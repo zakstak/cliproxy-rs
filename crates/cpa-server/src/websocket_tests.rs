@@ -693,6 +693,13 @@ async fn interrupt_diagnostics_are_sanitized() {
         ))
         .await
         .unwrap();
+    // The proxy stops the HTTP turn, so it acknowledges the interrupt first, as current
+    // Codex expects (docs/DIFFERENCES-FROM-GO.md).
+    let accepted = read_text(&mut socket).await;
+    assert_eq!(
+        accepted,
+        r#"{"type":"response.interrupt.accepted","response_id":"r-http"}"#
+    );
     let incomplete = read_text(&mut socket).await;
     assert_eq!(
         gjson::get(&incomplete, "type").str(),
@@ -722,24 +729,24 @@ async fn interrupt_diagnostics_are_sanitized() {
     // sha256("private-id-token") and sha256("r-http"), first 8 bytes.
     let (private, http) = ("6e621ae080fb54bf", "31a0066549f97718");
     let mut events = timeline_events(&log);
-    assert_eq!(events.len(), 9, "\n{log}");
-    // The local outcome and the turn's incomplete event are written concurrently.
-    events[6..8].sort();
-    assert_eq!(
-        events,
-        [
-            part("websocket.interrupt", &hashed(private, "")),
-            part("websocket.interrupt.outcome", &hashed(private, "rejected")),
-            part("websocket.request", create),
-            part("websocket.response", &created),
-            part("websocket.response", ITEM),
-            part("websocket.interrupt", &hashed(http, "")),
-            part("websocket.interrupt.outcome", &hashed(http, "local_http")),
-            part("websocket.response", &incomplete),
-            part("websocket.disconnect", "websocket: close 1000 (normal): bye"),
-        ],
-        "\n{log}"
-    );
+    assert_eq!(events.len(), 10, "\n{log}");
+    // The local outcome and the turn's acknowledgement and incomplete event are written
+    // concurrently.
+    events[6..9].sort();
+    let mut want = vec![
+        part("websocket.interrupt", &hashed(private, "")),
+        part("websocket.interrupt.outcome", &hashed(private, "rejected")),
+        part("websocket.request", create),
+        part("websocket.response", &created),
+        part("websocket.response", ITEM),
+        part("websocket.interrupt", &hashed(http, "")),
+        part("websocket.interrupt.outcome", &hashed(http, "local_http")),
+        part("websocket.response", &accepted),
+        part("websocket.response", &incomplete),
+        part("websocket.disconnect", "websocket: close 1000 (normal): bye"),
+    ];
+    want[6..9].sort();
+    assert_eq!(events, want, "\n{log}");
     for secret in [
         "private-id-token",
         "secret-mode",

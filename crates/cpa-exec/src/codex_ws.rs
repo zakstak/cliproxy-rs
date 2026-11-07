@@ -8,6 +8,12 @@
 //! serialised. The socket stays pooled after a completed response so the next turn can
 //! continue with `previous_response_id` and incremental input.
 //!
+//! Interrupts: current Codex waits for upstream's `response.interrupt.accepted` or
+//! `.failed` after the interrupted response's terminal event, so a turn that forwarded an
+//! interrupt keeps reading for that acknowledgement, at most [`ACK_WAIT`], and only
+//! acknowledgements of interrupts this socket forwarded reach a turn
+//! (docs/DIFFERENCES-FROM-GO.md).
+//!
 //! Lifecycle: the reader task ends with the socket; [`Pool::close`] (downstream gone)
 //! aborts it and sends a close frame. No task outlives its session.
 
@@ -69,6 +75,16 @@ impl WriteLimit {
             .max(Duration::from_secs(len.div_ceil(self.rate.max(1)) as u64))
     }
 }
+/// How long a socket waits for upstream's `response.interrupt.accepted` or `.failed`
+/// after the interrupted response ended: Codex e0aa043 gives up after one second from its
+/// cancel (`codex-rs/core/src/session/turn.rs`) and retires the connection, so a later
+/// acknowledgement helps no one.
+pub(crate) const ACK_WAIT: Duration = Duration::from_secs(1);
+/// Interrupts a turn tracks for acknowledgement; more are still forwarded, and their
+/// acknowledgements are dropped like unsolicited ones.
+// ponytail: a fixed cap; Codex sends one interrupt per response. Raise it if a client
+// legitimately interrupts many responses within one turn.
+const MAX_AWAITED: usize = 64;
 /// Go's per-turn read channel capacity.
 const TURN_BUFFER: usize = 4096;
 /// Bound on a handshake rejection body.
@@ -138,11 +154,35 @@ pub(crate) struct Link {
     active: Option<mpsc::Sender<Read>>,
     /// Why the reader stopped (`upstreamDisconnectError`); set once when it exits.
     pub(crate) lost: Option<ExecError>,
-    /// Response IDs this socket already finished (`terminalResponseIDs`): a late
-    /// `response.interrupt` for one is done, not an error and not forwarded.
+    /// Response IDs this socket already finished (`terminalResponseIDs`), each with the
+    /// activation that was current when the reader saw it: a late `response.interrupt`
+    /// for one finished by an earlier turn is done while a later turn reads.
     // ponytail: grows by one ID per finished response for the socket's life, as Go's
     // does; bound it if sockets ever outlive thousands of turns.
-    terminal: std::collections::HashSet<String>,
+    terminal: HashMap<String, u64>,
+    /// Counts activations; the turn reading now (if any) is number `turns`.
+    turns: u64,
+    /// Response IDs whose interrupt the reading turn forwarded and upstream has not
+    /// acknowledged yet. Only their acknowledgements reach the turn.
+    awaited: std::collections::HashSet<String>,
+    /// An interrupt forwarded while no turn reads (the response already ended): its
+    /// acknowledgement goes to the waiting [`Pool::interrupt`] call.
+    late: Option<(String, tokio::sync::oneshot::Sender<String>)>,
+}
+
+/// `response.interrupt.accepted` and `.failed`: the `response_id` they acknowledge, empty
+/// when it is missing or not a string. `None` for any other event.
+fn acknowledged_id(payload: &str) -> Option<String> {
+    let kind = gjson::get(payload, "type");
+    if !matches!(kind.str(), "response.interrupt.accepted" | "response.interrupt.failed") {
+        return None;
+    }
+    let id = gjson::get(payload, "response_id");
+    Some(if id.kind() == Kind::String {
+        id.str().to_owned()
+    } else {
+        String::new()
+    })
 }
 
 /// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
@@ -225,6 +265,8 @@ impl Upstream {
     pub(crate) fn activate(&self) -> mpsc::Receiver<Read> {
         let (tx, rx) = mpsc::channel(TURN_BUFFER);
         let mut link = self.link.lock().expect("link");
+        link.turns += 1;
+        link.awaited.clear();
         match &link.lost {
             Some(error) => {
                 let _ = tx.try_send(Read::Failed(turn_error(error)));
@@ -235,7 +277,28 @@ impl Upstream {
     }
 
     pub(crate) fn deactivate(&self) {
-        self.link.lock().expect("link").active.take();
+        let mut link = self.link.lock().expect("link");
+        link.active.take();
+        link.awaited.clear();
+    }
+
+    /// The turn read the acknowledgement for `id`: no later one is expected.
+    fn acknowledged(&self, id: &str) {
+        self.link.lock().expect("link").awaited.remove(id);
+    }
+
+    /// The turn read the terminal event of response `id`. True when an interrupt for it
+    /// still waits for its acknowledgement, so the turn keeps reading; otherwise the turn
+    /// stops reading here, in the same lock as the check, so an interrupt arriving now
+    /// finds the socket idle and waits for the acknowledgement itself.
+    fn finish(&self, id: &str) -> bool {
+        let mut link = self.link.lock().expect("link");
+        if link.awaited.contains(id) {
+            return true;
+        }
+        link.active.take();
+        link.awaited.clear();
+        false
     }
 
     /// `writeCodexWebsocketMessage` + `mapCodexWebsocketWriteError`: a write after the
@@ -334,6 +397,7 @@ impl Upstream {
             reader.abort();
         }
         self.deactivate();
+        self.link.lock().expect("link").late = None;
         let lease = {
             let mut slot = self.lease.lock().expect("lease");
             slot.0 = true;
@@ -414,6 +478,8 @@ pub(crate) struct Pool {
     /// Read deadline for each upstream application message.
     pub(crate) idle: Duration,
     pub(crate) write: WriteLimit,
+    /// Bound on waiting for an interrupt acknowledgement after its response ended.
+    pub(crate) ack_wait: Duration,
 }
 
 impl Default for Pool {
@@ -422,6 +488,7 @@ impl Default for Pool {
             sessions: Mutex::default(),
             idle: IDLE_TIMEOUT,
             write: WRITE_LIMIT,
+            ack_wait: ACK_WAIT,
         }
     }
 }
@@ -431,6 +498,14 @@ impl Pool {
     pub fn with_idle(idle: Duration) -> Self {
         Self {
             idle,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ack_wait(ack_wait: Duration) -> Self {
+        Self {
+            ack_wait,
             ..Self::default()
         }
     }
@@ -525,15 +600,24 @@ impl Pool {
     }
 
     /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
-    /// to the socket of the session's turn in progress. It never dials, replays or
-    /// selects another credential. `enabled(credential_id)` is the live account check,
-    /// called without holding a session lock.
+    /// to the session's socket. It never dials, replays or selects another credential.
+    /// `enabled(credential_id)` is the live account check, called without holding a
+    /// session lock.
+    ///
+    /// Current Codex waits for upstream's `response.interrupt.accepted` or `.failed`
+    /// after the response's terminal event (docs/DIFFERENCES-FROM-GO.md). An interrupt
+    /// for a response of the turn reading now is forwarded and its acknowledgement
+    /// reaches that turn. One for a response the socket finished while no turn reads is
+    /// forwarded too (Go answers success without sending it), and upstream's
+    /// acknowledgement, if it comes within [`Pool::ack_wait`], is returned for the
+    /// caller to deliver. One for a response finished before the turn reading now is
+    /// done without being forwarded, as in Go.
     pub async fn interrupt(
         &self,
         id: &str,
         payload: &[u8],
         enabled: impl FnOnce(&str) -> bool,
-    ) -> Result<(), InterruptError> {
+    ) -> Result<Option<Bytes>, InterruptError> {
         let session = Some(id.trim())
             .filter(|id| !id.is_empty())
             .and_then(|id| self.get(id))
@@ -541,32 +625,51 @@ impl Pool {
         let conn = session.current().ok_or(InterruptError::NoActive)?;
         let auth_enabled = enabled(&conn.target.credential);
         let response_id = cpa_common::json::get(payload, "response_id").bytes();
-        {
+        let response_id = std::str::from_utf8(&response_id).ok().map(str::to_owned);
+        let late = {
             // One snapshot of the socket's state: a completion landing between the
             // checks would otherwise turn a late interrupt into a stale error.
             let current = session.conn.lock().expect("session conn");
             if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
                 return Err(InterruptError::NoActive);
             }
-            let link = conn.link.lock().expect("link");
+            let mut link = conn.link.lock().expect("link");
             if let Some(lost) = &link.lost {
                 return Err(InterruptError::Rejected(
                     String::from_utf8_lossy(&lost.body).into_owned(),
                 ));
             }
-            if std::str::from_utf8(&response_id).is_ok_and(|id| link.terminal.contains(id)) {
-                return Ok(());
+            let finished_by = response_id.as_ref().and_then(|id| link.terminal.get(id)).copied();
+            let reading = link.active.is_some();
+            match finished_by {
+                // Finished before the turn reading now: that response is done.
+                Some(turn) if reading && turn != link.turns => return Ok(None),
+                // A socket kept from an earlier turn, and an ID it never finished: not
+                // the current upstream (an HTTP turn may still cancel locally).
+                None if !reading => return Err(InterruptError::NoActive),
+                _ => {}
             }
-            // A socket kept from an earlier turn is not the current upstream.
-            if link.active.is_none() {
-                return Err(InterruptError::NoActive);
+            if !auth_enabled {
+                return Err(InterruptError::Rejected(
+                    "websocket credential is no longer enabled".into(),
+                ));
             }
-        }
-        if !auth_enabled {
-            return Err(InterruptError::Rejected(
-                "websocket credential is no longer enabled".into(),
-            ));
-        }
+            match (reading, response_id) {
+                (true, Some(id)) => {
+                    if link.awaited.len() < MAX_AWAITED {
+                        link.awaited.insert(id);
+                    }
+                    None
+                }
+                (true, None) => None,
+                (false, id) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // An earlier waiter, if any, gives up now.
+                    link.late = Some((id.unwrap_or_default(), tx));
+                    Some(rx)
+                }
+            }
+        };
         // A failed or timed-out write may leave a partial frame: the socket is dropped
         // like after any failed turn write (Go leaves that to its reader).
         if let Err(error) = conn.send_raw(Bytes::copy_from_slice(payload)).await {
@@ -575,7 +678,23 @@ impl Pool {
                 String::from_utf8_lossy(&error.body).into_owned(),
             ));
         }
-        Ok(())
+        let Some(rx) = late else { return Ok(None) };
+        let acknowledged = tokio::time::timeout(self.ack_wait, rx).await;
+        let mut link = conn.link.lock().expect("link");
+        if link.late.as_ref().is_some_and(|(_, tx)| tx.is_closed()) {
+            link.late = None;
+        }
+        match acknowledged {
+            Ok(Ok(ack)) => Ok(Some(Bytes::from(ack))),
+            // The reader stopped: the socket is gone.
+            Ok(Err(_)) => match &link.lost {
+                Some(lost) => Err(InterruptError::Rejected(
+                    String::from_utf8_lossy(&lost.body).into_owned(),
+                )),
+                None => Ok(None),
+            },
+            Err(_) => Ok(None),
+        }
     }
 
     /// Resolves with the error that lost the session's upstream socket.
@@ -840,6 +959,10 @@ enum Frame {
         raw_len: usize,
         bufferable: bool,
         terminal: bool,
+        /// The terminal event's `response.id`.
+        terminal_id: Option<String>,
+        /// The `response_id` an interrupt acknowledgement names.
+        ack: Option<String>,
     },
     /// The response failed. `read` means the reader already dropped the socket;
     /// `overload` is a transient capacity rejection another credential may serve.
@@ -879,6 +1002,11 @@ struct Turn {
     /// Inside the bootstrap window, where Go records an empty incomplete as a
     /// WebSocket error rather than a response error.
     bootstrapping: bool,
+    /// Bound on waiting for an interrupt acknowledgement after the response ended.
+    ack_wait: Duration,
+    /// After the terminal event: the interrupted response whose acknowledgement the turn
+    /// still waits for, and until when.
+    drain: Option<(String, tokio::time::Instant)>,
 }
 
 impl Drop for Turn {
@@ -980,6 +1108,11 @@ impl Turn {
             kind.as_str(),
             "response.completed" | "response.done" | "response.incomplete"
         );
+        let terminal_id = terminal
+            .then(|| gjson::get(payload, "response.id"))
+            .filter(|id| id.kind() == Kind::String)
+            .map(|id| id.str().to_owned());
+        let ack = acknowledged_id(payload);
         if kind == "response.output_item.done" {
             self.items.collect(payload);
         }
@@ -997,12 +1130,17 @@ impl Turn {
             out: Bytes::from(response::ensure_usage_details(out)),
             bufferable,
             terminal,
+            terminal_id,
+            ack,
         }
     }
 
     /// Quota headers and usage from one upstream event, observed before collaboration
     /// names are restored (as Go does).
     fn observe(&mut self, payload: &str) {
+        if let Some(id) = acknowledged_id(payload) {
+            self.conn.acknowledged(&id);
+        }
         if let Some(headers) = codex_quota::event_headers(payload) {
             codex_quota::merge(&mut self.observed, &headers);
             self.quota.observe(&self.credential, &self.model, &self.observed);
@@ -1017,6 +1155,23 @@ impl Turn {
         self.session.invalidate(&self.conn, error, notify);
     }
 
+    /// The response `id` ended. True when its interrupt still waits for upstream's
+    /// acknowledgement: the turn keeps reading, at most [`Pool::ack_wait`], for that
+    /// acknowledgement alone. Otherwise the turn stops reading here.
+    fn settle(&mut self, id: Option<&str>) -> bool {
+        match id {
+            Some(id) if self.conn.finish(id) => {
+                self.drain = Some((id.to_owned(), tokio::time::Instant::now() + self.ack_wait));
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.conn.deactivate();
+                false
+            }
+        }
+    }
+
     /// The raw error that lost the session's socket, as the reader recorded it (the
     /// duplex wraps gorilla's close error unmapped).
     fn loss(&self) -> Option<ExecError> {
@@ -1024,19 +1179,46 @@ impl Turn {
     }
 }
 
-/// The rest of a turn as a stream; ends after the terminal event or the first error.
+/// The rest of a turn as a stream; ends after the terminal event or the first error, or,
+/// when the response was interrupted and upstream has not acknowledged that yet, after
+/// the acknowledgement or [`Pool::ack_wait`] (docs/DIFFERENCES-FROM-GO.md).
 fn rest(turn: Turn) -> ExecStream {
     futures_util::stream::unfold(Some(turn), |turn| async move {
         let mut turn = turn?;
         loop {
-            match turn.frame().await {
+            let frame = match turn.drain.as_ref().map(|(_, until)| *until) {
+                None => turn.frame().await,
+                Some(until) => match tokio::time::timeout_at(until, turn.frame()).await {
+                    Ok(frame) => frame,
+                    // No acknowledgement: the response itself already ended.
+                    Err(_) => return None,
+                },
+            };
+            match frame {
                 Frame::Skip => continue,
-                Frame::Event { out, terminal, .. } => {
-                    return Some((Ok(out), (!terminal).then_some(turn)));
+                Frame::Event {
+                    out,
+                    terminal,
+                    terminal_id,
+                    ack,
+                    ..
+                } => {
+                    if let Some((interrupted, _)) = &turn.drain {
+                        // After the terminal event only acknowledgements reach the client.
+                        let Some(ack) = ack else { continue };
+                        let done = ack == *interrupted;
+                        return Some((Ok(out), (!done).then_some(turn)));
+                    }
+                    let more = !terminal || turn.settle(terminal_id.as_deref());
+                    return Some((Ok(out), more.then_some(turn)));
                 }
                 Frame::Failed { error, read, .. } => {
                     if !read {
                         turn.invalidate(&error, true);
+                    }
+                    // The response already ended; the session reports the loss.
+                    if turn.drain.is_some() {
+                        return None;
                     }
                     return Some((Err(error), None));
                 }
@@ -1089,6 +1271,8 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 raw_len,
                 bufferable,
                 terminal,
+                terminal_id,
+                ..
             } => {
                 let size = raw_len + out.len();
                 if window_open && bufferable && !terminal && bytes + size <= response::BOOTSTRAP_MAX_BYTES {
@@ -1098,6 +1282,11 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 }
                 held.push(Ok(out));
                 if terminal {
+                    if turn.settle(terminal_id.as_deref()) {
+                        // An interrupt acknowledgement still follows the terminal event.
+                        turn.bootstrapping = false;
+                        return Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed());
+                    }
                     return Ok(futures_util::stream::iter(held).boxed());
                 }
                 break;
@@ -1347,6 +1536,8 @@ impl CodexExecutor {
             replay,
             wire,
             bootstrapping: false,
+            ack_wait: self.ws.ack_wait,
+            drain: None,
         };
         if let Some((input, initial)) = steering {
             // The socket now belongs to this connection; bootstrap buffering does not apply.
@@ -1433,12 +1624,27 @@ pub(crate) async fn read_loop(
         // Terminal IDs are recorded before delivery: the handler may still be forwarding
         // the turn after its read channel was released.
         let terminal = terminal_response_id(text.trim());
+        let acknowledged = acknowledged_id(text.trim());
         let active = {
             let mut link = conn.link.lock().expect("link");
             if let Some(id) = terminal {
-                link.terminal.insert(id);
+                let turn = link.turns;
+                link.terminal.insert(id, turn);
             }
-            link.active.clone()
+            match acknowledged {
+                // A late interrupt's caller waits for this one.
+                Some(id) if link.late.as_ref().is_some_and(|(late, _)| *late == id) => {
+                    if let Some((_, tx)) = link.late.take() {
+                        let _ = tx.send(text);
+                    }
+                    continue 'read;
+                }
+                // Only the reading turn's own interrupts are acknowledged to it: Codex
+                // fails a response on an acknowledgement for another one, and one that
+                // outlived its wait must not reach the next turn.
+                Some(id) if !link.awaited.contains(&id) => continue 'read,
+                _ => link.active.clone(),
+            }
         };
         if let Some(tx) = active {
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
@@ -1448,6 +1654,8 @@ pub(crate) async fn read_loop(
     let active = {
         let mut link = conn.link.lock().expect("link");
         link.lost = Some(error.clone());
+        // A late interrupt's caller stops waiting and finds the loss.
+        link.late = None;
         link.active.clone()
     };
     // The session records the loss before the turn reads its error, so a handler that

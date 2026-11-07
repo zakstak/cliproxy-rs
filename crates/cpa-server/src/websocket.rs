@@ -433,38 +433,68 @@ async fn read_input(
 /// no upstream socket can take it, which ends an HTTP turn locally.
 #[derive(Default)]
 struct LocalInterrupt {
-    /// Whether a turn is forwarding, and the first interrupt delivered to it.
-    state: std::sync::Mutex<(bool, Option<String>)>,
+    state: std::sync::Mutex<LocalState>,
     ready: Notify,
 }
 
+#[derive(Default)]
+struct LocalState {
+    /// A turn is forwarding.
+    forwarding: bool,
+    /// The first interrupt delivered to it.
+    pending: Option<String>,
+    /// The response the connection last sent a terminal event for.
+    finished: String,
+}
+
+/// Where [`LocalInterrupt::deliver`] put an interrupt.
+#[derive(PartialEq, Eq)]
+enum Local {
+    /// The turn in flight ends with it.
+    Delivered,
+    /// It names the response the connection already finished: there is nothing left to
+    /// stop, so the reader acknowledges it at once.
+    Finished,
+    /// No turn takes it.
+    Refused,
+}
+
 impl LocalInterrupt {
-    fn state(&self) -> std::sync::MutexGuard<'_, (bool, Option<String>)> {
+    fn state(&self) -> std::sync::MutexGuard<'_, LocalState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The turn starts forwarding; the returned guard ends it.
     fn begin(&self) -> LocalTurn<'_> {
-        self.state().0 = true;
+        self.state().forwarding = true;
         LocalTurn(self)
     }
 
-    fn deliver(&self, payload: &str) -> bool {
+    /// The connection sent the terminal event of response `id`.
+    fn finish(&self, id: &str) {
+        id.clone_into(&mut self.state().finished);
+    }
+
+    fn deliver(&self, payload: &str) -> Local {
+        let id = field(payload, "response_id");
         let mut state = self.state();
-        if !state.0 {
-            return false;
+        if !state.finished.is_empty() && state.finished == id {
+            return Local::Finished;
         }
-        if state.1.is_none() {
-            state.1 = Some(payload.to_owned());
+        if !state.forwarding {
+            return Local::Refused;
+        }
+        if state.pending.is_none() {
+            state.pending = Some(payload.to_owned());
             self.ready.notify_one();
         }
-        true
+        Local::Delivered
     }
 
     async fn next(&self) -> String {
         loop {
             let ready = self.ready.notified();
-            if let Some(payload) = self.state().1.take() {
+            if let Some(payload) = self.state().pending.take() {
                 return payload;
             }
             ready.await;
@@ -477,8 +507,16 @@ struct LocalTurn<'a>(&'a LocalInterrupt);
 
 impl Drop for LocalTurn<'_> {
     fn drop(&mut self) {
-        *self.0.state() = (false, None);
+        let mut state = self.0.state();
+        state.forwarding = false;
+        state.pending = None;
     }
+}
+
+/// The acknowledgement current Codex waits for after interrupting a response the proxy
+/// itself stops or already finished (docs/DIFFERENCES-FROM-GO.md).
+fn interrupt_accepted(response_id: &str) -> String {
+    set_str(r#"{"type":"response.interrupt.accepted"}"#, "response_id", response_id)
 }
 
 /// What the reader needs for `response.interrupt` (Go
@@ -507,22 +545,46 @@ impl Control {
         }
         self.diagnostic(frame, "");
         let outcome = match self.forward(frame).await {
-            Ok(()) => "handled",
-            Err(InterruptError::NoActive) if self.local.deliver(&String::from_utf8_lossy(frame)) => "local_http",
-            Err(error) => {
-                self.diagnostic(frame, "rejected");
-                // Only the sanitized outcome is logged: transport errors may carry
-                // credentials or URLs. The error event is not a timeline part.
-                let event = error_payload(400, &error.to_string(), None);
-                let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
-                return Some(sent.map_err(|e| e.to_string()));
+            Ok(None) => "handled",
+            // Upstream acknowledged an interrupt for a response that had already ended.
+            Ok(Some(ack)) => {
+                // Upstream's text frame, so valid UTF-8: passed on unchanged.
+                let ack = String::from_utf8_lossy(&ack).into_owned();
+                let sent = self.writer.lock().await.send(Message::Text(ack.into())).await;
+                if let Err(error) = sent {
+                    return Some(Err(error.to_string()));
+                }
+                "handled"
             }
+            Err(InterruptError::NoActive) => match self.local.deliver(&String::from_utf8_lossy(frame)) {
+                Local::Delivered => "local_http",
+                Local::Finished => {
+                    let ack = interrupt_accepted(&field(&String::from_utf8_lossy(frame), "response_id"));
+                    let sent = self.writer.lock().await.send(Message::Text(ack.into())).await;
+                    if let Err(error) = sent {
+                        return Some(Err(error.to_string()));
+                    }
+                    "handled"
+                }
+                Local::Refused => return Some(self.reject(frame, InterruptError::NoActive).await),
+            },
+            Err(error) => return Some(self.reject(frame, error).await),
         };
         self.diagnostic(frame, outcome);
         Some(Ok(()))
     }
 
-    async fn forward(&self, payload: &[u8]) -> Result<(), InterruptError> {
+    /// The error event for a rejected interrupt; `Err` when it cannot be written.
+    async fn reject(&self, frame: &[u8], error: InterruptError) -> Result<(), String> {
+        self.diagnostic(frame, "rejected");
+        // Only the sanitized outcome is logged: transport errors may carry credentials or
+        // URLs. The error event is not a timeline part.
+        let event = error_payload(400, &error.to_string(), None);
+        let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
+        sent.map_err(|e| e.to_string())
+    }
+
+    async fn forward(&self, payload: &[u8]) -> Result<Option<Bytes>, InterruptError> {
         let id = cpa_common::json::get(payload, "response_id");
         if id.kind != cpa_common::json::Kind::String || cpa_common::gostr::trim_space(&id.bytes()).is_empty() {
             return Err(InterruptError::Rejected(
@@ -1198,7 +1260,16 @@ impl Connection {
             let item = tokio::select! {
                 biased;
                 // Dropping the stream cancels the upstream request.
-                payload = self.local.next() => return interrupted(socket, &payload, &turn).await,
+                payload = self.local.next() => {
+                    if !completed {
+                        return interrupted(socket, &self.local, &payload, &turn).await;
+                    }
+                    // The terminal event already went out: only the acknowledgement is left.
+                    if !send_text(socket, interrupt_accepted(&field(&payload, "response_id"))).await {
+                        return Forwarded::End;
+                    }
+                    continue;
+                }
                 item = stream.next() => item,
                 () = sleep_until(deadline) => {
                     if let Err(error) = socket.send(Message::Ping(Bytes::new())).await {
@@ -1295,6 +1366,9 @@ impl Connection {
                 if !send_text(socket, payload).await {
                     return Forwarded::End;
                 }
+                if completed {
+                    self.local.finish(&completed_id);
+                }
             }
         }
     }
@@ -1302,15 +1376,21 @@ impl Connection {
 
 /// `completeResponsesWebsocketLocalInterrupt`: ends the turn in flight with an
 /// interrupted `response.incomplete` carrying the output collected so far. The turn
-/// completes with that output, so the transcript records it.
-async fn interrupted(socket: &mut Sink, payload: &str, turn: &Turn) -> Forwarded {
+/// completes with that output, so the transcript records it. Current Codex also waits
+/// for `response.interrupt.accepted`, which the proxy sends first: it is the one that
+/// stops this turn (docs/DIFFERENCES-FROM-GO.md).
+async fn interrupted(socket: &mut Sink, local: &LocalInterrupt, payload: &str, turn: &Turn) -> Forwarded {
     let id = field(payload, "response_id");
+    if !send_text(socket, interrupt_accepted(&id)).await {
+        return Forwarded::End;
+    }
     let output = turn.completed_output(r#"{"response":{"output":[]}}"#);
     let incomplete = r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}}"#;
     let incomplete = set_raw(&set_str(incomplete, "response.id", &id), "response.output", &output);
     if !send_text(socket, incomplete).await {
         return Forwarded::End;
     }
+    local.finish(&id);
     Forwarded::Completed {
         output,
         id,
@@ -1492,3 +1572,7 @@ fn gorilla_close(code: u16, reason: &str) -> String {
 #[cfg(test)]
 #[path = "websocket_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "websocket_interrupt_tests.rs"]
+mod interrupt_tests;

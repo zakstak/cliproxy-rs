@@ -1319,12 +1319,15 @@ async fn interrupt_needs_a_turn_reading_on_the_socket() {
 }
 
 /// Go `TestInterruptExecutionSessionCompletesDuringAuthCheck`: the response finishes
-/// while the account check runs. The interrupt is then done, not forwarded: the socket's
-/// state is read after the check.
+/// while the account check runs, and the socket's state is read after the check. Go
+/// then answers success without forwarding; current Codex waits for upstream's
+/// acknowledgement of that interrupt, so it goes upstream (docs/DIFFERENCES-FROM-GO.md)
+/// and, unacknowledged here, the call returns after the bounded wait.
 #[tokio::test]
-async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
+async fn interrupt_for_a_response_finished_during_the_auth_check_goes_upstream() {
     let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED])]).await;
-    let executor = CodexExecutor::new().unwrap();
+    let mut executor = CodexExecutor::new().unwrap();
+    executor.ws = Arc::new(Pool::with_ack_wait(Duration::from_millis(100)));
     let conn = pooled(&executor, &url).await;
     let mut reads = conn.activate();
     conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
@@ -1335,22 +1338,29 @@ async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
         conn.deactivate();
         true
     };
-    executor
-        .interrupt_session("conn-1", br#"{"type":"response.interrupt","response_id":"r1"}"#, |_| {
-            finish()
-        })
-        .await
-        .unwrap();
+    let late = br#"{"type":"response.interrupt","response_id":"r1"}"#;
+    let outcome = executor.interrupt_session("conn-1", late, |_| finish()).await;
+    assert_eq!(outcome, Ok(None), "no acknowledgement arrived");
     conn.send("barrier".into()).await.unwrap();
-    assert_eq!(received(&up, 2).await, [r#"{"type":"response.create"}"#, "barrier"]);
+    assert_eq!(
+        received(&up, 3).await,
+        [
+            r#"{"type":"response.create"}"#,
+            r#"{"type":"response.interrupt","response_id":"r1"}"#,
+            "barrier"
+        ]
+    );
 }
 
-/// Go `TestInterruptExecutionSessionAfterTerminal`: a late interrupt for a finished
-/// response is done, also while the next response runs, and never reaches upstream; an
-/// unknown ID on an idle socket falls through to the HTTP fallback; after the socket is
-/// lost there is no active upstream.
+/// Go `TestInterruptExecutionSessionAfterTerminal`, with current Codex's acknowledgement
+/// handshake (docs/DIFFERENCES-FROM-GO.md): an interrupt for a response finished before
+/// the turn reading now is done and never reaches upstream, as in Go; one for a finished
+/// response while no turn reads goes upstream (Go: done, not forwarded) and returns
+/// after the bounded wait without an acknowledgement here; an unknown ID on an idle
+/// socket falls through to the HTTP fallback; after the socket is lost there is no
+/// active upstream.
 #[tokio::test]
-async fn late_interrupts_for_finished_responses_are_done() {
+async fn late_interrupts_for_finished_responses() {
     for terminal in [
         "response.completed",
         "response.done",
@@ -1361,11 +1371,16 @@ async fn late_interrupts_for_finished_responses_are_done() {
             Box::leak(format!(r#"{{"type":"{terminal}","response":{{"id":"r1","output":[]}}}}"#).into_boxed_str());
         let (up, url) = upstream(vec![
             Act::Send(vec![CREATED, finished]),
+            Act::Send(vec![]),
+            Act::Send(vec![]),
             Act::Send(vec![r#"{"type":"response.incomplete","response":{"id":"r2"}}"#]),
+            Act::Send(vec![]),
+            Act::Send(vec![]),
             Act::SendClose(vec![], 1000),
         ])
         .await;
-        let executor = CodexExecutor::new().unwrap();
+        let mut executor = CodexExecutor::new().unwrap();
+        executor.ws = Arc::new(Pool::with_ack_wait(Duration::from_millis(100)));
         let conn = pooled(&executor, &url).await;
         let interrupt = |id: &str| format!(r#"{{"type":"response.interrupt","response_id":"{id}"}}"#);
         let send = |id: &'static str| {
@@ -1382,7 +1397,7 @@ async fn late_interrupts_for_finished_responses_are_done() {
         read_text(&mut reads).await;
         conn.deactivate();
         for _ in 0..2 {
-            assert_eq!(send("r1").await, Ok(()), "{terminal}: finished r1");
+            assert_eq!(send("r1").await, Ok(None), "{terminal}: finished r1, idle socket");
         }
         assert_eq!(
             send("unknown").await,
@@ -1391,17 +1406,24 @@ async fn late_interrupts_for_finished_responses_are_done() {
         );
 
         let mut reads = conn.activate();
-        assert_eq!(send("r1").await, Ok(()), "{terminal}: r1 while r2 runs");
-        assert_eq!(send("r2").await, Ok(()), "{terminal}: active r2");
+        assert_eq!(send("r1").await, Ok(None), "{terminal}: r1 while r2 runs");
+        assert_eq!(send("r2").await, Ok(None), "{terminal}: active r2");
         read_text(&mut reads).await;
         conn.deactivate();
         for id in ["r1", "r2"] {
-            assert_eq!(send(id).await, Ok(()), "{terminal}: finished {id}");
+            assert_eq!(send(id).await, Ok(None), "{terminal}: finished {id}, idle socket");
         }
         assert_eq!(
-            received(&up, 2).await,
-            [r#"{"type":"response.create"}"#.to_owned(), interrupt("r2")],
-            "{terminal}: only the active response's interrupt reached upstream"
+            received(&up, 6).await,
+            [
+                r#"{"type":"response.create"}"#.to_owned(),
+                interrupt("r1"),
+                interrupt("r1"),
+                interrupt("r2"),
+                interrupt("r1"),
+                interrupt("r2"),
+            ],
+            "{terminal}: r1 never reached upstream while r2 ran"
         );
         conn.send("bye".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
@@ -1417,6 +1439,9 @@ async fn late_interrupts_for_finished_responses_are_done() {
 
 #[path = "codex_duplex_tests.rs"]
 mod duplex;
+
+#[path = "codex_ws_interrupt_tests.rs"]
+mod interrupt;
 
 /// `buildCodexResponsesWebsocketURL` answers, recorded from Go v8.0.35 with the inputs of `url.Parse` and
 /// `URL.String()` (tests/reference/go_url).

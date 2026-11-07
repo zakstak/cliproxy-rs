@@ -138,13 +138,15 @@ impl CodexExecutor {
     }
 
     /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the
-    /// session's upstream socket while a turn reads on it (see `codex_ws::Pool::interrupt`).
+    /// session's upstream socket (see `codex_ws::Pool::interrupt`). `Some` is upstream's
+    /// acknowledgement of an interrupt for a response that had already ended, for the
+    /// caller to send to the client.
     pub async fn interrupt_session(
         &self,
         session: &str,
         payload: &[u8],
         enabled: impl FnOnce(&str) -> bool,
-    ) -> Result<(), InterruptError> {
+    ) -> Result<Option<Bytes>, InterruptError> {
         self.ws.interrupt(session, payload, enabled).await
     }
 
