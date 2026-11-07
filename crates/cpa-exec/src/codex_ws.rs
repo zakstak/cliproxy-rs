@@ -8,6 +8,12 @@
 //! serialised. The socket stays pooled after a completed response so the next turn can
 //! continue with `previous_response_id` and incremental input.
 //!
+//! Interrupts: current Codex waits for upstream's `response.interrupt.accepted` or
+//! `.failed` after the interrupted response's terminal event, so a turn that forwarded an
+//! interrupt keeps reading for that acknowledgement, at most [`ACK_WAIT`], and only
+//! acknowledgements of interrupts this socket forwarded reach a turn
+//! (docs/DIFFERENCES-FROM-GO.md).
+//!
 //! Lifecycle: the reader task ends with the socket; [`Pool::close`] (downstream gone)
 //! aborts it and sends a close frame. No task outlives its session.
 
@@ -42,6 +48,7 @@ use crate::codex_quota::{self, QuotaSignals};
 use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, OutputItems};
 use crate::proxy::Proxy;
+use crate::ws_cause;
 
 /// `codexResponsesWebsocketIdleTimeout`: read deadline renewed before every read.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,6 +76,16 @@ impl WriteLimit {
             .max(Duration::from_secs(len.div_ceil(self.rate.max(1)) as u64))
     }
 }
+/// How long a socket waits for upstream's `response.interrupt.accepted` or `.failed`
+/// after the interrupted response ended: Codex e0aa043 gives up after one second from its
+/// cancel (`codex-rs/core/src/session/turn.rs`) and retires the connection, so a later
+/// acknowledgement helps no one.
+pub(crate) const ACK_WAIT: Duration = Duration::from_secs(1);
+/// Interrupts a turn tracks for acknowledgement; more are still forwarded, and their
+/// acknowledgements are dropped like unsolicited ones.
+// ponytail: a fixed cap; Codex sends one interrupt per response. Raise it if a client
+// legitimately interrupts many responses within one turn.
+const MAX_AWAITED: usize = 64;
 /// Go's per-turn read channel capacity.
 const TURN_BUFFER: usize = 4096;
 /// Bound on a handshake rejection body.
@@ -138,11 +155,43 @@ pub(crate) struct Link {
     active: Option<mpsc::Sender<Read>>,
     /// Why the reader stopped (`upstreamDisconnectError`); set once when it exits.
     pub(crate) lost: Option<ExecError>,
-    /// Response IDs this socket already finished (`terminalResponseIDs`): a late
-    /// `response.interrupt` for one is done, not an error and not forwarded.
+    /// The active turn gives a Codex client a context-window rejection as a
+    /// `response.failed` and ends with it (`Turn::invalidate_after_event`); not a duplex turn, whose
+    /// connection survives that event.
+    preserves: bool,
+    /// The loss the reader left unreported because the event it last delivered to the
+    /// turn is such a failure: the turn's own error after the event replaces it, and the
+    /// turn reports this loss only if it ends some other way.
+    deferred: Option<ExecError>,
+    /// Response IDs this socket already finished (`terminalResponseIDs`), each with the
+    /// activation that was current when the reader saw it: a late `response.interrupt`
+    /// for one finished by an earlier turn is done while a later turn reads.
     // ponytail: grows by one ID per finished response for the socket's life, as Go's
     // does; bound it if sockets ever outlive thousands of turns.
-    terminal: std::collections::HashSet<String>,
+    terminal: HashMap<String, u64>,
+    /// Counts activations; the turn reading now (if any) is number `turns`.
+    turns: u64,
+    /// Response IDs whose interrupt the reading turn forwarded and upstream has not
+    /// acknowledged yet. Only their acknowledgements reach the turn.
+    awaited: std::collections::HashSet<String>,
+    /// An interrupt forwarded while no turn reads (the response already ended): its
+    /// acknowledgement goes to the waiting [`Pool::interrupt`] call.
+    late: Option<(String, tokio::sync::oneshot::Sender<String>)>,
+}
+
+/// `response.interrupt.accepted` and `.failed`: the `response_id` they acknowledge, empty
+/// when it is missing or not a string. `None` for any other event.
+fn acknowledged_id(payload: &str) -> Option<String> {
+    let kind = gjson::get(payload, "type");
+    if !matches!(kind.str(), "response.interrupt.accepted" | "response.interrupt.failed") {
+        return None;
+    }
+    let id = gjson::get(payload, "response_id");
+    Some(if id.kind() == Kind::String {
+        id.str().to_owned()
+    } else {
+        String::new()
+    })
 }
 
 /// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
@@ -222,20 +271,47 @@ impl Upstream {
         }
     }
 
-    pub(crate) fn activate(&self) -> mpsc::Receiver<Read> {
+    /// The read channel for the next turn. `preserves`: see [`Link::preserves`].
+    pub(crate) fn activate(&self, preserves: bool) -> mpsc::Receiver<Read> {
         let (tx, rx) = mpsc::channel(TURN_BUFFER);
         let mut link = self.link.lock().expect("link");
+        link.turns += 1;
+        link.awaited.clear();
         match &link.lost {
             Some(error) => {
                 let _ = tx.try_send(Read::Failed(turn_error(error)));
             }
-            None => link.active = Some(tx),
+            None => {
+                link.active = Some(tx);
+                link.preserves = preserves;
+            }
         }
         rx
     }
 
     pub(crate) fn deactivate(&self) {
-        self.link.lock().expect("link").active.take();
+        let mut link = self.link.lock().expect("link");
+        link.active.take();
+        link.awaited.clear();
+    }
+
+    /// The turn read the acknowledgement for `id`: no later one is expected.
+    fn acknowledged(&self, id: &str) {
+        self.link.lock().expect("link").awaited.remove(id);
+    }
+
+    /// The turn read the terminal event of response `id`. True when an interrupt for it
+    /// still waits for its acknowledgement, so the turn keeps reading; otherwise the turn
+    /// stops reading here, in the same lock as the check, so an interrupt arriving now
+    /// finds the socket idle and waits for the acknowledgement itself.
+    fn finish(&self, id: &str) -> bool {
+        let mut link = self.link.lock().expect("link");
+        if link.awaited.contains(id) {
+            return true;
+        }
+        link.active.take();
+        link.awaited.clear();
+        false
     }
 
     /// `writeCodexWebsocketMessage` + `mapCodexWebsocketWriteError`: a write after the
@@ -268,14 +344,16 @@ impl Upstream {
         let sent = tokio::time::timeout(deadline, async { self.sink.lock().await.send(message).await }).await;
         match sent {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(write_error(
+            Ok(Err(error)) => Err(write_error(
                 self.link.lock().expect("link").lost.as_ref(),
                 "codex websockets executor: write failed",
-            )),
+            )
+            .with_diagnostic(ws_cause::socket(&error))),
             Err(_) => Err(write_error(
                 self.link.lock().expect("link").lost.as_ref(),
                 "codex websockets executor: write timed out",
-            )),
+            )
+            .with_diagnostic(ws_cause::write_timeout(deadline, len))),
         }
     }
 
@@ -334,6 +412,7 @@ impl Upstream {
             reader.abort();
         }
         self.deactivate();
+        self.link.lock().expect("link").late = None;
         let lease = {
             let mut slot = self.lease.lock().expect("lease");
             slot.0 = true;
@@ -396,15 +475,20 @@ impl Session {
             *current = None;
         }
         if notify {
-            self.closed.send_if_modified(|slot| {
-                let first = slot.is_none();
-                if first {
-                    *slot = Some(error.clone());
-                }
-                first
-            });
+            self.notify(error);
         }
         conn.shutdown();
+    }
+
+    /// `notifyUpstreamDisconnect`: the first loss is the one reported.
+    fn notify(&self, error: &ExecError) {
+        self.closed.send_if_modified(|slot| {
+            let first = slot.is_none();
+            if first {
+                *slot = Some(error.clone());
+            }
+            first
+        });
     }
 }
 
@@ -414,6 +498,8 @@ pub(crate) struct Pool {
     /// Read deadline for each upstream application message.
     pub(crate) idle: Duration,
     pub(crate) write: WriteLimit,
+    /// Bound on waiting for an interrupt acknowledgement after its response ended.
+    pub(crate) ack_wait: Duration,
 }
 
 impl Default for Pool {
@@ -422,6 +508,7 @@ impl Default for Pool {
             sessions: Mutex::default(),
             idle: IDLE_TIMEOUT,
             write: WRITE_LIMIT,
+            ack_wait: ACK_WAIT,
         }
     }
 }
@@ -431,6 +518,14 @@ impl Pool {
     pub fn with_idle(idle: Duration) -> Self {
         Self {
             idle,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ack_wait(ack_wait: Duration) -> Self {
+        Self {
+            ack_wait,
             ..Self::default()
         }
     }
@@ -525,15 +620,24 @@ impl Pool {
     }
 
     /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
-    /// to the socket of the session's turn in progress. It never dials, replays or
-    /// selects another credential. `enabled(credential_id)` is the live account check,
-    /// called without holding a session lock.
+    /// to the session's socket. It never dials, replays or selects another credential.
+    /// `enabled(credential_id)` is the live account check, called without holding a
+    /// session lock.
+    ///
+    /// Current Codex waits for upstream's `response.interrupt.accepted` or `.failed`
+    /// after the response's terminal event (docs/DIFFERENCES-FROM-GO.md). An interrupt
+    /// for a response of the turn reading now is forwarded and its acknowledgement
+    /// reaches that turn. One for a response the socket finished while no turn reads is
+    /// forwarded too (Go answers success without sending it), and upstream's
+    /// acknowledgement, if it comes within [`Pool::ack_wait`], is returned for the
+    /// caller to deliver. One for a response finished before the turn reading now is
+    /// done without being forwarded, as in Go.
     pub async fn interrupt(
         &self,
         id: &str,
         payload: &[u8],
         enabled: impl FnOnce(&str) -> bool,
-    ) -> Result<(), InterruptError> {
+    ) -> Result<Option<Bytes>, InterruptError> {
         let session = Some(id.trim())
             .filter(|id| !id.is_empty())
             .and_then(|id| self.get(id))
@@ -541,32 +645,51 @@ impl Pool {
         let conn = session.current().ok_or(InterruptError::NoActive)?;
         let auth_enabled = enabled(&conn.target.credential);
         let response_id = cpa_common::json::get(payload, "response_id").bytes();
-        {
+        let response_id = std::str::from_utf8(&response_id).ok().map(str::to_owned);
+        let late = {
             // One snapshot of the socket's state: a completion landing between the
             // checks would otherwise turn a late interrupt into a stale error.
             let current = session.conn.lock().expect("session conn");
             if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
                 return Err(InterruptError::NoActive);
             }
-            let link = conn.link.lock().expect("link");
+            let mut link = conn.link.lock().expect("link");
             if let Some(lost) = &link.lost {
                 return Err(InterruptError::Rejected(
                     String::from_utf8_lossy(&lost.body).into_owned(),
                 ));
             }
-            if std::str::from_utf8(&response_id).is_ok_and(|id| link.terminal.contains(id)) {
-                return Ok(());
+            let finished_by = response_id.as_ref().and_then(|id| link.terminal.get(id)).copied();
+            let reading = link.active.is_some();
+            match finished_by {
+                // Finished before the turn reading now: that response is done.
+                Some(turn) if reading && turn != link.turns => return Ok(None),
+                // A socket kept from an earlier turn, and an ID it never finished: not
+                // the current upstream (an HTTP turn may still cancel locally).
+                None if !reading => return Err(InterruptError::NoActive),
+                _ => {}
             }
-            // A socket kept from an earlier turn is not the current upstream.
-            if link.active.is_none() {
-                return Err(InterruptError::NoActive);
+            if !auth_enabled {
+                return Err(InterruptError::Rejected(
+                    "websocket credential is no longer enabled".into(),
+                ));
             }
-        }
-        if !auth_enabled {
-            return Err(InterruptError::Rejected(
-                "websocket credential is no longer enabled".into(),
-            ));
-        }
+            match (reading, response_id) {
+                (true, Some(id)) => {
+                    if link.awaited.len() < MAX_AWAITED {
+                        link.awaited.insert(id);
+                    }
+                    None
+                }
+                (true, None) => None,
+                (false, id) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // An earlier waiter, if any, gives up now.
+                    link.late = Some((id.unwrap_or_default(), tx));
+                    Some(rx)
+                }
+            }
+        };
         // A failed or timed-out write may leave a partial frame: the socket is dropped
         // like after any failed turn write (Go leaves that to its reader).
         if let Err(error) = conn.send_raw(Bytes::copy_from_slice(payload)).await {
@@ -575,7 +698,23 @@ impl Pool {
                 String::from_utf8_lossy(&error.body).into_owned(),
             ));
         }
-        Ok(())
+        let Some(rx) = late else { return Ok(None) };
+        let acknowledged = tokio::time::timeout(self.ack_wait, rx).await;
+        let mut link = conn.link.lock().expect("link");
+        if link.late.as_ref().is_some_and(|(_, tx)| tx.is_closed()) {
+            link.late = None;
+        }
+        match acknowledged {
+            Ok(Ok(ack)) => Ok(Some(Bytes::from(ack))),
+            // The reader stopped: the socket is gone.
+            Ok(Err(_)) => match &link.lost {
+                Some(lost) => Err(InterruptError::Rejected(
+                    String::from_utf8_lossy(&lost.body).into_owned(),
+                )),
+                None => Ok(None),
+            },
+            Err(_) => Ok(None),
+        }
     }
 
     /// Resolves with the error that lost the session's upstream socket.
@@ -670,7 +809,10 @@ pub(crate) fn write_error(lost: Option<&ExecError>, message: &str) -> ExecError 
 
 fn turn_error(lost: &ExecError) -> ExecError {
     if lost.status == 413 {
-        message_too_big()
+        ExecError {
+            diagnostic: lost.diagnostic.clone(),
+            ..message_too_big()
+        }
     } else {
         lost.clone()
     }
@@ -840,14 +982,20 @@ enum Frame {
         raw_len: usize,
         bufferable: bool,
         terminal: bool,
+        /// The terminal event's `response.id`.
+        terminal_id: Option<String>,
+        /// The `response_id` an interrupt acknowledgement names.
+        ack: Option<String>,
     },
     /// The response failed. `read` means the reader already dropped the socket;
     /// `overload` is a transient capacity rejection another credential may serve.
+    /// `event` is the upstream event the client receives unchanged before `error`.
     Failed {
         error: ExecError,
         overload: bool,
         read: bool,
         status_frame: bool,
+        event: Option<Bytes>,
     },
 }
 
@@ -862,6 +1010,9 @@ struct Turn {
     items: OutputItems,
     saw_delta: bool,
     native: bool,
+    /// A Codex client: it gets an upstream context-window rejection as a `response.failed`
+    /// before the error (`request::codex_client`).
+    codex_client: bool,
     cooling: bool,
     quota: Arc<QuotaSignals>,
     credential: String,
@@ -879,12 +1030,18 @@ struct Turn {
     /// Inside the bootstrap window, where Go records an empty incomplete as a
     /// WebSocket error rather than a response error.
     bootstrapping: bool,
+    /// Bound on waiting for an interrupt acknowledgement after the response ended.
+    ack_wait: Duration,
+    /// After the terminal event: the interrupted response whose acknowledgement the turn
+    /// still waits for, and until when.
+    drain: Option<(String, tokio::time::Instant)>,
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
         // An abandoned turn keeps its session until an observation it started returns,
         // as Go's executor holds the session lock through the synchronous observer.
+        self.report_deferred();
         let conn = self.conn.clone();
         crate::ws_observation::release_after(self.observing.take(), self._turn.take(), move || conn.deactivate());
     }
@@ -905,11 +1062,13 @@ impl Turn {
         let text = match self.rx.recv().await {
             Some(Read::Text(text)) => text,
             Some(Read::Failed(error)) => {
+                self.report_deferred();
                 return Frame::Failed {
                     error,
                     overload: false,
                     read: true,
                     status_frame: false,
+                    event: None,
                 };
             }
             // A full channel can drop the reader's terminal error; the session still
@@ -923,6 +1082,7 @@ impl Turn {
                     overload: false,
                     read: true,
                     status_frame: false,
+                    event: None,
                 };
             }
         };
@@ -943,6 +1103,7 @@ impl Turn {
                 overload: false,
                 read: false,
                 status_frame: true,
+                event: None,
             };
         }
         if let Some((error, body)) = response::terminal_failure(payload, self.cooling) {
@@ -953,6 +1114,7 @@ impl Turn {
                 overload: response::is_overload(&body),
                 read: false,
                 status_frame: false,
+                event: self.preserved_event(payload),
             };
         }
         let kind = gjson::get(payload, "type");
@@ -972,6 +1134,7 @@ impl Turn {
                 overload: false,
                 read: false,
                 status_frame: false,
+                event: None,
             };
         }
         let bufferable = response::bufferable(payload);
@@ -980,6 +1143,11 @@ impl Turn {
             kind.as_str(),
             "response.completed" | "response.done" | "response.incomplete"
         );
+        let terminal_id = terminal
+            .then(|| gjson::get(payload, "response.id"))
+            .filter(|id| id.kind() == Kind::String)
+            .map(|id| id.str().to_owned());
+        let ack = acknowledged_id(payload);
         if kind == "response.output_item.done" {
             self.items.collect(payload);
         }
@@ -997,12 +1165,17 @@ impl Turn {
             out: Bytes::from(response::ensure_usage_details(out)),
             bufferable,
             terminal,
+            terminal_id,
+            ack,
         }
     }
 
     /// Quota headers and usage from one upstream event, observed before collaboration
     /// names are restored (as Go does).
     fn observe(&mut self, payload: &str) {
+        if let Some(id) = acknowledged_id(payload) {
+            self.conn.acknowledged(&id);
+        }
         if let Some(headers) = codex_quota::event_headers(payload) {
             codex_quota::merge(&mut self.observed, &headers);
             self.quota.observe(&self.credential, &self.model, &self.observed);
@@ -1017,6 +1190,68 @@ impl Turn {
         self.session.invalidate(&self.conn, error, notify);
     }
 
+    /// The response `id` ended. True when its interrupt still waits for upstream's
+    /// acknowledgement: the turn keeps reading, at most [`Pool::ack_wait`], for that
+    /// acknowledgement alone. Otherwise the turn stops reading here.
+    fn settle(&mut self, id: Option<&str>) -> bool {
+        match id {
+            Some(id) if self.conn.finish(id) => {
+                self.drain = Some((id.to_owned(), tokio::time::Instant::now() + self.ack_wait));
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.conn.deactivate();
+                false
+            }
+        }
+    }
+
+    /// For a failure the client first receives as the upstream's event: drops the socket
+    /// without reporting the session's loss, now or later. The turn's own error follows
+    /// the event at once and ends the downstream connection (the Responses WebSocket
+    /// handler takes it before writing the event, so an interrupt or a client leaving
+    /// during that write cannot replace it); a loss reported meanwhile would close the
+    /// client with a generic error and cut off a slow write of the event.
+    ///
+    /// The reader may already have dropped the socket and left its loss unreported for
+    /// this (`Link::deferred`); this turn's error replaces it, so a socket that closes
+    /// right after the event neither cuts the event off nor masks its classification.
+    /// The socket is dropped before the link is updated: a reader exiting in between
+    /// either finds the socket gone, or defers a loss that is then discarded here.
+    fn invalidate_after_event(&self, error: &ExecError) {
+        self.invalidate(error, false);
+        let mut link = self.conn.link.lock().expect("link");
+        link.preserves = false;
+        link.deferred = None;
+    }
+
+    /// Reports a loss the reader left to this turn (`Link::deferred`): before the turn
+    /// returns the reader's error, or when it ends without the event's own error.
+    ///
+    /// Also stops further deferral under the same lock: a dropped turn can keep its read
+    /// channel until an observation returns (`Drop`), and a reader exiting in that
+    /// window must report its own loss rather than leave it to a turn that is gone.
+    fn report_deferred(&self) {
+        let deferred = {
+            let mut link = self.conn.link.lock().expect("link");
+            link.preserves = false;
+            link.deferred.take()
+        };
+        if let Some(error) = deferred {
+            self.session.notify(&error);
+        }
+    }
+
+    /// The event a Codex client receives before this turn's error for an upstream
+    /// context-window rejection (`cpa_common::codex_client::context_window_failure_event`).
+    fn preserved_event(&self, payload: &str) -> Option<Bytes> {
+        if !self.codex_client {
+            return None;
+        }
+        cpa_common::codex_client::context_window_failure_event(payload).map(|e| Bytes::from(e.into_owned()))
+    }
+
     /// The raw error that lost the session's socket, as the reader recorded it (the
     /// duplex wraps gorilla's close error unmapped).
     fn loss(&self) -> Option<ExecError> {
@@ -1024,21 +1259,68 @@ impl Turn {
     }
 }
 
-/// The rest of a turn as a stream; ends after the terminal event or the first error.
+/// The rest of a turn as a stream; ends after the terminal event or the first error
+/// (preceded by the upstream event a Codex client receives unchanged), or, when the
+/// response was interrupted and upstream has not acknowledged that yet, after the
+/// acknowledgement or [`Pool::ack_wait`] (docs/DIFFERENCES-FROM-GO.md).
 fn rest(turn: Turn) -> ExecStream {
-    futures_util::stream::unfold(Some(turn), |turn| async move {
-        let mut turn = turn?;
+    enum State {
+        // Boxed: one allocation per turn keeps the other states small.
+        Reading(Box<Turn>),
+        Failing(ExecError),
+        Done,
+    }
+    futures_util::stream::unfold(State::Reading(Box::new(turn)), |state| async move {
+        let mut turn = match state {
+            State::Reading(turn) => turn,
+            State::Failing(error) => return Some((Err(error), State::Done)),
+            State::Done => return None,
+        };
         loop {
-            match turn.frame().await {
+            let frame = match turn.drain.as_ref().map(|(_, until)| *until) {
+                None => turn.frame().await,
+                Some(until) => match tokio::time::timeout_at(until, turn.frame()).await {
+                    Ok(frame) => frame,
+                    // No acknowledgement: the response itself already ended.
+                    Err(_) => return None,
+                },
+            };
+            match frame {
                 Frame::Skip => continue,
-                Frame::Event { out, terminal, .. } => {
-                    return Some((Ok(out), (!terminal).then_some(turn)));
+                Frame::Event {
+                    out,
+                    terminal,
+                    terminal_id,
+                    ack,
+                    ..
+                } => {
+                    let more = if let Some((interrupted, _)) = &turn.drain {
+                        // After the terminal event only acknowledgements reach the client.
+                        let Some(ack) = ack else { continue };
+                        ack != *interrupted
+                    } else {
+                        !terminal || turn.settle(terminal_id.as_deref())
+                    };
+                    let next = if more { State::Reading(turn) } else { State::Done };
+                    return Some((Ok(out), next));
                 }
-                Frame::Failed { error, read, .. } => {
+                Frame::Failed { error, read, event, .. } => {
+                    // `event` comes only with an upstream failure event, never with a
+                    // read failure (`read`), whose reader already dropped the socket. After
+                    // the terminal event (`drain`) the client has its one terminal event, so
+                    // the failure only ends the socket.
+                    if let Some(event) = event.filter(|_| turn.drain.is_none()) {
+                        turn.invalidate_after_event(&error);
+                        return Some((Ok(event), State::Failing(error)));
+                    }
                     if !read {
                         turn.invalidate(&error, true);
                     }
-                    return Some((Err(error), None));
+                    // The response already ended; the session reports the loss.
+                    if turn.drain.is_some() {
+                        return None;
+                    }
+                    return Some((Err(error), State::Done));
                 }
             }
         }
@@ -1073,12 +1355,20 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 held.push(Err(error));
                 return Ok(futures_util::stream::iter(held).boxed());
             }
-            Frame::Failed { error, overload, .. } => {
+            Frame::Failed {
+                error, overload, event, ..
+            } => {
                 if overload && !timed_out {
                     // Fail over before anything was shown; the downstream session survives.
                     turn.invalidate(&error, false);
                     let body = String::from_utf8_lossy(&error.body).into_owned();
                     return Err(response::bootstrap_overload(&body));
+                }
+                if let Some(event) = event {
+                    turn.invalidate_after_event(&error);
+                    held.push(Ok(event));
+                    held.push(Err(error));
+                    return Ok(futures_util::stream::iter(held).boxed());
                 }
                 turn.invalidate(&error, true);
                 held.push(Err(error));
@@ -1089,6 +1379,8 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 raw_len,
                 bufferable,
                 terminal,
+                terminal_id,
+                ..
             } => {
                 let size = raw_len + out.len();
                 if window_open && bufferable && !terminal && bytes + size <= response::BOOTSTRAP_MAX_BYTES {
@@ -1098,6 +1390,11 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 }
                 held.push(Ok(out));
                 if terminal {
+                    if turn.settle(terminal_id.as_deref()) {
+                        // An interrupt acknowledgement still follows the terminal event.
+                        turn.bootstrapping = false;
+                        return Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed());
+                    }
                     return Ok(futures_util::stream::iter(held).boxed());
                 }
                 break;
@@ -1171,7 +1468,7 @@ impl CodexExecutor {
             let mut res = builder
                 .send()
                 .await
-                .map_err(|_| transport("codex websockets executor: dial failed"))?;
+                .map_err(|e| transport("codex websockets executor: dial failed").with_diagnostic(ws_cause::dial(&e)))?;
             let status = res.status().as_u16();
             let handshake = res.headers().clone();
             if status != 101 {
@@ -1208,7 +1505,10 @@ impl CodexExecutor {
         };
         let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt)
             .await
-            .unwrap_or_else(|_| Err(transport("codex websockets executor: handshake timed out")));
+            .unwrap_or_else(|_| {
+                Err(transport("codex websockets executor: handshake timed out")
+                    .with_diagnostic(ws_cause::handshake_timeout(HANDSHAKE_TIMEOUT)))
+            });
         // A refused upgrade was recorded as an HTTP attempt; anything else is a dial error.
         if let (Err(error), Some(wire)) = (&dialed, wire)
             && !rejected
@@ -1258,6 +1558,7 @@ impl CodexExecutor {
                 (input, initial)
             });
         let guard = session.turn.clone().lock_owned().await;
+        let model_kept = model_kept(&req.original_body, &body);
         let frame = request_frame(body);
         let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
@@ -1283,7 +1584,8 @@ impl CodexExecutor {
             wire.ws_handshake(101, handshake);
         }
         let started = Instant::now();
-        let mut rx = conn.activate();
+        let preserves = steering.is_none() && request::codex_client(&req);
+        let mut rx = conn.activate(preserves);
         let mut restore = conn.restores(optimized, conflict);
         if let Err(error) = conn.send(frame.clone()).await {
             wire.ws_exec_error("send", &error);
@@ -1309,7 +1611,7 @@ impl CodexExecutor {
                 }
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
-            rx = fresh.activate();
+            rx = fresh.activate(preserves);
             restore = fresh.restores(optimized, conflict);
             wire.ws_request(&target.url, &headers, frame.as_bytes());
             if let Some(handshake) = &fresh_handshake {
@@ -1337,6 +1639,7 @@ impl CodexExecutor {
             items: OutputItems::default(),
             saw_delta: false,
             native,
+            codex_client: request::codex_client(&req),
             cooling: settings.model_level_cooling,
             quota: self.quota_handle(),
             credential: view.credential.id.clone(),
@@ -1347,13 +1650,15 @@ impl CodexExecutor {
             replay,
             wire,
             bootstrapping: false,
+            ack_wait: self.ws.ack_wait,
+            drain: None,
         };
         if let Some((input, initial)) = steering {
             // The socket now belongs to this connection; bootstrap buffering does not apply.
             let stream = duplex::Duplex::start(turn, input, initial, req, view, settings, &exec_session.id).await;
             return Ok(ExecResponse {
                 status: 200,
-                headers: handshake.unwrap_or_default(),
+                headers: returned_handshake(handshake, model_kept),
                 body: ResponseBody::Stream(stream),
             });
         }
@@ -1372,10 +1677,61 @@ impl CodexExecutor {
         };
         Ok(ExecResponse {
             status: 200,
-            headers: handshake.unwrap_or_default(),
+            headers: returned_handshake(handshake, model_kept),
             body: ResponseBody::Stream(writes.gate(stream)),
         })
     }
+}
+
+/// Codex's handshake header naming the model that served the request.
+const OPENAI_MODEL: &str = "openai-model";
+/// Codex's sticky-routing token for the turn.
+const TURN_STATE: &str = "x-codex-turn-state";
+
+/// Whether the frame sent upstream names the model the client asked for. Codex compares
+/// `openai-model` with the model it sent, ignoring ASCII case.
+fn model_kept(original: &[u8], upstream: &str) -> bool {
+    use cpa_common::json::{Kind, get};
+    let (original, upstream) = (get(original, "model"), get(upstream.as_bytes(), "model"));
+    original.kind == Kind::String && upstream.kind == Kind::String && original.s.eq_ignore_ascii_case(&upstream.s)
+}
+
+/// The handshake of a turn that opened its socket, as the server sees it. Codex treats
+/// an `openai-model` that differs from the model it sent as a reroute and warns the user
+/// that the account was flagged. When this proxy changed the model (alias, payload rule,
+/// thinking suffix), upstream's answer describes that change, so it is dropped. A reused
+/// socket has no handshake.
+fn returned_handshake(handshake: Option<HeaderMap>, model_kept: bool) -> HeaderMap {
+    let mut handshake = handshake.unwrap_or_default();
+    if !model_kept {
+        handshake.remove(OPENAI_MODEL);
+    }
+    handshake
+}
+
+/// Handshake metadata from a newly opened upstream socket, as a `response.metadata` event
+/// that a Codex client reads: `x-codex-turn-state` and `openai-model` from its `headers`.
+/// The downstream socket was upgraded before the first request chose a credential and a
+/// model, so these headers cannot go into its handshake. Codex reads
+/// `x-reasoning-included` only from a handshake, so it is not carried. Only the
+/// headers named here are carried; `None` when the handshake has none of them.
+pub fn handshake_metadata_event(handshake: &HeaderMap) -> Option<String> {
+    let mut headers = serde_json::Map::new();
+    for name in [TURN_STATE, OPENAI_MODEL] {
+        let value = handshake
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if let Some(value) = value {
+            headers.insert(name.to_owned(), value.into());
+        }
+    }
+    if headers.is_empty() {
+        return None;
+    }
+    let event = serde_json::json!({"type": "response.metadata", "headers": headers});
+    Some(event.to_string())
 }
 
 /// tungstenite's reports of a peer that went away without a close frame, which
@@ -1400,32 +1756,47 @@ pub(crate) async fn read_loop(
     conn: Arc<Upstream>,
     idle: Duration,
 ) {
+    // The last text delivered is a context-window failure for a turn that preserves it.
+    let mut held = false;
     let error = 'read: loop {
         let deadline = tokio::time::Instant::now() + idle;
         let text = loop {
             let message = match tokio::time::timeout_at(deadline, stream.next()).await {
-                Err(_) => break 'read transport("codex websockets executor: read idle timeout"),
+                Err(_) => {
+                    break 'read transport("codex websockets executor: read idle timeout")
+                        .with_diagnostic(ws_cause::idle_timeout(idle));
+                }
                 // gorilla/websocket reports a connection that ends without a close frame
                 // as close 1006; Go surfaces its text, which marks a lifecycle failure.
-                Ok(None) => break 'read transport(&close_error_text(1006, "unexpected EOF")),
-                Ok(Some(Err(error))) if ends_without_close(&error) => {
-                    break 'read transport(&close_error_text(1006, "unexpected EOF"));
+                // The diagnostic keeps what actually happened.
+                Ok(None) => {
+                    break 'read transport(&close_error_text(1006, "unexpected EOF"))
+                        .with_diagnostic(ws_cause::stream_ended());
                 }
-                Ok(Some(Err(_))) => break 'read transport("codex websockets executor: read failed"),
+                Ok(Some(Err(error))) if ends_without_close(&error) => {
+                    break 'read transport(&close_error_text(1006, "unexpected EOF"))
+                        .with_diagnostic(ws_cause::socket(&error));
+                }
+                Ok(Some(Err(error))) => {
+                    break 'read transport("codex websockets executor: read failed")
+                        .with_diagnostic(ws_cause::socket(&error));
+                }
                 Ok(Some(Ok(message))) => message,
             };
             match message {
                 Message::Text(text) => break text.as_str().to_owned(),
                 Message::Binary(_) => break 'read transport(UNEXPECTED_BINARY),
                 Message::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    let diagnostic = ws_cause::remote_close(code);
                     if let Some(frame) = frame.as_ref().filter(|f| u16::from(f.code) == 1009) {
-                        break 'read closed_too_big(frame.reason.as_str());
+                        break 'read closed_too_big(frame.reason.as_str()).with_diagnostic(diagnostic);
                     }
                     let text = match frame {
                         Some(frame) => close_error_text(u16::from(frame.code), frame.reason.as_str()),
                         None => close_error_text(1005, ""),
                     };
-                    break 'read transport(&text);
+                    break 'read transport(&text).with_diagnostic(diagnostic);
                 }
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }
@@ -1433,27 +1804,54 @@ pub(crate) async fn read_loop(
         // Terminal IDs are recorded before delivery: the handler may still be forwarding
         // the turn after its read channel was released.
         let terminal = terminal_response_id(text.trim());
-        let active = {
+        let acknowledged = acknowledged_id(text.trim());
+        let (active, preserves) = {
             let mut link = conn.link.lock().expect("link");
             if let Some(id) = terminal {
-                link.terminal.insert(id);
+                let turn = link.turns;
+                link.terminal.insert(id, turn);
             }
-            link.active.clone()
+            match acknowledged {
+                // A late interrupt's caller waits for this one.
+                Some(id) if link.late.as_ref().is_some_and(|(late, _)| *late == id) => {
+                    if let Some((_, tx)) = link.late.take() {
+                        let _ = tx.send(text);
+                    }
+                    continue 'read;
+                }
+                // Only the reading turn's own interrupts are acknowledged to it: Codex
+                // fails a response on an acknowledgement for another one, and one that
+                // outlived its wait must not reach the next turn.
+                Some(id) if !link.awaited.contains(&id) => continue 'read,
+                _ => (link.active.clone(), link.preserves),
+            }
         };
+        held = false;
         if let Some(tx) = active {
+            let failure = preserves && cpa_common::codex_client::is_context_window_rejection(text.trim().as_bytes());
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
-            let _ = tx.send(Read::Text(text)).await;
+            held = tx.send(Read::Text(text)).await.is_ok() && failure;
         }
     };
-    let active = {
+    let (active, defer) = {
         let mut link = conn.link.lock().expect("link");
         link.lost = Some(error.clone());
-        link.active.clone()
+        // A late interrupt's caller stops waiting and finds the loss.
+        link.late = None;
+        // The turn has yet to give its client the context-window failure it was handed:
+        // reporting the loss now would close the client before the event or replace its
+        // classified error (Go v8.0.35 replaces the event anyway). The turn decides.
+        let defer = held && link.preserves && link.active.is_some();
+        if defer {
+            link.deferred = Some(error.clone());
+        }
+        (link.active.clone(), defer)
     };
-    // The session records the loss before the turn reads its error, so a handler that
-    // sees the turn fail also finds the loss (Go's notifier closes the client first).
+    // Otherwise the session records the loss before the turn reads its error, so a
+    // handler that sees the turn fail also finds the loss (Go's notifier closes the
+    // client first).
     match session.upgrade() {
-        Some(session) => session.invalidate(&conn, &error, true),
+        Some(session) => session.invalidate(&conn, &error, !defer),
         None => conn.deactivate(),
     }
     if let Some(tx) = active {

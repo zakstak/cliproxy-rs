@@ -90,6 +90,92 @@ pub fn is_codex_client_user_agent(user_agent: &str) -> bool {
         || ua.starts_with("codex_exec/")
 }
 
+/// Go `isCodexResponsesClientRequest`: an official Codex client by `User-Agent` or
+/// `originator`.
+pub fn is_codex_responses_client(headers: &HeaderMap) -> bool {
+    let get = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if is_codex_client_user_agent(&get("user-agent")) {
+        return true;
+    }
+    let originator = get("originator").go_lower();
+    matches!(originator.as_str(), "codex desktop" | "codex-tui" | "codex_cli_rs")
+        || ["codex desktop/", "codex-tui/", "codex_cli_rs/"]
+            .iter()
+            .any(|p| originator.starts_with(p))
+}
+
+/// An upstream `response.failed` for a context-window overflow, exactly as Codex
+/// recognises it (codex-api `parse_failed_response`: `response.error.code` equal to
+/// `context_length_exceeded`). Codex compacts and retries only on this event, so a Codex
+/// client receives it unchanged; Go v8.0.35 replaces it with a classified error
+/// (docs/DIFFERENCES-FROM-GO.md).
+pub fn is_context_window_failure(payload: &[u8]) -> bool {
+    gj::get(payload, "type").str() == "response.failed"
+        && gj::get(payload, "response.error.code").str() == "context_length_exceeded"
+}
+
+/// An upstream context-window rejection: a [`is_context_window_failure`] event, or an
+/// `error` event without an HTTP status whose `error.code` is `context_length_exceeded`.
+/// The ChatGPT Codex backend sends the latter, before `response.created`, when the input
+/// alone exceeds the window.
+pub fn is_context_window_rejection(payload: &[u8]) -> bool {
+    is_context_window_failure(payload) || is_context_window_error(payload)
+}
+
+/// An `error` event with a positive `status` or `status_code` is Go's status frame
+/// (`parseCodexWebsocketErrorWithCooling`), which Codex reads as an HTTP error; it is
+/// not one of these.
+fn is_context_window_error(payload: &[u8]) -> bool {
+    gj::get(payload, "type").str() == "error"
+        && gj::get(payload, "error.code").str() == "context_length_exceeded"
+        && gj::get(payload, "status").int() <= 0
+        && gj::get(payload, "status_code").int() <= 0
+}
+
+/// The event a Codex client receives for an upstream context-window rejection
+/// ([`is_context_window_rejection`]), or `None` for any other event.
+///
+/// A `response.failed` is returned unchanged. Codex ignores an `error` event without a
+/// status (codex-api `process_responses_event`), so it would not compact the conversation;
+/// such an event therefore becomes the `response.failed` that codex-api
+/// `parse_failed_response` maps to `ContextWindowExceeded`:
+/// `{"type":"response.failed","sequence_number":…,"response":{"id":…,"object":"response","status":"failed","error":…}}`.
+/// `response.error` is the upstream `error` object byte for byte (code, message, type and
+/// param); `response.id` comes from `response_id`, and `sequence_number` is kept. Both
+/// are left out when the upstream event has none.
+pub fn context_window_failure_event(payload: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let bytes = payload.as_bytes();
+    if is_context_window_failure(bytes) {
+        return Some(std::borrow::Cow::Borrowed(payload));
+    }
+    if !is_context_window_error(bytes) {
+        return None;
+    }
+    let mut out = br#"{"type":"response.failed"}"#.to_vec();
+    let sequence = gj::get(bytes, "sequence_number");
+    if sequence.exists() && sequence.kind == Kind::Number {
+        gj::set_raw(&mut out, "sequence_number", sequence.raw());
+    }
+    let mut response = br#"{}"#.to_vec();
+    let id = gj::get(bytes, "response_id");
+    if id.kind == Kind::String && !id.str().is_empty() {
+        gj::set_raw(&mut response, "id", id.raw());
+    }
+    gj::set_str(&mut response, "object", "response");
+    gj::set_str(&mut response, "status", "failed");
+    gj::set_raw(&mut response, "error", gj::get(bytes, "error").raw());
+    gj::set_raw(&mut out, "response", &response);
+    // Built from valid JSON pieces only.
+    Some(std::borrow::Cow::Owned(String::from_utf8(out).ok()?))
+}
+
 /// Go `strings.EqualFold(value, ascii)` for an ASCII `ascii`: besides ASCII case, only
 /// U+017F (long s) and U+212A (Kelvin sign) fold onto ASCII letters.
 fn folds_to_ascii(value: &str, ascii: &str) -> bool {

@@ -722,6 +722,13 @@ impl Duplex {
         if self.first_response
             && let Some(error) = terminal
         {
+            // Later failures already reach the client as events (below); an initial
+            // context-window failure does too, so Codex can compact and retry.
+            if self.turn.codex_client
+                && let Some(event) = cpa_common::codex_client::context_window_failure_event(&payload)
+            {
+                self.outbox.push_back(Ok(Bytes::from(event.into_owned())));
+            }
             self.outbox.push_back(Err(error));
             self.done = true;
             return;

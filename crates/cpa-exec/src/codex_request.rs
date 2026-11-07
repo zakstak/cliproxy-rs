@@ -364,12 +364,38 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
     v.kind() == Kind::True || (v.kind() == Kind::String && v.str().trim().eq_ignore_ascii_case("true"))
 }
 
+/// Codex/Responses formats on both sides.
+fn responses_formats(req: &ExecRequest) -> bool {
+    let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
+    codexish(req.source_format) && codexish(req.response_format)
+}
+
 /// `helps.IsNativeCodexRequest`: Codex/Responses formats on both sides plus the lite marker.
 pub(crate) fn is_native(req: &ExecRequest) -> bool {
-    let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
-    codexish(req.source_format)
-        && codexish(req.response_format)
-        && is_lite(&String::from_utf8_lossy(&req.body), &req.headers)
+    responses_formats(req) && is_lite(&String::from_utf8_lossy(&req.body), &req.headers)
+}
+
+/// An official Codex client (Go `isCodexResponsesClientRequest`) reading Responses events
+/// itself: it gets an upstream context-window rejection as the `response.failed` Codex
+/// compacts on (`cpa_common::codex_client::context_window_failure_event`).
+pub(crate) fn codex_client(req: &ExecRequest) -> bool {
+    responses_formats(req) && cpa_common::codex_client::is_codex_responses_client(&req.headers)
+}
+
+/// Which client built a Responses request bound for Codex. An official Codex client
+/// (Go `isCodexResponsesClientRequest`) on both sides of a Codex or Responses exchange
+/// keeps its `parallel_tool_calls` and `include` (issue #2). Output replay
+/// (`output.encrypted_content`) is kept only on the ChatGPT Codex and OpenAI API-key
+/// routes, the upstreams Codex itself sends it to. SIWC and is-compat upstreams drop it,
+/// as Go does.
+fn responses_client(req: &ExecRequest, view: &View<'_>, is_compat: bool) -> cpa_translate::CodexResponsesClient {
+    if codex_client(req) {
+        cpa_translate::CodexResponsesClient::NativeCodex {
+            output_replay: !view.siwc && !is_compat,
+        }
+    } else {
+        cpa_translate::CodexResponsesClient::Translated
+    }
 }
 
 /// `translateCodexRequestPairWithUpdateIntent` + `helps.ApplyRequestThinking`: the
@@ -377,7 +403,12 @@ pub(crate) fn is_native(req: &ExecRequest) -> bool {
 /// thinking pipeline for `codex` (`openai-response` for compact). Also returns the
 /// translated original request, which payload default rules consult. Thinking reads the
 /// working translation's configuration-update intent (a plugin normalizer's edit).
-fn translate_request(req: &ExecRequest, call: Call, is_compat: bool) -> Result<(String, Vec<u8>), ExecError> {
+fn translate_request(
+    req: &ExecRequest,
+    call: Call,
+    is_compat: bool,
+    client: cpa_translate::CodexResponsesClient,
+) -> Result<(String, Vec<u8>), ExecError> {
     let target = call.target();
     let registered = cpa_translate::pair(req.source_format, target).is_some();
     if !registered && !matches!(req.source_format, Format::Codex | Format::OpenAIResponse) {
@@ -410,6 +441,8 @@ fn translate_request(req: &ExecRequest, call: Call, is_compat: bool) -> Result<(
     let translate = |raw: &[u8]| {
         if is_compat && req.source_format == Format::Claude && target == Format::Codex {
             crate::codex_client::translate_request(req.source_format, target, &ctx, raw, &compat)
+        } else if req.source_format == Format::OpenAIResponse && target == Format::Codex {
+            cpa_translate::translate_responses_to_codex_tracked(&ctx, raw, client)
         } else {
             cpa_translate::translate_request_tracked(req.source_format, target, &ctx, raw)
         }
@@ -535,7 +568,8 @@ pub(crate) fn shape(req: &ExecRequest, view: &View<'_>, settings: &Settings, cal
     let model = base_model(&req.model);
     let model = model.as_str();
     let is_compat = settings.is_compat(req);
-    let (mut body, original) = translate_request(req, call, is_compat)?;
+    let client = responses_client(req, view, is_compat);
+    let (mut body, original) = translate_request(req, call, is_compat, client)?;
     match call {
         Call::NonStream => {
             body = set_str_if_different(body, "model", model);
