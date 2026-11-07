@@ -2007,3 +2007,54 @@ fn count_tokens_sees_the_payload_rules() {
     assert!(plain > 0);
     assert!(configured > plain + 5, "{plain} -> {configured}");
 }
+
+/// Issue #2: a WebSocket turn from an official Codex client keeps `parallel_tool_calls`
+/// (false, true or omitted) and its output-replay `include`. Responses Lite still forces
+/// `false`, and SIWC and other Responses clients keep Go's values.
+#[test]
+fn native_codex_websocket_turns_keep_tool_parallelism_and_output_replay() {
+    let replay = r#"["reasoning.encrypted_content","output.encrypted_content"]"#;
+    let reasoning = r#"["reasoning.encrypted_content"]"#;
+    let shaped = |ua: &str, lite: bool, siwc: bool, parallel: &str| {
+        let mut credential = oauth_credential("http://127.0.0.1:1");
+        if siwc {
+            credential.metadata.insert("use_siwc".into(), true.into());
+            credential
+                .metadata
+                .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at-FAKE"}));
+        }
+        let mut req = plain_request(true, None);
+        (req.source_format, req.response_format) = (Format::OpenAIResponse, Format::OpenAIResponse);
+        req.headers.insert("user-agent", ua.parse().unwrap());
+        if lite {
+            req.headers
+                .insert("x-openai-internal-codex-responses-lite", "true".parse().unwrap());
+        }
+        req.body = Bytes::from(format!(
+            r#"{{"model":"gpt-5.4","input":[],"tools":[{{"type":"function","name":"f","parameters":{{"type":"object"}}}}],"tool_choice":"auto"{parallel},"store":false,"stream":true,"include":{replay}}}"#
+        ));
+        req.original_body = req.body.clone();
+        let view = View::new(&credential);
+        let settings = Settings::scoped(&Config::default(), &view);
+        request::shape(&req, &view, &settings, Call::Websocket).unwrap().body
+    };
+    let field = |body: &str, path: &str| gjson::get(body, path).json().to_owned();
+    let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
+    for (parallel, want) in [
+        (r#","parallel_tool_calls":false"#, "false"),
+        (r#","parallel_tool_calls":true"#, "true"),
+        ("", ""),
+    ] {
+        let body = shaped(codex, false, false, parallel);
+        assert_eq!(field(&body, "parallel_tool_calls"), want, "{body}");
+        assert_eq!(field(&body, "include"), replay, "{body}");
+    }
+    let lite = shaped(codex, true, false, r#","parallel_tool_calls":true"#);
+    assert_eq!(field(&lite, "parallel_tool_calls"), "false", "{lite}");
+    let siwc = shaped(codex, false, true, r#","parallel_tool_calls":false"#);
+    assert_eq!(field(&siwc, "parallel_tool_calls"), "false", "{siwc}");
+    assert_eq!(field(&siwc, "include"), reasoning, "{siwc}");
+    let other = shaped("OpenAI/Python 2.1.0", false, false, r#","parallel_tool_calls":false"#);
+    assert_eq!(field(&other, "parallel_tool_calls"), "true", "{other}");
+    assert_eq!(field(&other, "include"), reasoning, "{other}");
+}

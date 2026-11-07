@@ -293,6 +293,17 @@ fn config(scenario: &Value, upstream: &str) -> Config {
     Config::parse(&yaml).unwrap()
 }
 
+/// Go's upstream body for `name`, with cliproxy-rs's deliberate differences applied. The
+/// multi-agent v2 scenarios come from an official Codex client that omits
+/// `parallel_tool_calls`. Go adds `true`, and cliproxy-rs leaves the field absent
+/// (docs/DIFFERENCES-FROM-GO.md, "Codex native Responses fields").
+fn go_upstream_body(name: &str, body: &str) -> String {
+    if matches!(name, "ws_multi_agent_v2" | "http_multi_agent_v2") {
+        return body.replacen(r#""parallel_tool_calls":true,"#, "", 1);
+    }
+    body.to_owned()
+}
+
 /// Random values Go and Rust both generate: UUIDs and the prewarm timestamp.
 fn mask(s: &str) -> String {
     static UUID: LazyLock<regex::Regex> =
@@ -505,7 +516,7 @@ async fn run(name: &str) {
     for (i, (rust, go)) in captured.iter().zip(&go).enumerate() {
         assert_eq!(
             mask(&rust.body),
-            mask(go["body"].as_str().unwrap_or_default()),
+            mask(&go_upstream_body(name, go["body"].as_str().unwrap_or_default())),
             "{name}: upstream body #{i}"
         );
         if let Some(hex) = go["body_hex"].as_str() {

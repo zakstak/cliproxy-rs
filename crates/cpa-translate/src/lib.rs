@@ -128,7 +128,7 @@ mod thinking;
 #[doc(hidden)]
 pub use codex_responses::go_stream_with_bridge as codex_responses_go_stream_with_bridge;
 pub use codex_responses::{
-    non_stream_with_bridge as codex_responses_non_stream_with_bridge,
+    ResponsesClient as CodexResponsesClient, non_stream_with_bridge as codex_responses_non_stream_with_bridge,
     stream_with_bridge as codex_responses_stream_with_bridge,
 };
 /// translatorcommon.UserRun, for executors that refuse an emptied user turn (Devin).
@@ -407,6 +407,18 @@ pub fn translate_request_tracked(
         Some(pair) => translate_registered(client, upstream, ctx, body, |body| (pair.request)(ctx, body)),
         None => Ok(translate_fallback(client.as_str(), upstream.as_str(), ctx, body)),
     }
+}
+
+/// [`translate_request_tracked`] for OpenAI Responses -> Codex, where the client's
+/// identity decides which fields the conversion forces ([`CodexResponsesClient`]).
+pub fn translate_responses_to_codex_tracked(
+    ctx: &RequestCtx<'_>,
+    body: &[u8],
+    client: CodexResponsesClient,
+) -> Result<Translated, Error> {
+    translate_registered(Format::OpenAIResponse, Format::Codex, ctx, body, |body| {
+        Ok(codex_responses::convert(body, client))
+    })
 }
 
 /// [`translate_request`] between format names, which may name a format only a plugin
