@@ -216,59 +216,209 @@ pub(crate) fn clean_parameters(parameters: &Res<'_>) -> Vec<u8> {
     cleaned
 }
 
-/// `name` as one gjson path component: its path syntax characters escaped.
-fn escape_path(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if matches!(
-            c,
-            '.' | '*' | '?' | '|' | '#' | '@' | '\\' | '!' | '=' | '<' | '>' | '%' | ':'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// A Gemini `Schema` (OpenAPI subset) with JSON Schema's lower-case type names: `type`
 /// is converted only where the Gemini schema defines a schema (the object itself,
-/// `properties` values, `items` and `anyOf` entries). Literal data (`enum`, `default`,
-/// `example`), unknown members and their values stay as sent.
+/// `properties` values, `items` and `anyOf` entries). Every other byte, literal data
+/// (`enum`, `default`, `example`), unknown members, property names and their escapes
+/// included, is copied as sent. One pass over the input: each byte is read once and
+/// written once, so wide coding-agent schemas cost time linear in their size. Input that
+/// is not well-formed JSON is returned unchanged.
 fn gemini_schema_types(schema: &Res<'_>) -> Vec<u8> {
-    fn walk(schema: &Res<'_>, path: &str, edits: &mut Vec<(String, Vec<u8>)>) {
-        if !schema.is_object() {
-            return;
+    let raw = schema.raw.as_ref();
+    let mut renderer = SchemaTypes {
+        input: raw,
+        at: 0,
+        out: Vec::with_capacity(raw.len()),
+    };
+    match renderer.value(Position::Schema) {
+        Some(()) if renderer.rest_is_space() => renderer.out,
+        _ => raw.to_vec(),
+    }
+}
+
+/// The decoded bytes of a JSON string literal (quotes included in `literal`).
+fn unquote(literal: &[u8]) -> Option<Vec<u8>> {
+    serde_json::from_slice::<String>(literal).ok().map(String::into_bytes)
+}
+
+/// Where a JSON value sits in a Gemini schema.
+#[derive(Clone, Copy, PartialEq)]
+enum Position {
+    /// A schema object: its `type` is converted.
+    Schema,
+    /// The `properties` map: each member value is a schema.
+    Properties,
+    /// The `anyOf` array: each element is a schema.
+    Schemas,
+    /// Anything else: copied as is.
+    Literal,
+}
+
+struct SchemaTypes<'a> {
+    input: &'a [u8],
+    at: usize,
+    out: Vec<u8>,
+}
+
+impl SchemaTypes<'_> {
+    fn space(&mut self) {
+        while let Some(&b) = self.input.get(self.at) {
+            if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                break;
+            }
+            self.out.push(b);
+            self.at += 1;
         }
-        let kind = schema.get("type");
-        if kind.kind == Kind::String {
-            let lower = go_lower(&kind.s);
-            if lower != kind.s.as_ref() {
-                edits.push((format!("{path}type"), lower));
+    }
+
+    fn rest_is_space(&self) -> bool {
+        self.input[self.at..]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    }
+
+    /// The span of the string starting at `at`, quotes included, without copying it.
+    fn string_span(&mut self) -> Option<(usize, usize)> {
+        let start = self.at;
+        if self.input.get(start) != Some(&b'"') {
+            return None;
+        }
+        let mut i = start + 1;
+        while let Some(&b) = self.input.get(i) {
+            match b {
+                b'\\' => i += 2,
+                b'"' => {
+                    self.at = i + 1;
+                    return Some((start, i + 1));
+                }
+                _ => i += 1,
             }
         }
-        let properties = schema.get("properties");
-        if properties.is_object() {
-            for (name, child) in properties.map() {
-                let name = escape_path(&String::from_utf8_lossy(&name));
-                walk(&child, &format!("{path}properties.{name}."), edits);
+        None
+    }
+
+    fn value(&mut self, position: Position) -> Option<()> {
+        self.space();
+        match *self.input.get(self.at)? {
+            b'{' => self.object(position),
+            b'[' => self.array(position),
+            b'"' => {
+                let (start, end) = self.string_span()?;
+                self.out.extend_from_slice(&self.input[start..end]);
+                Some(())
             }
-        }
-        walk(&schema.get("items"), &format!("{path}items."), edits);
-        let any = schema.get("anyOf");
-        if any.is_array() {
-            for (i, child) in any.array().iter().enumerate() {
-                walk(child, &format!("{path}anyOf.{i}."), edits);
+            _ => {
+                let start = self.at;
+                while let Some(&b) = self.input.get(self.at) {
+                    if matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                        break;
+                    }
+                    self.at += 1;
+                }
+                (self.at > start).then(|| self.out.extend_from_slice(&self.input[start..self.at]))
             }
         }
     }
-    let mut edits = Vec::new();
-    walk(schema, "", &mut edits);
-    let mut out = schema.raw.to_vec();
-    for (path, value) in edits {
-        gj::set_str(&mut out, &path, value);
+
+    fn object(&mut self, position: Position) -> Option<()> {
+        self.out.push(b'{');
+        self.at += 1;
+        self.space();
+        if self.input.get(self.at) == Some(&b'}') {
+            self.out.push(b'}');
+            self.at += 1;
+            return Some(());
+        }
+        loop {
+            self.space();
+            let (start, end) = self.string_span()?;
+            let key = &self.input[start..end];
+            self.out.extend_from_slice(key);
+            self.space();
+            if self.input.get(self.at) != Some(&b':') {
+                return None;
+            }
+            self.out.push(b':');
+            self.at += 1;
+            // Keys compare by meaning: an escaped key is decoded first (only those pay).
+            let decoded = if key.contains(&b'\\') {
+                unquote(key)?
+            } else {
+                key[1..key.len() - 1].to_vec()
+            };
+            let child = match (position, decoded.as_slice()) {
+                (Position::Schema, b"type") => {
+                    self.space();
+                    if self.input.get(self.at) == Some(&b'"') {
+                        let (start, end) = self.string_span()?;
+                        let literal = &self.input[start..end];
+                        if literal.contains(&b'\\') {
+                            let lower = go_lower(&unquote(literal)?);
+                            self.out.extend_from_slice(&gj::quote(&lower));
+                        } else {
+                            self.out.extend_from_slice(&go_lower(literal));
+                        }
+                        None
+                    } else {
+                        Some(Position::Literal)
+                    }
+                }
+                (Position::Schema, b"properties") => Some(Position::Properties),
+                (Position::Schema, b"items") => Some(Position::Schema),
+                (Position::Schema, b"anyOf") => Some(Position::Schemas),
+                (Position::Properties, _) => Some(Position::Schema),
+                _ => Some(Position::Literal),
+            };
+            if let Some(child) = child {
+                self.value(child)?;
+            }
+            self.space();
+            match self.input.get(self.at)? {
+                b',' => {
+                    self.out.push(b',');
+                    self.at += 1;
+                }
+                b'}' => {
+                    self.out.push(b'}');
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
     }
-    out
+
+    fn array(&mut self, position: Position) -> Option<()> {
+        self.out.push(b'[');
+        self.at += 1;
+        self.space();
+        if self.input.get(self.at) == Some(&b']') {
+            self.out.push(b']');
+            self.at += 1;
+            return Some(());
+        }
+        let element = if position == Position::Schemas {
+            Position::Schema
+        } else {
+            Position::Literal
+        };
+        loop {
+            self.value(element)?;
+            self.space();
+            match self.input.get(self.at)? {
+                b',' => {
+                    self.out.push(b',');
+                    self.at += 1;
+                }
+                b']' => {
+                    self.out.push(b']');
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
 }
 
 /// The Codex translated route's tool choice from a Gemini `toolConfig` (either
@@ -954,4 +1104,64 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod schema_type_tests {
+    use super::gemini_schema_types;
+    use cpa_common::json as gj;
+
+    fn convert(schema: &str) -> String {
+        String::from_utf8(gemini_schema_types(&gj::parse(schema.as_bytes()))).unwrap()
+    }
+
+    /// Only `type` at schema positions changes; every other byte is the input's:
+    /// whitespace, number spellings, literal objects with a `type` key, extensions,
+    /// escaped property names (a dot, a quote, an escaped `type`) and an escaped keyword.
+    #[test]
+    fn only_schema_type_names_change() {
+        let input = concat!(
+            r#"{ "type" : "OBJECT", "x-ext": {"type": "OBJECT", "n": 1.50},"#,
+            r#" "properties": {"a.b": {"type": "STRING", "enum": [{"type": "VIP"}]},"#,
+            r#" "q\"uote": {"type": "INTEGER", "maximum": 1e3},"#,
+            r#" "\u0074ype": {"\u0074ype": "NUMBER", "default": {"type": "VIP"}},"#,
+            r#" "list": {"type": "ARRAY", "items": {"type": "BOOLEAN"}},"#,
+            r#" "either": {"anyOf": [{"type": "STRING"}, {"type": "NULL", "example": "STRING"}]}}}"#,
+        );
+        let want = concat!(
+            r#"{ "type" : "object", "x-ext": {"type": "OBJECT", "n": 1.50},"#,
+            r#" "properties": {"a.b": {"type": "string", "enum": [{"type": "VIP"}]},"#,
+            r#" "q\"uote": {"type": "integer", "maximum": 1e3},"#,
+            r#" "\u0074ype": {"\u0074ype": "number", "default": {"type": "VIP"}},"#,
+            r#" "list": {"type": "array", "items": {"type": "boolean"}},"#,
+            r#" "either": {"anyOf": [{"type": "string"}, {"type": "null", "example": "STRING"}]}}}"#,
+        );
+        assert_eq!(convert(input), want);
+    }
+
+    /// A wide coding-agent schema (20,000 properties, each with literal data that holds a
+    /// `type` key) converts in one pass, byte for byte.
+    #[test]
+    fn a_wide_schema_converts_byte_for_byte() {
+        let n = 20_000;
+        let property =
+            |i: usize, kind: &str| format!(r#""p{i}":{{"type":"{kind}","enum":["VIP"],"x-meta":{{"type":"OBJECT"}}}}"#);
+        let input: Vec<String> = (0..n).map(|i| property(i, "STRING")).collect();
+        let want: Vec<String> = (0..n).map(|i| property(i, "string")).collect();
+        let input = format!(r#"{{"type":"OBJECT","properties":{{{}}}}}"#, input.join(","));
+        let want = format!(r#"{{"type":"object","properties":{{{}}}}}"#, want.join(","));
+        assert_eq!(convert(&input), want);
+    }
+
+    /// Input that is not well-formed JSON comes back unchanged.
+    #[test]
+    fn malformed_input_is_unchanged() {
+        for input in [
+            r#"{"type":"OBJECT""#,
+            r#"{"type":"OBJECT"} trailing"#,
+            r#"{"type" "OBJECT"}"#,
+        ] {
+            assert_eq!(convert(input), input);
+        }
+    }
 }
