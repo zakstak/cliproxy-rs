@@ -77,6 +77,7 @@ impl CodexExecutor {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
@@ -141,10 +142,9 @@ impl CodexExecutor {
             })
             .map_err(plain_err)?;
         let body = Bytes::from(body);
-        // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
-        let mut client = req.headers.clone();
-        client.remove(http::header::USER_AGENT);
-        let mut headers = request::image_headers(view, settings, &client, model, cache.as_deref(), req.stream);
+        // `applyCodexDirectImageHeaders` drops the client's User-Agent; `image_headers`
+        // never forwards it (the proxy builds every Images request).
+        let mut headers = request::image_headers(view, settings, &req.headers, model, cache.as_deref(), req.stream);
         if !content_type.is_empty()
             && let Ok(value) = http::HeaderValue::from_str(&content_type)
         {

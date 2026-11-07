@@ -266,7 +266,9 @@ fn protocol_headers_keep_values_and_canonical_names() {
     );
     let direct = direct_headers(&client);
     assert!(direct.iter().all(|(n, _)| n != "Openai-Alpha"));
-    assert!(direct.contains(&("Originator".to_owned(), "Codex Desktop".to_owned())));
+    // Go defaults to `Codex Desktop`; the proxy names itself (#26).
+    assert!(direct.contains(&("Originator".to_owned(), "cliproxy-rs".to_owned())));
+    assert!(!direct.iter().any(|(_, v)| v.contains("Codex Desktop")));
     client.insert("originator", "Codex CLI".parse().unwrap());
     assert!(direct_headers(&client).contains(&("Originator".to_owned(), "Codex CLI".to_owned())));
 }
@@ -342,5 +344,58 @@ fn redact_sdp_recognises_an_escaped_equals_sign() {
     assert_eq!(
         &*redact_sdp(json),
         br#"{"sdp":"a\u003dice-pwd:[REDACTED]\r\na\u003Dice-ufrag:[REDACTED]\r\na\u003dmid:0","note":"a\u003dice"}"#
+    );
+}
+
+/// Live requests are formulated by the proxy: the proxy's `User-Agent` (Go sent
+/// net/http's `Go-http-client` default), the selected credential's bearer and account,
+/// and none of the operator headers the identity policy refuses (#26).
+#[test]
+fn live_requests_carry_the_proxy_identity_and_the_selected_credential() {
+    let mut credential = cpa_core::credential::Credential::from_file(
+        std::path::Path::new("/fake"),
+        std::path::Path::new("/fake/codex-live.json"),
+        serde_json::json!({"type": "codex", "access_token": "at-FAKE", "account_id": "acct-SELECTED"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    for (k, v) in [
+        ("header:User-Agent", "codex-tui/0.154.0 (Mac OS 26.5.2; arm64)"),
+        ("header:X-Copied", "$Authorization"),
+        ("header:X-Static", "kept"),
+    ] {
+        credential.attributes.insert(k.into(), v.into());
+    }
+    let view = crate::codex_request::View::new(&credential);
+    let mut client = HeaderMap::new();
+    client.insert("authorization", "Bearer client-key-FAKE".parse().unwrap());
+    let caller = vec![
+        ("Authorization".to_owned(), "Bearer client-key-FAKE".to_owned()),
+        ("Chatgpt-Account-Id".to_owned(), "acct-CALLER".to_owned()),
+    ];
+    let headers = CodexExecutor::live_credential_headers(&view, &client, caller);
+    let get = |name: &str| {
+        headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(get("User-Agent"), [crate::codex_identity::USER_AGENT]);
+    assert_eq!(get("Authorization"), ["Bearer at-FAKE"]);
+    assert_eq!(get("Chatgpt-Account-Id"), ["acct-SELECTED"]);
+    assert_eq!(get("X-Static"), ["kept"]);
+    assert!(get("X-Copied").is_empty());
+    assert!(
+        headers
+            .iter()
+            .all(|(_, v)| !v.contains("client-key-FAKE") && !v.contains("Mac OS")),
+        "{headers:?}"
+    );
+    assert!(
+        crate::codex_identity::check_credential(&credential).is_err(),
+        "live entry points refuse it"
     );
 }

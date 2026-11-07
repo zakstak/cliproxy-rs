@@ -3660,7 +3660,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
 async fn config_shared_upstream_round_trip() {
     let f = Fixture::from_yaml("upstream", |auth, hash| {
         format!(
-            "management: {{secret-key: '{hash}'}}\noauth: {{auth-dir: {}, providers: {{codex: {{stream-bootstrap-buffering: true, header-defaults: {{user-agent: oauth-agent}}}}}}}}\n",
+            "management: {{secret-key: '{hash}'}}\noauth: {{auth-dir: {}, providers: {{codex: {{stream-bootstrap-buffering: true, header-defaults: {{beta-features: oauth-beta}}}}}}}}\n",
             auth.display()
         )
     });
@@ -3714,11 +3714,11 @@ async fn config_shared_upstream_round_trip() {
         assert_eq!(d["oauth"]["auth-auto-refresh-workers"], 3);
     }
     assert_eq!(
-        loaded.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
-        "oauth-agent"
+        loaded.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"],
+        "oauth-beta"
     );
     assert_eq!(
-        api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
+        api.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"],
         ""
     );
     let before = f.file();
@@ -4663,12 +4663,12 @@ async fn config_v8_historical_field_paths() {
 /// DELETE removes all of them, leaving unrelated settings and OAuth scope alone.
 #[tokio::test]
 async fn config_v8_historical_provider_subtrees() {
-    let raw = "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}, xai: {inject-x-search: true}}\noauth: {providers: {codex: {header-defaults: {user-agent: oauth-agent}}}}\nclient: {codex: {optimize-multi-agent-v2: true, enable-apply-patch: true}}\n";
+    let raw = "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}, xai: {inject-x-search: true}}\noauth: {providers: {codex: {header-defaults: {beta-features: oauth-beta}}}}\nclient: {codex: {optimize-multi-agent-v2: true, enable-apply-patch: true}}\n";
     for (method, path, body, steering, buffering, optimize, agent) in [
         (
             wreq::Method::PATCH,
             "oauth/providers/codex",
-            r#"{"response-steering":false,"header-defaults":{"user-agent":"updated"}}"#,
+            r#"{"response-steering":false,"header-defaults":{"beta-features":"updated"}}"#,
             false,
             true,
             true,
@@ -4699,7 +4699,7 @@ async fn config_v8_historical_provider_subtrees() {
             false,
             false,
             true,
-            "oauth-agent",
+            "oauth-beta",
         ),
     ] {
         let f = Fixture::from_yaml("historical-subtrees", |auth, hash| {
@@ -4734,7 +4734,7 @@ async fn config_v8_historical_provider_subtrees() {
                 flag(&d["upstream"]["codex"]["response-steering"]),
                 flag(&d["upstream"]["codex"]["stream-bootstrap-buffering"]),
                 flag(&d["client"]["codex"]["optimize-multi-agent-v2"]),
-                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                     .as_str()
                     .unwrap_or(""),
             ),
@@ -4744,7 +4744,7 @@ async fn config_v8_historical_provider_subtrees() {
         assert!(flag(&d["upstream"]["xai"]["inject-x-search"]) && flag(&d["client"]["codex"]["enable-apply-patch"]));
         let api = cfg.for_api_key();
         assert!(
-            api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+            api.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                 .as_str()
                 .unwrap_or("")
                 .is_empty()
@@ -5148,8 +5148,8 @@ async fn v0_writes_keep_binary_values() {
 #[tokio::test]
 async fn v0_setters_save_v8_files_in_the_latest_layout() {
     for raw in [
-        "config-version: 8\n# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
-        "# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
+        "config-version: 8\n# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {beta-features: oauth-beta}}, xai: {inject-x-search: true}}}\n",
+        "# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {beta-features: oauth-beta}}, xai: {inject-x-search: true}}}\n",
         "config-version: 8\nupstream: {codex: {response-steering: true}, xai: {inject-x-search: true}}\nrouting: {retry: {request-retry: 3}}\n",
     ] {
         let f = Fixture::from_yaml("v0-existing-version", |auth, hash| {
@@ -5177,17 +5177,17 @@ async fn v0_setters_save_v8_files_in_the_latest_layout() {
             api.document["upstream"]["xai"]["inject-x-search"],
             serde_yaml_ng::Value::Bool(true)
         );
-        if raw.contains("oauth-agent") {
+        if raw.contains("oauth-beta") {
             // The Codex header defaults stay OAuth-only through the save.
             let ua = |d: &serde_yaml_ng::Value| {
-                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                     .as_str()
                     .unwrap_or("")
                     .to_owned()
             };
             assert_eq!(
                 (ua(&cfg.document), ua(&api.document)),
-                ("oauth-agent".to_owned(), String::new()),
+                ("oauth-beta".to_owned(), String::new()),
                 "{file}"
             );
         }
@@ -5281,7 +5281,7 @@ async fn config_v8_field_updates_keep_comments() {
 async fn v0_setters_keep_a_legacy_layout() {
     for raw in [
         "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\nrouting: {strategy: fill-first}\n",
-        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\ncodex-header-defaults: {user-agent: legacy-agent}\n",
+        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\ncodex-header-defaults: {beta-features: legacy-beta}\n",
     ] {
         let f = Fixture::from_yaml("v0-legacy-version", |auth, hash| private_config(raw, auth, hash, true));
         let (base, server) = f.server().await;
@@ -5312,11 +5312,11 @@ async fn v0_setters_keep_a_legacy_layout() {
             serde_yaml_ng::Value::Bool(true),
             "{file}"
         );
-        if raw.contains("legacy-agent") {
-            let ua = &d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"];
+        if raw.contains("legacy-beta") {
+            let ua = &d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"];
             assert_eq!(
                 ua.as_str(),
-                Some("legacy-agent"),
+                Some("legacy-beta"),
                 "API keys lost the legacy header default: {file}"
             );
         }

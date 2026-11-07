@@ -840,7 +840,8 @@ pub fn protocol_headers(client: &HeaderMap) -> Vec<(String, String)> {
     out
 }
 
-/// `directRealtimeHeaders`: no `OpenAI-Alpha`, and `Originator` defaults to Codex Desktop.
+/// `directRealtimeHeaders`: no `OpenAI-Alpha`. Go defaults `Originator` to
+/// `Codex Desktop`; the proxy names itself instead (#26, [`crate::codex_identity`]).
 pub fn direct_headers(client: &HeaderMap) -> Vec<(String, String)> {
     let mut out = protocol_headers(client);
     out.retain(|(name, _)| name != "Openai-Alpha");
@@ -850,7 +851,7 @@ pub fn direct_headers(client: &HeaderMap) -> Vec<(String, String)> {
         .is_none_or(|(_, v)| v.is_empty())
     {
         out.retain(|(name, _)| name != "Originator");
-        out.push(("Originator".into(), "Codex Desktop".into()));
+        out.push(("Originator".into(), crate::codex_identity::ORIGINATOR.into()));
     }
     out
 }
@@ -1020,7 +1021,9 @@ impl CodexExecutor {
     }
 
     /// `setAccountHeader` then the Codex `PrepareRequest`: bearer from the API key or
-    /// access token, then operator `header:` attributes.
+    /// access token, then operator `header:` attributes. The proxy formulates every live
+    /// request, so it carries the proxy's `User-Agent`, where Go sent net/http's
+    /// `Go-http-client` default (#26, [`crate::codex_identity`]).
     fn live_credential_headers(
         view: &View<'_>,
         client: &HeaderMap,
@@ -1039,6 +1042,7 @@ impl CodexExecutor {
         } else {
             set(&mut headers, "Authorization", format!("Bearer {}", view.token));
         }
+        set(&mut headers, "User-Agent", crate::codex_identity::USER_AGENT.to_owned());
         for (name, value) in request::custom_headers(view, client) {
             set(&mut headers, &name, value);
         }
@@ -1046,7 +1050,7 @@ impl CodexExecutor {
     }
 
     /// One live HTTP request (`authManager.HttpRequest` with the Codex executor): Go's
-    /// client for the URL (Chrome TLS for chatgpt.com) through the credential's proxy,
+    /// client for the URL ([`crate::codex_tls`]) through the credential's proxy,
     /// redirects followed like `http.Client.Do`.
     pub async fn live_post(
         &self,
@@ -1057,6 +1061,7 @@ impl CodexExecutor {
     ) -> Result<Upstream, ExecError> {
         // `PrepareRequest`: Sign in with ChatGPT needs its token.
         crate::codex_siwc::require_token(target.credential)?;
+        crate::codex_identity::check_credential(target.credential)?;
         let view = target.view();
         let headers = Self::live_credential_headers(&view, target.client, headers);
         target.record_post(url, &headers, &body);
@@ -1092,7 +1097,9 @@ impl CodexExecutor {
         protocols: Vec<String>,
     ) -> Result<LiveSocket, DialError> {
         // `PrepareHttpRequest`: Sign in with ChatGPT needs its token (Go's 401).
-        if let Err(error) = crate::codex_siwc::require_token(target.credential) {
+        if let Err(error) = crate::codex_siwc::require_token(target.credential)
+            .and_then(|()| crate::codex_identity::check_credential(target.credential))
+        {
             return Err(DialError {
                 response: None,
                 status: Some(error.status),

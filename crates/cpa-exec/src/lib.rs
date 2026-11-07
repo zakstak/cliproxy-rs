@@ -33,6 +33,7 @@ pub mod claude_login;
 pub mod codex;
 mod codex_capture;
 mod codex_client;
+pub mod codex_identity;
 mod codex_images;
 mod codex_json;
 pub mod codex_live;

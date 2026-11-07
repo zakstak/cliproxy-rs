@@ -96,6 +96,50 @@ fn uuid_shaped(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok()
 }
 
+/// The proxy's own identity, spelled out here rather than taken from the implementation.
+const PROXY_UA: &str = concat!("cliproxy-rs/", env!("CARGO_PKG_VERSION"));
+
+/// Go's recorded upstream request with the identity #26 sends instead of Go's fixed
+/// `codex-tui` one (docs/DIFFERENCES-FROM-GO.md): on a native Responses exchange the
+/// caller's own `User-Agent` and `originator`, otherwise cliproxy-rs's; an OAuth
+/// credential always carries an originator, an API key only the caller's. Every other
+/// header still has to match Go's recording.
+fn under_identity_policy(go: &Value, client: &HeaderMap, native: bool, oauth: bool) -> Value {
+    let mut go = go.clone();
+    let caller = |name: &str| {
+        client
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| native && !v.is_empty())
+            .map(str::to_owned)
+    };
+    let body = go["body"].as_str().unwrap_or_default().to_owned();
+    let headers = go["headers"].as_object_mut().unwrap();
+    let go_ua = headers["user-agent"][0].as_str().unwrap_or_default().to_owned();
+    let ua = caller("user-agent").unwrap_or_else(|| PROXY_UA.into());
+    // Go adds a random `session_id` when a model override leaves a "Mac OS" User-Agent
+    // (`applyModelHeaderOverrides`); the catalog's codex-tui override is gone, so a
+    // session that only that rule invented is gone too.
+    let random_session = headers
+        .get("session_id")
+        .and_then(|v| v[0].as_str())
+        .is_some_and(|id| !body.contains(id));
+    if go_ua.contains("Mac OS") && !ua.contains("Mac OS") && random_session {
+        headers.remove("session_id");
+    }
+    headers.insert("user-agent".into(), serde_json::json!([ua]));
+    match caller("originator").or_else(|| oauth.then(|| "cliproxy-rs".into())) {
+        Some(originator) => {
+            headers.insert("originator".into(), serde_json::json!([originator]));
+        }
+        None => {
+            headers.remove("originator");
+        }
+    }
+    go
+}
+
 /// Same path, body bytes and header set. Generated session UUIDs only need the same shape.
 fn assert_same_upstream(name: &str, rust: &Captured, go: &Value) {
     assert_eq!(rust.path, go["path"].as_str().unwrap(), "{name}: path");
@@ -283,17 +327,25 @@ async fn executor_matches_go_on_every_fixture_case() {
         }
         let (result, items) = run(&executor, case, &mock).await;
         let captured = mock.take();
+        let (client, view_credential) = (request(case).headers, credential(case, &mock.url));
+        let view = View::new(&view_credential);
+        let native = {
+            let req = request(case);
+            matches!(req.source_format, Format::Codex | Format::OpenAIResponse)
+                && matches!(req.response_format, Format::Codex | Format::OpenAIResponse)
+        };
+        let expected = |go: &Value| under_identity_policy(go, &client, native, !view.api_key);
         match case["hops"].as_array() {
             Some(hops) => {
                 assert_eq!(captured.len(), hops.len(), "{name}: upstream requests");
                 for (rust, go) in captured.iter().zip(hops) {
                     assert_eq!(rust.method, go["method"].as_str().unwrap(), "{name}: method");
-                    assert_same_upstream(name, rust, go);
+                    assert_same_upstream(name, rust, &expected(go));
                 }
             }
             None => {
                 assert_eq!(captured.len(), 1, "{name}: one upstream request");
-                assert_same_upstream(name, &captured[0], &case["upstream"]);
+                assert_same_upstream(name, &captured[0], &expected(&case["upstream"]));
             }
         }
         let output = &case["output"];
@@ -923,6 +975,7 @@ async fn images_match_go_on_every_fixture_case() {
         );
         let request_path = case["request_path"].as_str().unwrap();
         let model = case["model"].as_str().unwrap();
+        let client = headers.clone();
         let req = ExecRequest {
             operation: Operation::Generate,
             source_format: Format::OpenAI,
@@ -961,7 +1014,9 @@ async fn images_match_go_on_every_fixture_case() {
                     assert_eq!(rust_body, go_body, "{name}: upstream body fields");
                     go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
                 }
-                assert_same_upstream(name, &captured[0], &go);
+                // The proxy builds every Images request: never the caller's identity.
+                let oauth = !View::new(&credential).api_key;
+                assert_same_upstream(name, &captured[0], &under_identity_policy(&go, &client, false, oauth));
             }
         }
         let output = &case["output"];
@@ -1706,6 +1761,7 @@ async fn siwc_requests_match_go() {
                 &request::base_model(&req.model),
                 cache.as_deref(),
                 false,
+                crate::codex_identity::Origin::of(&req),
             );
             let mut actual: Vec<(String, String)> = headers
                 .iter()
@@ -2159,7 +2215,16 @@ fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
         let view = View::new(&credential);
         let settings = Settings::scoped(&Config::default(), &view);
         let body = request::shape(&req, &view, &settings, Call::Websocket).unwrap().body;
-        let headers = request::ws_headers(&view, &settings, &req.headers, &body, "gpt-5.4", None, true);
+        let headers = request::ws_headers(
+            &view,
+            &settings,
+            &req.headers,
+            &body,
+            "gpt-5.4",
+            None,
+            true,
+            crate::codex_identity::Origin::of(&req),
+        );
         let hint = headers
             .get("x-codex-routing-hint")
             .map(|v| v.to_str().unwrap().to_owned());

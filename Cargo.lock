@@ -869,7 +869,6 @@ dependencies = [
  "async-compression",
  "axum",
  "base64 0.22.1",
- "brotli-decompressor",
  "btls",
  "bytes",
  "chrono",

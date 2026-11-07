@@ -354,6 +354,51 @@ const COMPARED_HEADERS: [&str; 11] = [
     "content-type",
 ];
 
+/// #26: Go's recording with the identity cliproxy-rs sends instead of Go's fixed
+/// `codex-tui` one (docs/DIFFERENCES-FROM-GO.md). The WebSocket client is a native
+/// Responses caller, so its own `User-Agent` and `originator` go upstream, else
+/// cliproxy-rs's; an OAuth credential always carries an originator, an API key only the
+/// caller's. The expected values are spelled out here, not taken from the proxy.
+fn under_identity_policy(scenario: &Value, go: Vec<(String, String)>) -> Vec<(String, String)> {
+    if go.is_empty() {
+        // A WebSocket frame, which has no headers.
+        return go;
+    }
+    let client = |name: &str| {
+        scenario["client_headers"]
+            .as_object()
+            .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+            .and_then(|(_, v)| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let auth = go
+        .iter()
+        .find(|(k, _)| k == "authorization")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let oauth = scenario["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["metadata"]["access_token"].as_str())
+        .any(|token| auth == format!("Bearer {token}"));
+    let mut out: Vec<(String, String)> = go
+        .into_iter()
+        .filter(|(k, _)| k != "user-agent" && k != "originator")
+        .collect();
+    let proxy_ua = concat!("cliproxy-rs/", env!("CARGO_PKG_VERSION"));
+    out.push((
+        "user-agent".into(),
+        client("user-agent").unwrap_or_else(|| proxy_ua.into()),
+    ));
+    if let Some(originator) = client("originator").or_else(|| oauth.then(|| "cliproxy-rs".into())) {
+        out.push(("originator".into(), originator));
+    }
+    out
+}
+
 fn compared(headers: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = headers
         .filter(|(k, _)| COMPARED_HEADERS.contains(&k.as_str()))
@@ -569,10 +614,11 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
             .as_object()
             .into_iter()
             .flatten()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()));
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+            .collect();
         assert_eq!(
             compared(rust.headers.clone().into_iter()),
-            compared(go_headers),
+            compared(under_identity_policy(scenario, go_headers).into_iter()),
             "{name}: upstream headers #{i}"
         );
     }

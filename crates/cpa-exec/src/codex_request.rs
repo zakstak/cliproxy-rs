@@ -14,11 +14,10 @@ use gjson::Kind;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
 
+use crate::codex_identity::{self as identity, Origin};
 use crate::codex_json::{delete, set_bool_if_different, set_raw, set_str, set_str_if_different};
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub(crate) const USER_AGENT: &str = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)";
-pub(crate) const ORIGINATOR: &str = "codex-tui";
 pub(crate) const WS_BETA: &str = "responses_websockets=2026-02-06";
 const ROUTING_HINT: &str = "x-codex-routing-hint";
 const LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
@@ -46,11 +45,14 @@ impl Call {
 /// Codex settings read from the config snapshot (v8 paths; legacy keys are already moved).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Settings {
-    pub disable_cloaking: bool,
+    /// `upstream.codex.disable-codex-cloaking`. Go's cloaking overwrote the client
+    /// identity; that part is gone (#26, [`crate::codex_identity`]). What remains is its
+    /// other effect: a native WebSocket handshake carries the caller's own session
+    /// headers instead of the proxy's prompt-cache session.
+    pub native_session_headers: bool,
     pub bootstrap_buffering: bool,
     pub bootstrap_timeout: Option<Duration>,
     pub model_level_cooling: bool,
-    pub default_user_agent: String,
     pub default_beta_features: String,
     pub image_generation: bool,
     /// `requests.payload` rules and image-generation mode for this config snapshot.
@@ -165,7 +167,7 @@ impl Settings {
             Some(v) => v.as_bool() == Some(false) || v.as_str().is_some_and(|s| matches!(s.trim(), "" | "false")),
         };
         Self {
-            disable_cloaking: flag("disable-codex-cloaking"),
+            native_session_headers: flag("disable-codex-cloaking"),
             bootstrap_buffering: flag("stream-bootstrap-buffering"),
             bootstrap_timeout: codex("stream-bootstrap-timeout")
                 .and_then(|v| {
@@ -176,7 +178,6 @@ impl Settings {
                 .and_then(|s| go_duration(&s))
                 .filter(|d| !d.is_zero()),
             model_level_cooling: flag("model-level-cooling"),
-            default_user_agent: text(&["oauth", "providers", "codex", "header-defaults", "user-agent"]),
             default_beta_features: text(&["oauth", "providers", "codex", "header-defaults", "beta-features"]),
             image_generation: image_off,
             payload: cpa_common::payload::Rules::from_config(cfg),
@@ -310,10 +311,12 @@ impl<'a> View<'a> {
             .unwrap_or(self.attr("plan_type"))
     }
 
-    /// `isCodexCloakingDisabled`: the attribute (config synthesis copies the matching
-    /// `codex-api-key` entry's `disable-codex-cloaking` into it), then the setting.
-    pub fn cloaking_disabled(&self, settings: &Settings) -> bool {
-        go_bool(self.attr("codex_disable_cloaking")).unwrap_or(settings.disable_cloaking)
+    /// Go `isCodexCloakingDisabled`, which now only decides
+    /// [`Settings::native_session_headers`]: the attribute (config synthesis copies the
+    /// matching `codex-api-key` entry's `disable-codex-cloaking` into it), then the
+    /// setting. Neither can change the request identity.
+    pub fn native_session_headers(&self, settings: &Settings) -> bool {
+        go_bool(self.attr("codex_disable_cloaking")).unwrap_or(settings.native_session_headers)
     }
 
     /// `codexWebsocketsEnabled`: attribute first, then metadata.
@@ -1438,26 +1441,21 @@ fn ensure_from_client(headers: &mut HeaderMap, client: &HeaderMap, name: &str) {
     }
 }
 
-/// `ensureHeaderWithConfigPrecedence`: existing, config, client, fallback.
-fn ensure_config_first(headers: &mut HeaderMap, client: &HeaderMap, name: &str, config: &str, fallback: &str) {
-    if !header(headers, name).trim().is_empty() {
-        return;
-    }
-    for value in [config, header(client, name), fallback] {
-        if !value.trim().is_empty() {
-            set(headers, name, value.trim());
-            return;
-        }
-    }
-}
-
 /// `util.ApplyCustomHeadersFromAttrs` (`cpa_common::headers`) with the view's explicit
-/// `$CPA-SESSION-ID`.
+/// `$CPA-SESSION-ID`, minus the operator headers the identity policy refuses
+/// ([`identity::permitted_attributes`]): no client identity, no caller-chosen credential
+/// and no copied client key.
 pub(crate) fn custom_headers(view: &View<'_>, client: &HeaderMap) -> Vec<(String, String)> {
-    cpa_common::headers::custom_headers(&view.credential.attributes, client, view.session.as_deref())
+    cpa_common::headers::custom_headers(
+        &identity::permitted_attributes(view.credential),
+        client,
+        view.session.as_deref(),
+    )
 }
 
-/// `applyModelHeaderOverrides`: models.json `config.override_header` for the model.
+/// `applyModelHeaderOverrides`: models.json `config.override_header` for the model,
+/// except identity and credential headers ([`identity::model_override_permitted`]). The
+/// pinned catalog gives `gpt-5.6-luna` a `codex-tui` macOS identity, which #26 removes.
 fn model_overrides(model: &str) -> Vec<(String, String)> {
     let Some(info) = cpa_core::registry::pinned().lookup(model) else {
         return Vec::new();
@@ -1468,7 +1466,7 @@ fn model_overrides(model: &str) -> Vec<(String, String)> {
         .and_then(serde_json::Value::as_object)
         .map(|m| {
             m.iter()
-                .filter(|(k, _)| !k.trim().is_empty())
+                .filter(|(k, _)| !k.trim().is_empty() && identity::model_override_permitted(k))
                 .filter_map(|(k, v)| Some((k.trim().to_owned(), v.as_str()?.to_owned())))
                 .collect()
         })
@@ -1476,6 +1474,8 @@ fn model_overrides(model: &str) -> Vec<(String, String)> {
 }
 
 /// HTTP upstream headers (`applyCodexHeadersFromSources`, routing hint, model overrides).
+/// `origin` decides whose identity they carry ([`crate::codex_identity`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn http_headers(
     view: &View<'_>,
     settings: &Settings,
@@ -1484,16 +1484,17 @@ pub(crate) fn http_headers(
     model: &str,
     cache_id: Option<&str>,
     stream: bool,
+    origin: Origin,
 ) -> HeaderMap {
-    let mut h = source_headers(view, settings, client, cache_id, stream);
+    let mut h = source_headers(view, settings, client, cache_id, stream, origin);
     routing_hint(&mut h, view, client, body, model);
     model_header_overrides(&mut h, model);
     h
 }
 
-/// Images API upstream headers: `applyCodexHeaders` (or `applyCodexDirectImageHeaders`,
-/// whose caller drops the client's User-Agent) and `applyModelHeaderOverrides`, without
-/// the routing hint.
+/// Images API upstream headers: `applyCodexHeaders` and `applyModelHeaderOverrides`,
+/// without the routing hint. The proxy builds every Images request, so it carries the
+/// proxy's identity ([`Origin::Proxy`]).
 pub(crate) fn image_headers(
     view: &View<'_>,
     settings: &Settings,
@@ -1502,7 +1503,7 @@ pub(crate) fn image_headers(
     cache_id: Option<&str>,
     stream: bool,
 ) -> HeaderMap {
-    let mut h = source_headers(view, settings, client, cache_id, stream);
+    let mut h = source_headers(view, settings, client, cache_id, stream, Origin::Proxy);
     model_header_overrides(&mut h, model);
     h
 }
@@ -1514,6 +1515,7 @@ fn source_headers(
     client: &HeaderMap,
     cache_id: Option<&str>,
     stream: bool,
+    origin: Origin,
 ) -> HeaderMap {
     if view.siwc {
         return siwc_http_headers(view, settings, client, cache_id, stream);
@@ -1539,8 +1541,7 @@ fn source_headers(
     ] {
         ensure_from_client(&mut h, client, name);
     }
-    let default_ua = if view.api_key { "" } else { &settings.default_user_agent };
-    ensure_config_first(&mut h, client, "user-agent", default_ua, USER_AGENT);
+    set(&mut h, "user-agent", identity::user_agent(origin, client));
     set(
         &mut h,
         "accept",
@@ -1551,7 +1552,7 @@ fn source_headers(
         },
     );
     set(&mut h, "connection", "Keep-Alive");
-    apply_identity(&mut h, view, settings, client);
+    apply_identity(&mut h, view, client, origin);
     h
 }
 
@@ -1591,13 +1592,12 @@ fn siwc_http_headers(
     h
 }
 
-/// Originator, account header, operator headers and cloaking, shared by HTTP and WebSocket.
-fn apply_identity(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, client: &HeaderMap) {
-    let originator = header(client, "originator").trim();
-    if !originator.is_empty() {
+/// Originator, the selected credential's account header and operator headers, shared by
+/// HTTP and WebSocket. An OAuth credential always carries an originator, as in Go: the
+/// caller's on a native exchange, else the proxy's ([`identity::originator`]).
+fn apply_identity(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, origin: Origin) {
+    if let Some(originator) = identity::originator(origin, client, !view.api_key) {
         set(h, "originator", originator);
-    } else if !view.api_key {
-        set(h, "originator", ORIGINATOR);
     }
     if !view.api_key
         && let Some(account) = view.credential.str("account_id")
@@ -1606,10 +1606,6 @@ fn apply_identity(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, clien
     }
     for (name, value) in custom_headers(view, client) {
         set(h, &name, &value);
-    }
-    if !view.cloaking_disabled(settings) {
-        set(h, "user-agent", USER_AGENT);
-        set(h, "originator", ORIGINATOR);
     }
 }
 
@@ -1657,7 +1653,9 @@ fn model_header_overrides(h: &mut HeaderMap, model: &str) {
 }
 
 /// WebSocket handshake headers (`applyCodexPromptCacheHeadersWithContext`,
-/// `applyCodexWebsocketHeaders`, routing hint, model overrides).
+/// `applyCodexWebsocketHeaders`, routing hint, model overrides). `origin` decides whose
+/// identity they carry ([`crate::codex_identity`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ws_headers(
     view: &View<'_>,
     settings: &Settings,
@@ -1666,6 +1664,7 @@ pub(crate) fn ws_headers(
     model: &str,
     cache_id: Option<&str>,
     native: bool,
+    origin: Origin,
 ) -> HeaderMap {
     let mut h = HeaderMap::new();
     if let Some(id) = cache_id {
@@ -1680,13 +1679,10 @@ pub(crate) fn ws_headers(
         model_header_overrides(&mut h, model);
         return h;
     }
-    let (default_ua, default_beta) = if view.api_key {
-        ("", "")
+    let default_beta = if view.api_key {
+        ""
     } else {
-        (
-            settings.default_user_agent.as_str(),
-            settings.default_beta_features.as_str(),
-        )
+        settings.default_beta_features.as_str()
     };
     // ensureHeaderWithPriority: existing, client, config.
     for value in [header(client, "x-codex-beta-features"), default_beta] {
@@ -1707,14 +1703,7 @@ pub(crate) fn ws_headers(
     if native {
         ensure_from_client(&mut h, client, LITE_HEADER);
     }
-    if view.api_key {
-        let ua = header(client, "user-agent").trim();
-        if !ua.is_empty() {
-            set(&mut h, "user-agent", ua);
-        }
-    } else {
-        ensure_config_first(&mut h, client, "user-agent", default_ua, USER_AGENT);
-    }
+    set(&mut h, "user-agent", identity::user_agent(origin, client));
     let mut beta = header(client, "openai-beta").trim().to_owned();
     if !beta.contains("responses_websockets=") {
         beta = WS_BETA.to_owned();
@@ -1737,7 +1726,7 @@ pub(crate) fn ws_headers(
         set(&mut h, "session_id", &session);
     }
     h.remove("session-id");
-    if native && view.cloaking_disabled(settings) {
+    if native && view.native_session_headers(settings) {
         h.remove("session_id");
         h.remove("conversation_id");
         for name in [
@@ -1753,7 +1742,7 @@ pub(crate) fn ws_headers(
             }
         }
     }
-    apply_identity(&mut h, view, settings, client);
+    apply_identity(&mut h, view, client, origin);
     routing_hint(&mut h, view, client, body, model);
     model_header_overrides(&mut h, model);
     h

@@ -1544,7 +1544,16 @@ impl CodexExecutor {
         let body = turn_body(view, &req, settings, &finalize, body);
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let native = request::is_native(&req);
-        let headers = request::ws_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), native);
+        let headers = request::ws_headers(
+            view,
+            settings,
+            &req.headers,
+            &body,
+            &model,
+            cache.as_deref(),
+            native,
+            crate::codex_identity::Origin::of(&req),
+        );
         let target = Target::new(view.credential, ws_url(&format!("{}/responses", view.base_url))?, cfg);
         let session = self.ws.session(&exec_session.id);
         // `WebsocketInputFromContext(ctx) != nil && cfg.Codex.ResponseSteering`.
