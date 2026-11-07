@@ -320,6 +320,7 @@ pub(crate) async fn before_auth(
     headers: Header,
     body: &Bytes,
     metadata: &Metadata,
+    observe: bool,
 ) -> Result<BeforeAuth, Failure> {
     if !host.has_request_interceptors() {
         return Ok(BeforeAuth {
@@ -343,6 +344,17 @@ pub(crate) async fn before_auth(
     let resp = host
         .intercept_request_before_auth(req, &lifecycle.skip_plugin, &lifecycle.scope)
         .await;
+    if observe {
+        // The plugin saw the request; nothing it returned reaches the native route.
+        if resp.terminate {
+            tracing::debug!("pluginhost: before-auth termination ignored for a native Codex request");
+        }
+        return Ok(BeforeAuth {
+            headers,
+            body: None,
+            path: None,
+        });
+    }
     let out = BeforeAuth {
         headers: final_headers(&headers, &resp.headers),
         body: Some(resp.body.clone()).filter(|b| !b.is_empty()),
@@ -400,6 +412,9 @@ pub(crate) struct Request<'a> {
     pub body: &'a Bytes,
     pub metadata: Metadata,
     pub caller: Option<&'a Caller>,
+    /// Run the before-auth interceptors without applying their output or termination
+    /// (a request only the native Codex route can serve, #23).
+    pub observe: bool,
 }
 
 impl Hooks {
@@ -430,6 +445,7 @@ impl Hooks {
             req.headers,
             req.body,
             &req.metadata,
+            req.observe,
         )
         .await?;
         let mut metadata = req.metadata;
@@ -993,11 +1009,14 @@ fn model_detail(body: bytes::Bytes, id: &str) -> (u16, bytes::Bytes) {
 /// when no plugin intercepts requests, observes their lifecycle or watches upstream
 /// WebSocket frames: the request runs
 /// untouched, as in Go where every hook is then a no-op.
+/// `native_only`: only the native Codex route can serve the request, so the before-auth
+/// interceptors run without applying their output or termination.
 pub(crate) async fn start(
     rt: &Runtime,
     trace: &Trace,
     call: &mut Call,
     model: &str,
+    native_only: bool,
 ) -> Result<Option<Arc<Hooks>>, Failure> {
     let host = rt.plugins();
     let needed = host.has_request_interceptors()
@@ -1029,6 +1048,7 @@ pub(crate) async fn start(
             body: &call.body,
             metadata: super::execution::execution_metadata(call, model),
             caller: Some(&call.caller),
+            observe: native_only,
         },
     )
     .await?;
@@ -1331,6 +1351,7 @@ mod tests {
                 body: &body,
                 metadata: Metadata::new(),
                 caller: None,
+                observe: false,
             },
         )
         .await

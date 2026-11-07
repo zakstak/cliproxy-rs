@@ -30,9 +30,15 @@ fn b64(text: &str) -> String {
 
 impl Fixture {
     async fn start() -> Option<Self> {
+        Self::start_with("codex-native-plugins", &["key-FAKE-codex"], "").await
+    }
+
+    /// A proxy with one Codex API-key credential per entry of `keys`, all on one capture
+    /// upstream, plus the control provider; `routing` is extra config.
+    async fn start_with(name: &str, keys: &[&str], routing: &str) -> Option<Self> {
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let built = cpa_plugin::testing::built_plugins(tmp, "codex_native_plugins")?;
-        let dir = cpa_plugin::testing::scratch(tmp, "codex-native-plugins");
+        let dir = cpa_plugin::testing::scratch(tmp, name);
         let (auths, plugins, records) = (dir.join("auths"), dir.join("plugins"), dir.join("records"));
         for d in [&auths, &plugins, &records.join("respond/mutator")] {
             std::fs::create_dir_all(d).unwrap();
@@ -40,20 +46,22 @@ impl Fixture {
         std::fs::copy(built.join("recorder.so"), plugins.join("mutator.so")).unwrap();
         let sse = || Reply::sse(fixture("sse-completed").bytes());
         let codex = CaptureUpstream::start(Script {
-            http: vec![sse(), sse()],
+            http: (0..40).map(|_| sse()).collect(),
             ..Script::default()
         })
         .await;
         let chat = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
         let control = CaptureUpstream::start(Script {
-            http: vec![Reply::json(200, chat)],
+            http: vec![Reply::json(200, chat), Reply::json(200, chat)],
             ..Script::default()
         })
         .await;
+        let keys: String = keys.iter().map(|k| format!("{{api-key: {k}}}, ")).collect();
         let yaml = format!(
-            "auth-dir: {}\naccess:\n  api-keys: [client-key-1]\napi-keys:\n  codex:\n    - base-url: {}\n      models: [{{name: gpt-native}}]\n      keys: [{{api-key: key-FAKE-codex}}]\n  openai-compatibility:\n    - name: Acme\n      base-url: {}/v1\n      models:\n        - name: up-model\n          alias: control-model\n      keys:\n        - api-key: key-FAKE-control\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    mutator:\n      enabled: true\n      label: mutator\n      record: {}\n      caps: request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin\n",
+            "auth-dir: {}\naccess:\n  api-keys: [client-key-1]\n{routing}api-keys:\n  codex:\n    - base-url: {}\n      models: [{{name: gpt-native}}]\n      keys: [{}]\n  openai-compatibility:\n    - name: Acme\n      base-url: {}/v1\n      models:\n        - name: up-model\n          alias: control-model\n      keys:\n        - api-key: key-FAKE-control\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    mutator:\n      enabled: true\n      label: mutator\n      record: {}\n      caps: request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin\n",
             auths.display(),
             codex.base_url,
+            keys.trim_end_matches(", "),
             control.base_url,
             plugins.display(),
             records.display()
@@ -237,4 +245,121 @@ async fn plugin_interceptors_cannot_rewrite_native_codex_traffic() {
     assert_eq!(fx.calls("request.intercept_after"), 1);
     assert_eq!(fx.calls("response.intercept_after"), 1);
     assert!(fx.lifecycle_completions(3).await >= 3);
+}
+
+/// Which Codex key served the last request, and its outbound `session-id`.
+fn served(fx: &Fixture) -> (String, String) {
+    let sent = fx.codex.http().pop().expect("a Codex request");
+    let key = sent.headers["authorization"].to_str().unwrap().to_owned();
+    let session = sent
+        .headers
+        .get("session-id")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    (key, session)
+}
+
+/// Session affinity binds two sessions to two different Codex credentials; a
+/// before-auth rewrite of `Session-Id` cannot move a native request to the other one,
+/// and its termination cannot stop it. The control provider still honours termination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn before_auth_cannot_choose_the_native_session_or_credential() {
+    let Some(fx) = Fixture::start_with(
+        "codex-native-plugins-affinity",
+        &["key-FAKE-a", "key-FAKE-b"],
+        "routing:\n  session-affinity: true\n",
+    )
+    .await
+    else {
+        return;
+    };
+    let body = native_body(true);
+    let send = |session: String| {
+        let fx = &fx;
+        let body = body.clone();
+        async move {
+            let (status, answer) = fx.post("/v1/responses", &[("session-id", &session)], &body).await;
+            assert_eq!(status, 200, "{answer}");
+            served(fx).0
+        }
+    };
+    // Bind sessions until two land on different credentials.
+    let mut bound: Vec<(String, String)> = Vec::new();
+    for i in 0..12 {
+        let session = format!("session-{i}");
+        let key = send(session.clone()).await;
+        if bound.iter().all(|(_, k)| *k != key) {
+            bound.push((session, key));
+        }
+        if bound.len() == 2 {
+            break;
+        }
+    }
+    let [(first, first_key), (second, second_key)] = <[_; 2]>::try_from(bound).expect("two credentials bound");
+    assert_eq!(send(first.clone()).await, first_key, "affinity holds");
+    assert_eq!(send(second.clone()).await, second_key, "affinity holds");
+
+    // The plugin points the first session at the second one's binding.
+    fx.respond_once(
+        "request.intercept_before",
+        &json!({"ok": true, "result": {"Headers": {"Session-Id": [second.clone()]}}}),
+    );
+    assert_eq!(send(first.clone()).await, first_key, "the client's session decides");
+    fx.respond_once(
+        "request.intercept_before",
+        &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
+    );
+    assert_eq!(
+        send(first.clone()).await,
+        first_key,
+        "termination does not reach the native route"
+    );
+
+    // The control (not a Codex model) keeps before-auth termination.
+    fx.respond_once(
+        "request.intercept_before",
+        &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
+    );
+    let (status, answer) = fx
+        .post(
+            "/v1/chat/completions",
+            &[],
+            r#"{"model":"control-model","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+    assert_eq!((status, answer.as_str()), (403, "blocked"));
+}
+
+/// Without an explicit session or cache key, the outbound session identity derives from
+/// the client's body, not from a before-auth body rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn before_auth_body_rewrites_do_not_derive_the_native_session() {
+    let Some(fx) = Fixture::start_with("codex-native-plugins-derived", &["key-FAKE-codex"], "").await else {
+        return;
+    };
+    let original = r#"{"model":"gpt-native","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"original question"}]}]}"#;
+    let rewritten = r#"{"model":"gpt-native","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"rewritten question"}]}]}"#;
+    let derived = |body: &'static str| {
+        let fx = &fx;
+        async move {
+            let (status, answer) = fx.post("/v1/responses", &[], body).await;
+            assert_eq!(status, 200, "{answer}");
+            served(fx).1
+        }
+    };
+    let from_original = derived(original).await;
+    let from_rewritten = derived(rewritten).await;
+    assert!(!from_original.is_empty(), "a derived session identity is sent");
+    assert_ne!(from_original, from_rewritten, "the body decides the derived identity");
+
+    fx.rewrite_before_auth(rewritten);
+    let (status, _) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200);
+    let sent = fx.codex.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), original);
+    assert_eq!(
+        sent.headers["session-id"],
+        from_original.as_str(),
+        "derived from the client's body"
+    );
 }

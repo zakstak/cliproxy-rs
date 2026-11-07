@@ -276,10 +276,17 @@ transformations: the routed `model`, and `stream: true` for a buffered client on
 `chatgpt`. The server keeps the client's body, headers and route path in
 `dispatch::NativeRequest`, from before the Codex-client ingress rewrite, compact's
 `stream` deletion and plugin before-auth interceptors, so a native attempt never sees
-their output. A before-auth interceptor still runs, because it runs before a credential
-is chosen; its header changes can still affect credential selection and session
-affinity, but none of its output reaches the native request. A request that asks for
-unframed stream payloads (a plugin model callback) keeps the legacy path. The boundary validates those
+their output. The session, session affinity, the LCP prefix, Home dispatch headers, the plugin
+scheduler context and the executor's session metadata all come from the client's own
+request too (`Call::selection_inputs`), so before-auth output cannot choose the session or
+the credential of a native attempt. When every provider of the model is Codex, only the
+native route can serve the request: the before-auth interceptors still run (the plugin
+sees the request and its lifecycle runs), but their headers, body, path and termination
+are not applied. When the model is shared with another provider, before-auth output still
+reaches the other provider's attempts and its termination still ends the request, while
+selection reads the client's request for every provider and a native attempt restores it.
+A request that asks for unframed stream payloads (a plugin model callback) keeps the
+legacy path. The boundary validates those
 bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,
 tool or namespace preparation, or plugin `after_auth` hook runs. A model with a thinking
 suffix, such as `gpt-5.5(high)`, is refused with a 400, because the suffix would need a

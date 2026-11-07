@@ -217,15 +217,15 @@ impl CodexExecutor {
             return count_tokens(&req, cfg);
         }
         check_response_format(&req)?;
+        crate::codex_siwc::require_token(credential)?;
+        // Credential checks stay above the native route: it skips only payload work.
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
+        let settings = Settings::scoped(cfg, &view);
         if let Some(profile) = native::route(&view, &req) {
             // The native route reads the body through the boundary itself.
-            let settings = Settings::scoped(cfg, &view);
             return self.native(&view, &settings, req, profile).await;
         }
         check_native_body(&req)?;
-        crate::codex_siwc::require_token(credential)?;
-        let settings = Settings::scoped(cfg, &view);
         match (req.alt.as_deref(), req.stream) {
             (Some("responses/compact"), true) => Err(ExecError::local(
                 400,

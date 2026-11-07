@@ -135,6 +135,17 @@ pub enum MediaKind {
 
 impl Call {
     /// `WithPinnedAuthID` of a session turn, media call or host model callback.
+    /// The headers and body that choose the session, affinity and credential. A
+    /// Responses HTTP request is chosen by the client's own request, before plugin
+    /// before-auth output (#23): it may be served by the native Codex route, and in a
+    /// mixed pool the provider is not known until selection.
+    pub(crate) fn selection_inputs(&self) -> (&HeaderMap, &Bytes) {
+        match &self.native {
+            Some(native) => (&native.headers, &native.body),
+            None => (&self.headers, &self.body),
+        }
+    }
+
     pub(crate) fn pinned(&self) -> Option<String> {
         self.turn
             .as_ref()
@@ -746,7 +757,12 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         trace.prompt_prefix(call.entry, &call.body);
     }
     let mut call = call;
-    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1).await?;
+    // Only the native Codex route can serve a Responses request whose providers are all
+    // Codex: before-auth output and termination must not reach it (#23). A mixed pool
+    // keeps them for its other providers; a native attempt there restores the client's
+    // request, and selection reads the client's request either way.
+    let native_only = call.native.is_some() && resolved.0.iter().all(|p| p.eq_ignore_ascii_case("codex"));
+    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1, native_only).await?;
     let native = call.native.clone();
     let result = retry_bootstrap(rt, call, trace, &resolved, hooks.as_ref()).await;
     match hooks {
@@ -1016,10 +1032,11 @@ async fn run_routed(
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
     let aliases = registry::global_aliases(&cfg);
+    let (selection_headers, selection_body) = call.selection_inputs();
     let session = crate::session::resolve(
         call.entry,
-        &call.headers,
-        &call.body,
+        selection_headers,
+        selection_body,
         call.execution_session.as_deref(),
         &call.caller.principal,
     );
@@ -1125,7 +1142,8 @@ async fn run_routed(
     // Go `pickLCP`: with session affinity, an authenticated request without an explicit
     // session binds by its conversation prefix.
     if policy.session_affinity && !session.explicit {
-        selection.lcp = crate::lcp::Request::new(call.entry.as_str(), &call.body, &call.caller.principal).map(Arc::new);
+        selection.lcp =
+            crate::lcp::Request::new(call.entry.as_str(), selection_body, &call.caller.principal).map(Arc::new);
     }
     // Go `preferredExecutionAttemptError`: the latest failure that reached upstream wins
     // over later selection failures.
@@ -1979,7 +1997,7 @@ fn no_auth(base: &Selection) -> Failure {
 /// headers (Home authenticates the client with them), and this round's exclusions.
 /// The dispatcher canonicalizes the session (Go `homeDispatchSessionIDs`).
 fn remote_request(call: &Call, selection: &Selection, count: i64, trace: &Trace) -> crate::remote::RemoteRequest {
-    let headers = crate::remote::home_headers(&call.headers, Some(&call.caller));
+    let headers = crate::remote::home_headers(call.selection_inputs().0, Some(&call.caller));
     crate::remote::RemoteRequest {
         model: selection.model.clone(),
         session_id: selection.session.clone().unwrap_or_default(),
