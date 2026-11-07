@@ -138,8 +138,8 @@ pub(crate) struct Link {
     active: Option<mpsc::Sender<Read>>,
     /// Why the reader stopped (`upstreamDisconnectError`); set once when it exits.
     pub(crate) lost: Option<ExecError>,
-    /// The active turn gives a Codex client a context-window `response.failed` unchanged
-    /// and ends with it (`Turn::invalidate_after_event`); not a duplex turn, whose
+    /// The active turn gives a Codex client a context-window rejection as a
+    /// `response.failed` and ends with it (`Turn::invalidate_after_event`); not a duplex turn, whose
     /// connection survives that event.
     preserves: bool,
     /// The loss the reader left unreported because the event it last delivered to the
@@ -881,7 +881,7 @@ struct Turn {
     items: OutputItems,
     saw_delta: bool,
     native: bool,
-    /// A Codex client: it gets an upstream context-window `response.failed` unchanged
+    /// A Codex client: it gets an upstream context-window rejection as a `response.failed`
     /// before the error (`request::codex_client`).
     codex_client: bool,
     cooling: bool,
@@ -975,14 +975,12 @@ impl Turn {
         if let Some((error, body)) = response::terminal_failure(payload, self.cooling) {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
-            let event = (self.codex_client && cpa_common::codex_client::is_context_window_failure(payload.as_bytes()))
-                .then(|| Bytes::from(payload.to_owned()));
             return Frame::Failed {
                 error,
                 overload: response::is_overload(&body),
                 read: false,
                 status_frame: false,
-                event,
+                event: self.preserved_event(payload),
             };
         }
         let kind = gjson::get(payload, "type");
@@ -1078,6 +1076,15 @@ impl Turn {
         if let Some(error) = deferred {
             self.session.notify(&error);
         }
+    }
+
+    /// The event a Codex client receives before this turn's error for an upstream
+    /// context-window rejection (`cpa_common::codex_client::context_window_failure_event`).
+    fn preserved_event(&self, payload: &str) -> Option<Bytes> {
+        if !self.codex_client {
+            return None;
+        }
+        cpa_common::codex_client::context_window_failure_event(payload).map(|e| Bytes::from(e.into_owned()))
     }
 
     /// The raw error that lost the session's socket, as the reader recorded it (the
@@ -1548,7 +1555,7 @@ pub(crate) async fn read_loop(
         };
         held = false;
         if let Some(tx) = active {
-            let failure = preserves && cpa_common::codex_client::is_context_window_failure(text.trim().as_bytes());
+            let failure = preserves && cpa_common::codex_client::is_context_window_rejection(text.trim().as_bytes());
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
             held = tx.send(Read::Text(text)).await.is_ok() && failure;
         }

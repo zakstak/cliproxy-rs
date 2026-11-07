@@ -446,7 +446,8 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
 /// zakstak/cliproxy-rs#5 on the HTTP Responses route (Codex's HTTP transport): an
 /// upstream context-window `response.failed` reaches a Codex client byte for byte, the
 /// only event Codex classifies as `ContextWindowExceeded`, whether or not
-/// `response.created` came first. Go v8.0.35 answers `context_too_large` instead, and an
+/// `response.created` came first; the live `error` event with that code reaches it as
+/// such a `response.failed`. Go v8.0.35 answers `context_too_large` instead, and an
 /// HTTP 400 when nothing preceded the failure (docs/DIFFERENCES-FROM-GO.md); other
 /// clients keep that. The attempt is one request-scoped failure either way: counted as a
 /// failure, and the credential is not cooled.
@@ -457,14 +458,24 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
     let auth_dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&auth_dir).unwrap();
     let codex_ua = "codex_cli_rs/0.200.0 (Linux; x86_64)";
-    // (upstream events, client path, user agent)
-    let cases: [(&[&str], &str, &str); 4] = [
-        (&[created, failed], "/v1/responses", codex_ua),
-        (&[failed], "/v1/responses", codex_ua),
-        (&[created, failed], "/v1/responses", "openai-node/5"),
-        (&[created, failed], "/v1/chat/completions", "openai-node/5"),
+    // The ChatGPT Codex backend's live rejection: an `error` event without a status, which
+    // Codex ignores; a Codex client gets it as the `response.failed` Codex compacts on.
+    let live = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json").trim();
+    let live_failed = concat!(
+        r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_0565bda653e9b5da016aee80a2d70487d18b1c1858bc049dcf","object":"response","status":"failed","#,
+        r#""error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","param":"input","code":"context_length_exceeded"}}}"#
+    );
+    // (upstream events, client path, user agent, the failure event a Codex client gets)
+    let cases: [(&[&str], &str, &str, &str); 7] = [
+        (&[created, failed], "/v1/responses", codex_ua, failed),
+        (&[failed], "/v1/responses", codex_ua, failed),
+        (&[live], "/v1/responses", codex_ua, live_failed),
+        (&[created, live], "/v1/responses", codex_ua, live_failed),
+        (&[created, failed], "/v1/responses", "openai-node/5", ""),
+        (&[live], "/v1/responses", "openai-node/5", ""),
+        (&[created, failed], "/v1/chat/completions", "openai-node/5", ""),
     ];
-    for (events, path, ua) in cases {
+    for (events, path, ua, want) in cases {
         let sse: String = events
             .iter()
             .map(|e| format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str()))
@@ -515,7 +526,7 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
             .unwrap();
         let status = response.status().as_u16();
         let text = response.text().await.unwrap();
-        let case = format!("{path} {ua} {} events", events.len());
+        let case = format!("{path} {ua} {events:?}");
         let errors: Vec<Value> = text
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
@@ -525,7 +536,10 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         if ua == codex_ua {
             assert_eq!(status, 200, "{case}: {text}");
             assert_eq!(errors.len(), 1, "{case}: one failure event: {text}");
-            assert!(text.contains(&format!("data: {failed}\n")), "{case}: unchanged: {text}");
+            assert!(
+                text.contains(&format!("event: response.failed\ndata: {want}\n")),
+                "{case}: {text}"
+            );
         } else {
             // Go's classified error, unchanged.
             assert!(!text.contains("context_length_exceeded"), "{case}: {text}");

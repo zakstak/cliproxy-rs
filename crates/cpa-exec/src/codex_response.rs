@@ -691,8 +691,8 @@ pub(crate) struct Processor {
     usage: cpa_core::exec::UsageSink,
     /// Grok Build clients get keepalive events as SSE comments (`grokbuild`).
     grok_keepalive: bool,
-    /// A Codex client also gets an upstream context-window `response.failed` unchanged
-    /// before the error (`codex_request::codex_client`).
+    /// A Codex client also gets an upstream context-window rejection as a
+    /// `response.failed` before the error (`codex_request::codex_client`).
     codex_client: bool,
     /// The attempt's wire capture: every scanned line and each stream failure.
     wire: crate::codex_capture::Wire,
@@ -850,9 +850,16 @@ impl Processor {
                     }
                     if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
                         self.replay_failure(error.status, &body);
-                        if self.codex_client && cpa_common::codex_client::is_context_window_failure(payload.as_bytes())
+                        if self.codex_client
+                            && let Some(event) = cpa_common::codex_client::context_window_failure_event(payload)
                         {
-                            lines.push(format!("data: {payload}"));
+                            // A rewritten `error` event is named for what it now is.
+                            if matches!(event, std::borrow::Cow::Owned(_))
+                                && let Some(name) = lines.last_mut().filter(|l| l.as_str() == "event: error")
+                            {
+                                *name = "event: response.failed".to_owned();
+                            }
+                            lines.push(format!("data: {event}"));
                         }
                         return Step::Fail {
                             error,

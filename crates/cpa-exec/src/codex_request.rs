@@ -376,8 +376,8 @@ pub(crate) fn is_native(req: &ExecRequest) -> bool {
 }
 
 /// An official Codex client (Go `isCodexResponsesClientRequest`) reading Responses events
-/// itself: it gets an upstream context-window `response.failed` unchanged
-/// (`cpa_common::codex_client::is_context_window_failure`).
+/// itself: it gets an upstream context-window rejection as the `response.failed` Codex
+/// compacts on (`cpa_common::codex_client::context_window_failure_event`).
 pub(crate) fn codex_client(req: &ExecRequest) -> bool {
     responses_formats(req) && cpa_common::codex_client::is_codex_responses_client(&req.headers)
 }

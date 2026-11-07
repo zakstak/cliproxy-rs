@@ -1422,7 +1422,13 @@ async fn late_interrupts_for_finished_responses_are_done() {
 #[tokio::test]
 async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() {
     const CONTEXT: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
-    for (preserves, last, deferred) in [(true, CONTEXT, true), (false, CONTEXT, false), (true, CREATED, false)] {
+    for (preserves, last, deferred) in [
+        (true, CONTEXT, true),
+        (true, LIVE_CONTEXT_ERROR.trim(), true),
+        (false, CONTEXT, false),
+        (false, LIVE_CONTEXT_ERROR.trim(), false),
+        (true, CREATED, false),
+    ] {
         let (_up, url) = upstream(vec![Act::SendClose(vec![last], 1000)]).await;
         let executor = CodexExecutor::new().unwrap();
         let conn = pooled(&executor, &url).await;
@@ -1448,6 +1454,101 @@ async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() 
             executor.ws.session("conn-1").current().is_none(),
             "{preserves} {last}: socket kept"
         );
+    }
+}
+
+/// The ChatGPT Codex backend's rejection of an input larger than the window, recorded
+/// from a live subscription request: an `error` event without a status, before
+/// `response.created`.
+const LIVE_CONTEXT_ERROR: &str = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json");
+
+fn codex_client_request(body: &str) -> ExecRequest {
+    let mut req = request(body);
+    req.headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_static("codex_cli_rs/0.167.0"),
+    );
+    req
+}
+
+/// The live context-window rejection reaches a Codex client as the `response.failed`
+/// Codex compacts on, followed by Go's classified 400 `context_too_large`, which is also
+/// the one loss the session reports. With bootstrap buffering, and when the upstream
+/// closes the socket right after the event, the same holds. Other clients get only
+/// Go's classified error.
+#[tokio::test]
+async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
+    let live = LIVE_CONTEXT_ERROR.trim();
+    let normalized = cpa_common::codex_client::context_window_failure_event(live)
+        .unwrap()
+        .into_owned();
+    let buffered = Config::parse("codex:\n  stream-bootstrap-buffering: true\n").unwrap();
+    for (name, codex_client, cfg, act) in [
+        ("codex", true, Config::default(), Act::Send(vec![live])),
+        ("codex buffered", true, buffered.clone(), Act::Send(vec![live])),
+        (
+            "codex then close",
+            true,
+            Config::default(),
+            Act::SendClose(vec![live], 1000),
+        ),
+        (
+            "codex buffered then close",
+            true,
+            buffered.clone(),
+            Act::SendClose(vec![live], 1000),
+        ),
+        ("other", false, Config::default(), Act::Send(vec![live])),
+        (
+            "other buffered then close",
+            false,
+            buffered.clone(),
+            Act::SendClose(vec![live], 1000),
+        ),
+    ] {
+        let (_up, url) = upstream(vec![act]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let req = if codex_client {
+            codex_client_request(BODY)
+        } else {
+            request(BODY)
+        };
+        let items = match executor
+            .execute_in_session(&credential(&url), req, &cfg, &session(false))
+            .await
+        {
+            Ok(response) => collect(response).await,
+            Err(error) => vec![Err(error)],
+        };
+        let (events, errors): (Vec<_>, Vec<_>) = items.into_iter().partition(Result::is_ok);
+        let events: Vec<String> = events.into_iter().map(Result::unwrap).collect();
+        if codex_client {
+            assert_eq!(events, std::slice::from_ref(&normalized), "{name}");
+        } else {
+            assert!(events.is_empty(), "{name}: {events:?}");
+        }
+        let [Err(error)] = errors.as_slice() else {
+            panic!("{name}: one error, got {errors:?}");
+        };
+        assert_eq!(error.status, 400, "{name}");
+        assert_eq!(error.scope, FailureScope::Request, "{name}");
+        let code = |e: &ExecError| {
+            gjson::get(&String::from_utf8_lossy(&e.body), "error.code")
+                .str()
+                .to_owned()
+        };
+        assert_eq!(code(error), "context_too_large", "{name}");
+        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1"))
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the session's loss was not reported"));
+        // For other clients a close right after the event can be the loss, as in Go.
+        if codex_client {
+            assert_eq!(
+                code(&loss),
+                "context_too_large",
+                "{name}: the loss is the classified error"
+            );
+        }
     }
 }
 

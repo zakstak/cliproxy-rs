@@ -169,3 +169,47 @@ fn normalizes_missing_or_null_instructions() {
         assert_eq!(String::from_utf8(body).unwrap(), want);
     }
 }
+
+/// The ChatGPT Codex backend's rejection of an input larger than the window, recorded
+/// from a live subscription request (no `response.created` before it).
+const LIVE_CONTEXT_ERROR: &str = include_str!("../tests/fixtures/codex_context_window_error_live.json");
+
+#[test]
+fn context_window_error_becomes_the_failure_codex_compacts_on() {
+    let event = LIVE_CONTEXT_ERROR.trim();
+    assert!(is_context_window_rejection(event.as_bytes()));
+    assert!(!is_context_window_failure(event.as_bytes()));
+    let out = context_window_failure_event(event).expect("normalized");
+    assert_eq!(
+        out,
+        concat!(
+            r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_0565bda653e9b5da016aee80a2d70487d18b1c1858bc049dcf","object":"response","status":"failed","#,
+            r#""error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","param":"input","code":"context_length_exceeded"}}}"#
+        )
+    );
+    assert!(is_context_window_failure(out.as_bytes()));
+}
+
+#[test]
+fn context_window_failure_event_keeps_failures_and_ignores_others() {
+    let failed = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"context_length_exceeded"}}}"#;
+    assert!(matches!(context_window_failure_event(failed), Some(std::borrow::Cow::Borrowed(f)) if f == failed));
+    assert_eq!(
+        context_window_failure_event(r#"{"type":"error","error":{"code":"context_length_exceeded"}}"#).as_deref(),
+        Some(
+            r#"{"type":"response.failed","response":{"object":"response","status":"failed","error":{"code":"context_length_exceeded"}}}"#
+        )
+    );
+    for other in [
+        r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        r#"{"type":"error","error":{"code":"context_too_large"}}"#,
+        r#"{"type":"error","code":"context_length_exceeded"}"#,
+        r#"{"type":"error","status":400,"error":{"code":"context_length_exceeded"}}"#,
+        r#"{"type":"error","status_code":400,"error":{"code":"context_length_exceeded"}}"#,
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#,
+        r#"{"type":"response.completed","response":{"error":{"code":"context_length_exceeded"}}}"#,
+    ] {
+        assert!(context_window_failure_event(other).is_none(), "{other}");
+        assert!(!is_context_window_rejection(other.as_bytes()), "{other}");
+    }
+}

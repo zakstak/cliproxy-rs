@@ -1229,4 +1229,92 @@ mod context_window {
         let name = "steering_other_client_ctx_close1009";
         steering_failure_then(name, None, FAILED, "close1009_spaced", " oversized ").await;
     }
+
+    /// The ChatGPT Codex backend's rejection of an input larger than the window, recorded
+    /// from a live subscription request: an `error` event without a status and before
+    /// `response.created`. Codex ignores such an event, so a Codex client receives it as
+    /// the `response.failed` Codex compacts on, with the original error object, response
+    /// ID and sequence number.
+    mod live_error {
+        use super::*;
+
+        fn live() -> &'static str {
+            include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json").trim()
+        }
+
+        fn normalized(live: &str) -> String {
+            let error = &live[live.find(r#"{"message""#).unwrap()..live.find(r#","response_id""#).unwrap()];
+            format!(
+                r#"{{"type":"response.failed","sequence_number":3,"response":{{"id":"resp_0565bda653e9b5da016aee80a2d70487d18b1c1858bc049dcf","object":"response","status":"failed","error":{error}}}}}"#
+            )
+        }
+
+        #[tokio::test]
+        async fn ws_as_the_first_event() {
+            let frames = vec![text(&normalized(live())), closed()];
+            turn("live_ws_first_event", Transport::Websocket, &[live()], "close", frames).await;
+        }
+
+        #[tokio::test]
+        async fn ws_then_upstream_close() {
+            for then in ["close_now", "close1009_now", "drop_now"] {
+                let frames = vec![text(&normalized(live())), closed()];
+                let name = format!("live_ws_first_event_{then}");
+                turn_with(
+                    &name,
+                    Some(CODEX_UA),
+                    Transport::Websocket,
+                    &[live()],
+                    "close",
+                    frames,
+                    None,
+                    Some(then),
+                )
+                .await;
+            }
+        }
+
+        #[tokio::test]
+        async fn steering_as_the_first_event() {
+            let frames = vec![text(&normalized(live())), closed()];
+            turn(
+                "live_steering_first_event",
+                Transport::Steering,
+                &[live()],
+                "close",
+                frames,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn http_as_the_first_event() {
+            let frames = vec![text(&normalized(live())), closed()];
+            turn("live_http_first_event", Transport::Http, &[live()], "close", frames).await;
+        }
+
+        /// A slow client still gets the whole event before the connection closes, when the
+        /// upstream also ends its socket right after it.
+        #[tokio::test]
+        async fn ws_slow_client_upstream_ends() {
+            let message = format!(
+                "Your input exceeds the context window of this model. {}",
+                "x".repeat(8 << 20)
+            );
+            let live = live().replace(
+                "Your input exceeds the context window of this model. Please adjust your input and try again.",
+                &message,
+            );
+            let frames = vec![text(&normalized(&live)), closed()];
+            turn_paused("live_ws_slow_client_close", &[&live], frames, 300, Some("close_now")).await;
+        }
+
+        #[tokio::test]
+        async fn other_clients_keep_the_classified_error() {
+            for transport in [Transport::Websocket, Transport::Http] {
+                let frames = vec![text(GENERIC), closed()];
+                turn_as("live_other_client", None, transport, &[live()], "close", frames).await;
+            }
+        }
+    }
 }

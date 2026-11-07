@@ -2055,3 +2055,38 @@ fn context_window_failure_reaches_codex_clients_unchanged() {
         assert_eq!(fail(true, other).1.as_deref(), go_step, "{other}");
     }
 }
+
+/// The live ChatGPT Codex rejection of an oversized input is an `error` event without a
+/// status, which Codex ignores. A Codex client receives it as the `response.failed` Codex
+/// compacts on, with the original error object; the attempt still fails with Go's
+/// classified 400 `context_too_large`, and other clients keep Go's step.
+#[test]
+fn live_context_window_error_reaches_codex_clients_as_a_failure() {
+    use crate::codex_response::{Processor, Step};
+    let live = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json").trim();
+    let normalized = cpa_common::codex_client::context_window_failure_event(live).unwrap();
+    assert!(cpa_common::codex_client::is_context_window_failure(
+        normalized.as_bytes()
+    ));
+    let event = format!("event: error\ndata: {live}\n\n");
+    for codex_client in [true, false] {
+        let Step::Fail { error, before, .. } = Processor::new(false, false)
+            .codex_client(codex_client)
+            .event(event.as_bytes())
+        else {
+            panic!("a failure");
+        };
+        let want = if codex_client {
+            format!("event: response.failed\ndata: {normalized}\n\n")
+        } else {
+            "event: error\n\n".to_owned()
+        };
+        assert_eq!(before.as_deref(), Some(want.as_bytes()), "codex client {codex_client}");
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(
+            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large"
+        );
+    }
+}
