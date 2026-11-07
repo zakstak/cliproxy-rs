@@ -117,7 +117,6 @@ async fn existing_file_keeps_user_fields_but_never_old_tokens() {
         saved["disabled"], true,
         "re-login keeps an explicitly disabled account disabled"
     );
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

@@ -107,7 +107,6 @@ fn recovery_dir(parent: &Path) -> std::io::Result<PathBuf> {
         let dir = parent.join(format!(".gitstore-recovery-{}{nanos:09}{n}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(false);
-        #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         match builder.create(&dir) {
             Ok(()) => return Ok(dir),
@@ -145,13 +144,7 @@ fn apply_local_changes(source: &Path, target: &Path, paths: &[String]) -> Result
         }
         if info.file_type().is_symlink() {
             let link = std::fs::read_link(&from).with_context(|| format!("read local symlink {path}"))?;
-            #[cfg(unix)]
             std::os::unix::fs::symlink(&link, &to).with_context(|| format!("write local symlink {path}"))?;
-            #[cfg(not(unix))]
-            bail!(
-                "local change {path} is a symlink ({}); not supported here",
-                link.display()
-            );
         } else if info.is_file() {
             std::fs::copy(&from, &to).with_context(|| format!("write local change {path}"))?;
         } else {
@@ -1028,6 +1021,6 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 }
 
 // Local git remotes and file modes: Unix only, like tests/git.rs.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "git_tests.rs"]
 mod tests;

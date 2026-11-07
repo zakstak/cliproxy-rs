@@ -53,8 +53,6 @@ fn join_v4(ifaces: &[Iface]) -> Result<UdpSocket, String> {
     let fail = |op: &'static str| move |e: io::Error| format!("{ctx}: {}", os_error(op, &e));
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(fail("socket"))?;
     socket.set_reuse_address(true).map_err(fail("setsockopt"))?;
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-    socket.set_reuse_port(true).map_err(fail("setsockopt"))?;
     socket
         .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)).into())
         .map_err(fail("bind"))?;
@@ -83,8 +81,6 @@ fn join_v6(ifaces: &[Iface]) -> Result<UdpSocket, String> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).map_err(fail("socket"))?;
     socket.set_only_v6(true).map_err(fail("setsockopt"))?;
     socket.set_reuse_address(true).map_err(fail("setsockopt"))?;
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-    socket.set_reuse_port(true).map_err(fail("setsockopt"))?;
     socket
         .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, PORT)).into())
         .map_err(fail("bind"))?;

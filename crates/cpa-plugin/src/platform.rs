@@ -35,12 +35,10 @@ pub fn valid_version(version: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-'))
 }
 
-/// Go `runtime.GOOS` for this build.
+/// Go `runtime.GOOS` for this build: this fork builds only for Linux (enforced in
+/// `cpa-core`).
 pub fn goos() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
+    "linux"
 }
 
 /// Go `runtime.GOARCH` for this build.

@@ -6,7 +6,6 @@
 //! emitters format differently).
 
 // Native plugins load only on Unix (the host's `native` module).
-#![cfg(unix)]
 
 #[path = "go_host/auth.rs"]
 mod auth;

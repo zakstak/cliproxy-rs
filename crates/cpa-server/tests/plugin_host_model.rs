@@ -1,6 +1,5 @@
 //! v8.0.35 internal host.model callbacks through the production dispatcher and
 //! native plugins, with private credentials and loopback-only upstreams.
-#![cfg(unix)]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

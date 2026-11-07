@@ -2,7 +2,6 @@
 //! `websocket_response_observer` receives every upstream Codex WebSocket text message of
 //! a request (Go `EmitWebSocketResponseEvent` beside `AppendCodexAPIWebsocketResponse`),
 //! with fake credentials and a loopback upstream.
-#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

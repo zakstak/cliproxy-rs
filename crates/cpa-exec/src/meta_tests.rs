@@ -479,7 +479,6 @@ fn file_names_and_writer_match_go() {
         std::fs::write(&path, disk).unwrap();
         meta_auth::save_token_file(&path, &storage, snapshot.as_ref()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), out, "{name}: file");
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

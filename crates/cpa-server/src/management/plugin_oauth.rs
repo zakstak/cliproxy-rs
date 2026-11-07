@@ -287,7 +287,6 @@ pub(super) fn write_callback_file(
     }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder
         .create(auth_dir)
@@ -297,7 +296,6 @@ pub(super) fn write_callback_file(
     let target = auth_dir.join(format!(".oauth-{provider}-{}.oauth", sid.trim()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut attempt = 0u32;
     let (tmp_path, mut tmp) = loop {

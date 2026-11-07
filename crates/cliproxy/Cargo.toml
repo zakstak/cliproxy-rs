@@ -18,9 +18,6 @@ pkg-url = "{ repo }/releases/download/v{ version }/cliproxy-{ version }-{ target
 bin-dir = "cliproxy-{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
-[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-fmt = "zip"
-
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -38,8 +35,7 @@ libc.workspace = true
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-# `all` for SO_REUSEPORT, which Go sets on mDNS sockets outside Linux.
-socket2 = { workspace = true, features = ["all"] }
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tokio-util = "0.7"

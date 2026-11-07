@@ -226,12 +226,10 @@ fn user_status_matches_go() {
         }),
         *go
     );
-    if go_os_matches_fixture() {
-        assert_eq!(
-            b64(&user_status_request("tok", "fp")),
-            v["user_status_request_b64"].as_str().unwrap()
-        );
-    }
+    assert_eq!(
+        b64(&user_status_request("tok", "fp")),
+        v["user_status_request_b64"].as_str().unwrap()
+    );
 }
 
 #[test]
@@ -436,11 +434,6 @@ fn mask_proto(msg: &mut [u8], path: &[i64]) {
     }
 }
 
-/// Go fills `runtime.GOOS` into client metadata; the fixtures were recorded on Linux.
-fn go_os_matches_fixture() -> bool {
-    crate::kimi_http::go_os() == "linux"
-}
-
 fn bind_session(req: &mut ExecRequest) {
     let id = cpa_common::session::extract_session_id(
         &req.headers,
@@ -599,24 +592,20 @@ async fn check_executor_fixture(name: &str) {
                 "Sentry-Trace" if !custom_trace => {
                     assert!(trace.is_match(rv), "{name}: sentry trace {rv}");
                 }
-                // The frame embeds runtime.GOOS, so its length matches Go's only on Linux.
+                // The frame embeds runtime.GOOS; the fixtures were recorded on Linux.
                 "Content-Length" => {
                     assert_eq!(rv, &r.body.len().to_string(), "{name}: header {n}");
-                    if go_os_matches_fixture() {
-                        assert_eq!(rv, gv, "{name}: header {n}");
-                    }
+                    assert_eq!(rv, gv, "{name}: header {n}");
                 }
                 _ => assert_eq!(rv, gv, "{name}: header {n}"),
             }
         }
         let (mut rb, mut gb) = (r.body.clone(), g.body.clone());
-        if go_os_matches_fixture() {
-            for body in [&mut rb, &mut gb] {
-                assert_eq!(&body[..1], &[0], "{name}: data frame");
-                mask_proto(&mut body[5..], &[3, 1]);
-            }
-            assert_eq!(b64(&rb), b64(&gb), "{name}: GetChatMessage frame");
+        for body in [&mut rb, &mut gb] {
+            assert_eq!(&body[..1], &[0], "{name}: data frame");
+            mask_proto(&mut body[5..], &[3, 1]);
         }
+        assert_eq!(b64(&rb), b64(&gb), "{name}: GetChatMessage frame");
     }
     // Downstream.
     let go = &fx["downstream"];
@@ -778,9 +767,7 @@ async fn refresh_matches_go_fixtures() {
                 mask_proto(&mut r.body, &[1, 31]);
                 mask_proto(&mut g.body, &[1, 31]);
             }
-            if go_os_matches_fixture() {
-                crate::kimi_fixture::assert_same_request(name, &g, &r, &["Host"]);
-            }
+            crate::kimi_fixture::assert_same_request(name, &g, &r, &["Host"]);
         }
         match fx["downstream"]["err_body"].as_str() {
             Some(message) => {
@@ -845,9 +832,6 @@ async fn auth_record_matches_go_fixtures() {
                 // The login fingerprint is random (no device seed).
                 mask_proto(&mut r.body, &[1, 31]);
                 mask_proto(&mut g.body, &[1, 31]);
-                if !go_os_matches_fixture() {
-                    continue;
-                }
             }
             crate::kimi_fixture::assert_same_request(name, &g, &r, &["Host"]);
         }

@@ -2,7 +2,6 @@
 //! report a closed client, never touch freed library state.
 
 // Native plugins load only on Unix (the host's `native` module).
-#![cfg(unix)]
 
 mod support;
 

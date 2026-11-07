@@ -215,7 +215,7 @@ fn go_target_of(source: &str) -> Option<axum::http::Uri> {
 /// with Go's request target (`URL.RequestURI`) and must answer 200. Either is capped at
 /// 8 MiB.
 async fn read_source(source: &str) -> Result<Vec<u8>, ReadError> {
-    let data = if cpa_core::config::go_is_abs(source, cfg!(windows)) {
+    let data = if cpa_core::config::go_is_abs(source) {
         use tokio::io::AsyncReadExt;
         let file = tokio::fs::File::open(source).await.map_err(|_| ReadError::File)?;
         let mut data = Vec::new();

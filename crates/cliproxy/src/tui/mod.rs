@@ -68,8 +68,7 @@ pub enum Msg {
 enum Event {
     Term(TermEvent),
     Msg(Msg),
-    /// SIGTERM (Unix; Windows has only the console's Ctrl+C).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// SIGTERM.
     Quit,
     /// SIGINT (Ctrl+C itself is a key while the terminal is raw).
     Interrupted,
@@ -160,34 +159,18 @@ impl Drop for Workers {
 
 /// Bubble Tea's signal handling: SIGTERM quits, SIGINT interrupts (`ErrInterrupted`).
 /// The handlers are installed by [`signals`] before the terminal changes.
-#[cfg(unix)]
 type Signals = (tokio::signal::unix::Signal, tokio::signal::unix::Signal);
-#[cfg(not(unix))]
-type Signals = ();
 
-#[cfg(unix)]
 fn signals() -> io::Result<Signals> {
     use tokio::signal::unix::{SignalKind, signal};
     Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
 }
 
-#[cfg(not(unix))]
-fn signals() -> io::Result<Signals> {
-    Ok(())
-}
-
-#[cfg(unix)]
 async fn signal(mut signals: Signals) -> Event {
     tokio::select! {
         _ = signals.0.recv() => Event::Quit,
         _ = signals.1.recv() => Event::Interrupted,
     }
-}
-
-#[cfg(not(unix))]
-async fn signal(_: Signals) -> Event {
-    let _ = tokio::signal::ctrl_c().await;
-    Event::Interrupted
 }
 
 /// Go `RunWithBaseURL`: runs the TUI against `base_url` on the alternate screen of
@@ -202,8 +185,6 @@ pub fn run<W: Write + Send + 'static>(
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Handle::current();
     let mut app = app::App::new(base_url, secret, hook);
-    // Unit outside Unix, where Ctrl+C needs no handler set up in advance.
-    #[cfg_attr(not(unix), allow(clippy::let_unit_value))]
     let handlers = {
         let _context = runtime.enter();
         signals()?

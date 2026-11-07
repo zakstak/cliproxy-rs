@@ -69,16 +69,12 @@ pub(crate) struct Access {
     warned_untrusted_forwarding: AtomicBool,
 }
 
-/// An environment value as Go reads it: raw bytes on Unix; on Windows the UTF-16
-/// value decoded to UTF-8 with invalid units replaced (Go `syscall.Getenv`).
+/// An environment value as Go reads it: raw bytes.
 fn env_bytes(key: &str) -> Vec<u8> {
     let Some(value) = std::env::var_os(key) else {
         return Vec::new();
     };
-    #[cfg(unix)]
-    return std::os::unix::ffi::OsStringExt::into_vec(value);
-    #[cfg(not(unix))]
-    return value.to_string_lossy().into_owned().into_bytes();
+    std::os::unix::ffi::OsStringExt::into_vec(value)
 }
 
 /// Go `startAttemptCleanup`: an hourly purge for as long as the management state

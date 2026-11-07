@@ -675,7 +675,7 @@ mod seed_tests {
 }
 
 // Mode-bit assertions: Unix only.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -857,7 +857,6 @@ pub(super) fn write_file(dst: &Path, data: &[u8]) -> std::io::Result<()> {
         let tmp = dir.join(format!(".{name}.{}.{n}.upload", std::process::id()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&tmp) {
             Ok(f) => break (tmp, f),
@@ -3080,7 +3079,6 @@ mod tests {
 
     /// Go's store leaves a file whose document is unchanged alone (`jsonEqual`, numbers
     /// as float64): no new inode or mtime, and the record is published all the same.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_unchanged_save_writes_nothing() {
         use std::os::unix::fs::MetadataExt;
@@ -3114,7 +3112,6 @@ mod tests {
     /// Go `FileTokenStore.Save` skips writing an equal document, and the manager still
     /// publishes the saved record: a file edited to the same state behind its back, and
     /// an integer float64 cannot tell from the file's, both reach memory.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_equal_save_still_publishes_the_record() {
         use std::os::unix::fs::MetadataExt;

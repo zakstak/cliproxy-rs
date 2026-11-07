@@ -184,7 +184,6 @@ async fn model_detail_comes_from_the_clients_catalog() {
 /// the detail is picked from the catalog a response interceptor returned (its stale
 /// `Content-Length` dropped), and the request lifecycle completes once with the detail's
 /// status. The plugin is the Go recorder test plugin.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_detail_reads_the_intercepted_catalog() {
     use base64::Engine as _;

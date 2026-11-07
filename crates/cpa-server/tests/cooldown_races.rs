@@ -167,7 +167,6 @@ async fn in_flight_successes_keep_a_fresh_quota_cooldown() {
 /// Go stamps a dispatch right before it executes, after the after-auth interceptor: a
 /// request whose interceptor was still running when a 429 was recorded is dispatched
 /// after it, so its success clears the cooldown.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dispatch_after_its_interceptor_clears_a_cooldown_recorded_meanwhile() {
     let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));

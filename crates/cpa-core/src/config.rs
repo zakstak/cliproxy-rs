@@ -1191,7 +1191,6 @@ mod tests {
 
     /// Go `TestPrepareConfigFileForUploadReportsSecretItCannotHash` "read-only file";
     /// tests/prepare_upload_go.rs replays the other Go cases.
-    #[cfg(unix)]
     #[test]
     fn prepare_for_upload_refuses_a_file_it_cannot_write() {
         use std::os::unix::fs::PermissionsExt as _;
