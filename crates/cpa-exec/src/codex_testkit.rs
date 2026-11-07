@@ -122,6 +122,8 @@ pub(crate) enum Tap {
     WsHandshake(u16),
     WsResponse(String),
     WsError(String, String),
+    /// The transport diagnostic the preceding [`WsError`](Tap::WsError) carried.
+    WsCause(String),
 }
 
 /// A capture observer that keeps every event (the request log's view of the attempt).
@@ -160,7 +162,14 @@ impl cpa_core::exec::CaptureObserver for Wiretap {
             },
             WebsocketHandshake(status, _) => Tap::WsHandshake(status),
             WebsocketResponse(bytes) => Tap::WsResponse(text(bytes)),
-            WebsocketError { stage, error } => Tap::WsError(stage.into(), error.into()),
+            WebsocketError { stage, error, cause } => {
+                let mut taps = self.0.lock().unwrap();
+                taps.push(Tap::WsError(stage.into(), error.into()));
+                if let Some(cause) = cause {
+                    taps.push(Tap::WsCause(cause.into()));
+                }
+                return;
+            }
         };
         self.0.lock().unwrap().push(tap);
     }

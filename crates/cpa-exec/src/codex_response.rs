@@ -250,6 +250,7 @@ pub(crate) fn status_error_raw(code: u16, message: &str, headers: HeaderMap, mod
         retry_after,
         direct: false,
         addon: None,
+        diagnostic: None,
     }
 }
 

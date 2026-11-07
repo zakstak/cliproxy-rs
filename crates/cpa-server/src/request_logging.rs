@@ -664,7 +664,7 @@ impl RequestLog {
                 part.extend_from_slice(payload);
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
-            WebsocketError { stage, error } => {
+            WebsocketError { stage, error, cause } => {
                 record.api_timestamp.get_or_insert_with(Local::now);
                 let mut part = websocket_event("api.websocket.error");
                 let stage = crate::gojson::trim(stage);
@@ -672,6 +672,9 @@ impl RequestLog {
                     writeln!(part, "Stage: {stage}").unwrap();
                 }
                 writeln!(part, "Error: {error}").unwrap();
+                if let Some(cause) = cause.filter(|c| !c.trim().is_empty()) {
+                    writeln!(part, "Cause: {}", logged_cause(cause)).unwrap();
+                }
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
         }
@@ -1430,6 +1433,154 @@ fn logged_url(url: &str) -> String {
     out
 }
 
+/// Longest `Cause:` value written, in bytes, after redaction.
+const MAX_CAUSE: usize = 1024;
+
+/// Addition (docs/DIFFERENCES-FROM-GO.md): the `Cause:` line of an `api.websocket.error`
+/// event, a transport diagnostic built from library error texts, which can embed URLs,
+/// header lines and arbitrary bytes. Before writing it:
+/// - control characters (newlines, tabs, escapes, U+2028 and U+2029) become `\u{..}`, so
+///   the text cannot start a log line or section of its own;
+/// - a URL keeps its scheme, host and path: userinfo, query and fragment become
+///   `<redacted>`, as does the userinfo of a bare `user:pass@host`;
+/// - the value after an auth scheme (`Bearer`, `Basic`, ...) or a credential-like name
+///   followed by `:` or `=` becomes `<redacted>`, however short; after a cookie name,
+///   everything to the end does;
+/// - the result is cut to [`MAX_CAUSE`] bytes at a space.
+///
+/// Walks the text once; diagnostics are at most `Diagnostic::MAX` bytes anyway.
+fn logged_cause(cause: &str) -> String {
+    let mut out = String::with_capacity(cause.len());
+    // Tokens still to redact: after `Authorization:` or `Bearer`, or all after a cookie.
+    let mut pending = 0usize;
+    let mut rest = cause;
+    loop {
+        // A control character separates tokens like a space, so `\nAuthorization:` is
+        // still a header name.
+        let end = rest.find(|c: char| c == ' ' || line_break(c)).unwrap_or(rest.len());
+        out.push_str(&cause_token(&rest[..end], &mut pending));
+        let Some(separator) = rest[end..].chars().next() else {
+            break;
+        };
+        if separator == ' ' {
+            out.push(' ');
+        } else {
+            out.push_str(&format!("\\u{{{:x}}}", separator as u32));
+        }
+        rest = &rest[end + separator.len_utf8()..];
+    }
+    if out.len() > MAX_CAUSE {
+        const TRUNCATED: &str = " [truncated]";
+        let mut end = MAX_CAUSE - TRUNCATED.len();
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = out[..end].rfind(' ').filter(|&i| i > 0).unwrap_or(end);
+        out.truncate(end);
+        out.push_str(TRUNCATED);
+    }
+    out
+}
+
+fn line_break(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// One space-free token of a diagnostic, redacted.
+fn cause_token(token: &str, pending: &mut usize) -> String {
+    if *pending > 0 {
+        if auth_scheme(token) {
+            return token.to_owned();
+        }
+        *pending -= 1;
+        return REDACTED.to_owned();
+    }
+    if token.contains("://") {
+        return cause_url(token);
+    }
+    if let Some(at) = bare_userinfo(token) {
+        return format!("{REDACTED}{}", &token[at..]);
+    }
+    if let Some((name, value)) = token.find([':', '=']).map(|i| token.split_at(i + 1)) {
+        let key = name[..name.len() - 1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if credential_name(key) {
+            if cookie(&key.to_ascii_lowercase()) {
+                *pending = usize::MAX;
+            } else if value.trim_matches(|c: char| !c.is_ascii_alphanumeric()).is_empty() {
+                *pending = 1;
+            }
+            return if value.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}{REDACTED}")
+            };
+        }
+        return token.to_owned();
+    }
+    if auth_scheme(token) {
+        *pending = 1;
+    }
+    token.to_owned()
+}
+
+/// `Bearer`, `Basic` and the other HTTP auth schemes a header value starts with.
+fn auth_scheme(token: &str) -> bool {
+    let word = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    ["bearer", "basic", "digest", "negotiate", "ntlm", "token"]
+        .iter()
+        .any(|scheme| word.eq_ignore_ascii_case(scheme))
+}
+
+/// A header or parameter name whose value is a credential.
+fn credential_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "auth",
+        "cookie",
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "session",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+/// The `@` of `user:pass@host` outside a URL.
+fn bare_userinfo(token: &str) -> Option<usize> {
+    let at = token.rfind('@')?;
+    token[..at].contains(':').then_some(at)
+}
+
+/// A URL in a diagnostic: scheme, host and path only.
+fn cause_url(token: &str) -> String {
+    let start = token.find("://").expect("a URL") + 3;
+    let (lead, rest) = token.split_at(start);
+    // Closing punctuation around a URL in a message (`for uri (...)`).
+    let rest_trimmed = rest.trim_end_matches([')', ']', '>', '"', '\'', ',', ';', ':', '.']);
+    let tail = &rest[rest_trimmed.len()..];
+    let mut rest = rest_trimmed;
+    let mut out = lead.to_owned();
+    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+    if let Some(at) = authority.rfind('@') {
+        out.push_str(REDACTED);
+        out.push('@');
+        rest = &rest[at + 1..];
+    }
+    match rest.find(['?', '#']) {
+        Some(i) => {
+            out.push_str(&rest[..=i]);
+            out.push_str(REDACTED);
+        }
+        None => out.push_str(rest),
+    }
+    out.push_str(tail);
+    out
+}
+
 fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
     if cookie(name) {
         return REDACTED.as_bytes().to_vec();
@@ -1792,6 +1943,7 @@ mod tests {
                         sink.record(WebsocketError {
                             stage: " read ",
                             error: "fixture disconnect",
+                            cause: None,
                         });
                     } else {
                         if kind == "reload" {
@@ -2769,6 +2921,108 @@ mod tests {
         assert_eq!(
             logged_url("https://user@host.example/x"),
             "https://<redacted>@host.example/x"
+        );
+    }
+
+    /// Library error texts as a transport diagnostic carries them: URLs with userinfo and
+    /// query, proxy and auth header lines, short keys, cookies and line injection.
+    const HOSTILE_CAUSES: [&str; 6] = [
+        "connect (ConnectionRefused): error sending request for uri (wss://alice:pw-h1dden@proxy.example/v1/responses?api_key=sk-h1dden#h1dden): tcp connect error: Connection refused (os error 111)",
+        "proxy_connect: tunnel refused, sent Proxy-Authorization: Basic YWxpY2U6aDFkZGVu and authorization=Bearer%20h1dden",
+        "io (Other): IO error: bad\r\n=== API RESPONSE 9 ===\nAuthorization: Bearer sk-h1dd3n\u{1b}[31m\u{2028}x-api-key: h1dden",
+        "unclassified: token=ab api_key: k1 \"client_secret\":\"h1dden\" Token zz",
+        "socks5: refused by bob:h1dden@10.0.0.1:1080",
+        "tls: alert from upstream; Cookie: session=h1dden; other=h1dden2",
+    ];
+
+    #[test]
+    fn transport_causes_are_redacted_before_logging() {
+        for cause in HOSTILE_CAUSES {
+            let logged = logged_cause(cause);
+            assert!(!logged.contains("h1dden") && !logged.contains("h1dd3n"), "{logged}");
+            assert!(
+                !logged.contains("YWxpY2U6aDFkZGVu") && !logged.contains("alice"),
+                "{logged}"
+            );
+            assert!(!logged.chars().any(|c| c.is_control() || c == '\u{2028}'), "{logged:?}");
+        }
+        assert_eq!(
+            logged_cause(HOSTILE_CAUSES[0]),
+            "connect (ConnectionRefused): error sending request for uri (wss://<redacted>@proxy.example/v1/responses?<redacted>): tcp connect error: Connection refused (os error 111)"
+        );
+        assert_eq!(
+            logged_cause(HOSTILE_CAUSES[2]),
+            "io (Other): IO error: bad\\u{d}\\u{a}=== API RESPONSE 9 ===\\u{a}Authorization: Bearer <redacted>\\u{1b}[31m\\u{2028}x-api-key: <redacted>"
+        );
+        // Short values are redacted whole, not shortened.
+        assert_eq!(
+            logged_cause(HOSTILE_CAUSES[3]),
+            "unclassified: token=<redacted> api_key: <redacted> \"client_secret\":<redacted> Token <redacted>"
+        );
+        assert_eq!(
+            logged_cause(HOSTILE_CAUSES[5]),
+            "tls: alert from upstream; Cookie: <redacted> <redacted>"
+        );
+        // Evidence without credentials passes through unchanged.
+        for plain in [
+            "eof: the stream ended without a close frame",
+            "remote_close: code 1011",
+            "local_timeout: writing a 42-byte frame took longer than 10s",
+            "dns: error sending request for uri (wss://chatgpt.example/backend-api/codex/responses): dns error: failed to lookup address information",
+        ] {
+            assert_eq!(logged_cause(plain), plain);
+        }
+        // Bounded, cut at a space, with the cut marked.
+        let long = format!("io (Other): {}", "word ".repeat(2000));
+        let logged = logged_cause(&long);
+        assert!(
+            logged.len() <= MAX_CAUSE && logged.ends_with("word [truncated]"),
+            "{}",
+            logged.len()
+        );
+        let logged = logged_cause(&"x".repeat(5000));
+        assert!(
+            logged.len() <= MAX_CAUSE && logged.ends_with("x [truncated]"),
+            "{}",
+            logged.len()
+        );
+    }
+
+    /// The diagnostic reaches the persisted log as a `Cause:` line after Go's `Error:`
+    /// line, redacted and on one line; an event without one is written as before.
+    #[tokio::test]
+    async fn websocket_error_causes_reach_the_log_redacted() {
+        use cpa_core::exec::CaptureEvent::*;
+        let content = persisted(true, StatusCode::OK, |log| {
+            let sink = log.capture_sink();
+            for cause in HOSTILE_CAUSES {
+                sink.record(WebsocketError {
+                    stage: "dial",
+                    error: "codex websockets executor: dial failed",
+                    cause: Some(cause),
+                });
+            }
+            sink.record(WebsocketError {
+                stage: "upstream_error",
+                error: "{\"error\":\"go text\"}",
+                cause: None,
+            });
+        })
+        .await;
+        let content = String::from_utf8(content).unwrap();
+        assert!(!content.contains("h1dden") && !content.contains("h1dd3n"), "{content}");
+        assert!(!content.contains("\n=== API RESPONSE 9"), "{content}");
+        assert_eq!(content.matches("\nCause: ").count(), HOSTILE_CAUSES.len(), "{content}");
+        assert_eq!(
+            content
+                .matches("Error: codex websockets executor: dial failed\nCause: ")
+                .count(),
+            HOSTILE_CAUSES.len(),
+            "{content}"
+        );
+        assert!(
+            content.contains("Stage: upstream_error\nError: {\"error\":\"go text\"}\n\n"),
+            "{content}"
         );
     }
 

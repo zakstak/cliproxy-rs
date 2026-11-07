@@ -581,11 +581,11 @@ async fn a_repeated_ineligible_pick_fails_like_go() {
 async fn home_pick_errors_render_like_write_selection_error() {
     let home = Arc::new(FakeHome {
         fail: Some(RemoteError {
-            error: ExecError::local(
+            error: Box::new(ExecError::local(
                 429,
                 FailureScope::Credential,
                 "model_cooldown: all credentials for model gpt-live-1-codex are cooling down",
-            ),
+            )),
             code: "model_cooldown".into(),
             kind: RemoteErrorKind::Cooldown {
                 retry_after: Some(Duration::from_millis(2500)),

@@ -693,9 +693,17 @@ async fn a_write_the_upstream_never_reads_times_out() {
         panic!("a write that never completes fails the turn");
     };
     assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.body, "codex websockets executor: write timed out");
+    // The request log learns it was the proxy's own bound, and for how large a frame
+    // (whole seconds at this rate round up to 1 s, past the 300 ms floor).
+    let cause = error
+        .diagnostic
+        .as_ref()
+        .map(|d| d.as_str().to_owned())
+        .unwrap_or_default();
     assert!(
-        String::from_utf8_lossy(&error.body).contains("write timed out"),
-        "{error}"
+        cause.starts_with("local_timeout: writing a ") && cause.ends_with("-byte frame took longer than 1s"),
+        "{cause}"
     );
     assert_eq!(
         dials.load(std::sync::atomic::Ordering::SeqCst),
@@ -1107,13 +1115,136 @@ async fn capture_records_a_dial_failure() {
         .expect("nothing listens");
     let taps = tap.taps();
     assert!(matches!(&taps[0], Tap::WsRequest { .. }), "{taps:?}");
+    // The client-facing text stays fixed; the request log also gets the evidence.
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    let [Tap::WsError(stage, text), Tap::WsCause(cause)] = &taps[1..] else {
+        panic!("{taps:?}");
+    };
     assert_eq!(
-        taps[1..],
-        [Tap::WsError(
-            "dial".into(),
-            String::from_utf8_lossy(&error.body).into_owned()
-        )]
+        (stage.as_str(), text.as_str()),
+        ("dial", "codex websockets executor: dial failed")
     );
+    assert!(cause.starts_with("connect (ConnectionRefused): "), "{cause}");
+}
+
+/// The errors whose public text is fixed keep their causes apart in the request log:
+/// a close frame's code, a stream that ends without one, and the proxy's own idle
+/// deadline. Public texts and scopes are unchanged.
+#[tokio::test]
+async fn capture_keeps_why_a_socket_ended() {
+    use crate::codex_testkit::{Tap, Wiretap};
+    async fn read_failure(script: Vec<Act>, idle: Option<Duration>) -> (ExecError, String, String) {
+        let (_up, url) = upstream(script).await;
+        let tap = Arc::new(Wiretap::default());
+        let mut executor = CodexExecutor::new().unwrap();
+        if let Some(idle) = idle {
+            executor.ws = Arc::new(Pool::with_idle(idle));
+        }
+        let response = executor
+            .execute_in_session(
+                &credential(&url),
+                tapped(BODY, &tap),
+                &Config::default(),
+                &session(false),
+            )
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(response))
+            .await
+            .expect("the turn ends");
+        let error = events.last().unwrap().as_ref().expect_err("the turn fails").clone();
+        let taps = tap.taps();
+        let at = taps
+            .iter()
+            .position(|t| matches!(t, Tap::WsError(stage, _) if stage == "read"))
+            .unwrap_or_else(|| panic!("no read error: {taps:?}"));
+        let (Tap::WsError(_, text), Some(Tap::WsCause(cause))) = (&taps[at], taps.get(at + 1)) else {
+            panic!("no cause: {taps:?}");
+        };
+        assert_eq!(
+            text.as_bytes(),
+            error.body.as_ref(),
+            "the Error line is the turn's error"
+        );
+        (error, text.clone(), cause.clone())
+    }
+
+    let (error, text, cause) = read_failure(vec![Act::SendClose(vec![CREATED], 1011)], None).await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "websocket: close 1011 (internal server error): bye");
+    assert_eq!(cause, "remote_close: code 1011");
+
+    // gorilla's text for a peer that vanished is close 1006, which no peer can send:
+    // the cause says it was an end of stream, not a close frame.
+    let (error, text, cause) = read_failure(vec![Act::SendDrop(vec![CREATED])], None).await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "websocket: close 1006 (abnormal closure): unexpected EOF");
+    assert!(cause.starts_with("eof"), "{cause}");
+
+    let (error, text, cause) = read_failure(
+        vec![Act::Pings(Duration::from_millis(50), 40)],
+        Some(Duration::from_millis(300)),
+    )
+    .await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "codex websockets executor: read idle timeout");
+    assert_eq!(cause, "local_timeout: no application message within 300ms");
+}
+
+/// A TLS failure is labelled from BoringSSL's error type: the upstream answers plain
+/// HTTP on a `wss` URL.
+#[tokio::test]
+async fn capture_labels_a_tls_dial_failure() {
+    use crate::codex_testkit::{Tap, Wiretap};
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nnot tls").await;
+        }
+    });
+    let tap = Arc::new(Wiretap::default());
+    let error = CodexExecutor::new()
+        .unwrap()
+        .execute_in_session(
+            &credential(&url),
+            tapped(BODY, &tap),
+            &Config::default(),
+            &session(false),
+        )
+        .await
+        .err()
+        .expect("no TLS server");
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    assert_eq!(error.scope, FailureScope::Transport);
+    let taps = tap.taps();
+    let Some(Tap::WsCause(cause)) = taps.last() else {
+        panic!("{taps:?}");
+    };
+    assert!(cause.starts_with("tls: "), "{cause}");
+}
+
+/// A dial error's library text can carry the URL with its userinfo and query. It
+/// reaches only the request log's diagnostic (which the log redacts), never the error's
+/// body, `Display` or `Debug`.
+#[tokio::test]
+async fn a_dial_diagnostic_stays_out_of_the_public_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("http://alice:pw-h1dden@{addr}/backend?api_key=sk-h1dden");
+    let error = CodexExecutor::new()
+        .unwrap()
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .err()
+        .expect("nothing listens");
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    for shown in [format!("{error}"), format!("{error:?}")] {
+        assert!(!shown.contains("h1dden"), "{shown}");
+    }
+    assert!(error.diagnostic.is_some());
 }
 
 /// An upstream `error` event is recorded as received, then as stage `upstream_error`
