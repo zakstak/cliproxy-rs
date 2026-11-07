@@ -355,6 +355,13 @@ async fn run(name: &str) {
         .iter()
         .find(|s| s["name"] == name)
         .unwrap_or_else(|| panic!("no scenario {name}"));
+    run_scenario(name, scenario).await;
+}
+
+/// Runs one scenario and returns its runtime, for checks after the connection. A
+/// scenario without `upstream` (one not recorded from Go) skips the comparison of what
+/// upstream received.
+async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::Runtime> {
     let up = Arc::new(Upstream::default());
     for step in scenario["steps"].as_array().unwrap() {
         for reply in step["upstream"].as_array().into_iter().flatten() {
@@ -436,6 +443,10 @@ async fn run(name: &str) {
             let send = send.replace("{{last_response_id}}", &last_id);
             socket.send(Message::text(send)).await.unwrap();
         }
+        // A client that does not read for a while: large frames back up in the proxy's write.
+        if let Some(pause) = step["pause_ms"].as_u64() {
+            tokio::time::sleep(Duration::from_millis(pause)).await;
+        }
         let mode = step["read"].as_str().unwrap();
         if mode == "none" {
             assert!(expected.is_empty(), "{name} step {i}: Go read nothing");
@@ -489,12 +500,33 @@ async fn run(name: &str) {
                 break;
             }
         }
-        assert_eq!(got, expected, "{name} step {i}: client frames");
+        if got != expected {
+            // Frames can be megabytes long: show their start and length.
+            let short = |frames: &[Frame]| {
+                frames
+                    .iter()
+                    .map(|f| match f {
+                        Frame::Text(t) if t.len() > 300 => {
+                            format!("Text({}... {} bytes)", t.chars().take(300).collect::<String>(), t.len())
+                        }
+                        f => format!("{f:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            panic!(
+                "{name} step {i}: client frames\n got: {:?}\nwant: {:?}",
+                short(&got),
+                short(&expected)
+            );
+        }
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let captured = up.captured.lock().unwrap().clone();
-    let go: Vec<&Value> = scenario["upstream"].as_array().unwrap().iter().collect();
+    let Some(go) = scenario["upstream"].as_array() else {
+        return rt;
+    };
+    let go: Vec<&Value> = go.iter().collect();
     let kinds = |c: &[Captured]| c.iter().map(|c| c.kind.clone()).collect::<Vec<_>>();
     let go_kinds: Vec<String> = go.iter().map(|c| c["kind"].as_str().unwrap().to_owned()).collect();
     assert_eq!(
@@ -528,6 +560,7 @@ async fn run(name: &str) {
         scenario["http_canceled"].as_u64().unwrap_or(0),
         "{name}: held HTTP responses the proxy canceled"
     );
+    rt
 }
 
 #[tokio::test]
@@ -859,4 +892,272 @@ fn every_go_scenario_has_a_test() {
             "interrupt_late_ws",
         ]
     );
+}
+
+/// zakstak/cliproxy-rs#5, not recorded from Go: an upstream `response.failed` with
+/// `context_length_exceeded` reaches a Codex client byte for byte, then the connection
+/// closes as after any exposed request fault. Codex classifies only that event as
+/// `ContextWindowExceeded` (codex-api `parse_failed_response`) and then compacts; the
+/// generic `{"type":"error","status":400}` frame Go v8.0.35 sends instead maps to an
+/// invalid request (docs/DIFFERENCES-FROM-GO.md); other clients keep it. The scheduler
+/// still sees the classified request-scoped error: one failure, and no cooldown.
+mod context_window {
+    use super::*;
+    use serde_json::json;
+
+    /// Codex's own `ContextWindowExceeded` fixture (codex-api sse/responses.rs).
+    const FAILED: &str = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","created_at":1759510079,"status":"failed","background":false,"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null,"user":null,"metadata":{}}}"#;
+    const CREATED: &str = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","status":"in_progress","output":[]}}"#;
+    /// `response.created` as the HTTP transport delivers it (with the response model).
+    const CREATED_HTTP: &str = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","status":"in_progress","output":[],"model":"gpt-fixture"}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Partial answer"}"#;
+    const SEND: &str = r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"huge"}]}]}"#;
+
+    #[derive(Clone, Copy)]
+    enum Transport {
+        Websocket,
+        Steering,
+        Http,
+    }
+
+    /// Codex CLI's identity (Go `isCodexResponsesClientRequest`).
+    const CODEX_UA: &str = "codex_cli_rs/0.200.0 (Linux; x86_64) xterm";
+
+    /// One turn of a Codex client: `events` from upstream, `read` mode, and the frames the
+    /// client must see.
+    async fn turn(name: &str, transport: Transport, events: &[&str], read: &str, frames: Vec<Value>) {
+        turn_as(name, Some(CODEX_UA), transport, events, read, frames).await;
+    }
+
+    async fn turn_paused(name: &str, events: &[&str], frames: Vec<Value>, pause_ms: u64) {
+        turn_with(
+            name,
+            Some(CODEX_UA),
+            Transport::Websocket,
+            events,
+            "close",
+            frames,
+            Some(pause_ms),
+        )
+        .await;
+    }
+
+    async fn turn_as(
+        name: &str,
+        user_agent: Option<&str>,
+        transport: Transport,
+        events: &[&str],
+        read: &str,
+        frames: Vec<Value>,
+    ) {
+        turn_with(name, user_agent, transport, events, read, frames, None).await;
+    }
+
+    async fn turn_with(
+        name: &str,
+        user_agent: Option<&str>,
+        transport: Transport,
+        events: &[&str],
+        read: &str,
+        frames: Vec<Value>,
+        pause_ms: Option<u64>,
+    ) {
+        let (config, websockets) = match transport {
+            Transport::Websocket => ("host: \"\"\n", true),
+            Transport::Steering => ("host: \"\"\ncodex:\n  response-steering: true\n", true),
+            Transport::Http => ("host: \"\"\n", false),
+        };
+        let auth_dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let config = format!("auth-dir: {}\n{config}", auth_dir.display());
+        let mut attributes = json!({ "api_key": "sk-fake-ctx" });
+        if websockets {
+            attributes["websockets"] = json!("true");
+        }
+        let scenario = json!({
+            "name": name,
+            "config": config,
+            "credentials": [{ "id": "codex-ctx.json", "attributes": attributes, "models": ["gpt-fixture"] }],
+            "client_headers": user_agent.map(|ua| json!({ "user-agent": ua })),
+            "steps": [{
+                "send": SEND,
+                "read": read,
+                "pause_ms": pause_ms,
+                "upstream": [{ "events": events }],
+                "frames": frames,
+            }],
+        });
+        let rt = run_scenario(name, &scenario).await;
+        let credential = rt.store().snapshot().into_iter().next().unwrap();
+        assert!(
+            !rt.store().blocked(&credential, "gpt-fixture"),
+            "{name}: a context-window overflow is the request's fault, not the credential's"
+        );
+        assert!(
+            rt.store().cooldowns(&credential.id).is_empty(),
+            "{name}: {:?}",
+            rt.store().cooldowns(&credential.id)
+        );
+        // A steering failure after `response.created` leaves the attempt open.
+        if read == "close" {
+            assert_eq!(
+                (rt.store().stats().success, rt.store().stats().failure),
+                (0, 1),
+                "{name}: one failed attempt"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&auth_dir);
+    }
+
+    fn text(payload: &str) -> Value {
+        json!({ "text": payload })
+    }
+
+    fn closed() -> Value {
+        json!({ "close": 1006, "reason": "unexpected EOF" })
+    }
+
+    #[tokio::test]
+    async fn ws_before_output() {
+        let frames = vec![text(CREATED), text(FAILED), closed()];
+        turn(
+            "ws_before_output",
+            Transport::Websocket,
+            &[CREATED, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ws_as_the_first_event() {
+        let frames = vec![text(FAILED), closed()];
+        turn("ws_first_event", Transport::Websocket, &[FAILED], "close", frames).await;
+    }
+
+    #[tokio::test]
+    async fn ws_after_streamed_output() {
+        let frames = vec![text(CREATED), text(DELTA), text(FAILED), closed()];
+        turn(
+            "ws_after_output",
+            Transport::Websocket,
+            &[CREATED, DELTA, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+    }
+
+    /// Before `response.created` a steering failure still ends the turn, as in Go, now
+    /// after the event.
+    #[tokio::test]
+    async fn steering_as_the_first_event() {
+        let frames = vec![text(FAILED), closed()];
+        turn("steering_first_event", Transport::Steering, &[FAILED], "close", frames).await;
+    }
+
+    /// After `response.created` a steering failure was already an event the client may
+    /// correct on the same socket; it stays one.
+    #[tokio::test]
+    async fn steering_after_streamed_output() {
+        let frames = vec![text(CREATED), text(DELTA), text(FAILED)];
+        let events = [CREATED, DELTA, FAILED];
+        turn(
+            "steering_after_output",
+            Transport::Steering,
+            &events,
+            "until:response.failed",
+            frames,
+        )
+        .await;
+    }
+
+    /// The HTTP transport for a credential without WebSockets (the proxy's fallback).
+    #[tokio::test]
+    async fn http_before_output() {
+        let frames = vec![text(CREATED_HTTP), text(FAILED), closed()];
+        turn(
+            "http_before_output",
+            Transport::Http,
+            &[CREATED, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn http_after_streamed_output() {
+        let frames = vec![text(CREATED_HTTP), text(DELTA), text(FAILED), closed()];
+        turn(
+            "http_after_output",
+            Transport::Http,
+            &[CREATED, DELTA, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+    }
+
+    /// The event is written to the client before the session's loss is reported: a
+    /// client that reads slowly still gets the whole event, and no generic error after
+    /// it. The event is larger than the socket buffers, so its write waits for the
+    /// client while the session's loss would already close the connection.
+    async fn slow_client(name: &str, events: &[&str]) {
+        let message = format!(
+            "Your input exceeds the context window of this model. {}",
+            "x".repeat(8 << 20)
+        );
+        let failed = FAILED.replace(
+            "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            &message,
+        );
+        let events: Vec<&str> = events
+            .iter()
+            .map(|e| if *e == FAILED { failed.as_str() } else { e })
+            .collect();
+        let mut frames: Vec<Value> = events.iter().map(|e| text(e)).collect();
+        frames.push(closed());
+        turn_paused(name, &events, frames, 300).await;
+    }
+
+    /// Inside the bootstrap window, where `response.created` is held.
+    #[tokio::test]
+    async fn ws_slow_client_in_bootstrap() {
+        slow_client("ws_slow_client_bootstrap", &[CREATED, FAILED]).await;
+    }
+
+    /// After the bootstrap window.
+    #[tokio::test]
+    async fn ws_slow_client_after_output() {
+        slow_client("ws_slow_client_stream", &[CREATED, DELTA, FAILED]).await;
+    }
+
+    /// Go's generic error frame for a client that is not Codex, on both transports.
+    const GENERIC: &str = r#"{"type":"error","status":400,"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","code":"context_too_large"}}"#;
+
+    #[tokio::test]
+    async fn other_clients_keep_the_classified_error() {
+        let frames = vec![text(CREATED), text(GENERIC), closed()];
+        turn_as(
+            "ws_other_client",
+            None,
+            Transport::Websocket,
+            &[CREATED, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+        let frames = vec![text(CREATED_HTTP), text(GENERIC), closed()];
+        turn_as(
+            "http_other_client",
+            None,
+            Transport::Http,
+            &[CREATED, FAILED],
+            "close",
+            frames,
+        )
+        .await;
+    }
 }

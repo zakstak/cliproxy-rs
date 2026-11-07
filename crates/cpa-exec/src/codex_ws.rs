@@ -396,15 +396,20 @@ impl Session {
             *current = None;
         }
         if notify {
-            self.closed.send_if_modified(|slot| {
-                let first = slot.is_none();
-                if first {
-                    *slot = Some(error.clone());
-                }
-                first
-            });
+            self.notify(error);
         }
         conn.shutdown();
+    }
+
+    /// `notifyUpstreamDisconnect`: the first loss is the one reported.
+    fn notify(&self, error: &ExecError) {
+        self.closed.send_if_modified(|slot| {
+            let first = slot.is_none();
+            if first {
+                *slot = Some(error.clone());
+            }
+            first
+        });
     }
 }
 
@@ -843,11 +848,13 @@ enum Frame {
     },
     /// The response failed. `read` means the reader already dropped the socket;
     /// `overload` is a transient capacity rejection another credential may serve.
+    /// `event` is the upstream event the client receives unchanged before `error`.
     Failed {
         error: ExecError,
         overload: bool,
         read: bool,
         status_frame: bool,
+        event: Option<Bytes>,
     },
 }
 
@@ -862,6 +869,9 @@ struct Turn {
     items: OutputItems,
     saw_delta: bool,
     native: bool,
+    /// A Codex client: it gets an upstream context-window `response.failed` unchanged
+    /// before the error (`request::codex_client`).
+    codex_client: bool,
     cooling: bool,
     quota: Arc<QuotaSignals>,
     credential: String,
@@ -910,6 +920,7 @@ impl Turn {
                     overload: false,
                     read: true,
                     status_frame: false,
+                    event: None,
                 };
             }
             // A full channel can drop the reader's terminal error; the session still
@@ -923,6 +934,7 @@ impl Turn {
                     overload: false,
                     read: true,
                     status_frame: false,
+                    event: None,
                 };
             }
         };
@@ -943,16 +955,20 @@ impl Turn {
                 overload: false,
                 read: false,
                 status_frame: true,
+                event: None,
             };
         }
         if let Some((error, body)) = response::terminal_failure(payload, self.cooling) {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
+            let event = (self.codex_client && cpa_common::codex_client::is_context_window_failure(payload.as_bytes()))
+                .then(|| Bytes::from(payload.to_owned()));
             return Frame::Failed {
                 error,
                 overload: response::is_overload(&body),
                 read: false,
                 status_frame: false,
+                event,
             };
         }
         let kind = gjson::get(payload, "type");
@@ -972,6 +988,7 @@ impl Turn {
                 overload: false,
                 read: false,
                 status_frame: false,
+                event: None,
             };
         }
         let bufferable = response::bufferable(payload);
@@ -1017,6 +1034,18 @@ impl Turn {
         self.session.invalidate(&self.conn, error, notify);
     }
 
+    /// For a failure the client first receives as the upstream's event: drops the socket
+    /// now, but reports the session's loss only when the returned error is taken, after
+    /// the event. The downstream handler closes the connection with a generic error as
+    /// soon as the loss is reported, which would cut off a slow write of the event.
+    fn invalidate_after_event(&self, error: ExecError) -> AfterEvent {
+        self.invalidate(&error, false);
+        AfterEvent {
+            session: self.session.clone(),
+            error,
+        }
+    }
+
     /// The raw error that lost the session's socket, as the reader recorded it (the
     /// duplex wraps gorilla's close error unmapped).
     fn loss(&self) -> Option<ExecError> {
@@ -1024,21 +1053,52 @@ impl Turn {
     }
 }
 
-/// The rest of a turn as a stream; ends after the terminal event or the first error.
+/// A turn's error that follows the upstream event a Codex client received unchanged
+/// (`Turn::invalidate_after_event`).
+struct AfterEvent {
+    session: Arc<Session>,
+    error: ExecError,
+}
+
+impl AfterEvent {
+    fn take(self) -> ExecError {
+        self.session.notify(&self.error);
+        self.error
+    }
+}
+
+/// The rest of a turn as a stream; ends after the terminal event or the first error
+/// (preceded by the upstream event a Codex client receives unchanged).
 fn rest(turn: Turn) -> ExecStream {
-    futures_util::stream::unfold(Some(turn), |turn| async move {
-        let mut turn = turn?;
+    enum State {
+        // Boxed: one allocation per turn keeps the other states small.
+        Reading(Box<Turn>),
+        Failing(AfterEvent),
+        Done,
+    }
+    futures_util::stream::unfold(State::Reading(Box::new(turn)), |state| async move {
+        let mut turn = match state {
+            State::Reading(turn) => turn,
+            State::Failing(failure) => return Some((Err(failure.take()), State::Done)),
+            State::Done => return None,
+        };
         loop {
             match turn.frame().await {
                 Frame::Skip => continue,
                 Frame::Event { out, terminal, .. } => {
-                    return Some((Ok(out), (!terminal).then_some(turn)));
+                    let next = if terminal { State::Done } else { State::Reading(turn) };
+                    return Some((Ok(out), next));
                 }
-                Frame::Failed { error, read, .. } => {
+                Frame::Failed { error, read, event, .. } => {
+                    // `event` comes only with an upstream failure event, never with a
+                    // read failure (`read`), whose reader already dropped the socket.
+                    if let Some(event) = event {
+                        return Some((Ok(event), State::Failing(turn.invalidate_after_event(error))));
+                    }
                     if !read {
                         turn.invalidate(&error, true);
                     }
-                    return Some((Err(error), None));
+                    return Some((Err(error), State::Done));
                 }
             }
         }
@@ -1073,12 +1133,20 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 held.push(Err(error));
                 return Ok(futures_util::stream::iter(held).boxed());
             }
-            Frame::Failed { error, overload, .. } => {
+            Frame::Failed {
+                error, overload, event, ..
+            } => {
                 if overload && !timed_out {
                     // Fail over before anything was shown; the downstream session survives.
                     turn.invalidate(&error, false);
                     let body = String::from_utf8_lossy(&error.body).into_owned();
                     return Err(response::bootstrap_overload(&body));
+                }
+                if let Some(event) = event {
+                    held.push(Ok(event));
+                    let failure = turn.invalidate_after_event(error);
+                    let error = futures_util::stream::once(async move { Err(failure.take()) });
+                    return Ok(futures_util::stream::iter(held).chain(error).boxed());
                 }
                 turn.invalidate(&error, true);
                 held.push(Err(error));
@@ -1337,6 +1405,7 @@ impl CodexExecutor {
             items: OutputItems::default(),
             saw_delta: false,
             native,
+            codex_client: request::codex_client(&req),
             cooling: settings.model_level_cooling,
             quota: self.quota_handle(),
             credential: view.credential.id.clone(),

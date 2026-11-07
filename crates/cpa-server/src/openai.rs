@@ -492,7 +492,7 @@ pub async fn responses(
     let fields = peek(&body);
     let stream = fields.get("stream") == Some(&Value::Bool(true));
     let model = gojson::gjson_string(fields.get("model"));
-    let codex_client = codex_client(&headers);
+    let codex_client = cpa_common::codex_client::is_codex_responses_client(&headers);
     let req = Request {
         caller,
         peer: dispatch::peer(peer),
@@ -569,32 +569,6 @@ pub async fn responses(
         },
     )
     .await
-}
-
-/// Go `isCodexResponsesClientRequest`.
-fn codex_client(headers: &HeaderMap) -> bool {
-    let get = |k: &str| {
-        headers
-            .get(k)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .trim()
-            .to_owned()
-    };
-    let ua = get("user-agent");
-    if ua.starts_with("Codex Desktop/")
-        || ua.starts_with("codex-tui/")
-        || ua == "codex_cli_rs"
-        || ua.starts_with("codex_cli_rs/")
-        || ua.starts_with("codex_exec/")
-    {
-        return true;
-    }
-    let originator = get("originator").go_lower();
-    matches!(originator.as_str(), "codex desktop" | "codex-tui" | "codex_cli_rs")
-        || ["codex desktop/", "codex-tui/", "codex_cli_rs/"]
-            .iter()
-            .any(|p| originator.starts_with(p))
 }
 
 /// Go `responsesStreamErrorText`: sensitive values redacted, long text truncated, JSON
@@ -849,6 +823,14 @@ impl ResponsesSse {
             return None;
         }
         self.data_frames += 1;
+        // A Codex client gets the upstream's context-window failure unchanged, as the
+        // terminal event Codex compacts on; the executor's error after it only ends the
+        // attempt. Go v8.0.35 rewrites it (docs/DIFFERENCES-FROM-GO.md).
+        if self.codex && cpa_common::codex_client::is_context_window_failure(&payload) {
+            self.last_event = "response.failed".into();
+            self.terminal_event = "response.failed".into();
+            return Some(frame);
+        }
         let has_error = ["error", "response.error"].iter().any(|p| {
             let r = json::get(&payload, p);
             r.exists() && r.kind != json::Kind::Null

@@ -90,6 +90,37 @@ pub fn is_codex_client_user_agent(user_agent: &str) -> bool {
         || ua.starts_with("codex_exec/")
 }
 
+/// Go `isCodexResponsesClientRequest`: an official Codex client by `User-Agent` or
+/// `originator`.
+pub fn is_codex_responses_client(headers: &HeaderMap) -> bool {
+    let get = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if is_codex_client_user_agent(&get("user-agent")) {
+        return true;
+    }
+    let originator = get("originator").go_lower();
+    matches!(originator.as_str(), "codex desktop" | "codex-tui" | "codex_cli_rs")
+        || ["codex desktop/", "codex-tui/", "codex_cli_rs/"]
+            .iter()
+            .any(|p| originator.starts_with(p))
+}
+
+/// An upstream `response.failed` for a context-window overflow, exactly as Codex
+/// recognises it (codex-api `parse_failed_response`: `response.error.code` equal to
+/// `context_length_exceeded`). Codex compacts and retries only on this event, so a Codex
+/// client receives it unchanged; Go v8.0.35 replaces it with a classified error
+/// (docs/DIFFERENCES-FROM-GO.md).
+pub fn is_context_window_failure(payload: &[u8]) -> bool {
+    gj::get(payload, "type").str() == "response.failed"
+        && gj::get(payload, "response.error.code").str() == "context_length_exceeded"
+}
+
 /// Go `strings.EqualFold(value, ascii)` for an ASCII `ascii`: besides ASCII case, only
 /// U+017F (long s) and U+212A (Kelvin sign) fold onto ASCII letters.
 fn folds_to_ascii(value: &str, ascii: &str) -> bool {

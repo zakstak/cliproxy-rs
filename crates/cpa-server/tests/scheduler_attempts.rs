@@ -442,3 +442,108 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
     }
     upstream.abort();
 }
+
+/// zakstak/cliproxy-rs#5 on the HTTP Responses route (Codex's HTTP transport): an
+/// upstream context-window `response.failed` reaches a Codex client byte for byte, the
+/// only event Codex classifies as `ContextWindowExceeded`, whether or not
+/// `response.created` came first. Go v8.0.35 answers `context_too_large` instead, and an
+/// HTTP 400 when nothing preceded the failure (docs/DIFFERENCES-FROM-GO.md); other
+/// clients keep that. The attempt is one request-scoped failure either way: counted as a
+/// failure, and the credential is not cooled.
+#[tokio::test]
+async fn context_window_failure_reaches_the_client_as_its_own_code() {
+    let failed = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null}}"#;
+    let created = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}"#;
+    let auth_dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&auth_dir).unwrap();
+    let codex_ua = "codex_cli_rs/0.200.0 (Linux; x86_64)";
+    // (upstream events, client path, user agent)
+    let cases: [(&[&str], &str, &str); 4] = [
+        (&[created, failed], "/v1/responses", codex_ua),
+        (&[failed], "/v1/responses", codex_ua),
+        (&[created, failed], "/v1/responses", "openai-node/5"),
+        (&[created, failed], "/v1/chat/completions", "openai-node/5"),
+    ];
+    for (events, path, ua) in cases {
+        let sse: String = events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str()))
+            .collect();
+        let app = axum::Router::new().fallback(move || {
+            let sse = sse.clone();
+            async move { ([("content-type", "text/event-stream")], sse).into_response() }
+        });
+        let (upstream_url, upstream) = serve(app).await;
+        let mut credential = Credential::from_file(
+            Path::new("/mock"),
+            &Path::new("/mock").join("codex.json"),
+            serde_json::json!({"type":"codex"}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        for (k, v) in [
+            ("api_key", "sk-fake"),
+            ("base_url", upstream_url.as_str()),
+            ("auth_kind", "apikey"),
+        ] {
+            credential.attributes.insert(k.into(), v.into());
+        }
+        let config = format!("auth-dir: {}\n", auth_dir.display());
+        let rt = Arc::new(cpa_server::testing::runtime(
+            Config::parse(&config).unwrap(),
+            vec![cpa_server::testing::local(credential)],
+            Executors {
+                claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        ));
+        let (url, proxy) = serve(router(rt.clone())).await;
+        let body = if path == "/v1/responses" {
+            r#"{"model":"gpt-5.5","stream":true,"input":"huge"}"#
+        } else {
+            r#"{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"huge"}]}"#
+        };
+        let response = wreq::Client::new()
+            .post(format!("{url}{path}"))
+            .header("user-agent", ua)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        let case = format!("{path} {ua} {} events", events.len());
+        let errors: Vec<Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter(|v| v["type"] == "response.failed" || v["type"] == "error" || v.get("error").is_some())
+            .collect();
+        if ua == codex_ua {
+            assert_eq!(status, 200, "{case}: {text}");
+            assert_eq!(errors.len(), 1, "{case}: one failure event: {text}");
+            assert!(text.contains(&format!("data: {failed}\n")), "{case}: unchanged: {text}");
+        } else {
+            // Go's classified error, unchanged.
+            assert!(!text.contains("context_length_exceeded"), "{case}: {text}");
+            assert!(text.contains("context_too_large"), "{case}: {text}");
+        }
+        let credential = rt.store().snapshot().into_iter().next().unwrap();
+        assert!(!rt.store().blocked(&credential, "gpt-5.5"), "{case}");
+        assert_eq!(
+            rt.store().stats(),
+            AttemptStats {
+                success: 0,
+                failure: 1,
+                cancelled: 0
+            },
+            "{case}"
+        );
+        proxy.abort();
+        upstream.abort();
+    }
+    let _ = std::fs::remove_dir_all(&auth_dir);
+}

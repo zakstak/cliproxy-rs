@@ -364,12 +364,22 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
     v.kind() == Kind::True || (v.kind() == Kind::String && v.str().trim().eq_ignore_ascii_case("true"))
 }
 
+/// Codex/Responses formats on both sides.
+fn responses_formats(req: &ExecRequest) -> bool {
+    let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
+    codexish(req.source_format) && codexish(req.response_format)
+}
+
 /// `helps.IsNativeCodexRequest`: Codex/Responses formats on both sides plus the lite marker.
 pub(crate) fn is_native(req: &ExecRequest) -> bool {
-    let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
-    codexish(req.source_format)
-        && codexish(req.response_format)
-        && is_lite(&String::from_utf8_lossy(&req.body), &req.headers)
+    responses_formats(req) && is_lite(&String::from_utf8_lossy(&req.body), &req.headers)
+}
+
+/// An official Codex client (Go `isCodexResponsesClientRequest`) reading Responses events
+/// itself: it gets an upstream context-window `response.failed` unchanged
+/// (`cpa_common::codex_client::is_context_window_failure`).
+pub(crate) fn codex_client(req: &ExecRequest) -> bool {
+    responses_formats(req) && cpa_common::codex_client::is_codex_responses_client(&req.headers)
 }
 
 /// `translateCodexRequestPairWithUpdateIntent` + `helps.ApplyRequestThinking`: the

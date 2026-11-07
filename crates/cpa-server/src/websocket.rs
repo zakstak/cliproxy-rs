@@ -1193,6 +1193,8 @@ impl Connection {
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
         let mut response_started = false;
+        // The upstream's own `response.failed` reached the client in this turn.
+        let mut failed_forwarded = false;
         let _local = self.local.begin();
         loop {
             let item = tokio::select! {
@@ -1235,6 +1237,14 @@ impl Connection {
                     if ctx.suppress(failure.status) {
                         return Forwarded::Suppressed;
                     }
+                    // The client already has the upstream's event for this failure (a
+                    // context-window overflow, which Codex compacts on); a generic error
+                    // event after it would replace that meaning. Go v8.0.35 differs
+                    // (docs/DIFFERENCES-FROM-GO.md).
+                    if failed_forwarded && exposed(&failure) {
+                        socket.terminate(CLOSE_SENT);
+                        return Forwarded::End;
+                    }
                     if let Some(loss) = self.upstream_loss() {
                         close_for_upstream_loss(socket, &loss).await;
                         return Forwarded::End;
@@ -1250,6 +1260,7 @@ impl Connection {
                 if kind == "response.created" {
                     response_started = true;
                     completed = false;
+                    failed_forwarded = false;
                     turn.reset();
                 }
                 turn.collect(&payload);
@@ -1285,6 +1296,7 @@ impl Connection {
                     close_for_failure(socket, &failure).await;
                     return Forwarded::End;
                 }
+                failed_forwarded |= kind == "response.failed";
                 // Codex acknowledges `response.interrupt` with an interrupted
                 // `response.incomplete`; the connection stays open for the next request.
                 if completion || kind == "response.incomplete" {

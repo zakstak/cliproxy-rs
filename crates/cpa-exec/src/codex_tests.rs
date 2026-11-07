@@ -2007,3 +2007,51 @@ fn count_tokens_sees_the_payload_rules() {
     assert!(plain > 0);
     assert!(configured > plain + 5, "{plain} -> {configured}");
 }
+
+/// zakstak/cliproxy-rs#5: an upstream context-window `response.failed` reaches a
+/// Codex client unchanged before the classified error, because Codex compacts only on the
+/// original event. Other clients and other failures keep Go's error-only step, and
+/// the error the scheduler classifies is the same either way. Go v8.0.35 differs
+/// (docs/DIFFERENCES-FROM-GO.md).
+#[test]
+fn context_window_failure_reaches_codex_clients_unchanged() {
+    use crate::codex_response::{Processor, Step};
+    let fail = |codex_client: bool, payload: &str| {
+        let event = format!("event: response.failed\ndata: {payload}\n\n");
+        match Processor::new(false, false)
+            .codex_client(codex_client)
+            .event(event.as_bytes())
+        {
+            Step::Fail { error, before, .. } => (error, before),
+            _ => panic!("a failure for {payload}"),
+        }
+    };
+    // Codex's own `ContextWindowExceeded` fixture (codex-api sse/responses.rs).
+    let context = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null}}"#;
+    let (error, before) = fail(true, context);
+    assert_eq!(
+        before.as_deref(),
+        Some(format!("event: response.failed\ndata: {context}\n\n").as_bytes())
+    );
+    // Go's step: the lines before the failing data line, then the error.
+    let go_step = Some(&b"event: response.failed\n\n"[..]);
+    let (go_error, go_before) = fail(false, context);
+    assert_eq!(go_before.as_deref(), go_step, "other clients keep Go's step");
+    for error in [&error, &go_error] {
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(
+            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large"
+        );
+    }
+    // Other failures, and a context code only in the message or the replacement code, are
+    // not the event Codex recognises.
+    for other in [
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#,
+        r#"{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"too long"}}}"#,
+        r#"{"type":"response.failed","response":{"error":{"message":"maximum context length exceeded"}}}"#,
+    ] {
+        assert_eq!(fail(true, other).1.as_deref(), go_step, "{other}");
+    }
+}
