@@ -230,7 +230,7 @@ async fn native_codex_receives_the_upstream_tier_refusal() {
 }
 
 #[tokio::test]
-async fn translated_clients_keep_gos_service_tier_rule() {
+async fn translated_clients_keep_their_service_tier() {
     let proxy = proxy(false).await;
     // Any Responses client takes the native route (#23) and keeps its tier as sent.
     let python = [("user-agent", "OpenAI/Python 2.1.0")];
@@ -245,9 +245,10 @@ async fn translated_clients_keep_gos_service_tier_rule() {
         assert_eq!(tier(&body).as_deref(), want, "{sent}: {body}");
         assert_eq!(hint(&headers), Some(want_hint), "{sent}");
     }
-    // Chat Completions from a Codex user agent is a translated request too.
+    // Chat Completions from a Codex user agent takes the translated route (#27), which
+    // keeps any Chat tier as named; Go keeps only `priority` and `ultrafast`.
     for (sent, want, want_hint) in [
-        ("flex", None, "model=gpt-5.5"),
+        ("flex", Some(r#""flex""#), "model=gpt-5.5;tier=flex"),
         ("priority", Some(r#""priority""#), "model=gpt-5.5;tier=priority"),
     ] {
         let chat = format!(

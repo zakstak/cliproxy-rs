@@ -1128,9 +1128,10 @@ async fn images_match_go_on_every_fixture_case() {
         };
         let result = executor.images(&credential, req, request_path, &cfg).await;
         let captured = mock.take();
-        if name == "tool_generation_nonstream_b64" {
-            // `n: 2` and `style` cannot be expressed by the image tool: refused before the
-            // send (#27). Go drops them.
+        if matches!(name, "tool_generation_nonstream_b64" | "tool_edit_json") {
+            // `n: 2` and `style`, or an image entry with a blank `image_url`, cannot be
+            // expressed by the image tool: refused before the send (#27). Go drops them
+            // (and the edit's file-ID image too).
             let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
             assert_eq!(error.status, 400, "{name}");
             assert!(captured.is_empty(), "{name}: nothing is sent");
