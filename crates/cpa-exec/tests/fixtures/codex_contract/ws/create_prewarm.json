@@ -1,0 +1,1 @@
+{"type":"response.create","model":"gpt-test","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files."}]}],"tools":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"high"},"store":false,"include":["reasoning.encrypted_content"],"generate":false}

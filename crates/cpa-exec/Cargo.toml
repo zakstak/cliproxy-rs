@@ -59,6 +59,10 @@ tower = { version = "0.5", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
+[features]
+# Codex contract fixture reader (`codex_contract`) for other crates' tests.
+test-support = []
+
 [dev-dependencies]
 cpa-home = { workspace = true, features = ["fake"] }
 axum = { workspace = true, features = ["ws"] }

@@ -26,6 +26,8 @@ use cpa_exec::Executors;
 
 use crate::Runtime;
 
+pub mod codex_capture;
+
 /// The deny-all proxy: the discard port on loopback, where nothing listens.
 pub const DENY_PROXY: &str = "http://127.0.0.1:9";
 

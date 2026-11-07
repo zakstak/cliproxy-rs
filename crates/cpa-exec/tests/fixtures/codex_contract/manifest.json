@@ -1,0 +1,300 @@
+{
+  "pin": {
+    "repository": "https://github.com/openai/codex",
+    "commit": "44ccf394573cabb95e1f751a59f9d76f6f79faf1"
+  },
+  "fixtures": [
+    {
+      "name": "http-request-full",
+      "file": "http/request_full.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/common.rs:286-314 ResponsesApiRequest (field order, skip rules)",
+        "codex-rs/core/src/client.rs:1162-1316 build_responses_request",
+        "codex-rs/protocol/src/models.rs:1067-1341 ResponseItem",
+        "codex-rs/tools/src/responses_api.rs:33-45 ResponsesApiTool",
+        "codex-rs/protocol/src/turn_input.rs:221-228 PromptCacheTtl"
+      ],
+      "contract": "A native Responses body as first-party Codex serializes it: base instructions as a leading developer message, encrypted reasoning, namespaced function call, explicit parallel_tool_calls false, service_tier, prompt_cache_key, prompt_cache_options and client_metadata.",
+      "notes": "Hand-authored, compact serde order. IDs, UUIDs and encrypted strings are placeholders. client_metadata is a HashMap upstream, so its key order is not part of the contract. output.encrypted_content is requested only when output-token replay is on and the provider is OpenAI (client.rs:1258-1261)."
+    },
+    {
+      "name": "http-request-lite",
+      "file": "http/request_lite.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/core/src/client.rs:1198-1213 use_responses_lite moves tools into an additional_tools item",
+        "codex-rs/core/src/client.rs:1300 parallel_tool_calls is false under Responses Lite",
+        "codex-rs/core/src/client.rs:2701-2707 x-openai-internal-codex-responses-lite: true"
+      ],
+      "contract": "Responses Lite: no top-level tools, a leading additional_tools developer item, parallel_tool_calls false, sent with the x-openai-internal-codex-responses-lite header.",
+      "notes": "The tool declaration contents are illustrative. Responses Lite is a model-catalog flag; API-key support is unknown."
+    },
+    {
+      "name": "http-request-compaction",
+      "file": "http/request_compaction.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/core/src/compact_remote_v2_attempt.rs:228 pushes ResponseItem::CompactionTrigger",
+        "codex-rs/core/src/compact_remote_v2.rs:291-384 sends it through the ordinary Responses stream",
+        "codex-rs/core/src/compact_remote_v2.rs:386-492 expects exactly one compaction output item before response.completed",
+        "codex-rs/core/src/responses_metadata.rs:121-125 compaction requests use the /responses path",
+        "codex-rs/protocol/src/models.rs:1312-1327 compaction and compaction_trigger items"
+      ],
+      "contract": "Remote compaction v2 is a POST /responses stream whose input ends with {\"type\":\"compaction_trigger\"}. Earlier compaction items replay as opaque encrypted content.",
+      "notes": "The pinned client never calls /responses/compact. client_metadata compaction keys are abbreviated."
+    },
+    {
+      "name": "http-request-minimal",
+      "file": "http/request_minimal.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/common.rs:286-314 optional fields skip when None; reasoning has no skip rule and serializes as null"
+      ],
+      "contract": "Omitted optional fields stay omitted, explicit false stays false, explicit null stays null.",
+      "notes": "build_responses_request always sets reasoning, so a first-party client does not send reasoning null today; the type permits it. No tools key matches Responses Lite with an empty tool list."
+    },
+    {
+      "name": "http-error-usage-limit-429",
+      "file": "http/error_usage_limit_429.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/core/tests/suite/client.rs:3658-3665 mock 429 body",
+        "codex-rs/codex-api/src/api_bridge.rs:207-255 classifies error.type usage_limit_reached with plan_type and resets_at"
+      ],
+      "contract": "An HTTP 429 body that first-party Codex classifies as a usage limit. Its error.type, plan_type and resets_at must reach the client.",
+      "notes": "Rate-limit headers (x-codex-*) accompany it upstream and are parsed from the response headers."
+    },
+    {
+      "name": "probe-request-unknown-fields",
+      "file": "probe/request_unknown_fields.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "contract-probe",
+      "sources": [
+        "codex-rs/protocol/src/models.rs:1339-1340 ResponseItem::Other accepts unknown item kinds",
+        "docs/codex/CONTRACT.md#field-preservation"
+      ],
+      "contract": "Unknown top-level, item and content-part members, an unknown item kind, raw number spellings (1.50, 1e3, -0.0, a u64 overflow), a JSON unicode escape and explicit null must reach the upstream byte for byte.",
+      "notes": "Not first-party output. Hand-authored to probe the preservation rule."
+    },
+    {
+      "name": "ws-create-first",
+      "file": "ws/create_first.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/common.rs:341-373 ResponseCreateWsRequest",
+        "codex-rs/codex-api/src/common.rs:397-403 type: response.create tag",
+        "codex-rs/core/src/client.rs:2354-2376 the full input when no continuation applies"
+      ],
+      "contract": "A first response.create on a socket: the HTTP body fields plus the type tag, no previous_response_id.",
+      "notes": "Provider docs (websocket-mode guide) say stream and background are transport fields that are not used; the pinned client still sends stream: true."
+    },
+    {
+      "name": "ws-create-continuation",
+      "file": "ws/create_continuation.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/core/src/client.rs:1675-1706 get_incremental_items: unchanged non-input fields and an input that extends the previous input plus output",
+        "codex-rs/core/src/client.rs:2354-2376 previous_response_id with only the new items"
+      ],
+      "contract": "A continuation on the same socket: previous_response_id plus only the new input items. All other fields equal the previous request.",
+      "notes": "Provider docs: with store=false the ID resolves only from the connection-local cache."
+    },
+    {
+      "name": "ws-create-prewarm",
+      "file": "ws/create_prewarm.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/core/src/client.rs:2375 generate: Some(false) when warmup",
+        "codex-rs/core/src/client.rs:2517-2566 prewarm_websocket waits for response.completed",
+        "https://developers.openai.com/api/docs/guides/websocket-mode generate: false"
+      ],
+      "contract": "Prewarm is a client-sent response.create with generate false. The upstream answers with a response ID and no model output; the next turn may chain from it.",
+      "notes": "The proxy must forward a client's prewarm and must not originate one."
+    },
+    {
+      "name": "ws-interrupt",
+      "file": "ws/interrupt.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:824-839 response.interrupt with mode discard_partial_items"
+      ],
+      "contract": "The client interrupts its own in-flight response on the same socket after response.created.",
+      "notes": "Built with serde_json::json!, so key order depends on serde_json map features and is not part of the contract. Provider API docs do not document response.interrupt."
+    },
+    {
+      "name": "ws-steer-api-docs",
+      "file": "ws/steer_api_docs.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["api-key"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/api/docs/guides/steering"
+      ],
+      "contract": "Mid-turn steering on the API WebSocket: type, previous_response_id and input only; answered by response.steer.accepted, .pending or .failed.",
+      "notes": "Documented for the GPT-6 family only. The pinned Codex client never sends response.steer or response.append. ChatGPT and SIWC support is unknown."
+    },
+    {
+      "name": "ws-errors-first-party",
+      "file": "ws/errors_first_party.jsonl",
+      "format": "jsonl",
+      "transport": "websocket",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:1183-1198 wrapped usage_limit_reached",
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:1330-1340 websocket_connection_limit_reached",
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:712-764 map_wrapped_websocket_error_event"
+      ],
+      "contract": "Wrapped WebSocket errors: status, error and headers are what first-party Codex classifies. They must reach the client as sent.",
+      "notes": "Key order comes from the test source."
+    },
+    {
+      "name": "ws-error-previous-response-not-found",
+      "file": "ws/error_previous_response_not_found.json",
+      "format": "json",
+      "transport": "websocket",
+      "direction": "to-client",
+      "endpoints": ["api-key"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/api/docs/guides/websocket-mode previous_response_not_found, status 400",
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:177-179,736-749 first-party treats the code as retryable"
+      ],
+      "contract": "A continuation the upstream cannot resolve fails with previous_response_not_found. The client retries with full input; the proxy must not replay the continuation elsewhere.",
+      "notes": "Code, status and message come from provider docs; the wrapper shape follows WrappedWebsocketErrorEvent."
+    },
+    {
+      "name": "ws-events-interrupt",
+      "file": "ws/events_interrupt.jsonl",
+      "format": "jsonl",
+      "transport": "websocket",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/core/tests/suite/scenarios_mailbox_preemption_tests.rs:248-254 response.interrupt.accepted and response.output_item.interrupted",
+        "codex-rs/codex-api/src/sse/responses.rs:451-464 response.incomplete with reason interrupted completes the turn"
+      ],
+      "contract": "Interrupt acknowledgement, an interrupted item event the proxy does not model, and the interrupted terminal pass through unchanged.",
+      "notes": ""
+    },
+    {
+      "name": "sse-completed",
+      "file": "sse/completed.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:109-158 ResponseCompleted usage, cache_write_tokens, end_turn",
+        "codex-rs/codex-api/src/sse/responses.rs:375-562 process_responses_event",
+        "https://developers.openai.com/api/docs/guides/prompt-caching cache_write_tokens_details"
+      ],
+      "contract": "A completed stream with encrypted reasoning, output_text with empty annotations, message phase, end_turn and full usage including cache-write details.",
+      "notes": "Field values are placeholders."
+    },
+    {
+      "name": "sse-completed-no-usage",
+      "file": "sse/completed_no_usage.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:111-118 usage is optional"
+      ],
+      "contract": "Missing usage stays missing. The proxy must not add usage, model or zero counts.",
+      "notes": ""
+    },
+    {
+      "name": "sse-failed-context-window",
+      "file": "sse/failed_context_window.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:1181-1182 context_window_error_is_fatal",
+        "codex-rs/codex-api/src/sse/responses_error.rs:48 context_length_exceeded"
+      ],
+      "contract": "response.failed with code context_length_exceeded, which first-party Codex treats as fatal.",
+      "notes": "Verbatim from the test string."
+    },
+    {
+      "name": "sse-failed-rate-limit",
+      "file": "sse/failed_rate_limit.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:1089-1090 rate_limit_error_preserves_retry_delay",
+        "codex-rs/codex-api/src/sse/responses_error.rs:93-100,108-128 retry delay parsed from the message"
+      ],
+      "contract": "response.failed with rate_limit_exceeded; the client derives its retry delay from the message text, so the message must not change.",
+      "notes": "Verbatim from the test string, including its irregular spacing. org-AAA is the test's placeholder."
+    },
+    {
+      "name": "sse-incomplete-partial",
+      "file": "sse/incomplete_partial.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:1422-1437 incomplete_response_retains_partial_output_on_the_error",
+        "codex-rs/codex-api/src/sse/responses.rs:464-491 reason other than interrupted keeps partial output and usage"
+      ],
+      "contract": "An incomplete response keeps its reason, its incomplete output items and its usage.",
+      "notes": "The function_call item is hand-authored; the test uses a generic call item."
+    }
+  ]
+}
