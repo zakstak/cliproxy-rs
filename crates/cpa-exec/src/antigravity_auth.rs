@@ -1038,21 +1038,12 @@ async fn wait_for_callback(callbacks: &mut tokio::sync::mpsc::Receiver<Callback>
 
 /// Opens `url` in the desktop browser; `false` when none is available.
 fn open_browser(url: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    let command = std::process::Command::new("xdg-open")
+    std::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let command = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let command = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    let command: std::io::Result<std::process::Child> = Err(std::io::Error::other("no browser"));
-    command.is_ok()
+        .spawn()
+        .is_ok()
 }
 
 #[cfg(test)]

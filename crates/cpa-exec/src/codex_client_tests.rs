@@ -65,12 +65,10 @@ fn replays_go_translation_and_optimization() {
                     v["headers"]["User-Agent"]
                 );
             }
-            "optimize_auth" => {
-                optimized += 1;
-                let (got, renamed) = optimize_for_auth(&h, input, &settings(v), flag(v, "compat"), false);
-                assert_eq!(String::from_utf8(got).unwrap(), want, "{v}");
-                assert_eq!(renamed, flag(v, "bool"), "{v}");
-            }
+            // Go's `optimizeCodexRequestForAuth` vectors: the Codex executor's own
+            // multi-agent rewrite, deleted with every Codex request rewrite (#28). They are
+            // counted, not replayed, so the fixture stays as Go wrote it.
+            "optimize_auth" => optimized += 1,
             other => panic!("unknown vector fn {other}"),
         }
     }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, Res, every } from "../store.svelte";
   import { api, missing, text } from "../api";
-  import { buckets, sumBuckets, sum, label, provider, cleanEvent, usageStats, type Buckets, type Data, type Event } from "../core";
+  import { buckets, sumBuckets, sum, label, provider, keepEvents, livePage, usageStats, type Buckets, type Data, type Event } from "../core";
   import Grille from "../Grille.svelte";
   import Missing from "../Missing.svelte";
 
@@ -29,32 +29,71 @@
   });
   const max = $derived(Math.max(1, ...rows.flatMap((r) => r.b?.total || [])));
 
-  // Live view drains GET /observability/usage/queue, which other collectors may share.
+  // The live view pages through GET /observability/usage/live by cursor. Reading takes no
+  // record off the usage queue, so collectors and other tabs see every record too.
+  const feed = "/observability/usage/live";
   let live = $state(false),
+    cursor: string | null = null,
+    // Bumped on start and stop, so a read that was in flight cannot move the new cursor.
+    run = 0,
     events = $state.raw<Event[]>([]),
-    problem = $state("");
+    problem = $state(""),
+    missed = $state(false),
+    statistics = $state(true);
   const stats = $derived(usageStats(events));
+  const read = async (after: string | null) => {
+    const page = livePage(await api(after === null ? feed : `${feed}?after=${after}`));
+    statistics = page.statistics;
+    return page;
+  };
+  const stop = () => {
+    run++;
+    live = false;
+    cursor = null;
+  };
+  const start = async () => {
+    const mine = ++run;
+    try {
+      const at = (await read(null)).cursor;
+      if (mine !== run) return;
+      cursor = at;
+      problem = "";
+      missed = false;
+      live = true;
+    } catch (e) {
+      problem = e instanceof Error ? e.message : String(e);
+    }
+  };
   $effect(() =>
-    every(3000, async () => {
-      if (!live) return;
-      try {
-        const got = await api("/observability/usage/queue?count=500");
-        const cutoff = Date.now() - 60 * 60_000;
-        if (Array.isArray(got) && got.length)
-          events = [...events, ...got.filter((r) => r && typeof r === "object").map(cleanEvent)].filter((e) => e.at > cutoff).slice(-2000);
-        problem = "";
-      } catch (e) {
-        problem = e instanceof Error ? e.message : String(e);
-        live = false;
-      }
-    }),
+    every(
+      3000,
+      async () => {
+        if (!live || cursor === null) return;
+        const mine = run;
+        try {
+          // ponytail: one page (at most 500 records) every 3 s, about 166 records a second; past
+          // that the tab falls behind and the server reports a gap. Read while `more` to lift it.
+          const page = await read(cursor);
+          if (mine !== run) return;
+          cursor = page.cursor;
+          if (page.gap) missed = true;
+          if (page.events.length) events = keepEvents([...events, ...page.events], Date.now());
+          problem = "";
+        } catch (e) {
+          if (mine !== run) return;
+          problem = e instanceof Error ? e.message : String(e);
+          stop();
+        }
+      },
+      true,
+    ),
   );
   const fmt = (n: number | null, unit = "") => (n === null ? "—" : `${n.toLocaleString()}${unit}`);
   const time = (t: number) => new Date(t).toLocaleTimeString([], { hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 </script>
 
 <div class="head"><h1>Usage</h1></div>
-<Missing actions={[["GET", "/observability/usage/queue?count=0", "the live request view"]]} />
+<Missing actions={[["GET", "/observability/usage/live?count=0", "the live request view"]]} />
 
 <section class="section">
   <div class="section-head"><h2>Last 200 minutes</h2><span class="legend">Reported by the server · 10-minute buckets</span></div>
@@ -78,14 +117,17 @@
     <h2>Live requests</h2>
     <button
       class="key"
-      disabled={!store.can("GET", "/observability/usage/queue")}
+      disabled={!store.can("GET", feed)}
       aria-pressed={live}
       onclick={() => {
-        if (live || confirm("The live view takes records off the server’s usage queue; other readers of that queue will miss them. Start?")) live = !live;
+        if (live) stop();
+        else start();
       }}><span class="lamp {live ? 'ok live' : 'off'}"></span>{live ? "Stop" : "Start live view"}</button
     >
   </div>
   {#if problem}<p class="note error" role="alert"><span class="lamp bad"></span>{problem}</p>{/if}
+  {#if live && !statistics}<p class="note"><span class="lamp off"></span>Usage statistics are off on this server.</p>{/if}
+  {#if missed}<p class="note"><span class="lamp warn"></span>Some requests were missed while this tab was hidden or behind.</p>{/if}
   {#if !events.length}
     <p class="muted">
       {live

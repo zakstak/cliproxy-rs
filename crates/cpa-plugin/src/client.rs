@@ -65,7 +65,6 @@ pub trait PluginClient: Send + Sync + 'static {
     fn shutdown(&self);
 }
 
-#[cfg(unix)]
 impl PluginClient for crate::native::NativeClient {
     fn call(&self, method: &str, request: &[u8]) -> Result<Bytes, String> {
         crate::native::NativeClient::call(self, method, request)

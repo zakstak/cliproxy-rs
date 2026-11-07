@@ -30,12 +30,14 @@ use crate::respond::{self, Writer};
 use crate::{Runtime, errors};
 
 const DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
-const CODEX_TOOL_MODELS: [&str; 5] = [
+const CODEX_TOOL_MODELS: [&str; 7] = [
     "gpt-image-1.5",
     "gpt-image-2",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
 ];
 const XAI_DEFAULT_MODEL: &str = "grok-imagine-image";
 const XAI_QUALITY_MODEL: &str = "grok-imagine-image-quality";
@@ -91,9 +93,9 @@ fn unsupported(model: &str) -> Option<Response> {
     if is_codex_tool_model(model) || is_xai_model(model) || is_compat_model(model) {
         return None;
     }
-    let [a, b, c, d, e] = CODEX_TOOL_MODELS;
+    let codex = CODEX_TOOL_MODELS.join(", ");
     Some(bad_request(&format!(
-        "Model {model} is not supported on {GENERATIONS_PATH} or {EDITS_PATH}. Use {a}, {b}, {c}, {d}, {e}, {XAI_DEFAULT_MODEL}, {XAI_QUALITY_MODEL}, {XAI_20_MODEL}, or a configured openai-compatibility image model."
+        "Model {model} is not supported on {GENERATIONS_PATH} or {EDITS_PATH}. Use {codex}, {XAI_DEFAULT_MODEL}, {XAI_QUALITY_MODEL}, {XAI_20_MODEL}, or a configured openai-compatibility image model."
     )))
 }
 
@@ -513,6 +515,7 @@ impl Prepared {
             execution_session: None,
             request_path: self.path.clone(),
             peer: self.peer,
+            native: None,
             turn: None,
             media: Some(Arc::new(Media {
                 kind: MediaKind::Images,

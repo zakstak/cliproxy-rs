@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod forward_port;
+
 struct Fixture {
     dir: PathBuf,
     state: Arc<Management>,
@@ -418,8 +420,7 @@ async fn remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserve
     );
 }
 
-/// Unix only: the read-only case needs Unix directory permissions.
-#[cfg(unix)]
+/// Unix only: the read-only case needs Unix directory permissions, enforced (not root).
 #[test]
 fn plaintext_secret_loads_from_a_read_only_config_and_inherited_keys() {
     use std::os::unix::fs::PermissionsExt;
@@ -430,13 +431,27 @@ fn plaintext_secret_loads_from_a_read_only_config_and_inherited_keys() {
     std::fs::write(&path, text).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let loaded = Config::load(&path);
+    // Root (also uid 0 in a user namespace) writes through these modes, so the
+    // read-only case cannot happen there and is not checked.
+    let enforced =
+        std::fs::OpenOptions::new().append(true).open(&path).is_err() && std::fs::write(dir.join("probe"), "").is_err();
+    let loaded = enforced.then(|| Config::load(&path));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    // Go: hashed in memory, persistence failure ignored.
-    let cfg = loaded.expect("read-only config must load");
-    assert!(bcrypt::verify("fake-plain-secret", &cfg.management.secret_key).unwrap());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file untouched");
+    if let Some(loaded) = loaded {
+        // Go: hashed in memory, persistence failure ignored.
+        let cfg = loaded.expect("read-only config must load");
+        assert!(bcrypt::verify("fake-plain-secret", &cfg.management.secret_key).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file untouched");
+    } else {
+        let _ = std::fs::remove_file(dir.join("probe"));
+        // CI sets CPA_TEST_NO_SKIP: a run as root must not pass without the check.
+        assert!(
+            std::env::var_os("CPA_TEST_NO_SKIP").is_none(),
+            "file permissions are not enforced (running as root?), and CPA_TEST_NO_SKIP is set"
+        );
+        eprintln!("file permissions are not enforced (running as root?): read-only config case not checked");
+    }
     // Keys inherited through a merge (legacy and v8 layout, at the root or inside the
     // parent mapping) are persisted hashed, with no plaintext left in the merge.
     for text in [
@@ -1134,6 +1149,63 @@ async fn config_key_toggle_edits_only_the_target_key_in_the_current_file() {
     server.abort();
 }
 
+/// #28: a Management API write that marks a `codex-api-key` model `is-compat` is refused,
+/// through the legacy list route, the v8 config path and a whole-config upload alike: the
+/// file and the running config keep the last good value. Another provider's `is-compat`
+/// still saves.
+#[tokio::test]
+async fn management_writes_refuse_a_codex_is_compat_model() {
+    let f = Fixture::from_yaml("codex-compat", |auth, hash| {
+        format!(
+            "management:\n  secret-key: '{hash}'\nauth-dir: {}\ncodex-api-key:\n  - api-key: fake-codex\n    base-url: https://codex.example.invalid\n    models: [{{name: a, alias: b}}]\n",
+            auth.display()
+        )
+    });
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let before = f.file();
+    let compat = json!([{"api-key": "fake-codex", "base-url": "https://codex.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}]}]);
+    let writes = [
+        client
+            .put(format!("{base}/v0/management/codex-api-key"))
+            .bearer_auth("fake-management-only")
+            .json(&compat),
+        client
+            .put(format!("{base}/v8/management/config/api-keys/codex"))
+            .bearer_auth("fake-management-only")
+            .json(&json!([{"base-url": "https://codex.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}], "keys": [{"api-key": "fake-codex"}]}])),
+        client
+            .put(format!("{base}/v0/management/config.yaml"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/yaml")
+            .body(before.replace("alias: b}", "alias: b, is-compat: true}")),
+    ];
+    for (i, write) in writes.into_iter().enumerate() {
+        let r = write.send().await.unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap();
+        assert!((400..500).contains(&status), "write {i}: {status} {text}");
+        assert!(text.contains("is-compat"), "write {i}: {text}");
+        assert_eq!(f.file(), before, "write {i}: the file keeps the last good config");
+        let models = cpa_core::config::credentials::api_key_entries(&f.rt.config(), "codex")[0]
+            .models
+            .clone();
+        assert!(
+            models.iter().all(|m| m.get("is-compat").is_none()),
+            "write {i}: {models:?}"
+        );
+    }
+    let r = client
+        .put(format!("{base}/v0/management/claude-api-key"))
+        .bearer_auth("fake-management-only")
+        .json(&json!([{"api-key": "fake-claude", "base-url": "https://claude.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}]}]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "other providers keep is-compat");
+    server.abort();
+}
+
 /// Go d69962e4 and 3e309fb4: a config API key is not an auth file, so the fields patch
 /// does not find it (404) and changes nothing, in memory or in config.yaml.
 #[tokio::test]
@@ -1625,11 +1697,13 @@ async fn model_definitions_fall_back_to_registered_models_by_channel() {
 
 /// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
 /// the Codex, xAI and Devin built-ins. Every channel answers Go's bytes, recorded by
-/// `reference/manage` (its second output).
+/// `reference/manage` (its second output), with the GPT Image 2.6 forward port in the
+/// Codex built-ins (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
 async fn model_definitions_match_go_by_channel() {
-    let go: serde_json::Map<String, Value> =
+    let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
+    forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
     let f = Fixture::from_yaml("definitions-go", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
@@ -1672,7 +1746,6 @@ async fn model_definitions_match_go_by_channel() {
 /// Go v8.0.35 `TestGetStaticModelDefinitions_FallsBackToPluginStaticModels`: a plugin
 /// channel lists the plugin's static models in plugin order. The plugin is the Go
 /// recorder test plugin.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_definitions_fall_back_to_plugin_static_models() {
     let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -2070,7 +2143,6 @@ async fn github_token_stays_out_of_the_v0_config_json() {
 /// v8 saves (`migrate` true), clearing and the refusals are the `model_catalog_sources`
 /// scenario in `manage_go.json`; the load refusals are its `load_errors`. Unix only:
 /// `/abs/models.json` is not absolute on Windows.
-#[cfg(unix)]
 #[tokio::test]
 async fn model_catalog_sources_survive_a_legacy_save() {
     let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n  devin-catalog: 'http://localhost/devin.json'\n";
@@ -2100,7 +2172,6 @@ async fn model_catalog_sources_survive_a_legacy_save() {
 /// it is, while the running config keeps the last valid source. Go marshals its valid
 /// in-memory config over the file and saves (DIFFERENCES: v0 setters over a refused file).
 /// Unix only: `/ok/models.json` is not absolute on Windows.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_v0_write_over_a_file_with_an_invalid_catalog_source_is_refused() {
     let raw = "models:\n  catalog: /ok/models.json\n";
@@ -2510,6 +2581,219 @@ async fn usage_queue_pops_records_in_order() {
     server.abort();
 }
 
+/// The dashboard's `GET /observability/usage/live` over the served app, with records
+/// produced by real `/v1/messages` requests to a local mock Claude upstream: it needs
+/// the management key, two readers see the same records without competing, and the
+/// queue collector (v8 and v0 spellings) still gets every record it gets with no reader.
+#[tokio::test]
+async fn usage_live_observes_without_taking_records_from_the_queue() {
+    let upstream = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|| async {
+            axum::Json(json!({
+                "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-fake",
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let f = Fixture::from_yaml("usagelive", |auth, hash| {
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\naccess:\n  api-keys: [fake-client]\nobservability:\n  usage:\n    usage-statistics-enabled: true\nclaude-api-key:\n  - api-key: sk-fake-upstream\n    base-url: {upstream_url}\n",
+            auth.display()
+        )
+    });
+    cpa_server::install_registry(&f.rt);
+    // As the binary composes it, minus layers this test does not exercise.
+    let app = cpa_server::observability::router(
+        &f.rt,
+        cpa_server::app(f.rt.clone(), management::router(f.state.clone())),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = wreq::Client::new();
+    let get = |path: String, key: Option<&'static str>| {
+        let mut r = client.get(format!("{base}/{path}"));
+        if let Some(key) = key {
+            r = r.bearer_auth(key);
+        }
+        r.send()
+    };
+    let live = |after: Option<String>| {
+        let q = after.map_or(String::new(), |a| format!("?after={a}"));
+        get(
+            format!("v8/management/observability/usage/live{q}"),
+            Some("fake-management-only"),
+        )
+    };
+    let request = || {
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", "fake-client")
+            .json(
+                &json!({"model": "claude-opus-5-5", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .send()
+    };
+    let cursor = |v: &Value| v["cursor"].as_str().unwrap().to_owned();
+    let ids = |records: &Value| -> Vec<String> {
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["request_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Management auth: no key, a client key and a wrong key are all refused, and no
+    // refused read counts as a viewer.
+    for key in [None, Some("fake-client"), Some("wrong")] {
+        let r = get("v8/management/observability/usage/live".into(), key).await.unwrap();
+        assert_eq!(r.status(), 401, "key {key:?}");
+    }
+    for q in ["?after=x", "?after=1", "?after=-1", "?count=0", "?count=x"] {
+        let r = get(
+            format!("v8/management/observability/usage/live{q}"),
+            Some("fake-management-only"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status(), 400, "{q}");
+    }
+
+    // Baseline with no viewer: the collector gets both records.
+    for _ in 0..2 {
+        let r = request().await.unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    }
+    let baseline: Value = get(
+        "v8/management/observability/usage/queue?count=10".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(baseline.as_array().unwrap().len(), 2);
+
+    // Two dashboard tabs start, then three requests arrive.
+    let tab_a: Value = live(None).await.unwrap().json().await.unwrap();
+    let tab_b: Value = live(None).await.unwrap().json().await.unwrap();
+    assert_eq!(tab_a["records"], json!([]), "a new viewer starts at the newest record");
+    assert_eq!(tab_a["usage_statistics_enabled"], true);
+    for _ in 0..3 {
+        assert_eq!(request().await.unwrap().status(), 200);
+    }
+    let a: Value = live(Some(cursor(&tab_a))).await.unwrap().json().await.unwrap();
+    let b: Value = live(Some(cursor(&tab_b))).await.unwrap().json().await.unwrap();
+    let seen = ids(&a["records"]);
+    assert_eq!(seen.len(), 3);
+    assert!(seen.iter().all(|id| !id.is_empty()) && seen[0] != seen[1] && seen[1] != seen[2]);
+    assert_eq!(a["records"], b["records"], "both tabs see the same records");
+    assert_eq!((a["gap"].as_bool(), a["more"].as_bool()), (Some(false), Some(false)));
+    let again: Value = live(Some(cursor(&tab_a))).await.unwrap().json().await.unwrap();
+    assert_eq!(again["records"], a["records"], "re-reading takes nothing");
+    let empty: Value = live(Some(cursor(&a))).await.unwrap().json().await.unwrap();
+    assert_eq!(empty["records"], json!([]));
+    // A cursor from another process (another epoch) with an in-range number: a gap,
+    // and every kept record, instead of silently skipping some.
+    let (epoch, seq) = cursor(&a)
+        .split_once('.')
+        .map(|(e, s)| (e.to_owned(), s.parse::<u64>().unwrap()))
+        .unwrap();
+    let foreign_epoch = if epoch == "0000000000000000" {
+        "0000000000000001"
+    } else {
+        "0000000000000000"
+    };
+    let foreign: Value = live(Some(format!("{foreign_epoch}.{}", seq - 2)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(foreign["gap"], true);
+    assert_eq!(foreign["records"], a["records"]);
+
+    // The collector still gets every record, split across both queue spellings.
+    let first: Value = get(
+        "v8/management/observability/usage/queue?count=2".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rest: Value = get(
+        "v0/management/usage-queue?count=10".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let mut collected = ids(&first);
+    collected.extend(ids(&rest));
+    assert_eq!(collected, ids(&a["records"]), "same records, same order");
+    // Records are byte-identical to the queue's (the schema is unchanged).
+    assert_eq!(
+        a["records"].as_array().unwrap().iter().collect::<Vec<_>>(),
+        first
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(rest.as_array().unwrap())
+            .collect::<Vec<_>>()
+    );
+
+    // A slow tab that never reads again: the feed stays capped and the queue intact.
+    let slow = cursor(&a);
+    let queue = f.rt.usage_queue();
+    for i in 0..cpa_server::usage::LIVE_MAX_RECORDS + 10 {
+        queue.enqueue(format!(r#"{{"request_id":"synthetic-{i}"}}"#).into_bytes());
+    }
+    let behind: Value = live(Some(slow)).await.unwrap().json().await.unwrap();
+    assert_eq!(behind["gap"], true);
+    assert_eq!(behind["more"], true);
+    assert_eq!(
+        behind["records"].as_array().unwrap().len(),
+        cpa_server::usage::LIVE_MAX_PAGE
+    );
+    assert_eq!(
+        behind["records"][0]["request_id"], "synthetic-10",
+        "the oldest kept record"
+    );
+    let drained: Value = get(
+        "v8/management/observability/usage/queue?count=5000".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        drained.as_array().unwrap().len(),
+        cpa_server::usage::LIVE_MAX_RECORDS + 10,
+        "the queue lost nothing to the slow viewer"
+    );
+    server.abort();
+}
+
 /// api-call HEAD: Go's transport never asks for gzip on HEAD, so the upstream sees no
 /// Accept-Encoding and a gzip Content-Encoding on the answer is relayed untouched.
 #[tokio::test]
@@ -2751,7 +3035,6 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     }
     let last_refresh = saved["last_refresh"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(last_refresh).is_ok() && last_refresh.ends_with('Z'));
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -3224,7 +3507,6 @@ async fn vertex_service_account_import() {
         .replace("us-central1", "us-east1");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), golden);
     // The service account holds a private key: never world-readable.
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -3660,7 +3942,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
 async fn config_shared_upstream_round_trip() {
     let f = Fixture::from_yaml("upstream", |auth, hash| {
         format!(
-            "management: {{secret-key: '{hash}'}}\noauth: {{auth-dir: {}, providers: {{codex: {{stream-bootstrap-buffering: true, header-defaults: {{user-agent: oauth-agent}}}}}}}}\n",
+            "management: {{secret-key: '{hash}'}}\noauth: {{auth-dir: {}, providers: {{codex: {{stream-bootstrap-buffering: true, header-defaults: {{beta-features: oauth-beta}}}}}}}}\n",
             auth.display()
         )
     });
@@ -3714,11 +3996,11 @@ async fn config_shared_upstream_round_trip() {
         assert_eq!(d["oauth"]["auth-auto-refresh-workers"], 3);
     }
     assert_eq!(
-        loaded.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
-        "oauth-agent"
+        loaded.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"],
+        "oauth-beta"
     );
     assert_eq!(
-        api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"],
+        api.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"],
         ""
     );
     let before = f.file();
@@ -4437,7 +4719,6 @@ async fn siwc_binding_flows_follow_go() {
     }
 
     // The credential file itself may not be a symlink.
-    #[cfg(unix)]
     {
         let target = f.dir.join("auth").join("target.json");
         std::fs::rename(&file, &target).unwrap();
@@ -4663,12 +4944,12 @@ async fn config_v8_historical_field_paths() {
 /// DELETE removes all of them, leaving unrelated settings and OAuth scope alone.
 #[tokio::test]
 async fn config_v8_historical_provider_subtrees() {
-    let raw = "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}, xai: {inject-x-search: true}}\noauth: {providers: {codex: {header-defaults: {user-agent: oauth-agent}}}}\nclient: {codex: {optimize-multi-agent-v2: true, enable-apply-patch: true}}\n";
+    let raw = "upstream: {codex: {response-steering: true, stream-bootstrap-buffering: true}, xai: {inject-x-search: true}}\noauth: {providers: {codex: {header-defaults: {beta-features: oauth-beta}}}}\nclient: {codex: {optimize-multi-agent-v2: true, enable-apply-patch: true}}\n";
     for (method, path, body, steering, buffering, optimize, agent) in [
         (
             wreq::Method::PATCH,
             "oauth/providers/codex",
-            r#"{"response-steering":false,"header-defaults":{"user-agent":"updated"}}"#,
+            r#"{"response-steering":false,"header-defaults":{"beta-features":"updated"}}"#,
             false,
             true,
             true,
@@ -4699,7 +4980,7 @@ async fn config_v8_historical_provider_subtrees() {
             false,
             false,
             true,
-            "oauth-agent",
+            "oauth-beta",
         ),
     ] {
         let f = Fixture::from_yaml("historical-subtrees", |auth, hash| {
@@ -4734,7 +5015,7 @@ async fn config_v8_historical_provider_subtrees() {
                 flag(&d["upstream"]["codex"]["response-steering"]),
                 flag(&d["upstream"]["codex"]["stream-bootstrap-buffering"]),
                 flag(&d["client"]["codex"]["optimize-multi-agent-v2"]),
-                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                     .as_str()
                     .unwrap_or(""),
             ),
@@ -4744,7 +5025,7 @@ async fn config_v8_historical_provider_subtrees() {
         assert!(flag(&d["upstream"]["xai"]["inject-x-search"]) && flag(&d["client"]["codex"]["enable-apply-patch"]));
         let api = cfg.for_api_key();
         assert!(
-            api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+            api.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                 .as_str()
                 .unwrap_or("")
                 .is_empty()
@@ -5148,8 +5429,8 @@ async fn v0_writes_keep_binary_values() {
 #[tokio::test]
 async fn v0_setters_save_v8_files_in_the_latest_layout() {
     for raw in [
-        "config-version: 8\n# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
-        "# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {user-agent: oauth-agent}}, xai: {inject-x-search: true}}}\n",
+        "config-version: 8\n# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {beta-features: oauth-beta}}, xai: {inject-x-search: true}}}\n",
+        "# Preserve provider settings\noauth: {providers: {codex: {response-steering: true, header-defaults: {beta-features: oauth-beta}}, xai: {inject-x-search: true}}}\n",
         "config-version: 8\nupstream: {codex: {response-steering: true}, xai: {inject-x-search: true}}\nrouting: {retry: {request-retry: 3}}\n",
     ] {
         let f = Fixture::from_yaml("v0-existing-version", |auth, hash| {
@@ -5177,17 +5458,17 @@ async fn v0_setters_save_v8_files_in_the_latest_layout() {
             api.document["upstream"]["xai"]["inject-x-search"],
             serde_yaml_ng::Value::Bool(true)
         );
-        if raw.contains("oauth-agent") {
+        if raw.contains("oauth-beta") {
             // The Codex header defaults stay OAuth-only through the save.
             let ua = |d: &serde_yaml_ng::Value| {
-                d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
+                d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"]
                     .as_str()
                     .unwrap_or("")
                     .to_owned()
             };
             assert_eq!(
                 (ua(&cfg.document), ua(&api.document)),
-                ("oauth-agent".to_owned(), String::new()),
+                ("oauth-beta".to_owned(), String::new()),
                 "{file}"
             );
         }
@@ -5281,7 +5562,7 @@ async fn config_v8_field_updates_keep_comments() {
 async fn v0_setters_keep_a_legacy_layout() {
     for raw in [
         "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\nrouting: {strategy: fill-first}\n",
-        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\ncodex-header-defaults: {user-agent: legacy-agent}\n",
+        "request-retry: 3\ncodex: {response-steering: true}\nxai: {inject-x-search: true}\ncodex-header-defaults: {beta-features: legacy-beta}\n",
     ] {
         let f = Fixture::from_yaml("v0-legacy-version", |auth, hash| private_config(raw, auth, hash, true));
         let (base, server) = f.server().await;
@@ -5312,11 +5593,11 @@ async fn v0_setters_keep_a_legacy_layout() {
             serde_yaml_ng::Value::Bool(true),
             "{file}"
         );
-        if raw.contains("legacy-agent") {
-            let ua = &d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"];
+        if raw.contains("legacy-beta") {
+            let ua = &d["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"];
             assert_eq!(
                 ua.as_str(),
-                Some("legacy-agent"),
+                Some("legacy-beta"),
                 "API keys lost the legacy header default: {file}"
             );
         }

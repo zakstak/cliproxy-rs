@@ -782,7 +782,7 @@ async fn forward_usage(rt: Arc<Runtime>, client: Client, stop: CancellationToken
             // push fails, and the rest goes back to the queue.
             if stop.is_cancelled() || client.lpush_usage(item).await.is_err() {
                 for rest in &items[i..] {
-                    rt.usage_queue().enqueue(rest.clone());
+                    rt.usage_queue().requeue(rest.clone());
                 }
                 if !sleep(Duration::from_secs(1)).await {
                     return;
@@ -3251,10 +3251,12 @@ mod tests {
     }
 
     /// Go `registerConfigAPIKeyAuths` on each applied Home config: its API keys register
-    /// their models (a keyless OpenAI-compatibility entry is not an API key), so a kept
-    /// Home pin survives the continuation. A later config without the key drops the
-    /// model (unlike Go, which keeps it), so the same socket's next continuation no
-    /// longer keeps its pin and closes with 1012.
+    /// their models (a keyless OpenAI-compatibility entry is not an API key). A later
+    /// config without the key drops the model from the local registry (unlike Go, which
+    /// keeps it). The same socket's next continuation still keeps its pin: a Home pin is
+    /// validated by the pick Home granted, not by the local registry (#38,
+    /// docs/DIFFERENCES-FROM-GO.md "Codex native WebSocket route"; Go clears it and closes
+    /// with 1012), so the continuation stays on its socket and asks Home for nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn home_config_api_keys_register_their_models_until_removed() {
         let (upstream, _) = responses_ws_upstream().await;
@@ -3277,12 +3279,9 @@ mod tests {
         })
         .await;
         assert!(rt.store().snapshot().is_empty());
-        // The same socket, still holding its pick: the pin no longer matches a provider.
-        let close = ws_turn(&mut socket, CODEX_CONTINUATION).await.unwrap_err();
-        assert!(
-            close.contains("1012") && close.contains("upstream requires HTTP replay"),
-            "{close}"
-        );
+        // The same socket, still holding its pick: the pick, not the local registry,
+        // validates the pin, so the continuation stays on its socket.
+        ws_turn(&mut socket, CODEX_CONTINUATION).await.unwrap();
         assert_eq!(rpops(&home).len(), 1, "the continuations asked Home for nothing");
         drop(socket);
         shutdown.cancel();
@@ -5037,8 +5036,10 @@ mod tests {
                 assert_eq!(bound.is_compat(), enabled, "{provider}");
             }
         }
+        // The local binding comes from a Claude key: a `codex-api-key` model can no longer
+        // set `is-compat` (#28), and the rule is the same for every provider.
         let cfg = cpa_core::config::Config::parse(
-            "codex-api-key:\n  - api-key: fixture-key\n    base-url: http://127.0.0.1:9\n    prefix: tenant\n    models:\n      - name: upstream\n        alias: alias\n        is-compat: true\n",
+            "claude-api-key:\n  - api-key: fixture-key\n    base-url: http://127.0.0.1:9\n    prefix: tenant\n    models:\n      - name: upstream\n        alias: alias\n        is-compat: true\n",
         )
         .unwrap();
         for options in [
@@ -5046,8 +5047,8 @@ mod tests {
             Some(serde_json::json!({"weight": 2})),
             Some(serde_json::json!({"models": "invalid"})),
         ] {
-            let mut auth = serde_json::json!({"id": "c1", "provider": "codex", "prefix": "tenant",
-                "attributes": {"auth_kind": "apikey", "api_key": "fixture-key", "source": "config:codex[0]"}});
+            let mut auth = serde_json::json!({"id": "c1", "provider": "claude", "prefix": "tenant",
+                "attributes": {"auth_kind": "apikey", "api_key": "fixture-key", "source": "config:claude[0]"}});
             if let Some(options) = &options {
                 auth["metadata"] = serde_json::json!({"credential_options": options});
             }
@@ -6092,8 +6093,19 @@ mod tests {
         node.published().await;
         assert!(!first.exists());
 
-        // The same plugin config again: its sync key is unchanged.
-        let pushes = home.count("rpush");
+        // The same plugin config again: its sync key is unchanged. Only Home plugin
+        // reports count: once another test installs the process logger, this test's own
+        // plugin loads also reach Home as `app-log` lines.
+        let finalized = || {
+            home.commands()
+                .iter()
+                .filter(|c| {
+                    c[0].eq_ignore_ascii_case("rpush")
+                        && c.get(1).map(String::as_str) != Some(cpa_home::client::KEY_APP_LOG)
+                })
+                .count()
+        };
+        let pushes = finalized();
         let unload = hold(&host, &held, &enabled).await;
         *tasks.lock().unwrap() = r#"[{"id":2,"operation":"delete","plugin_id":"gone2"}]"#.to_owned();
         home.push(fake::message(
@@ -6109,7 +6121,7 @@ mod tests {
             second.exists(),
             "a delete task ran before the plugin worker applied the config"
         );
-        assert_eq!(home.count("rpush"), pushes, "finalized before the config applied");
+        assert_eq!(finalized(), pushes, "finalized before the config applied");
         release();
         assert!(unload.await.unwrap());
         eventually("the second delete", || !second.exists()).await;

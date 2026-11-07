@@ -321,7 +321,7 @@ impl Host {
             gojson::from_slice(raw).map_err(|e| err(format!("decode host auth save request: {e}")))?;
         // validateHostAuthSaveRequest.
         let name = req.name.trim();
-        if name.is_empty() || name.contains(['/', '\\']) || (cfg!(windows) && has_volume_name(name)) {
+        if name.is_empty() || name.contains(['/', '\\']) {
             return Err(err("invalid auth file name"));
         }
         if !name.go_lower().ends_with(".json") {
@@ -598,7 +598,7 @@ impl Host {
         {
             id = rel;
         }
-        if cfg!(windows) { id.go_lower() } else { id }
+        id
     }
 
     /// `host.affinity.lookup`.
@@ -867,12 +867,6 @@ fn validate_parsed_weight(auth: &crate::auth::PluginAuth) -> Result<(), Callback
     Ok(())
 }
 
-/// Windows `filepath.VolumeName` is non-empty: a drive letter or a UNC prefix.
-fn has_volume_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()) || name.starts_with("\\\\")
-}
-
 /// `info.ModTime()` in local time.
 fn mod_time(info: &std::fs::Metadata) -> GoTime {
     GoTime(
@@ -888,7 +882,6 @@ pub fn write_auth_file(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path).map_err(|e| path_error("open", path, &e))?;
     let written = file.write_all(data).map_err(|e| path_error("write", path, &e));
@@ -898,20 +891,12 @@ pub fn write_auth_file(path: &Path, data: &[u8]) -> Result<(), String> {
 
 /// Closes `file`, reporting the error `close(2)` returns (Go's `File.Close`).
 fn close(file: std::fs::File) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::IntoRawFd as _;
-        // SAFETY: the descriptor is owned here and closed exactly once.
-        if unsafe { libc::close(file.into_raw_fd()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+    use std::os::fd::IntoRawFd as _;
+    // SAFETY: the descriptor is owned here and closed exactly once.
+    if unsafe { libc::close(file.into_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(unix))]
-    {
-        drop(file);
-        Ok(())
-    }
+    Ok(())
 }
 
 /// `credentialweight.ParseString`'s error for a string weight `strconv.ParseInt`
@@ -945,7 +930,6 @@ pub(crate) fn path_error(op: &str, path: &Path, e: &std::io::Error) -> String {
 /// The error `os.ReadFile` reports: opening fails as `open`, reading a directory as
 /// `read`.
 fn read_error(path: &Path, e: &std::io::Error) -> String {
-    #[cfg(unix)]
     if e.raw_os_error() == Some(libc::EISDIR) {
         return path_error("read", path, e);
     }

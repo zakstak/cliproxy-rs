@@ -17,7 +17,7 @@ fn collect(path: &Path, files: &mut Vec<std::path::PathBuf>) {
 
 fn main() {
     // `dashboard` links to ../../ui/dist, so a packaged crate carries the files. Where Git
-    // checks the link out as a plain file (Windows without symlinks), read ui/dist itself.
+    // checks the link out as a plain file (`core.symlinks=false`), read ui/dist itself.
     let dir = if Path::new("dashboard").is_dir() {
         "dashboard"
     } else {
@@ -31,8 +31,8 @@ fn main() {
     let mut output =
         String::from("fn dashboard_asset(path: &str) -> Option<(&'static [u8], &'static str)> { match path {\n");
     for path in files {
-        // The match key is a URL path, so it is joined with `/` on every host;
-        // `display()` would give `\` on Windows. include_bytes! keeps the native path.
+        // The match key is a URL path, joined with `/`. include_bytes! keeps the native
+        // path.
         let name: String = path
             .strip_prefix(&root)
             .unwrap()

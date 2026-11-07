@@ -963,14 +963,8 @@ fn go_mkdir_all(dir: &Path) -> Result<(), String> {
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         go_mkdir_all(parent)?;
     }
-    #[cfg(unix)]
-    let builder = {
-        let mut builder = std::fs::DirBuilder::new();
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder
-    };
-    #[cfg(not(unix))]
-    let builder = std::fs::DirBuilder::new();
+    let mut builder = std::fs::DirBuilder::new();
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     match builder.create(dir) {
         Ok(()) => Ok(()),
         Err(_) if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) => Ok(()),

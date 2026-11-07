@@ -1501,12 +1501,32 @@ pub fn claude_messages_json_to_sse(raw: &[u8]) -> (Cow<'_, [u8]>, Vec<u8>) {
 pub struct UserTurnDrops {
     turn: Option<String>,
     first: Option<String>,
+    /// The first part dropped anywhere, for [`Self::strict_result`].
+    any: Option<String>,
 }
 
 impl UserTurnDrops {
     pub fn drop_part(&mut self, part_type: &str) {
         if self.turn.is_none() {
             self.turn = Some(part_type.to_owned());
+        }
+        if self.any.is_none() {
+            self.any = Some(part_type.to_owned());
+        }
+    }
+
+    /// The Codex translators' rule (`docs/codex/CONTRACT.md` "Translated route"): any
+    /// part the destination cannot express refuses the request before it is sent, so
+    /// no content is lost without the client knowing.
+    pub fn strict_result(&self, destination: &str) -> Result<(), crate::Error> {
+        match self.any.as_deref() {
+            None => Ok(()),
+            Some(kind) => {
+                let kind = if kind.is_empty() { "unknown" } else { kind };
+                Err(crate::Error(format!(
+                    "unsupported conversion: `{kind}` cannot be expressed in a {destination} request; remove it or send the request to a provider that accepts it"
+                )))
+            }
         }
     }
 

@@ -1,0 +1,2 @@
+{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1738888888},"headers":{"x-codex-primary-used-percent":"100.0","x-codex-primary-window-minutes":15}}
+{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"websocket_connection_limit_reached","message":"Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."}}

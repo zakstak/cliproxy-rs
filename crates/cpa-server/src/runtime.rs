@@ -3919,8 +3919,7 @@ pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<(
         // create_new is O_CREAT|O_EXCL: it never follows or reuses an existing path.
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // Go's 0600; on Windows Go ignores mode bits and creates the file plainly.
-        #[cfg(unix)]
+        // Go's 0600.
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&tmp) {
             Ok(file) => break (tmp, file),
@@ -4077,7 +4076,6 @@ fn test_hook(site: &'static str, id: &str) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     thread_local! {
@@ -4367,7 +4365,6 @@ pub(crate) mod tests {
         // A stale temp-file-looking path and a symlink must not be reused or followed.
         let victim = dir.join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(
             &victim,
             dir.join(format!(".claude-a.json.{}.0.tmp", std::process::id())),
@@ -4390,7 +4387,6 @@ pub(crate) mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "{\"type\":\"claude\",\"access_token\":\"new\",\"zz_unknown\":{\"k\":[1,2]},\"email\":\"a@x.test\",\"disabled\":true}\n"
         );
-        #[cfg(unix)]
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(
             std::fs::read_to_string(&victim).unwrap(),
@@ -4768,7 +4764,6 @@ pub(crate) mod tests {
             "an unreadable file's snapshot was applied"
         );
         // A FIFO in its place is not opened (reading one blocks until a writer appears).
-        #[cfg(unix)]
         {
             std::fs::remove_dir(&path).unwrap();
             let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
@@ -5297,7 +5292,6 @@ pub(crate) mod tests {
         lease.complete(Outcome::Failure(quota));
         let file = dir.join("a.cds");
         let written = std::fs::read_to_string(&file).expect("cooldown written");
-        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -7764,10 +7758,56 @@ pub(crate) mod tests {
     /// A plugin-routed refresh job that panics records no deadline of the plugin's, so
     /// the refresh state backs it off like any failure instead of starting it again on
     /// the next scan.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// Loading an auth-provider plugin installs the process-global plugin auth parser, and
+    /// while it is active every auth-folder scan in the process defers its files to the
+    /// plugin. Run in this binary's process, the test emptied the stores of credential
+    /// tests running beside or after it. It runs in a child process instead, holding only
+    /// this test; the parent checks that the child ran it and that its own parser stayed
+    /// inactive.
+    #[test]
     #[cfg_attr(feature = "media-relay", ignore = "needs the Go plugin toolchain")]
-    async fn a_panicking_plugin_refresh_backs_off() {
+    fn a_panicking_plugin_refresh_backs_off() {
+        const NAME: &str = "runtime::tests::a_panicking_plugin_refresh_backs_off";
+        const CHILD: &str = "CPA_TEST_PLUGIN_REFRESH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // The child: the real test.
+            return tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_panicking_plugin_refresh_backs_off_in_child());
+        }
+        // The environment is inherited, so the Go toolchain lookup and CPA_TEST_NO_SKIP
+        // behave as they would here; the marker stops the child from spawning again.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // A skip line (no Go toolchain) stays visible: straight to this process's stderr,
+        // which the harness does not capture (as cpa_plugin::testing writes it).
+        for line in stderr.lines().filter(|l| l.starts_with("SKIPPED:")) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+        assert!(output.status.success(), "child test failed:\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("test {NAME} ... ok")) && stdout.contains("1 passed"),
+            "the child did not run the test:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            !cpa_core::config::credentials::plugin_auth_parser_active(),
+            "the plugin auth parser must never become active in this process"
+        );
+    }
+
+    async fn a_panicking_plugin_refresh_backs_off_in_child() {
         let tmp = std::env::temp_dir();
         let Some(built) = cpa_plugin::testing::built_plugins(&tmp, "a_panicking_plugin_refresh") else {
             return;
@@ -7843,6 +7883,10 @@ pub(crate) mod tests {
             "no second attempt before the backoff"
         );
         rt.stop_auto_refresh();
+        // Unload the plugin as the plugin integration tests' `finish` does; this process
+        // holds only this test, but a clean shutdown is part of what it checks.
+        rt.plugins().shutdown_all(None).await;
+        assert!(!cpa_core::config::credentials::plugin_auth_parser_active());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

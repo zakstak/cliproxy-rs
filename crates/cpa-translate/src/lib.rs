@@ -69,6 +69,11 @@ macro_rules! registered {
             },
             token_count: $token_count,
             go_stream: $go_stream,
+            builtin_non_stream: |ctx, body| {
+                let non_stream: $crate::NonStreamFn = $non_stream;
+                let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
+                $crate::deep_stack(levels, || non_stream(ctx, body))
+            },
         }
     };
 }
@@ -95,6 +100,7 @@ mod codex_claude_response;
 mod codex_gemini;
 mod codex_interactions;
 mod codex_responses;
+mod codex_strict;
 mod common;
 mod gemini;
 mod gemini_chat_request;
@@ -298,6 +304,8 @@ pub(crate) struct Registered {
     pub pair: Pair,
     pub token_count: Option<TokenCountFn>,
     pub go_stream: GoStreamFn,
+    /// The pair's non-stream translation without plugin response hooks.
+    pub builtin_non_stream: NonStreamFn,
 }
 
 fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
@@ -409,15 +417,54 @@ pub fn translate_request_tracked(
     }
 }
 
-/// [`translate_request_tracked`] for OpenAI Responses -> Codex, where the client's
-/// identity decides which fields the conversion forces ([`CodexResponsesClient`]).
-pub fn translate_responses_to_codex_tracked(
-    ctx: &RequestCtx<'_>,
+/// The Codex translated route's request conversion (`docs/codex/CONTRACT.md`
+/// "Translated route"): the built-in converter of `client` into Codex in its strict
+/// mode, without plugin request normalizers or plugin translators, whose output no hook
+/// may change. The thinking summary pipeline runs, as it converts the client's own
+/// reasoning-summary choice. `None` for a source the route does not convert.
+pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Option<Result<Vec<u8>, Error>> {
+    let convert: RequestFn = match client {
+        Format::Claude => codex_claude::codex_strict,
+        Format::OpenAI => codex_chat_request::codex_strict,
+        Format::Gemini => codex_gemini::codex_strict,
+        Format::Interactions => codex_interactions::codex_strict,
+        _ => return None,
+    };
+    let upstream = Format::Codex;
+    Some(deep_stack(levels(&[body]), || {
+        let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
+        let mut out = convert(ctx, body)?;
+        codex_strict::controls(client, body, &mut out)?;
+        Ok(thinking::apply_summary_for_model(
+            out,
+            upstream.as_str(),
+            ctx.model,
+            summary,
+        ))
+    }))
+}
+
+/// A registered pair's non-stream response translation without plugin response hooks
+/// (see [`codex_request`]).
+pub fn builtin_non_stream(
+    client: Format,
+    upstream: Format,
+    ctx: &ResponseCtx<'_>,
     body: &[u8],
-    client: CodexResponsesClient,
-) -> Result<Translated, Error> {
-    translate_registered(Format::OpenAIResponse, Format::Codex, ctx, body, |body| {
-        Ok(codex_responses::convert(body, client))
+) -> Option<Result<Vec<u8>, Error>> {
+    registered(client, upstream).map(|r| (r.builtin_non_stream)(ctx, body))
+}
+
+/// A registered pair's stream translation without plugin response hooks (see
+/// [`codex_request`]).
+pub fn builtin_stream(client: Format, upstream: Format, ctx: &ResponseCtx<'_>) -> Option<Box<dyn StreamTranslator>> {
+    registered(client, upstream).map(|r| {
+        stream::framed(
+            client,
+            upstream,
+            (r.go_stream)(ctx),
+            levels(&[ctx.original_request, ctx.translated_request]),
+        )
     })
 }
 

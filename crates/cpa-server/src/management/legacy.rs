@@ -863,7 +863,7 @@ mod tests {
         ));
         let state = Management::with_options(rt, path.clone(), Default::default());
         let upload =
-            format!("auth-dir: {auth}\nrequest-retry: 3\ncodex-header-defaults: {{user-agent: legacy-agent}}\n");
+            format!("auth-dir: {auth}\nrequest-retry: 3\ncodex-header-defaults: {{beta-features: legacy-beta}}\n");
         let (upload_tx, upload_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let handle = tokio::runtime::Handle::current();
@@ -900,8 +900,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), upload);
         let cfg = state.rt.config();
         let api = cfg.for_api_key();
-        let ua = &api.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"];
-        assert_eq!(ua.as_str(), Some("legacy-agent"));
+        let ua = &api.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"];
+        assert_eq!(ua.as_str(), Some("legacy-beta"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

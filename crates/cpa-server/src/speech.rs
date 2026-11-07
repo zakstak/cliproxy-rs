@@ -97,6 +97,7 @@ pub async fn speech(
         execution_session: None,
         request_path: dispatch::route_path(matched.as_ref(), &uri),
         peer: dispatch::peer(peer),
+        native: None,
         turn: None,
         media: Some(Arc::new(Media {
             kind: MediaKind::Speech,

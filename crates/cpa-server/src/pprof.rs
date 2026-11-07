@@ -245,12 +245,7 @@ fn temporary_accept_error(error: &std::io::Error) -> bool {
         return true;
     }
     // net.OpError.Temporary also includes exhausted process/system descriptor tables.
-    #[cfg(unix)]
     if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-        return true;
-    }
-    #[cfg(windows)]
-    if error.raw_os_error() == Some(10024) {
         return true;
     }
     false
@@ -634,10 +629,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         for _ in 0..9 {
             let (accepted, observed) = tokio::sync::oneshot::channel();
-            #[cfg(unix)]
             let error = std::io::Error::from_raw_os_error(libc::EMFILE);
-            #[cfg(windows)]
-            let error = std::io::Error::from_raw_os_error(10024);
             server.accept_errors.send((error, accepted)).unwrap();
             observed.await.unwrap();
             symbol_on(&mut keep).await;

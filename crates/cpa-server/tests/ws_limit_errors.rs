@@ -217,6 +217,11 @@ impl Drop for AuthDir {
 
 /// One proxy over `keys` (API key, upstream WebSocket on), each serving [`MODEL`].
 async fn proxy(keys: &[(&str, bool)]) -> Proxy {
+    proxy_with(keys, "").await
+}
+
+/// [`proxy`] with `extra` appended to the config.
+async fn proxy_with(keys: &[(&str, bool)], extra: &str) -> Proxy {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let mock = Arc::new(Mock::default());
     let upstream_addr = serve(axum::Router::new().fallback(upstream).with_state(mock.clone())).await;
@@ -226,7 +231,7 @@ async fn proxy(keys: &[(&str, bool)]) -> Proxy {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut yaml = format!("host: \"\"\nauth-dir: '{}'\ncodex-api-key:\n", dir.display());
+    let mut yaml = format!("host: \"\"\nauth-dir: '{}'\n{extra}codex-api-key:\n", dir.display());
     for (key, ws) in keys {
         yaml.push_str(&format!("  - api-key: {key}\n    base-url: http://{upstream_addr}\n"));
         if *ws {
@@ -651,4 +656,128 @@ async fn limit_after_output(websocket: bool) {
     );
     assert_codex_usage_limit(error_frames(&frames)[0], Some("plus"), Some(resets_at));
     assert!(closed(&frames), "{frames:?}");
+}
+
+const SECRETS: [&str; 5] = [
+    "acct_private_123",
+    "sk-leaked-token",
+    "session=secret",
+    "req_private",
+    "sk-fake",
+];
+
+/// No frame the client received carries an account identifier or token.
+fn assert_no_secrets(frames: &[Frame]) {
+    for frame in frames {
+        if let Frame::Text(value) = frame {
+            let text = value.to_string();
+            for secret in SECRETS {
+                assert!(!text.contains(secret), "{secret} reached the client: {text}");
+            }
+        }
+    }
+}
+
+const STEERING: &str = "codex:\n  response-steering: true\n";
+
+fn created(id: &str) -> String {
+    json!({"type": "response.created", "response": {"id": id, "status": "in_progress", "output": []}}).to_string()
+}
+
+/// The two account failures a native upstream socket sends: a terminal
+/// `response.failed`, and the wrapped status `error` frame.
+fn account_failures(resets_at: i64) -> [(&'static str, String); 2] {
+    let error = serde_json::from_str::<Value>(&limit_body(resets_at)).unwrap()["error"].clone();
+    [
+        (
+            "terminal",
+            json!({"type": "response.failed", "response": {"id": "resp_1", "status": "failed", "error": error}})
+                .to_string(),
+        ),
+        (
+            "wrapped",
+            json!({"type": "error", "status": 429, "error": error, "headers": limit_headers(resets_at)}).to_string(),
+        ),
+    ]
+}
+
+/// A native turn's account failure after `response.created`, with and without response
+/// steering: the frame never reaches the client as sent (it names the account and carries
+/// a token). A Codex client gets the allowlisted limit event, any other client a silent
+/// close, and the credential still cools: the next connection does not reach it.
+#[tokio::test]
+async fn native_account_failures_after_start_never_reach_the_client_as_sent() {
+    for steering in [false, true] {
+        for codex_client in [true, false] {
+            for (shape, failure) in account_failures(now() + 7200) {
+                let _registry = REGISTRY.lock().await;
+                let config = if steering { STEERING } else { "" };
+                let proxy = proxy_with(&[("sk-fake-a", true)], config).await;
+                let name = format!("steering={steering} codex={codex_client} {shape}");
+                proxy.mock.push(
+                    "sk-fake-a",
+                    json!({"events": [
+                        created("resp_1"),
+                        json!({"type": "response.output_text.delta", "delta": "partial"}).to_string(),
+                        failure,
+                    ]}),
+                );
+                let mut socket = connect(&proxy, codex_client).await;
+                socket.send(Message::text(CREATE)).await.unwrap();
+                let frames = read(&mut socket, "").await;
+                assert_no_secrets(&frames);
+                let errors = error_frames(&frames);
+                if codex_client {
+                    assert_eq!(errors.len(), 1, "{name}: {frames:?}");
+                    assert_codex_usage_limit(errors[0], Some("plus"), None);
+                } else {
+                    assert!(errors.is_empty(), "{name}: {frames:?}");
+                }
+                assert!(
+                    !frames
+                        .iter()
+                        .any(|f| matches!(f, Frame::Text(v) if v["type"] == "response.failed")),
+                    "{name}: {frames:?}"
+                );
+                assert!(closed(&frames), "{name}: {frames:?}");
+                // The scheduler saw the classification: the credential cools.
+                let sent = proxy.mock.seen("sk-fake-a", "ws_frame").len();
+                let mut socket = connect(&proxy, codex_client).await;
+                socket.send(Message::text(CREATE)).await.unwrap();
+                let frames = read(&mut socket, "").await;
+                assert_no_secrets(&frames);
+                assert!(closed(&frames), "{name}: {frames:?}");
+                assert_eq!(
+                    proxy.mock.seen("sk-fake-a", "ws_frame").len(),
+                    sent,
+                    "{name}: the cooled credential was not used again"
+                );
+            }
+        }
+    }
+}
+
+/// With response steering, an account failure that rejects a create the client queued
+/// while a response runs ends the stream the same way: no raw frame, the allowlisted
+/// limit for a Codex client.
+#[tokio::test]
+async fn native_account_failure_of_a_pending_create_never_reaches_the_client_as_sent() {
+    for (shape, failure) in account_failures(now() + 7200) {
+        let _registry = REGISTRY.lock().await;
+        let proxy = proxy_with(&[("sk-fake-a", true)], STEERING).await;
+        proxy.mock.push("sk-fake-a", json!({"events": [created("resp_1")]}));
+        proxy.mock.push("sk-fake-a", json!({"events": [failure]}));
+        let mut socket = connect(&proxy, true).await;
+        socket.send(Message::text(CREATE)).await.unwrap();
+        let started = read(&mut socket, "response.created").await;
+        assert_no_secrets(&started);
+        socket.send(Message::text(CREATE)).await.unwrap();
+        let frames = read(&mut socket, "").await;
+        assert_no_secrets(&frames);
+        let errors = error_frames(&frames);
+        assert_eq!(errors.len(), 1, "{shape}: {frames:?}");
+        assert_codex_usage_limit(errors[0], Some("plus"), None);
+        assert!(closed(&frames), "{shape}: {frames:?}");
+        assert_eq!(proxy.mock.seen("sk-fake-a", "ws_frame").len(), 2, "{shape}");
+    }
 }

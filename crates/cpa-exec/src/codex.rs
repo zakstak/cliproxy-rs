@@ -21,21 +21,22 @@ use http::HeaderMap;
 use crate::codex_capture::Wire;
 use crate::codex_oauth::{self, CodexOAuth};
 use crate::codex_quota::QuotaSignals;
-use crate::codex_request::{self as request, Call, Settings, View};
+use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
+pub use native::APPEND_REFUSED;
 
 pub struct CodexExecutor {
-    /// Chrome profile for chatgpt.com, Go's standard transport elsewhere, per proxy.
+    /// Its own TLS client for chatgpt.com (no browser fingerprint, #26), Go's standard
+    /// transport elsewhere, per proxy.
     pub(crate) transport: crate::codex_tls::Transport,
     oauth: CodexOAuth,
     quota: Arc<QuotaSignals>,
     /// Upstream Responses WebSocket sockets per downstream session.
     pub(crate) ws: Arc<crate::codex_ws::Pool>,
     /// Claude clients' reasoning replay (process-wide in Go).
-    pub(crate) replay: Arc<crate::codex_replay::Cache>,
     /// Base for OAuth Alpha Search, which Go never derives from credential attributes.
     alpha_base_url: String,
     /// Live call, sideband and hangup URLs (`codex_live`).
@@ -50,7 +51,7 @@ impl Default for CodexExecutor {
 }
 
 impl CodexExecutor {
-    /// Production transports: uTLS Chrome for chatgpt.com, Go's standard transport
+    /// Production transports: the chatgpt.com client, Go's standard transport
     /// elsewhere, both per effective proxy (crate::proxy). Token refreshes use the
     /// standard transport for the credential's effective proxy.
     pub fn new() -> wreq::Result<Self> {
@@ -73,7 +74,6 @@ impl CodexExecutor {
             oauth,
             quota: Arc::default(),
             ws: Default::default(),
-            replay: Arc::default(),
             alpha_base_url: DEFAULT_BASE_URL.into(),
             live: Default::default(),
         }
@@ -94,10 +94,11 @@ impl CodexExecutor {
         self.quota.clone()
     }
 
-    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`):
-    /// credentials with `websockets` enabled keep a pooled upstream socket; others run
-    /// the HTTP stream with the session as prompt-cache identity and cannot continue
-    /// upstream state.
+    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`). Every
+    /// turn is the client's own `response.create` frame (`codex_native.rs`): credentials
+    /// with `websockets` carry it on a pooled upstream socket, and others send a first
+    /// turn as an HTTP stream with the session as prompt-cache identity. A continuation
+    /// without an upstream socket gets the replay close, and any other frame is refused.
     pub async fn execute_in_session(
         &self,
         credential: &Credential,
@@ -106,16 +107,74 @@ impl CodexExecutor {
         session: &ExecSession,
     ) -> Result<ExecResponse, ExecError> {
         check_response_format(&req)?;
+        check_native_body(&req)?;
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
+        settings.refuse_compat(&req, credential)?;
         if view.websockets() {
             return self.stream_ws(&view, &settings, req, session, cfg).await;
         }
         if session.continuation {
             return Err(ExecError::replay_required());
         }
-        self.stream_with_session(&view, &settings, req, Some(&session.id)).await
+        match native::route_ws(&view, &req) {
+            Some(profile) => self.native_ws_http(&view, &settings, req, profile, &session.id).await,
+            None => Err(native::refused_frame(&req.body)),
+        }
+    }
+
+    /// Whether `req` on `credential` takes the native HTTP route (`codex_native.rs`). The
+    /// server then gives the executor the client's own bytes and keeps request and
+    /// response mutation hooks away from the attempt.
+    pub fn native_http(credential: &Credential, req: &ExecRequest) -> bool {
+        native::eligible(&View::new(credential), req).is_some()
+    }
+
+    /// Whether a WebSocket turn whose client frame is `frame` takes the native WebSocket
+    /// route on `credential` (`codex_native.rs`, #24): the same handover as
+    /// [`Self::native_http`], for a `response.create` on a credential with `websockets`.
+    pub fn native_ws(credential: &Credential, req: &ExecRequest, frame: &[u8]) -> bool {
+        native::eligible_ws(&View::new(credential), req, frame).is_some()
+    }
+
+    /// The refusal of a client Responses request a built-in Codex credential cannot carry
+    /// natively: on a WebSocket turn, a frame other than `response.create` (such as Go's
+    /// `response.append`); over HTTP, a request outside the native route. No rewritten
+    /// request stands in (#28).
+    pub fn refused_native(turn: bool, body: &[u8]) -> ExecError {
+        if turn {
+            return native::refused_frame(body);
+        }
+        ExecError::local(
+            400,
+            FailureScope::Request,
+            "this Responses request cannot be sent to Codex natively; send a Responses generation or compaction",
+        )
+    }
+
+    /// Whether `source` and `response` are the native route's formats: Responses on both
+    /// sides, in either spelling (`openai-response` or `codex`). A caller that builds a
+    /// request for the native route (`dispatch::NativeRequest`) uses this, so its
+    /// eligibility cannot drift from the executor's.
+    pub fn responses_pair(source: Format, response: Format) -> bool {
+        request::responses_pair(source, response)
+    }
+
+    /// Whether a WebSocket client frame is one the native WebSocket route serves (a
+    /// `response.create`), whatever the credential: with [`Self::native_profile`] and
+    /// [`Self::upstream_websocket`], the server's test of whether a pool can serve a turn
+    /// natively.
+    pub fn native_ws_frame(frame: &[u8]) -> bool {
+        native::creates(frame)
+    }
+
+    /// Whether `credential` is on a native profile (`chatgpt`, `api-key`, `compatible`;
+    /// not `siwc`), whatever the request: the server's test of whether a pool can serve a
+    /// Responses request natively.
+    pub fn native_profile(credential: &Credential) -> bool {
+        native::Profile::of(&View::new(credential)).is_some()
     }
 
     /// Whether `credential` keeps upstream state on a WebSocket (Go:
@@ -210,22 +269,23 @@ impl CodexExecutor {
         }
         check_response_format(&req)?;
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
+        // Credential checks stay above the native route: it skips only payload work.
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
-        match (req.alt.as_deref(), req.stream) {
-            (Some("responses/compact"), true) => Err(ExecError::local(
-                400,
-                FailureScope::Request,
-                "streaming not supported for /responses/compact",
-            )),
-            (Some("responses/compact"), false) => self.compact(&view, &settings, req).await,
-            (_, true) => self.stream_with_session(&view, &settings, req, None).await,
-            (_, false) => self.buffered(&view, &settings, req).await,
+        settings.refuse_compat(&req, credential)?;
+        if let Some(profile) = native::route(&view, &req) {
+            // The native route reads the body through the boundary itself.
+            return self.native(&view, &settings, req, profile).await;
         }
+        if translated::route(&view, &req) {
+            return self.translated(&view, &settings, req).await;
+        }
+        Err(unrouted(&req))
     }
 
     /// Go's `http.Client.Do` through the Codex transport: the client is picked per hop
-    /// (Chrome for chatgpt.com, Go's standard transport elsewhere), redirects are
+    /// (the chatgpt.com client, Go's standard transport elsewhere), redirects are
     /// followed like Go's, and gzip is undone only when the transport asked for it.
     pub(crate) async fn post(
         &self,
@@ -257,14 +317,44 @@ impl CodexExecutor {
         url: String,
         headers: HeaderMap,
         body: String,
-        replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         // The shaped body names the base model, the key of per-model quota snapshots.
         let model = gjson::get(&body, "model").str().to_owned();
-        wire.request(&url, &headers, body.as_bytes());
-        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body)).await {
+        self.open_for(
+            view,
+            settings,
+            url,
+            headers,
+            Bytes::from(body),
+            wire,
+            error_body,
+            &model,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::open`] for a known upstream `model` (the quota-snapshot key). With
+    /// `direct`, a non-2xx answer keeps its classification (status and scope) for the
+    /// scheduler, and the client receives the upstream status, body and filtered headers
+    /// unchanged (the native HTTP route).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_for(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        url: String,
+        headers: HeaderMap,
+        body: Bytes,
+        wire: &Wire,
+        error_body: ErrorBody,
+        model: &str,
+        direct: bool,
+    ) -> Result<crate::proxy::Upstream, ExecError> {
+        wire.request(&url, &headers, &body);
+        let mut upstream = match self.post(view, &url, &headers, body).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 // ponytail: the text is this executor's transport message, not net/http's
@@ -274,7 +364,7 @@ impl CodexExecutor {
             }
         };
         wire.metadata(upstream.status, &upstream.headers);
-        self.quota.observe(&view.credential.id, &model, &upstream.headers);
+        self.quota.observe(&view.credential.id, model, &upstream.headers);
         let status = upstream.status;
         upstream.headers.remove(http::header::CONTENT_ENCODING);
         upstream.headers.remove(http::header::CONTENT_LENGTH);
@@ -288,13 +378,15 @@ impl CodexExecutor {
                 }
             };
             wire.chunk(&body);
-            crate::codex_replay::clear_on_invalid_signature(&self.replay, replay, status, &body);
-            return Err(response::status_error(
-                status,
-                &body,
-                upstream.headers,
-                settings.model_level_cooling,
-            ));
+            let mut error = response::status_error(status, &body, upstream.headers, settings.model_level_cooling);
+            if direct {
+                // `status` stays the scheduler's classification (a usage or capacity
+                // limit is classified 429); the client gets the upstream's own status.
+                error.body = body;
+                error.direct = true;
+                error.delivered_status = Some(status);
+            }
+            return Err(error);
         }
         Ok(upstream)
     }
@@ -308,13 +400,10 @@ impl CodexExecutor {
         url: String,
         headers: HeaderMap,
         body: String,
-        replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
     ) -> Result<ExecResponse, ExecError> {
-        let upstream = self
-            .open(view, settings, url, headers, body, replay, wire, error_body)
-            .await?;
+        let upstream = self.open(view, settings, url, headers, body, wire, error_body).await?;
         let (status, headers) = (upstream.status, upstream.headers);
         let sse = headers
             .get(http::header::CONTENT_TYPE)
@@ -332,205 +421,6 @@ impl CodexExecutor {
             }
         };
         Ok(ExecResponse { status, headers, body })
-    }
-
-    /// HTTP streaming. `ws_session` is the downstream WebSocket connection when an HTTP
-    /// credential serves a WebSocket client (Go's execution session id).
-    pub(crate) async fn stream_with_session(
-        &self,
-        view: &View<'_>,
-        settings: &Settings,
-        req: ExecRequest,
-        ws_session: Option<&str>,
-    ) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::Stream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
-        let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
-        let url = format!("{}/responses", view.base_url);
-        let started = Instant::now();
-        let wire = Wire::new(req.capture(), view.credential);
-        // The response waits for the Home replay writes it caused (Go writes inline).
-        let writes = scope.writes.clone();
-        let sent = self
-            .send(
-                view,
-                settings,
-                url,
-                headers,
-                body.clone(),
-                &scope,
-                &wire,
-                ErrorBody::Strict,
-            )
-            .await;
-        let res = match sent {
-            Ok(res) => res,
-            Err(error) => {
-                writes.settle().await;
-                return Err(error);
-            }
-        };
-        let upstream = events(res.body);
-        let processor = Processor::new(request::is_native(&req), settings.model_level_cooling)
-            .codex_client(request::codex_client(&req))
-            .grok_keepalive(&req.headers)
-            .restoring(restore)
-            .replaying(self.replay.clone(), scope)
-            .reporting(req.usage.clone())
-            .capturing(wire);
-        let stream = if settings.bootstrap_buffering {
-            match response::bootstrap(upstream, processor, settings.bootstrap_timeout, started).await {
-                Bootstrap::Reject(error) => {
-                    writes.settle().await;
-                    return Err(error);
-                }
-                Bootstrap::Stream(stream) => stream,
-            }
-        } else {
-            response::processed(upstream, processor, 0)
-        };
-        Ok(ExecResponse {
-            status: res.status,
-            headers: res.headers,
-            body: ResponseBody::Stream(writes.gate(client_stream(&req, &body, stream))),
-        })
-    }
-
-    async fn buffered(
-        &self,
-        view: &View<'_>,
-        settings: &Settings,
-        req: ExecRequest,
-    ) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::NonStream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
-        let (body, cache) = request::prompt_cache(&req, body, None, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
-        let url = format!("{}/responses", view.base_url);
-        let wire = Wire::new(req.capture(), view.credential);
-        // The response waits for the Home replay writes it caused (Go writes inline).
-        let writes = scope.writes.clone();
-        let result = async {
-            let res = self
-                .open(
-                    view,
-                    settings,
-                    url,
-                    headers,
-                    body.clone(),
-                    &scope,
-                    &wire,
-                    ErrorBody::Lossy,
-                )
-                .await?;
-            // Go reads the whole body (`io.ReadAll`, whatever its type), records every
-            // byte that arrived, then parses it, a read error's partial tail included.
-            let mut upstream = res.body;
-            let (mut data, mut failed) = (Vec::new(), None);
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(chunk) => data.extend_from_slice(&chunk),
-                    Err(error) => {
-                        failed = Some(error);
-                        break;
-                    }
-                }
-            }
-            wire.chunk(&data);
-            let mut processor = Processor::new(false, settings.model_level_cooling)
-                .restoring(restore)
-                .replaying(self.replay.clone(), scope)
-                .reporting(req.usage.clone());
-            // `bytes.Split(data, "\n")`: every line in order, an unterminated tail included.
-            if let Some(completed) = processor.buffered(&data)? {
-                return Ok(ExecResponse {
-                    status: res.status,
-                    headers: res.headers,
-                    body: ResponseBody::Buffered(non_stream_output(&req, &body, &completed, Format::Codex)?),
-                });
-            }
-            if let Some(error) = failed {
-                wire.exec_error(&error);
-            }
-            Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
-        }
-        .await;
-        writes.settle().await;
-        result
-    }
-
-    async fn compact(&self, view: &View<'_>, settings: &Settings, req: ExecRequest) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::Compact)?;
-        let (body, cache) = request::prompt_cache(&req, body, None, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::OpenAIResponse, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), false);
-        let url = format!("{}/responses/compact", view.base_url);
-        let wire = Wire::new(req.capture(), view.credential);
-        let res = self
-            .send(
-                view,
-                settings,
-                url,
-                headers,
-                body.clone(),
-                &Default::default(),
-                &wire,
-                ErrorBody::Lossy,
-            )
-            .await
-            .map_err(compact_error)?;
-        let data = match res.body {
-            ResponseBody::Buffered(bytes) => bytes,
-            ResponseBody::Stream(mut stream) => {
-                let mut out = Vec::new();
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(event) => out.extend_from_slice(&event),
-                        Err(error) => {
-                            wire.exec_error(&error);
-                            return Err(compact_error(error));
-                        }
-                    }
-                }
-                Bytes::from(out)
-            }
-        };
-        wire.chunk(&data);
-        let text = String::from_utf8_lossy(&data);
-        let text = response::restore(&text, restore);
-        if req.usage.enabled() {
-            // Go publishes `ParseOpenAIUsage` of the restored compaction body.
-            req.usage.response_body(Format::OpenAIResponse, text.as_bytes());
-        }
-        Ok(ExecResponse {
-            status: res.status,
-            headers: res.headers,
-            body: ResponseBody::Buffered(non_stream_output(&req, &body, &text, Format::OpenAIResponse)?),
-        })
     }
 
     /// The URL an Alpha Search on `credential` posts to; `None` for an API key without
@@ -590,6 +480,7 @@ impl CodexExecutor {
         }
         // `PrepareRequest` (inside `NewHttpRequest`): Sign in with ChatGPT needs its token.
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let mut headers = HeaderMap::new();
         let mut set = |name: &'static str, value: &str| {
             if let Ok(value) = http::HeaderValue::from_str(value) {
@@ -598,8 +489,14 @@ impl CodexExecutor {
         };
         set("content-type", "application/json");
         set("accept", "application/json");
-        set("originator", "codex_cli_rs");
-        for name in ["version", "user-agent", "session_id", "x-client-request-id"] {
+        // Go fixes `originator: codex_cli_rs` over the client's. The caller's own
+        // identity goes instead, else the proxy's (#26, `crate::codex_identity`).
+        let origin = crate::codex_identity::Origin::Caller;
+        if let Some(originator) = crate::codex_identity::originator(origin, client, true) {
+            set("originator", originator);
+        }
+        set("user-agent", crate::codex_identity::user_agent(origin, client));
+        for name in ["version", "session_id", "x-client-request-id"] {
             let value = request::header(client, name).trim();
             if !value.is_empty() {
                 set(name, value);
@@ -673,71 +570,16 @@ impl CodexExecutor {
 
 /// `CountTokens` (codex_executor_tokens.go): the request shaped as for Codex, counted
 /// locally with the model's tiktoken encoding; nothing is sent upstream.
-fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecError> {
-    use crate::codex_json::{delete, set_bool_if_different, set_str, set_str_if_different};
+fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecError> {
     let model = request::base_model(&req.model);
-    // Go reads is-compat only from the attempt's binding here (APIKeyModelIsCompat).
-    let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
-    let client = crate::codex_client::Client::new(&req.headers, cfg, "codex", is_compat);
-    let caps = req
-        .resolved_model
-        .as_ref()
-        .map(|r| cpa_common::thinking::ModelCaps::from(&r.info));
-    let ctx = cpa_translate::RequestCtx {
-        model: &model,
-        stream: false,
-        tool_search: false,
-    };
-    let translated = crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.body, &client)
-        .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?;
-    // The rule baseline: the translated original, else the translated body before
-    // thinking. Go counts with a failed translation's partial body; this refuses.
-    let original = if req.original_body.is_empty() {
-        translated.body.clone()
+    // The body the request would send: a Responses client's own bytes, or the built-in
+    // translation (#27). No Codex-client rewrite, default instructions or payload rule
+    // changes what is counted.
+    let body = if request::responses_formats(req) {
+        req.body.to_vec()
     } else {
-        crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.original_body, &client)
-            .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?
-            .body
+        translated::upstream_body(req, &model)?.into_bytes()
     };
-    let body = cpa_common::thinking::apply_request_thinking(&cpa_common::thinking::RequestThinking {
-        body: &translated.body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: Format::Codex.as_str(),
-        provider: "codex",
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: cpa_translate::pair(req.source_format, Format::Codex).is_some(),
-        updates_changed: translated.configuration_updates_changed,
-    })
-    .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    let mut body = String::from_utf8_lossy(&body).into_owned();
-    body = set_str_if_different(body, "model", &model);
-    for key in [
-        "previous_response_id",
-        "generate",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-    ] {
-        body = delete(&body, key);
-    }
-    body = set_bool_if_different(body, "stream", false);
-    if !request::is_native(req) {
-        let instructions = gjson::get(&body, "instructions");
-        if !instructions.exists() || instructions.kind() == gjson::Kind::Null {
-            body = set_str(&body, "instructions", "");
-        }
-    }
-    let body = crate::payload_barrier::Barrier {
-        executor: "codex",
-        model: &model,
-        protocol: Format::Codex.as_str(),
-        root: "",
-        original: &original,
-    }
-    .apply(cfg, req, body.into_bytes());
     let encoding = crate::codex_tokens::encoding_for_model(&model);
     let count = crate::codex_tokens::count_input_tokens(encoding, &body).map_err(|e| {
         ExecError::local(
@@ -749,9 +591,12 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
     let usage =
         format!(r#"{{"response":{{"usage":{{"input_tokens":{count},"output_tokens":0,"total_tokens":{count}}}}}}}"#);
     let payload = cpa_translate::translate_token_count(req.response_format, Format::Codex, count, usage.as_bytes());
+    // The count is this proxy's tokenizer estimate, never provider-reported usage.
+    let mut headers = HeaderMap::new();
+    headers.insert(LOCAL_TOKEN_COUNT, http::HeaderValue::from_static("local-estimate"));
     Ok(ExecResponse {
         status: 200,
-        headers: HeaderMap::new(),
+        headers,
         body: ResponseBody::Buffered(Bytes::from(payload)),
     })
 }
@@ -848,6 +693,34 @@ pub(crate) fn explicit_session(req: &ExecRequest) -> Option<String> {
     cpa_common::session::cpa_session_id(req.session.as_deref())
 }
 
+/// The Codex request boundary ([`cpa_common::codex_body`]) for a body a Responses client
+/// sent to a Responses route: HTTP streaming, buffered, compact and WebSocket turns. A
+/// body it refuses fails here, before translation and before any upstream send, with a
+/// client-safe request error. Other source formats arrive through a cross-API translator
+/// and keep its parsing until #27.
+fn check_native_body(req: &ExecRequest) -> Result<(), ExecError> {
+    if request::responses_formats(req) {
+        cpa_common::codex_body::CodexBody::parse(&req.body)?;
+    }
+    Ok(())
+}
+
+/// The refusal of a request no Codex route carries (#28): the native route takes
+/// Responses on both sides, the translated route a generation from its built-in
+/// sources. Nothing else reaches the provider, and no legacy rewrite stands in.
+fn unrouted(req: &ExecRequest) -> ExecError {
+    ExecError::local(
+        400,
+        FailureScope::Request,
+        format!(
+            "this request cannot be sent to Codex: {} -> {} {} is neither a native Responses request nor a supported translation (Claude, Chat Completions, Gemini or Gemini Interactions generations)",
+            req.source_format.as_str(),
+            req.response_format.as_str(),
+            req.alt.as_deref().unwrap_or("generation"),
+        ),
+    )
+}
+
 fn check_response_format(req: &ExecRequest) -> Result<(), ExecError> {
     let identity = matches!(req.response_format, Format::Codex | Format::OpenAIResponse);
     if identity || cpa_translate::pair(req.response_format, Format::Codex).is_some() {
@@ -880,142 +753,23 @@ fn translate_error(error: cpa_translate::Error) -> ExecError {
     ExecError::local(502, FailureScope::Request, error.to_string())
 }
 
-/// The client body for a buffered response (`TranslateNonStream`): the registered pair,
-/// else Go's identity. A translator failure (Go's apply_patch tool-input error) or empty
-/// output is Go's 502 `ApplyPatchUpstreamErrorMessage`.
-fn non_stream_output(
-    req: &ExecRequest,
-    translated: &str,
-    completed: &str,
-    upstream: Format,
-) -> Result<Bytes, ExecError> {
-    let out = match cpa_translate::pair(req.response_format, upstream) {
-        Some(pair) => {
-            let ctx = cpa_translate::ResponseCtx {
-                model: &req.model,
-                original_request: &req.original_body,
-                translated_request: translated.as_bytes(),
-                tool_search: false,
-            };
-            (pair.non_stream)(&ctx, completed.as_bytes()).unwrap_or_default()
-        }
-        None => completed.as_bytes().to_vec(),
-    };
-    if out.is_empty() {
-        return Err(ExecError::local(
-            502,
-            FailureScope::Request,
-            cpa_translate::APPLY_PATCH_UPSTREAM_ERROR,
-        ));
-    }
-    let out = String::from_utf8_lossy(&out).into_owned();
-    let out = if req.response_format == Format::OpenAIResponse {
-        response::ensure_usage_details(out)
-    } else {
-        out
-    };
-    Ok(Bytes::from(out))
-}
+#[path = "codex_native.rs"]
+pub(crate) mod native;
 
-/// The client stream (`TranslateStreamWithClaudeInputTokens`): translated, with Go's
-/// usage details for OpenAI Responses clients and the input-token estimate for Claude
-/// clients.
-fn client_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
-    translate_stream(req, translated, upstream)
-}
+#[path = "codex_translated.rs"]
+mod translated;
 
-/// Streaming translation for non-Codex clients; identity for Codex clients. Go keeps
-/// streaming after an apply_patch tool-input failure (Codex supports the tool natively)
-/// but skips the usage and input-token touch-ups for those chunks.
-fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
-    let responses_client = req.response_format == Format::OpenAIResponse;
-    let Some(pair) = cpa_translate::pair(req.response_format, Format::Codex) else {
-        return if responses_client {
-            upstream
-                .map(|chunk| chunk.map(response::ensure_usage_details_chunk))
-                .boxed()
-        } else {
-            upstream
-        };
-    };
-    let ctx = cpa_translate::ResponseCtx {
-        model: &req.model,
-        original_request: &req.original_body,
-        translated_request: translated.as_bytes(),
-        tool_search: false,
-    };
-    let translator = crate::translate::stream(pair, &ctx, req);
-    let original = if req.original_body.is_empty() {
-        req.body.clone()
-    } else {
-        req.original_body.clone()
-    };
-    let claude =
-        crate::gemini_stream::ClaudeInputTokens::new(req.source_format, Format::Codex, req.response_format, original);
-    struct State {
-        upstream: ExecStream,
-        translator: Box<dyn cpa_translate::StreamTranslator>,
-        /// Claude clients' `message_start` input-token estimate.
-        claude: crate::gemini_stream::ClaudeInputTokens,
-        responses_client: bool,
-        ready: std::collections::VecDeque<Bytes>,
-        /// The terminal error, written after the frames it flushed.
-        failed: Option<ExecError>,
-        done: bool,
-    }
-    futures_util::stream::unfold(
-        State {
-            upstream,
-            translator,
-            claude,
-            responses_client,
-            ready: Default::default(),
-            failed: None,
-            done: false,
-        },
-        |mut st| async move {
-            loop {
-                if let Some(event) = st.ready.pop_front() {
-                    return Some((Ok(event), st));
-                }
-                if let Some(error) = st.failed.take() {
-                    return Some((Err(error), st));
-                }
-                if st.done {
-                    return None;
-                }
-                let result = match st.upstream.next().await {
-                    Some(Ok(event)) => st.translator.event(&event).map_err(translate_error),
-                    Some(Err(error)) => Err(error),
-                    None => {
-                        st.done = true;
-                        st.translator.finish().map_err(translate_error)
-                    }
-                };
-                match result {
-                    Ok(mut events) => {
-                        if !st.translator.tool_input_failed() {
-                            st.claude.apply(&mut events);
-                            if st.responses_client {
-                                events = events.into_iter().map(response::ensure_usage_details_chunk).collect();
-                            }
-                        }
-                        st.ready.extend(events);
-                    }
-                    Err(error) => {
-                        // Go's responsesSSEFramer flushes the pending client frame before a
-                        // terminal error is written.
-                        st.ready.extend(st.translator.flush_frames());
-                        st.failed = Some(error);
-                        st.done = true;
-                    }
-                }
-            }
-        },
-    )
-    .boxed()
-}
+/// The response header that marks a token count as this proxy's local estimate.
+pub const LOCAL_TOKEN_COUNT: &str = "x-cliproxy-token-count";
+
+#[cfg(test)]
+#[path = "codex_boundary_tests.rs"]
+mod boundary_tests;
 
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_identity_tests.rs"]
+mod identity_tests;

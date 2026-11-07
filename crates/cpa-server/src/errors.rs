@@ -135,8 +135,9 @@ fn write_with(
 ) -> Response {
     // Go `writeDirectErrorResponse`: the filtered headers as given, JSON by default.
     if let Some(e) = failure.direct() {
-        let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut res = Response::new(axum::body::Body::from(direct_body(e.status, &e.body)));
+        let delivered = e.delivered_status.unwrap_or(e.status);
+        let status = StatusCode::from_u16(delivered).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut res = Response::new(axum::body::Body::from(direct_body(delivered, &e.body)));
         *res.status_mut() = status;
         let headers = crate::respond::filter_upstream_headers(&e.headers);
         for name in headers.keys() {

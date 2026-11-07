@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vayungodara/cliproxy-rs)](https://github.com/vayungodara/cliproxy-rs/releases/latest)
-[![Homebrew](https://img.shields.io/badge/brew-vayungodara%2Ftap%2Fcliproxy--rs-orange)](https://github.com/vayungodara/homebrew-tap)
 [![Stars](https://img.shields.io/github/stars/vayungodara/cliproxy-rs)](https://github.com/vayungodara/cliproxy-rs/stargazers)
 
 Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one local endpoint, API translation, failover. Single Rust binary, CLIProxyAPI-compatible.
@@ -11,11 +10,7 @@ Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one l
 - **Several keys and providers behind one model name.** By default, a 429 cools that key for the model and the request moves to another ready key or provider with the same alias.
 - **One binary with the dashboard built in.** It reads CLIProxyAPI's `config.yaml` and credential files. Parity with CLIProxyAPI v8.0.35 is partial; [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) has the counts.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh
-```
-
-On Windows, or with Homebrew or Scoop, see [Quick start](#quick-start).
+This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) runs on Linux only, natively or in the Linux container, and has published no release binaries yet. Build it from source on Linux, or build and run the container on any host; see [Quick start](#quick-start).
 
 <p align="center">
   <a href="https://github.com/vayungodara/cliproxy-rs/releases/latest"><img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/hero.gif" alt="cliproxy-rs on 127.0.0.1:8317 translates a Codex CLI Responses request to Chat Completions for DeepSeek and moves it to a second key when the first answers 429. Claude Code's Messages requests reach GLM the same way. Kimi and OpenRouter are the other providers shown." width="880"></a>
@@ -26,26 +21,20 @@ On Windows, or with Homebrew or Scoop, see [Quick start](#quick-start).
 > **Set it up with your coding agent.** Paste this into Claude Code, Codex or Amp on the machine where the proxy should run:
 >
 > ```text
-> Install cliproxy-rs on this machine by following https://github.com/vayungodara/cliproxy-rs/blob/master/docs/AI-SETUP.md
+> Install cliproxy-rs on this machine by following https://github.com/zakstak/cliproxy-rs/blob/fork/docs/AI-SETUP.md
 > ```
 
 ## Quick start
 
-1. On macOS or Linux, run the install command at the top of this page. On Windows, in PowerShell:
+1. On Linux, [build from source](docs/INSTALL.md#from-source) and [write `config.yaml` with two keys](docs/INSTALL.md#first-run-without-the-install-script), then start `cliproxy --config config.yaml`. Once this fork publishes a release, `sh install.sh` from a checkout does this setup for you; until then it stops before changing anything.
 
-   ```powershell
-   irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1 | iex
-   ```
+   On Windows or macOS, run the Linux container: [Windows and macOS: run the Linux container](docs/INSTALL.md#windows-and-macos-run-the-linux-container). This fork has no native build for those systems. Codex CLI, Claude Code and your browser still run there and connect to the container. [INSTALL.md](docs/INSTALL.md) lists every way to install.
 
-   The installer checks the release checksum, writes `~/.cliproxy-rs/config.yaml`, starts the proxy and opens the dashboard. On Windows, the config is `%USERPROFILE%\.cliproxy-rs\config.yaml`. It saves new keys in `keys.env` without printing them.
-
-   Other ways to install: [Homebrew](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/INSTALL.md#homebrew) on macOS or Linux, [Scoop](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/INSTALL.md#scoop) on Windows, and the rest in [INSTALL.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/INSTALL.md).
-
-2. Sign in to the dashboard with `CLIPROXY_MANAGEMENT_KEY` from the `keys.env` next to your config. Add a provider API key, or connect your own account. Read [Accounts and provider terms](#accounts-and-provider-terms) before connecting a subscription.
+2. Sign in to the dashboard at `http://127.0.0.1:8317/management.html` with your management key. Add a provider API key, or connect your own account. Read [Accounts and provider terms](#accounts-and-provider-terms) before connecting a subscription.
 
 3. Open the dashboard's **Use with tools** page and copy the Codex CLI or Claude Code settings. Your tools use `CLIPROXY_CLIENT_KEY`, not the management key.
 
-Run the install command again to upgrade, or `brew upgrade cliproxy-rs` with Homebrew. Both keep your config and keys. [INSTALL.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/INSTALL.md) covers start at login, release binaries, Docker and building from source. [GETTING-STARTED.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/GETTING-STARTED.md) has the longer walkthrough.
+To upgrade, pull and rebuild; the config and credentials stay where they are. [INSTALL.md](docs/INSTALL.md) covers start at login, Docker and building from source. [GETTING-STARTED.md](docs/GETTING-STARTED.md) has the longer walkthrough.
 
 ## What is this?
 
@@ -97,7 +86,7 @@ If you only use one provider and it serves the Responses API, Codex can talk to 
 
 The proxy is for the rest: an endpoint that only offers Chat Completions, such as OpenCode Go's models, or several providers and keys behind one endpoint, with failover when one returns 429. It accepts Responses requests from Codex and sends Chat Completions upstream, tool calls included.
 
-You do not need a subscription login. Merge this provider block into `~/.cliproxy-rs/config.yaml`, or `%USERPROFILE%\.cliproxy-rs\config.yaml` on Windows. Keep `access.api-keys`, `management.secret-key` and the rest of your config. The proxy reloads the configuration on save. The upstream keys below are separate from your proxy's client key. Replace the key and upstream model placeholders with values from each provider.
+You do not need a subscription login. Merge this provider block into `~/.cliproxy-rs/config.yaml`, or the `config.yaml` in your container's `/data` volume. Keep `access.api-keys`, `management.secret-key` and the rest of your config. The proxy reloads the configuration on save. The upstream keys below are separate from your proxy's client key. Replace the key and upstream model placeholders with values from each provider.
 
 ```yaml
 api-keys:

@@ -486,7 +486,6 @@ fn write_file_atomic(target: &Path, data: &[u8], mode: u32) -> Result<(), String
     // Go `os.MkdirAll(dir, 0o755)`.
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o755);
     builder
         .create(dir)
@@ -500,7 +499,6 @@ fn write_file_atomic(target: &Path, data: &[u8], mode: u32) -> Result<(), String
         let _ = std::fs::remove_file(&temp_path);
         e
     };
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         temp.set_permissions(std::fs::Permissions::from_mode(mode))
@@ -511,8 +509,6 @@ fn write_file_atomic(target: &Path, data: &[u8], mode: u32) -> Result<(), String
                 ))
             })?;
     }
-    #[cfg(not(unix))]
-    let _ = mode;
     temp.write_all(data).map_err(|e| {
         cleanup(format!(
             "write temp plugin file: {}",
@@ -527,22 +523,6 @@ fn write_file_atomic(target: &Path, data: &[u8], mode: u32) -> Result<(), String
     })?;
     drop(temp);
     if let Err(e) = std::fs::rename(&temp_path, target) {
-        if cfg!(windows) {
-            if let Err(e) = std::fs::remove_file(target)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(cleanup(format!(
-                    "remove old plugin file: {}",
-                    go_path_error("remove", target, &e)
-                )));
-            }
-            return std::fs::rename(&temp_path, target).map_err(|e| {
-                cleanup(format!(
-                    "install plugin file: {}",
-                    go_link_error(&temp_path, target, &e)
-                ))
-            });
-        }
         return Err(cleanup(format!(
             "install plugin file: {}",
             go_link_error(&temp_path, target, &e)
@@ -563,7 +543,6 @@ pub(crate) fn create_temp(dir: &Path, base: &str) -> Result<(std::fs::File, Path
         let path = dir.join(format!(".{base}.tmp-{suffix}"));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),

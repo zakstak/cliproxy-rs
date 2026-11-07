@@ -9,7 +9,7 @@ use crate::{Error, Registered, ResponseCtx};
 
 pub static PAIR: Registered = registered!(
     Interactions -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream)),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: None,
@@ -283,6 +283,10 @@ fn json_string(value: &Res<'_>) -> Vec<u8> {
 
 struct Input {
     items: Vec<Vec<u8>>,
+    /// Parts Codex cannot express: refused, not dropped.
+    drops: crate::common::UserTurnDrops,
+    /// The Codex translated route's rules ([`codex_strict`]).
+    strict: bool,
 }
 
 impl Input {
@@ -298,15 +302,20 @@ impl Input {
             self.text(role, &content.s);
         } else if content.is_array() {
             content.each(|_, part| {
-                if let Some(item) = message_part(&part, role).filter(|i| !i.is_empty()) {
-                    self.items.push(message(role, &item));
-                }
+                self.part(&part, role);
                 true
             });
-        } else if content.is_object()
-            && let Some(item) = message_part(content, role).filter(|i| !i.is_empty())
-        {
-            self.items.push(message(role, &item));
+        } else if content.is_object() {
+            self.part(content, role);
+        }
+    }
+
+    fn part(&mut self, part: &Res<'_>, role: &str) {
+        match message_part(part, role).filter(|i| !i.is_empty()) {
+            Some(item) => self.items.push(message(role, &item)),
+            None => self
+                .drops
+                .drop_part(&String::from_utf8_lossy(&part.get("type").bytes())),
         }
     }
 
@@ -354,6 +363,11 @@ impl Input {
                 self.items.push(item);
             }
             b"model_output" | b"assistant" => self.content(&step.get("content"), "assistant"),
+            b"thought" | b"reasoning" if self.strict => {
+                // Reasoning text Codex cannot carry is refused, not sent in a shape the
+                // destination does not define.
+                self.drops.drop_part("thought step");
+            }
             b"thought" | b"reasoning" => {
                 let mut text = content_text(&step.get("content"));
                 if text.is_empty() {
@@ -373,6 +387,10 @@ impl Input {
                 let role = default_role(&step.get("role").bytes(), role);
                 let content = step.get("content");
                 let text = step.get("text");
+                if self.strict && !content.exists() && !text.exists() {
+                    let kind = String::from_utf8_lossy(&step.get("type").bytes()).into_owned();
+                    self.drops.drop_part(&format!("{kind} step"));
+                }
                 if content.exists() {
                     self.content(&content, role);
                 } else if text.exists() {
@@ -491,7 +509,7 @@ pub(crate) fn cleaned_parameters(params: &Res<'_>) -> Vec<u8> {
 
 /// codexToolFromDeclaration, as json.Marshal writes the map (sorted keys); `None` when
 /// the parameters are not valid JSON (Marshal fails).
-fn tool_from_declaration(declaration: &Res<'_>) -> Option<Vec<u8>> {
+fn tool_from_declaration(declaration: &Res<'_>, strict: bool) -> Option<Vec<u8>> {
     let mut out = b"{".to_vec();
     let description = declaration.get("description");
     if description.exists() {
@@ -506,7 +524,12 @@ fn tool_from_declaration(declaration: &Res<'_>) -> Option<Vec<u8>> {
         &["parameters", "parametersJsonSchema", "parameters_json_schema"],
     );
     if params.exists() {
-        let cleaned = cleaned_parameters(&params);
+        // Strict: the client's schema as sent (Go drops `$schema` and more).
+        let cleaned = if strict {
+            params.raw.to_vec()
+        } else {
+            cleaned_parameters(&params)
+        };
         if !gj::std_valid(&cleaned) {
             return None;
         }
@@ -528,9 +551,20 @@ pub(crate) fn set_raw_if_different(out: &mut Vec<u8>, path: &str, value: &Res<'_
 }
 
 /// ConvertInteractionsRequestToCodex.
-fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions`, and a refusal for any part Codex cannot express.
+/// The registered pair, which other Responses providers share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert(ctx.model, body, ctx.stream, true)
+}
+
+fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8>, crate::Error> {
     let root = gj::parse(raw);
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
+    let mut out = if strict {
+        br#"{"model":"","input":[]}"#.to_vec()
+    } else {
+        br#"{"model":"","instructions":"","input":[]}"#.to_vec()
+    };
     gj::set_str(&mut out, "model", model);
     if stream || root.get("stream").bool() {
         gj::set_bool(&mut out, "stream", true);
@@ -565,6 +599,12 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
             gj::set_str(&mut out, "reasoning.summary", summary);
         }
         for (source, target) in COPY_RAW_PATHS {
+            // Strict: only fields Responses defines (the penalties and `response_format`
+            // have no Responses field; `codex_strict` refuses them unless at default).
+            let undefined = matches!(target, "presence_penalty" | "frequency_penalty" | "response_format");
+            if strict && undefined {
+                continue;
+            }
             let value = cfg.get(source);
             if value.exists() {
                 gj::set_raw(&mut out, target, &value.raw);
@@ -577,7 +617,11 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
         }
     }
 
-    let mut input = Input { items: vec![] };
+    let mut input = Input {
+        items: vec![],
+        drops: Default::default(),
+        strict,
+    };
     let value = root.get("input");
     if value.kind == Kind::String {
         input.text("user", &value.s);
@@ -609,13 +653,13 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
                     if declarations.is_array() {
                         declarations.each(|_, d| {
                             if d.get("name").exists() {
-                                normalized.push(tool_from_declaration(&d));
+                                normalized.push(tool_from_declaration(&d, strict));
                             }
                             true
                         });
                     }
                 } else if tool.get("name").exists() {
-                    normalized.push(tool_from_declaration(&tool));
+                    normalized.push(tool_from_declaration(&tool, strict));
                 }
                 true
             });
@@ -650,7 +694,10 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
             set_raw_if_different(&mut out, path, &value);
         }
     }
-    out
+    if strict {
+        input.drops.strict_result("Codex Responses")?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------

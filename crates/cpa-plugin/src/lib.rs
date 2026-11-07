@@ -29,13 +29,11 @@ pub use hosthttp::{go_preflight, go_read_error_text, go_url_error, go_url_error_
 pub mod interceptors;
 pub mod management;
 pub mod models;
-#[cfg(unix)]
 pub mod native;
 pub mod platform;
 pub mod quota;
 pub mod routing;
 pub mod rpc;
-#[cfg(unix)]
 mod shadow;
 pub mod store;
 pub mod streams;
@@ -45,7 +43,6 @@ pub mod transform;
 
 pub use host::{Host, Record, RegisteredPluginInfo, Snapshot};
 
-/// Go `pluginhost.SupportPluginHeaderValue` (`X-CPA-SUPPORT-PLUGIN`): "1" where native
-/// plugins load, as in Go's cgo builds.
-/// ponytail: Windows DLL loading is not ported, so Windows reports "0".
-pub const SUPPORT_PLUGIN: &str = if cfg!(unix) { "1" } else { "0" };
+/// Go `pluginhost.SupportPluginHeaderValue` (`X-CPA-SUPPORT-PLUGIN`): native plugins
+/// load, as in Go's cgo builds.
+pub const SUPPORT_PLUGIN: &str = "1";

@@ -253,19 +253,11 @@ fn device_id(credential: &Credential) -> String {
     if let Some(id) = credential.str("device_id").map(str::trim).filter(|s| !s.is_empty()) {
         return id.to_owned();
     }
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+    // kimi-cli's Linux data folder.
+    let Some(home) = std::env::var_os("HOME") else {
         return "cli-proxy-api-device".into();
     };
-    let home = std::path::PathBuf::from(home);
-    let dir = match go_os() {
-        "darwin" => home.join("Library/Application Support/kimi"),
-        "windows" => std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData/Roaming"))
-            .join("kimi"),
-        _ => home.join(".local/share/kimi"),
-    };
-    std::fs::read_to_string(dir.join("device_id"))
+    std::fs::read_to_string(std::path::PathBuf::from(home).join(".local/share/kimi/device_id"))
         .map(|s| s.trim().to_owned())
         .unwrap_or_else(|_| "cli-proxy-api-device".into())
 }

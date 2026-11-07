@@ -608,12 +608,14 @@ fn channel(name: &str) -> Vec<Spec> {
 }
 
 /// The Images API models every Codex catalog carries (`codexBuiltinImage*ModelInfo`).
-const CODEX_BUILTIN_IMAGES: [(&str, &str); 5] = [
+const CODEX_BUILTIN_IMAGES: [(&str, &str); 7] = [
     ("gpt-image-1.5", "GPT Image 1.5"),
     ("gpt-image-2", "GPT Image 2"),
     ("gpt-image-2.5-flare", "GPT Image 2.5 Flare"),
     ("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst"),
     ("gpt-image-2.5", "GPT Image 2.5"),
+    ("gpt-image-2.6-flare", "GPT Image 2.6 Flare"),
+    ("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst"),
 ];
 
 /// Go `GetCodex*Models`: a plan catalog `WithCodexBuiltins`.
@@ -2220,5 +2222,34 @@ mod tests {
         ] {
             assert_eq!(wildcard(p, v), ok, "{p} {v}");
         }
+    }
+
+    /// Go `TestWithCodexBuiltinsIncludesImage25Models`, with the GPT Image 2.6 rows of
+    /// CLIProxyAPI PR #7261 (a forward port past v8.0.35, docs/DIFFERENCES-FROM-GO.md).
+    #[test]
+    fn codex_builtins_include_gpt_image_25_and_26() {
+        let codex = static_definitions("codex").expect("codex channel");
+        for (id, display_name) in [
+            ("gpt-image-2.5-flare", "GPT Image 2.5 Flare"),
+            ("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst"),
+            ("gpt-image-2.5", "GPT Image 2.5"),
+            ("gpt-image-2.6-flare", "GPT Image 2.6 Flare"),
+            ("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst"),
+        ] {
+            let model = codex
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} registered"));
+            assert_eq!(model.kind, "openai", "{id}");
+            assert_eq!(model.raw["display_name"], display_name, "{id}");
+            assert_eq!(model.raw["version"], id, "{id}");
+            assert_eq!(model.raw["owned_by"], "openai", "{id}");
+            assert_eq!(model.raw["object"], "model", "{id}");
+            assert_eq!(model.raw["created"], 1_704_067_200, "{id}");
+        }
+        assert!(
+            codex.iter().all(|m| m.id != "gpt-image-2.6"),
+            "PR #7261 adds no bare gpt-image-2.6"
+        );
     }
 }

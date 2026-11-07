@@ -567,17 +567,10 @@ fn vmhwm_kb() -> u64 {
 
 /// Whole harness CPU (proxy + mock + client), not a proxy-only estimate.
 fn cpu_ms() -> f64 {
-    #[cfg(unix)]
-    {
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
-        let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
-        ms(usage.ru_utime) + ms(usage.ru_stime)
-    }
-    #[cfg(not(unix))]
-    {
-        0.0
-    }
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+    let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    ms(usage.ru_utime) + ms(usage.ru_stime)
 }
 
 fn env_list(name: &str, default: &str) -> Vec<usize> {

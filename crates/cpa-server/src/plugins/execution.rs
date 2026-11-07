@@ -206,7 +206,7 @@ pub(crate) async fn execute(
     }
     let mut call = call.clone();
     let model = call.model.clone();
-    let hooks = super::interceptors::start(rt, trace, &mut call, &model).await?;
+    let hooks = super::interceptors::start(rt, trace, &mut call, &model, false).await?;
     let result = run_executor(rt, &mut call, plugin_id, query, trace, hooks.as_deref()).await;
     let result = match hooks {
         Some(hooks) => {
@@ -495,10 +495,11 @@ pub(crate) fn scheduler_context(
         .as_deref()
         .map(cpa_common::session::normalize_explicit_id)
         .unwrap_or_default();
-    if cpa_common::session::has_explicit_session(&call.headers, &call.body) {
+    if cpa_common::session::has_explicit_session(call.selection_inputs().0, call.selection_inputs().1) {
         let execution = (!execution.is_empty()).then_some(execution.as_str());
-        if let Some(info) = cpa_common::session::extract_session_info(&call.headers, &call.body, execution)
-            .filter(|info| !info.session_id.is_empty())
+        if let Some(info) =
+            cpa_common::session::extract_session_info(call.selection_inputs().0, call.selection_inputs().1, execution)
+                .filter(|info| !info.session_id.is_empty())
         {
             metadata.insert("canonical_session_id".into(), bound(&info.session_id));
             if !info.parent_session_id.is_empty() && info.parent_session_id != info.session_id {
@@ -520,7 +521,7 @@ pub(crate) fn scheduler_context(
     super::SchedulerContext {
         stream: call.stream,
         options: cpa_plugin::api::SchedulerOptions {
-            headers: super::go_request_header(&call.headers),
+            headers: super::go_request_header(call.selection_inputs().0),
             metadata,
         },
     }

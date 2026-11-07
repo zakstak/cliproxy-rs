@@ -33,13 +33,15 @@ pub mod claude_login;
 pub mod codex;
 mod codex_capture;
 mod codex_client;
+#[cfg(any(test, feature = "test-support"))]
+pub mod codex_contract;
+pub mod codex_identity;
 mod codex_images;
 mod codex_json;
 pub mod codex_live;
 pub mod codex_oauth;
 pub mod codex_quota;
 pub mod codex_refresh;
-mod codex_replay;
 mod codex_request;
 mod codex_response;
 pub mod codex_siwc;

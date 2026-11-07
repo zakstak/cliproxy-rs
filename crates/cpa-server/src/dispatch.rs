@@ -48,12 +48,74 @@ pub struct Call {
     pub request_path: String,
     /// The downstream peer (Go `Request.RemoteAddr`), when the listener provides it.
     pub peer: Option<std::net::SocketAddr>,
+    /// The client's own bytes, for an attempt a Codex credential serves on the native
+    /// HTTP (#23) or WebSocket (#24) route. Set only by the Responses routes.
+    pub native: Option<Arc<NativeRequest>>,
     /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
     /// ordinary HTTP requests.
     pub turn: Option<Arc<SessionTurn>>,
     /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
     /// types), `None` for inference routes.
     pub media: Option<Arc<Media>>,
+}
+
+/// A Responses request that a Codex credential may serve on a native route
+/// (`docs/codex/CONTRACT.md` "Native HTTP route" and "Native WebSocket route"). It holds
+/// the client's body (a WebSocket turn's frame), headers and route path before any
+/// rewrite (the Codex-client preparation, compact's `stream` deletion, the WebSocket
+/// transcript and tool handling, plugin before-auth interceptors); other providers keep
+/// receiving the rewritten [`Call`].
+/// Each attempt records whether it ran natively, so the route and the response hooks
+/// treat the answer accordingly: the last attempt is the one that answered.
+pub struct NativeRequest {
+    pub body: Bytes,
+    /// The client's headers and route path, before plugin before-auth interceptors.
+    pub headers: HeaderMap,
+    pub path: String,
+    /// A credential that may serve the request is on the native route
+    /// ([`native_possible`]): selection reads the client's request and before-auth
+    /// output is deferred to the attempts that are not native.
+    possible: std::sync::atomic::AtomicBool,
+    served: std::sync::atomic::AtomicBool,
+    /// The route could not build the request it sends a non-native attempt (a WebSocket
+    /// frame the HTTP fallback cannot convert): every attempt that is not native stops
+    /// with this request error, status and message, before anything is sent.
+    fallback_error: Option<(u16, String)>,
+}
+
+impl NativeRequest {
+    pub fn new(body: Bytes, headers: HeaderMap, path: String) -> Arc<Self> {
+        Arc::new(Self {
+            body,
+            headers,
+            path,
+            possible: std::sync::atomic::AtomicBool::new(false),
+            served: std::sync::atomic::AtomicBool::new(false),
+            fallback_error: None,
+        })
+    }
+
+    /// See [`NativeRequest::fallback_error`]. Called on a request no attempt has seen.
+    pub fn with_fallback_error(mut self: Arc<Self>, error: Option<(u16, String)>) -> Arc<Self> {
+        if let Some(this) = Arc::get_mut(&mut self) {
+            this.fallback_error = error;
+        }
+        self
+    }
+
+    /// Whether a native Codex attempt is possible for this request.
+    pub fn possible(&self) -> bool {
+        self.possible.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the attempt that answered ran on the native route.
+    pub fn served(&self) -> bool {
+        self.served.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark(&self, native: bool) {
+        self.served.store(native, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// How a media route runs through [`run`]: which executor operation serves it, and the
@@ -97,6 +159,16 @@ pub enum MediaKind {
 
 impl Call {
     /// `WithPinnedAuthID` of a session turn, media call or host model callback.
+    /// The headers and body that choose the session, affinity and credential. When a
+    /// native Codex attempt is possible ([`native_possible`]), they are the client's own
+    /// request, before any rewrite (#23); otherwise the rewritten call, as in Go.
+    pub(crate) fn selection_inputs(&self) -> (&HeaderMap, &Bytes) {
+        match &self.native {
+            Some(native) if native.possible() => (&native.headers, &native.body),
+            _ => (&self.headers, &self.body),
+        }
+    }
+
     pub(crate) fn pinned(&self) -> Option<String> {
         self.turn
             .as_ref()
@@ -404,12 +476,14 @@ fn check_route_only(base: &str, call: &Call) -> Result<(), RunError> {
 /// Go `isXAISpeechOnlyModel`.
 const SPEECH_ONLY: [&str; 2] = ["grok-tts", "grok-voice-tts-1.0"];
 
-const IMAGE_ONLY: [&str; 8] = [
+const IMAGE_ONLY: [&str; 10] = [
     "gpt-image-1.5",
     "gpt-image-2",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
     "grok-imagine-image",
     "grok-imagine-image-quality",
     "grok-imagine-image-2.0",
@@ -708,12 +782,57 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         trace.prompt_prefix(call.entry, &call.body);
     }
     let mut call = call;
-    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1).await?;
+    // When a credential that may serve this request is on the native Codex route,
+    // before-auth output and termination are held back from the call and applied only to
+    // the attempts that are not native (#23).
+    let defer = native_possible(rt, &call, &resolved);
+    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1, defer).await?;
+    let native = call.native.clone();
     let result = retry_bootstrap(rt, call, trace, &resolved, hooks.as_ref()).await;
     match hooks {
+        // A native Codex answer reaches the client without response interceptors.
+        Some(hooks) if native.is_some_and(|n| n.served()) => hooks.finish_native(result),
         Some(hooks) => hooks.finish(result, trace).await,
         None => result,
     }
+}
+
+/// Whether a native Codex attempt is possible for `call`: a Responses request
+/// (`Call::native`) whose selectable credentials for the model include a built-in Codex
+/// credential without a plugin executor (every Codex profile is native, #28). A
+/// WebSocket turn also needs a `response.create` frame. Records the answer on
+/// the request. Under Home the pool is remote and unknown, so every such request counts;
+/// its non-native attempts still receive the deferred before-auth result.
+fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<String>, String)) -> bool {
+    let Some(native) = &call.native else {
+        return false;
+    };
+    let turn = call.turn.is_some();
+    let eligible = (!turn || cpa_exec::codex::CodexExecutor::native_ws_frame(&native.body))
+        && call.media.is_none()
+        && call.operation == Operation::Generate
+        // Under Home the pool is remote and `providers` is just `home`: any Responses
+        // request may reach a native Codex credential there.
+        && (rt.remote_dispatch().is_some() || providers.iter().any(|p| p.eq_ignore_ascii_case("codex")) && {
+            let cfg = rt.config();
+            let registry = rt.registry();
+            let aliases = registry::global_aliases(&cfg);
+            let selection = Selection {
+                providers: providers.clone(),
+                model: call.selection_model.clone().unwrap_or_else(|| model.clone()),
+                ..Selection::default()
+            };
+            let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors, rt.plugin_runtime());
+            rt.store().snapshot().iter().any(|c| {
+                !c.disabled
+                    && c.provider.trim().eq_ignore_ascii_case("codex")
+                    && admit(c).is_some()
+                    && cpa_exec::codex::CodexExecutor::native_profile(c)
+                    && rt.plugin_runtime().executor(&rt.for_executor(c), &cfg).is_none()
+            })
+        });
+    native.possible.store(eligible, std::sync::atomic::Ordering::Release);
+    eligible
 }
 
 /// The bootstrap retry rounds of one resolved request.
@@ -771,9 +890,11 @@ async fn run_primed(
     resolved: (Vec<String>, String),
     hooks: Option<&Arc<crate::plugins::interceptors::Hooks>>,
 ) -> Result<Done, RunError> {
+    let native = call.native.clone();
     let result = run_routed(rt, call, trace, resolved, hooks.map(|h| &**h)).await;
+    let native = native.is_some_and(|n| n.served());
     match (hooks, result) {
-        (Some(hooks), Ok(done @ Done::Stream { .. })) => {
+        (Some(hooks), Ok(done @ Done::Stream { .. })) if !native => {
             hooks.prime(Ok(done), trace).await.map_err(|failure| RunError {
                 failure,
                 bootstrap: true,
@@ -973,10 +1094,11 @@ async fn run_routed(
     let (cfg, policy) = rt.request_snapshot();
     let registry = rt.registry();
     let aliases = registry::global_aliases(&cfg);
+    let (selection_headers, selection_body) = call.selection_inputs();
     let session = crate::session::resolve(
         call.entry,
-        &call.headers,
-        &call.body,
+        selection_headers,
+        selection_body,
         call.execution_session.as_deref(),
         &call.caller.principal,
     );
@@ -1076,13 +1198,15 @@ async fn run_routed(
             compact,
             trace,
             user_key: Default::default(),
+            before_auth: hooks,
         };
         return run_remote(context, remote, selection).await;
     }
     // Go `pickLCP`: with session affinity, an authenticated request without an explicit
     // session binds by its conversation prefix.
     if policy.session_affinity && !session.explicit {
-        selection.lcp = crate::lcp::Request::new(call.entry.as_str(), &call.body, &call.caller.principal).map(Arc::new);
+        selection.lcp =
+            crate::lcp::Request::new(call.entry.as_str(), selection_body, &call.caller.principal).map(Arc::new);
     }
     // Go `preferredExecutionAttemptError`: the latest failure that reached upstream wins
     // over later selection failures.
@@ -1169,7 +1293,20 @@ async fn run_routed(
                 keep_model: call.selection_model.is_some(),
                 unauthorized: None,
             };
-            match attempt(rt, &cfg, &policy, &call, &request, usage.as_ref(), lease, target, hooks).await {
+            match attempt(
+                rt,
+                &cfg,
+                &policy,
+                &call,
+                &request,
+                usage.as_ref(),
+                lease,
+                target,
+                hooks,
+                hooks,
+            )
+            .await
+            {
                 Attempt::Done(done) => return Ok(done),
                 Attempt::Stop(fault) => return Err(fault.into_run_error()),
                 Attempt::Next(fault) => {
@@ -1272,6 +1409,9 @@ struct RemoteContext<'a> {
     /// The client key Home authenticated on the latest pick that sent one (Go
     /// `setHomeUserAPIKeyOnGinContext`, which keeps it for the rest of the request).
     user_key: std::sync::Mutex<String>,
+    /// The request's plugin hooks, for the deferred before-auth result only (#23). Home
+    /// runs no after-auth chain.
+    before_auth: Option<&'a crate::plugins::interceptors::Hooks>,
 }
 
 /// Go `homeRetryRoundExhaustedError`: the round ended; its timing decides the next.
@@ -1820,7 +1960,21 @@ async fn remote_round(
                 let mut lease = lease;
                 match cx.rt.prepare_remote(&mut lease, cx.cfg).await {
                     Ok(()) => (
-                        attempt(cx.rt, cx.cfg, cx.policy, cx.call, request, usage, lease, target, None).await,
+                        // Home runs no after-auth chain, but a deferred before-auth result
+                        // still reaches an attempt that is not native.
+                        attempt(
+                            cx.rt,
+                            cx.cfg,
+                            cx.policy,
+                            cx.call,
+                            request,
+                            usage,
+                            lease,
+                            target,
+                            None,
+                            cx.before_auth,
+                        )
+                        .await,
                         false,
                     ),
                     Err(error) => {
@@ -1936,7 +2090,7 @@ fn no_auth(base: &Selection) -> Failure {
 /// headers (Home authenticates the client with them), and this round's exclusions.
 /// The dispatcher canonicalizes the session (Go `homeDispatchSessionIDs`).
 fn remote_request(call: &Call, selection: &Selection, count: i64, trace: &Trace) -> crate::remote::RemoteRequest {
-    let headers = crate::remote::home_headers(&call.headers, Some(&call.caller));
+    let headers = crate::remote::home_headers(call.selection_inputs().0, Some(&call.caller));
     crate::remote::RemoteRequest {
         model: selection.model.clone(),
         session_id: selection.session.clone().unwrap_or_default(),
@@ -2057,10 +2211,13 @@ impl Credits<'_> {
             // Go's stream fallback runs the after-auth interceptor
             // (`executeStreamWithModelPool`); its non-stream fallback calls the executor
             // directly.
-            let hooks = hooks.filter(|_| request.stream);
+            // The deferred before-auth result reaches the credits attempt either way.
+            let after_auth = hooks.filter(|_| request.stream);
             // ponytail: a 401 inside a credits attempt retries with the refreshed
             // credential, which no longer carries the credits flag.
-            if let Attempt::Done(done) = attempt(rt, cfg, policy, call, request, usage, lease, target, hooks).await {
+            if let Attempt::Done(done) =
+                attempt(rt, cfg, policy, call, request, usage, lease, target, after_auth, hooks).await
+            {
                 return Ok(done);
             }
         }
@@ -2103,6 +2260,7 @@ async fn attempt(
     mut lease: Lease,
     target: Target<'_>,
     hooks: Option<&crate::plugins::interceptors::Hooks>,
+    before_auth: Option<&crate::plugins::interceptors::Hooks>,
 ) -> Attempt {
     let route_model = lease.selection.model.clone();
     let mut last = None;
@@ -2152,9 +2310,67 @@ async fn attempt(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
+        // The native Codex HTTP (#23) and WebSocket (#24) routes: the client's own bytes,
+        // and no request hook.
+        let builtin_codex = call.media.is_none()
+            && lease.credential.provider.trim().eq_ignore_ascii_case("codex")
+            && rt
+                .plugin_runtime()
+                .executor(&rt.for_executor(&lease.credential), cfg)
+                .is_none();
+        let native = call.native.as_ref().filter(|request| {
+            builtin_codex
+                && match call.turn {
+                    None => cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req),
+                    Some(_) => cpa_exec::codex::CodexExecutor::native_ws(&lease.credential, &req, &request.body),
+                }
+        });
+        // A client Responses request that a built-in Codex credential cannot carry
+        // natively (a `response.append` frame, for one) is refused: the rewritten request
+        // other providers receive never reaches Codex (#28).
+        if native.is_none()
+            && builtin_codex
+            && let Some(request) = &call.native
+        {
+            let error = cpa_exec::codex::CodexExecutor::refused_native(call.turn.is_some(), &request.body);
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
+        if let Some(request) = &call.native {
+            request.mark(native.is_some());
+        }
+        let native = match native {
+            Some(request) => {
+                req.body = request.body.clone();
+                req.original_body = request.body.clone();
+                req.headers = request.headers.clone();
+                req.request_path = request.path.clone();
+                // No hook reads a native attempt's chunks, so the executor forwards the
+                // upstream's events. A plugin model callback reads unframed payloads: the
+                // executor hands it each event's data, unchanged.
+                req.stream_payloads = crate::plugins::model_callbacks::context().is_some();
+                true
+            }
+            None => false,
+        };
+        // A frame only the native route can carry ends every other attempt here.
+        if !native && let Some((status, message)) = call.native.as_ref().and_then(|n| n.fallback_error.clone()) {
+            let error = ExecError::local(status, cpa_core::exec::FailureScope::Request, message);
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
+        // Before-auth output held back for a possible native attempt reaches every other
+        // attempt here, its termination included.
+        if !native
+            && let Some(before_auth) = before_auth
+            && let Err(error) = before_auth.apply_deferred(&mut req)
+        {
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
         // Go `applyRequestAfterAuthInterceptor`: a termination ends the request before
         // the executor runs, without a result for the credential.
-        if let Some(hooks) = hooks
+        if let Some(hooks) = hooks.filter(|_| !native)
             && let Err(error) = hooks
                 .after_auth(
                     &mut req,
@@ -2249,7 +2465,8 @@ async fn attempt(
             Ok(response) => match finish(call, response).await {
                 Ok(done) => {
                     let done = track_usage(done, tracker.take());
-                    let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
+                    // A native Codex answer keeps the upstream's model name.
+                    let done = if !native && target.alias.force_mapping && !target.alias.original_alias.is_empty() {
                         rewrite_model(done, &target.alias.original_alias)
                     } else {
                         done
@@ -2803,6 +3020,7 @@ mod tests {
             execution_session: None,
             request_path: String::new(),
             peer: None,
+            native: None,
             turn: None,
             media: None,
         };
@@ -2835,11 +3053,12 @@ mod tests {
 
     /// Each attempt carries Go's binding for its credential and upstream model; a kept
     /// request model (Go `restoreExecutionModel`) routes Codex by that model. Expected
-    /// values are the Go goldens' "codex configured" and "codex restore" cases.
+    /// values are the Go goldens' "codex configured" and "codex restore" cases, without
+    /// `is-compat`, which a `codex-api-key` model can no longer set (#28).
     #[test]
     fn attempts_bind_resolved_model_like_go() {
         let cfg = Config::parse(
-            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          is-compat: true\n      keys:\n        - api-key: xk1\n",
+            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n      keys:\n        - api-key: xk1\n",
         )
         .unwrap();
         let credential = cpa_core::config::credentials::from_config(&cfg).remove(0);
@@ -2872,7 +3091,7 @@ mod tests {
         let bound = req.resolved_model.unwrap();
         assert_eq!(
             (bound.info.id.as_str(), bound.source, bound.is_compat()),
-            ("gpt-6-sol", cpa_core::exec::ResolvedSource::ApiKey, true)
+            ("gpt-6-sol", cpa_core::exec::ResolvedSource::ApiKey, false)
         );
         let kept = attempt_request(&request, &cfg, &credential, "selection", "gpt-6-sol", true, false);
         assert_eq!(kept.model, "sol");
@@ -2891,7 +3110,7 @@ mod tests {
             (bound.source, caps.support_configuration_update, bound.is_compat())
         };
         let cfg = Config::parse(
-            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          is-compat: true\n          support-configuration-update: true\n      keys:\n        - api-key: xk1\n",
+            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          support-configuration-update: true\n      keys:\n        - api-key: xk1\n",
         )
         .unwrap();
         let home_source = cpa_core::exec::ResolvedSource::Home;

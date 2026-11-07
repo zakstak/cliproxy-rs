@@ -5,7 +5,6 @@
 //! and the plugin store through a fake HTTP client (every request it receives compared).
 
 // Native plugins load only on Unix (the host's `native` module).
-#![cfg(unix)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

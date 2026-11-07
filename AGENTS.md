@@ -9,6 +9,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) tar
 - The reference is frozen at CLIProxyAPI **v8.0.35**, commit `ae3ee3be303fb07fb8173279923413005bf32177`: clone https://github.com/router-for-me/CLIProxyAPI, check out that commit and treat the clone as read-only. Cite Go file paths in comments only where behaviour is non-obvious. Existing goldens keep their recorded versions; they do not prove later Go changes. `docs/parity-audit/checklist.md` tracks the target contracts; `docs/parity-audit/upstream-v8.0.35.md` lists the commits since the previous reference, `6fecc6e`.
 - When Go behaviour and documentation disagree, the Go code wins. Port behaviour, not structure: idiomatic Rust over transliterated Go.
 - A deliberate difference from Go is listed in `docs/DIFFERENCES-FROM-GO.md`, and tests that compare against Go goldens encode it explicitly.
+- Codex is the exception. For Codex request and response payloads, transports and identity, [docs/codex/CONTRACT.md](docs/codex/CONTRACT.md) is the authority: first-party `openai/codex` at `44ccf394573c` and OpenAI's API documentation, per endpoint profile. Go behaviour, Go goldens and Go parser quirks do not decide the Codex contract, and an unknown in that document stays unknown until a source covers it. Codex goldens stay labelled with their Go version as historical evidence for behaviour not yet migrated. A Codex PR that changes behaviour visible to an operator coming from Go still lists it in `docs/DIFFERENCES-FROM-GO.md`, justified by the contract. Every other provider keeps the Go v8.0.35 rule above.
 
 ## Layout
 
@@ -37,7 +38,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) tar
 
 ## Review guidelines
 
-Flag, in order: behaviour that differs from Go v8.0.35 (`ae3ee3be`) without an entry in `docs/DIFFERENCES-FROM-GO.md` or an explicit partial/missing audit item; request or response bytes changed on passthrough; credentials or client keys reaching logs or the wrong side; tests that can touch the network or a real `auth-dir`; work on a request body that grows faster than linearly with its size. Skip style nits that `cargo fmt` and clippy already cover.
+Flag, in order: behaviour that differs from Go v8.0.35 (`ae3ee3be`) without an entry in `docs/DIFFERENCES-FROM-GO.md` or an explicit partial/missing audit item, or, on Codex routes, behaviour that differs from `docs/codex/CONTRACT.md`, a payload change outside its permitted transformations, a setting, credential attribute, plugin hook or client header that rewrites a Codex request or is accepted and silently ignored instead of refused (the contract's "Settings" table lists each outcome), a request path that bypasses the native or translated route, or a Codex fixture without first-party or documented provenance; request or response bytes changed on passthrough; credentials or client keys reaching logs or the wrong side; tests that can touch the network or a real `auth-dir`; work on a request body that grows faster than linearly with its size. Skip style nits that `cargo fmt` and clippy already cover.
 
 ## Claude cache telemetry deployment check
 

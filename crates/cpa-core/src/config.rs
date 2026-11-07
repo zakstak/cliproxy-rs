@@ -1049,7 +1049,7 @@ impl Config {
         validate::go_custom(document.value())?;
         let oauth_only = schema::oauth_only_paths(&Value::Mapping(root.clone()));
         let plugin_configs = plugin_configs(text, &root);
-        Ok(Config {
+        let cfg = Config {
             host,
             port,
             api_keys: normalize_keys(api_keys),
@@ -1061,7 +1061,9 @@ impl Config {
             oauth_only,
             plugin_configs,
             derived: Derived::default(),
-        })
+        };
+        validate::codex_compat(&cfg)?;
+        Ok(cfg)
     }
 
     /// `server.max-request-body-bytes` (legacy root `max-request-body-bytes`), Go
@@ -1191,7 +1193,6 @@ mod tests {
 
     /// Go `TestPrepareConfigFileForUploadReportsSecretItCannotHash` "read-only file";
     /// tests/prepare_upload_go.rs replays the other Go cases.
-    #[cfg(unix)]
     #[test]
     fn prepare_for_upload_refuses_a_file_it_cannot_write() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1360,7 +1361,7 @@ mod tests {
         let keys = "api-keys: {codex: [{base-url: https://example.invalid, keys: [{api-key: test-key, disable-codex-cloaking: false}]}]}\n";
         let codex = "{disable-codex-cloaking: true, stream-bootstrap-buffering: true, stream-bootstrap-timeout: 10s, orphan-delegation-compatibility: true, model-level-cooling: true, response-steering: true";
         let headers = "{user-agent: client-agent, package-version: 1.2.3, runtime-version: v22.1.0, os: Linux, arch: arm64, timeout: '123', timezone: Asia/Shanghai, stabilize-device-profile: true}";
-        let oauth = "oauth: {auth-dir: client-auth, auth-auto-refresh-workers: 3, providers: {codex: {header-defaults: {user-agent: oauth-agent, beta-features: oauth-beta}}}}\n";
+        let oauth = "oauth: {auth-dir: client-auth, auth-auto-refresh-workers: 3, providers: {codex: {header-defaults: {beta-features: oauth-beta}}}}\n";
         let legacy = format!(
             "auth-dir: client-auth\nauth-auto-refresh-workers: 3\ncodex: {codex}}}\nclaude: {{model-level-cooling: true}}\nclaude-code: {{disable-cloaking-model-list: true}}\ndisable-claude-cloak-mode: true\nclaude-header-defaults: {headers}\nxai: {{inject-x-search: true}}\n{oauth}{keys}"
         );
@@ -1368,7 +1369,7 @@ mod tests {
             "upstream:\n  codex: {codex}}}\n  claude:\n    model-level-cooling: true\n    disable-cloaking-model-list: true\n    disable-claude-cloak-mode: true\n    header-defaults: {headers}\n  xai: {{inject-x-search: true}}\n{oauth}{keys}"
         );
         let historical = format!(
-            "oauth:\n  auth-dir: client-auth\n  auth-auto-refresh-workers: 3\n  providers:\n    codex: {codex}, header-defaults: {{user-agent: oauth-agent, beta-features: oauth-beta}}}}\n    claude:\n      model-level-cooling: true\n      claude-code: {{disable-cloaking-model-list: true}}\n      disable-claude-cloak-mode: true\n      header-defaults: {headers}\n    xai: {{inject-x-search: true}}\n{keys}"
+            "oauth:\n  auth-dir: client-auth\n  auth-auto-refresh-workers: 3\n  providers:\n    codex: {codex}, header-defaults: {{beta-features: oauth-beta}}}}\n    claude:\n      model-level-cooling: true\n      claude-code: {{disable-cloaking-model-list: true}}\n      disable-claude-cloak-mode: true\n      header-defaults: {headers}\n    xai: {{inject-x-search: true}}\n{keys}"
         );
         let expected = Config::parse(&canonical).unwrap().document;
         assert_eq!(
@@ -1400,10 +1401,12 @@ mod tests {
                     let key = &view.document["api-keys"]["codex"][0]["keys"][0];
                     assert_eq!(key["disable-codex-cloaking"], Value::Bool(false));
                 }
-                let user_agent =
-                    |c: &Config| c.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"].clone();
-                assert_eq!(user_agent(&cfg), "oauth-agent");
-                assert_eq!(user_agent(&cfg.for_api_key()), "");
+                // The Codex user-agent default is refused since #26 (validate.rs); the
+                // remaining header default shows the OAuth-only view.
+                let beta =
+                    |c: &Config| c.document["oauth"]["providers"]["codex"]["header-defaults"]["beta-features"].clone();
+                assert_eq!(beta(&cfg), "oauth-beta");
+                assert_eq!(beta(&cfg.for_api_key()), "");
             }
         }
     }

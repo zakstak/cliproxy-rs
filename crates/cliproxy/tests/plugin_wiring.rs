@@ -4,7 +4,6 @@
 //! requests the plugins receive (frontend auth so far).
 
 // Native plugins load only on Unix (the host's `native` module).
-#![cfg(unix)]
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};

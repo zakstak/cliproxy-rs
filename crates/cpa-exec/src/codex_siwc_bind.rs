@@ -79,7 +79,6 @@ pub fn resolve(auth_dir: &Path, target: &str) -> Result<PathBuf, String> {
     // parent of its target.
     let dir = go_abs(auth_dir)
         .and_then(std::fs::canonicalize)
-        .map(plain_path)
         .map_err(|e| format!("siwc-bind: failed to resolve real auth-dir: {e}"))?;
     let candidate = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
@@ -88,9 +87,8 @@ pub fn resolve(auth_dir: &Path, target: &str) -> Result<PathBuf, String> {
     } else {
         dir.join(raw)
     };
-    let candidate = std::fs::canonicalize(candidate)
-        .map(plain_path)
-        .map_err(|e| format!("siwc-bind: failed to resolve credential file: {e}"))?;
+    let candidate =
+        std::fs::canonicalize(candidate).map_err(|e| format!("siwc-bind: failed to resolve credential file: {e}"))?;
     if candidate
         .strip_prefix(&dir)
         .map_or(true, |rel| rel.as_os_str().is_empty())
@@ -144,7 +142,7 @@ pub fn save(path: &Path, tokens: &Tokens) -> Result<(), String> {
 }
 
 /// Go `WithFileLock`'s inter-process half: an exclusive lock on `<path>.lock` for the
-/// duration of `f` (`flock`, or `LockFileEx` on Windows), so a Go or Rust process
+/// duration of `f` (`flock`), so a Go or Rust process
 /// refreshing the same file waits.
 // ponytail: Go also serializes callers in one process with a mutex per path; here the
 // server's refresh holds its per-credential preparation lock around [`lock_file`].
@@ -184,7 +182,6 @@ fn open_lock(path: &Path) -> Result<(std::fs::File, PathBuf), String> {
     let lock_path = PathBuf::from(lock_path);
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let file = options
         .open(&lock_path)
@@ -192,7 +189,6 @@ fn open_lock(path: &Path) -> Result<(std::fs::File, PathBuf), String> {
     Ok((file, lock_path))
 }
 
-#[cfg(unix)]
 fn lock(file: &std::fs::File, wait: bool) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let operation = if wait {
@@ -212,47 +208,8 @@ fn lock(file: &std::fs::File, wait: bool) -> std::io::Result<()> {
     }
 }
 
-#[cfg(unix)]
 fn would_block(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
-}
-
-#[cfg(windows)]
-fn lock(file: &std::fs::File, wait: bool) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx};
-    let flags = if wait {
-        LOCKFILE_EXCLUSIVE_LOCK
-    } else {
-        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
-    };
-    // Go locks the first byte; overlapping ranges conflict, so the two interoperate.
-    // SAFETY: a valid open handle and a zeroed OVERLAPPED that outlives the call.
-    let ok = unsafe {
-        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
-        LockFileEx(file.as_raw_handle() as _, flags, 0, 1, 0, &mut overlapped)
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn would_block(error: &std::io::Error) -> bool {
-    // ERROR_LOCK_VIOLATION
-    error.raw_os_error() == Some(33)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn lock(_: &std::fs::File, _: bool) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn would_block(_: &std::io::Error) -> bool {
-    false
 }
 
 /// Go `filepath.Clean`, lexically.
@@ -276,33 +233,6 @@ fn go_clean(path: &Path) -> PathBuf {
         return PathBuf::from(".");
     }
     out.iter().collect()
-}
-
-/// A canonical path spelled as Go's `filepath.EvalSymlinks` spells it. On Windows,
-/// `std::fs::canonicalize` answers with a verbatim path: `\\?\C:\x` becomes `C:\x`
-/// and `\\?\UNC\server\share\x` becomes `\\server\share\x`; other verbatim
-/// forms stay. Other platforms return the path as it is.
-#[cfg(windows)]
-pub fn plain_path(path: PathBuf) -> PathBuf {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::path::{Component, Prefix};
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let plain = match path.components().next() {
-        Some(Component::Prefix(p)) => match p.kind() {
-            // `\\?\` is four UTF-16 units, `\\?\UNC\` eight.
-            Prefix::VerbatimDisk(_) => wide[4..].to_vec(),
-            Prefix::VerbatimUNC(..) => [&[u16::from(b'\\'); 2][..], &wide[8..]].concat(),
-            _ => return path,
-        },
-        _ => return path,
-    };
-    PathBuf::from(std::ffi::OsString::from_wide(&plain))
-}
-
-/// The path as it is: only Windows spells canonical paths verbatim.
-#[cfg(not(windows))]
-pub fn plain_path(path: PathBuf) -> PathBuf {
-    path
 }
 
 /// Go `filepath.Abs` of a cleaned path: joined with the working directory, cleaned.

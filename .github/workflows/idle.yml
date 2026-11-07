@@ -1,8 +1,7 @@
 # Idle cost outside the per-PR Linux gate: once a week, by hand, and on a push to master
-# or a pull request that changes the file watcher or these gates.
+# or a pull request that changes the file watcher or these gates. This fork builds for
+# Linux only, so there are no macOS or Windows idle gates.
 #
-# - macOS (Apple silicon and Intel) and Windows: release build, the file-watch tests,
-#   then the idle gate (bench/gate.sh, bench/budgets.txt).
 # - Go comparison: CLIProxyAPI's release binary and this one on the same one-API-key
 #   config in a loopback-only network, 30 s of warm-up, then 300 s of samples. No OAuth
 #   credentials are involved, so nothing can be signed out. The numbers go to the job
@@ -23,7 +22,6 @@ on:
       - crates/cpa-server/src/fs_events.rs
       - crates/cpa-server/src/watching.rs
       - bench/idle.sh
-      - bench/idle-other.sh
       - bench/gate.sh
       - bench/budgets.txt
       - .github/workflows/idle.yml
@@ -33,7 +31,6 @@ on:
       - crates/cpa-server/src/fs_events.rs
       - crates/cpa-server/src/watching.rs
       - bench/idle.sh
-      - bench/idle-other.sh
       - bench/gate.sh
       - bench/budgets.txt
       - .github/workflows/idle.yml
@@ -54,52 +51,6 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  other-os:
-    name: idle gate (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: aarch64-apple-darwin, os: macos-15 }
-          - { target: x86_64-apple-darwin, os: macos-15-intel }
-          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-      # As in release.yml: BoringSSL needs NASM on a native MSVC build; bindgen needs libclang.
-      - name: NASM and libclang (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install nasm --no-progress -y
-          printf '%s\n' 'C:\Program Files\NASM' >> "$GITHUB_PATH"
-          printf 'LIBCLANG_PATH=%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
-      - name: Rust
-        run: |
-          if ! command -v rustup >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Build
-        run: cargo build --release --locked -p cliproxy --target ${{ matrix.target }}
-      # kqueue on macOS and ReadDirectoryChangesW on Windows are only exercised here.
-      - name: File-watch tests
-        run: cargo test --release --locked -p cpa-server --lib --target ${{ matrix.target }} -- fs_events watching
-      - name: Idle gate
-        run: |
-          exe=cliproxy; os=macos
-          [[ "$RUNNER_OS" == Windows ]] && { exe=cliproxy.exe; os=windows; }
-          bench/gate.sh idle "$os" "target/${{ matrix.target }}/release/$exe" 1
-
   go-comparison:
     name: idle, Go vs cliproxy-rs (Linux)
     runs-on: ubuntu-22.04

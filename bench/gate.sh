@@ -5,9 +5,9 @@
 #                                                    .rodata (ELF), the release archive,
 #                                                    and duplicate crates (Linux only)
 #   bench/gate.sh image <docker image>               compressed image bytes
-#   bench/gate.sh idle <os> <binary> [auth files]    idle cost over a window of no requests
+#   bench/gate.sh idle linux <binary> [auth files]   idle cost over a window of no requests
 #
-# <os> is linux, macos or windows. Each measured value is printed and compared with the
+# This fork builds for Linux only, so linux is the only idle <os>. Each measured value is printed and compared with the
 # line of the same key in bench/budgets.txt: `<key> <value> <tolerance %>`. A key with no
 # line is printed and not gated, so a new target starts reporting before it has a budget.
 # Gates count events and bytes, never elapsed time: shared runners vary by about 15%.
@@ -91,25 +91,7 @@ idle_gate() { # os binary [files]
         check "idle.linux.$files.$metric" "$(jq -r ".$metric" <<<"$json" | tr -d '\r')"
       done
       ;;
-    macos | windows)
-      local json key metrics
-      json=$("$HERE/idle-other.sh" "$os" "$bin" "$files" "${IDLE_SECONDS:-60}")
-      echo "$json"
-      # Apple silicon and Intel idle at different sizes, so each has its own budgets.
-      if [[ $os == macos ]]; then
-        key=macos-$(uname -m)
-        metrics="cpu_ms idle_wakeups threads rss_kb"
-      else
-        key=windows
-        metrics="cpu_ms threads rss_kb"
-      fi
-      for metric in $metrics; do
-        # jq on Windows ends its lines with CRLF; a missing key prints "null", which
-        # check() rejects.
-        check "idle.$key.$files.$metric" "$(jq -r ".$metric" <<<"$json" | tr -d '\r')"
-      done
-      ;;
-    *) echo "unknown os $os" >&2; exit 2 ;;
+    *) echo "unsupported os $os: this fork measures idle cost on Linux only" >&2; exit 2 ;;
   esac
 }
 

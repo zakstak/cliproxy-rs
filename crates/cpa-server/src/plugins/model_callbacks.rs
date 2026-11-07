@@ -131,6 +131,14 @@ impl ModelExecutor for Executor {
                 proxy_url: req.proxy_url,
                 scope,
             };
+            let headers = super::interceptors::header_map(&req.headers);
+            // A Responses callback may reach a Codex credential: it takes the native route
+            // with the plugin's own bytes, as a client request does (#28), and other
+            // plugins' before-auth output reaches only the attempts that are not native.
+            // Eligibility is the executor's own test: Responses on both sides, in either
+            // spelling. Media calls have their own route.
+            let native = (cpa_exec::codex::CodexExecutor::responses_pair(entry, response) && media.is_none())
+                .then(|| crate::dispatch::NativeRequest::new(req.body.clone(), headers.clone(), request_path.clone()));
             let call = Call {
                 entry,
                 response,
@@ -139,7 +147,7 @@ impl ModelExecutor for Executor {
                 body: req.body,
                 stream: req.stream,
                 alt: Some(req.alt).filter(|s| !s.is_empty()),
-                headers: super::interceptors::header_map(&req.headers),
+                headers,
                 caller: Caller {
                     principal: String::new(),
                     source: "",
@@ -150,6 +158,7 @@ impl ModelExecutor for Executor {
                 execution_session,
                 request_path,
                 peer: None,
+                native,
                 turn: None,
                 media,
             };

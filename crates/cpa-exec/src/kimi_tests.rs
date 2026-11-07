@@ -424,7 +424,6 @@ async fn login_writes_go_identical_credential_file() {
         );
         let expired = crate::kimi_http::parse_time(&ours["expired"]).unwrap().timestamp();
         assert!((timestamp / 1000 + 3599..=timestamp / 1000 + 3601).contains(&expired));
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

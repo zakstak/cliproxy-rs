@@ -521,17 +521,12 @@ fn worker_threads(config: Option<&Path>) -> usize {
 
 /// Waits for Ctrl+C or SIGTERM, Go's `signal.NotifyContext(SIGINT, SIGTERM)`.
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler installs");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
+    let mut term =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler installs");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Go `LoadConfigOptional`: in cloud deploy mode a missing, empty or undecodable file
@@ -599,7 +594,7 @@ fn main() -> anyhow::Result<()> {
         std::env::set_current_dir(dir).with_context(|| format!("change to working directory {dir:?}"))?;
     }
     // Next, relative to that directory, so every line from here on reaches the file:
-    // sizing the runtime can warn, and stdout may be hidden (the Windows Run entry).
+    // sizing the runtime can warn.
     // An empty value is left for the parse to reject.
     let log_file = prescan_value(&raw[1..], "log-file");
     if let Some(path) = log_file.as_deref().filter(|p| !p.is_empty()) {
@@ -915,11 +910,6 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
         }
         return Ok(());
     }
-    // Only the plain server detaches: discovery, login, import, TUI and plugin
-    // commands keep their console.
-    if args.log_file.is_some() {
-        free_console();
-    }
     serve(
         config,
         config_path,
@@ -932,22 +922,6 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
         None,
     )
     .await
-}
-
-/// A direct Windows Run entry needs no persistent console or shell parent; logs go
-/// to the `--log-file` instead.
-fn free_console() {
-    #[cfg(windows)]
-    {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn FreeConsole() -> i32;
-        }
-        // SAFETY: detaches only this process from its console; no pointers.
-        unsafe {
-            FreeConsole();
-        }
-    }
 }
 
 /// Go's `commandMode`: a login or import flag is set.
@@ -996,13 +970,11 @@ fn management_base_url(flag: &str, configured: &str, port: i64) -> String {
 
 /// Go's standalone TUI points stdout and stderr at /dev/null while it runs and draws on
 /// the original stdout; dropping this restores both.
-#[cfg(unix)]
 struct QuietStdio {
     out: libc::c_int,
     err: libc::c_int,
 }
 
-#[cfg(unix)]
 impl QuietStdio {
     /// Silences fds 1 and 2; returns the guard and a handle on the original stdout.
     fn start() -> io::Result<(Self, std::fs::File)> {
@@ -1022,7 +994,6 @@ impl QuietStdio {
     }
 }
 
-#[cfg(unix)]
 impl Drop for QuietStdio {
     fn drop(&mut self) {
         // SAFETY: restores the fds saved in `start` and closes the saved copies.
@@ -1032,19 +1003,6 @@ impl Drop for QuietStdio {
             libc::close(self.out);
             libc::close(self.err);
         }
-    }
-}
-
-/// ponytail: Windows keeps the console handles. Go swaps only its `os.Stdout`
-/// variable there too; the log lines already go to the hook, so only a stray direct
-/// print could reach the screen.
-#[cfg(not(unix))]
-struct QuietStdio;
-
-#[cfg(not(unix))]
-impl QuietStdio {
-    fn start() -> io::Result<(Self, io::Stdout)> {
-        Ok((QuietStdio, io::stdout()))
     }
 }
 
@@ -1104,8 +1062,7 @@ async fn standalone_tui(
         Ok(_) => Err("embedded server is not ready".to_owned()),
         Err(e) => Err(e.clone()),
     };
-    // Restores stdout and stderr on Unix; outside Unix nothing was redirected.
-    #[cfg_attr(not(unix), allow(clippy::drop_non_drop))]
+    // Restores stdout and stderr.
     drop(quiet);
     cpa_server::logging::release();
     if let Err(e) = result {
@@ -1177,10 +1134,8 @@ async fn persist_command(
 /// Saves the file `-siwc-bind` bound, under the store's spelling of the auth directory
 /// (the bound path has its symlinks resolved).
 async fn persist_bound(store: &cpa_store::Store, path: &Path) {
-    // resolve() spells the bound path without Windows' verbatim prefix; so does this.
     let path = std::fs::canonicalize(&store.auth_dir)
         .ok()
-        .map(cpa_exec::codex_siwc_bind::plain_path)
         .and_then(|dir| path.strip_prefix(dir).ok().map(|rel| store.auth_dir.join(rel)))
         .unwrap_or_else(|| path.to_owned());
     let name = path
@@ -1338,7 +1293,6 @@ fn ensure_auth_dir(dir: &Path) -> anyhow::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true);
-            #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o755);
             builder
                 .create(dir)
@@ -1570,10 +1524,7 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("real")).unwrap();
         // The store names the auth directory through a link; the bound path is real.
-        #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("real"), root.join("auth")).unwrap();
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(root.join("auth")).unwrap();
         let auth = root.join("auth");
         std::fs::write(auth.join("c.json"), "{}").unwrap();
         let before = auth_files(&auth);

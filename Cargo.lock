@@ -869,7 +869,6 @@ dependencies = [
  "async-compression",
  "axum",
  "base64 0.22.1",
- "brotli-decompressor",
  "btls",
  "bytes",
  "chrono",
@@ -901,7 +900,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "windows-sys 0.61.2",
  "wreq",
 ]
 
@@ -1000,7 +998,6 @@ dependencies = [
  "url",
  "uuid",
  "webrtc",
- "windows-sys 0.61.2",
  "wreq",
  "zstd",
 ]

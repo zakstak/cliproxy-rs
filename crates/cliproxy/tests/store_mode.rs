@@ -13,8 +13,8 @@ fn scratch(name: &str) -> PathBuf {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("cliproxy-store-{name}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // The binary resolves its store root from the canonical working directory
-    // (macOS temp paths sit behind the /var -> /private/var symlink).
+    // The binary resolves its store root from the canonical working directory (the
+    // temp folder may sit behind a symlink).
     dir.canonicalize().unwrap()
 }
 

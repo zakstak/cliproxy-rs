@@ -144,15 +144,10 @@ fn show_url(url: &str, port: u16, no_browser: bool) {
     println!("Waiting for Claude authentication callback...");
 }
 
-/// `browser.OpenURL`: announces the URL, then starts the platform opener.
+/// `browser.OpenURL` on Linux: announces the URL, then starts `xdg-open`.
 pub(crate) fn open_browser(url: &str) -> bool {
     println!("Attempting to open URL in browser: {url}");
-    let command = match std::env::consts::OS {
-        "macos" => "open",
-        "windows" => "explorer",
-        _ => "xdg-open",
-    };
-    std::process::Command::new(command)
+    std::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -247,14 +242,13 @@ async fn bind(port: u16) -> Result<tokio::net::TcpListener, ExecError> {
 }
 
 /// Go `net.Listen("tcp", ":port")`: one socket on `[::]` that also takes IPv4
-/// (`IPV6_V6ONLY` cleared; Windows sets it by default, so a plain `[::]` bind there
-/// misses `127.0.0.1`, the address Go's SSH tunnel instructions forward to).
+/// (`IPV6_V6ONLY` cleared, so `127.0.0.1`, the address Go's SSH tunnel instructions
+/// forward to, reaches it even where the host defaults to IPv6-only).
 pub(crate) fn listen_any(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
     let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
     socket.set_only_v6(false)?;
-    // Go sets SO_REUSEADDR except on Windows (net/sockopt_windows.go).
-    #[cfg(not(windows))]
+    // Go sets SO_REUSEADDR (net/sockopt_posix.go).
     socket.set_reuse_address(true)?;
     socket.bind(&std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
     socket.listen(1024)?;
@@ -708,7 +702,6 @@ fn publish(directory: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut directory_options = std::fs::DirBuilder::new();
     directory_options.recursive(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         directory_options.mode(0o700);
@@ -721,7 +714,6 @@ fn publish(directory: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let result = (|| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
@@ -730,8 +722,7 @@ fn publish(directory: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
-        // Go never syncs the folder, and Windows cannot open one as a file.
-        #[cfg(unix)]
+        // Go never syncs the folder.
         std::fs::File::open(directory)?.sync_all()?;
         Ok(())
     })();

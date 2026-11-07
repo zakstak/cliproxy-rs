@@ -9,6 +9,8 @@ use cpa_exec::Executors;
 use cpa_server::router;
 use serde_json::Value;
 
+mod forward_port;
+
 async fn get(path: &str, cfg: &str) -> (u16, String, Value) {
     let cfg = Config::parse(cfg).unwrap();
     let credentials = cpa_core::config::credentials::from_config(&cfg);
@@ -119,13 +121,15 @@ async fn tool_search_catalog_matches_go() {
 /// A Codex API key without configured models serves the Pro catalog plus the gpt-image-*
 /// built-ins (Go `WithCodexBuiltins`), as Go's `/v1/models` lists them
 /// (tests/reference/codex_models `TestRSFixCodexBuiltins`). Compared as a set: list order
-/// is the registry's concern.
+/// is the registry's concern. GPT Image 2.6 is a forward port past Go's recording
+/// (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
 async fn codex_builtins_match_go_models_list() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_builtins_go.json")).unwrap();
     let (status, _, body) = get("/v1/models", fixture["config"].as_str().unwrap()).await;
     assert_eq!(status, 200);
-    let want: Value = serde_json::from_str(fixture["models"].as_str().unwrap()).unwrap();
+    let mut want: Value = serde_json::from_str(fixture["models"].as_str().unwrap()).unwrap();
+    forward_port::gpt_image_26::openai_models(&mut want);
     let sorted = |list: &Value| {
         let mut entries = list["data"].as_array().unwrap().clone();
         entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -184,7 +188,6 @@ async fn model_detail_comes_from_the_clients_catalog() {
 /// the detail is picked from the catalog a response interceptor returned (its stale
 /// `Content-Length` dropped), and the request lifecycle completes once with the detail's
 /// status. The plugin is the Go recorder test plugin.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_detail_reads_the_intercepted_catalog() {
     use base64::Engine as _;

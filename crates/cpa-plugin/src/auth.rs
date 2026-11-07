@@ -90,15 +90,9 @@ pub fn auth_id_for_path(path: &str, auth_dir: &str) -> String {
         Some(rel) if !auth_dir.is_empty() && !rel.is_empty() && !rel.starts_with("..") => rel,
         _ => path.to_owned(),
     };
-    let id = crate::platform::clean(std::path::Path::new(&id))
+    crate::platform::clean(std::path::Path::new(&id))
         .to_string_lossy()
-        .into_owned();
-    // Go `filepath.ToSlash` only rewrites the OS separator.
-    if cfg!(windows) {
-        id.replace('\\', "/").go_lower()
-    } else {
-        id
-    }
+        .into_owned()
 }
 
 fn first_non_empty(values: &[&str]) -> String {
@@ -314,7 +308,6 @@ fn is_auth_token_payload_key(key: &str) -> bool {
 fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)
 }
@@ -351,7 +344,6 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     })?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     // Go `os.CreateTemp(dir, ".plugin-auth-*.tmp")`: a fresh name until one is unused.
     let mut attempt = 0u32;
@@ -1023,7 +1015,6 @@ pub struct FrontendAuthOutcome {
 #[cfg(test)]
 mod tests {
     // File modes are only checked where they exist.
-    #[cfg(unix)]
     #[test]
     fn save_file_follows_go_filestore() {
         use std::os::unix::fs::PermissionsExt as _;

@@ -29,7 +29,7 @@ mod subscriber;
 mod tls;
 
 // Mode-bit assertions: Unix only.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod cert_tests;
 #[cfg(test)]
 mod client_tests;

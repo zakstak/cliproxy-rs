@@ -124,7 +124,9 @@ async fn alpha_search_uses_policy_eligible_credential_and_passes_upstream_throug
     );
     assert_eq!(headers["authorization"], "Bearer at-FAKE", "client key never forwarded");
     assert_eq!(headers["chatgpt-account-id"], "acct-FAKE");
-    assert_eq!(headers["originator"], "codex_cli_rs");
+    // Go fixes `originator: codex_cli_rs`; a caller that sends none gets the proxy's own
+    // (#26, docs/DIFFERENCES-FROM-GO.md). The caller's User-Agent passes through.
+    assert_eq!(headers["originator"], "cliproxy-rs");
     assert_eq!(headers["user-agent"], "codex_cli_rs/0.150.0");
     assert_eq!(headers["version"], "0.150.0");
     assert_eq!(headers["session_id"], "s-1");

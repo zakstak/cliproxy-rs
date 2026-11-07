@@ -11,12 +11,9 @@ use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, FailureScope};
 use serde_json::Value;
 
-/// Go `runtime.GOOS`.
+/// Go `runtime.GOOS`: this fork builds only for Linux (enforced in `cpa-core`).
 pub(crate) fn go_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
+    "linux"
 }
 
 /// Go `runtime.GOARCH`.
@@ -32,7 +29,6 @@ pub(crate) fn go_arch() -> &'static str {
 
 /// Go `os.Hostname()`, or `None` when it fails.
 pub(crate) fn hostname() -> Option<String> {
-    #[cfg(target_os = "linux")]
     if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let name = name.trim_end_matches('\n');
         if !name.is_empty() {
@@ -42,7 +38,6 @@ pub(crate) fn hostname() -> Option<String> {
     platform_hostname()
 }
 
-#[cfg(unix)]
 fn platform_hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: gethostname writes at most buf.len() bytes into the provided buffer.
@@ -52,41 +47,6 @@ fn platform_hostname() -> Option<String> {
     }
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
-}
-
-/// Go's Windows `os.Hostname`: `GetComputerNameExW(ComputerNamePhysicalDnsHostname)`,
-/// growing the buffer while the call answers `ERROR_MORE_DATA` with a larger size.
-#[cfg(windows)]
-fn platform_hostname() -> Option<String> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetComputerNameExW(name_type: i32, buffer: *mut u16, size: *mut u32) -> i32;
-        fn GetLastError() -> u32;
-    }
-    const COMPUTER_NAME_PHYSICAL_DNS_HOSTNAME: i32 = 5;
-    const ERROR_MORE_DATA: u32 = 234;
-    let mut n: u32 = 64;
-    loop {
-        let mut buf = vec![0u16; n as usize];
-        // SAFETY: `buf` holds `n` UTF-16 units; the call writes at most that many and
-        // stores the written (or required) length in `n`.
-        let ok = unsafe { GetComputerNameExW(COMPUTER_NAME_PHYSICAL_DNS_HOSTNAME, buf.as_mut_ptr(), &mut n) };
-        if ok != 0 {
-            buf.truncate(n as usize);
-            // syscall.UTF16ToString: up to the first NUL, invalid surrogates as U+FFFD.
-            let end = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
-            return Some(String::from_utf16_lossy(&buf[..end]));
-        }
-        // SAFETY: no preconditions.
-        if unsafe { GetLastError() } != ERROR_MORE_DATA || n as usize <= buf.len() {
-            return None;
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_hostname() -> Option<String> {
-    None
 }
 
 /// Go `ApplyPayloadConfigWithRequest` (no target executor) for the device providers:
@@ -159,6 +119,8 @@ pub(crate) async fn status_error(upstream: crate::proxy::Upstream) -> ExecError 
         headers: Box::new(upstream.headers),
         retry_after: None,
         direct: false,
+        delivered_status: None,
+        delivered_event: None,
         addon: None,
         diagnostic: None,
     }

@@ -308,6 +308,9 @@ impl CodexOAuth {
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
         headers.set("Accept", "application/json");
+        // Every token grant is the proxy's own request: it names cliproxy-rs, where Go
+        // sent net/http's `Go-http-client` default (#26, `crate::codex_identity`).
+        headers.set("User-Agent", crate::codex_identity::USER_AGENT);
         let upstream = crate::proxy::send(&self.client, url, headers, body, None)
             .await
             .map_err(|_| failed())?;
@@ -884,7 +887,6 @@ pub(crate) fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
     use std::io::Write;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
@@ -899,7 +901,6 @@ pub(crate) fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
     let result = (|| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
@@ -908,8 +909,7 @@ pub(crate) fn publish(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
-        // Go never syncs the folder, and Windows cannot open one as a file.
-        #[cfg(unix)]
+        // Go never syncs the folder.
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
@@ -960,16 +960,11 @@ impl Default for LoginOptions {
 }
 
 fn open_browser(url: &str) {
-    #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = url;
 }
 
 /// Browser PKCE login (`-codex-login`). Only the explicit CLI flag calls this.

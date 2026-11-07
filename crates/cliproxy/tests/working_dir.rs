@@ -57,7 +57,7 @@ fn working_dir_applies_before_dotenv_config_and_log_paths() {
 }
 
 /// `--log-file` opens before the runtime starts, so a warning from sizing it lands in
-/// the file and not on stdout, which the Windows Run entry hides.
+/// the file and not on stdout.
 #[test]
 fn a_warning_before_the_runtime_starts_goes_to_the_log_file() {
     let root = scratch("early-log");

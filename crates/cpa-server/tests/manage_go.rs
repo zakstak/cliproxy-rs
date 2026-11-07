@@ -8,6 +8,8 @@ use cpa_core::config::{Config, TrustedProxies, credentials};
 use cpa_core::credential::{Credential, Source};
 use serde_json::{Value, json};
 
+mod forward_port;
+
 fn fixture() -> &'static Value {
     static FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("fixtures/manage_go.json")).expect("fixture JSON")
@@ -248,11 +250,6 @@ fn forwarded_header_bytes_and_zoned_peers_match_gin() {
 fn trusted_proxy_validation_errors_match_go_text() {
     for case in fixture()["load_errors"].as_array().unwrap() {
         let yaml = case["yaml"].as_str().unwrap();
-        // The catalog sources were recorded on Linux, and filepath.IsAbs depends on the
-        // OS; the Windows rules are validate.rs's absolute-path table.
-        if cfg!(windows) && yaml.contains("models") {
-            continue;
-        }
         let got = Config::parse(yaml).err().map(|e| e.to_string()).unwrap_or_default();
         // Errors Go finds while decoding carry LoadConfig's wrapper; yaml.v3's own
         // decode messages (line numbers, Go type names) are not ported, only the refusal.
@@ -305,26 +302,43 @@ fn oauth_only_presence_matches_go() {
     };
     let cases = fixture()["oauth_only"].as_array().unwrap().clone();
     assert_eq!(cases.len(), 6);
+    // #26 (docs/DIFFERENCES-FROM-GO.md): Go accepts a Codex `header-defaults.user-agent`;
+    // cliproxy-rs refuses it. That case is checked without the key, and its field drops
+    // out of Go's list.
+    const CODEX_UA: &str = "header-defaults: {user-agent: x}, ";
+    const CODEX_UA_FIELD: &str = "codex-header-defaults.user-agent";
+    let without_codex_ua = |yaml: &str| {
+        if yaml.contains(CODEX_UA) {
+            let error = Config::parse(yaml).expect_err("refused").to_string();
+            assert!(
+                error.contains("header-defaults.user-agent is no longer supported"),
+                "{error}"
+            );
+        }
+        yaml.replace(CODEX_UA, "")
+    };
+    assert!(cases.iter().any(|c| c["yaml"].as_str().unwrap().contains(CODEX_UA)));
     for case in &cases {
-        let yaml = case["yaml"].as_str().unwrap();
+        let yaml = without_codex_ua(case["yaml"].as_str().unwrap());
         let want: std::collections::BTreeSet<String> = case["fields"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|f| to_v8(f.as_str().unwrap()))
+            .filter_map(serde_json::Value::as_str)
+            .filter(|f| *f != CODEX_UA_FIELD)
+            .map(to_v8)
             .collect();
-        assert_eq!(Config::parse(yaml).unwrap().oauth_only, want, "{yaml}");
+        assert_eq!(Config::parse(&yaml).unwrap().oauth_only, want, "{yaml}");
     }
     // Go `ForAPIKey`: those fields read as zero for API-key credentials; the shared
     // `upstream.codex` value written at its historical path stays.
-    let cfg = Config::parse(cases[1]["yaml"].as_str().unwrap()).unwrap();
+    let cfg = Config::parse(&without_codex_ua(cases[1]["yaml"].as_str().unwrap())).unwrap();
     let view = cfg.for_api_key();
     assert_eq!(
         view.document["upstream"]["codex"]["disable-codex-cloaking"],
         serde_yaml_ng::Value::Bool(true)
     );
     let codex = &view.document["oauth"]["providers"]["codex"];
-    assert_eq!(codex["header-defaults"]["user-agent"], serde_yaml_ng::Value::from(""));
     assert!(codex["live-media-relay"].get("ice-servers").is_none());
     assert_eq!(
         view.document["oauth"]["providers"]["aistudio"]["ws-auth"],
@@ -793,10 +807,6 @@ mod config_writes {
         let mut verified = HashSet::new();
         for scenario in fixture()["config_writes"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
-            // Recorded on Linux: its sources are Unix absolute paths (see load_errors).
-            if cfg!(windows) && name == "model_catalog_sources" {
-                continue;
-            }
             let dir = std::env::temp_dir().join(format!("cpa-config-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("config.yaml");
@@ -932,14 +942,9 @@ mod config_writes {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-        // Windows skips model_catalog_sources: 31 steps, 25 of them byte-compared.
-        assert_eq!(compared, if cfg!(windows) { 151 } else { 182 });
+        assert_eq!(compared, 182);
         eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(
-            bytes_compared,
-            if cfg!(windows) { 121 } else { 146 },
-            "steps compared byte for byte"
-        );
+        assert_eq!(bytes_compared, 146, "steps compared byte for byte");
     }
 }
 
@@ -1122,7 +1127,7 @@ mod creds {
             let mut last_cursor = "no-cursor".to_owned();
             for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
-                let step = &pin_pending_steps(step.clone(), name, i, &at);
+                let step = &forward_ports(pin_pending_steps(step.clone(), name, i, &at));
                 if let Some(ms) = step["sleep_ms"].as_u64() {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
@@ -1166,11 +1171,6 @@ mod creds {
                     assert_eq!(body, raw, "{at}");
                     let want = step["resp_headers"].as_object().unwrap();
                     for (h, v) in want {
-                        // Go types `.log` from the host's MIME database; the fixture
-                        // host (Linux) maps it to text/x-log, macOS has no entry.
-                        if h == "Content-Type" && v == "text/x-log; charset=utf-8" && !cfg!(target_os = "linux") {
-                            continue;
-                        }
                         assert_eq!(headers.get(h).map(String::as_str), v.as_str(), "{at}: header {h}");
                     }
                 } else {
@@ -1296,6 +1296,19 @@ mod creds {
         assert_eq!(compared, 222);
         eprintln!("credentials: {bytes_compared} of {compared} steps compared byte for byte");
         assert_eq!(bytes_compared, 174, "steps compared byte for byte");
+    }
+
+    /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model
+    /// definitions carry the GPT Image 2.6 built-ins.
+    fn forward_ports(mut step: Value) -> Value {
+        if step["response"]["channel"] == "codex"
+            && let Some(raw) = step["raw_json"].as_str()
+        {
+            let raw = crate::forward_port::gpt_image_26::definitions_raw(raw);
+            step["response"] = serde_json::from_str(&raw).unwrap();
+            step["raw_json"] = raw.into();
+        }
+        step
     }
 
     /// Pending v8.0.35 drift outside the config saver. Each pin names its scenario and

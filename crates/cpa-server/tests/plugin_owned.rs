@@ -3,7 +3,6 @@
 //! models applied), and a plugin executor serves those credentials through the
 //! ordinary selection loop. Plugin schedulers choose among built-in credentials.
 //! Private auth-dir, native test plugins, loopback-only upstreams.
-#![cfg(unix)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -3791,8 +3790,18 @@ async fn a_plugin_refresh_that_cannot_be_saved_backs_off() {
     // A read-only auth dir: the atomic write of the refreshed file fails.
     mode(0o555);
     if std::fs::write(auth_dir.join("probe"), "").is_ok() {
-        // Running as root: permissions do not stop the write.
+        // Running as root: permissions do not stop the write, so the unsaved refresh
+        // cannot happen and is not checked. Shut the plugins down as the normal path
+        // does: a loaded `acme` auth provider would otherwise parse the next test's
+        // `acme` auth files.
         mode(0o755);
+        env.finish().await;
+        // CI sets CPA_TEST_NO_SKIP: a run as root must not pass without the check.
+        assert!(
+            std::env::var_os("CPA_TEST_NO_SKIP").is_none(),
+            "folder permissions are not enforced (running as root?), and CPA_TEST_NO_SKIP is set"
+        );
+        eprintln!("folder permissions are not enforced (running as root?): unsaved refresh not checked");
         return;
     }
     let refreshes = || calls(&env.records, "acme", "auth.refresh").len();

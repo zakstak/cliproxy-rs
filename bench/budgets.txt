@@ -8,7 +8,7 @@
 # A change that needs more raises the value here, with a dated line above it that names
 # the feature and its cost, as ui/scripts/size.mjs does for the dashboard:
 #
-#   # 2026-11-02: Homebrew service hook, +18 KB .text.
+#   # 2026-11-02: device-code login for a new provider, +18 KB .text.
 #
 # Every budgeted number comes from one pinned compiler (RUST_TOOLCHAIN in the workflows).
 # A toolchain bump re-measures these budgets in the same pull request, with a dated line:
@@ -112,34 +112,6 @@ idle.linux.2000.cpu_ticks      1   0
 idle.linux.2000.threads        6   0
 idle.linux.2000.rss_kb    77_492  10
 
-# Idle, macOS and Windows (release builds and the weekly idle workflow): 60 s without
-# requests, after 30 s of warm-up (10 s for the measurements below). Windows adds one
-# parked thread for file change notifications. macOS keys carry `uname -m`. RSS measured
-# on 2026-10-05: 14,976 to 15,344 KB on macos-15 (Apple silicon), 10,496 to 10,656 KB on
-# macos-15-intel, 15,812 to 16,232 KB on windows-2025 (working set).
-# 2026-10-06: idle_wakeups cut from 30 to 3 per 60 s. Over four CI runs each, macos-15
-# measured 0, 0, 0 and 1, and macos-15-intel 0 every time; 3 sits just above the worst.
-# 2026-10-22: both macOS RSS budgets re-measured at master. Master 22abc036's idle run
-# read 11,772 KB on macos-15-intel, over the ceiling of 11,770. The last five idle runs
-# (master 22abc036, master f1fbe526, #150, #155, #153) read 11,772, 11,336, 11,448,
-# 11,288 and 11,288 KB on macos-15-intel and 16,704, 16,592, 16,272, 16,304 and
-# 16,608 KB on macos-15, against 10,496 to 10,656 and 14,976 to 15,344 KB on
-# 2026-10-05; each budget is the median. The cause is the one #155 measured on Linux:
-# the binary grew, which adds mapped binary pages (RssFile), and the catalog data each
-# credential registers grew. Windows (16,744 to 16,872 KB, one outlier at 8,208) is
-# still inside its ceiling of 17,930 and keeps its budget.
-idle.macos-arm64.1.cpu_ms           20   0
-idle.macos-arm64.1.idle_wakeups      3   0
-idle.macos-arm64.1.threads           6   0
-idle.macos-arm64.1.rss_kb       16_592  10
-idle.macos-x86_64.1.cpu_ms          20   0
-idle.macos-x86_64.1.idle_wakeups     3   0
-idle.macos-x86_64.1.threads          6   0
-idle.macos-x86_64.1.rss_kb      11_336  10
-idle.windows.1.cpu_ms         20   0
-idle.windows.1.threads         7   0
-idle.windows.1.rss_kb     16_300  10
-
 # Field-mix soak (bench/soak.sh MIX=field: Claude, Codex and count_tokens requests of
 # 200 KB to 2 MB from 4 sessions, on release tags and weekly): VmHWM at the end of the
 # run, in kB. A 60-minute run of this build on a GitHub-hosted Ubuntu 22.04 runner peaked
@@ -169,18 +141,64 @@ alloc.306k.allocations          2_337  3
 alloc.1900k.peak_bytes      7_420_905  2
 alloc.1900k.allocations         6_710  3
 
-# The same through the Codex route: one streamed /v1/responses request of about 322 KB and
-# one of about 1.9 MB (reasoning items, function calls and their outputs) through the
-# Codex executor and an API key whose base-url is the fake upstream. Target: peak at most
-# 3x the body; today it is 8.8x (the request is rewritten pass by pass, each pass a new
-# copy of the body).
+# The same through the Codex route: streamed /v1/responses requests (reasoning items with
+# encrypted content, function calls and their large outputs) through the Codex executor
+# and an API key whose base-url is the fake upstream. The request body is built before
+# counting starts and handed to the router, so it is not counted itself.
 # 2026-10-06: first budgets; identical over 4 runs.
 # 2026-10-11: the runtime also holds the cloaked login below and its request capture:
 # +48 bytes and +6 allocations per request.
-alloc.codex.306k.peak_bytes       2_769_147  2
-alloc.codex.306k.allocations          1_683  3
-alloc.codex.1900k.peak_bytes     16_783_275  2
-alloc.codex.1900k.allocations         4_004  3
+# 2026-11-07: Codex native route (#23, #28) and the Responses handler keeping the client's
+# buffer when the Codex-client preparation leaves it alone (#29): a request whose model
+# needs no routing held no copy of its body in these runs: its peak was the same at every sampled size
+# (84,460 bytes at 122 KB and at 7.7 MB; was 2.0x the body, and 8.8x before #23).
+# Allocation counts were the same at every sampled size. 100k and 7600k are new. Raw output, three
+# runs each on rustc 1.99.1 and on CI's pinned 1.99.0, both on one local machine at
+# 894e24c7: bench/results/2026-11-07-codex-alloc.txt. Not yet measured on CI's runners.
+alloc.codex.100k.peak_bytes          84_460  2
+alloc.codex.100k.allocations            939  3
+alloc.codex.306k.peak_bytes          84_460  2
+alloc.codex.306k.allocations            939  3
+alloc.codex.1900k.peak_bytes         84_460  2
+alloc.codex.1900k.allocations           939  3
+alloc.codex.7600k.peak_bytes         84_460  2
+alloc.codex.7600k.allocations           939  3
+
+# 2026-11-07: the same bodies for a model alias, so `model` is routed: the one native
+# body edit (#23), one copy of the body (1.0x at 1.9 MB and 7.7 MB). 856 allocations in
+# every run of bench/results/2026-11-07-codex-alloc.txt (an earlier, uncommitted run
+# counted 858 once; the line now holds the recorded value).
+alloc.codex.alias.100k.peak_bytes       198_009  2
+alloc.codex.alias.100k.allocations          856  3
+alloc.codex.alias.1900k.peak_bytes    1_991_511  2
+alloc.codex.alias.1900k.allocations         856  3
+alloc.codex.alias.7600k.peak_bytes    7_748_431  2
+alloc.codex.alias.7600k.allocations         856  3
+
+# 2026-11-07: the Claude bodies above sent to the Codex model through /v1/messages: the
+# translated route (#27) converts them to Responses and the answer back. 4.4x the body
+# at 119 KB and 4.0x at 1.8 MB and 7.4 MB. Not attributed by measurement; by reading the
+# code, the peak includes the strict conversion's output and the copy that the shared
+# reasoning step (cpa_common::thinking, which other providers share) returns, and the
+# Claude route above measures 4.0x too.
+alloc.codex.claude.100k.peak_bytes        522_797  2
+alloc.codex.claude.100k.allocations         2_647  3
+alloc.codex.claude.1900k.peak_bytes     7_441_814  2
+alloc.codex.claude.1900k.allocations       10_117  3
+alloc.codex.claude.7600k.peak_bytes    29_649_658  2
+alloc.codex.claude.7600k.allocations       34_069  3
+
+# Each 2026-11-07 value is the largest of the six runs in
+# bench/results/2026-11-07-codex-alloc.txt.
+# 2026-11-07: Gemini requests for the Codex model whose size starts with 48 large tool
+# schemas (upper-case types converted at schema positions only, #27), then turns of
+# function calls and large responses. 3.8x to 4.5x the body.
+alloc.codex.gemini.400k.peak_bytes      2_402_207  2
+alloc.codex.gemini.400k.allocations        35_524  3
+alloc.codex.gemini.1900k.peak_bytes     7_565_550  2
+alloc.codex.gemini.1900k.allocations       41_394  3
+alloc.codex.gemini.7600k.peak_bytes    29_806_962  2
+alloc.codex.gemini.7600k.allocations       63_784  3
 
 # count_tokens with the same Claude bodies, counted locally as for an OAuth login: the
 # body as a JSON tree, its text joined, then the shared o200k_base encoder (built by the
