@@ -5,6 +5,7 @@
 use cpa_core::gostr::GoStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1439,26 +1440,38 @@ const MAX_CAUSE: usize = 1024;
 /// Addition (docs/DIFFERENCES-FROM-GO.md): the `Cause:` line of an `api.websocket.error`
 /// event, a transport diagnostic built from library error texts, which can embed URLs,
 /// header lines and arbitrary bytes. Before writing it:
-/// - control characters (newlines, tabs, escapes, U+2028 and U+2029) become `\u{..}`, so
-///   the text cannot start a log line or section of its own;
+/// - control characters, and whitespace other than a space (tabs, newlines, escapes,
+///   NBSP, U+2028 and U+2029), become `\u{..}`, so the text cannot start a log line or
+///   section of its own; they still separate words like a space does;
 /// - a URL keeps its scheme, host and path: userinfo, query and fragment become
-///   `<redacted>`, as does the userinfo of a bare `user:pass@host`;
-/// - the value after an auth scheme (`Bearer`, `Basic`, ...) or a credential-like name
-///   followed by `:` or `=` becomes `<redacted>`, however short; after a cookie name,
-///   everything to the end does;
-/// - the result is cut to [`MAX_CAUSE`] bytes at a space.
+///   `<redacted>`, as does the userinfo of a bare `user:pass@host`, and a path holding
+///   another URL or userinfo;
+/// - a credential field fails closed. After a credential-like name (`authorization`,
+///   `cookie`, `key`, `token`, `secret`, ...) or an auth scheme followed by `:`, in any
+///   case and with or without spaces around the colon, as in a header line or JSON, the
+///   rest of the diagnostic becomes `<redacted>`: a header or JSON value can hold spaces,
+///   quotes and escapes, so its end cannot be found safely. After `name=`, only a
+///   single-token value is replaced, up to `&`, `;`, `,` or a closing bracket, or a
+///   quoted value without escapes; an empty value, a value that is an auth scheme
+///   (`authorization=Bearer x`), or a cookie also fail closed;
+/// - the word after a standalone `Bearer`, `Basic`, `Token`, `Negotiate` or `NTLM`
+///   (one token68 credential, however much whitespace precedes it) becomes `<redacted>`,
+///   and everything after `Digest`, whose value is a list of parameters;
+/// - the result is cut to [`MAX_CAUSE`] bytes at a space, after redaction.
 ///
-/// Walks the text once; diagnostics are at most `Diagnostic::MAX` bytes anyway.
+/// A secret with no marker around it is not recognised. Walks the text once.
 fn logged_cause(cause: &str) -> String {
-    let mut out = String::with_capacity(cause.len());
-    // Tokens still to redact: after `Authorization:` or `Bearer`, or all after a cookie.
-    let mut pending = 0usize;
+    let mut out = String::with_capacity(cause.len().min(2 * MAX_CAUSE));
+    let mut state = CauseState::default();
     let mut rest = cause;
-    loop {
-        // A control character separates tokens like a space, so `\nAuthorization:` is
-        // still a header name.
-        let end = rest.find(|c: char| c == ' ' || line_break(c)).unwrap_or(rest.len());
-        out.push_str(&cause_token(&rest[..end], &mut pending));
+    while out.len() <= MAX_CAUSE {
+        let end = rest.find(cause_separator).unwrap_or(rest.len());
+        let word = &rest[..end];
+        // Repeated whitespace yields empty words, which neither carry nor consume a
+        // pending credential.
+        if !word.is_empty() && redact_word(word, &mut state, &mut out).is_break() {
+            break;
+        }
         let Some(separator) = rest[end..].chars().next() else {
             break;
         };
@@ -1482,45 +1495,130 @@ fn logged_cause(cause: &str) -> String {
     out
 }
 
-fn line_break(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+/// What the previous word of a diagnostic leaves for the next one.
+#[derive(Default)]
+struct CauseState {
+    /// It ended in a credential name, so a word starting with `:` or `=` is its value.
+    name: bool,
+    /// It was a token68 auth scheme, so the next word is a credential.
+    scheme: bool,
 }
 
-/// One space-free token of a diagnostic, redacted.
-fn cause_token(token: &str, pending: &mut usize) -> String {
-    if *pending > 0 {
-        if auth_scheme(token) {
-            return token.to_owned();
+fn cause_separator(c: char) -> bool {
+    c.is_whitespace() || c.is_control()
+}
+
+/// Appends one whitespace-free word of a diagnostic, redacted. `Break` means a credential
+/// field whose end cannot be bounded starts here: `<redacted>` was written for it and
+/// everything after it.
+fn redact_word(word: &str, state: &mut CauseState, out: &mut String) -> ControlFlow<()> {
+    if std::mem::take(&mut state.scheme) {
+        out.push_str(REDACTED);
+        // `Bearer Bearer x`: the credential is still to come.
+        state.scheme = auth_scheme(word);
+        return ControlFlow::Continue(());
+    }
+    if std::mem::take(&mut state.name) && word.starts_with([':', '=']) {
+        out.push_str(&word[..1]);
+        out.push_str(REDACTED);
+        return ControlFlow::Break(());
+    }
+    let url = url_span(word);
+    let (mut emitted, mut at) = (0, 0);
+    if url.is_none()
+        && let Some(i) = bare_userinfo(word)
+    {
+        out.push_str(REDACTED);
+        (emitted, at) = (i, i);
+    }
+    let bytes = word.as_bytes();
+    while at < word.len() {
+        if let Some((start, end)) = url
+            && at == start
+        {
+            out.push_str(&word[emitted..start]);
+            out.push_str(&cause_url(&word[start..end]));
+            (emitted, at) = (end, end);
+            continue;
         }
-        *pending -= 1;
-        return REDACTED.to_owned();
-    }
-    if token.contains("://") {
-        return cause_url(token);
-    }
-    if let Some(at) = bare_userinfo(token) {
-        return format!("{REDACTED}{}", &token[at..]);
-    }
-    if let Some((name, value)) = token.find([':', '=']).map(|i| token.split_at(i + 1)) {
-        let key = name[..name.len() - 1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if credential_name(key) {
-            if cookie(&key.to_ascii_lowercase()) {
-                *pending = usize::MAX;
-            } else if value.trim_matches(|c: char| !c.is_ascii_alphanumeric()).is_empty() {
-                *pending = 1;
+        let b = bytes[at];
+        if matches!(b, b':' | b'=') {
+            let name = name_before(word, at);
+            if credential_name(name) || auth_scheme(name) {
+                out.push_str(&word[emitted..=at]);
+                out.push_str(REDACTED);
+                let value_end = (b == b'=' && !cookie(&name.to_ascii_lowercase()))
+                    .then(|| param_value_end(word, at + 1))
+                    .flatten();
+                let Some(mut value_end) = value_end else {
+                    return ControlFlow::Break(());
+                };
+                // A URL that starts inside the value goes with it.
+                if let Some((start, end)) = url
+                    && start > at
+                    && start < value_end
+                {
+                    value_end = value_end.max(end);
+                }
+                (emitted, at) = (value_end, value_end);
+                continue;
             }
-            return if value.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{name}{REDACTED}")
-            };
         }
-        return token.to_owned();
+        at += 1;
     }
-    if auth_scheme(token) {
-        *pending = 1;
+    out.push_str(&word[emitted..]);
+    if word
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .eq_ignore_ascii_case("digest")
+    {
+        out.push(' ');
+        out.push_str(REDACTED);
+        return ControlFlow::Break(());
     }
-    token.to_owned()
+    state.scheme = auth_scheme(word);
+    state.name = credential_name(name_before(word, word.len()));
+    ControlFlow::Continue(())
+}
+
+/// The name a `:` or `=` at `at` belongs to: the run of name characters before it,
+/// past closing quotes, escapes and brackets (`"key":`, `\"key\":`, `headers[key]=`).
+fn name_before(word: &str, at: usize) -> &str {
+    let head = word[..at].trim_end_matches(['"', '\'', '\\', ']']);
+    let len = head
+        .bytes()
+        .rev()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        .count();
+    &head[head.len() - len..]
+}
+
+/// Where a `name=value` value starting at `start` ends, if it is one bounded token: up to
+/// `&`, `;`, `,` or a closing bracket, or a quoted value without escapes. `None` when it
+/// cannot be bounded within the word: empty (the value follows a space), an auth scheme
+/// (`authorization=Bearer x`), or quoted or escaped across a space.
+fn param_value_end(word: &str, start: usize) -> Option<usize> {
+    let value = &word[start..];
+    let (value, len, quotes) = match value.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let body = &value[1..];
+            let len = body.find(quote)?;
+            (&body[..len], len, 2)
+        }
+        _ => {
+            let len = value
+                .find(['&', ';', ',', ')', ']', '}', '"', '\'', '\\'])
+                .unwrap_or(value.len());
+            if value[len..].starts_with(['"', '\'', '\\']) {
+                return None;
+            }
+            (&value[..len], len, 0)
+        }
+    };
+    if value.contains('\\') || value.trim_matches(|c: char| !c.is_ascii_alphanumeric()).is_empty() || auth_scheme(value)
+    {
+        return None;
+    }
+    Some(start + len + quotes)
 }
 
 /// `Bearer`, `Basic` and the other HTTP auth schemes a header value starts with.
@@ -1544,6 +1642,7 @@ fn credential_name(name: &str) -> bool {
         "passwd",
         "credential",
         "session",
+        "signature",
     ]
     .iter()
     .any(|word| name.contains(word))
@@ -1555,29 +1654,42 @@ fn bare_userinfo(token: &str) -> Option<usize> {
     token[..at].contains(':').then_some(at)
 }
 
+/// The URL in a word, from its scheme up to closing punctuation (`for uri (...):`).
+fn url_span(word: &str) -> Option<(usize, usize)> {
+    let separator = word.find("://")?;
+    let start = word[..separator]
+        .bytes()
+        .rposition(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+        .map_or(0, |i| i + 1);
+    let trimmed = word[start..].trim_end_matches([')', ']', '>', '"', '\'', ',', ';', ':', '.']);
+    Some((start, start + trimmed.len()))
+}
+
 /// A URL in a diagnostic: scheme, host and path only.
-fn cause_url(token: &str) -> String {
-    let start = token.find("://").expect("a URL") + 3;
-    let (lead, rest) = token.split_at(start);
-    // Closing punctuation around a URL in a message (`for uri (...)`).
-    let rest_trimmed = rest.trim_end_matches([')', ']', '>', '"', '\'', ',', ';', ':', '.']);
-    let tail = &rest[rest_trimmed.len()..];
-    let mut rest = rest_trimmed;
+fn cause_url(url: &str) -> String {
+    let (lead, mut rest) = url.split_at(url.find("://").expect("a URL") + 3);
     let mut out = lead.to_owned();
+    // Userinfo up to the first `/`, even past `?` or `#`, as in `logged_url`.
     let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
     if let Some(at) = authority.rfind('@') {
         out.push_str(REDACTED);
         out.push('@');
         rest = &rest[at + 1..];
     }
-    match rest.find(['?', '#']) {
-        Some(i) => {
-            out.push_str(&rest[..=i]);
-            out.push_str(REDACTED);
-        }
-        None => out.push_str(rest),
+    let (rest, query) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    out.push_str(host);
+    // A path holding another URL or userinfo (`/redirect/https://u:p@host`).
+    if path.contains("://") || bare_userinfo(path).is_some() {
+        out.push('/');
+        out.push_str(REDACTED);
+    } else {
+        out.push_str(path);
     }
-    out.push_str(tail);
+    if let Some(separator) = query.chars().next() {
+        out.push(separator);
+        out.push_str(REDACTED);
+    }
     out
 }
 
@@ -2952,16 +3064,17 @@ mod tests {
         );
         assert_eq!(
             logged_cause(HOSTILE_CAUSES[2]),
-            "io (Other): IO error: bad\\u{d}\\u{a}=== API RESPONSE 9 ===\\u{a}Authorization: Bearer <redacted>\\u{1b}[31m\\u{2028}x-api-key: <redacted>"
+            "io (Other): IO error: bad\\u{d}\\u{a}=== API RESPONSE 9 ===\\u{a}Authorization:<redacted>"
         );
-        // Short values are redacted whole, not shortened.
+        // Short values are redacted whole, not shortened; a header-style value fails
+        // closed to the end.
         assert_eq!(
             logged_cause(HOSTILE_CAUSES[3]),
-            "unclassified: token=<redacted> api_key: <redacted> \"client_secret\":<redacted> Token <redacted>"
+            "unclassified: token=<redacted> api_key:<redacted>"
         );
         assert_eq!(
             logged_cause(HOSTILE_CAUSES[5]),
-            "tls: alert from upstream; Cookie: <redacted> <redacted>"
+            "tls: alert from upstream; Cookie:<redacted>"
         );
         // Evidence without credentials passes through unchanged.
         for plain in [
@@ -2969,6 +3082,10 @@ mod tests {
             "remote_close: code 1011",
             "local_timeout: writing a 42-byte frame took longer than 10s",
             "dns: error sending request for uri (wss://chatgpt.example/backend-api/codex/responses): dns error: failed to lookup address information",
+            "connect (ConnectionRefused): error sending request for uri (http://127.0.0.1:40321/responses): client error (Connect): tcp connect error: Connection refused (os error 111)",
+            "tls: error sending request for uri (https://127.0.0.1:40269/responses): client error (Connect): [WRONG_VERSION_NUMBER]",
+            "eof: WebSocket protocol error: Connection reset without closing handshake",
+            "local_timeout: no application message within 300ms",
         ] {
             assert_eq!(logged_cause(plain), plain);
         }
@@ -2985,6 +3102,98 @@ mod tests {
             logged.len() <= MAX_CAUSE && logged.ends_with("x [truncated]"),
             "{}",
             logged.len()
+        );
+    }
+
+    /// Credential fields in the shapes HTTP and JSON allow: no space after the colon,
+    /// repeated or non-space whitespace, mixed case, `name = value`, quoted and escaped
+    /// JSON, multi-word Digest values, folded lines, cookies, query strings outside a
+    /// URL. Every fake secret contains `Zq9`; none of it may reach the log.
+    const CREDENTIAL_FIELD_CAUSES: &[&str] = &[
+        "Authorization:Bearer Zq9secretA",
+        "x-api-key:  Zq9secretB",
+        "authorization=Bearer Zq9secretC",
+        "AUTHORIZATION:\tBasic Zq9secretD",
+        "Proxy-Authorization: Digest username=\"u\", realm=\"r\", response=\"Zq9secretE\"",
+        "authorization: Basic  Zq9secretF",
+        "sent Bearer   Zq9secretG",
+        "sent bEaReR\tZq9secretH",
+        "{\"headers\":{\"Authorization\":\"Bearer Zq9secretI\"}}",
+        "{\\\"api_key\\\":\\\"Zq9secretJ\\\"}",
+        "model=gpt&token=Zq9secretK&x=1",
+        "Authorization : Bearer Zq9secretL",
+        "Authorization\r\n Bearer Zq9secretM",
+        "Cookie: a=Zq9secretN; b=Zq9secretO",
+        "token=\"Zq9secretP Zq9secretQ\"",
+        "password='Zq9secretR'",
+        "Authorization: Negotiate Zq9secretS",
+        "Authorization:\u{a0}Bearer\u{a0}Zq9secretT",
+        "Bearer\u{1b}Zq9secretU",
+        "secret= Zq9secretV",
+        "https://u:Zq9secretW@h.example/p?q=Zq9secretX#Zq9secretY",
+        "proxy at u:Zq9secretZ@10.0.0.1:8080",
+        "headers[authorization]=Zq9secretAA",
+        "Bearer:Zq9secretAB",
+        "token=Zq9secretAC\u{2028}Bearer Zq9secretAD",
+        "authorization=Bearer%20Zq9secretAE",
+        "token=\"Zq9\\\"secretAF Zq9secretAG\"",
+        "authorization= \"Basic Zq9secretAH\"",
+        "Authorization\t:\tBearer\t\tZq9secretAI",
+        "Authorization: Digest\r\n\tresponse=\"Zq9secretAJ\"",
+        "uri (https://h.example/r/https://u:Zq9secretAK@x.example/): refused",
+        "Digest username=\"u\", response=\"Zq9secretAL\"",
+        "X-Amz-Signature=Zq9secretAM;Credential=Zq9secretAN",
+    ];
+
+    #[test]
+    fn credential_field_values_are_redacted_whatever_the_spacing() {
+        for cause in CREDENTIAL_FIELD_CAUSES {
+            let logged = logged_cause(cause);
+            assert!(!logged.contains("Zq9"), "{cause:?} -> {logged:?}");
+            assert!(!logged.chars().any(|c| c.is_control()), "{logged:?}");
+        }
+        // Near the cut: the redaction happens first, so truncation cannot expose a value.
+        let long = format!("{} Authorization: Bearer Zq9secret", "x".repeat(1000));
+        assert!(!logged_cause(&long).contains("Zq9"));
+        // The header name and the text before the value stay readable.
+        for (cause, logged) in [
+            ("Authorization:Bearer Zq9secretA", "Authorization:<redacted>"),
+            ("x-api-key:  Zq9secretB", "x-api-key:<redacted>"),
+            ("authorization=Bearer Zq9secretC", "authorization=<redacted>"),
+            ("model=gpt&token=Zq9secretK&x=1", "model=gpt&token=<redacted>&x=1"),
+            ("sent Bearer   Zq9secretG then", "sent Bearer   <redacted> then"),
+            ("key=a key:b", "key=<redacted> key:<redacted>"),
+            (
+                "proxy_connect: tunnel refused by u:Zq9secretZ@10.0.0.1:8080 (os error 111)",
+                "proxy_connect: tunnel refused by <redacted>@10.0.0.1:8080 (os error 111)",
+            ),
+        ] {
+            assert_eq!(logged_cause(cause), logged, "{cause:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_field_values_never_reach_the_persisted_cause() {
+        use cpa_core::exec::CaptureEvent::*;
+        let content = persisted(true, StatusCode::OK, |log| {
+            let sink = log.capture_sink();
+            for cause in CREDENTIAL_FIELD_CAUSES {
+                sink.record(WebsocketError {
+                    stage: "dial",
+                    error: "codex websockets executor: dial failed",
+                    cause: Some(cause),
+                });
+            }
+        })
+        .await;
+        let content = String::from_utf8(content).unwrap();
+        assert!(!content.contains("Zq9"), "{content}");
+        assert_eq!(
+            content
+                .matches("Error: codex websockets executor: dial failed\nCause: ")
+                .count(),
+            CREDENTIAL_FIELD_CAUSES.len(),
+            "{content}"
         );
     }
 
