@@ -10,7 +10,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # fork is this fork's integration branch (docs/FORK.md); master tracks upstream. Both
+    # save the build caches, because pull requests restore them from their base branch.
+    branches: [master, fork]
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -72,7 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ steps.profile.outputs.hash }}
-          save-if: ${{ github.ref == 'refs/heads/master' && matrix.shard == 1 }}
+          save-if: ${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/fork') && matrix.shard == 1 }}
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.148
@@ -192,7 +194,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ steps.profile.outputs.hash }}
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/fork' }}
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.148
@@ -252,7 +254,7 @@ jobs:
       # Both entries share one cache; one of them saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' && matrix.auth-files == 1 }}
+          save-if: ${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/fork') && matrix.auth-files == 1 }}
       - name: Build
         run: |
           cargo tree --locked -p cliproxy --edges normal --prefix none > size-dependencies.txt
@@ -303,7 +305,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ steps.profile.outputs.hash }}
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/fork' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
       # The credential and config file writers on Windows, against loopback mocks only.
