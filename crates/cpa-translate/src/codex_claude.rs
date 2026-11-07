@@ -741,6 +741,6 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
         gj::set_raw(&mut out, "tools", gj::join(&tool_items));
     }
     gj::set_items(&mut out, "input", &state.items);
-    state.drops.result()?;
+    state.drops.strict_result("Codex Responses")?;
     Ok(out)
 }

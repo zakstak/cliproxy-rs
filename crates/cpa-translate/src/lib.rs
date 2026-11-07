@@ -69,6 +69,11 @@ macro_rules! registered {
             },
             token_count: $token_count,
             go_stream: $go_stream,
+            builtin_non_stream: |ctx, body| {
+                let non_stream: $crate::NonStreamFn = $non_stream;
+                let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
+                $crate::deep_stack(levels, || non_stream(ctx, body))
+            },
         }
     };
 }
@@ -298,6 +303,8 @@ pub(crate) struct Registered {
     pub pair: Pair,
     pub token_count: Option<TokenCountFn>,
     pub go_stream: GoStreamFn,
+    /// The pair's non-stream translation without plugin response hooks.
+    pub builtin_non_stream: NonStreamFn,
 }
 
 fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
@@ -407,6 +414,54 @@ pub fn translate_request_tracked(
         Some(pair) => translate_registered(client, upstream, ctx, body, |body| (pair.request)(ctx, body)),
         None => Ok(translate_fallback(client.as_str(), upstream.as_str(), ctx, body)),
     }
+}
+
+/// The built-in translation of a registered pair, without plugin request normalizers or
+/// plugin translators: the Codex translated route (`docs/codex/CONTRACT.md`
+/// "Translated route"), whose wire body no hook may change. The thinking summary
+/// pipeline runs, as it converts the client's own reasoning-summary choice. `None` when
+/// the pair is not registered.
+pub fn builtin_request(
+    client: Format,
+    upstream: Format,
+    ctx: &RequestCtx<'_>,
+    body: &[u8],
+) -> Option<Result<Vec<u8>, Error>> {
+    let pair = pair(client, upstream)?;
+    Some(deep_stack(levels(&[body]), || {
+        let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
+        let out = (pair.request)(ctx, body)?;
+        Ok(thinking::apply_summary_for_model(
+            out,
+            upstream.as_str(),
+            ctx.model,
+            summary,
+        ))
+    }))
+}
+
+/// A registered pair's non-stream response translation without plugin response hooks
+/// (see [`builtin_request`]).
+pub fn builtin_non_stream(
+    client: Format,
+    upstream: Format,
+    ctx: &ResponseCtx<'_>,
+    body: &[u8],
+) -> Option<Result<Vec<u8>, Error>> {
+    registered(client, upstream).map(|r| (r.builtin_non_stream)(ctx, body))
+}
+
+/// A registered pair's stream translation without plugin response hooks (see
+/// [`builtin_request`]).
+pub fn builtin_stream(client: Format, upstream: Format, ctx: &ResponseCtx<'_>) -> Option<Box<dyn StreamTranslator>> {
+    registered(client, upstream).map(|r| {
+        stream::framed(
+            client,
+            upstream,
+            (r.go_stream)(ctx),
+            levels(&[ctx.original_request, ctx.translated_request]),
+        )
+    })
 }
 
 /// [`translate_request_tracked`] for OpenAI Responses -> Codex, where the client's

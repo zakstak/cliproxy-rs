@@ -497,7 +497,7 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
         }
     }
     gj::set_bool(&mut out, "store", false);
-    drops.result().map(|()| out)
+    drops.strict_result("Codex Responses").map(|()| out)
 }
 
 /// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
