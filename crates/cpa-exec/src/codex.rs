@@ -468,42 +468,38 @@ impl CodexExecutor {
         let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
-        let result = async {
-            let res = self
-                .open(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
-                .await?;
-            // Go reads the whole body (`io.ReadAll`, whatever its type), records every
-            // byte that arrived, then parses it, a read error's partial tail included.
-            let mut upstream = res.body;
-            let (mut data, mut failed) = (Vec::new(), None);
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(chunk) => data.extend_from_slice(&chunk),
-                    Err(error) => {
-                        failed = Some(error);
-                        break;
-                    }
+        let res = self
+            .open(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
+            .await?;
+        // Go reads the whole body (`io.ReadAll`, whatever its type), records every
+        // byte that arrived, then parses it, a read error's partial tail included.
+        let mut upstream = res.body;
+        let (mut data, mut failed) = (Vec::new(), None);
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
                 }
             }
-            wire.chunk(&data);
-            let mut processor = Processor::new(false, settings.model_level_cooling)
-                .restoring(restore)
-                .reporting(req.usage.clone());
-            // `bytes.Split(data, "\n")`: every line in order, an unterminated tail included.
-            if let Some(completed) = processor.buffered(&data)? {
-                return Ok(ExecResponse {
-                    status: res.status,
-                    headers: res.headers,
-                    body: ResponseBody::Buffered(non_stream_output(&req, &body, &completed, Format::Codex)?),
-                });
-            }
-            if let Some(error) = failed {
-                wire.exec_error(&error);
-            }
-            Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
         }
-        .await;
-        result
+        wire.chunk(&data);
+        let mut processor = Processor::new(false, settings.model_level_cooling)
+            .restoring(restore)
+            .reporting(req.usage.clone());
+        // `bytes.Split(data, "\n")`: every line in order, an unterminated tail included.
+        if let Some(completed) = processor.buffered(&data)? {
+            return Ok(ExecResponse {
+                status: res.status,
+                headers: res.headers,
+                body: ResponseBody::Buffered(non_stream_output(&req, &body, &completed, Format::Codex)?),
+            });
+        }
+        if let Some(error) = failed {
+            wire.exec_error(&error);
+        }
+        Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
     }
 
     async fn compact(&self, view: &View<'_>, settings: &Settings, req: ExecRequest) -> Result<ExecResponse, ExecError> {
