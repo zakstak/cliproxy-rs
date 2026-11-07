@@ -6092,8 +6092,19 @@ mod tests {
         node.published().await;
         assert!(!first.exists());
 
-        // The same plugin config again: its sync key is unchanged.
-        let pushes = home.count("rpush");
+        // The same plugin config again: its sync key is unchanged. Only Home plugin
+        // reports count: once another test installs the process logger, this test's own
+        // plugin loads also reach Home as `app-log` lines.
+        let finalized = || {
+            home.commands()
+                .iter()
+                .filter(|c| {
+                    c[0].eq_ignore_ascii_case("rpush")
+                        && c.get(1).map(String::as_str) != Some(cpa_home::client::KEY_APP_LOG)
+                })
+                .count()
+        };
+        let pushes = finalized();
         let unload = hold(&host, &held, &enabled).await;
         *tasks.lock().unwrap() = r#"[{"id":2,"operation":"delete","plugin_id":"gone2"}]"#.to_owned();
         home.push(fake::message(
@@ -6109,7 +6120,7 @@ mod tests {
             second.exists(),
             "a delete task ran before the plugin worker applied the config"
         );
-        assert_eq!(home.count("rpush"), pushes, "finalized before the config applied");
+        assert_eq!(finalized(), pushes, "finalized before the config applied");
         release();
         assert!(unload.await.unwrap());
         eventually("the second delete", || !second.exists()).await;

@@ -418,7 +418,7 @@ async fn remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserve
     );
 }
 
-/// Unix only: the read-only case needs Unix directory permissions.
+/// Unix only: the read-only case needs Unix directory permissions, enforced (not root).
 #[cfg(unix)]
 #[test]
 fn plaintext_secret_loads_from_a_read_only_config_and_inherited_keys() {
@@ -430,13 +430,27 @@ fn plaintext_secret_loads_from_a_read_only_config_and_inherited_keys() {
     std::fs::write(&path, text).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let loaded = Config::load(&path);
+    // Root (also uid 0 in a user namespace) writes through these modes, so the
+    // read-only case cannot happen there and is not checked.
+    let enforced =
+        std::fs::OpenOptions::new().append(true).open(&path).is_err() && std::fs::write(dir.join("probe"), "").is_err();
+    let loaded = enforced.then(|| Config::load(&path));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    // Go: hashed in memory, persistence failure ignored.
-    let cfg = loaded.expect("read-only config must load");
-    assert!(bcrypt::verify("fake-plain-secret", &cfg.management.secret_key).unwrap());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file untouched");
+    if let Some(loaded) = loaded {
+        // Go: hashed in memory, persistence failure ignored.
+        let cfg = loaded.expect("read-only config must load");
+        assert!(bcrypt::verify("fake-plain-secret", &cfg.management.secret_key).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file untouched");
+    } else {
+        let _ = std::fs::remove_file(dir.join("probe"));
+        // CI sets CPA_TEST_NO_SKIP: a run as root must not pass without the check.
+        assert!(
+            std::env::var_os("CPA_TEST_NO_SKIP").is_none(),
+            "file permissions are not enforced (running as root?), and CPA_TEST_NO_SKIP is set"
+        );
+        eprintln!("file permissions are not enforced (running as root?): read-only config case not checked");
+    }
     // Keys inherited through a merge (legacy and v8 layout, at the root or inside the
     // parent mapping) are persisted hashed, with no plaintext left in the merge.
     for text in [
