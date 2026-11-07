@@ -186,12 +186,13 @@ impl CodexExecutor {
         let cache = request::prompt_cache_id(&req, text, None, false);
         let headers = request::http_headers(
             view,
-            settings,
             &req.headers,
             text,
             &model,
             cache.as_deref(),
             upstream_stream,
+            // A native exchange carries the caller's own identity (#26).
+            crate::codex_identity::Origin::Caller,
         );
         report_request(
             &req,

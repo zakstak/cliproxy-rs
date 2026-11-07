@@ -88,7 +88,16 @@ impl CodexExecutor {
         report_request(&req, Format::Codex, &body);
         // The handshake identity headers follow the native route's rule; #26 owns them.
         let cache = request::prompt_cache_id(&req, &body, None, false);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
+        // A translated request carries the proxy's own identity (#26).
+        let headers = request::http_headers(
+            view,
+            &req.headers,
+            &body,
+            &model,
+            cache.as_deref(),
+            true,
+            crate::codex_identity::Origin::of(&req),
+        );
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let started = Instant::now();

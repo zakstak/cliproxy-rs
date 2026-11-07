@@ -1,18 +1,35 @@
 //! Go's custom checks in `ParseConfigBytes` beyond YAML shape: credential in-flight
 //! bounds (internal/config/credential_in_flight.go), the Codex Live media relay
 //! (internal/config/codex_live.go), and the model catalog sources Go checks while
-//! decoding (internal/registry/catalog_config.go). Messages are Go's.
+//! decoding (internal/registry/catalog_config.go). Messages are Go's, except for the
+//! Codex identity check, which Go does not have (#26, docs/DIFFERENCES-FROM-GO.md).
 
 use anyhow::{Result, bail};
 use serde_yaml_ng::Value;
 
 use super::go_url;
 
-/// Runs both checks on the canonical v8 document.
+/// Runs the checks on the canonical v8 document.
 pub(super) fn go_custom(doc: &Value) -> Result<()> {
     let at = |path: &[&str]| path.iter().try_fold(doc, |node, part| node.get(*part));
     in_flight(at(&["credentials", "in-flight"]))?;
-    live_media_relay(at(&["oauth", "providers", "codex", "live-media-relay"]))
+    live_media_relay(at(&["oauth", "providers", "codex", "live-media-relay"]))?;
+    codex_identity(at(&["oauth", "providers", "codex", "header-defaults"]))
+}
+
+/// The Codex `header-defaults.user-agent` (legacy `codex-header-defaults`) set the
+/// identity of every OAuth Codex request. Codex requests now send the caller's own
+/// identity or cliproxy-rs's (#26), so a configured value is refused rather than
+/// silently ignored: at startup, on a reload (the running config stays) and on a
+/// Management API write. `beta-features` is protocol negotiation and stays.
+fn codex_identity(section: Option<&Value>) -> Result<()> {
+    if text(section, "user-agent", "").trim().is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "oauth.providers.codex.header-defaults.user-agent is no longer supported: Codex requests send \
+         the caller's own User-Agent or cliproxy-rs's; remove the setting (see docs/DIFFERENCES-FROM-GO.md)"
+    )
 }
 
 /// v8.0.35 `CatalogSources.Validate` (internal/registry/catalog_config.go): each model
@@ -325,6 +342,37 @@ pub fn parse_duration(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{Value, go_is_abs, in_flight, parse_duration};
+
+    /// #26: a configured Codex `header-defaults.user-agent` is refused in the v8 layout
+    /// and through each legacy spelling that migrates to it; an empty one and
+    /// `beta-features` stay valid. The message names the key, never its value.
+    #[test]
+    fn codex_user_agent_default_is_refused() {
+        let refused = [
+            "oauth: {providers: {codex: {header-defaults: {user-agent: 'codex-tui/0.154.0 (Mac OS 26.5.2; arm64)'}}}}\n",
+            "codex-header-defaults: {user-agent: legacy-agent}\n",
+            "codex: {header-defaults: {user-agent: flat-agent}}\n",
+        ];
+        for yaml in refused {
+            let error = crate::config::Config::parse(yaml).expect_err(yaml).to_string();
+            assert!(
+                error.contains("oauth.providers.codex.header-defaults.user-agent is no longer supported"),
+                "{error}"
+            );
+            assert!(!error.contains("Mac OS") && !error.contains("legacy-agent"), "{error}");
+            assert!(
+                crate::config::Config::parse_payload(yaml).is_err(),
+                "Management API writes too"
+            );
+        }
+        for yaml in [
+            "oauth: {providers: {codex: {header-defaults: {user-agent: '', beta-features: b1}}}}\n",
+            "oauth: {providers: {codex: {header-defaults: {beta-features: b1}}}}\n",
+            "upstream: {claude: {header-defaults: {user-agent: claude-cli/2.0}}}\n",
+        ] {
+            assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");
+        }
+    }
 
     /// Go 1.26.4 `TestIsAbs` (path/filepath/path_test.go): `isabstests` on Unix; on
     /// Windows `winisabstests`, every Unix case false, and every Unix case behind `c:`.

@@ -28,7 +28,8 @@ pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
 
 pub struct CodexExecutor {
-    /// Chrome profile for chatgpt.com, Go's standard transport elsewhere, per proxy.
+    /// Its own TLS client for chatgpt.com (no browser fingerprint, #26), Go's standard
+    /// transport elsewhere, per proxy.
     pub(crate) transport: crate::codex_tls::Transport,
     oauth: CodexOAuth,
     quota: Arc<QuotaSignals>,
@@ -49,7 +50,7 @@ impl Default for CodexExecutor {
 }
 
 impl CodexExecutor {
-    /// Production transports: uTLS Chrome for chatgpt.com, Go's standard transport
+    /// Production transports: the chatgpt.com client, Go's standard transport
     /// elsewhere, both per effective proxy (crate::proxy). Token refreshes use the
     /// standard transport for the credential's effective proxy.
     pub fn new() -> wreq::Result<Self> {
@@ -107,6 +108,7 @@ impl CodexExecutor {
         check_response_format(&req)?;
         check_native_body(&req)?;
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         if view.websockets() {
@@ -239,6 +241,7 @@ impl CodexExecutor {
         }
         check_response_format(&req)?;
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         // Credential checks stay above the native route: it skips only payload work.
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
@@ -263,7 +266,7 @@ impl CodexExecutor {
     }
 
     /// Go's `http.Client.Do` through the Codex transport: the client is picked per hop
-    /// (Chrome for chatgpt.com, Go's standard transport elsewhere), redirects are
+    /// (the chatgpt.com client, Go's standard transport elsewhere), redirects are
     /// followed like Go's, and gzip is undone only when the transport asked for it.
     pub(crate) async fn post(
         &self,
@@ -420,7 +423,15 @@ impl CodexExecutor {
         let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
+        let headers = request::http_headers(
+            view,
+            &req.headers,
+            &body,
+            &model,
+            cache.as_deref(),
+            true,
+            crate::codex_identity::Origin::of(&req),
+        );
         let url = format!("{}/responses", view.base_url);
         let started = Instant::now();
         let wire = Wire::new(req.capture(), view.credential);
@@ -465,7 +476,15 @@ impl CodexExecutor {
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
+        let headers = request::http_headers(
+            view,
+            &req.headers,
+            &body,
+            &model,
+            cache.as_deref(),
+            true,
+            crate::codex_identity::Origin::of(&req),
+        );
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self
@@ -513,7 +532,15 @@ impl CodexExecutor {
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::OpenAIResponse, &body);
-        let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), false);
+        let headers = request::http_headers(
+            view,
+            &req.headers,
+            &body,
+            &model,
+            cache.as_deref(),
+            false,
+            crate::codex_identity::Origin::of(&req),
+        );
         let url = format!("{}/responses/compact", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self
@@ -607,6 +634,7 @@ impl CodexExecutor {
         }
         // `PrepareRequest` (inside `NewHttpRequest`): Sign in with ChatGPT needs its token.
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let mut headers = HeaderMap::new();
         let mut set = |name: &'static str, value: &str| {
             if let Ok(value) = http::HeaderValue::from_str(value) {
@@ -615,8 +643,14 @@ impl CodexExecutor {
         };
         set("content-type", "application/json");
         set("accept", "application/json");
-        set("originator", "codex_cli_rs");
-        for name in ["version", "user-agent", "session_id", "x-client-request-id"] {
+        // Go fixes `originator: codex_cli_rs` over the client's. The caller's own
+        // identity goes instead, else the proxy's (#26, `crate::codex_identity`).
+        let origin = crate::codex_identity::Origin::Caller;
+        if let Some(originator) = crate::codex_identity::originator(origin, client, true) {
+            set("originator", originator);
+        }
+        set("user-agent", crate::codex_identity::user_agent(origin, client));
+        for name in ["version", "session_id", "x-client-request-id"] {
             let value = request::header(client, name).trim();
             if !value.is_empty() {
                 set(name, value);
@@ -1009,3 +1043,7 @@ mod boundary_tests;
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_identity_tests.rs"]
+mod identity_tests;

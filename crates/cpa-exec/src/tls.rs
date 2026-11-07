@@ -35,7 +35,7 @@ type ClientsKey = (Proxy, Option<Duration>);
 
 /// `requests.tls-handshake-timeout-seconds` (Go `SDKConfig.TLSHandshakeTimeout`, v8.0.35
 /// 345cc9d5 and b3dc6c3f): the bound on TLS establishment through the Claude Code and
-/// Chrome transports. 0 or less turns it off; Go saturates values past its duration range.
+/// chatgpt.com transports. 0 or less turns it off; Go saturates values past its duration range.
 /// Read from each request's config snapshot, so a reload applies to the next dial.
 pub(crate) fn handshake_timeout(cfg: &Config) -> Option<Duration> {
     let seconds = cfg

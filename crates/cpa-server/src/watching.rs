@@ -586,6 +586,37 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #26: a reload that brings back a Codex `header-defaults.user-agent` (v8 or legacy
+    /// spelling) is refused like any invalid config: the running config stays, so the
+    /// obsolete identity setting never reaches a request.
+    #[tokio::test]
+    async fn a_reload_with_a_codex_user_agent_default_keeps_the_running_config() {
+        let (state, dir) = state();
+        let auth = dir.display();
+        std::fs::write(&state.path, format!("port: 9101\noauth: {{auth-dir: {auth}}}\n")).unwrap();
+        reload(&state).unwrap();
+        for obsolete in [
+            format!(
+                "port: 9102\noauth: {{auth-dir: {auth}, providers: {{codex: {{header-defaults: {{user-agent: 'codex-tui/0.154.0 (Mac OS 26.5.2; arm64)'}}}}}}}}\n"
+            ),
+            format!("port: 9102\nauth-dir: {auth}\ncodex-header-defaults: {{user-agent: legacy-agent}}\n"),
+        ] {
+            std::fs::write(&state.path, &obsolete).unwrap();
+            let error = reload(&state).expect_err("refused");
+            assert!(matches!(error, ReloadError::Invalid(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("header-defaults.user-agent is no longer supported"),
+                "{error}"
+            );
+            let running = state.rt.config();
+            assert_eq!(running.port, 9101, "the last good config keeps running");
+            assert!(running.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"].is_null());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// One watcher reload as `start` makes it: reload what was observed, then record
     /// what was applied.
     fn step(state: &Management, cache: &mut HashCache, read_config: bool, observed: &Snapshot) -> Snapshot {

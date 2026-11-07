@@ -77,6 +77,7 @@ impl CodexExecutor {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
@@ -115,10 +116,9 @@ impl CodexExecutor {
         let cache = request::session_uuid(&req, None);
         // No input-ID rewrite or payload rule either (#27): the body is the client's
         // Images request with only its model and `stream` routed.
-        // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
-        let mut client = req.headers.clone();
-        client.remove(http::header::USER_AGENT);
-        let mut headers = request::image_headers(view, settings, &client, model, cache.as_deref(), req.stream);
+        // `applyCodexDirectImageHeaders` drops the client's User-Agent; `image_headers`
+        // never forwards it (the proxy builds every Images request).
+        let mut headers = request::image_headers(view, &req.headers, model, cache.as_deref(), req.stream);
         if !content_type.is_empty()
             && let Ok(value) = http::HeaderValue::from_str(&content_type)
         {
@@ -218,7 +218,7 @@ impl CodexExecutor {
         let cache = request::session_uuid(&req, None);
         // No input-ID rewrite or payload rule (#27): the body is the adapter's conversion.
         report_request(&req, Format::Codex, &body);
-        let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
+        let headers = request::image_headers(view, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self
