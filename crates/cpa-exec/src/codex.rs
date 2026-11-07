@@ -381,6 +381,7 @@ impl CodexExecutor {
         };
         let upstream = events(res.body);
         let processor = Processor::new(request::is_native(&req), settings.model_level_cooling)
+            .codex_client(request::codex_client(&req))
             .grok_keepalive(&req.headers)
             .restoring(restore)
             .replaying(self.replay.clone(), scope)

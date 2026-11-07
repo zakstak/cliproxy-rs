@@ -2007,3 +2007,188 @@ fn count_tokens_sees_the_payload_rules() {
     assert!(plain > 0);
     assert!(configured > plain + 5, "{plain} -> {configured}");
 }
+
+/// zakstak/cliproxy-rs#5: an upstream context-window `response.failed` reaches a
+/// Codex client unchanged before the classified error, because Codex compacts only on the
+/// original event. Other clients and other failures keep Go's error-only step, and
+/// the error the scheduler classifies is the same either way. Go v8.0.35 differs
+/// (docs/DIFFERENCES-FROM-GO.md).
+#[test]
+fn context_window_failure_reaches_codex_clients_unchanged() {
+    use crate::codex_response::{Processor, Step};
+    let fail = |codex_client: bool, payload: &str| {
+        let event = format!("event: response.failed\ndata: {payload}\n\n");
+        match Processor::new(false, false)
+            .codex_client(codex_client)
+            .event(event.as_bytes())
+        {
+            Step::Fail { error, before, .. } => (error, before),
+            _ => panic!("a failure for {payload}"),
+        }
+    };
+    // Codex's own `ContextWindowExceeded` fixture (codex-api sse/responses.rs).
+    let context = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null}}"#;
+    let (error, before) = fail(true, context);
+    assert_eq!(
+        before.as_deref(),
+        Some(format!("event: response.failed\ndata: {context}\n\n").as_bytes())
+    );
+    // Go's step: the lines before the failing data line, then the error.
+    let go_step = Some(&b"event: response.failed\n\n"[..]);
+    let (go_error, go_before) = fail(false, context);
+    assert_eq!(go_before.as_deref(), go_step, "other clients keep Go's step");
+    for error in [&error, &go_error] {
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(
+            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large"
+        );
+    }
+    // Other failures, and a context code only in the message or the replacement code, are
+    // not the event Codex recognises.
+    for other in [
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#,
+        r#"{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"too long"}}}"#,
+        r#"{"type":"response.failed","response":{"error":{"message":"maximum context length exceeded"}}}"#,
+    ] {
+        assert_eq!(fail(true, other).1.as_deref(), go_step, "{other}");
+    }
+}
+
+/// The live ChatGPT Codex rejection of an oversized input is an `error` event without a
+/// status, which Codex ignores. A Codex client receives it as the `response.failed` Codex
+/// compacts on, with the original error object; the attempt still fails with Go's
+/// classified 400 `context_too_large`, and other clients keep Go's step.
+#[test]
+fn live_context_window_error_reaches_codex_clients_as_a_failure() {
+    use crate::codex_response::{Processor, Step};
+    let live = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json").trim();
+    let normalized = cpa_common::codex_client::context_window_failure_event(live).unwrap();
+    assert!(cpa_common::codex_client::is_context_window_failure(
+        normalized.as_bytes()
+    ));
+    let event = format!("event: error\ndata: {live}\n\n");
+    for codex_client in [true, false] {
+        let Step::Fail { error, before, .. } = Processor::new(false, false)
+            .codex_client(codex_client)
+            .event(event.as_bytes())
+        else {
+            panic!("a failure");
+        };
+        let want = if codex_client {
+            format!("event: response.failed\ndata: {normalized}\n\n")
+        } else {
+            "event: error\n\n".to_owned()
+        };
+        assert_eq!(before.as_deref(), Some(want.as_bytes()), "codex client {codex_client}");
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scope, FailureScope::Request);
+        assert_eq!(
+            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large"
+        );
+    }
+}
+
+/// Issue #2: a WebSocket turn from an official Codex client keeps `parallel_tool_calls`
+/// (false, true or omitted) and its output-replay `include`. Responses Lite still forces
+/// `false`, and SIWC and other Responses clients keep Go's values.
+#[test]
+fn native_codex_websocket_turns_keep_tool_parallelism_and_output_replay() {
+    let replay = r#"["reasoning.encrypted_content","output.encrypted_content"]"#;
+    let reasoning = r#"["reasoning.encrypted_content"]"#;
+    let shaped = |ua: &str, lite: bool, siwc: bool, parallel: &str| {
+        let mut credential = oauth_credential("http://127.0.0.1:1");
+        if siwc {
+            credential.metadata.insert("use_siwc".into(), true.into());
+            credential
+                .metadata
+                .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at-FAKE"}));
+        }
+        let mut req = plain_request(true, None);
+        (req.source_format, req.response_format) = (Format::OpenAIResponse, Format::OpenAIResponse);
+        req.headers.insert("user-agent", ua.parse().unwrap());
+        if lite {
+            req.headers
+                .insert("x-openai-internal-codex-responses-lite", "true".parse().unwrap());
+        }
+        req.body = Bytes::from(format!(
+            r#"{{"model":"gpt-5.4","input":[],"tools":[{{"type":"function","name":"f","parameters":{{"type":"object"}}}}],"tool_choice":"auto"{parallel},"store":false,"stream":true,"include":{replay}}}"#
+        ));
+        req.original_body = req.body.clone();
+        let view = View::new(&credential);
+        let settings = Settings::scoped(&Config::default(), &view);
+        request::shape(&req, &view, &settings, Call::Websocket).unwrap().body
+    };
+    let field = |body: &str, path: &str| gjson::get(body, path).json().to_owned();
+    let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
+    for (parallel, want) in [
+        (r#","parallel_tool_calls":false"#, "false"),
+        (r#","parallel_tool_calls":true"#, "true"),
+        ("", ""),
+    ] {
+        let body = shaped(codex, false, false, parallel);
+        assert_eq!(field(&body, "parallel_tool_calls"), want, "{body}");
+        assert_eq!(field(&body, "include"), replay, "{body}");
+    }
+    let lite = shaped(codex, true, false, r#","parallel_tool_calls":true"#);
+    assert_eq!(field(&lite, "parallel_tool_calls"), "false", "{lite}");
+    let siwc = shaped(codex, false, true, r#","parallel_tool_calls":false"#);
+    assert_eq!(field(&siwc, "parallel_tool_calls"), "false", "{siwc}");
+    assert_eq!(field(&siwc, "include"), reasoning, "{siwc}");
+    let other = shaped("OpenAI/Python 2.1.0", false, false, r#","parallel_tool_calls":false"#);
+    assert_eq!(field(&other, "parallel_tool_calls"), "true", "{other}");
+    assert_eq!(field(&other, "include"), reasoning, "{other}");
+}
+
+/// Issue #8: a WebSocket turn from an official Codex client keeps an explicit
+/// `service_tier`, and the handshake's routing hint names the same tier. Other Responses
+/// clients keep Go's rule, which drops `flex`.
+#[test]
+fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
+    let shaped = |ua: &str, tier: &str| {
+        let credential = oauth_credential("http://127.0.0.1:1");
+        let mut req = plain_request(true, None);
+        (req.source_format, req.response_format) = (Format::OpenAIResponse, Format::OpenAIResponse);
+        req.headers.insert("user-agent", ua.parse().unwrap());
+        req.body = Bytes::from(format!(
+            r#"{{"model":"gpt-5.4","input":[],"store":false,"stream":true{tier}}}"#
+        ));
+        req.original_body = req.body.clone();
+        let view = View::new(&credential);
+        let settings = Settings::scoped(&Config::default(), &view);
+        let body = request::shape(&req, &view, &settings, Call::Websocket).unwrap().body;
+        let headers = request::ws_headers(&view, &settings, &req.headers, &body, "gpt-5.4", None, true);
+        let hint = headers
+            .get("x-codex-routing-hint")
+            .map(|v| v.to_str().unwrap().to_owned());
+        (gjson::get(&body, "service_tier").json().to_owned(), hint)
+    };
+    let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
+    for (tier, want, want_hint) in [
+        (r#","service_tier":"flex""#, r#""flex""#, "model=gpt-5.4;tier=flex"),
+        (
+            r#","service_tier":"priority""#,
+            r#""priority""#,
+            "model=gpt-5.4;tier=priority",
+        ),
+        (
+            r#","service_tier":"ultrafast""#,
+            r#""ultrafast""#,
+            "model=gpt-5.4;tier=ultrafast",
+        ),
+        (r#","service_tier":"scale""#, r#""scale""#, "model=gpt-5.4;tier=scale"),
+        ("", "", "model=gpt-5.4"),
+    ] {
+        assert_eq!(
+            shaped(codex, tier),
+            (want.to_owned(), Some(want_hint.to_owned())),
+            "{tier}"
+        );
+    }
+    assert_eq!(
+        shaped("OpenAI/Python 2.1.0", r#","service_tier":"flex""#),
+        (String::new(), Some("model=gpt-5.4".to_owned()))
+    );
+}

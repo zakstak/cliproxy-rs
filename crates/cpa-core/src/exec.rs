@@ -554,7 +554,13 @@ pub enum CaptureEvent<'a> {
     WebsocketRequest(UpstreamRequest<'a>),
     WebsocketHandshake(u16, &'a [(String, String)]),
     WebsocketResponse(&'a [u8]),
-    WebsocketError { stage: &'a str, error: &'a str },
+    /// `RecordAPIWebsocketError`. `cause` is the error's [`Diagnostic`], which Go has no
+    /// counterpart for; the request log redacts it before writing.
+    WebsocketError {
+        stage: &'a str,
+        error: &'a str,
+        cause: Option<&'a str>,
+    },
 }
 
 pub trait CaptureObserver: Send + Sync {
@@ -709,6 +715,8 @@ pub struct ExecError {
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the
     /// classification copy and is never sent, except as a `direct` response's headers.
     pub addon: Option<Box<HeaderMap>>,
+    /// Why a transport failed, for the request log only (see [`Diagnostic`]).
+    pub diagnostic: Option<Diagnostic>,
 }
 
 impl ExecError {
@@ -721,7 +729,54 @@ impl ExecError {
             retry_after: None,
             direct: false,
             addon: None,
+            diagnostic: None,
         }
+    }
+
+    pub fn with_diagnostic(mut self, diagnostic: Diagnostic) -> Self {
+        self.diagnostic = Some(diagnostic);
+        self
+    }
+}
+
+/// The evidence behind a transport failure whose client-facing text is fixed: the stage
+/// and the library's cause chain, for example `connect (ConnectionRefused): ...`. It is
+/// never part of a response, `Display` or `Debug`: only the request log writes it, as
+/// `CaptureEvent::WebsocketError::cause`, after redacting credentials and control
+/// characters. Library messages can embed URLs, so it is unredacted until then.
+// A thin pointer: `ExecError` travels in `Result`s and must stay small.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Diagnostic(std::sync::Arc<String>);
+
+impl Diagnostic {
+    /// Longest diagnostic kept, in bytes.
+    pub const MAX: usize = 4096;
+    const TRUNCATED: &'static str = " [truncated]";
+
+    /// Keeps at most [`Self::MAX`] bytes, cut at a space so no token (a URL with its
+    /// userinfo, a header value) is split where a redactor could no longer recognise it.
+    pub fn new(text: impl Into<String>) -> Self {
+        let mut text = text.into();
+        if text.len() > Self::MAX {
+            let mut end = Self::MAX - Self::TRUNCATED.len();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            end = text[..end].rfind(' ').unwrap_or(0);
+            text.truncate(end);
+            text.push_str(Self::TRUNCATED);
+        }
+        Self(std::sync::Arc::new(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Diagnostic(<request log only>)")
     }
 }
 

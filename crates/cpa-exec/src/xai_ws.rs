@@ -839,6 +839,10 @@ impl WsCapture {
             self.sink.record(CaptureEvent::WebsocketError {
                 stage,
                 error: &String::from_utf8_lossy(&error.body),
+                // ponytail: xAI capture keeps Go's text only; the shared reader's
+                // diagnostics reach the request log for Codex sockets. Pass
+                // `error.diagnostic` here once xAI's stages are covered by tests.
+                cause: None,
             });
         }
     }
@@ -1194,7 +1198,7 @@ impl XaiExecutor {
         }
         conn.bind(&session, exec_session.lease.as_ref())?;
         req.usage.round_trip_started();
-        let mut rx = conn.activate();
+        let mut rx = conn.activate(false);
         if let Err(error) = conn.send(message.clone()).await {
             let error = pool_error(error);
             capture.error("send", &error);
@@ -1226,7 +1230,7 @@ impl XaiExecutor {
             }
             fresh.bind(&session, exec_session.lease.as_ref())?;
             req.usage.round_trip_started();
-            rx = fresh.activate();
+            rx = fresh.activate(false);
             if let Err(error) = fresh.send(message).await {
                 let error = pool_error(error);
                 capture.error("send_retry", &error);

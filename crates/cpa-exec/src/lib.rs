@@ -95,6 +95,7 @@ pub mod vertex;
 pub mod vertex_auth;
 mod vertex_openapi;
 mod wire;
+mod ws_cause;
 mod ws_observation;
 pub mod wsrelay;
 pub mod xai;

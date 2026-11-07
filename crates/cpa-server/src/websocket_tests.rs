@@ -1336,3 +1336,245 @@ async fn removal_closes_only_its_sockets(section: &str) {
     drop((kept, dropped));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// zakstak/cliproxy-rs#5: once a Codex client's context-window failure is committed (the
+/// upstream sent it and the executor classified it), a `response.interrupt` or a client
+/// that leaves while the proxy writes the event does not replace it. The client gets one
+/// terminal event and no interrupted `response.incomplete`, and the scheduler records
+/// one failure instead of a cancellation. The event write is held at a test gate, so the
+/// client acts during it on every machine (no reliance on socket buffer sizes).
+mod committed_context_failure {
+    use super::*;
+    use crate::websocket::gate;
+    use futures_util::StreamExt;
+    use wreq::ws::message::Message as WsMessage;
+
+    const CODEX_UA: &str = "codex_cli_rs/0.200.0 (Linux; x86_64) xterm";
+
+    /// A private `auth-dir`, removed even when an assertion fails.
+    struct AuthDir(std::path::PathBuf);
+
+    impl AuthDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("cpa-ws-ctx-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for AuthDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum During {
+        Interrupt,
+        Leave,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        /// The canonical `response.failed`, first on the stream (bootstrap).
+        FailedFirst,
+        /// The canonical `response.failed` after streamed output.
+        FailedAfterOutput,
+        /// The live statusless `error`, first on the stream.
+        Statusless,
+    }
+
+    /// Upstream events and the marker only the client's context-failure event carries.
+    fn events(shape: Shape, id: &str) -> (Vec<(&'static str, String)>, String) {
+        let marker = format!("too long for {id}");
+        let created = format!(
+            r#"{{"type":"response.created","sequence_number":0,"response":{{"id":"{id}","object":"response","status":"in_progress","output":[]}}}}"#
+        );
+        let delta = r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Partial"}"#.to_owned();
+        let failed = format!(
+            r#"{{"type":"response.failed","sequence_number":2,"response":{{"id":"{id}","object":"response","status":"failed","error":{{"code":"context_length_exceeded","message":"{marker}"}}}}}}"#
+        );
+        let statusless = format!(
+            r#"{{"type":"error","error":{{"type":"invalid_request_error","code":"context_length_exceeded","message":"{marker}","param":"input"}},"response_id":"{id}","sequence_number":2}}"#
+        );
+        let events = match shape {
+            Shape::FailedFirst => vec![("response.failed", failed)],
+            Shape::FailedAfterOutput => vec![
+                ("response.created", created),
+                ("response.output_text.delta", delta),
+                ("response.failed", failed),
+            ],
+            Shape::Statusless => vec![("error", statusless)],
+        };
+        (events, marker)
+    }
+
+    /// A Codex upstream: over a WebSocket, or over HTTP SSE with (`named`) or without
+    /// `event:` lines.
+    async fn upstream(events: Vec<(&'static str, String)>, websocket: bool, named: bool) -> String {
+        if websocket {
+            return serve(axum::Router::new().fallback(move |ws: WebSocketUpgrade| {
+                let events = events.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket: AxSocket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if !matches!(message, AxMessage::Text(_)) {
+                                continue;
+                            }
+                            for (_, event) in &events {
+                                let _ = socket.send(AxMessage::Text(event.clone().into())).await;
+                            }
+                        }
+                    })
+                }
+            }))
+            .await;
+        }
+        let body: String = events
+            .iter()
+            .map(|(name, data)| {
+                if named {
+                    format!("event: {name}\ndata: {data}\n\n")
+                } else {
+                    format!("data: {data}\n\n")
+                }
+            })
+            .collect();
+        serve(axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { ([("content-type", "text/event-stream")], body) }
+        }))
+        .await
+    }
+
+    async fn case(name: &str, shape: Shape, websocket: bool, named: bool, during: During) {
+        let id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+        let (events, marker) = events(shape, &id);
+        let upstream = upstream(events, websocket, named).await;
+        let dir = AuthDir::new();
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\ncodex-api-key:\n  - api-key: sk-FAKE\n    base-url: http://{upstream}\n    websockets: {websocket}\n    models:\n      - name: gpt-fixture\n",
+            dir.0.display()
+        ))
+        .unwrap();
+        let credentials = cpa_core::config::credentials::from_config(&cfg);
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        };
+        let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
+        let proxy = serve(router(rt.clone())).await;
+        let mut socket = wreq::Client::new()
+            .websocket(format!("ws://{proxy}/v1/responses"))
+            .header("user-agent", CODEX_UA)
+            .send()
+            .await
+            .unwrap()
+            .into_websocket()
+            .await
+            .unwrap();
+        let write = gate::arm("write", &marker);
+        let deliver = gate::arm("deliver", &id);
+        let _disarm = Disarm(vec![write.clone(), deliver.clone()]);
+        socket
+            .send(WsMessage::text(
+                r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"huge"}]}]}"#,
+            ))
+            .await
+            .unwrap();
+        let reached = tokio::time::timeout(Duration::from_secs(10), write.reached.acquire()).await;
+        reached
+            .unwrap_or_else(|_| panic!("{name}: the context failure event was never written"))
+            .unwrap()
+            .forget();
+        let stats = || (rt.store().stats().success, rt.store().stats().failure);
+        match during {
+            During::Interrupt => {
+                socket
+                    .send(WsMessage::text(format!(
+                        r#"{{"type":"response.interrupt","response_id":"{id}"}}"#
+                    )))
+                    .await
+                    .unwrap();
+                let delivered = tokio::time::timeout(Duration::from_secs(10), deliver.reached.acquire()).await;
+                delivered
+                    .unwrap_or_else(|_| panic!("{name}: the interrupt did not reach the turn"))
+                    .unwrap()
+                    .forget();
+                gate::disarm(&write);
+                let mut frames = Vec::new();
+                while let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(3), socket.next()).await {
+                    match frame {
+                        WsMessage::Text(text) => frames.push(text.as_str().to_owned()),
+                        WsMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+                let kinds: Vec<String> = frames
+                    .iter()
+                    .map(|f| gjson::get(f, "type").str().to_owned())
+                    .filter(|k| k.starts_with("response.failed") || k == "response.incomplete" || k == "error")
+                    .collect();
+                assert_eq!(kinds, ["response.failed"], "{name}: one terminal event\n{frames:#?}");
+                assert!(frames.last().unwrap().contains(&marker), "{name}: {frames:#?}");
+            }
+            During::Leave => {
+                drop(socket);
+                // The turn is dropped with the connection; its failure was committed first.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while stats() == (0, 0) && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                gate::disarm(&write);
+            }
+        }
+        assert_eq!(stats(), (0, 1), "{name}: one failed attempt, not a cancellation");
+    }
+
+    /// Disarms its gates when the test ends, passed or not.
+    struct Disarm(Vec<Arc<gate::Gate>>);
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            for gate in &self.0 {
+                gate::disarm(gate);
+            }
+        }
+    }
+
+    /// Runs every case, then fails with the names of those that failed.
+    async fn every_shape(during: During) {
+        let mut failed = Vec::new();
+        for (shape, websocket, named) in [
+            (Shape::FailedFirst, true, false),
+            (Shape::FailedAfterOutput, true, false),
+            (Shape::Statusless, true, false),
+            (Shape::FailedFirst, false, true),
+            (Shape::FailedFirst, false, false),
+            (Shape::FailedAfterOutput, false, true),
+            (Shape::Statusless, false, true),
+        ] {
+            let name = format!("{during:?} {shape:?} websocket={websocket} named={named}");
+            if tokio::spawn(async move { case(&name, shape, websocket, named, during).await })
+                .await
+                .is_err()
+            {
+                failed.push(format!("{shape:?} websocket={websocket} named={named}"));
+            }
+        }
+        assert!(failed.is_empty(), "{during:?}: failed cases {failed:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupt_during_the_event_write_adds_no_second_terminal() {
+        every_shape(During::Interrupt).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_leaving_during_the_event_write_keeps_the_failure() {
+        every_shape(During::Leave).await;
+    }
+}
