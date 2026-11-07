@@ -8,6 +8,8 @@ use cpa_core::config::{Config, TrustedProxies, credentials};
 use cpa_core::credential::{Credential, Source};
 use serde_json::{Value, json};
 
+mod forward_port;
+
 fn fixture() -> &'static Value {
     static FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("fixtures/manage_go.json")).expect("fixture JSON")
@@ -1125,7 +1127,7 @@ mod creds {
             let mut last_cursor = "no-cursor".to_owned();
             for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
-                let step = &pin_pending_steps(step.clone(), name, i, &at);
+                let step = &forward_ports(pin_pending_steps(step.clone(), name, i, &at));
                 if let Some(ms) = step["sleep_ms"].as_u64() {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
@@ -1294,6 +1296,19 @@ mod creds {
         assert_eq!(compared, 222);
         eprintln!("credentials: {bytes_compared} of {compared} steps compared byte for byte");
         assert_eq!(bytes_compared, 174, "steps compared byte for byte");
+    }
+
+    /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model
+    /// definitions carry the GPT Image 2.6 built-ins.
+    fn forward_ports(mut step: Value) -> Value {
+        if step["response"]["channel"] == "codex"
+            && let Some(raw) = step["raw_json"].as_str()
+        {
+            let raw = crate::forward_port::gpt_image_26::definitions_raw(raw);
+            step["response"] = serde_json::from_str(&raw).unwrap();
+            step["raw_json"] = raw.into();
+        }
+        step
     }
 
     /// Pending v8.0.35 drift outside the config saver. Each pin names its scenario and

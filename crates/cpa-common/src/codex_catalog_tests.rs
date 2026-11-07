@@ -142,3 +142,27 @@ fn versions_compare_like_go() {
     assert_eq!(compare_versions("1.-2", "1"), Some(0));
     assert_eq!(compare_versions("1.x", "1"), None);
 }
+
+/// Go `isCodexClientImageOrVideoModel`, with the GPT Image 2.6 IDs of CLIProxyAPI
+/// PR #7261 (docs/DIFFERENCES-FROM-GO.md): hidden from the client catalog, prefixed or
+/// not; the bare `gpt-image-2.6` is no known image model.
+#[test]
+fn gpt_image_built_ins_are_hidden_image_models() {
+    for id in [
+        "gpt-image-2.5-flare",
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5",
+        "gpt-image-2.6-flare",
+        "gpt-image-2.6-sunburst",
+    ] {
+        assert!(image_or_video(id), "{id}");
+        assert!(image_or_video(&format!("codex/{id}")), "codex/{id}");
+        let mut entry = Map::new();
+        apply_visibility(&mut entry, id);
+        assert!(
+            matches!(entry.get("visibility"), Some(GoValue::String(s)) if s == "hide"),
+            "{id}"
+        );
+    }
+    assert!(!image_or_video("gpt-image-2.6"));
+}

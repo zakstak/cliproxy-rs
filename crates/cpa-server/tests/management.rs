@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod forward_port;
+
 struct Fixture {
     dir: PathBuf,
     state: Arc<Management>,
@@ -1695,11 +1697,13 @@ async fn model_definitions_fall_back_to_registered_models_by_channel() {
 
 /// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
 /// the Codex, xAI and Devin built-ins. Every channel answers Go's bytes, recorded by
-/// `reference/manage` (its second output).
+/// `reference/manage` (its second output), with the GPT Image 2.6 forward port in the
+/// Codex built-ins (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
 async fn model_definitions_match_go_by_channel() {
-    let go: serde_json::Map<String, Value> =
+    let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
+    forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
     let f = Fixture::from_yaml("definitions-go", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
