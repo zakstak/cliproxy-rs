@@ -42,6 +42,7 @@ use crate::codex_quota::{self, QuotaSignals};
 use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, OutputItems};
 use crate::proxy::Proxy;
+use crate::ws_cause;
 
 /// `codexResponsesWebsocketIdleTimeout`: read deadline renewed before every read.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -280,14 +281,16 @@ impl Upstream {
         let sent = tokio::time::timeout(deadline, async { self.sink.lock().await.send(message).await }).await;
         match sent {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(write_error(
+            Ok(Err(error)) => Err(write_error(
                 self.link.lock().expect("link").lost.as_ref(),
                 "codex websockets executor: write failed",
-            )),
+            )
+            .with_diagnostic(ws_cause::socket(&error))),
             Err(_) => Err(write_error(
                 self.link.lock().expect("link").lost.as_ref(),
                 "codex websockets executor: write timed out",
-            )),
+            )
+            .with_diagnostic(ws_cause::write_timeout(deadline, len))),
         }
     }
 
@@ -687,7 +690,10 @@ pub(crate) fn write_error(lost: Option<&ExecError>, message: &str) -> ExecError 
 
 fn turn_error(lost: &ExecError) -> ExecError {
     if lost.status == 413 {
-        message_too_big()
+        ExecError {
+            diagnostic: lost.diagnostic.clone(),
+            ..message_too_big()
+        }
     } else {
         lost.clone()
     }
@@ -1271,7 +1277,7 @@ impl CodexExecutor {
             let mut res = builder
                 .send()
                 .await
-                .map_err(|_| transport("codex websockets executor: dial failed"))?;
+                .map_err(|e| transport("codex websockets executor: dial failed").with_diagnostic(ws_cause::dial(&e)))?;
             let status = res.status().as_u16();
             let handshake = res.headers().clone();
             if status != 101 {
@@ -1308,7 +1314,10 @@ impl CodexExecutor {
         };
         let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt)
             .await
-            .unwrap_or_else(|_| Err(transport("codex websockets executor: handshake timed out")));
+            .unwrap_or_else(|_| {
+                Err(transport("codex websockets executor: handshake timed out")
+                    .with_diagnostic(ws_cause::handshake_timeout(HANDSHAKE_TIMEOUT)))
+            });
         // A refused upgrade was recorded as an HTTP attempt; anything else is a dial error.
         if let (Err(error), Some(wire)) = (&dialed, wire)
             && !rejected
@@ -1508,28 +1517,41 @@ pub(crate) async fn read_loop(
         let deadline = tokio::time::Instant::now() + idle;
         let text = loop {
             let message = match tokio::time::timeout_at(deadline, stream.next()).await {
-                Err(_) => break 'read transport("codex websockets executor: read idle timeout"),
+                Err(_) => {
+                    break 'read transport("codex websockets executor: read idle timeout")
+                        .with_diagnostic(ws_cause::idle_timeout(idle));
+                }
                 // gorilla/websocket reports a connection that ends without a close frame
                 // as close 1006; Go surfaces its text, which marks a lifecycle failure.
-                Ok(None) => break 'read transport(&close_error_text(1006, "unexpected EOF")),
-                Ok(Some(Err(error))) if ends_without_close(&error) => {
-                    break 'read transport(&close_error_text(1006, "unexpected EOF"));
+                // The diagnostic keeps what actually happened.
+                Ok(None) => {
+                    break 'read transport(&close_error_text(1006, "unexpected EOF"))
+                        .with_diagnostic(ws_cause::stream_ended());
                 }
-                Ok(Some(Err(_))) => break 'read transport("codex websockets executor: read failed"),
+                Ok(Some(Err(error))) if ends_without_close(&error) => {
+                    break 'read transport(&close_error_text(1006, "unexpected EOF"))
+                        .with_diagnostic(ws_cause::socket(&error));
+                }
+                Ok(Some(Err(error))) => {
+                    break 'read transport("codex websockets executor: read failed")
+                        .with_diagnostic(ws_cause::socket(&error));
+                }
                 Ok(Some(Ok(message))) => message,
             };
             match message {
                 Message::Text(text) => break text.as_str().to_owned(),
                 Message::Binary(_) => break 'read transport(UNEXPECTED_BINARY),
                 Message::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    let diagnostic = ws_cause::remote_close(code);
                     if let Some(frame) = frame.as_ref().filter(|f| u16::from(f.code) == 1009) {
-                        break 'read closed_too_big(frame.reason.as_str());
+                        break 'read closed_too_big(frame.reason.as_str()).with_diagnostic(diagnostic);
                     }
                     let text = match frame {
                         Some(frame) => close_error_text(u16::from(frame.code), frame.reason.as_str()),
                         None => close_error_text(1005, ""),
                     };
-                    break 'read transport(&text);
+                    break 'read transport(&text).with_diagnostic(diagnostic);
                 }
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }

@@ -839,6 +839,10 @@ impl WsCapture {
             self.sink.record(CaptureEvent::WebsocketError {
                 stage,
                 error: &String::from_utf8_lossy(&error.body),
+                // ponytail: xAI capture keeps Go's text only; the shared reader's
+                // diagnostics reach the request log for Codex sockets. Pass
+                // `error.diagnostic` here once xAI's stages are covered by tests.
+                cause: None,
             });
         }
     }

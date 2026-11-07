@@ -338,8 +338,8 @@ pub enum RemoteErrorKind {
 /// and its retry behaviour.
 #[derive(Debug, Clone)]
 pub struct RemoteError {
-    pub error: ExecError,
-    /// Boxed to keep the error small (it travels in `Result`s).
+    /// Boxed, like `code`, to keep the error small (it travels in `Result`s).
+    pub error: Box<ExecError>,
     pub code: Box<str>,
     pub kind: RemoteErrorKind,
 }
@@ -347,7 +347,7 @@ pub struct RemoteError {
 impl RemoteError {
     pub fn plain(error: ExecError, code: &str) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             code: code.into(),
             kind: RemoteErrorKind::Plain,
         }

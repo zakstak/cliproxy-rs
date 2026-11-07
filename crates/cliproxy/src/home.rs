@@ -376,7 +376,7 @@ impl Dispatcher {
                 failure.retry_after = *retry_after;
             }
             return Err(RemoteError {
-                error: failure,
+                error: Box::new(failure),
                 code: error.code.as_str().into(),
                 kind,
             });
