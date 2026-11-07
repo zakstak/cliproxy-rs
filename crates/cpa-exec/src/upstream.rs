@@ -77,6 +77,7 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
             body,
             direct: false,
             addon: None,
+            diagnostic: None,
         });
     }
     let is_sse = headers

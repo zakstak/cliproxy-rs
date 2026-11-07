@@ -125,9 +125,13 @@ fn inflate(payload: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::DeflateDecoder::new(Read::chain(payload, TAIL))
         .take(limit as u64 + 1)
-        .read_to_end(&mut out)?;
+        .read_to_end(&mut out)
+        .map_err(|e| io::Error::new(e.kind(), LayerError::Compression(e.to_string())))?;
     if out.len() > limit {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "inflated message too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            LayerError::Compression("inflated message too large".into()),
+        ));
     }
     Ok(out)
 }
@@ -192,8 +196,29 @@ fn encode(opcode: u8, payload: &[u8], out: &mut BytesMut) {
 }
 
 fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+    io::Error::new(io::ErrorKind::InvalidData, LayerError::Framing(message))
 }
+
+/// A failure [`Inflate`] found in the server's frames rather than in the connection under
+/// it. Transport diagnostics label a read failure by this type, never by its text.
+#[derive(Debug)]
+pub(crate) enum LayerError {
+    /// A compressed message that does not inflate, or inflates past the limit.
+    Compression(String),
+    /// Frames the layer refuses to pass on (too large, data before FIN).
+    Framing(&'static str),
+}
+
+impl std::fmt::Display for LayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compression(message) => f.write_str(message),
+            Self::Framing(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for LayerError {}
 
 /// The upgraded connection under tungstenite, inflating compressed messages when the
 /// handshake negotiated permessage-deflate.

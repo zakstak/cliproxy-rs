@@ -438,38 +438,70 @@ async fn read_input(
 /// no upstream socket can take it, which ends an HTTP turn locally.
 #[derive(Default)]
 struct LocalInterrupt {
-    /// Whether a turn is forwarding, and the first interrupt delivered to it.
-    state: std::sync::Mutex<(bool, Option<String>)>,
+    state: std::sync::Mutex<LocalState>,
     ready: Notify,
 }
 
+#[derive(Default)]
+struct LocalState {
+    /// A turn is forwarding.
+    forwarding: bool,
+    /// The first interrupt delivered to it.
+    pending: Option<String>,
+    /// The response the connection last sent a terminal event for.
+    finished: String,
+}
+
+/// Where [`LocalInterrupt::deliver`] put an interrupt.
+#[derive(PartialEq, Eq)]
+enum Local {
+    /// The turn in flight ends with it.
+    Delivered,
+    /// It names the response the connection already finished: there is nothing left to
+    /// stop, so the reader acknowledges it at once.
+    Finished,
+    /// No turn takes it.
+    Refused,
+}
+
 impl LocalInterrupt {
-    fn state(&self) -> std::sync::MutexGuard<'_, (bool, Option<String>)> {
+    fn state(&self) -> std::sync::MutexGuard<'_, LocalState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The turn starts forwarding; the returned guard ends it.
     fn begin(&self) -> LocalTurn<'_> {
-        self.state().0 = true;
+        self.state().forwarding = true;
         LocalTurn(self)
     }
 
-    fn deliver(&self, payload: &str) -> bool {
+    /// The connection sent the terminal event of response `id`.
+    fn finish(&self, id: &str) {
+        id.clone_into(&mut self.state().finished);
+    }
+
+    fn deliver(&self, payload: &str) -> Local {
+        let id = field(payload, "response_id");
         let mut state = self.state();
-        if !state.0 {
-            return false;
+        if !state.finished.is_empty() && state.finished == id {
+            return Local::Finished;
         }
-        if state.1.is_none() {
-            state.1 = Some(payload.to_owned());
+        if !state.forwarding {
+            return Local::Refused;
+        }
+        if state.pending.is_none() {
+            state.pending = Some(payload.to_owned());
             self.ready.notify_one();
         }
-        true
+        #[cfg(test)]
+        gate::reached("deliver", payload);
+        Local::Delivered
     }
 
     async fn next(&self) -> String {
         loop {
             let ready = self.ready.notified();
-            if let Some(payload) = self.state().1.take() {
+            if let Some(payload) = self.state().pending.take() {
                 return payload;
             }
             ready.await;
@@ -482,8 +514,16 @@ struct LocalTurn<'a>(&'a LocalInterrupt);
 
 impl Drop for LocalTurn<'_> {
     fn drop(&mut self) {
-        *self.0.state() = (false, None);
+        let mut state = self.0.state();
+        state.forwarding = false;
+        state.pending = None;
     }
+}
+
+/// The acknowledgement current Codex waits for after interrupting a response the proxy
+/// itself stops or already finished (docs/DIFFERENCES-FROM-GO.md).
+fn interrupt_accepted(response_id: &str) -> String {
+    set_str(r#"{"type":"response.interrupt.accepted"}"#, "response_id", response_id)
 }
 
 /// What the reader needs for `response.interrupt` (Go
@@ -512,22 +552,46 @@ impl Control {
         }
         self.diagnostic(frame, "");
         let outcome = match self.forward(frame).await {
-            Ok(()) => "handled",
-            Err(InterruptError::NoActive) if self.local.deliver(&String::from_utf8_lossy(frame)) => "local_http",
-            Err(error) => {
-                self.diagnostic(frame, "rejected");
-                // Only the sanitized outcome is logged: transport errors may carry
-                // credentials or URLs. The error event is not a timeline part.
-                let event = error_payload(400, &error.to_string(), None);
-                let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
-                return Some(sent.map_err(|e| e.to_string()));
+            Ok(None) => "handled",
+            // Upstream acknowledged an interrupt for a response that had already ended.
+            Ok(Some(ack)) => {
+                // Upstream's text frame, so valid UTF-8: passed on unchanged.
+                let ack = String::from_utf8_lossy(&ack).into_owned();
+                let sent = self.writer.lock().await.send(Message::Text(ack.into())).await;
+                if let Err(error) = sent {
+                    return Some(Err(error.to_string()));
+                }
+                "handled"
             }
+            Err(InterruptError::NoActive) => match self.local.deliver(&String::from_utf8_lossy(frame)) {
+                Local::Delivered => "local_http",
+                Local::Finished => {
+                    let ack = interrupt_accepted(&field(&String::from_utf8_lossy(frame), "response_id"));
+                    let sent = self.writer.lock().await.send(Message::Text(ack.into())).await;
+                    if let Err(error) = sent {
+                        return Some(Err(error.to_string()));
+                    }
+                    "handled"
+                }
+                Local::Refused => return Some(self.reject(frame, InterruptError::NoActive).await),
+            },
+            Err(error) => return Some(self.reject(frame, error).await),
         };
         self.diagnostic(frame, outcome);
         Some(Ok(()))
     }
 
-    async fn forward(&self, payload: &[u8]) -> Result<(), InterruptError> {
+    /// The error event for a rejected interrupt; `Err` when it cannot be written.
+    async fn reject(&self, frame: &[u8], error: InterruptError) -> Result<(), String> {
+        self.diagnostic(frame, "rejected");
+        // Only the sanitized outcome is logged: transport errors may carry credentials or
+        // URLs. The error event is not a timeline part.
+        let event = error_payload(400, &error.to_string(), None);
+        let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
+        sent.map_err(|e| e.to_string())
+    }
+
+    async fn forward(&self, payload: &[u8]) -> Result<Option<Bytes>, InterruptError> {
         let id = cpa_common::json::get(payload, "response_id");
         if id.kind != cpa_common::json::Kind::String || cpa_common::gostr::trim_space(&id.bytes()).is_empty() {
             return Err(InterruptError::Rejected(
@@ -1211,7 +1275,10 @@ impl Connection {
             .then(|| cpa_exec::codex::handshake_metadata_event(&headers))
             .flatten();
         // `stream` completes its lease as it ends (dispatch).
-        let mut stream = futures_util::stream::iter(first.map(Ok)).chain(stream).boxed();
+        let mut stream = futures_util::stream::iter(first.map(Ok))
+            .chain(stream)
+            .boxed()
+            .peekable();
         let keepalive = keepalive_interval(cfg);
         let mut deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
         let mut turn = Turn::default();
@@ -1220,12 +1287,26 @@ impl Connection {
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
         let mut response_started = false;
+        // The last payload sent was an upstream context-window `response.failed`, which
+        // the executor follows with its own classified error (`preserved_failure`).
+        let mut preserved_event = false;
         let _local = self.local.begin();
         loop {
             let item = tokio::select! {
                 biased;
-                // Dropping the stream cancels the upstream request.
-                payload = self.local.next() => return interrupted(socket, &payload, &turn).await,
+                // Dropping the stream cancels the upstream request. A turn that already
+                // gave its client a context-window `response.failed` has its terminal
+                // event; an interrupt cannot add a second one.
+                payload = self.local.next(), if !preserved_event => {
+                    if !completed {
+                        return interrupted(socket, &self.local, &payload, &turn).await;
+                    }
+                    // The terminal event already went out: only the acknowledgement is left.
+                    if !send_text(socket, interrupt_accepted(&field(&payload, "response_id"))).await {
+                        return Forwarded::End;
+                    }
+                    continue;
+                }
                 item = stream.next() => item,
                 () = sleep_until(deadline) => {
                     if let Err(error) = socket.send(Message::Ping(Bytes::new())).await {
@@ -1256,19 +1337,7 @@ impl Connection {
                     socket.terminate(CLOSE_SENT);
                     return Forwarded::End;
                 }
-                Some(Err(error)) => {
-                    let failure = Failure::from_exec(&error);
-                    // Replay before the session-loss close, as at the turn's start.
-                    if ctx.suppress(failure.status) {
-                        return Forwarded::Suppressed;
-                    }
-                    if let Some(loss) = self.upstream_loss() {
-                        close_for_upstream_loss(socket, &loss).await;
-                        return Forwarded::End;
-                    }
-                    close_for_failure(socket, &failure).await;
-                    return Forwarded::End;
-                }
+                Some(Err(error)) => return self.failed(socket, ctx, &error, preserved_event).await,
                 Some(Ok(chunk)) => chunk,
             };
             deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
@@ -1319,6 +1388,20 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
                 }
+                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
+                // The executor follows such an event with its classified error at once
+                // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
+                // scheduler even when the client interrupts or leaves during the write,
+                // including the write of handshake metadata ahead of it.
+                let committed = if preserved_event {
+                    std::pin::Pin::new(&mut stream)
+                        .next_if(Result::is_err)
+                        .now_or_never()
+                        .flatten()
+                        .and_then(Result::err)
+                } else {
+                    None
+                };
                 if let Some(metadata) = metadata.take()
                     && !send_text(socket, metadata).await
                 {
@@ -1327,22 +1410,58 @@ impl Connection {
                 if !send_text(socket, payload).await {
                     return Forwarded::End;
                 }
+                if let Some(error) = committed {
+                    return self.failed(socket, ctx, &error, true).await;
+                }
+                if completed {
+                    self.local.finish(&completed_id);
+                }
             }
         }
+    }
+
+    /// The turn's stream failed with `error`; `preserved_event`: the last payload sent was
+    /// an upstream context-window `response.failed`.
+    async fn failed(&self, socket: &mut Sink, ctx: &TurnCtx, error: &ExecError, preserved_event: bool) -> Forwarded {
+        let failure = Failure::from_exec(error);
+        // Replay before the session-loss close, as at the turn's start.
+        if ctx.suppress(failure.status) {
+            return Forwarded::Suppressed;
+        }
+        // The client already has the upstream's event for this failure (a context-window
+        // overflow, which Codex compacts on); a generic error event after it would replace
+        // that meaning. Go v8.0.35 differs (docs/DIFFERENCES-FROM-GO.md). Any other error,
+        // including one after a recoverable steering failure, closes as before.
+        if preserved_event && preserved_failure(&failure) {
+            socket.terminate(CLOSE_SENT);
+            return Forwarded::End;
+        }
+        if let Some(loss) = self.upstream_loss() {
+            close_for_upstream_loss(socket, &loss).await;
+            return Forwarded::End;
+        }
+        close_for_failure(socket, &failure).await;
+        Forwarded::End
     }
 }
 
 /// `completeResponsesWebsocketLocalInterrupt`: ends the turn in flight with an
 /// interrupted `response.incomplete` carrying the output collected so far. The turn
-/// completes with that output, so the transcript records it.
-async fn interrupted(socket: &mut Sink, payload: &str, turn: &Turn) -> Forwarded {
+/// completes with that output, so the transcript records it. Current Codex also waits
+/// for `response.interrupt.accepted`, which the proxy sends first: it is the one that
+/// stops this turn (docs/DIFFERENCES-FROM-GO.md).
+async fn interrupted(socket: &mut Sink, local: &LocalInterrupt, payload: &str, turn: &Turn) -> Forwarded {
     let id = field(payload, "response_id");
+    if !send_text(socket, interrupt_accepted(&id)).await {
+        return Forwarded::End;
+    }
     let output = turn.completed_output(r#"{"response":{"output":[]}}"#);
     let incomplete = r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}}"#;
     let incomplete = set_raw(&set_str(incomplete, "response.id", &id), "response.output", &output);
     if !send_text(socket, incomplete).await {
         return Forwarded::End;
     }
+    local.finish(&id);
     Forwarded::Completed {
         output,
         id,
@@ -1403,6 +1522,8 @@ fn lite_request(payload: &str, headers: &HeaderMap) -> bool {
 /// `writeResponsesWebsocketPayload`: the frame joins the timeline, then goes out.
 async fn send_text(socket: &mut Sink, payload: String) -> bool {
     socket.event("response", payload.as_bytes());
+    #[cfg(test)]
+    gate::pass("write", &payload).await;
     match socket.send(Message::Text(payload.into())).await {
         Ok(()) => true,
         Err(error) => {
@@ -1445,6 +1566,12 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
         return Some((CLOSE_MESSAGE_TOO_BIG, reason));
     }
     None
+}
+
+/// The executor's classified error for an upstream context-window `response.failed`
+/// (cpa-exec `terminal_failure`: status 400, `context_too_large`).
+fn preserved_failure(failure: &Failure) -> bool {
+    failure.status == 400 && gjson::get(&failure.text, "error.code").str() == "context_too_large"
 }
 
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,
@@ -1521,6 +1648,70 @@ fn gorilla_close(code: u16, reason: &str) -> String {
     text
 }
 
+/// Test pauses at named points of a connection, armed for payloads that contain a key,
+/// so a test can order events that otherwise race (a client frame during a write).
+#[cfg(test)]
+pub(crate) mod gate {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Semaphore;
+
+    pub(crate) struct Gate {
+        point: &'static str,
+        key: String,
+        /// One permit each time the point is reached.
+        pub(crate) reached: Semaphore,
+        /// `pass` waits for a permit here.
+        pub(crate) release: Semaphore,
+    }
+
+    static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
+
+    /// Arms `point` for payloads containing `key` until [`disarm`]; concurrent tests use
+    /// unique keys.
+    pub(crate) fn arm(point: &'static str, key: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            point,
+            key: key.to_owned(),
+            reached: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        GATES.lock().unwrap().push(gate.clone());
+        gate
+    }
+
+    /// Disarms `gate` and lets every waiter through.
+    pub(crate) fn disarm(gate: &Arc<Gate>) {
+        GATES.lock().unwrap().retain(|g| !Arc::ptr_eq(g, gate));
+        gate.release.add_permits(Semaphore::MAX_PERMITS / 2);
+    }
+
+    fn find(point: &str, payload: &str) -> Option<Arc<Gate>> {
+        let gates = GATES.lock().unwrap();
+        gates
+            .iter()
+            .find(|g| g.point == point && payload.contains(g.key.as_str()))
+            .cloned()
+    }
+
+    pub(crate) fn reached(point: &str, payload: &str) {
+        if let Some(gate) = find(point, payload) {
+            gate.reached.add_permits(1);
+        }
+    }
+
+    pub(crate) async fn pass(point: &str, payload: &str) {
+        if let Some(gate) = find(point, payload) {
+            gate.reached.add_permits(1);
+            let _ = gate.release.acquire().await.map(tokio::sync::SemaphorePermit::forget);
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "websocket_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "websocket_interrupt_tests.rs"]
+mod interrupt_tests;

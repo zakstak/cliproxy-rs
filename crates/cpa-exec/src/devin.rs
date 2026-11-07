@@ -190,6 +190,7 @@ fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecErr
         retry_after,
         direct: false,
         addon: None,
+        diagnostic: None,
     }
 }
 

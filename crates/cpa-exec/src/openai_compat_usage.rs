@@ -320,7 +320,7 @@ impl cpa_core::exec::CaptureObserver for CaptureLog {
             E::WebsocketRequest(r) => request(true, r),
             E::WebsocketHandshake(status, headers) => Captured::Handshake(status, headers.to_vec()),
             E::WebsocketResponse(b) => Captured::WsResponse(text(b)),
-            E::WebsocketError { stage, error } => Captured::WsError(stage.to_owned(), error.to_owned()),
+            E::WebsocketError { stage, error, .. } => Captured::WsError(stage.to_owned(), error.to_owned()),
         };
         self.0.lock().unwrap().push(event);
     }

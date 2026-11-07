@@ -194,15 +194,16 @@ impl Wire {
         Some(Box::pin(async move { websocket.emit(payload.as_bytes()).await }))
     }
 
-    /// `RecordAPIWebsocketError`.
-    pub(crate) fn ws_error(&self, stage: &str, error: &str) {
-        self.sink.record(CaptureEvent::WebsocketError { stage, error });
-    }
-
-    /// [`Self::ws_error`] with an executor error's Go text.
+    /// `RecordAPIWebsocketError` with an executor error's Go text, and its transport
+    /// [`Diagnostic`](cpa_core::exec::Diagnostic) when it has one (the request log redacts
+    /// that before writing it).
     pub(crate) fn ws_exec_error(&self, stage: &str, error: &cpa_core::exec::ExecError) {
         if self.enabled() {
-            self.ws_error(stage, &String::from_utf8_lossy(&error.body));
+            self.sink.record(CaptureEvent::WebsocketError {
+                stage,
+                error: &String::from_utf8_lossy(&error.body),
+                cause: error.diagnostic.as_ref().map(cpa_core::exec::Diagnostic::as_str),
+            });
         }
     }
 

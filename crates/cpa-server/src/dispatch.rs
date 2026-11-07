@@ -1299,7 +1299,7 @@ struct RemoteFault {
 impl RemoteFault {
     fn from_pick(error: crate::remote::RemoteError) -> Self {
         Self {
-            failure: Failure::Exec(error.error),
+            failure: Failure::Exec(*error.error),
             bootstrap: false,
             upstream: false,
             stop: false,
@@ -2976,11 +2976,11 @@ mod tests {
     /// A Home `model_cooldown` pick failure.
     fn home_cooldown(retry_after: Duration, request_retry: Option<i64>) -> RemoteFault {
         RemoteFault::from_pick(crate::remote::RemoteError {
-            error: ExecError::local(
+            error: Box::new(ExecError::local(
                 429,
                 cpa_core::exec::FailureScope::Credential,
                 "model_cooldown: all Home credentials are cooling down",
-            ),
+            )),
             code: "model_cooldown".into(),
             kind: crate::remote::RemoteErrorKind::Cooldown {
                 retry_after: Some(retry_after),

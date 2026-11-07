@@ -77,6 +77,8 @@ enum Act {
     SendOwned(String),
     /// Ping `count` times, `every` apart, without any application message.
     Pings(Duration, usize),
+    /// Send, then close the socket with code 1000 once notified.
+    SendCloseOn(Vec<&'static str>, Arc<tokio::sync::Notify>),
 }
 
 #[derive(Default)]
@@ -141,6 +143,13 @@ async fn serve_socket(up: Arc<Upstream>, mut socket: AxSocket) {
                 break;
             }
             Some(Act::SendClose(events, code)) => (events, Some(code)),
+            Some(Act::SendCloseOn(events, close)) => {
+                for event in events {
+                    let _ = socket.send(AxMessage::Text(event.into())).await;
+                }
+                close.notified().await;
+                (Vec::new(), Some(1000))
+            }
             Some(Act::SendOwned(text)) => {
                 let _ = socket.send(AxMessage::Text(text.into())).await;
                 continue;
@@ -272,7 +281,7 @@ async fn a_turn_activating_after_the_reader_stopped_gets_its_error() {
         })
         .await
         .unwrap_or_else(|_| panic!("{name}: the disconnect was not processed"));
-        let mut reads = conn.activate();
+        let mut reads = conn.activate(false);
         let read = tokio::time::timeout(Duration::from_secs(1), reads.recv())
             .await
             .unwrap_or_else(|_| panic!("{name}: activation waited"));
@@ -693,9 +702,17 @@ async fn a_write_the_upstream_never_reads_times_out() {
         panic!("a write that never completes fails the turn");
     };
     assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.body, "codex websockets executor: write timed out");
+    // The request log learns it was the proxy's own bound, and for how large a frame
+    // (whole seconds at this rate round up to 1 s, past the 300 ms floor).
+    let cause = error
+        .diagnostic
+        .as_ref()
+        .map(|d| d.as_str().to_owned())
+        .unwrap_or_default();
     assert!(
-        String::from_utf8_lossy(&error.body).contains("write timed out"),
-        "{error}"
+        cause.starts_with("local_timeout: writing a ") && cause.ends_with("-byte frame took longer than 1s"),
+        "{cause}"
     );
     assert_eq!(
         dials.load(std::sync::atomic::Ordering::SeqCst),
@@ -1107,13 +1124,136 @@ async fn capture_records_a_dial_failure() {
         .expect("nothing listens");
     let taps = tap.taps();
     assert!(matches!(&taps[0], Tap::WsRequest { .. }), "{taps:?}");
+    // The client-facing text stays fixed; the request log also gets the evidence.
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    let [Tap::WsError(stage, text), Tap::WsCause(cause)] = &taps[1..] else {
+        panic!("{taps:?}");
+    };
     assert_eq!(
-        taps[1..],
-        [Tap::WsError(
-            "dial".into(),
-            String::from_utf8_lossy(&error.body).into_owned()
-        )]
+        (stage.as_str(), text.as_str()),
+        ("dial", "codex websockets executor: dial failed")
     );
+    assert!(cause.starts_with("connect (ConnectionRefused): "), "{cause}");
+}
+
+/// The errors whose public text is fixed keep their causes apart in the request log:
+/// a close frame's code, a stream that ends without one, and the proxy's own idle
+/// deadline. Public texts and scopes are unchanged.
+#[tokio::test]
+async fn capture_keeps_why_a_socket_ended() {
+    use crate::codex_testkit::{Tap, Wiretap};
+    async fn read_failure(script: Vec<Act>, idle: Option<Duration>) -> (ExecError, String, String) {
+        let (_up, url) = upstream(script).await;
+        let tap = Arc::new(Wiretap::default());
+        let mut executor = CodexExecutor::new().unwrap();
+        if let Some(idle) = idle {
+            executor.ws = Arc::new(Pool::with_idle(idle));
+        }
+        let response = executor
+            .execute_in_session(
+                &credential(&url),
+                tapped(BODY, &tap),
+                &Config::default(),
+                &session(false),
+            )
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(response))
+            .await
+            .expect("the turn ends");
+        let error = events.last().unwrap().as_ref().expect_err("the turn fails").clone();
+        let taps = tap.taps();
+        let at = taps
+            .iter()
+            .position(|t| matches!(t, Tap::WsError(stage, _) if stage == "read"))
+            .unwrap_or_else(|| panic!("no read error: {taps:?}"));
+        let (Tap::WsError(_, text), Some(Tap::WsCause(cause))) = (&taps[at], taps.get(at + 1)) else {
+            panic!("no cause: {taps:?}");
+        };
+        assert_eq!(
+            text.as_bytes(),
+            error.body.as_ref(),
+            "the Error line is the turn's error"
+        );
+        (error, text.clone(), cause.clone())
+    }
+
+    let (error, text, cause) = read_failure(vec![Act::SendClose(vec![CREATED], 1011)], None).await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "websocket: close 1011 (internal server error): bye");
+    assert_eq!(cause, "remote_close: code 1011");
+
+    // gorilla's text for a peer that vanished is close 1006, which no peer can send:
+    // the cause says it was an end of stream, not a close frame.
+    let (error, text, cause) = read_failure(vec![Act::SendDrop(vec![CREATED])], None).await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "websocket: close 1006 (abnormal closure): unexpected EOF");
+    assert!(cause.starts_with("eof"), "{cause}");
+
+    let (error, text, cause) = read_failure(
+        vec![Act::Pings(Duration::from_millis(50), 40)],
+        Some(Duration::from_millis(300)),
+    )
+    .await;
+    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(text, "codex websockets executor: read idle timeout");
+    assert_eq!(cause, "local_timeout: no application message within 300ms");
+}
+
+/// A TLS failure is labelled from BoringSSL's error type: the upstream answers plain
+/// HTTP on a `wss` URL.
+#[tokio::test]
+async fn capture_labels_a_tls_dial_failure() {
+    use crate::codex_testkit::{Tap, Wiretap};
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nnot tls").await;
+        }
+    });
+    let tap = Arc::new(Wiretap::default());
+    let error = CodexExecutor::new()
+        .unwrap()
+        .execute_in_session(
+            &credential(&url),
+            tapped(BODY, &tap),
+            &Config::default(),
+            &session(false),
+        )
+        .await
+        .err()
+        .expect("no TLS server");
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    assert_eq!(error.scope, FailureScope::Transport);
+    let taps = tap.taps();
+    let Some(Tap::WsCause(cause)) = taps.last() else {
+        panic!("{taps:?}");
+    };
+    assert!(cause.starts_with("tls: "), "{cause}");
+}
+
+/// A dial error's library text can carry the URL with its userinfo and query. It
+/// reaches only the request log's diagnostic (which the log redacts), never the error's
+/// body, `Display` or `Debug`.
+#[tokio::test]
+async fn a_dial_diagnostic_stays_out_of_the_public_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("http://alice:pw-h1dden@{addr}/backend?api_key=sk-h1dden");
+    let error = CodexExecutor::new()
+        .unwrap()
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .err()
+        .expect("nothing listens");
+    assert_eq!(error.body, "codex websockets executor: dial failed");
+    for shown in [format!("{error}"), format!("{error:?}")] {
+        assert!(!shown.contains("h1dden"), "{shown}");
+    }
+    assert!(error.diagnostic.is_some());
 }
 
 /// An upstream `error` event is recorded as received, then as stage `upstream_error`
@@ -1295,7 +1435,7 @@ async fn interrupt_needs_a_turn_reading_on_the_socket() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(up.frames.lock().unwrap().is_empty(), "the idle socket was written");
 
-    let _reads = conn.activate();
+    let _reads = conn.activate(false);
     let mut checked = Vec::new();
     let check = |id: &str| {
         checked.push(id.to_owned());
@@ -1319,14 +1459,17 @@ async fn interrupt_needs_a_turn_reading_on_the_socket() {
 }
 
 /// Go `TestInterruptExecutionSessionCompletesDuringAuthCheck`: the response finishes
-/// while the account check runs. The interrupt is then done, not forwarded: the socket's
-/// state is read after the check.
+/// while the account check runs, and the socket's state is read after the check. Go
+/// then answers success without forwarding; current Codex waits for upstream's
+/// acknowledgement of that interrupt, so it goes upstream (docs/DIFFERENCES-FROM-GO.md)
+/// and, unacknowledged here, the call returns after the bounded wait.
 #[tokio::test]
-async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
+async fn interrupt_for_a_response_finished_during_the_auth_check_goes_upstream() {
     let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED])]).await;
-    let executor = CodexExecutor::new().unwrap();
+    let mut executor = CodexExecutor::new().unwrap();
+    executor.ws = Arc::new(Pool::with_ack_wait(Duration::from_millis(100)));
     let conn = pooled(&executor, &url).await;
-    let mut reads = conn.activate();
+    let mut reads = conn.activate(false);
     conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
     read_text(&mut reads).await;
     read_text(&mut reads).await;
@@ -1335,22 +1478,29 @@ async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
         conn.deactivate();
         true
     };
-    executor
-        .interrupt_session("conn-1", br#"{"type":"response.interrupt","response_id":"r1"}"#, |_| {
-            finish()
-        })
-        .await
-        .unwrap();
+    let late = br#"{"type":"response.interrupt","response_id":"r1"}"#;
+    let outcome = executor.interrupt_session("conn-1", late, |_| finish()).await;
+    assert_eq!(outcome, Ok(None), "no acknowledgement arrived");
     conn.send("barrier".into()).await.unwrap();
-    assert_eq!(received(&up, 2).await, [r#"{"type":"response.create"}"#, "barrier"]);
+    assert_eq!(
+        received(&up, 3).await,
+        [
+            r#"{"type":"response.create"}"#,
+            r#"{"type":"response.interrupt","response_id":"r1"}"#,
+            "barrier"
+        ]
+    );
 }
 
-/// Go `TestInterruptExecutionSessionAfterTerminal`: a late interrupt for a finished
-/// response is done, also while the next response runs, and never reaches upstream; an
-/// unknown ID on an idle socket falls through to the HTTP fallback; after the socket is
-/// lost there is no active upstream.
+/// Go `TestInterruptExecutionSessionAfterTerminal`, with current Codex's acknowledgement
+/// handshake (docs/DIFFERENCES-FROM-GO.md): an interrupt for a response finished before
+/// the turn reading now is done and never reaches upstream, as in Go; one for a finished
+/// response while no turn reads goes upstream (Go: done, not forwarded) and returns
+/// after the bounded wait without an acknowledgement here; an unknown ID on an idle
+/// socket falls through to the HTTP fallback; after the socket is lost there is no
+/// active upstream.
 #[tokio::test]
-async fn late_interrupts_for_finished_responses_are_done() {
+async fn late_interrupts_for_finished_responses() {
     for terminal in [
         "response.completed",
         "response.done",
@@ -1361,11 +1511,16 @@ async fn late_interrupts_for_finished_responses_are_done() {
             Box::leak(format!(r#"{{"type":"{terminal}","response":{{"id":"r1","output":[]}}}}"#).into_boxed_str());
         let (up, url) = upstream(vec![
             Act::Send(vec![CREATED, finished]),
+            Act::Send(vec![]),
+            Act::Send(vec![]),
             Act::Send(vec![r#"{"type":"response.incomplete","response":{"id":"r2"}}"#]),
+            Act::Send(vec![]),
+            Act::Send(vec![]),
             Act::SendClose(vec![], 1000),
         ])
         .await;
-        let executor = CodexExecutor::new().unwrap();
+        let mut executor = CodexExecutor::new().unwrap();
+        executor.ws = Arc::new(Pool::with_ack_wait(Duration::from_millis(100)));
         let conn = pooled(&executor, &url).await;
         let interrupt = |id: &str| format!(r#"{{"type":"response.interrupt","response_id":"{id}"}}"#);
         let send = |id: &'static str| {
@@ -1376,13 +1531,13 @@ async fn late_interrupts_for_finished_responses_are_done() {
                     .await
             }
         };
-        let mut reads = conn.activate();
+        let mut reads = conn.activate(false);
         conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
         read_text(&mut reads).await;
         read_text(&mut reads).await;
         conn.deactivate();
         for _ in 0..2 {
-            assert_eq!(send("r1").await, Ok(()), "{terminal}: finished r1");
+            assert_eq!(send("r1").await, Ok(None), "{terminal}: finished r1, idle socket");
         }
         assert_eq!(
             send("unknown").await,
@@ -1390,18 +1545,25 @@ async fn late_interrupts_for_finished_responses_are_done() {
             "{terminal}: unknown"
         );
 
-        let mut reads = conn.activate();
-        assert_eq!(send("r1").await, Ok(()), "{terminal}: r1 while r2 runs");
-        assert_eq!(send("r2").await, Ok(()), "{terminal}: active r2");
+        let mut reads = conn.activate(false);
+        assert_eq!(send("r1").await, Ok(None), "{terminal}: r1 while r2 runs");
+        assert_eq!(send("r2").await, Ok(None), "{terminal}: active r2");
         read_text(&mut reads).await;
         conn.deactivate();
         for id in ["r1", "r2"] {
-            assert_eq!(send(id).await, Ok(()), "{terminal}: finished {id}");
+            assert_eq!(send(id).await, Ok(None), "{terminal}: finished {id}, idle socket");
         }
         assert_eq!(
-            received(&up, 2).await,
-            [r#"{"type":"response.create"}"#.to_owned(), interrupt("r2")],
-            "{terminal}: only the active response's interrupt reached upstream"
+            received(&up, 6).await,
+            [
+                r#"{"type":"response.create"}"#.to_owned(),
+                interrupt("r1"),
+                interrupt("r1"),
+                interrupt("r2"),
+                interrupt("r1"),
+                interrupt("r2"),
+            ],
+            "{terminal}: r1 never reached upstream while r2 ran"
         );
         conn.send("bye".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
@@ -1415,8 +1577,224 @@ async fn late_interrupts_for_finished_responses_are_done() {
     }
 }
 
+/// A socket that ends right after a context-window failure, while the turn has yet to
+/// give it to a Codex client: the reader drops the socket but leaves the loss to the
+/// turn, whose own error after the event replaces it. After any other event, or for a
+/// turn that does not preserve the failure, the reader reports the loss at once.
+#[tokio::test]
+async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() {
+    const CONTEXT: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+    for (preserves, last, deferred) in [
+        (true, CONTEXT, true),
+        (true, LIVE_CONTEXT_ERROR.trim(), true),
+        (false, CONTEXT, false),
+        (false, LIVE_CONTEXT_ERROR.trim(), false),
+        (true, CREATED, false),
+    ] {
+        let (_up, url) = upstream(vec![Act::SendClose(vec![last], 1000)]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let conn = pooled(&executor, &url).await;
+        let mut reads = conn.activate(preserves);
+        conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
+        assert_eq!(read_text(&mut reads).await, last);
+        // The reader's own error follows the event and comes after its decision.
+        let after = tokio::time::timeout(Duration::from_secs(5), reads.recv()).await;
+        assert!(
+            matches!(after, Ok(Some(Read::Failed(_)))),
+            "{preserves} {last}: no read error"
+        );
+        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.closed("conn-1"))
+            .await
+            .is_ok();
+        assert_eq!(reported, !deferred, "{preserves} {last}: loss reported by the reader");
+        assert_eq!(
+            conn.link.lock().expect("link").deferred.is_some(),
+            deferred,
+            "{preserves} {last}"
+        );
+        assert!(
+            executor.ws.session("conn-1").current().is_none(),
+            "{preserves} {last}: socket kept"
+        );
+    }
+}
+
+/// The ChatGPT Codex backend's rejection of an input larger than the window, recorded
+/// from a live subscription request: an `error` event without a status, before
+/// `response.created`.
+const LIVE_CONTEXT_ERROR: &str = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json");
+
+fn codex_client_request(body: &str) -> ExecRequest {
+    let mut req = request(body);
+    req.headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_static("codex_cli_rs/0.167.0"),
+    );
+    req
+}
+
+/// The live context-window rejection reaches a Codex client as the `response.failed`
+/// Codex compacts on, followed by Go's classified 400 `context_too_large`, which is also
+/// the one loss the session reports. With bootstrap buffering, and when the upstream
+/// closes the socket right after the event, the same holds. Other clients get only
+/// Go's classified error.
+#[tokio::test]
+async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
+    let live = LIVE_CONTEXT_ERROR.trim();
+    let normalized = cpa_common::codex_client::context_window_failure_event(live)
+        .unwrap()
+        .into_owned();
+    let buffered = Config::parse("codex:\n  stream-bootstrap-buffering: true\n").unwrap();
+    for (name, codex_client, cfg, act) in [
+        ("codex", true, Config::default(), Act::Send(vec![live])),
+        ("codex buffered", true, buffered.clone(), Act::Send(vec![live])),
+        (
+            "codex then close",
+            true,
+            Config::default(),
+            Act::SendClose(vec![live], 1000),
+        ),
+        (
+            "codex buffered then close",
+            true,
+            buffered.clone(),
+            Act::SendClose(vec![live], 1000),
+        ),
+        ("other", false, Config::default(), Act::Send(vec![live])),
+        (
+            "other buffered then close",
+            false,
+            buffered.clone(),
+            Act::SendClose(vec![live], 1000),
+        ),
+    ] {
+        let (_up, url) = upstream(vec![act]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let req = if codex_client {
+            codex_client_request(BODY)
+        } else {
+            request(BODY)
+        };
+        let items = match executor
+            .execute_in_session(&credential(&url), req, &cfg, &session(false))
+            .await
+        {
+            Ok(response) => collect(response).await,
+            Err(error) => vec![Err(error)],
+        };
+        let (events, errors): (Vec<_>, Vec<_>) = items.into_iter().partition(Result::is_ok);
+        let events: Vec<String> = events.into_iter().map(Result::unwrap).collect();
+        if codex_client {
+            assert_eq!(events, std::slice::from_ref(&normalized), "{name}");
+        } else {
+            assert!(events.is_empty(), "{name}: {events:?}");
+        }
+        let [Err(error)] = errors.as_slice() else {
+            panic!("{name}: one error, got {errors:?}");
+        };
+        assert_eq!(error.status, 400, "{name}");
+        assert_eq!(error.scope, FailureScope::Request, "{name}");
+        let code = |e: &ExecError| {
+            gjson::get(&String::from_utf8_lossy(&e.body), "error.code")
+                .str()
+                .to_owned()
+        };
+        assert_eq!(code(error), "context_too_large", "{name}");
+        // A Codex client's turn ends its connection after the event itself: no loss is
+        // reported, not even a close right after the event. For other clients the
+        // classified error, or such a close, is the loss, as in Go.
+        if codex_client {
+            assert!(
+                executor.ws.loss("conn-1").is_none(),
+                "{name}: a loss was reported: {:?}",
+                executor.ws.loss("conn-1").map(|l| code(&l))
+            );
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1"))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: the session's loss was not reported"));
+        }
+    }
+}
+
+/// A Codex client's turn abandoned while an observer holds the context-window rejection
+/// keeps its read channel until the observation returns. A reader that loses the socket
+/// in that window reports its own loss: the gone turn cannot report a deferred one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_preserving_turn_leaves_no_loss_unreported() {
+    /// Holds every message until `release`.
+    struct Holding {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Credential,
+            _: &'a str,
+            _: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let _ = self.release.acquire().await.unwrap();
+            })
+        }
+    }
+    const FAILED: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+    for rejection in [FAILED, LIVE_CONTEXT_ERROR.trim()] {
+        let close = Arc::new(tokio::sync::Notify::new());
+        let (_up, url) = upstream(vec![Act::SendCloseOn(vec![rejection], close.clone())]).await;
+        let executor = Arc::new(CodexExecutor::new().unwrap());
+        let observer = Arc::new(Holding {
+            calls: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let turn = {
+            let (executor, url, observer) = (executor.clone(), url.clone(), observer.clone());
+            tokio::spawn(async move {
+                let mut req = codex_client_request(BODY);
+                req.usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer));
+                if let Ok(response) = executor
+                    .execute_in_session(&credential(&url), req, &Config::default(), &session(false))
+                    .await
+                {
+                    collect(response).await;
+                }
+            })
+        };
+        let calls = || observer.calls.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..250 {
+            if calls() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls(), 1, "{rejection}: the rejection was not observed");
+        let conn = executor.ws.session("conn-1").current().expect("socket");
+        turn.abort();
+        let _ = turn.await;
+        assert!(
+            conn.link.lock().expect("link").active.is_some(),
+            "{rejection}: the abandoned turn released its read channel during the observation"
+        );
+        close.notify_one();
+        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1")).await;
+        let deferred = conn.link.lock().expect("link").deferred.is_some();
+        observer.release.add_permits(100);
+        assert!(
+            loss.is_ok(),
+            "{rejection}: the reader's loss was left unreported (deferred: {deferred})"
+        );
+        assert!(!deferred, "{rejection}: a loss was deferred to the abandoned turn");
+    }
+}
+
 #[path = "codex_duplex_tests.rs"]
 mod duplex;
+
+#[path = "codex_ws_interrupt_tests.rs"]
+mod interrupt;
 
 /// `buildCodexResponsesWebsocketURL` answers, recorded from Go v8.0.35 with the inputs of `url.Parse` and
 /// `URL.String()` (tests/reference/go_url).
