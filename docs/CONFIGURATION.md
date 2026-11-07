@@ -112,7 +112,7 @@ How the server picks an account for each request. [MULTI-ACCOUNT.md](MULTI-ACCOU
 | Setting | What it does |
 |---|---|
 | `strategy` | `soonest-reset` (alias `reset-first`, the default when unset: select the account whose weekly window resets soonest), `round-robin`, `fill-first` or `weighted-round-robin`. Set `round-robin` to take the accounts in turn as Go does. [Routing strategies](MULTI-ACCOUNT.md#routing-strategies) explains each one. |
-| `session-affinity` | `true` keeps a conversation on the account that served its first request. The installer writes `true` for new configs. If omitted, the server default is `false`, as in Go. |
+| `session-affinity` | `true` keeps a conversation on the account that served its first request. If omitted, the server default is `false`, as in Go. |
 | `session-affinity-ttl` | How long a conversation stays bound to its account, `"1h"` by default. |
 | `retry.request-retry` | Extra rounds over the accounts after a failed attempt, `0` by default. |
 | `retry.max-retry-credentials` | At most this many accounts tried per round; `0` means all of them. |

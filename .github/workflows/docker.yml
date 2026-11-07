@@ -1,9 +1,8 @@
 # Builds the Docker image, without pushing it, when a pull request or a push to master
 # changes what the image build depends on besides the source: the Dockerfile, the build
 # context filter, the manifests, the vendored crates and the dashboard that the binary
-# embeds (ui/dist, read by crates/cpa-server/build.rs). release.yml builds the same image
-# before every release; this catches a Dockerfile that misses a new input before a tag
-# does.
+# embeds (ui/dist, read by crates/cpa-server/build.rs). This workflow only checks the
+# local image build; it never uploads an image to a registry.
 # One run per change: pushes to master, and pull requests through `pull_request` only.
 # Runs are grouped per pull request (or per ref outside one), and a newer push cancels the
 # older run.
@@ -41,8 +40,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The build, smoke test and size gate of the docker job in release.yml, on the same
-  # runner image and with the same (default) build arguments and platform.
+  # Check the local Dockerfile with the default build arguments and platform.
   image:
     name: docker image (not pushed)
     runs-on: ubuntu-24.04

@@ -52,7 +52,7 @@ Each account can also have a `priority` (default 0). The proxy only uses the acc
 
 ## Session affinity
 
-The installer enables affinity for new configs. It leaves an existing config unchanged. To enable it by hand:
+To enable affinity, set this in `config.yaml`:
 
 ```yaml
 routing:

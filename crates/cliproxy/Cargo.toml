@@ -2,21 +2,15 @@
 name = "cliproxy"
 description = "Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one local endpoint with API translation and failover. CLIProxyAPI-compatible."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-exclude.workspace = true
 readme = "../../README.md"
 keywords = ["llm", "proxy", "openai", "claude-code", "codex"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
-
-# cargo binstall installs the GitHub release archive for the host target.
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/cliproxy-{ version }-{ target }{ archive-suffix }"
-bin-dir = "cliproxy-{ version }-{ target }/{ bin }{ binary-ext }"
-pkg-fmt = "tgz"
 
 [dependencies]
 anyhow.workspace = true

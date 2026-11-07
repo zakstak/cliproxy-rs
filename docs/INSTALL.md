@@ -10,117 +10,14 @@ On a Windows or macOS computer, run the proxy in the Linux container ([Windows a
 
 ## Pick an installation path
 
-This fork, [zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs), has published no release binaries yet. Install it in one of two ways:
+This fork, [zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs), uses local builds and has no release publishing or package distribution. Install it in one of two ways:
 
-- On a Linux host, [build it from source](#from-source), then [write the config](#first-run-without-the-install-script) or [run it as a service](#running-as-a-system-service).
+- On a Linux host, [build it from source](#from-source), then [write the config](#first-run) or [run it as a service](#running-as-a-system-service).
 - On any host with a container runtime, [build and run the Linux container](#docker).
-
-The install script and the release archives below apply once this fork publishes a release. The upstream project's installer (`vayungodara/cliproxy-rs`) installs upstream builds, not this fork.
-
-## With the install script
-
-`install.sh` in this repository installs a release of this fork. Until one is published, it stops before it changes anything, with `no release is published yet; build from source`. On a system other than Linux, it also stops at once and points to the container. It needs no `sudo`, Rust or any other tool. Run it from a checkout:
-
-```sh
-sh install.sh
-```
-
-Once a release exists, the first run:
-
-1. Picks the release archive for your system, downloads it with the release's `SHA256SUMS`, and stops without installing anything if the checksum does not match.
-2. Installs the binary as `~/.local/bin/cliproxy`.
-3. If `~/.cliproxy-rs/config.yaml` does not exist, writes it: the server listens on `127.0.0.1`, on port 8317 or the next free port if something such as CLIProxyAPI already uses 8317, with a credential folder `auth` and session affinity on. It creates a client key and a management key and saves both in `keys.env` next to the config. Only you can read the folder, and the script never prints the keys.
-4. Starts the server in the background, logging to `cliproxy.log`, and checks that `/healthz` answers.
-5. Prints the dashboard address and opens it in your browser when there is one.
-
-Sign in to the dashboard with the `CLIPROXY_MANAGEMENT_KEY` line from `keys.env` (`cat ~/.cliproxy-rs/keys.env`). Your tools use `CLIPROXY_CLIENT_KEY`.
-
-Running the script again upgrades the binary to the latest release and restarts the server. A current binary is left alone only when the managed server is running and its last-start marker is at least as new as the binary. A rerun after `--binary-only` or an interrupted upgrade starts the installed version without downloading it again. Upgrades keep a hard link at `cliproxy.prev`, and if startup fails the script restores the previous image and checks that it answers. The script never changes an existing `config.yaml` or `keys.env`. Probes and printed dashboard addresses follow the configured host, port and TLS setting; wildcard hosts use loopback.
-
-On a machine without a browser, such as a server you reach over SSH, keep the server on `127.0.0.1` and open an SSH tunnel from your own computer, for example `ssh -L 8317:127.0.0.1:8317 you@server`, then open `http://127.0.0.1:8317/management.html` there. [Tailscale](MULTI-ACCOUNT.md#reach-the-proxy-from-other-machines) works too. Never listen on `0.0.0.0` without client keys.
-
-Read [install.sh](../install.sh) before you run it if you prefer.
-
-### Options
-
-| Option | Effect |
-| --- | --- |
-| `--service` | Also start cliproxy-rs at login; see below. |
-| `--binary-only` | Install or upgrade the binary and stop there. |
-| `--check` | Report installed and available versions without downloading a binary, changing files or restarting. |
-
-Pass options after the script name, for example `sh install.sh --service`.
-
-The script reads these environment variables:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `CLIPROXY_VERSION` | the latest release | Release tag to install, such as `v0.1.0`. |
-| `CLIPROXY_INSTALL_DIR` | `~/.local/bin` | Where the binary goes. |
-| `CLIPROXY_HOME` | `~/.cliproxy-rs` | Config, keys, credentials and log. |
-| `CLIPROXY_NO_OPEN` | unset | Set to `1` to never open a browser. |
-| `CLIPROXY_RELEASES` | `https://github.com/zakstak/cliproxy-rs/releases` | Release page base URL for a mirror or installer tests. Unless `CLIPROXY_VERSION` is set, a HEAD request for `<base>/latest` must redirect to a final URL ending in `/tag/<tag>`: the installer reads the tag from that URL. It must also serve `/download/<tag>/SHA256SUMS` and the platform archive under `/download/<tag>/`. |
-
-Use only a mirror you trust. The installer checks the archive against the `SHA256SUMS` file from that same mirror.
-
-### Start at login
-
-Without `--service`, the server runs until the computer restarts. With it, the script writes a systemd user unit, `~/.config/systemd/user/cliproxy.service`, and enables and starts it. The unit runs while you are logged in; for a server that should run without a login session, run `loginctl enable-linger` once. Stop it with `systemctl --user disable --now cliproxy`.
-
-For a binary you built yourself, write the same unit by hand. Adjust the paths:
-
-```ini
-# ~/.config/systemd/user/cliproxy.service
-[Unit]
-Description=cliproxy-rs
-
-[Service]
-ExecStart=%h/.local/bin/cliproxy --config %h/.cliproxy-rs/config.yaml
-WorkingDirectory=%h/.cliproxy-rs
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Then run `systemctl --user daemon-reload` and `systemctl --user enable --now cliproxy`.
-
-Once set up, later upgrades restart the server through the same mechanism. The System page checks for a new release only when clicked, with an anonymous HEAD request cached for 12 h. Set `CLIPROXY_NO_UPDATE_CHECK=1` in the server's environment before starting it to disable these checks. Release checks use the configured `proxy-url`, or the environment proxy when none is set, and never send tokens or cookies; proxy credentials go only to your proxy, with TLS verification on and redirects off.
-
-### Removing it
-
-Stop the server (`kill $(cat ~/.cliproxy-rs/cliproxy.pid)` or the service command above), then delete the binary. `~/.cliproxy-rs` holds your config, keys and signed-in accounts; delete it only if you no longer need them.
-
-## From a release
-
-This fork has published no releases yet. `.github/workflows/release.yml` builds, for each tagged release of this fork, an archive per Linux platform and a `SHA256SUMS` file:
-
-| Platform | Archive |
-| --- | --- |
-| Linux x86_64 | `cliproxy-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `cliproxy-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-
-The release also carries `management.html`, the dashboard as a single file for Go CLIProxyAPI servers (see [ui/PANEL.md](../ui/PANEL.md)). The Rust binary does not need it.
-
-Check the download before you run it:
-
-```sh
-sha256sum --check --ignore-missing SHA256SUMS
-```
-
-Unpack and put the binary on your `PATH`:
-
-```sh
-tar -xzf cliproxy-<version>-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 0755 cliproxy-<version>-x86_64-unknown-linux-gnu/cliproxy /usr/local/bin/cliproxy
-cliproxy --version
-```
-
-The Linux binaries link against glibc and libstdc++ and run on current distributions (Debian 12, Ubuntu 22.04 and later, Fedora, Arch). For Alpine or other musl systems, build from source or use the Docker image.
 
 ## From source
 
-This is the way to install this fork on a Linux host today. You need a Rust toolchain (stable, 1.88 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
+Build this fork on a Linux host. You need a Rust toolchain (stable, 1.88 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get install -y build-essential cmake clang perl git
@@ -138,7 +35,14 @@ cargo build --release -p cliproxy
 ./target/release/cliproxy --version
 ```
 
-The WebRTC media relay is an optional feature and is not part of the release binaries or the Docker image. To include it, build with `cargo build --release -p cliproxy --features cpa-server/media-relay`.
+To run it as `cliproxy`, copy it to a directory on your `PATH`, for example:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 0755 target/release/cliproxy ~/.local/bin/cliproxy
+```
+
+The WebRTC media relay is an optional feature and is disabled in default builds and the Docker image. To include it, build with `cargo build --release -p cliproxy --features cpa-server/media-relay`.
 
 The dashboard in `ui/dist` is committed, so Node is not needed for a normal build. To change the dashboard, see [ui/README.md](../ui/README.md); rebuild the UI before building the binary.
 
@@ -245,9 +149,9 @@ These steps were tested with rootless Podman on a Linux x86_64 host. They have n
 - That the browser on the host reaches the published `127.0.0.1` ports, which the callback redirects use.
 - On an Apple silicon Mac, the image builds for arm64 Linux. That build has not been tested.
 
-## First run without the install script
+## First run
 
-If you installed the binary another way, set it up by hand:
+After building the binary, set it up by hand:
 
 1. Make two random keys, for example with `openssl rand -hex 24`, and write `config.yaml`:
 
@@ -271,6 +175,28 @@ If you installed the binary another way, set it up by hand:
 Go-style single-dash flags such as `-config config.yaml` work too.
 
 The server reloads `config.yaml` and the credential directory when they change. Set `RUST_LOG=debug` for more detailed logs; the default level is `info`.
+
+## Start at login
+
+For a binary you built yourself, write a systemd user unit. Adjust the paths:
+
+```ini
+# ~/.config/systemd/user/cliproxy.service
+[Unit]
+Description=cliproxy-rs
+
+[Service]
+ExecStart=%h/.local/bin/cliproxy --config %h/.cliproxy-rs/config.yaml
+WorkingDirectory=%h/.cliproxy-rs
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then run `systemctl --user daemon-reload` and `systemctl --user enable --now cliproxy`.
+
+Stop it with `systemctl --user disable --now cliproxy`. To run without a login session, enable lingering with `loginctl enable-linger` according to your host's policy.
 
 ## Running as a system service
 

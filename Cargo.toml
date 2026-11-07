@@ -6,18 +6,16 @@ exclude = ["vendor"]
 
 [workspace.package]
 version = "0.4.1"
+publish = false
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
 repository = "https://github.com/vayungodara/cliproxy-rs"
 homepage = "https://github.com/vayungodara/cliproxy-rs"
 categories = ["network-programming", "web-programming"]
-# The Go reference recordings and fixtures stay in the repository; a published crate
-# only needs to build.
-exclude = ["tests/"]
 
 [workspace.dependencies]
-# The versions are for crates.io; a release bumps them with workspace.package.version.
+# Keep internal dependency versions aligned with workspace.package.version.
 cpa-common = { path = "crates/cpa-common", version = "0.4.1" }
 cpa-core = { path = "crates/cpa-core", version = "0.4.1" }
 cpa-exec = { path = "crates/cpa-exec", version = "0.4.1" }
@@ -59,6 +57,6 @@ codegen-units = 1
 strip = true
 
 # gjson 0.8.1 with SIMD string scanning; behaviour unchanged (vendor/README.md). A patch
-# applies to this workspace only: a build from crates.io uses upstream gjson 0.8.1.
+# applies to this workspace only.
 [patch.crates-io]
 gjson = { path = "vendor/gjson" }
