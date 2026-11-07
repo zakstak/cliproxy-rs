@@ -454,7 +454,8 @@ receives (`ExecError::delivered_event`).
   error of its own.
 - A failure before anything was delivered fails over when its classification allows it
   (a retryable status, an overload). Once the attempts run out, the client receives the
-  last attempt's frame.
+  last attempt's frame. That includes a Home round that ends with a retry hint, which
+  wraps the upstream error in its retry metadata.
 - A failure after the response started reaches the client after the events before it.
   Without `codex.response-steering` the connection then closes. With it, the first
   response's failure is handled like a failure before anything was delivered, and a later
@@ -482,6 +483,11 @@ opened a socket, including a send retried on a fresh socket.
 the upstream puts in an event (a `headers` member) reaches the client inside that event,
 unchanged, on every turn.
 
+Under Home, a connection does not pin its first pick, because the server learns the
+credential only after Home keeps the pick. A later `previous_response_id` continuation
+on that connection therefore closes with 1012 instead of continuing on the socket, and
+the client replays it. This predates the native route, and the route does not change it.
+
 The source sets two limits on this. The pinned client reads `x-reasoning-included` only
 from the handshake of a socket it opened itself (`responses_websocket.rs:617`). It also
 repeats `ServerModel` and `ServerReasoningIncluded` from that handshake on every request
@@ -499,8 +505,11 @@ payload rules and posts an HTTP Responses request. A prewarm on such a credentia
 refused with a 400 `invalid_request_error` that names the cause and the fix: there is no
 upstream socket to prewarm, and the proxy does not invent a response. Nothing reaches the
 upstream, and the connection stays open. This applies when the pinned credential is a
-Codex credential, or when nothing is pinned and the model's pool holds one. Go answers such
-a prewarm locally with a made-up `resp_prewarm_` response; other providers keep that
+Codex credential, or when nothing is pinned and the model's pool holds one. Under Home,
+before the connection's first pick, no credential or transport is known, so a prewarm is
+refused the same way, without a Home pick, with a message that says so. After a pick on
+an upstream socket, a prewarm goes to the provider on that socket. Go answers such a
+prewarm locally with a made-up `resp_prewarm_` response; other providers keep that
 behaviour. A `previous_response_id` on such a connection is
 answered from the stored transcript, as in Go. A continuation of state held on an upstream
 socket cannot move to this transport, so it closes with 1012.

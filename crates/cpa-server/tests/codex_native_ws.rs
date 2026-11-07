@@ -724,3 +724,227 @@ async fn handshake_metadata_reaches_the_opening_turn_and_event_metadata_every_tu
     let reused = read(&mut socket, &TERMINAL).await;
     assert_eq!(reused.frames, upstream, "a reused socket has no handshake to report");
 }
+
+// Home (`remote_dispatch`): the pool is remote, and the local store holds no credential.
+
+type Pick = Result<Credential, cpa_server::remote::RemoteError>;
+
+/// A fake Home: hands out `picks` in order, counting picks and released leases.
+struct Home {
+    picks: std::sync::Mutex<std::collections::VecDeque<Pick>>,
+    dispatched: Arc<std::sync::atomic::AtomicUsize>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl cpa_server::remote::RemoteDispatch for Home {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn dispatch(
+        &self,
+        _: cpa_server::remote::RemoteRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<cpa_server::remote::RemoteGrant, cpa_server::remote::RemoteError>>
+    {
+        self.dispatched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pick = self.picks.lock().unwrap().pop_front().expect("an unexpected Home pick");
+        let released = self.released.clone();
+        Box::pin(async move {
+            pick.map(|credential| cpa_server::remote::RemoteGrant {
+                credential,
+                end: Box::new(move || {
+                    released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    None
+                }),
+                cancel: None,
+                request_retry: Some(0),
+                user_api_key: String::new(),
+                private: Default::default(),
+            })
+        })
+    }
+
+    fn models(
+        &self,
+        _: Vec<(String, String)>,
+        _: Vec<(String, String)>,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, cpa_server::remote::ModelsError>> {
+        unreachable!("no model lists")
+    }
+}
+
+/// A native WebSocket credential that Home hands out, pointing at `base`.
+fn home_credential(base: &str) -> Credential {
+    let mut credential = credential(Profile::Compatible, base, true);
+    credential.id = "home-native.json".into();
+    credential.attributes.insert(
+        cpa_core::config::credentials::HOME_AUTH_INDEX.into(),
+        "idx-home-native".into(),
+    );
+    credential
+}
+
+/// Home's `model_cooldown` with a positive retry hint and no retry round left.
+fn home_cooldown() -> Pick {
+    Err(cpa_server::remote::RemoteError {
+        error: Box::new(cpa_core::exec::ExecError::local(
+            429,
+            cpa_core::exec::FailureScope::Credential,
+            "model_cooldown: every credential is cooling",
+        )),
+        code: "model_cooldown".into(),
+        kind: cpa_server::remote::RemoteErrorKind::Cooldown {
+            retry_after: Some(Duration::from_secs(30)),
+            request_retry: Some(0),
+        },
+    })
+}
+
+struct HomeProxy {
+    proxy: Proxy,
+    dispatched: Arc<std::sync::atomic::AtomicUsize>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A proxy with an empty local store under a fake Home handing out `picks(base_url)`.
+async fn home_proxy(script: Script, extra_config: &str, picks: impl FnOnce(&str) -> Vec<Pick>) -> HomeProxy {
+    let upstream = CaptureUpstream::start(script).await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\n{extra_config}",
+        auth_dir.0.display()
+    ))
+    .unwrap();
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, Vec::new(), executors));
+    let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    rt.set_remote_dispatch(Some(Arc::new(Home {
+        picks: std::sync::Mutex::new(picks(&upstream.base_url).into()),
+        dispatched: dispatched.clone(),
+        released: released.clone(),
+    })));
+    HomeProxy {
+        proxy: Proxy {
+            addr: serve(cpa_server::router(rt)).await,
+            upstream,
+            _auth_dir: auth_dir,
+        },
+        dispatched,
+        released,
+    }
+}
+
+async fn wait_released(home: &HomeProxy, count: usize) {
+    for _ in 0..100 {
+        if home.released.load(std::sync::atomic::Ordering::SeqCst) >= count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        home.released.load(std::sync::atomic::Ordering::SeqCst),
+        count,
+        "every Home lease released"
+    );
+}
+
+/// Under Home, before this connection's first pick, nobody knows which credential or
+/// transport will serve it: a `generate: false` prewarm is refused with an actionable
+/// error, without a Home pick, an upstream request or a made-up response. The connection
+/// stays usable: the first real turn takes a Home pick onto the native WebSocket route,
+/// and a prewarm after it goes to the provider on that socket.
+#[tokio::test]
+async fn a_home_prewarm_before_the_first_pick_is_refused() {
+    let prewarm_done = r#"{"type":"response.completed","response":{"id":"resp_warm","usage":null}}"#;
+    let home = home_proxy(
+        Script {
+            ws: vec![
+                fixture("sse-completed").frames(),
+                vec![Bytes::from_static(prewarm_done.as_bytes())],
+            ],
+            ..Script::default()
+        },
+        "",
+        |url| vec![Ok(home_credential(url))],
+    )
+    .await;
+    let mut socket = connect(&home.proxy).await;
+    let prewarm = client_frame("ws-create-prewarm", "gpt-5.5");
+    socket.send(Message::text(prewarm.clone())).await.unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    assert_eq!(refused.frames.len(), 1, "{refused:?}");
+    assert!(!refused.frames[0].contains("resp_prewarm_"), "no fabricated response");
+    let error: serde_json::Value = serde_json::from_str(&refused.frames[0]).unwrap();
+    assert_eq!(error["status"], 400, "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("before Home selects a credential"), "{message}");
+    assert_eq!(
+        home.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no Home pick"
+    );
+    assert!(home.proxy.upstream.sockets().is_empty() && home.proxy.upstream.http().is_empty());
+
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(create.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    socket.send(Message::text(prewarm.clone())).await.unwrap();
+    let warm = read(&mut socket, &TERMINAL).await;
+    assert_eq!(warm.frames, [prewarm_done], "the provider's prewarm answer");
+    assert_eq!(home.dispatched.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        upstream_frames(&home.proxy, 0),
+        [create, prewarm],
+        "nothing else upstream"
+    );
+    drop(socket);
+    wait_released(&home, 1).await;
+}
+
+/// A native failure that a Home round ends with a retry hint: Home grants a native
+/// credential, its upstream answers a retryable wrapped 503, and the next pick is a
+/// `model_cooldown` with a positive retry hint and no retry round. Dispatch then ends
+/// with `Failure::Remote` around the upstream error, and the client still gets the
+/// upstream frame as sent; with and without response steering. Every lease is released.
+#[tokio::test]
+async fn a_home_cooldown_after_a_native_failure_keeps_the_frame() {
+    let wrapped = r#"{"type":"error","status":503,"error":{"type":"server_error","message":null,"x":1.50,"big":12345678901234567890},"future_frame_field":[1e3,-0.0]}"#;
+    for steering in [false, true] {
+        let home = home_proxy(
+            Script {
+                ws: vec![vec![Bytes::from_static(wrapped.as_bytes())]],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+            |url| vec![Ok(home_credential(url)), home_cooldown()],
+        )
+        .await;
+        let mut socket = connect(&home.proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let read = read(&mut socket, &[]).await;
+        assert_eq!(
+            read.frames,
+            [wrapped],
+            "steering={steering}: the upstream frame as sent"
+        );
+        assert!(read.closed.is_some(), "steering={steering}");
+        assert_eq!(
+            home.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "steering={steering}: the grant, then the cooldown"
+        );
+        assert_eq!(home.proxy.upstream.sockets().len(), 1, "steering={steering}");
+        drop(socket);
+        wait_released(&home, 1).await;
+    }
+}

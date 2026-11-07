@@ -80,6 +80,10 @@ const CLOSE_SERVICE_RESTART: u16 = 1012;
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const TURN_STATE: &str = "x-codex-turn-state";
 
+/// The error a `generate: false` prewarm gets under Home before this connection's first
+/// pick, when no credential or transport is known yet.
+const HOME_PREWARM_UNSUPPORTED: &str = "response.create with generate: false (prewarm) is not supported before Home selects a credential for this connection: the serving transport is unknown, and the proxy does not invent a response. Send the first request without generate: false.";
+
 /// The error a `generate: false` prewarm gets when only the HTTP fallback can serve it.
 const CODEX_PREWARM_UNSUPPORTED: &str = "response.create with generate: false (prewarm) is not supported for Codex credentials without websockets: there is no upstream socket to prewarm, and the proxy does not invent a response. Enable websockets on the Codex credential, or send the request without generate: false.";
 // ponytail: gorilla reads messages of any size; 64 MiB (the HTTP body cap) bounds
@@ -281,8 +285,11 @@ impl Failure {
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
             // event is added.
+            // Also an upstream executor error that a Home round ended with a retry hint:
+            // a native turn's frame still reaches the client as sent.
             dispatch::Failure::Remote { error: e, .. } => Self {
                 limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
+                delivered: delivered(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -913,6 +920,14 @@ impl Connection {
             && CodexExecutor::upstream_websocket(&pinned)
         {
             use_upstream_ws = matches!(pinned.provider.to_ascii_lowercase().as_str(), "codex" | "xai");
+        } else if self.mode == Mode::Websocket
+            && let Some(upstream) = self.credential(&self.upstream_auth)
+            && CodexExecutor::upstream_websocket(&upstream)
+        {
+            // A Home pick serves this connection on an upstream socket but was not
+            // pinned (its credential is known only once Home kept the pick): the turn
+            // still belongs to that socket, never to a local answer.
+            use_upstream_ws = matches!(upstream.provider.to_ascii_lowercase().as_str(), "codex" | "xai");
         }
         let native = self.mode == Mode::Websocket
             && use_upstream_ws
@@ -941,12 +956,22 @@ impl Connection {
             };
 
         let is_prewarm = !use_upstream_ws && requests::is_local_prewarm(&payload);
-        if is_prewarm && self.codex_may_serve(&request_model) {
+        let home_unknown = self.rt.remote_dispatch().is_some()
+            && self.credential(&self.pinned).is_none()
+            && self.credential(&self.upstream_auth).is_none();
+        if is_prewarm && (home_unknown || self.codex_may_serve(&request_model)) {
             // Go answers this prewarm locally with a made-up response. A Codex credential
             // without an upstream socket has no provider prewarm to forward, and a Codex
-            // client must never receive output no provider produced (#24). The request
-            // fails; the connection stays open.
-            let frame = error_payload(400, CODEX_PREWARM_UNSUPPORTED, None);
+            // client must never receive output no provider produced (#24). Under Home,
+            // before the first pick, the serving credential and its transport are unknown,
+            // so the prewarm cannot be forwarded or answered either. The request fails;
+            // the connection stays open.
+            let message = if home_unknown {
+                HOME_PREWARM_UNSUPPORTED
+            } else {
+                CODEX_PREWARM_UNSUPPORTED
+            };
+            let frame = error_payload(400, message, None);
             return match send_text(socket, frame).await {
                 true => Flow::Next,
                 false => Flow::End,
