@@ -202,16 +202,18 @@ async fn upstream_socket<S: AsyncRead + AsyncWrite + Unpin>(up: Arc<Upstream>, m
             let _ = write_frame(&mut socket, 0x1, event.as_str().unwrap().as_bytes()).await;
         }
         let then = reply["then"].as_str().unwrap_or_default();
-        if !then.is_empty() {
+        // `*_now` ends the socket right after the events, while the proxy may still be
+        // delivering them; the others wait first.
+        if !then.is_empty() && !then.ends_with("_now") {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         let close = |code: u16, reason: &str| [&code.to_be_bytes()[..], reason.as_bytes()].concat();
         match then {
-            "close" => {
+            "close" | "close_now" => {
                 let _ = write_frame(&mut socket, 0x8, &close(1000, "bye")).await;
                 return;
             }
-            "close1009" => {
+            "close1009" | "close1009_now" => {
                 let _ = write_frame(&mut socket, 0x8, &close(1009, "too big")).await;
                 return;
             }
@@ -219,7 +221,7 @@ async fn upstream_socket<S: AsyncRead + AsyncWrite + Unpin>(up: Arc<Upstream>, m
                 let _ = write_frame(&mut socket, 0x8, &close(1009, " oversized ")).await;
                 return;
             }
-            "drop" => return,
+            "drop" | "drop_now" => return,
             _ => {}
         }
     }
@@ -929,7 +931,7 @@ mod context_window {
         turn_as(name, Some(CODEX_UA), transport, events, read, frames).await;
     }
 
-    async fn turn_paused(name: &str, events: &[&str], frames: Vec<Value>, pause_ms: u64) {
+    async fn turn_paused(name: &str, events: &[&str], frames: Vec<Value>, pause_ms: u64, then: Option<&str>) {
         turn_with(
             name,
             Some(CODEX_UA),
@@ -938,7 +940,7 @@ mod context_window {
             "close",
             frames,
             Some(pause_ms),
-            None,
+            then,
         )
         .await;
     }
@@ -1002,7 +1004,7 @@ mod context_window {
             rt.store().cooldowns(&credential.id)
         );
         // A steering failure after `response.created` leaves the attempt open.
-        if read == "close" && then.is_none() {
+        if read == "close" && (then.is_none() || !matches!(transport, Transport::Steering)) {
             assert_eq!(
                 (rt.store().stats().success, rt.store().stats().failure),
                 (0, 1),
@@ -1107,7 +1109,7 @@ mod context_window {
     /// client that reads slowly still gets the whole event, and no generic error after
     /// it. The event is larger than the socket buffers, so its write waits for the
     /// client while the session's loss would already close the connection.
-    async fn slow_client(name: &str, events: &[&str]) {
+    async fn slow_client(name: &str, events: &[&str], then: Option<&str>) {
         let message = format!(
             "Your input exceeds the context window of this model. {}",
             "x".repeat(8 << 20)
@@ -1122,19 +1124,40 @@ mod context_window {
             .collect();
         let mut frames: Vec<Value> = events.iter().map(|e| text(e)).collect();
         frames.push(closed());
-        turn_paused(name, &events, frames, 300).await;
+        turn_paused(name, &events, frames, 300, then).await;
     }
 
     /// Inside the bootstrap window, where `response.created` is held.
     #[tokio::test]
     async fn ws_slow_client_in_bootstrap() {
-        slow_client("ws_slow_client_bootstrap", &[CREATED, FAILED]).await;
+        slow_client("ws_slow_client_bootstrap", &[CREATED, FAILED], None).await;
     }
 
     /// After the bootstrap window.
     #[tokio::test]
     async fn ws_slow_client_after_output() {
-        slow_client("ws_slow_client_stream", &[CREATED, DELTA, FAILED]).await;
+        slow_client("ws_slow_client_stream", &[CREATED, DELTA, FAILED], None).await;
+    }
+
+    /// The upstream ends its socket right after the event (a normal close, a 1009 close,
+    /// or no close frame): the reader sees the end while the event is still queued for
+    /// the turn or being written to the client. The event still arrives whole, followed
+    /// by no error of the socket's end, and the scheduler still sees the classified
+    /// failure.
+    #[tokio::test]
+    async fn ws_slow_client_upstream_ends_in_bootstrap() {
+        let events = [CREATED, FAILED];
+        slow_client("ws_slow_client_bootstrap_1009", &events, Some("close1009_now")).await;
+        slow_client("ws_slow_client_bootstrap_close", &events, Some("close_now")).await;
+        slow_client("ws_slow_client_bootstrap_drop", &events, Some("drop_now")).await;
+    }
+
+    #[tokio::test]
+    async fn ws_slow_client_upstream_ends_after_output() {
+        let events = [CREATED, DELTA, FAILED];
+        slow_client("ws_slow_client_stream_1009", &events, Some("close1009_now")).await;
+        slow_client("ws_slow_client_stream_close", &events, Some("close_now")).await;
+        slow_client("ws_slow_client_stream_drop", &events, Some("drop_now")).await;
     }
 
     /// Go's generic error frame for a client that is not Codex, on both transports.

@@ -138,6 +138,14 @@ pub(crate) struct Link {
     active: Option<mpsc::Sender<Read>>,
     /// Why the reader stopped (`upstreamDisconnectError`); set once when it exits.
     pub(crate) lost: Option<ExecError>,
+    /// The active turn gives a Codex client a context-window `response.failed` unchanged
+    /// and ends with it (`Turn::invalidate_after_event`); not a duplex turn, whose
+    /// connection survives that event.
+    preserves: bool,
+    /// The loss the reader left unreported because the event it last delivered to the
+    /// turn is such a failure: the turn reports its own error after the event instead,
+    /// or this loss if it ends some other way.
+    deferred: Option<ExecError>,
     /// Response IDs this socket already finished (`terminalResponseIDs`): a late
     /// `response.interrupt` for one is done, not an error and not forwarded.
     // ponytail: grows by one ID per finished response for the socket's life, as Go's
@@ -222,14 +230,18 @@ impl Upstream {
         }
     }
 
-    pub(crate) fn activate(&self) -> mpsc::Receiver<Read> {
+    /// The read channel for the next turn. `preserves`: see [`Link::preserves`].
+    pub(crate) fn activate(&self, preserves: bool) -> mpsc::Receiver<Read> {
         let (tx, rx) = mpsc::channel(TURN_BUFFER);
         let mut link = self.link.lock().expect("link");
         match &link.lost {
             Some(error) => {
                 let _ = tx.try_send(Read::Failed(turn_error(error)));
             }
-            None => link.active = Some(tx),
+            None => {
+                link.active = Some(tx);
+                link.preserves = preserves;
+            }
         }
         rx
     }
@@ -895,6 +907,7 @@ impl Drop for Turn {
     fn drop(&mut self) {
         // An abandoned turn keeps its session until an observation it started returns,
         // as Go's executor holds the session lock through the synchronous observer.
+        self.report_deferred();
         let conn = self.conn.clone();
         crate::ws_observation::release_after(self.observing.take(), self._turn.take(), move || conn.deactivate());
     }
@@ -915,6 +928,7 @@ impl Turn {
         let text = match self.rx.recv().await {
             Some(Read::Text(text)) => text,
             Some(Read::Failed(error)) => {
+                self.report_deferred();
                 return Frame::Failed {
                     error,
                     overload: false,
@@ -1038,11 +1052,31 @@ impl Turn {
     /// now, but reports the session's loss only when the returned error is taken, after
     /// the event. The downstream handler closes the connection with a generic error as
     /// soon as the loss is reported, which would cut off a slow write of the event.
+    ///
+    /// The reader may already have dropped the socket and left its loss unreported for
+    /// this (`Link::deferred`); this turn's error replaces it, so a socket that closes
+    /// right after the event neither cuts the event off nor masks its classification.
+    /// The socket is dropped before the link is updated: a reader exiting in between
+    /// either finds the socket gone, or defers a loss that is then discarded here.
     fn invalidate_after_event(&self, error: ExecError) -> AfterEvent {
         self.invalidate(&error, false);
+        {
+            let mut link = self.conn.link.lock().expect("link");
+            link.preserves = false;
+            link.deferred = None;
+        }
         AfterEvent {
             session: self.session.clone(),
             error,
+        }
+    }
+
+    /// Reports a loss the reader left to this turn (`Link::deferred`): before the turn
+    /// returns the reader's error, or when it ends without the event's own error.
+    fn report_deferred(&self) {
+        let deferred = self.conn.link.lock().expect("link").deferred.take();
+        if let Some(error) = deferred {
+            self.session.notify(&error);
         }
     }
 
@@ -1351,7 +1385,8 @@ impl CodexExecutor {
             wire.ws_handshake(101, handshake);
         }
         let started = Instant::now();
-        let mut rx = conn.activate();
+        let preserves = steering.is_none() && request::codex_client(&req);
+        let mut rx = conn.activate(preserves);
         let mut restore = conn.restores(optimized, conflict);
         if let Err(error) = conn.send(frame.clone()).await {
             wire.ws_exec_error("send", &error);
@@ -1377,7 +1412,7 @@ impl CodexExecutor {
                 }
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
-            rx = fresh.activate();
+            rx = fresh.activate(preserves);
             restore = fresh.restores(optimized, conflict);
             wire.ws_request(&target.url, &headers, frame.as_bytes());
             if let Some(handshake) = &fresh_handshake {
@@ -1469,6 +1504,8 @@ pub(crate) async fn read_loop(
     conn: Arc<Upstream>,
     idle: Duration,
 ) {
+    // The last text delivered is a context-window failure for a turn that preserves it.
+    let mut held = false;
     let error = 'read: loop {
         let deadline = tokio::time::Instant::now() + idle;
         let text = loop {
@@ -1502,27 +1539,37 @@ pub(crate) async fn read_loop(
         // Terminal IDs are recorded before delivery: the handler may still be forwarding
         // the turn after its read channel was released.
         let terminal = terminal_response_id(text.trim());
-        let active = {
+        let (active, preserves) = {
             let mut link = conn.link.lock().expect("link");
             if let Some(id) = terminal {
                 link.terminal.insert(id);
             }
-            link.active.clone()
+            (link.active.clone(), link.preserves)
         };
+        held = false;
         if let Some(tx) = active {
+            let failure = preserves && cpa_common::codex_client::is_context_window_failure(text.trim().as_bytes());
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
-            let _ = tx.send(Read::Text(text)).await;
+            held = tx.send(Read::Text(text)).await.is_ok() && failure;
         }
     };
-    let active = {
+    let (active, defer) = {
         let mut link = conn.link.lock().expect("link");
         link.lost = Some(error.clone());
-        link.active.clone()
+        // The turn has yet to give its client the context-window failure it was handed:
+        // reporting the loss now would close the client before the event or replace its
+        // classified error (Go v8.0.35 replaces the event anyway). The turn reports.
+        let defer = held && link.preserves && link.active.is_some();
+        if defer {
+            link.deferred = Some(error.clone());
+        }
+        (link.active.clone(), defer)
     };
-    // The session records the loss before the turn reads its error, so a handler that
-    // sees the turn fail also finds the loss (Go's notifier closes the client first).
+    // Otherwise the session records the loss before the turn reads its error, so a
+    // handler that sees the turn fail also finds the loss (Go's notifier closes the
+    // client first).
     match session.upgrade() {
-        Some(session) => session.invalidate(&conn, &error, true),
+        Some(session) => session.invalidate(&conn, &error, !defer),
         None => conn.deactivate(),
     }
     if let Some(tx) = active {

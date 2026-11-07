@@ -272,7 +272,7 @@ async fn a_turn_activating_after_the_reader_stopped_gets_its_error() {
         })
         .await
         .unwrap_or_else(|_| panic!("{name}: the disconnect was not processed"));
-        let mut reads = conn.activate();
+        let mut reads = conn.activate(false);
         let read = tokio::time::timeout(Duration::from_secs(1), reads.recv())
             .await
             .unwrap_or_else(|_| panic!("{name}: activation waited"));
@@ -1295,7 +1295,7 @@ async fn interrupt_needs_a_turn_reading_on_the_socket() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(up.frames.lock().unwrap().is_empty(), "the idle socket was written");
 
-    let _reads = conn.activate();
+    let _reads = conn.activate(false);
     let mut checked = Vec::new();
     let check = |id: &str| {
         checked.push(id.to_owned());
@@ -1326,7 +1326,7 @@ async fn interrupt_for_a_response_finished_during_the_auth_check_is_done() {
     let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED])]).await;
     let executor = CodexExecutor::new().unwrap();
     let conn = pooled(&executor, &url).await;
-    let mut reads = conn.activate();
+    let mut reads = conn.activate(false);
     conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
     read_text(&mut reads).await;
     read_text(&mut reads).await;
@@ -1376,7 +1376,7 @@ async fn late_interrupts_for_finished_responses_are_done() {
                     .await
             }
         };
-        let mut reads = conn.activate();
+        let mut reads = conn.activate(false);
         conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
         read_text(&mut reads).await;
         read_text(&mut reads).await;
@@ -1390,7 +1390,7 @@ async fn late_interrupts_for_finished_responses_are_done() {
             "{terminal}: unknown"
         );
 
-        let mut reads = conn.activate();
+        let mut reads = conn.activate(false);
         assert_eq!(send("r1").await, Ok(()), "{terminal}: r1 while r2 runs");
         assert_eq!(send("r2").await, Ok(()), "{terminal}: active r2");
         read_text(&mut reads).await;
@@ -1411,6 +1411,42 @@ async fn late_interrupts_for_finished_responses_are_done() {
             send("r2").await,
             Err(InterruptError::NoActive),
             "{terminal}: lost socket"
+        );
+    }
+}
+
+/// A socket that ends right after a context-window failure, while the turn has yet to
+/// give it to a Codex client: the reader drops the socket but leaves the loss to the
+/// turn, which reports its own error after the event. After any other event, or for a
+/// turn that does not preserve the failure, the reader reports the loss at once.
+#[tokio::test]
+async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() {
+    const CONTEXT: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+    for (preserves, last, deferred) in [(true, CONTEXT, true), (false, CONTEXT, false), (true, CREATED, false)] {
+        let (_up, url) = upstream(vec![Act::SendClose(vec![last], 1000)]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let conn = pooled(&executor, &url).await;
+        let mut reads = conn.activate(preserves);
+        conn.send(r#"{"type":"response.create"}"#.into()).await.unwrap();
+        assert_eq!(read_text(&mut reads).await, last);
+        // The reader's own error follows the event and comes after its decision.
+        let after = tokio::time::timeout(Duration::from_secs(5), reads.recv()).await;
+        assert!(
+            matches!(after, Ok(Some(Read::Failed(_)))),
+            "{preserves} {last}: no read error"
+        );
+        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.closed("conn-1"))
+            .await
+            .is_ok();
+        assert_eq!(reported, !deferred, "{preserves} {last}: loss reported by the reader");
+        assert_eq!(
+            conn.link.lock().expect("link").deferred.is_some(),
+            deferred,
+            "{preserves} {last}"
+        );
+        assert!(
+            executor.ws.session("conn-1").current().is_none(),
+            "{preserves} {last}: socket kept"
         );
     }
 }
