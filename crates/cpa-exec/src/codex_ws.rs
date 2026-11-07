@@ -143,8 +143,8 @@ pub(crate) struct Link {
     /// connection survives that event.
     preserves: bool,
     /// The loss the reader left unreported because the event it last delivered to the
-    /// turn is such a failure: the turn reports its own error after the event instead,
-    /// or this loss if it ends some other way.
+    /// turn is such a failure: the turn's own error after the event replaces it, and the
+    /// turn reports this loss only if it ends some other way.
     deferred: Option<ExecError>,
     /// Response IDs this socket already finished (`terminalResponseIDs`): a late
     /// `response.interrupt` for one is done, not an error and not forwarded.
@@ -1047,26 +1047,22 @@ impl Turn {
     }
 
     /// For a failure the client first receives as the upstream's event: drops the socket
-    /// now, but reports the session's loss only when the returned error is taken, after
-    /// the event. The downstream handler closes the connection with a generic error as
-    /// soon as the loss is reported, which would cut off a slow write of the event.
+    /// without reporting the session's loss, now or later. The turn's own error follows
+    /// the event at once and ends the downstream connection (the Responses WebSocket
+    /// handler takes it before writing the event, so an interrupt or a client leaving
+    /// during that write cannot replace it); a loss reported meanwhile would close the
+    /// client with a generic error and cut off a slow write of the event.
     ///
     /// The reader may already have dropped the socket and left its loss unreported for
     /// this (`Link::deferred`); this turn's error replaces it, so a socket that closes
     /// right after the event neither cuts the event off nor masks its classification.
     /// The socket is dropped before the link is updated: a reader exiting in between
     /// either finds the socket gone, or defers a loss that is then discarded here.
-    fn invalidate_after_event(&self, error: ExecError) -> AfterEvent {
-        self.invalidate(&error, false);
-        {
-            let mut link = self.conn.link.lock().expect("link");
-            link.preserves = false;
-            link.deferred = None;
-        }
-        AfterEvent {
-            session: self.session.clone(),
-            error,
-        }
+    fn invalidate_after_event(&self, error: &ExecError) {
+        self.invalidate(error, false);
+        let mut link = self.conn.link.lock().expect("link");
+        link.preserves = false;
+        link.deferred = None;
     }
 
     /// Reports a loss the reader left to this turn (`Link::deferred`): before the turn
@@ -1102,33 +1098,19 @@ impl Turn {
     }
 }
 
-/// A turn's error that follows the upstream event a Codex client received unchanged
-/// (`Turn::invalidate_after_event`).
-struct AfterEvent {
-    session: Arc<Session>,
-    error: ExecError,
-}
-
-impl AfterEvent {
-    fn take(self) -> ExecError {
-        self.session.notify(&self.error);
-        self.error
-    }
-}
-
 /// The rest of a turn as a stream; ends after the terminal event or the first error
 /// (preceded by the upstream event a Codex client receives unchanged).
 fn rest(turn: Turn) -> ExecStream {
     enum State {
         // Boxed: one allocation per turn keeps the other states small.
         Reading(Box<Turn>),
-        Failing(AfterEvent),
+        Failing(ExecError),
         Done,
     }
     futures_util::stream::unfold(State::Reading(Box::new(turn)), |state| async move {
         let mut turn = match state {
             State::Reading(turn) => turn,
-            State::Failing(failure) => return Some((Err(failure.take()), State::Done)),
+            State::Failing(error) => return Some((Err(error), State::Done)),
             State::Done => return None,
         };
         loop {
@@ -1142,7 +1124,8 @@ fn rest(turn: Turn) -> ExecStream {
                     // `event` comes only with an upstream failure event, never with a
                     // read failure (`read`), whose reader already dropped the socket.
                     if let Some(event) = event {
-                        return Some((Ok(event), State::Failing(turn.invalidate_after_event(error))));
+                        turn.invalidate_after_event(&error);
+                        return Some((Ok(event), State::Failing(error)));
                     }
                     if !read {
                         turn.invalidate(&error, true);
@@ -1192,10 +1175,10 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     return Err(response::bootstrap_overload(&body));
                 }
                 if let Some(event) = event {
+                    turn.invalidate_after_event(&error);
                     held.push(Ok(event));
-                    let failure = turn.invalidate_after_event(error);
-                    let error = futures_util::stream::once(async move { Err(failure.take()) });
-                    return Ok(futures_util::stream::iter(held).chain(error).boxed());
+                    held.push(Err(error));
+                    return Ok(futures_util::stream::iter(held).boxed());
                 }
                 turn.invalidate(&error, true);
                 held.push(Err(error));
@@ -1573,7 +1556,7 @@ pub(crate) async fn read_loop(
         link.lost = Some(error.clone());
         // The turn has yet to give its client the context-window failure it was handed:
         // reporting the loss now would close the client before the event or replace its
-        // classified error (Go v8.0.35 replaces the event anyway). The turn reports.
+        // classified error (Go v8.0.35 replaces the event anyway). The turn decides.
         let defer = held && link.preserves && link.active.is_some();
         if defer {
             link.deferred = Some(error.clone());

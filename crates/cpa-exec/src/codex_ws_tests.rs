@@ -1426,7 +1426,7 @@ async fn late_interrupts_for_finished_responses_are_done() {
 
 /// A socket that ends right after a context-window failure, while the turn has yet to
 /// give it to a Codex client: the reader drops the socket but leaves the loss to the
-/// turn, which reports its own error after the event. After any other event, or for a
+/// turn, whose own error after the event replaces it. After any other event, or for a
 /// turn that does not preserve the failure, the reader reports the loss at once.
 #[tokio::test]
 async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() {
@@ -1547,16 +1547,19 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
                 .to_owned()
         };
         assert_eq!(code(error), "context_too_large", "{name}");
-        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1"))
-            .await
-            .unwrap_or_else(|_| panic!("{name}: the session's loss was not reported"));
-        // For other clients a close right after the event can be the loss, as in Go.
+        // A Codex client's turn ends its connection after the event itself: no loss is
+        // reported, not even a close right after the event. For other clients the
+        // classified error, or such a close, is the loss, as in Go.
         if codex_client {
-            assert_eq!(
-                code(&loss),
-                "context_too_large",
-                "{name}: the loss is the classified error"
+            assert!(
+                executor.ws.loss("conn-1").is_none(),
+                "{name}: a loss was reported: {:?}",
+                executor.ws.loss("conn-1").map(|l| code(&l))
             );
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1"))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: the session's loss was not reported"));
         }
     }
 }

@@ -455,8 +455,16 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
 async fn context_window_failure_reaches_the_client_as_its_own_code() {
     let failed = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null}}"#;
     let created = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}"#;
-    let auth_dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&auth_dir).unwrap();
+    type Case<'a> = (&'a [&'a str], &'a str, &'a str, &'a str, bool, u16);
+    /// A private `auth-dir`, removed even when an assertion fails.
+    struct AuthDir(std::path::PathBuf);
+    impl Drop for AuthDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let auth_dir = AuthDir(std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&auth_dir.0).unwrap();
     let codex_ua = "codex_cli_rs/0.200.0 (Linux; x86_64)";
     // The ChatGPT Codex backend's live rejection: an `error` event without a status, which
     // Codex ignores; a Codex client gets it as the `response.failed` Codex compacts on.
@@ -465,20 +473,45 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_0565bda653e9b5da016aee80a2d70487d18b1c1858bc049dcf","object":"response","status":"failed","#,
         r#""error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","param":"input","code":"context_length_exceeded"}}}"#
     );
-    // (upstream events, client path, user agent, the failure event a Codex client gets)
-    let cases: [(&[&str], &str, &str, &str); 7] = [
-        (&[created, failed], "/v1/responses", codex_ua, failed),
-        (&[failed], "/v1/responses", codex_ua, failed),
-        (&[live], "/v1/responses", codex_ua, live_failed),
-        (&[created, live], "/v1/responses", codex_ua, live_failed),
-        (&[created, failed], "/v1/responses", "openai-node/5", ""),
-        (&[live], "/v1/responses", "openai-node/5", ""),
-        (&[created, failed], "/v1/chat/completions", "openai-node/5", ""),
+    // (upstream events, client path, user agent, the failure event a Codex client gets,
+    // SSE `event:` lines, HTTP status). For other clients a failure first on the stream
+    // fails the stream's start (HTTP 400 with the classified error), with or without an
+    // `event:` line before its data, as before this change; a Codex client gets a 200
+    // stream with the event instead.
+    let cases: &[Case] = &[
+        (&[created, failed], "/v1/responses", codex_ua, failed, true, 200),
+        (&[failed], "/v1/responses", codex_ua, failed, true, 200),
+        (&[live], "/v1/responses", codex_ua, live_failed, true, 200),
+        (&[created, live], "/v1/responses", codex_ua, live_failed, true, 200),
+        (&[failed], "/v1/responses", codex_ua, failed, false, 200),
+        (&[live], "/v1/responses", codex_ua, live_failed, false, 200),
+        (&[created, failed], "/v1/responses", codex_ua, failed, false, 200),
+        (&[created, failed], "/v1/responses", "openai-node/5", "", true, 200),
+        (&[failed], "/v1/responses", "openai-node/5", "", true, 400),
+        (&[live], "/v1/responses", "openai-node/5", "", true, 400),
+        (&[failed], "/v1/responses", "openai-node/5", "", false, 400),
+        (&[live], "/v1/responses", "openai-node/5", "", false, 400),
+        (&[created, failed], "/v1/responses", "openai-node/5", "", false, 200),
+        // Chat Completions shows nothing before the first output, so it fails the start.
+        (
+            &[created, failed],
+            "/v1/chat/completions",
+            "openai-node/5",
+            "",
+            true,
+            400,
+        ),
     ];
-    for (events, path, ua, want) in cases {
+    for &(events, path, ua, want, named, want_status) in cases {
         let sse: String = events
             .iter()
-            .map(|e| format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str()))
+            .map(|e| {
+                if named {
+                    format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str())
+                } else {
+                    format!("data: {e}\n\n")
+                }
+            })
             .collect();
         let app = axum::Router::new().fallback(move || {
             let sse = sse.clone();
@@ -498,7 +531,7 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         ] {
             credential.attributes.insert(k.into(), v.into());
         }
-        let config = format!("auth-dir: {}\n", auth_dir.display());
+        let config = format!("auth-dir: {}\n", auth_dir.0.display());
         let rt = Arc::new(cpa_server::testing::runtime(
             Config::parse(&config).unwrap(),
             vec![cpa_server::testing::local(credential)],
@@ -526,7 +559,8 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
             .unwrap();
         let status = response.status().as_u16();
         let text = response.text().await.unwrap();
-        let case = format!("{path} {ua} {events:?}");
+        let case = format!("{path} {ua} named={named} {events:?}");
+        assert_eq!(status, want_status, "{case}: {text}");
         let errors: Vec<Value> = text
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
@@ -534,12 +568,14 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
             .filter(|v| v["type"] == "response.failed" || v["type"] == "error" || v.get("error").is_some())
             .collect();
         if ua == codex_ua {
-            assert_eq!(status, 200, "{case}: {text}");
             assert_eq!(errors.len(), 1, "{case}: one failure event: {text}");
-            assert!(
-                text.contains(&format!("event: response.failed\ndata: {want}\n")),
-                "{case}: {text}"
-            );
+            // Named only when upstream named its events.
+            let line = if named {
+                format!("event: response.failed\ndata: {want}\n")
+            } else {
+                format!("data: {want}\n")
+            };
+            assert!(text.contains(&line), "{case}: {text}");
         } else {
             // Go's classified error, unchanged.
             assert!(!text.contains("context_length_exceeded"), "{case}: {text}");
@@ -559,5 +595,4 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         proxy.abort();
         upstream.abort();
     }
-    let _ = std::fs::remove_dir_all(&auth_dir);
 }

@@ -972,9 +972,8 @@ mod context_window {
             Transport::Steering => ("host: \"\"\ncodex:\n  response-steering: true\n", true),
             Transport::Http => ("host: \"\"\n", false),
         };
-        let auth_dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&auth_dir).unwrap();
-        let config = format!("auth-dir: {}\n{config}", auth_dir.display());
+        let auth_dir = AuthDir::new();
+        let config = format!("auth-dir: {}\n{config}", auth_dir.0.display());
         let mut attributes = json!({ "api_key": "sk-fake-ctx" });
         if websockets {
             attributes["websockets"] = json!("true");
@@ -1011,7 +1010,23 @@ mod context_window {
                 "{name}: one failed attempt"
             );
         }
-        let _ = std::fs::remove_dir_all(&auth_dir);
+    }
+
+    /// A private `auth-dir`, removed even when an assertion fails.
+    struct AuthDir(std::path::PathBuf);
+
+    impl AuthDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("cpa-it-auth-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for AuthDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn text(payload: &str) -> Value {
