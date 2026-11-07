@@ -452,7 +452,8 @@ fn strict_tool_choice(
         .iter()
         .map(|n| n.bytes().into_owned())
         .collect();
-    let declared: Vec<Vec<u8>> = names.keys().cloned().collect();
+    // `names` holds every declared function; the set makes coverage one pass.
+    let allowed_set: std::collections::HashSet<&[u8]> = allowed.iter().map(Vec::as_slice).collect();
     let mode = config.get("mode");
     let mode = if mode.kind == Kind::String {
         go_lower(trim_space(&mode.s))
@@ -467,10 +468,11 @@ fn strict_tool_choice(
             gj::set_str(out, "tool_choice", "auto");
         }
         b"any" => {
-            if allowed.is_empty() || declared.iter().all(|d| allowed.contains(d)) {
-                gj::set_str(out, "tool_choice", "required");
-            } else if allowed.iter().any(|a| !declared.contains(a)) {
+            // An undeclared name is refused first, even when the rest covers every function.
+            if allowed.iter().any(|a| !names.contains_key(a)) {
                 drops.drop_part("allowedFunctionNames entry naming no declared function");
+            } else if allowed.is_empty() || names.keys().all(|d| allowed_set.contains(d.as_slice())) {
+                gj::set_str(out, "tool_choice", "required");
             } else if let [only] = allowed.as_slice() {
                 let mut choice = br#"{"type":"function","name":""}"#.to_vec();
                 gj::set_str(&mut choice, "name", mapped_name(names, only));

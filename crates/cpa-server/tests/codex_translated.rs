@@ -1024,3 +1024,62 @@ async fn failed_tool_results_are_refused() {
         assert_eq!(status, 200, "{content}: an ordinary result: {answer}");
     }
 }
+
+/// Gemini tool restrictions over many functions (codex review r4502075020): every
+/// declared name allowed is unrestricted `required`; all but one is an `allowed_tools`
+/// subset in the client's order; every declared name plus one undeclared name is refused,
+/// not widened to `required`.
+#[tokio::test]
+async fn wide_gemini_tool_restrictions_keep_their_meaning() {
+    let n = 2_000;
+    let names: Vec<String> = (0..n).map(|i| format!("tool_{i}")).collect();
+    let request = |allowed: &[String]| {
+        let declarations: Vec<Value> = names
+            .iter()
+            .map(|name| json!({"name": name, "parameters": {"type": "OBJECT", "properties": {}}}))
+            .collect();
+        json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "tools": [{"functionDeclarations": declarations}],
+            "tool_config": {"function_calling_config": {"mode": "ANY", "allowed_function_names": allowed}}
+        })
+    };
+    let path = "/v1beta/models/gpt-5.5:generateContent";
+
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, path, &request(&names)).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        sent(&proxy)["tool_choice"],
+        "required",
+        "every declared function allowed"
+    );
+
+    let mut subset: Vec<String> = names[1..].to_vec();
+    subset.reverse();
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, path, &request(&subset)).await;
+    assert_eq!(status, 200, "{answer}");
+    let choice = sent(&proxy)["tool_choice"].clone();
+    assert_eq!(choice["type"], "allowed_tools");
+    assert_eq!(choice["mode"], "required");
+    let listed: Vec<&str> = choice["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed,
+        subset.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the client's order"
+    );
+
+    let mut unknown = names.clone();
+    unknown.push("not_declared".into());
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, path, &request(&unknown)).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer.contains("naming no declared function"), "{answer}");
+    assert!(proxy.upstream.http().is_empty(), "nothing was sent");
+}
