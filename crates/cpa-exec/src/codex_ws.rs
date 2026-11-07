@@ -45,7 +45,7 @@ pub(crate) type WebSocket = WebSocketStream<Inflate<wreq::Upgraded>>;
 use crate::codex::CodexExecutor;
 use crate::codex_json::{set_raw, set_str};
 use crate::codex_quota::{self, QuotaSignals};
-use crate::codex_request::{self as request, Call, Settings, View};
+use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response::{self as response, OutputItems};
 use crate::proxy::Proxy;
 use crate::ws_cause;
@@ -235,9 +235,6 @@ pub(crate) struct Upstream {
     pub(crate) sink: tokio::sync::Mutex<SplitSink<WebSocket, Message>>,
     pub(crate) link: Mutex<Link>,
     pub(crate) reader: Mutex<Option<tokio::task::AbortHandle>>,
-    /// The last request that touched the `collaboration` namespace on this socket renamed
-    /// it (`multiAgentV2OptimizedConn`): later continuations restore upstream names too.
-    multi_agent: std::sync::atomic::AtomicBool,
     /// The Home pick this socket keeps (Go `session.lifecycle`); `true` once the socket
     /// shut down, after which no pick binds.
     lease: Mutex<(bool, Option<SessionLease>)>,
@@ -253,22 +250,8 @@ impl Upstream {
             sink: tokio::sync::Mutex::new(sink),
             link: Mutex::default(),
             reader: Mutex::default(),
-            multi_agent: Default::default(),
             lease: Mutex::default(),
         })
-    }
-
-    /// `!conflict && (optimized || isMultiAgentV2Optimized(conn))`.
-    fn restores(&self, optimized: bool, conflict: bool) -> bool {
-        !conflict && (optimized || self.multi_agent.load(std::sync::atomic::Ordering::Acquire))
-    }
-
-    /// `setMultiAgentV2Optimized` after a request that optimized or conflicted.
-    fn note_multi_agent(&self, optimized: bool, conflict: bool) {
-        if optimized || conflict {
-            self.multi_agent
-                .store(optimized && !conflict, std::sync::atomic::Ordering::Release);
-        }
     }
 
     /// The read channel for the next turn. `preserves`: see [`Link::preserves`].
@@ -840,28 +823,6 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
     Ok(crate::xai_url::string(&parsed))
 }
 
-/// A WebSocket turn's body after the prompt cache key, in Go's order:
-/// `SanitizeCodexInputItemIDs`, `applyCodexSIWCWebsocketBodyRules` (the id pass sees
-/// the `configuration_update` items the SIWC rules then drop), then the payload rules.
-pub(crate) fn turn_body(
-    view: &View<'_>,
-    req: &ExecRequest,
-    settings: &Settings,
-    finalize: &request::Finalizer,
-    body: String,
-) -> String {
-    let mut body = request::sanitize_input_ids(body);
-    if view.siwc {
-        body = request::siwc_request_body(body, req, Call::Websocket);
-    }
-    finalize.apply(req, settings, body)
-}
-
-/// `frameCodexWebsocketRequestBody`: every turn is a `response.create`.
-fn request_frame(body: String) -> String {
-    set_str(&body, "type", "response.create")
-}
-
 /// `buildCodexWebsocketErrorPayload` for an `error` frame with a positive status: the
 /// status and the body Go classifies (and clears the reasoning replay with).
 fn ws_error_body(payload: &str) -> Option<(u16, String)> {
@@ -974,9 +935,6 @@ struct Turn {
     observing: Option<crate::ws_observation::Observation>,
     items: OutputItems,
     saw_delta: bool,
-    native: bool,
-    /// A native WebSocket turn (#24): events reach the client as upstream sent them.
-    passthrough: bool,
     /// A Codex client: it gets an upstream context-window rejection as a `response.failed`
     /// before the error (`request::codex_client`).
     codex_client: bool,
@@ -985,8 +943,6 @@ struct Turn {
     credential: String,
     /// Handshake headers plus quota headers from this turn's events.
     observed: HeaderMap,
-    /// The request renamed the `collaboration` namespace (multi-agent v2).
-    restore: bool,
     /// The attempt's usage record.
     usage: cpa_core::exec::UsageSink,
     /// The upstream model, for per-model quota snapshots.
@@ -1059,8 +1015,6 @@ impl Turn {
         self.observe(payload);
         crate::ws_observation::observe(&mut self.observing, self.wire.ws_response_observation(payload)).await;
         let raw_len = payload.len();
-        let payload = response::restore(payload, self.restore);
-        let payload = payload.as_ref();
         if let Some(mut error) = ws_error(payload, self.cooling) {
             self.wire.ws_exec_error("upstream_error", &error);
             self.deliver_as_sent(&mut error, &text);
@@ -1122,27 +1076,10 @@ impl Turn {
         if kind == "response.output_item.done" {
             self.items.collect(payload);
         }
-        if self.passthrough {
-            // Observation above read a copy; the client gets the frame as it arrived.
-            return Frame::Event {
-                raw_len,
-                out: Bytes::from(text),
-                bufferable,
-                terminal,
-                terminal_id,
-                ack,
-            };
-        }
-        let mut out = payload.to_owned();
-        if terminal {
-            out = response::normalize_completion(out);
-            if !self.native {
-                out = self.items.patch(out);
-            }
-        }
+        // Observation above read a copy; the client gets the frame as it arrived.
         Frame::Event {
             raw_len,
-            out: Bytes::from(response::ensure_usage_details(out)),
+            out: Bytes::from(text),
             bufferable,
             terminal,
             terminal_id,
@@ -1150,8 +1087,7 @@ impl Turn {
         }
     }
 
-    /// Quota headers and usage from one upstream event, observed before collaboration
-    /// names are restored (as Go does).
+    /// Quota headers and usage from one upstream event.
     fn observe(&mut self, payload: &str) {
         if let Some(id) = acknowledged_id(payload) {
             self.conn.acknowledged(&id);
@@ -1229,7 +1165,7 @@ impl Turn {
     /// allowlisted subscription-limit event, #6, or a silent close): its frame can name the
     /// pooled account or carry its tokens.
     fn deliver_as_sent(&self, error: &mut ExecError, frame: &str) {
-        if self.passthrough && !account_failure(error.status) {
+        if !account_failure(error.status) {
             error.delivered_event = Some(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
         }
     }
@@ -1550,27 +1486,16 @@ impl CodexExecutor {
         // upstream with only its `model` routed. No shaping, payload rules, prompt-cache
         // key, reasoning replay, ID or namespace edits; nothing is restored on the way
         // back (`docs/codex/CONTRACT.md` "Native WebSocket route").
-        let passthrough = crate::codex::native::route_ws(view, &req).is_some();
-        let (model, body, optimized, conflict, cache) = if passthrough {
-            let model = crate::codex::native::upstream_model(&req)?;
-            let frame = crate::codex::native::routed(&req.body, &model)?;
-            // The frame passed the request boundary, so it is UTF-8.
-            let body = String::from_utf8(frame.to_vec())
-                .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
-            let cache = request::prompt_cache_id(&req, &body, Some(&exec_session.id), true);
-            (model, body, false, false, cache)
-        } else {
-            let model = request::base_model(&req.model).to_owned();
-            let request::Shaped {
-                body,
-                optimized,
-                conflict,
-                finalize,
-            } = request::shape(&req, view, settings, Call::Websocket)?;
-            let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
-            let body = turn_body(view, &req, settings, &finalize, body);
-            (model, body, optimized, conflict, cache)
-        };
+        if crate::codex::native::route_ws(view, &req).is_none() {
+            return Err(crate::codex::native::refused_frame(&req.body));
+        }
+        let model = crate::codex::native::upstream_model(&req)?;
+        let frame = crate::codex::native::routed(&req.body, &model)?;
+        settings.refuse_image_tool(&req.request_path, &frame)?;
+        // The frame passed the request boundary, so it is UTF-8.
+        let body = String::from_utf8(frame.to_vec())
+            .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
+        let cache = request::prompt_cache_id(&req, &body, Some(&exec_session.id), true);
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let native = request::is_native(&req);
         let headers = request::ws_headers(
@@ -1582,11 +1507,7 @@ impl CodexExecutor {
             cache.as_deref(),
             native,
             // A native frame carries the caller's own identity (#26).
-            if passthrough {
-                crate::codex_identity::Origin::Caller
-            } else {
-                crate::codex_identity::Origin::of(&req)
-            },
+            crate::codex_identity::Origin::Caller,
         );
         let target = Target::new(view.credential, ws_url(&format!("{}/responses", view.base_url))?, cfg);
         let session = self.ws.session(&exec_session.id);
@@ -1595,15 +1516,11 @@ impl CodexExecutor {
             .response_steering
             .then(|| session.steering())
             .flatten()
-            .map(|input| {
-                let initial = duplex::Prepared::new(&body, &req.original_body, optimized, conflict, native)
-                    .with_passthrough(passthrough);
-                (input, initial)
-            });
+            .map(|input| (input, duplex::Prepared::new(native)));
         let guard = session.turn.clone().lock_owned().await;
         let model_kept = model_kept(&req.original_body, &body);
         // A native frame is already a `response.create`.
-        let frame = if passthrough { body } else { request_frame(body) };
+        let frame = body;
         let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
         wire.ws_request(&target.url, &headers, frame.as_bytes());
@@ -1630,7 +1547,6 @@ impl CodexExecutor {
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
         let mut rx = conn.activate(preserves);
-        let mut restore = !passthrough && conn.restores(optimized, conflict);
         if let Err(error) = conn.send(frame.clone()).await {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
@@ -1656,7 +1572,6 @@ impl CodexExecutor {
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
             rx = fresh.activate(preserves);
-            restore = !passthrough && fresh.restores(optimized, conflict);
             wire.ws_request(&target.url, &headers, frame.as_bytes());
             if let Some(handshake) = &fresh_handshake {
                 wire.ws_handshake(101, handshake);
@@ -1669,7 +1584,6 @@ impl CodexExecutor {
             conn = fresh;
             handshake = fresh_handshake;
         }
-        conn.note_multi_agent(optimized, conflict);
         let observed = handshake.clone().unwrap_or_default();
         if !observed.is_empty() {
             self.quota_observe(&view.credential.id, &model, &observed);
@@ -1682,14 +1596,11 @@ impl CodexExecutor {
             observing: None,
             items: OutputItems::default(),
             saw_delta: false,
-            native,
-            passthrough,
             codex_client: request::codex_client(&req),
             cooling: settings.model_level_cooling,
             quota: self.quota_handle(),
             credential: view.credential.id.clone(),
             observed,
-            restore,
             usage: req.usage.clone(),
             model: model.clone(),
             wire,
@@ -1699,7 +1610,7 @@ impl CodexExecutor {
         };
         if let Some((input, initial)) = steering {
             // The socket now belongs to this connection; bootstrap buffering does not apply.
-            let stream = duplex::Duplex::start(turn, input, initial, req, view, settings, &exec_session.id).await;
+            let stream = duplex::Duplex::start(turn, input, initial, req, view, settings.image_generation).await;
             return Ok(ExecResponse {
                 status: 200,
                 headers: returned_handshake(handshake, model_kept),

@@ -617,6 +617,31 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #28: a reload that marks a `codex-api-key` model `is-compat` is refused like any
+    /// invalid config: the running config stays, so the obsolete rewrite control never
+    /// reaches a request.
+    #[tokio::test]
+    async fn a_reload_with_a_codex_is_compat_model_keeps_the_running_config() {
+        let (state, dir) = state();
+        let auth = dir.display();
+        let entry = |compat: &str| {
+            format!(
+                "auth-dir: {auth}\ncodex-api-key: [{{api-key: k, base-url: https://x.test, models: [{{name: a, alias: b{compat}}}]}}]\n"
+            )
+        };
+        std::fs::write(&state.path, format!("port: 9201\n{}", entry(""))).unwrap();
+        reload(&state).unwrap();
+        std::fs::write(&state.path, format!("port: 9202\n{}", entry(", is-compat: true"))).unwrap();
+        let error = reload(&state).expect_err("refused");
+        assert!(matches!(error, ReloadError::Invalid(_)), "{error}");
+        assert!(
+            error.to_string().contains("is-compat is no longer supported"),
+            "{error}"
+        );
+        assert_eq!(state.rt.config().port, 9201, "the last good config keeps running");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// One watcher reload as `start` makes it: reload what was observed, then record
     /// what was applied.
     fn step(state: &Management, cache: &mut HashCache, read_config: bool, observed: &Snapshot) -> Snapshot {

@@ -85,6 +85,7 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let model = request::base_model(&req.model).to_owned();
         let body = upstream_body(&req, &model)?;
+        settings.refuse_image_tool(&req.request_path, body.as_bytes())?;
         report_request(&req, Format::Codex, &body);
         // The handshake identity headers follow the native route's rule; #26 owns them.
         let cache = request::prompt_cache_id(&req, &body, None, false);

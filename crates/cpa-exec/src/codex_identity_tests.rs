@@ -44,6 +44,16 @@ fn credential(base_url: &str, api_key: bool, attributes: &[(&str, &str)]) -> Cre
     credential
 }
 
+/// A WebSocket turn as the server hands it over: the client's `response.create` frame.
+fn frame(mut req: ExecRequest) -> ExecRequest {
+    let tagged = cpa_common::codex_body::CodexBody::parse(&req.body)
+        .unwrap()
+        .with_member("type", r#""response.create""#);
+    req.body = Bytes::from(tagged);
+    req.original_body = req.body.clone();
+    req
+}
+
 /// A caller request: `native` is Responses on both sides, otherwise Chat Completions.
 fn request(native: bool, headers: &[(&str, &str)]) -> ExecRequest {
     let (format, body) = if native {
@@ -257,7 +267,7 @@ async fn operator_headers_cannot_bypass_the_policy() {
                     lease: None,
                 };
                 executor
-                    .execute_in_session(&cred, req, &Config::default(), &session)
+                    .execute_in_session(&cred, frame(req), &Config::default(), &session)
                     .await
             } else {
                 executor.execute(&cred, req, &Config::default()).await
@@ -390,7 +400,7 @@ async fn websocket_handshake_follows_the_policy() {
                     lease: None,
                 };
                 let executor = executor();
-                drain(executor.execute_in_session(&cred, req, &cfg, &session).await)
+                drain(executor.execute_in_session(&cred, frame(req), &cfg, &session).await)
                     .await
                     .unwrap();
                 executor.close_session("conn-identity");
@@ -479,7 +489,7 @@ async fn siwc_requests_follow_the_policy_not_the_configured_identifier() {
         let executor = executor();
         drain(
             executor
-                .execute_in_session(&siwc_credential(&url, true), req, &cfg, &session)
+                .execute_in_session(&siwc_credential(&url, true), frame(req), &cfg, &session)
                 .await,
         )
         .await

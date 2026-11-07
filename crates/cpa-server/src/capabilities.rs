@@ -451,7 +451,12 @@ mod tests {
     #[test]
     fn resolved_models_match_go() {
         let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cfg = Config::parse(fixture["resolved_config"].as_str().unwrap()).unwrap();
+        // A `codex-api-key` model can no longer set `is-compat` (#28): the recorded config
+        // loses it, and the Codex cases bind without it.
+        let config = fixture["resolved_config"].as_str().unwrap();
+        let codex_compat = "          alias: sol\n          is-compat: true\n";
+        assert_eq!(config.matches(codex_compat).count(), 1);
+        let cfg = Config::parse(&config.replace(codex_compat, "          alias: sol\n")).unwrap();
         let synthesized = credentials::from_config(&cfg);
         let cases = fixture["resolved"].as_array().unwrap();
         assert_eq!(cases.len(), 32);
@@ -502,6 +507,11 @@ mod tests {
             assert_eq!(source, case["source"].as_str().unwrap(), "{name}: source");
             let Some(got) = got else { continue };
             let mut want = case["info"].clone();
+            if c.provider.eq_ignore_ascii_case("codex")
+                && let Some(info) = want.as_object_mut()
+            {
+                info.remove("is_compat");
+            }
             if want["id"] == "claude-opus-4-7" {
                 // Recorded before Go ad9e456d made Opus 4.7 adaptive-only in the v8.0.35
                 // catalog (internal/registry/models/models.json).
@@ -537,7 +547,7 @@ mod tests {
             assert_eq!(got.info.kind, want["type"].as_str().unwrap(), "{name}: type");
             assert_eq!(
                 got.is_compat(),
-                case["is_compat"].as_bool().unwrap(),
+                case["is_compat"].as_bool().unwrap() && !c.provider.eq_ignore_ascii_case("codex"),
                 "{name}: is_compat"
             );
             let caps = cpa_common::thinking::ModelCaps::from(&got.info);

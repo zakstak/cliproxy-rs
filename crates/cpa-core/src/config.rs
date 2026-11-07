@@ -1049,7 +1049,7 @@ impl Config {
         validate::go_custom(document.value())?;
         let oauth_only = schema::oauth_only_paths(&Value::Mapping(root.clone()));
         let plugin_configs = plugin_configs(text, &root);
-        Ok(Config {
+        let cfg = Config {
             host,
             port,
             api_keys: normalize_keys(api_keys),
@@ -1061,7 +1061,9 @@ impl Config {
             oauth_only,
             plugin_configs,
             derived: Derived::default(),
-        })
+        };
+        validate::codex_compat(&cfg)?;
+        Ok(cfg)
     }
 
     /// `server.max-request-body-bytes` (legacy root `max-request-body-bytes`), Go

@@ -225,3 +225,29 @@ fn with_member_edits_one_value_in_place() {
     let body = CodexBody::parse(flag).unwrap();
     assert_eq!(body.with_member("stream", "true"), br#"{"stream":true,"a":[]}"#);
 }
+
+/// Removing a member drops it and one separating comma; every other byte stays.
+#[test]
+fn without_member_removes_one_member_and_its_comma() {
+    let cases: [(&[u8], &[u8]); 6] = [
+        (
+            br#"{"type":"response.create","model":"m","input":[]}"#,
+            br#"{"model":"m","input":[]}"#,
+        ),
+        (br#"{ "type" : "x" ,  "model":"m" }"#, br#"{"model":"m" }"#),
+        (
+            br#"{"model":"m", "type":"x", "input":[{"type":"message"}]}"#,
+            br#"{"model":"m", "input":[{"type":"message"}]}"#,
+        ),
+        (br#"{"model":"m","type":"x"}"#, br#"{"model":"m"}"#),
+        (br#" {"type":"x"} "#, br#" {} "#),
+        (br#"{"model":"m","t\u0079pe":"x"}"#, br#"{"model":"m"}"#),
+    ];
+    for (raw, want) in cases {
+        let body = CodexBody::parse(raw).unwrap();
+        assert_eq!(body.without_member("type"), want, "{}", String::from_utf8_lossy(raw));
+        CodexBody::parse(&body.without_member("type")).unwrap();
+    }
+    let raw = br#"{"model":"m"}"#;
+    assert_eq!(CodexBody::parse(raw).unwrap().without_member("type"), raw);
+}

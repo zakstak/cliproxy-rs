@@ -2,7 +2,6 @@
 //! (codex_executor_terminal.go, codex_websockets_errors.go), per-event SSE processing,
 //! bootstrap buffering, and buffered (non-streaming) assembly.
 
-use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -489,51 +488,6 @@ pub(crate) fn normalize_completion(payload: String) -> String {
     }
 }
 
-/// `EnsureResponsesUsageDetails` for one JSON object payload.
-pub(crate) fn ensure_usage_details(payload: String) -> String {
-    let trimmed = payload.trim();
-    if !trimmed.starts_with('{') || gjson::get(trimmed, "object").str() == "response.compaction" {
-        return payload;
-    }
-    let mut out = trimmed.to_owned();
-    for path in ["response.usage", "usage"] {
-        let usage = gjson::get(&out, path);
-        if usage.kind() != Kind::Object {
-            continue;
-        }
-        let (output, input) = (usage.get("output_tokens_details"), usage.get("input_tokens_details"));
-        let output = (
-            output.exists(),
-            output.kind(),
-            output.get("reasoning_tokens").exists() && output.get("reasoning_tokens").kind() != Kind::Null,
-        );
-        let input = (
-            input.exists(),
-            input.kind(),
-            input.get("cached_tokens").exists() && input.get("cached_tokens").kind() != Kind::Null,
-        );
-        out = match output {
-            (false, ..) => set_raw(&out, &format!("{path}.output_tokens_details.reasoning_tokens"), "0"),
-            (true, kind, _) if kind != Kind::Object => set_raw(
-                &out,
-                &format!("{path}.output_tokens_details"),
-                r#"{"reasoning_tokens":0}"#,
-            ),
-            (true, _, false) => set_raw(&out, &format!("{path}.output_tokens_details.reasoning_tokens"), "0"),
-            _ => out,
-        };
-        out = match input {
-            (false, ..) => set_raw(&out, &format!("{path}.input_tokens_details.cached_tokens"), "0"),
-            (true, kind, _) if kind != Kind::Object => {
-                set_raw(&out, &format!("{path}.input_tokens_details"), r#"{"cached_tokens":0}"#)
-            }
-            (true, _, false) => set_raw(&out, &format!("{path}.input_tokens_details.cached_tokens"), "0"),
-            _ => out,
-        };
-    }
-    if out == trimmed { payload } else { out }
-}
-
 /// Go `http.StatusText` (where the `http` crate's reason phrases differ).
 pub(crate) fn go_status_text(status: u16) -> &'static str {
     match status {
@@ -549,50 +503,6 @@ pub(crate) fn go_status_text(status: u16) -> &'static str {
             .and_then(|s| s.canonical_reason())
             .unwrap_or_default(),
     }
-}
-
-/// `EnsureResponsesUsageDetails` over one stream chunk: a JSON object, or SSE `data:`
-/// lines (Go applies it to every chunk sent to an OpenAI Responses client).
-pub(crate) fn ensure_usage_details_chunk(chunk: Bytes) -> Bytes {
-    let text = String::from_utf8_lossy(&chunk);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return chunk;
-    }
-    if trimmed.starts_with('{') {
-        let out = ensure_usage_details(trimmed.to_owned());
-        return if out == trimmed { chunk } else { Bytes::from(out) };
-    }
-    if !text.contains("data:") {
-        return chunk;
-    }
-    let mut modified = false;
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|line| {
-            if !line.trim().starts_with("data:") {
-                return line.to_owned();
-            }
-            let prefix = if line.starts_with("data: ") {
-                "data: "
-            } else if line.starts_with("data:") {
-                "data:"
-            } else {
-                return line.to_owned();
-            };
-            let data = line[prefix.len()..].trim();
-            if !data.starts_with('{') {
-                return line.to_owned();
-            }
-            let updated = ensure_usage_details(data.to_owned());
-            if updated == data {
-                return line.to_owned();
-            }
-            modified = true;
-            format!("{prefix}{updated}")
-        })
-        .collect();
-    if modified { Bytes::from(lines.join("\n")) } else { chunk }
 }
 
 /// Output items seen in `response.output_item.done`, used to patch an empty
@@ -695,15 +605,8 @@ pub(crate) struct Processor {
     model_level_cooling: bool,
     /// The last completed payload (response.completed/incomplete), for buffered callers.
     pub completed: Option<String>,
-    /// The request renamed the `collaboration` namespace (multi-agent v2).
-    restore: bool,
     /// Usage records see every upstream payload in Codex format (`observeCodexTokenEvent`).
     usage: cpa_core::exec::UsageSink,
-    /// Grok Build clients get keepalive events as SSE comments (`grokbuild`).
-    grok_keepalive: bool,
-    /// A Codex client also gets an upstream context-window rejection as a
-    /// `response.failed` before the error (`codex_request::codex_client`).
-    codex_client: bool,
     /// The attempt's wire capture: every scanned line and each stream failure.
     wire: crate::codex_capture::Wire,
     /// Joins an event's data split across `data:` lines (`CodexSSEScanner`, 50 MB lines).
@@ -718,19 +621,10 @@ impl Processor {
             preserve_native,
             model_level_cooling,
             completed: None,
-            restore: false,
             usage: Default::default(),
-            grok_keepalive: false,
-            codex_client: false,
             wire: Default::default(),
             sse: crate::codex_sse::DataLines::new(SCANNER_MAX_LINE),
         }
-    }
-
-    /// The client is a Codex client (`codex_request::codex_client`).
-    pub fn codex_client(mut self, codex_client: bool) -> Self {
-        self.codex_client = codex_client;
-        self
     }
 
     /// Records every scanned line and each stream failure (Go `AppendAPIResponseChunk`
@@ -745,26 +639,12 @@ impl Processor {
         self.wire.exec_error(error);
     }
 
-    /// `grokbuild.TransformKeepaliveSSELine` for a Grok Build client (`User-Agent` with
-    /// `grok-pager` or `grok-shell`).
-    pub fn grok_keepalive(mut self, headers: &http::HeaderMap) -> Self {
-        self.grok_keepalive = is_grok_client(headers);
-        self
-    }
-
     /// Reports each upstream payload to the attempt's usage record.
     // ponytail: Go also publishes `response.tool_usage.image_gen` as a second record under
     // the request's image_generation tool model (`publishCodexImageToolUsage`, default
     // gpt-image-2); `UsageSink` has no per-model record yet (a Server contract change).
     pub fn reporting(mut self, usage: cpa_core::exec::UsageSink) -> Self {
         self.usage = usage;
-        self
-    }
-
-    /// Restores the client's `collaboration` names in every payload before anything
-    /// reads it, as Go does right after trimming each `data:` line.
-    pub fn restoring(mut self, restore: bool) -> Self {
-        self.restore = restore;
         self
     }
 
@@ -788,8 +668,6 @@ impl Processor {
     fn event_step(&mut self, event: &[u8], mut gate: Option<&mut Gate>) -> Step {
         let mut lines = Vec::new();
         let mut terminal = false;
-        // Go writes each keepalive comment as its own SSE frame.
-        let mut after_comment = false;
         let mut physical = event.split(|b| *b == b'\n');
         let mut scanned = Vec::new();
         let mut read_all = false;
@@ -821,32 +699,13 @@ impl Processor {
                     continue;
                 }
                 let before = lines.len();
-                if after_comment {
-                    lines.push(String::new());
-                }
-                after_comment = self.grok_keepalive && is_keepalive_line(line);
-                let handshake = if after_comment {
-                    lines.push(": keepalive".to_owned());
-                    true
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    let payload = restore(data.trim(), self.restore);
-                    let payload = payload.as_ref();
+                let handshake = if let Some(data) = line.strip_prefix("data:") {
+                    let payload = data.trim();
                     if self.usage.enabled() {
                         self.usage
                             .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
                     }
                     if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
-                        if self.codex_client
-                            && let Some(event) = cpa_common::codex_client::context_window_failure_event(payload)
-                        {
-                            // A rewritten `error` event is named for what it now is.
-                            if matches!(event, std::borrow::Cow::Owned(_))
-                                && let Some(name) = lines.last_mut().filter(|l| l.as_str() == "event: error")
-                            {
-                                *name = "event: response.failed".to_owned();
-                            }
-                            lines.push(format!("data: {event}"));
-                        }
                         return Step::Fail {
                             error,
                             body: Some(body),
@@ -924,8 +783,7 @@ impl Processor {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
-                let payload = restore(data.trim(), self.restore);
-                let payload = payload.as_ref();
+                let payload = data.trim();
                 if self.usage.enabled() {
                     self.usage
                         .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
@@ -949,37 +807,6 @@ impl Processor {
             }
         }
         Ok(None)
-    }
-}
-
-/// `grokbuild.IsGrokClientHeaders`: any `User-Agent` value naming Grok Pager or Shell.
-pub(crate) fn is_grok_client(headers: &http::HeaderMap) -> bool {
-    headers.get_all(http::header::USER_AGENT).iter().any(|v| {
-        let ua = String::from_utf8_lossy(v.as_bytes()).go_lower();
-        ua.contains("grok-pager") || ua.contains("grok-shell")
-    })
-}
-
-/// `grokbuild.IsKeepaliveSSELine`: `event: keepalive` or a `keepalive` data payload.
-fn is_keepalive_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if let Some(name) = trimmed.strip_prefix("event:") {
-        return name.trim() == "keepalive";
-    }
-    trimmed
-        .strip_prefix("data:")
-        .is_some_and(|data| gjson::get(data.trim(), "type").str() == "keepalive")
-}
-
-/// `RestoreCodexMultiAgentV2Response` on one upstream payload when the request was
-/// optimized.
-pub(crate) fn restore(payload: &str, optimized: bool) -> std::borrow::Cow<'_, str> {
-    if !optimized {
-        return std::borrow::Cow::Borrowed(payload);
-    }
-    match String::from_utf8(cpa_common::codex_client::restore_response(payload.as_bytes(), true)) {
-        Ok(restored) => std::borrow::Cow::Owned(restored),
-        Err(_) => std::borrow::Cow::Borrowed(payload),
     }
 }
 

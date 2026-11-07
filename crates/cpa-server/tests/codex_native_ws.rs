@@ -503,12 +503,14 @@ async fn a_lost_socket_never_replays_a_continuation() {
     assert_eq!(upstream_frames(&proxy, 1), [fresh]);
 }
 
-/// A Codex credential without `websockets` serves the WebSocket route over HTTP. That is
-/// an explicit conversion, not the native route: the turn goes upstream as an HTTP
-/// Responses request built by the legacy path. It has no upstream socket to prewarm, so a
-/// `generate: false` prewarm is refused with an actionable error instead of a made-up
-/// response (#24 forbids synthesized output), and nothing reaches the upstream. The
-/// connection stays open for the real turn.
+/// A Codex credential without `websockets` serves the WebSocket route over HTTP (#28):
+/// the client's `response.create` goes upstream as the HTTP body without its `type` tag
+/// (the first-party frame is the HTTP request plus that tag), with nothing else changed,
+/// and the upstream's events reach the client unchanged, one payload per frame. It has no
+/// upstream socket to prewarm, so a `generate: false` prewarm is refused with an
+/// actionable error instead of a made-up response, and nothing reaches the upstream; the
+/// connection stays open for the real turn. A continuation needs an upstream socket's
+/// state, so it gets the replay close and nothing is sent.
 #[tokio::test]
 async fn http_fallback_is_a_separate_explicit_conversion() {
     let proxy = proxy_with(
@@ -545,15 +547,28 @@ async fn http_fallback_is_a_separate_explicit_conversion() {
     let create = client_frame("ws-create-first", "gpt-5.5");
     socket.send(Message::text(create.clone())).await.unwrap();
     let turn = read(&mut socket, &TERMINAL).await;
-    assert_eq!(
-        gjson::get(turn.frames.last().unwrap(), "type").str(),
-        "response.completed"
-    );
+    assert_eq!(turn.frames, events("sse-completed"), "the upstream's events, unchanged");
     assert!(proxy.upstream.sockets().is_empty(), "no upstream socket");
     let sent = proxy.upstream.http().pop().expect("an HTTP request");
-    let body = text(sent.body);
-    assert_ne!(body, create, "the HTTP conversion, not the client's frame");
-    assert!(!body.contains(r#""type":"response.create""#), "{body}");
+    let untagged = cpa_common::codex_body::CodexBody::parse(create.as_bytes())
+        .unwrap()
+        .without_member("type");
+    assert_eq!(
+        text(sent.body),
+        String::from_utf8(untagged).unwrap(),
+        "the frame without its tag"
+    );
+
+    // A continuation: the replay close, and nothing upstream.
+    let continuation = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_fixture_1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#;
+    socket.send(Message::text(continuation)).await.unwrap();
+    let replay = read(&mut socket, &[]).await;
+    assert_eq!(replay.closed, Some(1012), "{replay:?}");
+    assert_eq!(
+        proxy.upstream.http().len(),
+        1,
+        "the continuation sends nothing upstream"
+    );
 }
 
 // Native failure delivery (#25, WebSocket half). Each failure frame is hand-authored to
@@ -1144,11 +1159,12 @@ async fn a_native_frame_never_depends_on_fallback_preparation() {
     wait_released(&home, 1).await;
 }
 
-/// The fallback keeps its conversion rule: a Codex credential without `websockets` refuses
-/// a string `input` with the same error frame as before, sends nothing, and the
-/// connection stays usable.
+/// The server's transcript fallback refused a string `input`. A Codex credential without
+/// `websockets` no longer uses that fallback (#28): the frame is the client's
+/// `response.create`, so it goes upstream as sent, without its tag, and the provider
+/// judges it. Other providers still get the fallback's refusal.
 #[tokio::test]
-async fn the_fallback_still_refuses_what_it_cannot_convert() {
+async fn a_codex_turn_over_http_forwards_what_the_fallback_refused() {
     let proxy = proxy_with(
         Script {
             http: vec![cpa_server::testing::codex_capture::Reply::sse(
@@ -1161,27 +1177,15 @@ async fn the_fallback_still_refuses_what_it_cannot_convert() {
     )
     .await;
     let mut socket = connect(&proxy).await;
-    socket
-        .send(Message::text(with_input("ws-create-first", r#""List the files.""#)))
-        .await
-        .unwrap();
-    let refused = read(&mut socket, &["error"]).await;
-    assert_eq!(refused.closed, None, "{refused:?}");
-    assert!(
-        refused.frames[0].contains("websocket request requires array field: input"),
-        "{refused:?}"
-    );
-    assert!(proxy.upstream.http().is_empty() && proxy.upstream.sockets().is_empty());
-    socket
-        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
-        .await
-        .unwrap();
+    let frame = with_input("ws-create-first", r#""List the files.""#);
+    socket.send(Message::text(frame.clone())).await.unwrap();
     let turn = read(&mut socket, &TERMINAL).await;
-    assert_eq!(
-        gjson::get(turn.frames.last().unwrap(), "type").str(),
-        "response.completed"
-    );
-    assert_eq!(proxy.upstream.http().len(), 1);
+    assert_eq!(turn.frames, events("sse-completed"), "{turn:?}");
+    let sent = proxy.upstream.http().pop().expect("an HTTP request");
+    let untagged = cpa_common::codex_body::CodexBody::parse(frame.as_bytes())
+        .unwrap()
+        .without_member("type");
+    assert_eq!(text(sent.body), String::from_utf8(untagged).unwrap());
 }
 
 /// `ws-create-first` as bytes with an invalid UTF-8 byte inside a string.
@@ -1252,16 +1256,24 @@ async fn proxy_with_steering(steering: bool) -> Proxy {
     .await
 }
 
-/// On a native response-steering connection a `response.append` keeps its legacy
-/// shaping, the multi-agent namespace rename included, but its upstream frames reach the
-/// client as sent: nothing on a native connection is restored.
+/// `response.append` is refused on a Codex credential (#28): no first-party or documented
+/// source defines it. On a response-steering connection the refusal is a local error
+/// event and the connection stays open, with the multi-agent setting on; nothing of the
+/// append reaches the upstream, and the client's next `response.create` goes upstream as
+/// sent. On an ordinary turn the client gets the error and the connection closes.
 #[tokio::test]
-async fn an_append_on_a_native_connection_is_not_restored() {
+async fn an_append_is_refused_on_a_codex_connection() {
     let created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
-    let call = r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_s","call_id":"call_s","namespace":"collaboration-optimize","name":"spawn_agent","arguments":"{\"message\":\"go\"}"}}"#;
     let created2 =
         r#"{"type":"response.created","response":{"id":"resp_fixture_2","previous_response_id":"resp_fixture_1"}}"#;
     let done = r#"{"type":"response.completed","response":{"id":"resp_fixture_2","output":[]}}"#;
+    let append = r#"{"type":"response.append","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"delegate"}]}],"tools":[{"type":"namespace","name":"collaboration","tools":[]}]}"#;
+    let refusal = |frame: &str| {
+        let error: serde_json::Value = serde_json::from_str(frame).unwrap();
+        assert_eq!(error["type"], "error", "{frame}");
+        assert_eq!(error["status"], 400, "{frame}");
+        assert_eq!(error["error"]["message"], cpa_exec::codex::APPEND_REFUSED, "{frame}");
+    };
     let proxy = proxy(
         Profile::Chatgpt,
         Script {
@@ -1269,7 +1281,6 @@ async fn an_append_on_a_native_connection_is_not_restored() {
                 vec![Bytes::from_static(created.as_bytes())],
                 vec![
                     Bytes::from_static(created2.as_bytes()),
-                    Bytes::from_static(call.as_bytes()),
                     Bytes::from_static(done.as_bytes()),
                 ],
             ],
@@ -1295,14 +1306,36 @@ async fn an_append_on_a_native_connection_is_not_restored() {
         .await
         .unwrap();
     assert_eq!(read(&mut socket, &["response.created"]).await.frames, [created]);
-    let append = r#"{"type":"response.append","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"delegate"}]}],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent.","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}]}]}"#;
     socket.send(Message::text(append)).await.unwrap();
-    let turn = read(&mut socket, &TERMINAL).await;
-    assert_eq!(turn.frames, [created2, call, done], "the upstream frames as sent");
+    let refused = read(&mut socket, &["error"]).await;
+    assert_eq!(refused.closed, None, "{refused:?}");
+    refusal(&refused.frames[0]);
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_fixture_1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"delegate"}]}]}"#;
+    socket.send(Message::text(next)).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, [created2, done]);
     let frames = upstream_frames(&proxy, 0);
-    assert!(
-        frames[1].contains("collaboration-optimize"),
-        "the append's legacy shaping renamed the namespace: {}",
-        frames[1]
-    );
+    assert_eq!(frames.len(), 2, "the append sent nothing: {frames:?}");
+    assert_eq!(frames[1], next, "the next create as sent");
+
+    // An ordinary turn on the same socket: the error, then the connection closes.
+    let proxy = proxy_with(
+        Script {
+            ws: replies(&["sse-completed"]),
+            ..Script::default()
+        },
+        "",
+        |url| vec![credential(Profile::Chatgpt, url, true)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    socket.send(Message::text(append)).await.unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    refusal(&refused.frames[0]);
+    assert!(read(&mut socket, &[]).await.closed.is_some(), "the connection closes");
+    assert_eq!(upstream_frames(&proxy, 0).len(), 1, "the append sent nothing");
 }

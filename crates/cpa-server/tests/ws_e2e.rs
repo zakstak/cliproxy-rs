@@ -434,8 +434,10 @@ async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
 /// `response.done` or `response.incomplete` of a turn served over an upstream socket
 /// reaches the client as upstream sent it. Go rebuilds `output` from the streamed items,
 /// renames `response.done` and adds zero usage details; the expected frame becomes the
-/// scripted upstream event with the same response ID. Only replies that Go's upstream
-/// read as WebSocket frames count: an HTTP-mode turn keeps Go's frames.
+/// scripted upstream event with the same response ID. A Codex turn served over HTTP is
+/// native too (#28): Go also added the routed `model` to its `response.*` events, so
+/// every expected event with a response ID becomes the scripted event of the same type
+/// and ID.
 fn native_terminals(scenario: &mut Value) {
     const TERMINAL: [&str; 3] = ["response.completed", "response.done", "response.incomplete"];
     let terminal = |text: &str| TERMINAL.contains(&gjson::get(text, "type").str());
@@ -449,14 +451,20 @@ fn native_terminals(scenario: &mut Value) {
         .filter(|k| k != "ws_dial")
         .collect();
     let mut raw = std::collections::HashMap::new();
+    let mut events = std::collections::HashMap::new();
     let mut k = 0;
     for step in scenario["steps"].as_array().unwrap() {
         for reply in step["upstream"].as_array().into_iter().flatten() {
-            if consumers.get(k).map(String::as_str) == Some("ws_frame") {
+            let consumer = consumers.get(k).map(String::as_str);
+            if matches!(consumer, Some("ws_frame" | "http")) {
                 for event in reply["events"].as_array().into_iter().flatten() {
                     let event = event.as_str().unwrap();
+                    let id = gjson::get(event, "response.id").str().to_owned();
                     if terminal(event) {
-                        raw.insert(gjson::get(event, "response.id").str().to_owned(), event.to_owned());
+                        raw.insert(id.clone(), event.to_owned());
+                    }
+                    if consumer == Some("http") && !id.is_empty() {
+                        events.insert((gjson::get(event, "type").str().to_owned(), id), event.to_owned());
                     }
                 }
             }
@@ -465,10 +473,16 @@ fn native_terminals(scenario: &mut Value) {
     }
     for step in scenario["steps"].as_array_mut().unwrap() {
         for frame in step["frames"].as_array_mut().into_iter().flatten() {
-            let Some(text) = frame["text"].as_str().filter(|t| terminal(t)) else {
+            let Some(text) = frame["text"].as_str() else {
                 continue;
             };
-            if let Some(event) = raw.get(gjson::get(text, "response.id").str()) {
+            let id = gjson::get(text, "response.id").str().to_owned();
+            let replaced = if terminal(text) {
+                raw.get(&id)
+            } else {
+                events.get(&(gjson::get(text, "type").str().to_owned(), id))
+            };
+            if let Some(event) = replaced {
                 frame["text"] = Value::String(event.clone());
             }
         }
@@ -483,6 +497,14 @@ fn native_frame(sent: &str, model: &str) -> String {
         return sent.to_owned();
     }
     String::from_utf8(body.with_member("model", &serde_json::to_string(model).unwrap())).unwrap()
+}
+
+/// The HTTP body a Codex credential without `websockets` sends for the client's `sent`
+/// create: the frame without `type`, with `model` routed.
+fn http_body(sent: &str, model: &str) -> String {
+    let routed = native_frame(sent, model);
+    let body = cpa_common::codex_body::CodexBody::parse(routed.as_bytes()).unwrap();
+    String::from_utf8(body.without_member("type")).unwrap()
 }
 
 /// Runs one scenario and returns its runtime, for checks after the connection. A
@@ -689,6 +711,18 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
                 "{name}: upstream frame #{i} is neither a client create as sent nor Go's append framing\n rust: {}\n   go: {go_body}",
                 rust.body
             );
+        } else if rust.kind == "http" {
+            // A Codex turn over HTTP (#28): the client's create without its `type` tag,
+            // with only `model` routed, where Go sent its merged and shaped transcript.
+            let model = gjson::get(&rust.body, "model").str().to_owned();
+            let matched = requests
+                .by_ref()
+                .find(|s| gjson::get(s, "type").str() == "response.create" && http_body(s, &model) == rust.body);
+            assert!(
+                matched.is_some(),
+                "{name}: upstream request #{i} is not a client create without its tag\n rust: {}",
+                rust.body
+            );
         } else {
             assert_eq!(mask(&rust.body), go_body, "{name}: upstream body #{i}");
         }
@@ -721,14 +755,57 @@ async fn ws_two_turns_reuse_one_upstream_socket() {
     run("ws_two_turns").await;
 }
 
-#[tokio::test]
-async fn http_mode_merges_the_transcript_each_turn() {
-    run("http_incremental").await;
+/// The client's frames as a turn on a Codex credential without `websockets` delivers
+/// them (#28): each scripted upstream event as it arrived.
+fn upstream_events(step: &Value) -> Value {
+    Value::Array(
+        step["upstream"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|reply| reply["events"].as_array().cloned().unwrap_or_default())
+            .map(|event| serde_json::json!({ "text": event }))
+            .collect(),
+    )
 }
 
+/// The error a Codex credential's `response.append` receives on an ordinary turn.
+fn append_refused() -> Value {
+    serde_json::json!({ "text": serde_json::json!({
+        "type": "error",
+        "status": 400,
+        "error": { "message": cpa_exec::codex::APPEND_REFUSED, "type": "invalid_request_error" },
+    }).to_string() })
+}
+
+/// Go's HTTP mode merged the connection's transcript into every turn and turned a
+/// `response.append` into a create. A Codex credential without `websockets` now sends
+/// each `response.create` as the client wrote it, without `type` (a create without
+/// `previous_response_id` already carries the client's full input), and refuses the
+/// append: the client gets the error and the connection closes (#28,
+/// docs/codex/CONTRACT.md "WebSocket HTTP fallback").
+#[tokio::test]
+async fn http_mode_sends_each_create_as_sent_and_refuses_append() {
+    run_with("http_incremental", |scenario| {
+        scenario["upstream"].as_array_mut().unwrap().truncate(2);
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        steps[1]["frames"] = upstream_events(&steps[1]);
+        steps[2]["upstream"] = serde_json::json!([]);
+        steps[2]["read"] = "close".into();
+        steps[2]["frames"] = serde_json::json!([append_refused(), {"close": 1006, "reason": "unexpected EOF"}]);
+    })
+    .await;
+}
+
+/// Go's step that sent a string `input` is left out: the HTTP fallback refused it
+/// locally, and a Codex turn now carries the client's frame natively, so the provider
+/// judges it (#28; `codex_native_ws.rs` covers that frame).
 #[tokio::test]
 async fn request_shape_errors_keep_the_connection_open() {
-    run("previous_not_found_then_create").await;
+    run_with("previous_not_found_then_create", |scenario| {
+        scenario["steps"].as_array_mut().unwrap().remove(2);
+    })
+    .await;
 }
 
 /// Go answers the prewarm of a Codex credential without `websockets` locally, with a
@@ -840,9 +917,16 @@ async fn ws_multi_agent_v2_is_neither_renamed_nor_restored() {
     .await;
 }
 
+/// Go's multi-agent v2 and orphan-delegation rewrites renamed the namespace upstream and
+/// restored it for the client. No Codex attempt receives them (#28): the client's create
+/// goes upstream without its tag, and the upstream's events reach the client unchanged.
 #[tokio::test]
-async fn http_multi_agent_v2_renames_upstream_and_restores_for_the_client() {
-    run("http_multi_agent_v2").await;
+async fn http_multi_agent_v2_is_not_applied_to_codex() {
+    run_with("http_multi_agent_v2", |scenario| {
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        steps[0]["frames"] = upstream_events(&steps[0]);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -916,9 +1000,24 @@ async fn steering_idle_upstream_close_closes_the_client() {
 }
 
 /// An append inherits `previous_response_id`, `model` and the parent's instructions.
+/// Go turned a `response.append` on a steering connection into a create with the
+/// parent's context. A Codex credential refuses it with a local error event, and the
+/// connection stays open; nothing reaches the upstream (#28).
 #[tokio::test]
-async fn steering_append_inherits_parent_context() {
-    run("steer_append_inherits").await;
+async fn steering_append_is_refused_on_the_open_connection() {
+    run_with("steer_append_inherits", |scenario| {
+        scenario["upstream"].as_array_mut().unwrap().truncate(2);
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        steps[1]["upstream"] = serde_json::json!([]);
+        steps[1]["read"] = "one".into();
+        let refused = serde_json::json!({
+            "error": { "message": cpa_exec::codex::APPEND_REFUSED, "type": "invalid_request_error" },
+            "status": 400,
+            "type": "error",
+        });
+        steps[1]["frames"] = serde_json::json!([{ "text": refused.to_string() }]);
+    })
+    .await;
 }
 
 /// A create queued behind an automatic successor does not hold back a later steer.
@@ -1048,6 +1147,12 @@ async fn interrupt_cancels_an_http_turn_locally() {
         let steps = scenario["steps"].as_array_mut().unwrap();
         steps[1]["frames"].as_array_mut().unwrap().insert(0, accepted.clone());
         steps[2]["frames"] = serde_json::json!([accepted]);
+        // The continuation needs upstream state a credential without `websockets` does
+        // not keep: the replay close, where Go answered from its transcript (#28).
+        steps[3]["upstream"] = serde_json::json!([]);
+        steps[3]["read"] = "close".into();
+        steps[3]["frames"] = serde_json::json!([{"close": 1012, "reason": "upstream requires HTTP replay"}]);
+        scenario["upstream"].as_array_mut().unwrap().truncate(1);
     })
     .await;
 }
@@ -1170,8 +1275,9 @@ mod context_window {
     /// Codex's own `ContextWindowExceeded` fixture (codex-api sse/responses.rs).
     const FAILED: &str = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","created_at":1759510079,"status":"failed","background":false,"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null,"user":null,"metadata":{}}}"#;
     const CREATED: &str = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","status":"in_progress","output":[]}}"#;
-    /// `response.created` as the HTTP transport delivers it (with the response model).
-    const CREATED_HTTP: &str = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","status":"in_progress","output":[],"model":"gpt-fixture"}}"#;
+    /// A turn served over HTTP is native too (#28): `response.created` arrives as the
+    /// upstream sent it, where Go added the response model.
+    const CREATED_HTTP: &str = CREATED;
     const DELTA: &str = r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Partial answer"}"#;
     const SEND: &str = r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"huge"}]}]}"#;
 
@@ -1435,11 +1541,8 @@ mod context_window {
         slow_client("ws_slow_client_stream_drop", &events, Some("drop_now")).await;
     }
 
-    /// Go's generic error frame for a client that is not Codex, on both transports.
-    const GENERIC: &str = r#"{"type":"error","status":400,"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","code":"context_too_large"}}"#;
-
-    /// Over an upstream WebSocket the turn is native (#24): any client gets the upstream's
-    /// `response.failed` as it arrived. The HTTP fallback keeps Go's generic error.
+    /// The turn is native on both transports (#24, #28): any client gets the upstream's
+    /// `response.failed` as it arrived, where Go sent its generic error.
     #[tokio::test]
     async fn other_clients_keep_the_classified_error() {
         let frames = vec![text(CREATED), text(FAILED), closed()];
@@ -1452,7 +1555,7 @@ mod context_window {
             frames,
         )
         .await;
-        let frames = vec![text(CREATED_HTTP), text(GENERIC), closed()];
+        let frames = vec![text(CREATED_HTTP), text(FAILED), closed()];
         turn_as(
             "http_other_client",
             None,
@@ -1586,8 +1689,8 @@ mod context_window {
             turn_paused("live_ws_slow_client_close", &[&live], frames, 300, Some("close_now")).await;
         }
 
-        /// A native WebSocket turn delivers the upstream's `error` event as it arrived; the
-        /// HTTP fallback keeps Go's generic error.
+        /// A native turn delivers the upstream's `error` event as it arrived, over an upstream
+        /// WebSocket and over HTTP alike (#28); Go sent its generic error.
         #[tokio::test]
         async fn other_clients_keep_the_classified_error() {
             let frames = vec![text(live()), closed()];
@@ -1600,7 +1703,7 @@ mod context_window {
                 frames,
             )
             .await;
-            let frames = vec![text(GENERIC), closed()];
+            let frames = vec![text(live()), closed()];
             turn_as(
                 "live_other_client_http",
                 None,

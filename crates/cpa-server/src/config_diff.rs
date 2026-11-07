@@ -695,9 +695,19 @@ mod tests {
                 .replace("/tmp/new-auth", &dir.join("next-auth").to_string_lossy())
         };
         let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/config_diff_go.json")).unwrap();
+        let mut refused = 0;
         for (i, case) in list(&cases).iter().enumerate() {
             let old = Config::parse(&private_paths(text(&case["old"]))).unwrap();
-            let new = Config::parse(&private_paths(text(&case["new"]))).unwrap();
+            // A `codex-api-key` model marked `is-compat` makes the reload invalid (#28); the
+            // running config stays, so there is no summary. Other providers keep the flag.
+            let new = match Config::parse(&private_paths(text(&case["new"]))) {
+                Err(error) if error.to_string().contains("is-compat is no longer supported") => {
+                    assert!(text(&case["new"]).contains("codex-api-key"), "case {i}: {error}");
+                    refused += 1;
+                    continue;
+                }
+                parsed => parsed.unwrap(),
+            };
             let actual = details(&old, &new);
             let expected: Vec<_> = list(&case["changes"])
                 .iter()
@@ -706,6 +716,7 @@ mod tests {
             assert_eq!(json!(actual), json!(expected), "case {i}");
             assert!(!actual.join("\n").contains("fixture-secret"));
         }
+        assert_eq!(refused, 1, "the one Codex is-compat case");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

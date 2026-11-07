@@ -220,6 +220,45 @@ impl<'a> CodexBody<'a> {
         }
         out
     }
+
+    /// The body without top-level `key`, every other byte copied unchanged, once. The
+    /// member goes with its separating comma: after the previous member's value for any
+    /// member but the first, else up to the next member's key. A missing key leaves the
+    /// bytes as they are. This serves the WebSocket `type` envelope, the one member a
+    /// contract transformation removes; it is not a general editing tool.
+    pub fn without_member(&self, key: &str) -> Vec<u8> {
+        let Some(index) = self.members.iter().position(|m| m.key == key) else {
+            return self.raw.to_vec();
+        };
+        let offset = |m: &Member<'_>| m.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
+        let value_end = |m: &Member<'_>| offset(m) + m.raw.len();
+        let member = &self.members[index];
+        let (cut_start, cut_end) = if index > 0 {
+            (value_end(&self.members[index - 1]), value_end(member))
+        } else {
+            let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
+            let end = match self.members.get(1) {
+                // Past the comma and the whitespace before the next key.
+                Some(_) => {
+                    let mut at = value_end(member);
+                    while at < self.raw.len() && self.raw[at] != b',' {
+                        at += 1;
+                    }
+                    at += 1;
+                    while at < self.raw.len() && matches!(self.raw[at], b' ' | b'\t' | b'\n' | b'\r') {
+                        at += 1;
+                    }
+                    at
+                }
+                None => value_end(member),
+            };
+            (open, end)
+        };
+        let mut out = Vec::with_capacity(self.raw.len() - (cut_end - cut_start));
+        out.extend_from_slice(&self.raw[..cut_start]);
+        out.extend_from_slice(&self.raw[cut_end..]);
+        out
+    }
 }
 
 /// A strict JSON scanner over text already known to be UTF-8. It splits the text only at

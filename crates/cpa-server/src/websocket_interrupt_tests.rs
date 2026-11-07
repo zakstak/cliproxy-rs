@@ -228,7 +228,11 @@ async fn an_http_turn_acknowledges_its_local_interrupt() {
     assert_eq!(gjson::get(&incomplete, "response.id").str(), "r1");
     client.send(INTERRUPT_R1).await;
     assert_eq!(client.read().await, ACCEPTED_R1, "the finished response's interrupt");
-    client.send(CREATE_R2).await;
+    // Without an upstream socket, the next turn carries the full input: a continuation
+    // of `r1` would get the replay close (#28).
+    client
+        .send(r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#)
+        .await;
     assert_eq!(client.read_kind().await, "response.created");
     assert_eq!(client.read_kind().await, "response.completed");
     assert_eq!(*calls.lock().unwrap(), 2);

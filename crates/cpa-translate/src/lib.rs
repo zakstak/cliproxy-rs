@@ -468,18 +468,6 @@ pub fn builtin_stream(client: Format, upstream: Format, ctx: &ResponseCtx<'_>) -
     })
 }
 
-/// [`translate_request_tracked`] for OpenAI Responses -> Codex, where the client's
-/// identity decides which fields the conversion forces ([`CodexResponsesClient`]).
-pub fn translate_responses_to_codex_tracked(
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-    client: CodexResponsesClient,
-) -> Result<Translated, Error> {
-    translate_registered(Format::OpenAIResponse, Format::Codex, ctx, body, |body| {
-        Ok(codex_responses::convert(body, client))
-    })
-}
-
 /// [`translate_request`] between format names, which may name a format only a plugin
 /// knows (Go's registry is keyed by name): such a pair has no native translator.
 pub fn translate_request_named(

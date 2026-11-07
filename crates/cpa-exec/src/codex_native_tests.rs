@@ -360,19 +360,52 @@ async fn upstream_http_errors_reach_the_client_unchanged() {
     assert_ne!(error.scope, FailureScope::Request);
 }
 
-#[test]
-fn sign_in_with_chatgpt_keeps_the_legacy_path() {
+/// Every Codex profile takes the native route (#28), Sign in with ChatGPT included: no
+/// first-party source covers its Responses behaviour, so the proxy adds nothing. Go's
+/// SIWC body rules (`store`, `stream`, dropped `temperature`, `max_output_tokens`,
+/// `prompt_cache_retention` and blank `instructions`, collapsed `configuration_update`
+/// items) no longer run; a buffered request keeps the client's `stream: false`. A Chat
+/// Completions request is not native on any profile.
+#[tokio::test]
+async fn sign_in_with_chatgpt_takes_the_native_route() {
     let req = request(fixture("http-request-full").bytes(), "gpt-test", true, None);
-    for (kind, native) in [(Kind::OAuth, true), (Kind::Key, true), (Kind::Siwc, false)] {
+    for kind in [Kind::OAuth, Kind::Key, Kind::Siwc] {
         let credential = credential(kind, "http://127.0.0.1:1");
-        assert_eq!(CodexExecutor::native_http(&credential, &req), native);
+        assert!(CodexExecutor::native_http(&credential, &req));
     }
     let mut chat = req.clone();
     chat.source_format = Format::OpenAI;
     assert!(!CodexExecutor::native_http(
-        &credential(Kind::OAuth, "http://127.0.0.1:1"),
+        &credential(Kind::Siwc, "http://127.0.0.1:1"),
         &chat
     ));
+    let body = r#"{"model":"gpt-test","stream":false,"store":true,"temperature":0.5,"max_output_tokens":9,"prompt_cache_retention":"24h","instructions":" ","input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"type":"message","role":"user","content":"hi"}]}"#;
+    let mock = Mock::start().await;
+    mock.script(
+        "/responses",
+        vec![json(
+            200,
+            r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#,
+        )],
+    );
+    let out = executor()
+        .execute(
+            &credential(Kind::Siwc, &mock.url),
+            request(body, "gpt-test", false, None),
+            &Config::default(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(text(&sent[0].body), body, "the client's bytes, unchanged");
+    let ResponseBody::Buffered(answer) = out.body else {
+        panic!("a buffered answer")
+    };
+    assert_eq!(
+        text(&answer),
+        r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#
+    );
 }
 
 #[tokio::test]
@@ -459,7 +492,7 @@ async fn through(chunks: &[&[u8]], hold: Option<Option<Duration>>) -> (Vec<u8>, 
             .map(|c| Ok::<_, ExecError>(Bytes::copy_from_slice(c)))
             .collect::<Vec<_>>(),
     );
-    let mut stream = passthrough(crate::upstream::framed(upstream), observer(), hold);
+    let mut stream = passthrough(crate::upstream::framed(upstream), observer(), hold, false);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
@@ -665,5 +698,126 @@ async fn an_open_final_event_is_closed() {
         let (out, error) = through(&[sent.as_bytes()], None).await;
         assert!(error.is_none(), "{sent:?}: {error:?}");
         assert_eq!(text(&out), want, "{sent:?}");
+    }
+}
+
+/// #28: `multimedia.disable-image-generation` keeps an `image_generation` tool from the
+/// provider. Go stripped it in its payload step; no Codex route edits a body, so the
+/// request is refused before the upstream, on the native HTTP route, a WebSocket turn over
+/// HTTP and the translated route. `chat` mode spares the Images API paths, `passthrough`
+/// and the default send the tool, and a body without the tool goes through.
+#[tokio::test]
+async fn a_disabled_image_tool_is_refused_not_stripped() {
+    let with_tool = r#"{"model":"gpt-test","stream":true,"input":[],"tools":[{"type":"image_generation"}]}"#;
+    let with_choice = r#"{"model":"gpt-test","stream":true,"input":[],"tool_choice":{"type":"image_generation"}}"#;
+    let plain = r#"{"model":"gpt-test","stream":true,"input":[]}"#;
+    for (config, body, refused) in [
+        ("multimedia: {disable-image-generation: true}\n", with_tool, true),
+        ("multimedia: {disable-image-generation: true}\n", with_choice, true),
+        ("multimedia: {disable-image-generation: chat}\n", with_tool, true),
+        (
+            "multimedia: {disable-image-generation: passthrough}\n",
+            with_tool,
+            false,
+        ),
+        ("{}", with_tool, false),
+        ("multimedia: {disable-image-generation: true}\n", plain, false),
+    ] {
+        let cfg = Config::parse(config).unwrap();
+        for kind in [Kind::OAuth, Kind::Key, Kind::Siwc] {
+            let mock = Mock::start().await;
+            mock.script("/responses", vec![sse("sse-completed")]);
+            let mut req = request(body, "gpt-test", true, None);
+            req.request_path = "/v1/responses".into();
+            let result = executor().execute(&credential(kind, &mock.url), req, &cfg).await;
+            let sent = mock.take();
+            let name = format!("{config:?} {body}");
+            if refused {
+                let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
+                assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
+                assert!(
+                    text(&error.body).contains("multimedia.disable-image-generation"),
+                    "{name}"
+                );
+                assert!(sent.is_empty(), "{name}: nothing upstream");
+            } else {
+                let ResponseBody::Stream(mut stream) = result.unwrap_or_else(|e| panic!("{name}: {e}")).body else {
+                    panic!("{name}: a stream")
+                };
+                while stream.next().await.is_some() {}
+                let all = [sent, mock.take()].concat();
+                assert_eq!(text(&all[0].body), body, "{name}: the client's bytes");
+            }
+        }
+    }
+    // A WebSocket turn over HTTP refuses the frame the same way.
+    let cfg = Config::parse("multimedia: {disable-image-generation: true}\n").unwrap();
+    let mock = Mock::start().await;
+    let frame = r#"{"type":"response.create","model":"gpt-test","input":[],"tools":[{"type":"image_generation"}]}"#;
+    let mut req = request(frame, "gpt-test", true, None);
+    req.request_path = "/v1/responses".into();
+    let session = ExecSession {
+        id: "conn-image".into(),
+        continuation: false,
+        lease: None,
+    };
+    let error = executor()
+        .execute_in_session(&credential(Kind::Key, &mock.url), req, &cfg, &session)
+        .await
+        .err()
+        .expect("refused");
+    assert_eq!(error.status, 400);
+    assert!(mock.take().is_empty(), "nothing upstream");
+}
+
+/// #28: a Home credential whose `credential_options` mark the model `is-compat` asked
+/// for Go's compatibility rewrites. No Codex route honours the flag, and a Home credential
+/// arrives at run time, so the request fails for the credential before anything is sent,
+/// on HTTP and on a WebSocket turn. The same credential without the flag is served.
+#[tokio::test]
+async fn a_home_is_compat_model_is_refused_for_the_credential() {
+    for compat in [true, false] {
+        let mock = Mock::start().await;
+        mock.script("/responses", vec![sse("sse-completed"), sse("sse-completed")]);
+        let mut home = credential(Kind::Key, &mock.url);
+        home.attributes
+            .insert(cpa_core::config::credentials::HOME_PROVIDER.into(), "codex".into());
+        home.metadata.insert(
+            "credential_options".into(),
+            serde_json::json!({"models": [{"name": "gpt-test", "is-compat": compat}]}),
+        );
+        let body = r#"{"model":"gpt-test","stream":true,"input":[]}"#;
+        let http = executor()
+            .execute(&home, request(body, "gpt-test", true, None), &Config::default())
+            .await;
+        let session = ExecSession {
+            id: format!("conn-compat-{compat}"),
+            continuation: false,
+            lease: None,
+        };
+        let frame = r#"{"type":"response.create","model":"gpt-test","input":[]}"#;
+        let ws = executor()
+            .execute_in_session(
+                &home,
+                request(frame, "gpt-test", true, None),
+                &Config::default(),
+                &session,
+            )
+            .await;
+        for (name, result) in [("http", http), ("websocket", ws)] {
+            match result {
+                Err(error) if compat => {
+                    assert_eq!((error.status, error.scope), (500, FailureScope::Credential), "{name}");
+                    assert!(text(&error.body).contains("is-compat"), "{name}");
+                }
+                Ok(response) if !compat => {
+                    if let ResponseBody::Stream(mut stream) = response.body {
+                        while stream.next().await.is_some() {}
+                    }
+                }
+                other => panic!("{name} compat={compat}: {:?}", other.err()),
+            }
+        }
+        assert_eq!(mock.take().len(), if compat { 0 } else { 2 }, "compat={compat}");
     }
 }

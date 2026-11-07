@@ -1134,6 +1134,63 @@ async fn config_key_toggle_edits_only_the_target_key_in_the_current_file() {
     server.abort();
 }
 
+/// #28: a Management API write that marks a `codex-api-key` model `is-compat` is refused,
+/// through the legacy list route, the v8 config path and a whole-config upload alike: the
+/// file and the running config keep the last good value. Another provider's `is-compat`
+/// still saves.
+#[tokio::test]
+async fn management_writes_refuse_a_codex_is_compat_model() {
+    let f = Fixture::from_yaml("codex-compat", |auth, hash| {
+        format!(
+            "management:\n  secret-key: '{hash}'\nauth-dir: {}\ncodex-api-key:\n  - api-key: fake-codex\n    base-url: https://codex.example.invalid\n    models: [{{name: a, alias: b}}]\n",
+            auth.display()
+        )
+    });
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let before = f.file();
+    let compat = json!([{"api-key": "fake-codex", "base-url": "https://codex.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}]}]);
+    let writes = [
+        client
+            .put(format!("{base}/v0/management/codex-api-key"))
+            .bearer_auth("fake-management-only")
+            .json(&compat),
+        client
+            .put(format!("{base}/v8/management/config/api-keys/codex"))
+            .bearer_auth("fake-management-only")
+            .json(&json!([{"base-url": "https://codex.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}], "keys": [{"api-key": "fake-codex"}]}])),
+        client
+            .put(format!("{base}/v0/management/config.yaml"))
+            .bearer_auth("fake-management-only")
+            .header("content-type", "application/yaml")
+            .body(before.replace("alias: b}", "alias: b, is-compat: true}")),
+    ];
+    for (i, write) in writes.into_iter().enumerate() {
+        let r = write.send().await.unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap();
+        assert!((400..500).contains(&status), "write {i}: {status} {text}");
+        assert!(text.contains("is-compat"), "write {i}: {text}");
+        assert_eq!(f.file(), before, "write {i}: the file keeps the last good config");
+        let models = cpa_core::config::credentials::api_key_entries(&f.rt.config(), "codex")[0]
+            .models
+            .clone();
+        assert!(
+            models.iter().all(|m| m.get("is-compat").is_none()),
+            "write {i}: {models:?}"
+        );
+    }
+    let r = client
+        .put(format!("{base}/v0/management/claude-api-key"))
+        .bearer_auth("fake-management-only")
+        .json(&json!([{"api-key": "fake-claude", "base-url": "https://claude.example.invalid", "models": [{"name": "a", "alias": "b", "is-compat": true}]}]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "other providers keep is-compat");
+    server.abort();
+}
+
 /// Go d69962e4 and 3e309fb4: a config API key is not an auth file, so the fields patch
 /// does not find it (404) and changes nothing, in memory or in config.yaml.
 #[tokio::test]

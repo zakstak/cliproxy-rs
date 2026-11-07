@@ -44,7 +44,16 @@ fn request(case: &Value) -> ExecRequest {
             v.as_str().unwrap().parse().unwrap(),
         );
     }
-    let body = Bytes::from(case["payload"].as_str().unwrap().to_owned());
+    let mut body = Bytes::from(case["payload"].as_str().unwrap().to_owned());
+    // A WebSocket turn reaches the executor as the client's `response.create` frame; Go's
+    // recorded turn body is the frame without its tag.
+    if case["exec_metadata"]["execution_session_id"].as_str().is_some()
+        && matches!(source, Format::Codex | Format::OpenAIResponse)
+        && let Ok(frame) = cpa_common::codex_body::CodexBody::parse(&body)
+        && frame.get("type").is_none()
+    {
+        body = Bytes::from(frame.with_member("type", r#""response.create""#));
+    }
     // Go's executor-side fallback (EnsureSessionContext -> CanonicalSessionID) for a
     // request without conductor metadata, which is how the fixtures were generated: the
     // canonical session from headers and body, with no derived identity.
@@ -182,48 +191,6 @@ fn assert_same_upstream(name: &str, rust: &Captured, go: &Value) {
     }
 }
 
-/// Go streams native lines one per chunk and translated events several per chunk; Rust
-/// streams whole events. Compare event by event.
-fn go_events(chunks: &Value) -> Vec<Vec<String>> {
-    let mut events = Vec::new();
-    let mut current = Vec::new();
-    for chunk in chunks.as_array().unwrap() {
-        let chunk = chunk.as_str().unwrap();
-        let lines: Vec<&str> = if chunk.contains('\n') {
-            chunk.split('\n').collect()
-        } else {
-            vec![chunk]
-        };
-        for line in lines {
-            match line {
-                "" => {
-                    if !current.is_empty() {
-                        events.push(std::mem::take(&mut current));
-                    }
-                }
-                line => current.push(line.to_owned()),
-            }
-        }
-    }
-    if !current.is_empty() {
-        events.push(current);
-    }
-    events
-}
-
-fn rust_events(events: &[Bytes]) -> Vec<Vec<String>> {
-    events
-        .iter()
-        .flat_map(|e| {
-            String::from_utf8_lossy(e)
-                .split("\n\n")
-                .filter(|event| !event.trim_end_matches('\n').is_empty())
-                .map(|event| event.trim_end_matches('\n').split('\n').map(str::to_owned).collect())
-                .collect::<Vec<Vec<String>>>()
-        })
-        .collect()
-}
-
 fn assert_same_error(name: &str, rust: &ExecError, go: &Value) {
     assert_eq!(rust.status, go["status"].as_u64().unwrap() as u16, "{name}: status");
     assert_eq!(
@@ -268,12 +235,9 @@ async fn run(
         });
     }
     let ws_session = case["exec_metadata"]["execution_session_id"].as_str();
-    let result = if ws_session.is_some() {
-        let settings = Settings::from(&cfg);
-        let view = View::new(&credential);
-        executor.stream_with_session(&view, &settings, req, ws_session).await
-    } else {
-        executor.execute(&credential, req, &cfg).await
+    let result = match ws_session {
+        Some(session) => ws_http(executor, &credential, &cfg, req, session).await,
+        None => executor.execute(&credential, req, &cfg).await,
     };
     let mut items = Vec::new();
     let result = match result {
@@ -300,6 +264,33 @@ fn executor() -> CodexExecutor {
     CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()))
 }
 
+/// The load error of a recorded case's config: a `codex-api-key` model marked
+/// `is-compat` is refused at load (#28), so the case never reaches the executor.
+fn config_refusal(case: &Value) -> Option<String> {
+    let text = case["config"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("{}");
+    Config::parse(&text.replace("{{base_url}}", "http://127.0.0.1:1"))
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// `execute_in_session` on a credential without an upstream socket (#28): the frame as an
+/// HTTP stream, or its refusal.
+async fn ws_http(
+    executor: &CodexExecutor,
+    credential: &Credential,
+    cfg: &Config,
+    req: ExecRequest,
+    session: &str,
+) -> Result<ExecResponse, ExecError> {
+    let view = View::new(credential);
+    let settings = Settings::scoped(cfg, &view);
+    settings.refuse_compat(&req, credential)?;
+    match super::native::route_ws(&view, &req) {
+        Some(profile) => executor.native_ws_http(&view, &settings, req, profile, session).await,
+        None => Err(super::native::refused_frame(&req.body)),
+    }
+}
+
 /// A recorded case that now takes the native HTTP route (#23): Go's bytes no longer
 /// apply to it, the contract does (`docs/codex/CONTRACT.md` "Native HTTP route").
 /// No request was recorded: the attempt ended before the send.
@@ -321,7 +312,8 @@ fn image_tool_bodies(go: &str, rust: &[u8]) -> (Value, Value) {
 /// A recorded case the translated route serves (#27): a Claude, Chat Completions,
 /// Gemini or Interactions request on a native profile.
 fn translated_case(case: &Value, base_url: &str) -> bool {
-    case["exec_metadata"]["execution_session_id"].as_str().is_none()
+    case["resolved_compat"] != true
+        && case["exec_metadata"]["execution_session_id"].as_str().is_none()
         && super::translated::route(&View::new(&credential(case, base_url)), &request(case))
 }
 
@@ -375,8 +367,7 @@ fn assert_translated_contract(
 }
 
 fn native_case(case: &Value, base_url: &str) -> bool {
-    case["exec_metadata"]["execution_session_id"].as_str().is_none()
-        && CodexExecutor::native_http(&credential(case, base_url), &request(case))
+    case["resolved_compat"] != true && CodexExecutor::native_http(&credential(case, base_url), &request(case))
 }
 
 /// The native contract for a recorded case: the upstream body is the client's with
@@ -399,18 +390,37 @@ fn assert_native_contract(
         assert!(captured.is_empty(), "{name}: nothing is sent");
         return;
     }
+    let ws_session = case["exec_metadata"]["execution_session_id"].as_str().is_some();
+    use cpa_common::codex_body::{CodexBody, Kind};
+    if ws_session {
+        let frame = CodexBody::parse(&req.body).unwrap();
+        let continuation = frame.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null);
+        let prewarm = frame.get("generate").is_some_and(|m| m.kind == Kind::False);
+        if continuation || prewarm {
+            let error = result
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a continuation or prewarm without a socket is refused"));
+            assert_eq!(error.is_replay_required(), continuation, "{name}");
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+            return;
+        }
+    }
     // The first hop: a redirect's later hops follow the HTTP client's method rules.
     let sent = captured
         .first()
         .unwrap_or_else(|| panic!("{name}: an upstream request"));
-    use cpa_common::codex_body::CodexBody;
     let mut expected = req.body.to_vec();
-    let body = CodexBody::parse(&req.body).unwrap();
+    if ws_session {
+        // The WebSocket frame's HTTP body: the frame without its `type` tag.
+        expected = CodexBody::parse(&req.body).unwrap().without_member("type");
+    }
+    let body = CodexBody::parse(&expected).unwrap();
     if body.get("model").and_then(|m| m.text()).as_deref() != Some(req.model.trim()) {
         expected = body.with_member("model", &serde_json::to_string(req.model.trim()).unwrap());
     }
     let oauth = !case["attributes"]["api_key"].as_str().is_some_and(|k| !k.is_empty());
-    if oauth && !req.stream && req.alt.is_none() {
+    if oauth && !req.stream && req.alt.is_none() && !ws_session {
         let edited = expected.clone();
         let reread = CodexBody::parse(&edited).unwrap();
         if reread.get("stream").map(|m| m.raw) != Some(&b"true"[..]) {
@@ -429,7 +439,22 @@ fn assert_native_contract(
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.starts_with("text/event-stream"));
     if req.stream && sse && reply.status == 200 && items.iter().all(Result::is_ok) && result.is_ok() {
         let out: Vec<u8> = items.iter().flat_map(|i| i.as_ref().unwrap().to_vec()).collect();
-        assert_eq!(String::from_utf8_lossy(&out), reply.body, "{name}: native events");
+        // A WebSocket turn over HTTP gets each event's `data` payload as one frame (#28).
+        let want = if ws_session {
+            reply
+                .body
+                .split("\n\n")
+                .filter_map(|event| {
+                    event
+                        .lines()
+                        .find_map(|l| l.strip_prefix("data:"))
+                        .map(|d| d.strip_prefix(' ').unwrap_or(d).to_owned())
+                })
+                .collect::<String>()
+        } else {
+            reply.body.clone()
+        };
+        assert_eq!(String::from_utf8_lossy(&out), want, "{name}: native events");
     }
 }
 
@@ -458,8 +483,28 @@ async fn executor_matches_go_on_every_fixture_case() {
         } else {
             mock.script(path, vec![reply(case)]);
         }
+        if let Some(error) = config_refusal(case) {
+            assert!(error.contains("is-compat is no longer supported"), "{name}: {error}");
+            continue;
+        }
         let (result, items) = run(&executor, case, &mock).await;
         let captured = mock.take();
+        if case["resolved_compat"] == true {
+            // `is-compat` chose Go's compatibility rewrites; no Codex route honours it, so
+            // the request is refused for the credential before anything is sent (#28).
+            let error = result
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("{name}: is-compat is refused"));
+            assert_eq!(
+                (error.status, error.scope),
+                (500, cpa_core::exec::FailureScope::Credential),
+                "{name}"
+            );
+            assert!(String::from_utf8_lossy(&error.body).contains("is-compat"), "{name}");
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+            continue;
+        }
         if native_case(case, &mock.url) {
             assert_native_contract(name, case, &result, &items, &captured);
             continue;
@@ -468,61 +513,14 @@ async fn executor_matches_go_on_every_fixture_case() {
             assert_translated_contract(name, case, &result, &captured);
             continue;
         }
-        let (client, view_credential) = (request(case).headers, credential(case, &mock.url));
-        let view = View::new(&view_credential);
-        let native = {
-            let req = request(case);
-            matches!(req.source_format, Format::Codex | Format::OpenAIResponse)
-                && matches!(req.response_format, Format::Codex | Format::OpenAIResponse)
-        };
-        let expected = |go: &Value| under_identity_policy(go, &client, native, !view.api_key);
-        match case["hops"].as_array() {
-            Some(hops) => {
-                assert_eq!(captured.len(), hops.len(), "{name}: upstream requests");
-                for (rust, go) in captured.iter().zip(hops) {
-                    assert_eq!(rust.method, go["method"].as_str().unwrap(), "{name}: method");
-                    assert_same_upstream(name, rust, &expected(go));
-                }
-            }
-            None => {
-                assert_eq!(captured.len(), 1, "{name}: one upstream request");
-                assert_same_upstream(name, &captured[0], &expected(&case["upstream"]));
-            }
-        }
-        let output = &case["output"];
-        if let Some(go_error) = output.get("error") {
-            assert_same_error(
-                name,
-                result
-                    .as_ref()
-                    .err()
-                    .unwrap_or_else(|| panic!("{name}: expected error")),
-                go_error,
-            );
-            continue;
-        }
-        let response = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        if let Some(payload) = output["payload"].as_str() {
-            let ResponseBody::Buffered(body) = response.body else {
-                unreachable!()
-            };
-            assert_eq!(String::from_utf8_lossy(&body), payload, "{name}: payload");
-            continue;
-        }
-        let ok: Vec<Bytes> = items.iter().filter_map(|i| i.as_ref().ok().cloned()).collect();
-        assert_eq!(rust_events(&ok), go_events(&output["chunks"]), "{name}: events");
-        match (items.last(), output.get("stream_error")) {
-            (Some(Err(error)), Some(go)) => assert_same_error(name, error, go),
-            (_, Some(_)) => panic!("{name}: expected a terminal stream error"),
-            (Some(Err(error)), None) => panic!("{name}: unexpected stream error {error}"),
-            _ => {}
-        }
-        let snapshot = executor.quota().snapshot("codex-fixture.json").expect("quota observed");
-        assert_eq!(snapshot.signals["X-Codex-Primary-Used-Percent"], "42");
-        // Go observes the same headers into the model's state (`model_quotas`).
-        let model = cpa_common::thinking::parse_suffix(case["model"].as_str().unwrap()).model_name;
-        let models = executor.quota().model_snapshots("codex-fixture.json");
-        assert_eq!(models.get(&model), Some(&snapshot), "{name}: model quota");
+        // Every other recorded request has no Codex route (#28): no legacy rewrite stands
+        // in, and nothing reaches the provider.
+        let error = result
+            .as_ref()
+            .err()
+            .unwrap_or_else(|| panic!("{name}: a request without a Codex route is refused"));
+        assert_eq!(error.scope, cpa_core::exec::FailureScope::Request, "{name}");
+        assert!(captured.is_empty(), "{name}: nothing is sent");
     }
 }
 
@@ -1316,19 +1314,18 @@ async fn capture_records_each_attempt_as_go_does() {
         } else {
             mock.script(path, vec![reply(case)]);
         }
+        if config_refusal(case).is_some() {
+            continue;
+        }
         let credential = credential(case, &mock.url);
         let cfg = Config::parse(case["config"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("{}")).unwrap();
         let tap = Arc::new(Wiretap::default());
         let mut req = request(case);
         req.usage = cpa_core::exec::UsageSink::default().with_capture(cpa_core::exec::CaptureSink::new(tap.clone()));
         let ws_session = case["exec_metadata"]["execution_session_id"].as_str();
-        let result = if ws_session.is_some() {
-            let settings = Settings::from(&cfg);
-            executor
-                .stream_with_session(&View::new(&credential), &settings, req, ws_session)
-                .await
-        } else {
-            executor.execute(&credential, req, &cfg).await
+        let result = match ws_session {
+            Some(session) => ws_http(&executor, &credential, &cfg, req, session).await,
+            None => executor.execute(&credential, req, &cfg).await,
         };
         if let Ok(ExecResponse {
             body: ResponseBody::Stream(mut stream),
@@ -1339,8 +1336,9 @@ async fn capture_records_each_attempt_as_go_does() {
         }
         let taps = tap.taps();
         let all = mock.take();
-        if all.is_empty() && translated_case(case, &mock.url) {
-            // A conversion the translated route refuses sends nothing (#27).
+        if all.is_empty() {
+            // A refused request (a translated conversion, a suffix, a continuation without
+            // a socket) sends nothing and records no request (#27, #28).
             assert!(result_refused(&taps), "{name}");
             continue;
         }
@@ -1622,43 +1620,36 @@ async fn direct_images_return_the_read_error_of_a_broken_error_body() {
     }
 }
 
-/// A streamed (or buffered, `stream: false`) Responses request whose upstream sends `sse`:
-/// the client frames and the in-stream error, or the attempt's error. It runs on a Sign
-/// in with ChatGPT credential, which keeps the legacy line scanner these Go cases pin;
-/// the native route forwards events unchanged (`codex_native_tests.rs`).
+/// The translated route's event processing (`Processor`, with the bootstrap gate when
+/// `buffering`) over an upstream that sends `sse`: the frames and the in-stream error, or
+/// the attempt's error; buffered (`stream: false`), the terminal `response`. These Go
+/// cases pin its line scanner. The native route forwards events unchanged instead
+/// (`codex_native_tests.rs`).
 async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<String>, Option<ExecError>), ExecError> {
-    let mock = Mock::start().await;
-    mock.script(
-        "/responses",
-        vec![Reply {
-            status: 200,
-            headers: vec![("content-type".into(), "text/event-stream".into())],
-            body: sse.into(),
-        }],
-    );
-    let synthetic = serde_json::json!({
-        "source": "openai-response",
-        "model": "gpt-5.4",
-        "payload": r#"{"model":"gpt-5.4","input":"hello"}"#,
-        "stream": stream,
-        "attributes": {"api_key": "test"},
-        "metadata": {"type": "codex", "use_siwc": true, "siwc": {"access_token": "siwc-at-FAKE"}},
-    });
-    let cfg = Config::parse(&format!("codex:\n  stream-bootstrap-buffering: {buffering}\n")).unwrap();
-    let response = executor()
-        .execute(&credential(&synthetic, &mock.url), request(&synthetic), &cfg)
-        .await?;
-    let (mut frames, mut failure) = (Vec::new(), None);
-    match response.body {
-        ResponseBody::Stream(mut body) => {
-            while let Some(item) = body.next().await {
-                match item {
-                    Ok(frame) => frames.push(String::from_utf8(frame.to_vec()).unwrap()),
-                    Err(error) => failure = Some(error),
-                }
-            }
+    use crate::codex_response::{Bootstrap, Processor, bootstrap, processed};
+    let processor = Processor::new(false, false);
+    if !stream {
+        let mut processor = processor;
+        let completed = processor.buffered(sse.as_bytes())?.expect("a terminal event");
+        return Ok((vec![gjson::get(&completed, "response").json().to_owned()], None));
+    }
+    let upstream = crate::codex::events(ResponseBody::Stream(crate::upstream::framed(
+        futures_util::stream::iter([Ok::<_, ExecError>(Bytes::from(sse.to_owned()))]).boxed(),
+    )));
+    let mut body = if buffering {
+        match bootstrap(upstream, processor, None, Instant::now()).await {
+            Bootstrap::Reject(error) => return Err(error),
+            Bootstrap::Stream(stream) => stream,
         }
-        ResponseBody::Buffered(body) => frames.push(String::from_utf8(body.to_vec()).unwrap()),
+    } else {
+        processed(upstream, processor, 0)
+    };
+    let (mut frames, mut failure) = (Vec::new(), None);
+    while let Some(item) = body.next().await {
+        match item {
+            Ok(frame) => frames.push(String::from_utf8(frame.to_vec()).unwrap()),
+            Err(error) => failure = Some(error),
+        }
     }
     Ok((frames, failure))
 }
@@ -1831,9 +1822,9 @@ async fn split_sse_events_spend_the_bootstrap_budget() {
 }
 
 /// Go `TestCodexExecutorReplayedWebSearchCallHistoryEnsuresWebSearchTool_Issue6770`
-/// (e7d4c731) through the executor: the bodies sent on the stream, non-stream and compact
-/// paths, and the shaped WebSocket body, match Go's byte for byte, which pins where the
-/// web search tool lands beside the image tool and the `instructions` default.
+/// (e7d4c731) through the executor. Go added a web search tool (and the image tool and
+/// an `instructions` default) to the body; every call now takes the native route, so the
+/// client's body goes upstream unchanged on HTTP and WebSocket alike (#23, #24, #28).
 #[tokio::test]
 async fn replayed_web_search_history_matches_go() {
     let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_web_search_history_go.json")).unwrap();
@@ -1865,15 +1856,9 @@ async fn replayed_web_search_history_matches_go() {
         })
         .unwrap();
         let sent = if call == "websocket" {
-            let credential = credential(&synthetic, "http://127.0.0.1:1");
-            request::shape(
-                &request(&synthetic),
-                &View::new(&credential),
-                &Settings::from(&cfg),
-                Call::Websocket,
-            )
-            .unwrap()
-            .body
+            let req = request(&synthetic);
+            let model = super::native::upstream_model(&req).unwrap();
+            String::from_utf8(super::native::routed(&req.body, &model).unwrap().to_vec()).unwrap()
         } else {
             let mock = Mock::start().await;
             let (path, content_type, body) = if call == "compact" {
@@ -1908,21 +1893,16 @@ async fn replayed_web_search_history_matches_go() {
             }
             String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
         };
-        // The HTTP calls take the native route (#23): the client's body goes upstream
-        // unchanged, without the web search or image tool. The WebSocket shape keeps Go's
-        // bytes until #24.
-        let expected = if call == "websocket" {
-            case["sent"].as_str().unwrap()
-        } else {
-            case["payload"].as_str().unwrap()
-        };
-        assert_eq!(sent, expected, "{name}");
+        // Without the web search or image tool Go added.
+        assert_eq!(sent, case["payload"].as_str().unwrap(), "{name}");
     }
 }
 
-/// Sign in with ChatGPT (7b0319fb): Go v8.0.35's upstream body and headers for a
-/// `use_siwc` credential on every call, and its missing-token error; see
-/// tests/reference/codex_siwc.
+/// Sign in with ChatGPT (7b0319fb): Go v8.0.35's upstream headers for a `use_siwc`
+/// credential on every call, and its missing-token error; see tests/reference/codex_siwc.
+/// The bodies follow the native contract instead (#28, docs/DIFFERENCES-FROM-GO.md): the
+/// `siwc` profile takes the native route, so the client's body goes upstream with only
+/// its `model` routed, and Go's Sign in with ChatGPT body rules no longer run.
 #[tokio::test]
 async fn siwc_requests_match_go() {
     let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_go.json")).unwrap();
@@ -1963,19 +1943,33 @@ async fn siwc_requests_match_go() {
                 .filter(|v| call != "image" && !v.is_empty());
             ua[0] = caller.unwrap_or(PROXY_UA).into();
         }
+        // A buffered request keeps the client's `stream: false` on this profile (#28), so
+        // it asks for JSON, where Go forced a stream.
+        if call == "non_stream"
+            && let Some(accept) = sent_headers.get_mut("accept")
+        {
+            accept[0] = "application/json".into();
+        }
+        // The native body: the client's, with only the routed model.
+        let native_body = {
+            let req = request(&synthetic);
+            let model = super::native::upstream_model(&req).ok();
+            model
+                .and_then(|m| super::native::routed(&req.body, &m).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
         let go_upstream = serde_json::json!({
             "path": case["path"],
-            "body": case["body"],
+            "body": if call == "image" { case["body"].clone() } else { Value::String(native_body.clone()) },
             "headers": sent_headers,
         });
         if call == "websocket" {
             let req = request(&synthetic);
             let view = View::new(&credential);
             let settings = Settings::scoped(&cfg, &view);
-            let shaped = request::shape(&req, &view, &settings, Call::Websocket).unwrap();
-            let (body, cache) = request::prompt_cache(&req, shaped.body, Some("exec-session"), true);
-            let body = crate::codex_ws::turn_body(&view, &req, &settings, &shaped.finalize, body);
-            assert_eq!(body, case["body"].as_str().unwrap(), "{name}: body");
+            let body = native_body.clone();
+            let cache = request::prompt_cache_id(&req, &body, Some("exec-session"), true);
             let headers = request::ws_headers(
                 &view,
                 &settings,
@@ -1983,8 +1977,8 @@ async fn siwc_requests_match_go() {
                 &body,
                 &request::base_model(&req.model),
                 cache.as_deref(),
-                false,
-                crate::codex_identity::Origin::of(&req),
+                request::is_native(&req),
+                crate::codex_identity::Origin::Caller,
             );
             let mut actual: Vec<(String, String)> = headers
                 .iter()
@@ -2053,6 +2047,16 @@ async fn siwc_requests_match_go() {
                     while stream.next().await.is_some() {}
                 }
                 assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            }
+            // A thinking suffix has no native meaning, so the native route refuses it
+            // before any upstream request, where Go turned it into body fields.
+            Err(error) if case["status"].is_null() => {
+                assert!(
+                    cpa_common::thinking::parse_suffix(case["model"].as_str().unwrap()).has_suffix,
+                    "{name}: {error:?}"
+                );
+                assert_eq!(error.status, 400, "{name}");
+                assert!(mock.take().is_empty(), "{name}: nothing may reach upstream");
             }
             Err(error) => {
                 assert_eq!(error.status as i64, case["status"].as_i64().unwrap(), "{name}: status");
@@ -2301,143 +2305,8 @@ fn count_tokens_ignores_the_payload_rules_and_is_marked_local() {
     assert_eq!(out.headers[super::LOCAL_TOKEN_COUNT], "local-estimate");
 }
 
-/// zakstak/cliproxy-rs#5: an upstream context-window `response.failed` reaches a
-/// Codex client unchanged before the classified error, because Codex compacts only on the
-/// original event. Other clients and other failures keep Go's error-only step, and
-/// the error the scheduler classifies is the same either way. Go v8.0.35 differs
-/// (docs/DIFFERENCES-FROM-GO.md).
-#[test]
-fn context_window_failure_reaches_codex_clients_unchanged() {
-    use crate::codex_response::{Processor, Step};
-    let fail = |codex_client: bool, payload: &str| {
-        let event = format!("event: response.failed\ndata: {payload}\n\n");
-        match Processor::new(false, false)
-            .codex_client(codex_client)
-            .event(event.as_bytes())
-        {
-            Step::Fail { error, before, .. } => (error, before),
-            _ => panic!("a failure for {payload}"),
-        }
-    };
-    // Codex's own `ContextWindowExceeded` fixture (codex-api sse/responses.rs).
-    let context = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null}}"#;
-    let (error, before) = fail(true, context);
-    assert_eq!(
-        before.as_deref(),
-        Some(format!("event: response.failed\ndata: {context}\n\n").as_bytes())
-    );
-    // Go's step: the lines before the failing data line, then the error.
-    let go_step = Some(&b"event: response.failed\n\n"[..]);
-    let (go_error, go_before) = fail(false, context);
-    assert_eq!(go_before.as_deref(), go_step, "other clients keep Go's step");
-    for error in [&error, &go_error] {
-        assert_eq!(error.status, 400);
-        assert_eq!(error.scope, FailureScope::Request);
-        assert_eq!(
-            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
-            "context_too_large"
-        );
-    }
-    // Other failures, and a context code only in the message or the replacement code, are
-    // not the event Codex recognises.
-    for other in [
-        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#,
-        r#"{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"too long"}}}"#,
-        r#"{"type":"response.failed","response":{"error":{"message":"maximum context length exceeded"}}}"#,
-    ] {
-        assert_eq!(fail(true, other).1.as_deref(), go_step, "{other}");
-    }
-}
-
-/// The live ChatGPT Codex rejection of an oversized input is an `error` event without a
-/// status, which Codex ignores. A Codex client receives it as the `response.failed` Codex
-/// compacts on, with the original error object; the attempt still fails with Go's
-/// classified 400 `context_too_large`, and other clients keep Go's step.
-#[test]
-fn live_context_window_error_reaches_codex_clients_as_a_failure() {
-    use crate::codex_response::{Processor, Step};
-    let live = include_str!("../../cpa-common/tests/fixtures/codex_context_window_error_live.json").trim();
-    let normalized = cpa_common::codex_client::context_window_failure_event(live).unwrap();
-    assert!(cpa_common::codex_client::is_context_window_failure(
-        normalized.as_bytes()
-    ));
-    let event = format!("event: error\ndata: {live}\n\n");
-    for codex_client in [true, false] {
-        let Step::Fail { error, before, .. } = Processor::new(false, false)
-            .codex_client(codex_client)
-            .event(event.as_bytes())
-        else {
-            panic!("a failure");
-        };
-        let want = if codex_client {
-            format!("event: response.failed\ndata: {normalized}\n\n")
-        } else {
-            "event: error\n\n".to_owned()
-        };
-        assert_eq!(before.as_deref(), Some(want.as_bytes()), "codex client {codex_client}");
-        assert_eq!(error.status, 400);
-        assert_eq!(error.scope, FailureScope::Request);
-        assert_eq!(
-            gjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
-            "context_too_large"
-        );
-    }
-}
-
-/// Issue #2: a WebSocket turn from an official Codex client keeps `parallel_tool_calls`
-/// (false, true or omitted) and its output-replay `include`. Responses Lite still forces
-/// `false`, and SIWC and other Responses clients keep Go's values.
-#[test]
-fn native_codex_websocket_turns_keep_tool_parallelism_and_output_replay() {
-    let replay = r#"["reasoning.encrypted_content","output.encrypted_content"]"#;
-    let reasoning = r#"["reasoning.encrypted_content"]"#;
-    let shaped = |ua: &str, lite: bool, siwc: bool, parallel: &str| {
-        let mut credential = oauth_credential("http://127.0.0.1:1");
-        if siwc {
-            credential.metadata.insert("use_siwc".into(), true.into());
-            credential
-                .metadata
-                .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at-FAKE"}));
-        }
-        let mut req = plain_request(true, None);
-        (req.source_format, req.response_format) = (Format::OpenAIResponse, Format::OpenAIResponse);
-        req.headers.insert("user-agent", ua.parse().unwrap());
-        if lite {
-            req.headers
-                .insert("x-openai-internal-codex-responses-lite", "true".parse().unwrap());
-        }
-        req.body = Bytes::from(format!(
-            r#"{{"model":"gpt-5.4","input":[],"tools":[{{"type":"function","name":"f","parameters":{{"type":"object"}}}}],"tool_choice":"auto"{parallel},"store":false,"stream":true,"include":{replay}}}"#
-        ));
-        req.original_body = req.body.clone();
-        let view = View::new(&credential);
-        let settings = Settings::scoped(&Config::default(), &view);
-        request::shape(&req, &view, &settings, Call::Websocket).unwrap().body
-    };
-    let field = |body: &str, path: &str| gjson::get(body, path).json().to_owned();
-    let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
-    for (parallel, want) in [
-        (r#","parallel_tool_calls":false"#, "false"),
-        (r#","parallel_tool_calls":true"#, "true"),
-        ("", ""),
-    ] {
-        let body = shaped(codex, false, false, parallel);
-        assert_eq!(field(&body, "parallel_tool_calls"), want, "{body}");
-        assert_eq!(field(&body, "include"), replay, "{body}");
-    }
-    let lite = shaped(codex, true, false, r#","parallel_tool_calls":true"#);
-    assert_eq!(field(&lite, "parallel_tool_calls"), "false", "{lite}");
-    let siwc = shaped(codex, false, true, r#","parallel_tool_calls":false"#);
-    assert_eq!(field(&siwc, "parallel_tool_calls"), "false", "{siwc}");
-    assert_eq!(field(&siwc, "include"), reasoning, "{siwc}");
-    let other = shaped("OpenAI/Python 2.1.0", false, false, r#","parallel_tool_calls":false"#);
-    assert_eq!(field(&other, "parallel_tool_calls"), "true", "{other}");
-    assert_eq!(field(&other, "include"), reasoning, "{other}");
-}
-
-/// Issue #8: a WebSocket turn from an official Codex client keeps an explicit
-/// `service_tier`, and the handshake's routing hint names the same tier. Other Responses
-/// clients keep Go's rule, which drops `flex`.
+/// Issue #8: a WebSocket turn keeps an explicit `service_tier`, and the handshake's
+/// routing hint names the same tier.
 #[test]
 fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
     let shaped = |ua: &str, tier: &str| {
@@ -2451,7 +2320,8 @@ fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
         req.original_body = req.body.clone();
         let view = View::new(&credential);
         let settings = Settings::scoped(&Config::default(), &view);
-        let body = request::shape(&req, &view, &settings, Call::Websocket).unwrap().body;
+        // A native frame goes upstream as the client sent it (#24, #28).
+        let body = String::from_utf8(req.body.to_vec()).unwrap();
         let headers = request::ws_headers(
             &view,
             &settings,
@@ -2489,9 +2359,10 @@ fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
             "{tier}"
         );
     }
+    // Any Responses client: no client-dependent tier rule remains (#28).
     assert_eq!(
         shaped("OpenAI/Python 2.1.0", r#","service_tier":"flex""#),
-        (String::new(), Some("model=gpt-5.4".to_owned()))
+        (r#""flex""#.to_owned(), Some("model=gpt-5.4;tier=flex".to_owned()))
     );
 }
 

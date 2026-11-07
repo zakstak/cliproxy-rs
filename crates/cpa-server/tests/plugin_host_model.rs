@@ -78,7 +78,12 @@ async fn serve_codex(seen: Arc<Mutex<Vec<(&'static str, String)>>>) -> String {
             let auth = headers["authorization"].to_str().unwrap().to_owned();
             let Ok(ws) = ws else {
                 seen.lock().unwrap().push(("http", auth));
-                return format!("event: response.completed\ndata: {DONE}\n\n").into_response();
+                // An SSE answer labelled as one: the native route reads the content type.
+                return (
+                    [("content-type", "text/event-stream")],
+                    format!("event: response.completed\ndata: {DONE}\n\n"),
+                )
+                    .into_response();
             };
             seen.lock().unwrap().push(("websocket", auth));
             ws.on_upgrade(|mut socket| async move {
@@ -522,15 +527,16 @@ async fn callback_streams_preserve_executor_bytes_across_interceptor_unload() {
                     .filter(|r| r["ChunkIndex"].as_i64().unwrap() >= 0)
                     .map(|r| String::from_utf8(decode(&r["Body"])).unwrap())
                     .collect();
-                assert_eq!(
-                    bodies,
-                    if mode == "present" {
-                        expected.clone()
-                    } else {
-                        vec![expected[0]]
-                    },
-                    "interceptor {protocol}/{mode}"
-                );
+                // A Responses callback served by Codex takes the native route (#28), where no
+                // chunk interceptor runs; the executor bytes above are the same.
+                let intercepted = if protocol == "openai-response" {
+                    vec![]
+                } else if mode == "present" {
+                    expected.clone()
+                } else {
+                    vec![expected[0]]
+                };
+                assert_eq!(bodies, intercepted, "interceptor {protocol}/{mode}");
                 std::fs::remove_file(records.join("observer.jsonl")).unwrap();
             }
             drop(guard);

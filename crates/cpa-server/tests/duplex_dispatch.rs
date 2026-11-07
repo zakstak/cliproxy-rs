@@ -196,12 +196,19 @@ impl Conductor {
     /// `manager.ExecuteStream` for a downstream WebSocket turn: the first item, then the
     /// rest, as one stream.
     async fn stream(&self) -> ExecStream {
+        // As the Responses WebSocket handler builds it: the client's `response.create`
+        // frame, kept for the native route (`dispatch::NativeRequest`).
+        let body = Bytes::from(format!(
+            r#"{{"type":"response.create","model":"{}","input":[]}}"#,
+            self.model
+        ));
+        let native = dispatch::NativeRequest::new(body.clone(), Default::default(), "/v1/responses".into());
         let call = Call {
             entry: Format::OpenAIResponse,
             response: Format::OpenAIResponse,
             operation: Operation::Generate,
             model: self.model.clone(),
-            body: Bytes::from(format!(r#"{{"model":"{}","input":[]}}"#, self.model)),
+            body,
             stream: true,
             alt: None,
             headers: Default::default(),
@@ -215,7 +222,7 @@ impl Conductor {
             execution_session: Some(self.session.clone()),
             request_path: "/v1/responses".into(),
             peer: None,
-            native: None,
+            native: Some(native),
             turn: Some(Arc::new(SessionTurn {
                 session: ExecSession {
                     id: self.session.clone(),
@@ -443,9 +450,11 @@ async fn bootstrap_preserves_followup() {
     }
 }
 
-/// `TestCodexDuplexLaterCredentialFailure`: a 401/403/429 after the first response
-/// forwards the event, ends the stream with the original classification, cools that
-/// account only, and is never replayed on another one.
+/// `TestCodexDuplexLaterCredentialFailure`: a 401/403/429 after the first response ends
+/// the stream with the original classification, cools that account only, and is never
+/// replayed on another one. Go forwarded the event; every duplex connection is native
+/// now (#28), where an account failure never reaches the client as sent: its frame can
+/// name the pooled account (docs/codex/CONTRACT.md "Responses and failures").
 #[tokio::test]
 async fn later_credential_failure() {
     for kind in ["error", "response.failed"] {
@@ -513,10 +522,7 @@ async fn later_credential_failure() {
                                 FailureScope::Request,
                                 "{name}: credential failure became request-scoped"
                             );
-                            assert!(
-                                payload_seen,
-                                "{name}: original failure not forwarded before terminal error"
-                            );
+                            assert!(!payload_seen, "{name}: the account failure reached the client");
                             continue;
                         }
                     };
@@ -527,7 +533,7 @@ async fn later_credential_failure() {
                     payload_seen |= event == kind;
                 }
                 assert!(
-                    payload_seen && terminal_seen,
+                    !payload_seen && terminal_seen,
                     "{name}: failure payload={payload_seen} terminal={terminal_seen}"
                 );
                 conductor.assert_cooled("bad-key", status, status == 429, &name);

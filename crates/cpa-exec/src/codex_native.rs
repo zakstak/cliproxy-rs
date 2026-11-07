@@ -1,5 +1,5 @@
 //! The native Codex HTTP route (#23, and the HTTP half of #25): a Responses body from a
-//! Responses client, sent over HTTP to a `chatgpt`, `api-key` or `compatible` profile
+//! Responses client, sent over HTTP to any Codex endpoint profile
 //! (`docs/codex/CONTRACT.md` "Native HTTP route"). The predicates and request edits of
 //! the native WebSocket route (#24) live here too; its socket handling is in
 //! `codex_ws.rs` and `codex_duplex.rs` ("Native WebSocket route").
@@ -8,7 +8,12 @@
 //! permitted transformations: the upstream `model` of an alias, and `stream: true` for a
 //! buffered client on the `chatgpt` profile, whose buffered support is unknown. Nothing
 //! else runs: no translation, thinking, payload rules, prompt-cache key, reasoning
-//! replay, tool or namespace preparation, or Sign in with ChatGPT rules.
+//! replay, tool or namespace preparation, or Sign in with ChatGPT rules (#28).
+//!
+//! A WebSocket turn on a credential without `websockets` also comes here
+//! ([`CodexExecutor::native_ws_http`]): the first-party `response.create` frame is the
+//! HTTP request body plus its `type` tag (`codex-api/src/common.rs:315-339`), so the
+//! frame goes upstream without `type`, with only its `model` routed.
 //!
 //! The response reaches the client as the upstream sent it. A stream's events are
 //! forwarded byte for byte; observation (usage, capture, failure classification) reads
@@ -29,13 +34,17 @@ use cpa_common::codex_body::{CodexBody, Kind};
 
 use super::*;
 
-/// The endpoint profiles the native route serves. The `siwc` profile is not one of them:
-/// no first-party source covers it, so it keeps the legacy request path.
+/// The endpoint profiles. Every profile takes the native and translated routes (#28).
+/// Only `chatgpt` gets the buffered `stream: true` adaptation; the others pass the
+/// client's `stream` choice through, as the OpenAI API documents it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
     Chatgpt,
     ApiKey,
     Compatible,
+    /// Sign in with ChatGPT. No first-party source covers its Responses behaviour, so
+    /// the proxy adds nothing: Go's request rules for it (`siwc_body`) were deleted.
+    Siwc,
 }
 
 impl Profile {
@@ -44,7 +53,7 @@ impl Profile {
     /// `api.openai.com` and `compatible` anywhere else.
     pub(crate) fn of(view: &View<'_>) -> Option<Self> {
         if view.siwc {
-            return None;
+            return Some(Self::Siwc);
         }
         if !view.api_key {
             return Some(Self::Chatgpt);
@@ -70,13 +79,11 @@ pub(crate) fn eligible(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
         .flatten()
 }
 
-/// Whether the executor serves `req` natively: an eligible request the server handed
-/// over as native. The server clears `stream_payloads` on a native attempt, because no
-/// hook reads its chunks; a request that still asks for unframed payloads (a plugin
-/// model callback, a hooked attempt the server did not make native) keeps the legacy
-/// path and its payload framing.
+/// Whether the executor serves `req` natively. Every eligible request does: a request
+/// that asks for unframed stream payloads (a plugin model callback) gets each event's
+/// `data` payload, unchanged, instead of the framed event.
 pub(crate) fn route(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
-    eligible(view, req).filter(|_| !req.stream_payloads)
+    eligible(view, req)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,20 +94,62 @@ enum Call {
 }
 
 /// Whether a WebSocket turn on `view` may take the native route (#24): an eligible
-/// request on a credential with `websockets: true` whose frame is a `response.create`,
-/// the one request frame the pinned client sends (`codex-api/src/common.rs:400-406`).
-/// That covers a first turn, a continuation with `previous_response_id`, a prewarm with
-/// `generate: false`, and a create the client sends while a response runs. The
-/// Go-defined `response.append` keeps the legacy path: no first-party or documented
-/// source defines it, so the proxy's own handling is all it has. The server decides
-/// with this ([`CodexExecutor::native_ws`]); `frame` is the client's frame.
+/// request whose frame is a `response.create`, the one request frame the pinned client
+/// sends (`codex-api/src/common.rs:400-406`). That covers a first turn, a continuation
+/// with `previous_response_id`, a prewarm with `generate: false`, and a create the
+/// client sends while a response runs. A credential with `websockets` carries it on a
+/// socket; one without sends a first turn over HTTP and refuses the rest
+/// ([`CodexExecutor::native_ws_http`]). Any other frame, such as the Go-defined
+/// `response.append`, is refused ([`refused_frame`]). The server decides with this
+/// ([`CodexExecutor::native_ws`]); `frame` is the client's frame.
 pub(crate) fn eligible_ws(view: &View<'_>, req: &ExecRequest, frame: &[u8]) -> Option<Profile> {
-    eligible(view, req).filter(|_| view.websockets() && creates(frame))
+    eligible(view, req).filter(|_| creates(frame))
 }
 
 /// Whether the executor serves a WebSocket turn natively, as [`route`] does for HTTP.
 pub(crate) fn route_ws(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
-    eligible_ws(view, req, &req.body).filter(|_| !req.stream_payloads)
+    eligible_ws(view, req, &req.body)
+}
+
+/// The refusal of a WebSocket turn no Codex route carries: a frame other than
+/// `response.create` (such as Go's `response.append`, which no first-party or documented
+/// source defines), or a turn whose formats are not Responses on both sides.
+pub(crate) fn refused_frame(frame: &[u8]) -> ExecError {
+    let kind = cpa_common::json::get(frame, "type");
+    let message = match &*kind.str() {
+        "response.append" => APPEND_REFUSED.to_owned(),
+        "" | "response.create" => {
+            "Codex WebSocket turns must be Responses `response.create` frames from a Responses client".to_owned()
+        }
+        other => format!(
+            "`{other}` is not supported on Codex credentials: no first-party or documented source defines it; send a `response.create` (with `previous_response_id` to continue a response)"
+        ),
+    };
+    ExecError::local(400, FailureScope::Request, message)
+}
+
+/// The refusal of Go's `response.append` frame, on a turn and inside a steering
+/// connection alike.
+pub const APPEND_REFUSED: &str = "`response.append` is not supported on Codex credentials: no first-party or documented source defines it; send a `response.create` (with `previous_response_id` to continue a response)";
+
+/// The HTTP body of a WebSocket `response.create` frame: the frame without its `type`
+/// tag, with `model` routed. A continuation (`previous_response_id`) needs the state of
+/// an upstream socket this credential does not keep, so it is refused with the replay
+/// close; a prewarm (`generate: false`) has no HTTP meaning and is refused.
+pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
+    let body = CodexBody::parse(frame)?;
+    if body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null) {
+        return Err(ExecError::replay_required());
+    }
+    if body.get("generate").is_some_and(|m| m.kind == Kind::False) {
+        return Err(ExecError::local(
+            400,
+            FailureScope::Request,
+            "a prewarm (`generate: false`) needs an upstream WebSocket; enable `websockets` on the Codex credential or send the turn without `generate`",
+        ));
+    }
+    let untagged = CodexBody::parse(frame)?.without_member("type");
+    routed(&Bytes::from(untagged), model)
 }
 
 /// Whether `frame` is a `response.create`. A frame the request boundary refuses counts
@@ -179,11 +228,45 @@ impl CodexExecutor {
         };
         let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
+        self.native_send(view, settings, req, profile, call, model, body, None)
+            .await
+    }
+
+    /// A WebSocket turn on a credential without `websockets`: the client's
+    /// `response.create` frame as an HTTP stream ([`ws_http_body`]), with the downstream
+    /// connection as prompt-cache identity.
+    pub(crate) async fn native_ws_http(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        req: ExecRequest,
+        profile: Profile,
+        session: &str,
+    ) -> Result<ExecResponse, ExecError> {
+        let model = upstream_model(&req)?;
+        let body = ws_http_body(&req.body, &model)?;
+        self.native_send(view, settings, req, profile, Call::Stream, model, body, Some(session))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn native_send(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        req: ExecRequest,
+        profile: Profile,
+        call: Call,
+        model: String,
+        body: Bytes,
+        ws_session: Option<&str>,
+    ) -> Result<ExecResponse, ExecError> {
+        settings.refuse_image_tool(&req.request_path, &body)?;
         // The body passed the boundary, so this never fails.
         let text = std::str::from_utf8(&body)
             .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
         let upstream_stream = call == Call::Stream || (call == Call::Buffered && profile == Profile::Chatgpt);
-        let cache = request::prompt_cache_id(&req, text, None, false);
+        let cache = request::prompt_cache_id(&req, text, ws_session, false);
         let headers = request::http_headers(
             view,
             &req.headers,
@@ -248,7 +331,21 @@ impl CodexExecutor {
         let (status, headers) = (upstream.status, upstream.headers);
         if call == Call::Stream && sse {
             let hold = settings.bootstrap_buffering.then_some(settings.bootstrap_timeout);
-            let stream = passthrough(crate::upstream::framed(upstream.body), observer, hold);
+            let mut stream = passthrough(
+                crate::upstream::framed(upstream.body),
+                observer,
+                hold,
+                ws_session.is_some(),
+            );
+            if ws_session.is_some() {
+                // A WebSocket client takes each event's payload as one text frame.
+                stream = stream.filter_map(|item| async move { unframed(item) }).boxed();
+            } else if req.stream_payloads {
+                // A plugin model callback reads executor chunks: each line of an event.
+                stream = stream
+                    .flat_map(|item| futures_util::stream::iter(event_lines(item)))
+                    .boxed();
+            }
             return Ok(ExecResponse {
                 status,
                 headers,
@@ -387,6 +484,31 @@ fn parse_frame(frame: &[u8]) -> (Option<&str>, Option<Cow<'_, str>>) {
         }
     }
     (name, data)
+}
+
+/// An event as the executor chunks a plugin model callback reads: each non-empty line,
+/// its bytes unchanged.
+fn event_lines(item: Result<Bytes, ExecError>) -> Vec<Result<Bytes, ExecError>> {
+    match item {
+        Ok(frame) => sse_lines(&frame)
+            .filter(|line| !line.is_empty())
+            .map(|line| Ok(frame.slice_ref(line)))
+            .collect(),
+        Err(error) => vec![Err(error)],
+    }
+}
+
+/// An event as the payload a WebSocket client reads as one text frame: its `data`,
+/// unchanged. An event without data (a comment) carries nothing for it.
+fn unframed(item: Result<Bytes, ExecError>) -> Option<Result<Bytes, ExecError>> {
+    match item {
+        Ok(frame) => match parse_frame(&frame).1 {
+            Some(Cow::Borrowed(data)) => Some(Ok(frame.slice_ref(data.as_bytes()))),
+            Some(Cow::Owned(data)) => Some(Ok(Bytes::from(data))),
+            None => None,
+        },
+        Err(error) => Some(Err(error)),
+    }
 }
 
 /// What the client receives for a failure it does not see as an event (a buffered
@@ -548,6 +670,9 @@ struct Passthrough {
     hold: Option<tokio::time::Instant>,
     /// Something reached the client: from here on nothing fails over.
     committed: bool,
+    /// A WebSocket turn served over HTTP: a failure follows the native WebSocket rule
+    /// instead of reaching the client as an event (see [`Passthrough::fail_websocket`]).
+    websocket: bool,
     out: VecDeque<Result<Bytes, ExecError>>,
     done: bool,
 }
@@ -588,6 +713,10 @@ impl Passthrough {
                 self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
             }
+            Seen::Failure { error, deliver, .. } if self.websocket => {
+                self.observer.wire.exec_error(&error);
+                self.fail_websocket(error, frame, deliver);
+            }
             Seen::Failure { error, body, deliver } => {
                 self.observer.wire.exec_error(&error);
                 if !self.committed && error.scope != FailureScope::Request {
@@ -604,6 +733,43 @@ impl Passthrough {
                 self.done = true;
             }
         }
+    }
+
+    /// A failure on a WebSocket turn served over HTTP, as the native WebSocket route
+    /// delivers one (`codex_ws.rs`, docs/codex/CONTRACT.md "Responses and failures"): the
+    /// #5 context-window event a Codex client receives goes ahead of the error; any other
+    /// failure travels on the error as the upstream sent it, for delivery once failover is
+    /// decided; an account failure (401, 402, 403, 429) never reaches the client as sent,
+    /// because its frame can name the pooled account.
+    fn fail_websocket(&mut self, mut error: ExecError, frame: Bytes, deliver: Option<Bytes>) {
+        // Nothing was delivered and another credential may serve the turn: the held
+        // handshake events go with the attempt, as on the HTTP route.
+        let retry = !self.committed && error.scope != FailureScope::Request;
+        if retry {
+            self.held.clear();
+        } else {
+            self.commit();
+        }
+        // #5 as `codex_ws.rs` `preserved_event`: a Codex client gets the context-window
+        // event ahead of the error, renamed when it was the status-less `error`.
+        let preserved = deliver.or_else(|| {
+            let context = self.observer.codex_client
+                && parse_frame(&frame)
+                    .1
+                    .is_some_and(|data| cpa_common::codex_client::context_window_failure_event(data.trim()).is_some());
+            context.then(|| frame.clone())
+        });
+        match preserved {
+            Some(event) if !retry => self.out.push_back(Ok(event)),
+            _ if crate::codex_ws::account_failure(error.status) => {}
+            _ => {
+                if let Some(data) = parse_frame(&frame).1 {
+                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(data.as_bytes())));
+                }
+            }
+        }
+        self.out.push_back(Err(error));
+        self.done = true;
     }
 
     fn end(&mut self, error: ExecError) {
@@ -647,7 +813,12 @@ fn terminated(frame: Bytes) -> Bytes {
 /// (`stream-bootstrap-buffering` and `stream-bootstrap-timeout`); without, every event
 /// is delivered at once. Either way a failure that arrives before anything was
 /// delivered may fail over.
-fn passthrough(upstream: ExecStream, observer: Observer, hold: Option<Option<Duration>>) -> ExecStream {
+fn passthrough(
+    upstream: ExecStream,
+    observer: Observer,
+    hold: Option<Option<Duration>>,
+    websocket: bool,
+) -> ExecStream {
     let state = Passthrough {
         upstream,
         observer,
@@ -656,6 +827,7 @@ fn passthrough(upstream: ExecStream, observer: Observer, hold: Option<Option<Dur
         holding: hold.is_some(),
         hold: hold.flatten().map(|d| tokio::time::Instant::now() + d),
         committed: false,
+        websocket,
         out: VecDeque::new(),
         done: false,
     };

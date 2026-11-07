@@ -2,7 +2,7 @@
 //! `api-key` profiles every Responses client's body reaches the upstream byte for byte,
 //! with only the contract's permitted edits, and the upstream's answer reaches the client
 //! byte for byte (`docs/codex/CONTRACT.md` "Native HTTP route"). Sign in with ChatGPT
-//! keeps the legacy path. Loopback upstreams, fake tokens and a private `auth-dir`.
+//! takes the same route (#28). Loopback upstreams, fake tokens and a private `auth-dir`.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,6 @@ use axum::http::HeaderMap;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_exec::Executors;
-use serde_json::Value;
 
 type Seen = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
 
@@ -138,27 +137,17 @@ async fn send(proxy: &Proxy, headers: &[(&str, &str)], body: String) -> (HeaderM
     (headers, String::from_utf8(body.to_vec()).unwrap())
 }
 
-fn field(body: &str, path: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).unwrap();
-    value.pointer(path).map(Value::to_string)
-}
-
+/// A Sign in with ChatGPT credential takes the native route (#28): the client's body goes
+/// upstream byte for byte, output replay and `prompt_cache_options` included. Go dropped
+/// both, and forced its other SIWC body rules; no first-party source covers the profile,
+/// so the proxy adds and removes nothing.
 #[tokio::test]
-async fn native_siwc_keeps_parallelism_and_drops_unproven_fields() {
+async fn native_siwc_forwards_the_client_body() {
     let proxy = proxy(true).await;
-    let (headers, sent) = send(&proxy, &[("user-agent", CODEX_UA)], body(Some(false), REPLAY)).await;
+    let sent_body = body(Some(false), REPLAY);
+    let (headers, sent) = send(&proxy, &[("user-agent", CODEX_UA)], sent_body.clone()).await;
     assert_eq!(headers["authorization"], "Bearer siwc-at-FAKE");
-    assert_eq!(field(&sent, "/parallel_tool_calls").as_deref(), Some("false"), "{sent}");
-    assert_eq!(
-        field(&sent, "/include").as_deref(),
-        Some(r#"["reasoning.encrypted_content"]"#),
-        "no evidence that the SIWC upstream accepts output replay"
-    );
-    assert_eq!(
-        field(&sent, "/prompt_cache_options"),
-        None,
-        "Go's SIWC unsupported field"
-    );
+    assert_eq!(sent, sent_body, "the client's bytes");
 }
 
 /// The Codex request boundary (#22) refuses an ambiguous or mistyped native body through

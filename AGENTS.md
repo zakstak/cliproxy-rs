@@ -38,7 +38,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) tar
 
 ## Review guidelines
 
-Flag, in order: behaviour that differs from Go v8.0.35 (`ae3ee3be`) without an entry in `docs/DIFFERENCES-FROM-GO.md` or an explicit partial/missing audit item, or, on Codex routes, behaviour that differs from `docs/codex/CONTRACT.md`, a payload change outside its permitted transformations, or a Codex fixture without first-party or documented provenance; request or response bytes changed on passthrough; credentials or client keys reaching logs or the wrong side; tests that can touch the network or a real `auth-dir`; work on a request body that grows faster than linearly with its size. Skip style nits that `cargo fmt` and clippy already cover.
+Flag, in order: behaviour that differs from Go v8.0.35 (`ae3ee3be`) without an entry in `docs/DIFFERENCES-FROM-GO.md` or an explicit partial/missing audit item, or, on Codex routes, behaviour that differs from `docs/codex/CONTRACT.md`, a payload change outside its permitted transformations, a setting, credential attribute, plugin hook or client header that rewrites a Codex request or is accepted and silently ignored instead of refused (the contract's "Settings" table lists each outcome), a request path that bypasses the native or translated route, or a Codex fixture without first-party or documented provenance; request or response bytes changed on passthrough; credentials or client keys reaching logs or the wrong side; tests that can touch the network or a real `auth-dir`; work on a request body that grows faster than linearly with its size. Skip style nits that `cargo fmt` and clippy already cover.
 
 ## Claude cache telemetry deployment check
 

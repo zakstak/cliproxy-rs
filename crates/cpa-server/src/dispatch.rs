@@ -797,8 +797,8 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
 
 /// Whether a native Codex attempt is possible for `call`: a Responses request
 /// (`Call::native`) whose selectable credentials for the model include a built-in Codex
-/// credential on a native profile without a plugin executor. A WebSocket turn also needs
-/// a `response.create` frame and a credential with `websockets`. Records the answer on
+/// credential without a plugin executor (every Codex profile is native, #28). A
+/// WebSocket turn also needs a `response.create` frame. Records the answer on
 /// the request. Under Home the pool is remote and unknown, so every such request counts;
 /// its non-native attempts still receive the deferred before-auth result.
 fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<String>, String)) -> bool {
@@ -826,7 +826,6 @@ fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<Str
                     && c.provider.trim().eq_ignore_ascii_case("codex")
                     && admit(c).is_some()
                     && cpa_exec::codex::CodexExecutor::native_profile(c)
-                    && (!turn || cpa_exec::codex::CodexExecutor::upstream_websocket(c))
                     && rt.plugin_runtime().executor(&rt.for_executor(c), &cfg).is_none()
             })
         });
@@ -2311,18 +2310,30 @@ async fn attempt(
         }
         // The native Codex HTTP (#23) and WebSocket (#24) routes: the client's own bytes,
         // and no request hook.
+        let builtin_codex = call.media.is_none()
+            && lease.credential.provider.trim().eq_ignore_ascii_case("codex")
+            && rt
+                .plugin_runtime()
+                .executor(&rt.for_executor(&lease.credential), cfg)
+                .is_none();
         let native = call.native.as_ref().filter(|request| {
-            call.media.is_none()
-                && lease.credential.provider.trim().eq_ignore_ascii_case("codex")
-                && rt
-                    .plugin_runtime()
-                    .executor(&rt.for_executor(&lease.credential), cfg)
-                    .is_none()
+            builtin_codex
                 && match call.turn {
                     None => cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req),
                     Some(_) => cpa_exec::codex::CodexExecutor::native_ws(&lease.credential, &req, &request.body),
                 }
         });
+        // A client Responses request that a built-in Codex credential cannot carry
+        // natively (a `response.append` frame, for one) is refused: the rewritten request
+        // other providers receive never reaches Codex (#28).
+        if native.is_none()
+            && builtin_codex
+            && let Some(request) = &call.native
+        {
+            let error = cpa_exec::codex::CodexExecutor::refused_native(call.turn.is_some(), &request.body);
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
         if let Some(request) = &call.native {
             request.mark(native.is_some());
         }
@@ -2333,8 +2344,9 @@ async fn attempt(
                 req.headers = request.headers.clone();
                 req.request_path = request.path.clone();
                 // No hook reads a native attempt's chunks, so the executor forwards the
-                // upstream's events instead of unframed payloads.
-                req.stream_payloads = false;
+                // upstream's events. A plugin model callback reads unframed payloads: the
+                // executor hands it each event's data, unchanged.
+                req.stream_payloads = crate::plugins::model_callbacks::context().is_some();
                 true
             }
             None => false,
@@ -3039,11 +3051,12 @@ mod tests {
 
     /// Each attempt carries Go's binding for its credential and upstream model; a kept
     /// request model (Go `restoreExecutionModel`) routes Codex by that model. Expected
-    /// values are the Go goldens' "codex configured" and "codex restore" cases.
+    /// values are the Go goldens' "codex configured" and "codex restore" cases, without
+    /// `is-compat`, which a `codex-api-key` model can no longer set (#28).
     #[test]
     fn attempts_bind_resolved_model_like_go() {
         let cfg = Config::parse(
-            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          is-compat: true\n      keys:\n        - api-key: xk1\n",
+            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n      keys:\n        - api-key: xk1\n",
         )
         .unwrap();
         let credential = cpa_core::config::credentials::from_config(&cfg).remove(0);
@@ -3076,7 +3089,7 @@ mod tests {
         let bound = req.resolved_model.unwrap();
         assert_eq!(
             (bound.info.id.as_str(), bound.source, bound.is_compat()),
-            ("gpt-6-sol", cpa_core::exec::ResolvedSource::ApiKey, true)
+            ("gpt-6-sol", cpa_core::exec::ResolvedSource::ApiKey, false)
         );
         let kept = attempt_request(&request, &cfg, &credential, "selection", "gpt-6-sol", true, false);
         assert_eq!(kept.model, "sol");
@@ -3095,7 +3108,7 @@ mod tests {
             (bound.source, caps.support_configuration_update, bound.is_compat())
         };
         let cfg = Config::parse(
-            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          is-compat: true\n          support-configuration-update: true\n      keys:\n        - api-key: xk1\n",
+            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n          support-configuration-update: true\n      keys:\n        - api-key: xk1\n",
         )
         .unwrap();
         let home_source = cpa_core::exec::ResolvedSource::Home;

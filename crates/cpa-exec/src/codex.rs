@@ -21,11 +21,12 @@ use http::HeaderMap;
 use crate::codex_capture::Wire;
 use crate::codex_oauth::{self, CodexOAuth};
 use crate::codex_quota::QuotaSignals;
-use crate::codex_request::{self as request, Call, Settings, View};
+use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
+pub use native::APPEND_REFUSED;
 
 pub struct CodexExecutor {
     /// Its own TLS client for chatgpt.com (no browser fingerprint, #26), Go's standard
@@ -93,11 +94,11 @@ impl CodexExecutor {
         self.quota.clone()
     }
 
-    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`):
-    /// credentials with `websockets` enabled keep a pooled upstream socket, and a
-    /// `response.create` the server handed over as native goes on it unchanged
-    /// (`codex_native.rs`); others run the HTTP stream with the session as prompt-cache
-    /// identity and cannot continue upstream state.
+    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`). Every
+    /// turn is the client's own `response.create` frame (`codex_native.rs`): credentials
+    /// with `websockets` carry it on a pooled upstream socket, and others send a first
+    /// turn as an HTTP stream with the session as prompt-cache identity. A continuation
+    /// without an upstream socket gets the replay close, and any other frame is refused.
     pub async fn execute_in_session(
         &self,
         credential: &Credential,
@@ -111,13 +112,17 @@ impl CodexExecutor {
         crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
+        settings.refuse_compat(&req, credential)?;
         if view.websockets() {
             return self.stream_ws(&view, &settings, req, session, cfg).await;
         }
         if session.continuation {
             return Err(ExecError::replay_required());
         }
-        self.stream_with_session(&view, &settings, req, Some(&session.id)).await
+        match native::route_ws(&view, &req) {
+            Some(profile) => self.native_ws_http(&view, &settings, req, profile, &session.id).await,
+            None => Err(native::refused_frame(&req.body)),
+        }
     }
 
     /// Whether `req` on `credential` takes the native HTTP route (`codex_native.rs`). The
@@ -132,6 +137,21 @@ impl CodexExecutor {
     /// [`Self::native_http`], for a `response.create` on a credential with `websockets`.
     pub fn native_ws(credential: &Credential, req: &ExecRequest, frame: &[u8]) -> bool {
         native::eligible_ws(&View::new(credential), req, frame).is_some()
+    }
+
+    /// The refusal of a client Responses request a built-in Codex credential cannot carry
+    /// natively: on a WebSocket turn, a frame other than `response.create` (such as Go's
+    /// `response.append`); over HTTP, a request outside the native route. No rewritten
+    /// request stands in (#28).
+    pub fn refused_native(turn: bool, body: &[u8]) -> ExecError {
+        if turn {
+            return native::refused_frame(body);
+        }
+        ExecError::local(
+            400,
+            FailureScope::Request,
+            "this Responses request cannot be sent to Codex natively; send a Responses generation or compaction",
+        )
     }
 
     /// Whether a WebSocket client frame is one the native WebSocket route serves (a
@@ -245,6 +265,7 @@ impl CodexExecutor {
         // Credential checks stay above the native route: it skips only payload work.
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
+        settings.refuse_compat(&req, credential)?;
         if let Some(profile) = native::route(&view, &req) {
             // The native route reads the body through the boundary itself.
             return self.native(&view, &settings, req, profile).await;
@@ -252,17 +273,7 @@ impl CodexExecutor {
         if translated::route(&view, &req) {
             return self.translated(&view, &settings, req).await;
         }
-        check_native_body(&req)?;
-        match (req.alt.as_deref(), req.stream) {
-            (Some("responses/compact"), true) => Err(ExecError::local(
-                400,
-                FailureScope::Request,
-                "streaming not supported for /responses/compact",
-            )),
-            (Some("responses/compact"), false) => self.compact(&view, &settings, req).await,
-            (_, true) => self.stream_with_session(&view, &settings, req, None).await,
-            (_, false) => self.buffered(&view, &settings, req).await,
-        }
+        Err(unrouted(&req))
     }
 
     /// Go's `http.Client.Do` through the Codex transport: the client is picked per hop
@@ -402,179 +413,6 @@ impl CodexExecutor {
             }
         };
         Ok(ExecResponse { status, headers, body })
-    }
-
-    /// HTTP streaming. `ws_session` is the downstream WebSocket connection when an HTTP
-    /// credential serves a WebSocket client (Go's execution session id).
-    pub(crate) async fn stream_with_session(
-        &self,
-        view: &View<'_>,
-        settings: &Settings,
-        req: ExecRequest,
-        ws_session: Option<&str>,
-    ) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::Stream)?;
-        let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(
-            view,
-            &req.headers,
-            &body,
-            &model,
-            cache.as_deref(),
-            true,
-            crate::codex_identity::Origin::of(&req),
-        );
-        let url = format!("{}/responses", view.base_url);
-        let started = Instant::now();
-        let wire = Wire::new(req.capture(), view.credential);
-        let res = self
-            .send(view, settings, url, headers, body.clone(), &wire, ErrorBody::Strict)
-            .await?;
-        let upstream = events(res.body);
-        let processor = Processor::new(request::is_native(&req), settings.model_level_cooling)
-            .codex_client(request::codex_client(&req))
-            .grok_keepalive(&req.headers)
-            .restoring(restore)
-            .reporting(req.usage.clone())
-            .capturing(wire);
-        let stream = if settings.bootstrap_buffering {
-            match response::bootstrap(upstream, processor, settings.bootstrap_timeout, started).await {
-                Bootstrap::Reject(error) => return Err(error),
-                Bootstrap::Stream(stream) => stream,
-            }
-        } else {
-            response::processed(upstream, processor, 0)
-        };
-        Ok(ExecResponse {
-            status: res.status,
-            headers: res.headers,
-            body: ResponseBody::Stream(client_stream(&req, &body, stream)),
-        })
-    }
-
-    async fn buffered(
-        &self,
-        view: &View<'_>,
-        settings: &Settings,
-        req: ExecRequest,
-    ) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::NonStream)?;
-        let (body, cache) = request::prompt_cache(&req, body, None, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::Codex, &body);
-        let headers = request::http_headers(
-            view,
-            &req.headers,
-            &body,
-            &model,
-            cache.as_deref(),
-            true,
-            crate::codex_identity::Origin::of(&req),
-        );
-        let url = format!("{}/responses", view.base_url);
-        let wire = Wire::new(req.capture(), view.credential);
-        let res = self
-            .open(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
-            .await?;
-        // Go reads the whole body (`io.ReadAll`, whatever its type), records every
-        // byte that arrived, then parses it, a read error's partial tail included.
-        let mut upstream = res.body;
-        let (mut data, mut failed) = (Vec::new(), None);
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(error) => {
-                    failed = Some(error);
-                    break;
-                }
-            }
-        }
-        wire.chunk(&data);
-        let mut processor = Processor::new(false, settings.model_level_cooling)
-            .restoring(restore)
-            .reporting(req.usage.clone());
-        // `bytes.Split(data, "\n")`: every line in order, an unterminated tail included.
-        if let Some(completed) = processor.buffered(&data)? {
-            return Ok(ExecResponse {
-                status: res.status,
-                headers: res.headers,
-                body: ResponseBody::Buffered(non_stream_output(&req, &body, &completed, Format::Codex)?),
-            });
-        }
-        if let Some(error) = failed {
-            wire.exec_error(&error);
-        }
-        Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
-    }
-
-    async fn compact(&self, view: &View<'_>, settings: &Settings, req: ExecRequest) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized: restore,
-            finalize,
-            ..
-        } = request::shape(&req, view, settings, Call::Compact)?;
-        let (body, cache) = request::prompt_cache(&req, body, None, false);
-        let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
-        report_request(&req, Format::OpenAIResponse, &body);
-        let headers = request::http_headers(
-            view,
-            &req.headers,
-            &body,
-            &model,
-            cache.as_deref(),
-            false,
-            crate::codex_identity::Origin::of(&req),
-        );
-        let url = format!("{}/responses/compact", view.base_url);
-        let wire = Wire::new(req.capture(), view.credential);
-        let res = self
-            .send(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
-            .await
-            .map_err(compact_error)?;
-        let data = match res.body {
-            ResponseBody::Buffered(bytes) => bytes,
-            ResponseBody::Stream(mut stream) => {
-                let mut out = Vec::new();
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(event) => out.extend_from_slice(&event),
-                        Err(error) => {
-                            wire.exec_error(&error);
-                            return Err(compact_error(error));
-                        }
-                    }
-                }
-                Bytes::from(out)
-            }
-        };
-        wire.chunk(&data);
-        let text = String::from_utf8_lossy(&data);
-        let text = response::restore(&text, restore);
-        if req.usage.enabled() {
-            // Go publishes `ParseOpenAIUsage` of the restored compaction body.
-            req.usage.response_body(Format::OpenAIResponse, text.as_bytes());
-        }
-        Ok(ExecResponse {
-            status: res.status,
-            headers: res.headers,
-            body: ResponseBody::Buffered(non_stream_output(&req, &body, &text, Format::OpenAIResponse)?),
-        })
     }
 
     /// The URL an Alpha Search on `credential` posts to; `None` for an API key without
@@ -859,6 +697,22 @@ fn check_native_body(req: &ExecRequest) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// The refusal of a request no Codex route carries (#28): the native route takes
+/// Responses on both sides, the translated route a generation from its built-in
+/// sources. Nothing else reaches the provider, and no legacy rewrite stands in.
+fn unrouted(req: &ExecRequest) -> ExecError {
+    ExecError::local(
+        400,
+        FailureScope::Request,
+        format!(
+            "this request cannot be sent to Codex: {} -> {} {} is neither a native Responses request nor a supported translation (Claude, Chat Completions, Gemini or Gemini Interactions generations)",
+            req.source_format.as_str(),
+            req.response_format.as_str(),
+            req.alt.as_deref().unwrap_or("generation"),
+        ),
+    )
+}
+
 fn check_response_format(req: &ExecRequest) -> Result<(), ExecError> {
     let identity = matches!(req.response_format, Format::Codex | Format::OpenAIResponse);
     if identity || cpa_translate::pair(req.response_format, Format::Codex).is_some() {
@@ -889,142 +743,6 @@ pub(crate) fn events(body: ResponseBody) -> ExecStream {
 
 fn translate_error(error: cpa_translate::Error) -> ExecError {
     ExecError::local(502, FailureScope::Request, error.to_string())
-}
-
-/// The client body for a buffered response (`TranslateNonStream`): the registered pair,
-/// else Go's identity. A translator failure (Go's apply_patch tool-input error) or empty
-/// output is Go's 502 `ApplyPatchUpstreamErrorMessage`.
-fn non_stream_output(
-    req: &ExecRequest,
-    translated: &str,
-    completed: &str,
-    upstream: Format,
-) -> Result<Bytes, ExecError> {
-    let out = match cpa_translate::pair(req.response_format, upstream) {
-        Some(pair) => {
-            let ctx = cpa_translate::ResponseCtx {
-                model: &req.model,
-                original_request: &req.original_body,
-                translated_request: translated.as_bytes(),
-                tool_search: false,
-            };
-            (pair.non_stream)(&ctx, completed.as_bytes()).unwrap_or_default()
-        }
-        None => completed.as_bytes().to_vec(),
-    };
-    if out.is_empty() {
-        return Err(ExecError::local(
-            502,
-            FailureScope::Request,
-            cpa_translate::APPLY_PATCH_UPSTREAM_ERROR,
-        ));
-    }
-    let out = String::from_utf8_lossy(&out).into_owned();
-    let out = if req.response_format == Format::OpenAIResponse {
-        response::ensure_usage_details(out)
-    } else {
-        out
-    };
-    Ok(Bytes::from(out))
-}
-
-/// The client stream (`TranslateStreamWithClaudeInputTokens`): translated, with Go's
-/// usage details for OpenAI Responses clients and the input-token estimate for Claude
-/// clients.
-fn client_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
-    translate_stream(req, translated, upstream)
-}
-
-/// Streaming translation for non-Codex clients; identity for Codex clients. Go keeps
-/// streaming after an apply_patch tool-input failure (Codex supports the tool natively)
-/// but skips the usage and input-token touch-ups for those chunks.
-fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
-    let responses_client = req.response_format == Format::OpenAIResponse;
-    let Some(pair) = cpa_translate::pair(req.response_format, Format::Codex) else {
-        return if responses_client {
-            upstream
-                .map(|chunk| chunk.map(response::ensure_usage_details_chunk))
-                .boxed()
-        } else {
-            upstream
-        };
-    };
-    let ctx = cpa_translate::ResponseCtx {
-        model: &req.model,
-        original_request: &req.original_body,
-        translated_request: translated.as_bytes(),
-        tool_search: false,
-    };
-    let translator = crate::translate::stream(pair, &ctx, req);
-    let original = if req.original_body.is_empty() {
-        req.body.clone()
-    } else {
-        req.original_body.clone()
-    };
-    let claude =
-        crate::gemini_stream::ClaudeInputTokens::new(req.source_format, Format::Codex, req.response_format, original);
-    struct State {
-        upstream: ExecStream,
-        translator: Box<dyn cpa_translate::StreamTranslator>,
-        /// Claude clients' `message_start` input-token estimate.
-        claude: crate::gemini_stream::ClaudeInputTokens,
-        responses_client: bool,
-        ready: std::collections::VecDeque<Bytes>,
-        /// The terminal error, written after the frames it flushed.
-        failed: Option<ExecError>,
-        done: bool,
-    }
-    futures_util::stream::unfold(
-        State {
-            upstream,
-            translator,
-            claude,
-            responses_client,
-            ready: Default::default(),
-            failed: None,
-            done: false,
-        },
-        |mut st| async move {
-            loop {
-                if let Some(event) = st.ready.pop_front() {
-                    return Some((Ok(event), st));
-                }
-                if let Some(error) = st.failed.take() {
-                    return Some((Err(error), st));
-                }
-                if st.done {
-                    return None;
-                }
-                let result = match st.upstream.next().await {
-                    Some(Ok(event)) => st.translator.event(&event).map_err(translate_error),
-                    Some(Err(error)) => Err(error),
-                    None => {
-                        st.done = true;
-                        st.translator.finish().map_err(translate_error)
-                    }
-                };
-                match result {
-                    Ok(mut events) => {
-                        if !st.translator.tool_input_failed() {
-                            st.claude.apply(&mut events);
-                            if st.responses_client {
-                                events = events.into_iter().map(response::ensure_usage_details_chunk).collect();
-                            }
-                        }
-                        st.ready.extend(events);
-                    }
-                    Err(error) => {
-                        // Go's responsesSSEFramer flushes the pending client frame before a
-                        // terminal error is written.
-                        st.ready.extend(st.translator.flush_frames());
-                        st.failed = Some(error);
-                        st.done = true;
-                    }
-                }
-            }
-        },
-    )
-    .boxed()
 }
 
 #[path = "codex_native.rs"]

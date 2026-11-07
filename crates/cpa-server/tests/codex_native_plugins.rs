@@ -525,10 +525,11 @@ async fn a_mixed_pool_applies_before_auth_only_to_attempts_that_are_not_native()
     }
 }
 
-/// A model only a Sign in with ChatGPT credential serves cannot be served natively:
-/// before-auth output and termination apply as in Go.
+/// A Sign in with ChatGPT credential takes the native route too (#28): a model only it
+/// serves gets the client's body, and before-auth output and termination never reach
+/// it, where Go applied both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_siwc_only_pool_keeps_before_auth() {
+async fn a_siwc_only_pool_is_native() {
     let Some(fx) = Fixture::build(Setup {
         name: "codex-native-plugins-siwc",
         providers: "  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models: [{name: up-model, alias: control-model}]\n      keys: [{api-key: key-FAKE-control}]\n".to_owned(),
@@ -559,18 +560,14 @@ async fn a_siwc_only_pool_keeps_before_auth() {
     let (status, answer) = fx.post("/v1/responses", &[], original).await;
     assert_eq!(status, 200, "{answer}");
     let sent = fx.codex.http().pop().expect("the SIWC credential served it");
-    let body = String::from_utf8_lossy(&sent.body);
-    assert!(
-        body.contains("before-auth body"),
-        "the legacy path keeps the rewrite: {body}"
-    );
+    assert_eq!(String::from_utf8_lossy(&sent.body), original, "the client's bytes");
     fx.respond_once(
         "request.intercept_before",
         &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
     );
     let (status, answer) = fx.post("/v1/responses", &[], original).await;
-    assert_eq!((status, answer.as_str()), (403, "blocked"));
-    assert!(fx.codex.http().len() == 1, "nothing sent after the termination");
+    assert_eq!(status, 200, "a native attempt ignores the termination: {answer}");
+    assert_eq!(fx.codex.http().len(), 2, "the request went upstream");
 }
 
 /// A Responses model only another provider serves keeps Go's selection: a before-auth
@@ -690,12 +687,12 @@ fn home_credential(id: &str, siwc: bool, base: &str) -> cpa_core::credential::Cr
     c
 }
 
-/// Under Home a Codex pool may be native, so before-auth output is deferred. A native
-/// pick ignores it; a Sign in with ChatGPT pick gets the rewrite and the termination,
-/// as before; every lease is released and every lifecycle completes. Home runs no
-/// after-auth chain.
+/// Under Home a Codex pool may be native, so before-auth output is deferred. Every Codex
+/// pick is native (#28), Sign in with ChatGPT included: each ignores the rewrite and the
+/// termination, where Go gave a Sign in with ChatGPT pick both. Every lease is released
+/// and every lifecycle completes. Home runs no after-auth chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn home_picks_get_deferred_before_auth_only_when_not_native() {
+async fn home_picks_of_every_codex_profile_are_native() {
     let Some(fx) = Fixture::build(Setup {
         name: "codex-native-plugins-home",
         providers: String::new(),
@@ -740,18 +737,13 @@ async fn home_picks_get_deferred_before_auth_only_when_not_native() {
     let sent = fx.codex.http().pop().expect("the native pick served it");
     assert_eq!(String::from_utf8_lossy(&sent.body), original);
 
-    // Sign in with ChatGPT pick: the before-auth rewrite, and no after-auth rewrite.
+    // Sign in with ChatGPT pick: native too, so the client's body.
     fx.rewrite_before_auth(rewritten);
     let (status, answer) = fx.post("/v1/responses", &[], original).await;
     assert_eq!(status, 200, "{answer}");
     let sent = fx.codex.http().pop().expect("the SIWC pick served it");
-    let body = String::from_utf8_lossy(&sent.body);
-    assert!(body.contains("before-auth body"), "{body}");
-    assert!(
-        !body.contains("after-auth body"),
-        "Home runs no after-auth chain: {body}"
-    );
-    assert_eq!(fx.calls("request.intercept_after"), 0);
+    assert_eq!(String::from_utf8_lossy(&sent.body), original);
+    assert_eq!(fx.calls("request.intercept_after"), 0, "Home runs no after-auth chain");
 
     // Native pick: a termination is ignored.
     terminate();
@@ -759,11 +751,11 @@ async fn home_picks_get_deferred_before_auth_only_when_not_native() {
     assert_eq!(status, 200, "{answer}");
     assert_eq!(fx.codex.http().len(), 3);
 
-    // Sign in with ChatGPT pick: the termination stops it before the upstream.
+    // Sign in with ChatGPT pick: a termination is ignored too.
     terminate();
     let (status, answer) = fx.post("/v1/responses", &[], original).await;
-    assert_eq!((status, answer.as_str()), (403, "blocked"));
-    assert_eq!(fx.codex.http().len(), 3, "nothing sent after the termination");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(fx.codex.http().len(), 4);
 
     assert_eq!(
         released.load(std::sync::atomic::Ordering::SeqCst),
@@ -871,74 +863,100 @@ async fn the_credits_fallback_gets_the_deferred_before_auth_rewrite() {
 
 /// The native WebSocket route (#24) with the same hooks: before-auth runs when the turn
 /// starts, but its headers, body and path never reach the native turn, and no after-auth,
-/// response or chunk hook runs. The upstream socket gets the client's frame and the
-/// client gets the upstream's frames. The turn still completes its plugin lifecycle.
+/// response or chunk hook runs. The upstream gets the client's frame (on a socket, or as
+/// an HTTP body without its tag for a credential without `websockets`, #28) and the client
+/// gets the upstream's frames. The turn still completes its plugin lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_interceptors_cannot_rewrite_native_websocket_turns() {
-    let Some(fx) = Fixture::build(Setup {
-        name: "codex-native-ws-plugins",
-        providers: default_providers(&["key-FAKE-codex, websockets: true"]),
-        routing: "",
-        caps: "request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin",
-        extra: Box::new(|_| Vec::new()),
-        rewriting_hooks: true,
-    })
-    .await
-    else {
-        return;
-    };
-    fx.rewrite_before_auth(r#"{"type":"response.create","model":"gpt-native","input":"before-auth body"}"#);
-    let mut socket = wreq::Client::new()
-        .websocket(format!("{}/v1/responses", fx.base.replacen("http://", "ws://", 1)))
-        .header("authorization", "Bearer client-key-1")
-        .header("session-id", "client-session")
-        .send()
+    for websockets in [true, false] {
+        let key = if websockets {
+            "key-FAKE-codex, websockets: true"
+        } else {
+            "key-FAKE-codex"
+        };
+        let name = if websockets {
+            "codex-native-ws-plugins"
+        } else {
+            "codex-native-ws-http-plugins"
+        };
+        let Some(fx) = Fixture::build(Setup {
+            name,
+            providers: default_providers(&[key]),
+            routing: "",
+            caps: "request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin",
+            extra: Box::new(|_| Vec::new()),
+            rewriting_hooks: true,
+        })
         .await
-        .unwrap()
-        .into_websocket()
-        .await
-        .unwrap();
-    let frame = String::from_utf8(fixture("ws-create-first").bytes().to_vec())
-        .unwrap()
-        .replacen(r#""model":"gpt-test""#, r#""model":"gpt-native""#, 1);
-    socket
-        .send(wreq::ws::message::Message::text(frame.clone()))
-        .await
-        .unwrap();
-    let want: Vec<String> = fixture("sse-completed")
-        .frames()
-        .into_iter()
-        .map(|f| String::from_utf8(f.to_vec()).unwrap())
-        .collect();
-    let mut got = Vec::new();
-    while got.len() < want.len() {
-        let next = tokio::time::timeout(Duration::from_secs(5), futures_util::StreamExt::next(&mut socket))
+        else {
+            return;
+        };
+        fx.rewrite_before_auth(r#"{"type":"response.create","model":"gpt-native","input":"before-auth body"}"#);
+        let mut socket = wreq::Client::new()
+            .websocket(format!("{}/v1/responses", fx.base.replacen("http://", "ws://", 1)))
+            .header("authorization", "Bearer client-key-1")
+            .header("session-id", "client-session")
+            .send()
             .await
-            .expect("an upstream frame");
-        match next {
-            Some(Ok(wreq::ws::message::Message::Text(text))) => got.push(text.as_str().to_owned()),
-            other => panic!("{other:?} after {got:?}"),
+            .unwrap()
+            .into_websocket()
+            .await
+            .unwrap();
+        let frame = String::from_utf8(fixture("ws-create-first").bytes().to_vec())
+            .unwrap()
+            .replacen(r#""model":"gpt-test""#, r#""model":"gpt-native""#, 1);
+        socket
+            .send(wreq::ws::message::Message::text(frame.clone()))
+            .await
+            .unwrap();
+        let want: Vec<String> = fixture("sse-completed")
+            .frames()
+            .into_iter()
+            .map(|f| String::from_utf8(f.to_vec()).unwrap())
+            .collect();
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            let next = tokio::time::timeout(Duration::from_secs(5), futures_util::StreamExt::next(&mut socket))
+                .await
+                .expect("an upstream frame");
+            match next {
+                Some(Ok(wreq::ws::message::Message::Text(text))) => got.push(text.as_str().to_owned()),
+                other => panic!("websockets={websockets}: {other:?} after {got:?}"),
+            }
         }
+        assert_eq!(got, want, "websockets={websockets}: the upstream's frames");
+        let (headers, sent) = if websockets {
+            let sockets = fx.codex.sockets();
+            assert_eq!(sockets.len(), 1, "the turn ran on an upstream socket");
+            assert_eq!(sockets[0].frames, [frame.as_bytes()], "the client's frame");
+            assert!(fx.codex.http().is_empty());
+            (sockets[0].headers.clone(), None)
+        } else {
+            let http = fx.codex.http();
+            assert_eq!(http.len(), 1, "the turn ran over HTTP");
+            assert!(fx.codex.sockets().is_empty());
+            (http[0].headers.clone(), Some(http[0].body.clone()))
+        };
+        if let Some(body) = sent {
+            let untagged = cpa_common::codex_body::CodexBody::parse(frame.as_bytes())
+                .unwrap()
+                .without_member("type");
+            assert_eq!(body.as_ref(), untagged.as_slice(), "the client's frame without its tag");
+        }
+        assert_eq!(headers.get("x-codex-turn-state"), None, "no before-auth header");
+        assert_eq!(headers.get("x-after"), None, "no after-auth header");
+        assert_ne!(
+            headers.get("session-id").and_then(|v| v.to_str().ok()),
+            Some("plugin-session"),
+            "no before-auth session"
+        );
+        assert_eq!(fx.calls("request.intercept_before"), 1);
+        assert_eq!(fx.calls("request.intercept_after"), 0);
+        assert_eq!(fx.calls("response.intercept_stream_chunk"), 0);
+        assert_eq!(fx.calls("response.intercept_after"), 0);
+        drop(socket);
+        assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
     }
-    assert_eq!(got, want, "the upstream's frames");
-    let sockets = fx.codex.sockets();
-    assert_eq!(sockets.len(), 1, "the turn ran on an upstream socket");
-    assert_eq!(sockets[0].frames, [frame.as_bytes()], "the client's frame");
-    let handshake = &sockets[0].headers;
-    assert_eq!(handshake.get("x-codex-turn-state"), None, "no before-auth header");
-    assert_eq!(handshake.get("x-after"), None, "no after-auth header");
-    assert_ne!(
-        handshake.get("session-id").and_then(|v| v.to_str().ok()),
-        Some("plugin-session"),
-        "no before-auth session"
-    );
-    assert!(fx.codex.http().is_empty());
-    assert_eq!(fx.calls("request.intercept_before"), 1);
-    assert_eq!(fx.calls("request.intercept_after"), 0);
-    assert_eq!(fx.calls("response.intercept_stream_chunk"), 0);
-    assert_eq!(fx.calls("response.intercept_after"), 0);
-    drop(socket);
-    assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
 }
 
 /// Plugin request normalizers and translators and response normalizers (the

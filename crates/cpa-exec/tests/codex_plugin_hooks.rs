@@ -224,7 +224,7 @@ async fn plugin_normalizers_cannot_change_translated_codex_requests() {
     let claude = r#"{"model":"opaque-route","max_tokens":64,"thinking":{"type":"enabled","budget_tokens":2048,"display":"summarized"},"messages":[{"role":"user","content":"hello"}]}"#;
     let plain = {
         let _hooks = install(None, false);
-        sent(request(Format::Claude, "opaque-route", claude, claude, true)).await
+        sent(request(Format::Claude, "opaque-route", claude, claude, false)).await
     };
     assert!(
         plain["reasoning"]["summary"].is_string(),
@@ -235,9 +235,29 @@ async fn plugin_normalizers_cannot_change_translated_codex_requests() {
         ..Default::default()
     });
     let _hooks = install(Some(fake.clone()), true);
-    let body = sent(request(Format::Claude, "opaque-route", claude, claude, true)).await;
+    let body = sent(request(Format::Claude, "opaque-route", claude, claude, false)).await;
     assert_eq!(body, plain, "the normalizer cannot change it");
     assert!(body.get("plugin_call").is_none(), "{body}");
+    assert!(fake.seen.lock().unwrap().is_empty(), "no normalizer ran");
+    // Go's test reached the normalizer through an `is-compat` model, which chose the
+    // compatibility translator. No Codex route honours the flag (#28): the request is
+    // refused for the credential, before any normalizer or upstream request.
+    let (url, bodies) = upstream().await;
+    let error = executor()
+        .execute(
+            &credential(&url),
+            request(Format::Claude, "opaque-route", claude, claude, true),
+            &Config::default(),
+        )
+        .await
+        .err()
+        .expect("is-compat is refused");
+    assert_eq!(
+        (error.status, error.scope),
+        (500, cpa_core::exec::FailureScope::Credential)
+    );
+    assert!(String::from_utf8_lossy(&error.body).contains("is-compat"), "{error:?}");
+    assert!(bodies.lock().unwrap().is_empty(), "nothing upstream");
     assert!(fake.seen.lock().unwrap().is_empty(), "no normalizer ran");
 }
 
