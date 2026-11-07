@@ -84,16 +84,21 @@ impl CodexExecutor {
         req: ExecRequest,
     ) -> Result<ExecResponse, ExecError> {
         let model = request::base_model(&req.model).to_owned();
-        let body = upstream_body(&req, &model)?;
+        // One buffer for the upstream send and the response translator: the send shares
+        // it instead of copying the converted body (#29, docs/BENCHMARKS.md).
+        let sent = Bytes::from(upstream_body(&req, &model)?);
+        // The conversion produced a `String`, so the bytes are UTF-8.
+        let body = std::str::from_utf8(&sent)
+            .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8 JSON"))?;
         settings.refuse_image_tool(&req.request_path, body.as_bytes())?;
-        report_request(&req, Format::Codex, &body);
+        report_request(&req, Format::Codex, body);
         // The handshake identity headers follow the native route's rule; #26 owns them.
-        let cache = request::prompt_cache_id(&req, &body, None, false);
+        let cache = request::prompt_cache_id(&req, body, None, false);
         // A translated request carries the proxy's own identity (#26).
         let headers = request::http_headers(
             view,
             &req.headers,
-            &body,
+            body,
             &model,
             cache.as_deref(),
             true,
@@ -108,7 +113,7 @@ impl CodexExecutor {
                 settings,
                 url,
                 headers,
-                Bytes::from(body.clone()),
+                sent.clone(),
                 &wire,
                 ErrorBody::Strict,
                 &model,
@@ -131,14 +136,14 @@ impl CodexExecutor {
             return Ok(ExecResponse {
                 status,
                 headers,
-                body: ResponseBody::Stream(client_stream(&req, &body, stream)),
+                body: ResponseBody::Stream(client_stream(&req, body, stream)),
             });
         }
         let completed = aggregate(events, processor, &wire).await?;
         Ok(ExecResponse {
             status,
             headers,
-            body: ResponseBody::Buffered(client_body(&req, &body, &completed)?),
+            body: ResponseBody::Buffered(client_body(&req, body, &completed)?),
         })
     }
 }

@@ -70,6 +70,24 @@ pub fn prepare_responses_request(headers: &HeaderMap, payload: &[u8], settings: 
     rewrite_orphan_delegation_input(headers, &prepared, settings.orphan_delegation)
 }
 
+/// [`prepare_responses_request`] when it changes the body, else `None`: no copy of the
+/// body is made unless a preparation applies to this client (the multi-agent setting and
+/// a multi-agent client, or orphan delegation and a `collab_spawn` subagent), so a
+/// request it leaves alone keeps the caller's buffer.
+pub fn prepare_responses_request_if_changed(
+    headers: &HeaderMap,
+    payload: &[u8],
+    settings: &Settings,
+) -> Option<Vec<u8>> {
+    let tools = multi_agent_client(headers, settings.optimize_multi_agent_v2);
+    let orphan = settings.orphan_delegation && folds_to_ascii(&header(headers, "x-openai-subagent"), "collab_spawn");
+    if !tools && !orphan {
+        return None;
+    }
+    let prepared = prepare_responses_request(headers, payload, settings);
+    (prepared != payload).then_some(prepared)
+}
+
 /// `headerValueCaseInsensitive`: the first non-blank value, trimmed.
 fn header(headers: &HeaderMap, name: &str) -> String {
     headers

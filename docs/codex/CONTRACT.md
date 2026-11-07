@@ -868,6 +868,10 @@ new one, and never half of a reversible rewrite.
 Each implementation PR states which transports and profiles it migrated, adds its own
 behavioural tests against the fixtures, and updates this document.
 
+[QUALIFICATION.md](QUALIFICATION.md) is the final receipt (#29): the cross-path matrix,
+the ownership of each acceptance item, the measured preparation cost and the live gates
+that stay unproven.
+
 ## Contract fixtures and test helpers
 
 `crates/cpa-exec/tests/fixtures/codex_contract/` holds small hand-authored payloads.

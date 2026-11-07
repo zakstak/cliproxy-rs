@@ -213,3 +213,35 @@ fn context_window_failure_event_keeps_failures_and_ignores_others() {
         assert!(!is_context_window_rejection(other.as_bytes()), "{other}");
     }
 }
+
+/// The copy-free variant agrees with `prepare_responses_request`: `None` exactly when the
+/// body would come back unchanged, and the same bytes otherwise.
+#[test]
+fn prepare_if_changed_matches_the_full_preparation() {
+    let codex = |subagent: bool| {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "codex_cli_rs/0.160.0 (Linux; x86_64)".parse().unwrap());
+        if subagent {
+            h.insert("x-openai-subagent", "collab_spawn".parse().unwrap());
+        }
+        h
+    };
+    let orphan = br#"{"input":[{"type":"function_call_output","call_id":"orphan","name":"create_thread","namespace":"codex_app","output":"ok"}]}"#;
+    let plain = br#"{"input":[{"type":"message","role":"user","content":"hi"}]}"#;
+    for (headers, orphan_on, body) in [
+        (HeaderMap::new(), true, &orphan[..]),
+        (codex(false), true, &orphan[..]),
+        (codex(true), false, &orphan[..]),
+        (codex(true), true, &orphan[..]),
+        (codex(true), true, &plain[..]),
+    ] {
+        let settings = Settings {
+            optimize_multi_agent_v2: true,
+            orphan_delegation: orphan_on,
+        };
+        let full = prepare_responses_request(&headers, body, &settings);
+        let changed = prepare_responses_request_if_changed(&headers, body, &settings);
+        assert_eq!(changed.as_deref().unwrap_or(body), full.as_slice());
+        assert_eq!(changed.is_some(), full != body);
+    }
+}
