@@ -920,14 +920,6 @@ impl Connection {
             && CodexExecutor::upstream_websocket(&pinned)
         {
             use_upstream_ws = matches!(pinned.provider.to_ascii_lowercase().as_str(), "codex" | "xai");
-        } else if self.mode == Mode::Websocket
-            && let Some(upstream) = self.credential(&self.upstream_auth)
-            && CodexExecutor::upstream_websocket(&upstream)
-        {
-            // A Home pick serves this connection on an upstream socket but was not
-            // pinned (its credential is known only once Home kept the pick): the turn
-            // still belongs to that socket, never to a local answer.
-            use_upstream_ws = matches!(upstream.provider.to_ascii_lowercase().as_str(), "codex" | "xai");
         }
         let native = self.mode == Mode::Websocket
             && use_upstream_ws
@@ -956,9 +948,7 @@ impl Connection {
             };
 
         let is_prewarm = !use_upstream_ws && requests::is_local_prewarm(&payload);
-        let home_unknown = self.rt.remote_dispatch().is_some()
-            && self.credential(&self.pinned).is_none()
-            && self.credential(&self.upstream_auth).is_none();
+        let home_unknown = self.rt.remote_dispatch().is_some() && self.credential(&self.pinned).is_none();
         if is_prewarm && (home_unknown || self.codex_may_serve(&request_model)) {
             // Go answers this prewarm locally with a made-up response. A Codex credential
             // without an upstream socket has no provider prewarm to forward, and a Codex
@@ -1240,15 +1230,20 @@ impl Connection {
         home: Option<(&str, &crate::remote::Availability)>,
     ) -> bool {
         let (providers, key) = self.providers(model);
-        if !providers.contains(&provider_key(credential)) {
-            return false;
-        }
         match home {
+            // A Home pick: Home's pool is remote, so the local registry need not list its
+            // provider or model. The pick itself proves the route: it is still kept (the
+            // credential resolves only while its lease lives), it was granted for this
+            // model (`pinned_key`), and Home's availability snapshot still allows it.
             Some((pinned_key, snapshot)) => {
                 crate::remote::available_for_model(credential, snapshot, &key, SystemTime::now())
                     && pinned_key.trim().go_eq_fold(key.trim())
             }
-            None => self.usable(credential, &key) && self.rt.registry().client_supports(&credential.id, &key),
+            None => {
+                providers.contains(&provider_key(credential))
+                    && self.usable(credential, &key)
+                    && self.rt.registry().client_supports(&credential.id, &key)
+            }
         }
     }
 

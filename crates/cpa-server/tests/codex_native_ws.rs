@@ -948,3 +948,128 @@ async fn a_home_cooldown_after_a_native_failure_keeps_the_frame() {
         wait_released(&home, 1).await;
     }
 }
+
+/// Under Home with an empty local store, a healthy `previous_response_id` continuation
+/// stays on the Home pick's credential and upstream socket: no fresh pick, no reconnect,
+/// the client's frames unchanged, one grant released once, when the connection ends.
+/// With and without response steering. The fake Home has exactly one grant, so a second
+/// pick would fail the test.
+#[tokio::test]
+async fn a_home_continuation_stays_on_its_pick_and_socket() {
+    for steering in [false, true] {
+        let home = home_proxy(
+            Script {
+                ws: vec![fixture("sse-completed").frames(), fixture("sse-completed").frames()],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+            |url| vec![Ok(home_credential(url))],
+        )
+        .await;
+        let mut socket = connect(&home.proxy).await;
+        let first = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(first.clone())).await.unwrap();
+        assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        let turn = read(&mut socket, &TERMINAL).await;
+        assert_eq!(turn.frames, events("sse-completed"), "steering={steering}: {turn:?}");
+        assert_eq!(
+            home.proxy.upstream.sockets().len(),
+            1,
+            "steering={steering}: one socket"
+        );
+        assert_eq!(
+            upstream_frames(&home.proxy, 0),
+            [first, continuation],
+            "steering={steering}: the client's frames"
+        );
+        assert_eq!(
+            home.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "steering={steering}: one Home grant"
+        );
+        assert_eq!(
+            home.released.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "steering={steering}: the pick is kept while the connection lives"
+        );
+        drop(socket);
+        wait_released(&home, 1).await;
+    }
+}
+
+/// A Home continuation that cannot stay on its pick never moves. A continuation for
+/// another model releases the pin and closes with the replay code; after the upstream
+/// socket is lost, the connection closes, and on a new connection the continuation is
+/// refused locally. Neither reaches an upstream socket or takes a Home pick.
+#[tokio::test]
+async fn a_home_continuation_that_cannot_stay_never_moves() {
+    // Another model.
+    let home = home_proxy(
+        Script {
+            ws: vec![fixture("sse-completed").frames()],
+            ..Script::default()
+        },
+        "",
+        |url| vec![Ok(home_credential(url))],
+    )
+    .await;
+    let mut socket = connect(&home.proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    socket
+        .send(Message::text(client_frame("ws-create-continuation", "gpt-5.4")))
+        .await
+        .unwrap();
+    let moved = read(&mut socket, &TERMINAL).await;
+    assert_eq!(moved.closed, Some(1012), "{moved:?}");
+    assert_eq!(upstream_frames(&home.proxy, 0), [first], "nothing else upstream");
+    assert_eq!(home.proxy.upstream.sockets().len(), 1);
+    assert_eq!(
+        home.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no fresh pick"
+    );
+    wait_released(&home, 1).await;
+
+    // A lost socket.
+    let home = home_proxy(
+        Script {
+            ws: vec![fixture("sse-completed").frames()],
+            ws_close: vec![0],
+            ..Script::default()
+        },
+        "",
+        |url| vec![Ok(home_credential(url))],
+    )
+    .await;
+    let mut socket = connect(&home.proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    assert!(
+        read(&mut socket, &[]).await.closed.is_some(),
+        "the loss reaches the client"
+    );
+    let mut socket = connect(&home.proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-continuation", "gpt-5.5")))
+        .await
+        .unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    assert!(
+        refused.frames.last().unwrap().contains("previous_response_not_found"),
+        "{refused:?}"
+    );
+    assert_eq!(home.proxy.upstream.sockets().len(), 1, "no new socket");
+    assert_eq!(upstream_frames(&home.proxy, 0), [first]);
+    assert_eq!(
+        home.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no fresh pick"
+    );
+    drop(socket);
+    wait_released(&home, 1).await;
+}

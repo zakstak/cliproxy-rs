@@ -423,7 +423,14 @@ sends a prewarm or any other request of its own, so it sends no inference keepal
 ### Socket and account ownership
 
 One client connection uses one upstream socket on one credential. A continuation runs
-only on the session's current socket. When it cannot, the connection closes with 1012,
+only on the session's current socket. Under Home, the connection pins the pick that Home
+granted. The pin holds while Home still keeps that pick, the continuation names the
+model the pick was granted for, and Home's availability snapshot still allows the
+credential. The local model registry does not need to list Home's provider. A healthy
+continuation therefore reuses the pick and its socket, with no fresh pick and no
+reconnect. A pick that is lost or released, a credential that Home's snapshot marks
+unavailable, or a continuation for another model drops the pin, and the continuation
+closes with 1012. When it cannot, the connection closes with 1012,
 and the continuation never moves to another socket or account. When the upstream socket
 is lost, the client connection closes, and the client recovers on its own. On a new
 connection, a `previous_response_id` from the old one is refused locally with
@@ -482,11 +489,6 @@ opened a socket, including a send retried on a fresh socket.
 [Permitted transformations](#permitted-transformations) lists this edit. Metadata that
 the upstream puts in an event (a `headers` member) reaches the client inside that event,
 unchanged, on every turn.
-
-Under Home, a connection does not pin its first pick, because the server learns the
-credential only after Home keeps the pick. A later `previous_response_id` continuation
-on that connection therefore closes with 1012 instead of continuing on the socket, and
-the client replays it. This predates the native route, and the route does not change it.
 
 The source sets two limits on this. The pinned client reads `x-reasoning-included` only
 from the handshake of a socket it opened itself (`responses_websocket.rs:617`). It also
