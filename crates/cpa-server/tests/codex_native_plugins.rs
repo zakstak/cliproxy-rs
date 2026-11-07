@@ -1113,7 +1113,11 @@ async fn responses_callbacks_in_either_spelling_take_the_native_route() {
                 if stream {
                     assert_eq!(got, lines, "{name}: the event lines as sent");
                 } else {
-                    assert_eq!(got, [response_object.clone()], "{name}: the terminal response object");
+                    assert_eq!(
+                        got,
+                        std::slice::from_ref(&response_object),
+                        "{name}: the terminal response object"
+                    );
                 }
                 sent += 1;
                 let exchanges = fx.codex.http();
