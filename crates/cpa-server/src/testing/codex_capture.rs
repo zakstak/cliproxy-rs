@@ -63,8 +63,10 @@ impl Reply {
         }
     }
 
+    /// The scripted status, headers and body only: no default `content-type`.
     fn into_response(self) -> Response {
-        let mut response = (StatusCode::from_u16(self.status).unwrap(), self.body).into_response();
+        let mut response = Response::new(axum::body::Body::from(self.body));
+        *response.status_mut() = StatusCode::from_u16(self.status).unwrap();
         for (name, value) in self.headers {
             response.headers_mut().append(
                 HeaderName::try_from(name).unwrap(),
