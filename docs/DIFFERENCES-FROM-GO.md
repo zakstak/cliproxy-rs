@@ -2,6 +2,17 @@
 
 The compatibility target is frozen at CLIProxyAPI v8.0.35, commit `ae3ee3be303fb07fb8173279923413005bf32177` ([PARITY.md](PARITY.md)). This page records deliberate differences and implementation limits; it does not claim that every newer Go feature is ported. Existing fixtures retain their original Go versions. Missing or unproven v8.0.35 contracts are tracked in the [parity audit](parity-audit/status.md), with the intervening commits in the [upstream inventory](parity-audit/upstream-v8.0.35.md).
 
+Codex JSON cleanup: request inspection no longer coerces a non-string
+`prompt_cache_key` into header identity. The field still reaches the provider
+unchanged, and the existing session fallback supplies the identity when available.
+The pinned first-party `ResponsesApiRequest` models the cache key as
+`Option<String>` (`codex-api/src/common.rs:305`), and the
+[Codex contract](codex/CONTRACT.md#field-preservation) requires opaque field
+preservation, not Go coercion. A non-string duplex frame `type` also no longer
+becomes a name in its unsupported-type diagnostic; it is still refused locally.
+Other providers keep their Go readers.
+[The migration inventory](GJSON-MIGRATION.md) lists the remaining consumers.
+
 ## Additions in cliproxy-rs
 
 - Routing strategy `soonest-reset` (alias `reset-first`): select the account whose weekly window resets soonest, until it cools down or reaches a limit, then move to the next. An account whose reset time is not known yet gets one probe request. Conversations bound to an account stay on it. Go has only `round-robin`, `weighted-round-robin` and `fill-first`, and reads `soonest-reset` as `round-robin`. The dashboard offers it only when it is connected to cliproxy-rs. See [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md#routing-strategies).

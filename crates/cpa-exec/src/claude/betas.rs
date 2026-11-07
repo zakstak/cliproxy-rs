@@ -163,11 +163,11 @@ pub(crate) fn supports_effort(body: &str) -> bool {
 
 fn display_updates(body: &str) -> bool {
     let d = rawjson::get(body, "thinking.display");
-    d.kind() == gjson::Kind::String && d.str().trim().go_eq_fold("updates")
+    d.kind() == rawjson::Kind::String && d.str().trim().go_eq_fold("updates")
 }
 fn display_set(body: &str) -> bool {
     let d = rawjson::get(body, "thinking.display");
-    d.kind() == gjson::Kind::String && !d.str().trim().is_empty()
+    d.kind() == rawjson::Kind::String && !d.str().trim().is_empty()
 }
 fn tool_types(body: &str) -> Vec<String> {
     rawjson::get(body, "tools")
@@ -178,7 +178,7 @@ fn tool_types(body: &str) -> Vec<String> {
 }
 fn advanced_tool_use(body: &str) -> bool {
     let tools = rawjson::get(body, "tools");
-    tools.kind() == gjson::Kind::Array
+    tools.kind() == rawjson::Kind::Array
         && tools.array().iter().any(|t| {
             t.get("type").str().trim().go_lower().starts_with("tool_search_tool_")
                 || t.get("defer_loading").bool()
@@ -191,7 +191,7 @@ pub(crate) fn has_advisor_tool(body: &str) -> bool {
 }
 pub(crate) fn uses_fast_mode(body: &str, r: &Requested) -> bool {
     let speed = rawjson::get(body, "speed");
-    r.contains(FAST_MODE) || (speed.kind() == gjson::Kind::String && speed.str().trim().go_eq_fold("fast"))
+    r.contains(FAST_MODE) || (speed.kind() == rawjson::Kind::String && speed.str().trim().go_eq_fold("fast"))
 }
 
 /// `claudeCodeCLIBetas`.
@@ -283,7 +283,7 @@ pub(crate) fn cli(body: &str, r: &Requested, oauth: bool) -> String {
     if r.contains(PROMPT_CACHING_EVICT) || body.contains("\"evict_on_complete\"") {
         b.push(PROMPT_CACHING_EVICT);
     }
-    if rawjson::get(body, "diagnostics").kind() == gjson::Kind::Object {
+    if rawjson::get(body, "diagnostics").kind() == rawjson::Kind::Object {
         b.push(CACHE_DIAGNOSIS);
     }
     b.join(",")

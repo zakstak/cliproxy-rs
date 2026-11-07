@@ -3,9 +3,9 @@
 //! With `response-steering` on, a downstream Responses WebSocket whose turn runs on a
 //! Codex credential in WebSocket mode keeps that upstream socket for the rest of the
 //! connection. Once the first `response.created` reached the client, the client's later
-//! frames go straight to the socket: `response.steer` raw, `response.create` and
-//! `response.append` shaped like turns. A response terminal is not a stream terminal:
-//! accepted steering may start an automatic successor or wait for tool results. The
+//! frames go straight to the socket: `response.steer` raw and `response.create` with
+//! only its model routed. `response.append` is refused. A response terminal is not a
+//! stream terminal: accepted steering may start an automatic successor or wait for tool results. The
 //! stream ends with the socket, and the socket with the stream. There is no redial,
 //! credential switch, local acknowledgement or replay here; only upstream owns a
 //! steering submission.
@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use cpa_common::codex_body::CodexBody;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
 use futures_util::{FutureExt, StreamExt};
@@ -134,7 +135,7 @@ pub(super) struct Duplex {
     /// Client creates waiting until steering settles.
     queued_creates: VecDeque<String>,
     /// A steer whose parent settings are unknown waits for pending creates to start.
-    deferred_steer: Option<String>,
+    deferred_steer: Option<(String, String)>,
     /// Client frames are read only after the first `response.created` was delivered.
     input_ready: bool,
     first_response: bool,
@@ -212,9 +213,13 @@ impl Duplex {
     ) -> ExecStream {
         // Turns on a session are serialised, so no other stream holds the frames.
         let frames = input.frames.clone().lock_owned().await;
-        let initial_model = gjson::get(&String::from_utf8_lossy(&req.original_body), "model")
-            .str()
-            .to_owned();
+        let original = CodexBody::parse(&req.original_body).ok();
+        let initial_model = original
+            .as_ref()
+            .and_then(|b| b.get("model"))
+            .and_then(|m| m.text())
+            .unwrap_or_default()
+            .into_owned();
         let (writes, queue) = mpsc::channel(WRITE_QUEUE);
         let writer = tokio::spawn(write_loop(
             turn.conn.clone(),
@@ -278,7 +283,7 @@ impl Duplex {
     async fn serve(&mut self) {
         loop {
             if self.input_ready && !self.done && self.failing.is_none() {
-                self.progress().await;
+                self.progress();
             }
             let deliver = !self.outbox.is_empty();
             if self.done && !deliver {
@@ -330,7 +335,7 @@ impl Duplex {
                         self.fail(error);
                     }
                 }
-                Step::Client(frame) => self.client(frame).await,
+                Step::Client(frame) => self.client(frame),
                 Step::Writer(ended) => self.fail(match ended {
                     Ok(Err(error)) => error,
                     Ok(Ok(())) | Err(_) => local("websocket writer stopped"),
@@ -384,13 +389,13 @@ impl Duplex {
     /// Writer progress after a state change: a deferred steer once pending creates have
     /// started, then queued creates while steering allows them (`flushPendingCreates`).
     /// Each step needs room in the write queue (Go's writer is blocked meanwhile).
-    async fn progress(&mut self) {
-        if let Some(steer) = self.deferred_steer.take() {
+    fn progress(&mut self) {
+        if let Some((payload, parent)) = self.deferred_steer.take() {
             if !self.pending.is_empty() || self.writes.capacity() == 0 {
-                self.deferred_steer = Some(steer);
+                self.deferred_steer = Some((payload, parent));
                 return;
             }
-            self.steer(steer);
+            self.steer(payload, parent);
         }
         while !self.done
             && self.failing.is_none()
@@ -400,7 +405,7 @@ impl Duplex {
             && self.outbox.len() < OUTBOX
         {
             let payload = self.queued_creates.pop_front().expect("non-empty");
-            self.create(payload).await;
+            self.create(payload);
         }
     }
 
@@ -415,7 +420,7 @@ impl Duplex {
     }
 
     /// One client frame (the writer's input loop).
-    async fn client(&mut self, frame: Option<Bytes>) {
+    fn client(&mut self, frame: Option<Bytes>) {
         let Some(frame) = frame else {
             // The downstream reader stopped: Go's writer fails with `context.Canceled`,
             // a connection error that does not cool the credential.
@@ -430,26 +435,33 @@ impl Duplex {
         }
         // The native route reads client frames through the request boundary: strict
         // UTF-8 and JSON, the bytes kept as they are.
-        if let Err(error) = cpa_common::codex_body::CodexBody::parse(&frame) {
-            self.reject(&error.to_string());
-            return;
-        }
+        let body = match CodexBody::parse(&frame) {
+            Ok(body) => body,
+            Err(error) => {
+                self.reject(&error.to_string());
+                return;
+            }
+        };
+        let kind = body.get("type").and_then(|m| m.text()).unwrap_or_default();
         let payload = String::from_utf8_lossy(&frame).into_owned();
-        let kind = gjson::get(&payload, "type").str().to_owned();
-        match kind.as_str() {
+        match kind.as_ref() {
             "response.steer" => {
-                let parent = gjson::get(&payload, "previous_response_id").str().to_owned();
+                let parent = body
+                    .get("previous_response_id")
+                    .and_then(|m| m.text())
+                    .unwrap_or_default()
+                    .into_owned();
                 if !self.response_settings.contains_key(&parent) && !self.pending.is_empty() {
                     // `waitFor(len(pending) == 0)`: its settings may belong to a create
                     // upstream has not started yet.
-                    self.deferred_steer = Some(payload);
+                    self.deferred_steer = Some((payload, parent));
                     return;
                 }
-                self.steer(payload);
+                self.steer(payload, parent);
             }
             "response.create" | "response.append" => {
                 if self.queued_creates.is_empty() && self.ready_for_create() {
-                    self.create(payload).await;
+                    self.create(payload);
                 } else if self.queued_creates.len() >= MAX_PENDING {
                     self.fail(local("too many outstanding response.create requests"));
                 } else {
@@ -463,11 +475,10 @@ impl Duplex {
     /// A steer goes upstream as the client wrote it. The pinned client never sends one;
     /// OpenAI documents `response.steer` for the GPT-6 family on the API, and nothing
     /// documents it on the ChatGPT backend. The upstream decides; the proxy adds nothing.
-    fn steer(&mut self, payload: String) {
+    fn steer(&mut self, payload: String, parent: String) {
         if !self.image_tool_allowed(&payload) {
             return;
         }
-        let parent = gjson::get(&payload, "previous_response_id").str().to_owned();
         if let Some(settings) = self.response_settings.get(&parent).cloned() {
             self.steering_settings.insert(parent.clone(), settings);
         }
@@ -492,33 +503,38 @@ impl Duplex {
         }
     }
 
-    /// `processCreatePayload`. A `response.append`, which comes from Go and no
-    /// first-party or documented source defines, is refused with a local error event on
-    /// a connection that stays open (#28).
-    async fn create(&mut self, payload: String) {
-        if gjson::get(&payload, "type").str() == "response.append" {
-            self.reject(crate::codex::native::APPEND_REFUSED);
-            return;
-        }
-        self.native_create(payload)
-    }
-
     /// A `response.create` on the native route, sent while the connection's duplex
     /// stream runs. The pinned client steers this way: it interrupts the running response
     /// and sends a new create (`codex-api/src/endpoint/responses_websocket.rs:310-325`,
     /// 824-839). The frame goes upstream as the client wrote it; only `model` is routed to
     /// this socket's upstream model. A create for another model cannot use this socket
     /// and asks the client to replay, as on the legacy path.
-    fn native_create(&mut self, payload: String) {
+    fn create(&mut self, payload: String) {
+        let body = match CodexBody::parse(payload.as_bytes()) {
+            Ok(body) => body,
+            Err(error) => {
+                self.fail(error.into());
+                return;
+            }
+        };
+        if body.get("type").and_then(|m| m.text()).as_deref() == Some("response.append") {
+            self.reject(crate::codex::native::APPEND_REFUSED);
+            return;
+        }
         if !self.image_tool_allowed(&payload) {
             return;
         }
-        let parent = gjson::get(&payload, "previous_response_id").str().trim().to_owned();
+        let parent = body
+            .get("previous_response_id")
+            .and_then(|m| m.text())
+            .unwrap_or_default();
+        let parent = parent.trim();
         if !self.accepted.is_empty() && parent != self.waiting_parent {
             self.reject("response.create must continue the response waiting for required input");
             return;
         }
-        let model = gjson::get(&payload, "model").str().trim().to_owned();
+        let model = body.get("model").and_then(|m| m.text()).unwrap_or_default();
+        let model = model.trim();
         if !model.is_empty() && model != self.req.model && model != self.initial_model {
             self.fail(ExecError::replay_required());
             return;
@@ -528,21 +544,17 @@ impl Duplex {
         } else {
             self.req.model.trim().to_owned()
         };
-        let frame = match crate::codex::native::routed(&Bytes::from(payload), &upstream) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.fail(error);
-                return;
-            }
+        let frame = match body.routed(&upstream, false) {
+            std::borrow::Cow::Borrowed(_) => payload,
+            std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
         };
-        let body = String::from_utf8_lossy(&frame).into_owned();
         let prepared = Prepared::new(self.initial.native);
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
         }
         self.pending.push_back(prepared);
-        self.write(body);
+        self.write(frame);
     }
 
     /// `releaseSteeringSettings`.

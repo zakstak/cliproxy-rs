@@ -194,25 +194,19 @@ pub(crate) fn upstream_model(req: &ExecRequest) -> Result<String, ExecError> {
 /// already matches.
 pub(crate) fn routed(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
     let body = CodexBody::parse(frame)?;
-    if body.get("model").and_then(|m| m.text()).as_deref() == Some(model) {
-        return Ok(frame.clone());
+    match body.routed(model, false) {
+        Cow::Borrowed(_) => Ok(frame.clone()),
+        Cow::Owned(bytes) => Ok(Bytes::from(bytes)),
     }
-    let quoted = serde_json::to_string(model).unwrap_or_default();
-    Ok(Bytes::from(body.with_member("model", &quoted)))
 }
 
 /// The upstream body: the client's bytes with only the permitted edits.
 fn upstream_body(req: &ExecRequest, profile: Profile, call: Call, model: &str) -> Result<Bytes, ExecError> {
-    let mut bytes = routed(&req.body, model)?;
-    if call == Call::Buffered && profile == Profile::Chatgpt {
-        let current = CodexBody::parse(&bytes)?;
-        let streamed =
-            (current.get("stream").map(|m| m.kind) != Some(Kind::True)).then(|| current.with_member("stream", "true"));
-        if let Some(streamed) = streamed {
-            bytes = Bytes::from(streamed);
-        }
+    let body = CodexBody::parse(&req.body)?;
+    match body.routed(model, call == Call::Buffered && profile == Profile::Chatgpt) {
+        Cow::Borrowed(_) => Ok(req.body.clone()),
+        Cow::Owned(bytes) => Ok(Bytes::from(bytes)),
     }
-    Ok(bytes)
 }
 
 impl CodexExecutor {

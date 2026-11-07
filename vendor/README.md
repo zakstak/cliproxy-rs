@@ -10,7 +10,7 @@ cargo test --locked --manifest-path vendor/gjson/Cargo.toml
 
 Source: the crates.io archive `gjson-0.8.1.crate`, SHA-256 `43503cc176394dd30a6525f5f36e838339b8b5619be33ed9a7783841580a97b6` (the checksum `Cargo.lock` recorded before the patch). License: MIT, `gjson/LICENSE`.
 
-The Claude executor reads request bodies with gjson dozens of times per request, and almost every byte of a coding agent's prompt sits inside a JSON string, which gjson scanned one byte at a time.
+The patch originally accelerated repeated Claude request lookups. Claude now reads through the independent `cpa_common::json` port, and its `rawjson` adapter owns its kind enum. Remaining consumers include Codex response observation, Images conversion, shared WebSocket handling and management helpers, plus their tests. [The migration inventory](../docs/GJSON-MIGRATION.md) records the contract boundaries and dependency-removal steps. Keep this vendor and both manifest patches while those consumers remain.
 
 [`gjson.patch`](gjson.patch) is the complete difference between the archive and `vendor/gjson`, apart from the files dropped below. Apply it with `patch -p2` inside an unpacked copy of the archive.
 
