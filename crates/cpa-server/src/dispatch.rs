@@ -2215,6 +2215,9 @@ async fn attempt(
                 req.original_body = request.body.clone();
                 req.headers = request.headers.clone();
                 req.request_path = request.path.clone();
+                // No hook reads a native attempt's chunks, so the executor forwards the
+                // upstream's events instead of unframed payloads.
+                req.stream_payloads = false;
                 true
             }
             None => false,

@@ -141,6 +141,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
+| Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
 Until it lands, header behaviour stays as it is; see
@@ -277,7 +278,8 @@ transformations: the routed `model`, and `stream: true` for a buffered client on
 `stream` deletion and plugin before-auth interceptors, so a native attempt never sees
 their output. A before-auth interceptor still runs, because it runs before a credential
 is chosen; its header changes can still affect credential selection and session
-affinity, but none of its output reaches the native request. The boundary validates those
+affinity, but none of its output reaches the native request. A request that asks for
+unframed stream payloads (a plugin model callback) keeps the legacy path. The boundary validates those
 bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,
 tool or namespace preparation, or plugin `after_auth` hook runs. A model with a thinking
 suffix, such as `gpt-5.5(high)`, is refused with a 400, because the suffix would need a
@@ -294,7 +296,8 @@ The response reaches the client as the upstream sent it:
   allows it; otherwise the provider's event is delivered. After something was delivered,
   a failure ends the stream after its event and is never replayed on another credential.
 - A stream that ends without a terminal event ends for the client too, without a local
-  event. The attempt records a request-scoped 408.
+  event. The attempt records a request-scoped 408. A final event the upstream left open
+  gets the line endings that close it.
 - An upstream HTTP error keeps its classification for the scheduler, and the client
   receives the upstream's status, body and filtered headers unchanged
   (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit

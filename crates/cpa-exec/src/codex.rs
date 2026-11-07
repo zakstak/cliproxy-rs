@@ -123,7 +123,7 @@ impl CodexExecutor {
     /// server then gives the executor the client's own bytes and keeps request and
     /// response mutation hooks away from the attempt.
     pub fn native_http(credential: &Credential, req: &ExecRequest) -> bool {
-        native::route(&View::new(credential), req).is_some()
+        native::eligible(&View::new(credential), req).is_some()
     }
 
     /// Whether `credential` keeps upstream state on a WebSocket (Go:

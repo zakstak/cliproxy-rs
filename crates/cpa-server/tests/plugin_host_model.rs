@@ -954,17 +954,13 @@ async fn responses_bootstrap_flushes_a_pending_payload() {
                 std::fs::remove_dir_all(dir).unwrap();
                 continue;
             }
+            // A Codex credential serves this Responses request on the native route (#23),
+            // hooked or not: the upstream's bytes, an open final event closed, and a reset
+            // after an event ends the stream without a locally made `error` event.
             let expected = if broken {
-                // The pending event is delivered, then the error ends the stream.
-                concat!(
-                    r#"data: {"type":"response.created","response":{"id":"r","status":"in_progress","output":[],"model":"gpt-fixture"}}"#,
-                    "\n\n\nevent: error\n",
-                    r#"data: {"type":"error","error":{"code":"internal_server_error","message":"upstream request failed","param":null,"type":"server_error"},"sequence_number":1}"#,
-                    "\n\n"
-                )
-                .to_owned()
+                format!("data: {CREATED}\n\n")
             } else {
-                format!("data: {COMPLETED}\n\n\n")
+                format!("data: {COMPLETED}\n\n")
             };
             assert_eq!((status, body.as_str()), (200, expected.as_str()), "{label}");
             rt.plugins().shutdown_all(None).await;

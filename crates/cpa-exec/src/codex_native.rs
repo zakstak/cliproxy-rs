@@ -59,12 +59,22 @@ impl Profile {
     }
 }
 
-/// Whether `req` on `view` takes the native route: Responses formats on both sides, a
-/// generation, and a native profile.
-pub(crate) fn route(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
+/// Whether `req` on `view` may take the native route: Responses formats on both sides, a
+/// generation, and a native profile. The server decides with this
+/// ([`CodexExecutor::native_http`]).
+pub(crate) fn eligible(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
     (req.operation == Operation::Generate && request::responses_formats(req))
         .then(|| Profile::of(view))
         .flatten()
+}
+
+/// Whether the executor serves `req` natively: an eligible request the server handed
+/// over as native. The server clears `stream_payloads` on a native attempt, because no
+/// hook reads its chunks; a request that still asks for unframed payloads (a plugin
+/// model callback, a hooked attempt the server did not make native) keeps the legacy
+/// path and its payload framing.
+pub(crate) fn route(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
+    eligible(view, req).filter(|_| !req.stream_payloads)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,7 +540,7 @@ impl Passthrough {
             }
             Seen::Terminal => {
                 self.commit();
-                self.out.push_back(Ok(frame));
+                self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
             }
             Seen::EmptyIncomplete if !self.committed => {
@@ -540,7 +550,7 @@ impl Passthrough {
                 self.done = true;
             }
             Seen::EmptyIncomplete => {
-                self.out.push_back(Ok(frame));
+                self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
             }
             Seen::Failure { error, body, deliver } => {
@@ -553,7 +563,7 @@ impl Passthrough {
                     // The client gets the provider's event; the error after it only ends
                     // the attempt and reports its outcome.
                     self.commit();
-                    self.out.push_back(Ok(deliver.unwrap_or(frame)));
+                    self.out.push_back(Ok(terminated(deliver.unwrap_or(frame))));
                     self.out.push_back(Err(error));
                 }
                 self.done = true;
@@ -567,6 +577,34 @@ impl Passthrough {
         self.out.push_back(Err(error));
         self.done = true;
     }
+}
+
+/// `frame` with the line endings that close an SSE event. Only a final event the upstream
+/// left open can lack them; without them an SSE client drops that event at the end of the
+/// stream. Transport framing, not payload: the event's own bytes are unchanged.
+fn terminated(frame: Bytes) -> Bytes {
+    let strip = |b: &[u8]| -> Option<usize> {
+        if b.ends_with(b"\r\n") {
+            Some(2)
+        } else if b.ends_with(b"\n") || b.ends_with(b"\r") {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let missing: &[u8] = match strip(&frame) {
+        // The last line already ended: closed when the line before it is blank.
+        Some(n) if strip(&frame[..frame.len() - n]).is_some() => return frame,
+        // One more of the same line ending (after a lone `\r`, `\n` would only make it
+        // a CRLF).
+        Some(_) if frame.ends_with(b"\n") => b"\n",
+        Some(_) => b"\r",
+        None => b"\n\n",
+    };
+    let mut out = Vec::with_capacity(frame.len() + missing.len());
+    out.extend_from_slice(&frame);
+    out.extend_from_slice(missing);
+    Bytes::from(out)
 }
 
 /// Forwards upstream events unchanged (see the module docs). With `hold`, leading

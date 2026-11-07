@@ -648,3 +648,22 @@ async fn the_api_openai_com_profile_maps_without_traffic() {
 fn credential_with(base: &str) -> Credential {
     credential(Kind::Key, base)
 }
+
+/// A final event the upstream left open gets the line endings that close it, so an SSE
+/// client does not drop it; its own bytes are unchanged.
+#[tokio::test]
+async fn an_open_final_event_is_closed() {
+    for (sent, want) in [
+        (format!("data: {COMPLETED}"), format!("data: {COMPLETED}\n\n")),
+        (format!("data: {COMPLETED}\n"), format!("data: {COMPLETED}\n\n")),
+        (format!("data: {COMPLETED}\r"), format!("data: {COMPLETED}\r\r")),
+        (
+            format!("data: {COMPLETED}\r\n\r\n"),
+            format!("data: {COMPLETED}\r\n\r\n"),
+        ),
+    ] {
+        let (out, error) = through(&[sent.as_bytes()], None).await;
+        assert!(error.is_none(), "{sent:?}: {error:?}");
+        assert_eq!(text(&out), want, "{sent:?}");
+    }
+}
