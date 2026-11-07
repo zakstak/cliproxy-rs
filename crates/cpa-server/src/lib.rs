@@ -52,6 +52,7 @@ mod usage_record;
 mod videos;
 pub mod watching;
 mod websocket;
+mod websocket_limit;
 mod websocket_requests;
 mod websocket_tools;
 

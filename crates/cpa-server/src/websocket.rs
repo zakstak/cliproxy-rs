@@ -240,13 +240,18 @@ struct Failure {
     replay: bool,
     /// Go `ErrorMessage.Addon`: copied into the error event.
     addon: Option<Box<HeaderMap>>,
+    /// The client-safe subscription-limit event a native Codex client gets
+    /// (`websocket_limit`), when the failure is one.
+    limit: Option<String>,
 }
 
 impl Failure {
     fn from_exec(e: &ExecError) -> Self {
+        let text = String::from_utf8_lossy(&e.body).into_owned();
         Self {
+            limit: exec_limit(e.status, &text, e),
             status: e.status,
-            text: String::from_utf8_lossy(&e.body).into_owned(),
+            text,
             payload: None,
             replay: e.is_replay_required(),
             addon: e.addon.clone(),
@@ -255,14 +260,44 @@ impl Failure {
 
     fn from_dispatch(failure: &dispatch::Failure) -> Self {
         match failure {
-            dispatch::Failure::Exec(e) => Self {
-                status: classify::response_status(e),
-                text: classify::error_text(e),
-                payload: None,
-                replay: e.is_replay_required(),
-                addon: e.addon.clone(),
+            dispatch::Failure::Exec(e) => {
+                let (status, text) = (classify::response_status(e), classify::error_text(e));
+                Self {
+                    limit: exec_limit(status, &text, e),
+                    status,
+                    text,
+                    payload: None,
+                    replay: e.is_replay_required(),
+                    addon: e.addon.clone(),
+                }
+            }
+            // A trusted control-plane rejection keeps its Go rendering; only the limit
+            // event is added.
+            dispatch::Failure::Remote { error: e, .. } => Self {
+                limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
+                ..Self::local(failure.status(), &failure.text())
+            },
+            dispatch::Failure::Cooldown {
+                wait,
+                cause: Some(cause),
+                ..
+            } => Self {
+                limit: crate::websocket_limit::cooldown(cause, *wait, unix_now()),
+                ..Self::local(failure.status(), &failure.text())
             },
             other => Self::local(other.status(), &other.text()),
+        }
+    }
+
+    /// A wrapped upstream `error` event that reached the stream.
+    fn from_event(status: u16, payload: &str) -> Self {
+        Self {
+            status,
+            text: payload.to_owned(),
+            payload: Some(payload.to_owned()),
+            replay: false,
+            addon: None,
+            limit: crate::websocket_limit::from_error_event(payload, unix_now()),
         }
     }
 
@@ -273,14 +308,31 @@ impl Failure {
             payload: None,
             replay: false,
             addon: None,
+            limit: None,
         }
     }
+}
+
+/// The limit event for an executor error: the frame's headers (addon) first, then the
+/// upstream response's.
+fn exec_limit(status: u16, text: &str, e: &ExecError) -> Option<String> {
+    let maps: Vec<&HeaderMap> = e.addon.as_deref().into_iter().chain([&*e.headers]).collect();
+    crate::websocket_limit::event(status, text, &crate::websocket_limit::Headers::Maps(&maps), unix_now())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 struct Connection {
     rt: Arc<Runtime>,
     caller: Caller,
     headers: HeaderMap,
+    /// An official Codex client (`User-Agent` or `originator`): it gets subscription-limit
+    /// failures as the structured event Codex classifies, where Go closes silently.
+    codex_client: bool,
     /// Go `request_path` metadata for payload rules.
     request_path: String,
     /// The upgrade request's raw query (Go reads it from the retained gin context).
@@ -685,7 +737,9 @@ enum Forwarded {
         id: String,
         pending: Vec<String>,
     },
-    Suppressed,
+    /// A pinned continuation's 401/429: [`Connection::turn`] decides between the replay
+    /// close and the final limit.
+    Suppressed(Failure),
     End,
 }
 
@@ -693,6 +747,7 @@ impl Connection {
     fn new(rt: Arc<Runtime>, caller: Caller, headers: HeaderMap) -> Self {
         Self {
             tool_key: tools::session_key(&headers),
+            codex_client: cpa_common::codex_client::is_codex_responses_client(&headers),
             rt,
             caller,
             headers,
@@ -758,7 +813,7 @@ impl Connection {
             let frame = tokio::select! {
                 frame = client.next() => frame,
                 error = &mut lost => {
-                    close_for_upstream_loss(&mut sink, &error).await;
+                    close_for_upstream_loss(&mut sink, &error, self.codex_client).await;
                     break;
                 }
             };
@@ -783,7 +838,7 @@ impl Connection {
                     flow = &mut turn => Ok(flow),
                     error = &mut lost => {
                         // A pinned continuation's own 401/429 lost the socket: the turn
-                        // sends the replay close (1012) instead.
+                        // sends the replay close (1012), or the final limit, instead.
                         let replay = replays.load(Ordering::Acquire) && matches!(error.status, 401 | 429);
                         if duplex.load(Ordering::Acquire) || replay {
                             tokio::select! {
@@ -804,7 +859,7 @@ impl Connection {
                 Ok(Flow::Next) => {}
                 Ok(Flow::End) => break,
                 Err(Some(error)) => {
-                    close_for_upstream_loss(&mut sink, &error).await;
+                    close_for_upstream_loss(&mut sink, &error, self.codex_client).await;
                     break;
                 }
                 // The client left mid-turn: Go's forward returns the cancelled context.
@@ -974,19 +1029,23 @@ impl Connection {
                 // A pinned continuation's credential failure also lost the session's
                 // socket; the client still needs the replay signal, not the loss close.
                 if ctx.suppress(failure.status) {
-                    Forwarded::Suppressed
+                    Forwarded::Suppressed(failure)
                 } else if let Some(loss) = self.upstream_loss() {
-                    close_for_upstream_loss(socket, &loss).await;
+                    close_for_upstream_loss(socket, &loss, self.codex_client).await;
                     Forwarded::End
                 } else {
-                    close_for_failure(socket, &failure).await;
+                    close_for_failure(socket, &failure, self.codex_client).await;
                     Forwarded::End
                 }
             }
         };
         let (output, id, pending) = match forwarded {
             Forwarded::Completed { output, id, pending } => (output, id, pending),
-            Forwarded::Suppressed => {
+            Forwarded::Suppressed(failure) if self.limit_is_final(&failure, &ctx.last_attempted, &model) => {
+                close_for_failure(socket, &failure, true).await;
+                return Flow::End;
+            }
+            Forwarded::Suppressed(_) => {
                 close_with_code(socket, CLOSE_SERVICE_RESTART, "upstream requires HTTP replay").await;
                 socket.terminate(&replay_text());
                 return Flow::End;
@@ -1059,6 +1118,14 @@ impl Connection {
             return None;
         }
         self.rt.executors.codex.session_loss(&self.session)
+    }
+
+    /// A pinned continuation reached a subscription limit and no other credential can
+    /// take the conversation over: a native Codex client gets the limit instead of the
+    /// replay close, which would only send the whole transcript back to exhausted
+    /// accounts. The continuation itself never moves to another credential.
+    fn limit_is_final(&self, failure: &Failure, pinned: &str, model: &str) -> bool {
+        self.codex_client && failure.limit.is_some() && self.available(model).iter().all(|c| c.id == pinned)
     }
 
     /// `responsesWebsocketAuthAvailableForModel`: enabled and not cooling for the model.
@@ -1368,17 +1435,11 @@ impl Connection {
                         status = gjson::get(&payload, "status_code").i64();
                     }
                     let status = u16::try_from(status).ok().filter(|s| *s > 0).unwrap_or(500);
+                    let failure = Failure::from_event(status, payload.trim());
                     if ctx.suppress(status) {
-                        return Forwarded::Suppressed;
+                        return Forwarded::Suppressed(failure);
                     }
-                    let failure = Failure {
-                        status,
-                        text: payload.trim().to_owned(),
-                        payload: Some(payload.trim().to_owned()),
-                        replay: false,
-                        addon: None,
-                    };
-                    close_for_failure(socket, &failure).await;
+                    close_for_failure(socket, &failure, self.codex_client).await;
                     return Forwarded::End;
                 }
                 // Codex acknowledges `response.interrupt` with an interrupted
@@ -1426,7 +1487,7 @@ impl Connection {
         let failure = Failure::from_exec(error);
         // Replay before the session-loss close, as at the turn's start.
         if ctx.suppress(failure.status) {
-            return Forwarded::Suppressed;
+            return Forwarded::Suppressed(failure);
         }
         // The client already has the upstream's event for this failure (a context-window
         // overflow, which Codex compacts on); a generic error event after it would replace
@@ -1437,10 +1498,10 @@ impl Connection {
             return Forwarded::End;
         }
         if let Some(loss) = self.upstream_loss() {
-            close_for_upstream_loss(socket, &loss).await;
+            close_for_upstream_loss(socket, &loss, self.codex_client).await;
             return Forwarded::End;
         }
-        close_for_failure(socket, &failure).await;
+        close_for_failure(socket, &failure, self.codex_client).await;
         Forwarded::End
     }
 }
@@ -1575,7 +1636,9 @@ fn preserved_failure(failure: &Failure) -> bool {
 }
 
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,
-/// quota and transport failures close silently so the client reconnects and resends.
+/// quota and transport failures close silently so the client reconnects and resends. A
+/// native Codex client's subscription limit (`Failure::limit`) is sent before this check
+/// (docs/DIFFERENCES-FROM-GO.md).
 // ponytail: Go also exposes terminal upstream-auth errors; no executor reports them yet.
 fn exposed(failure: &Failure) -> bool {
     classify::is_request_fault(failure.status, &failure.text)
@@ -1585,9 +1648,12 @@ fn exposed(failure: &Failure) -> bool {
 /// the error event and a TCP close, or a bare TCP close. The socket is dropped by the
 /// caller right after. The timeline gets the exposed event, or the hidden reason as a
 /// disconnect, and the connection ends with gorilla's "close sent".
-async fn close_for_failure(socket: &mut Sink, failure: &Failure) {
+async fn close_for_failure(socket: &mut Sink, failure: &Failure, codex_client: bool) {
     if let Some((code, reason)) = close_code(failure) {
         close_with_code(socket, code, &reason).await;
+    } else if let Some(limit) = failure.limit.as_ref().filter(|_| codex_client) {
+        socket.event("response", limit.as_bytes());
+        let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(limit.clone().into()))).await;
     } else if exposed(failure) {
         let payload = failure
             .payload
@@ -1606,10 +1672,12 @@ async fn close_for_failure(socket: &mut Sink, failure: &Failure) {
 /// writes nothing to the timeline.
 // ponytail: Go's final disconnect is whatever its blocked read returns once the notifier
 // closed the socket; this logs gorilla's "close sent".
-async fn close_for_upstream_loss(socket: &mut Sink, error: &ExecError) {
+async fn close_for_upstream_loss(socket: &mut Sink, error: &ExecError, codex_client: bool) {
     let failure = Failure::from_exec(error);
     if let Some((code, reason)) = close_code(&failure) {
         close_with_code(socket, code, &reason).await;
+    } else if let Some(limit) = failure.limit.as_ref().filter(|_| codex_client) {
+        let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(limit.clone().into()))).await;
     } else if exposed(&failure) {
         let payload = error_payload(failure.status, &failure.text, failure.addon.as_deref());
         let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(payload.into()))).await;
