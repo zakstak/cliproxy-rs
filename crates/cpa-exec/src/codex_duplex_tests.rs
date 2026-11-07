@@ -1510,3 +1510,79 @@ async fn steer_frames_pass_the_payload_rules() {
         up.finish().await;
     }
 }
+
+// ------------------------------------------------------------------ interrupt acknowledgements
+
+const DUPLEX_INTERRUPT: &str = r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#;
+const DUPLEX_ACCEPTED: &str = r#"{"type":"response.interrupt.accepted","response_id":"r1"}"#;
+
+/// Current Codex may interrupt a response the duplex already finished (it had not read
+/// the terminal event yet). The duplex owns the socket, so the interrupt goes upstream
+/// and upstream's acknowledgement comes back on the stream.
+#[tokio::test]
+async fn an_interrupt_after_the_terminal_event_is_acknowledged_on_the_stream() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+            .await;
+        let got = c.read().await;
+        if got != DUPLEX_INTERRUPT {
+            c.error(format!("interrupt: {got}"));
+        }
+        c.write(DUPLEX_ACCEPTED).await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("duplex-late-interrupt");
+    let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+    for want in ["response.created", "response.completed"] {
+        let event = next(&mut stream).await.unwrap().unwrap();
+        assert_eq!(get(&event, "type"), want, "{event}");
+    }
+    let outcome = client
+        .executor
+        .interrupt_session(&client.session, DUPLEX_INTERRUPT.as_bytes(), |_| true)
+        .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let ack = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(ack, DUPLEX_ACCEPTED, "the acknowledgement is unchanged");
+    drop(stream);
+    up.finish().await;
+}
+
+/// An acknowledgement for a response nobody interrupted (another ID) never reaches the
+/// stream; the interrupted response's own one does.
+#[tokio::test]
+async fn an_acknowledgement_for_another_response_never_reaches_the_stream() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#).await;
+        let got = c.read().await;
+        if got != DUPLEX_INTERRUPT {
+            c.error(format!("interrupt: {got}"));
+        }
+        c.write(r#"{"type":"response.interrupt.accepted","response_id":"stale"}"#).await;
+        c.write(DUPLEX_ACCEPTED).await;
+        c.write(r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"incomplete_details":{"reason":"interrupted"}}}"#)
+            .await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("duplex-stale-ack");
+    let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+    let created = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&created, "type"), "response.created", "{created}");
+    let outcome = client
+        .executor
+        .interrupt_session(&client.session, DUPLEX_INTERRUPT.as_bytes(), |_| true)
+        .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let ack = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(ack, DUPLEX_ACCEPTED, "only r1's acknowledgement");
+    let incomplete = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&incomplete, "type"), "response.incomplete", "{incomplete}");
+    drop(stream);
+    up.finish().await;
+}

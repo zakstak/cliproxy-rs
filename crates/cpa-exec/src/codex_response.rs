@@ -412,9 +412,19 @@ pub(crate) fn meaningful_delta(payload: &str) -> bool {
     ) && !gjson::get(payload, "delta").str().trim().is_empty()
 }
 
-/// `IsCodexTerminalEmptyIncomplete`: `response.incomplete` with literally zero output.
+/// `IsCodexTerminalEmptyIncomplete`: `response.incomplete` with literally zero output,
+/// an upstream silent abort. Unlike Go, an incomplete response that names why it stopped
+/// (`interrupted`, `content_filter`, `max_output_tokens`) is that response, not an
+/// abort: a cancellation before the first token produces exactly this shape, and current
+/// Codex reads those reasons itself (docs/DIFFERENCES-FROM-GO.md).
 pub(crate) fn empty_incomplete(payload: &str, items: usize, saw_delta: bool) -> bool {
     if gjson::get(payload, "type").str() != "response.incomplete" || saw_delta || items > 0 {
+        return false;
+    }
+    if matches!(
+        gjson::get(payload, "response.incomplete_details.reason").str(),
+        "interrupted" | "content_filter" | "max_output_tokens"
+    ) {
         return false;
     }
     let output = gjson::get(payload, "response.output");
@@ -1211,6 +1221,33 @@ pub(crate) async fn bootstrap(
                     return Bootstrap::Stream(futures_util::stream::iter(held).chain(rest).boxed());
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_incomplete_tests {
+    use super::empty_incomplete;
+
+    fn incomplete(details: &str) -> String {
+        format!(
+            r#"{{"type":"response.incomplete","response":{{"id":"r1","output":[],{details}"usage":{{"output_tokens":0}}}}}}"#
+        )
+    }
+
+    /// An explained stop is a response; an unexplained zero-output one stays an abort.
+    #[test]
+    fn named_reasons_are_not_silent_aborts() {
+        for reason in ["interrupted", "content_filter", "max_output_tokens"] {
+            let payload = incomplete(&format!(r#""incomplete_details":{{"reason":"{reason}"}},"#));
+            assert!(!empty_incomplete(&payload, 0, false), "{reason}");
+        }
+        for details in [
+            "",
+            r#""incomplete_details":null,"#,
+            r#""incomplete_details":{"reason":"unknown"},"#,
+        ] {
+            assert!(empty_incomplete(&incomplete(details), 0, false), "{details}");
         }
     }
 }

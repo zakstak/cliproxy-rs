@@ -364,11 +364,19 @@ fn compared(headers: impl Iterator<Item = (String, String)>) -> Vec<(String, Str
 }
 
 async fn run(name: &str) {
-    let scenario = FIXTURE
+    run_with(name, |_| {}).await;
+}
+
+/// [`run`] after `differ` encodes a deliberate difference from Go into the scenario
+/// (docs/DIFFERENCES-FROM-GO.md).
+async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
+    let mut scenario = FIXTURE
         .iter()
         .find(|s| s["name"] == name)
-        .unwrap_or_else(|| panic!("no scenario {name}"));
-    run_scenario(name, scenario).await;
+        .unwrap_or_else(|| panic!("no scenario {name}"))
+        .clone();
+    differ(&mut scenario);
+    run_scenario(name, &scenario).await;
 }
 
 /// Runs one scenario and returns its runtime, for checks after the connection. A
@@ -830,10 +838,19 @@ async fn interrupt_reaches_the_active_socket_unchanged_with_steering() {
 
 /// Go `TestResponsesInterruptStopsHTTPUpstream`: an HTTP turn ends locally with
 /// `response.incomplete` (reason interrupted, the collected output), its upstream request
-/// is canceled, and the next turn continues from that transcript.
+/// is canceled, and the next turn continues from that transcript. Deliberate difference:
+/// current Codex waits for `response.interrupt.accepted`, which comes before the
+/// incomplete event, and an interrupt for the finished response is acknowledged the same
+/// way instead of rejected.
 #[tokio::test]
 async fn interrupt_cancels_an_http_turn_locally() {
-    run("interrupt_http_local").await;
+    run_with("interrupt_http_local", |scenario| {
+        let accepted = serde_json::json!({"text": r#"{"type":"response.interrupt.accepted","response_id":"r-http"}"#});
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        steps[1]["frames"].as_array_mut().unwrap().insert(0, accepted.clone());
+        steps[2]["frames"] = serde_json::json!([accepted]);
+    })
+    .await;
 }
 
 /// A binary `response.interrupt` holding a non-UTF-8 byte in a string is valid JSON
@@ -844,10 +861,43 @@ async fn binary_interrupt_reaches_upstream_byte_for_byte() {
 }
 
 /// Go `TestResponsesLateInterruptDoesNotPoisonNextCreate`: an interrupt for a finished
-/// response is a silent no-op, before and during the next turn, and never reaches upstream.
+/// response never reaches the next turn. Deliberate differences, for current Codex's
+/// acknowledgement handshake: while no turn reads, the interrupt goes upstream and
+/// upstream's acknowledgement reaches the client (Go: a silent no-op); an acknowledgement
+/// after the terminal event of an interrupted turn still reaches the client. During the
+/// next turn the late interrupt is a silent no-op, as in Go.
 #[tokio::test]
 async fn late_interrupt_does_not_poison_the_next_turn() {
-    run("interrupt_late_ws").await;
+    run_with("interrupt_late_ws", |scenario| {
+        let ack = |id: &str| format!(r#"{{"type":"response.interrupt.accepted","response_id":"{id}"}}"#);
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        // The late r1 interrupt on the idle socket.
+        steps[2]["upstream"] = serde_json::json!([{"events": [ack("r1")]}]);
+        steps[2]["read"] = "one".into();
+        steps[2]["frames"] = serde_json::json!([{"text": ack("r1")}]);
+        // The interrupted r2 acknowledges after its terminal event.
+        steps[6]["upstream"][0]["events"]
+            .as_array_mut()
+            .unwrap()
+            .push(ack("r2").into());
+        steps[6]["read"] = "until:response.interrupt.accepted".into();
+        steps[6]["frames"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"text": ack("r2")}));
+        // The late r2 interrupt on the idle socket.
+        steps[7]["upstream"] = serde_json::json!([{"events": [ack("r2")]}]);
+        steps[7]["read"] = "one".into();
+        steps[7]["frames"] = serde_json::json!([{"text": ack("r2")}]);
+        let upstream = scenario["upstream"].as_array_mut().unwrap();
+        let frame = |body: &str| serde_json::json!({"kind": "ws_frame", "body": body});
+        upstream.insert(
+            2,
+            frame(r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#),
+        );
+        upstream.insert(5, frame(r#"{"type":"response.interrupt","response_id":"r2"}"#));
+    })
+    .await;
 }
 
 #[test]
