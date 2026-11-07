@@ -280,12 +280,15 @@ their output.
 
 Plugin before-auth interceptors run once, before a credential is chosen, so their output
 follows one rule. A native attempt is possible when the selectable credentials for the
-model include a built-in Codex credential on a native profile without a plugin executor;
-under Home, whose credentials are remote, when the pool includes Codex. When it is
-possible, the before-auth result (headers, body, path and termination) is held back from
-the request and applied to each attempt that is not native: a Sign in with ChatGPT,
+model include a built-in Codex credential on a native profile without a plugin executor.
+Under Home the pool is remote and unknown, so every Responses HTTP request counts. When it
+is possible, the before-auth result (headers, body, path and termination) is held back
+from the request and applied to each attempt that is not native: a Sign in with ChatGPT,
 plugin-executor or other-provider attempt gets it, termination included, and a native
-attempt never does. The session, session affinity, the LCP prefix, Home dispatch headers,
+attempt never does. That holds on every attempt path: local selection, a Home pick and
+the Antigravity credits fallback. Delivering the before-auth result is separate from the
+after-auth chain, so Home still runs no after-auth chain and a buffered credits fallback
+still skips it, as before. The session, session affinity, the LCP prefix, Home dispatch headers,
 the plugin scheduler's headers and context, and the executor's session metadata then come
 from the client's own request (`Call::selection_inputs`), so before-auth output cannot
 choose the session or the credential. When a native attempt is not possible (a model only

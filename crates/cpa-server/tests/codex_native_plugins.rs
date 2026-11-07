@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 struct Fixture {
     base: String,
     records: PathBuf,
+    rt: Arc<cpa_server::Runtime>,
     codex: CaptureUpstream,
     control: CaptureUpstream,
 }
@@ -36,7 +37,7 @@ struct Setup<'a> {
     routing: &'a str,
     caps: &'a str,
     /// Credentials beyond the config's, given the Codex upstream's URL.
-    extra: fn(&str) -> Vec<cpa_core::credential::Credential>,
+    extra: Box<dyn Fn(&str) -> Vec<cpa_core::credential::Credential>>,
     /// Install after-auth, response and chunk hooks that rewrite whenever they run.
     rewriting_hooks: bool,
 }
@@ -62,7 +63,7 @@ impl Fixture {
             providers: default_providers(keys),
             routing,
             caps: "request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin",
-            extra: |_| Vec::new(),
+            extra: Box::new(|_| Vec::new()),
             rewriting_hooks: true,
         })
         .await
@@ -116,11 +117,12 @@ impl Fixture {
         cpa_server::plugins::start(&rt).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let router = cpa_server::router(rt);
+        let router = cpa_server::router(rt.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let fixture = Self {
             base,
             records,
+            rt,
             codex,
             control,
         };
@@ -416,7 +418,7 @@ async fn a_mixed_pool_applies_before_auth_only_to_attempts_that_are_not_native()
         providers: MIXED.to_owned(),
         routing: "",
         caps: "request_interceptor,request_lifecycle_plugin,scheduler",
-        extra: |_| Vec::new(),
+        extra: Box::new(|_| Vec::new()),
         rewriting_hooks: false,
     })
     .await
@@ -528,7 +530,7 @@ async fn a_siwc_only_pool_keeps_before_auth() {
         providers: "  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models: [{name: up-model, alias: control-model}]\n      keys: [{api-key: key-FAKE-control}]\n".to_owned(),
         routing: "",
         caps: "request_interceptor,request_lifecycle_plugin",
-        extra: |codex| {
+        extra: Box::new(|codex| {
             let metadata = json!({
                 "type": "codex", "access_token": "at-FAKE", "account_id": "acct-FAKE",
                 "use_siwc": true, "siwc": {"access_token": "siwc-at-FAKE"},
@@ -541,7 +543,7 @@ async fn a_siwc_only_pool_keeps_before_auth() {
             .unwrap();
             c.attributes.insert("base_url".into(), codex.into());
             vec![c]
-        },
+        }),
         rewriting_hooks: false,
     })
     .await
@@ -576,7 +578,7 @@ async fn a_pure_non_codex_responses_model_keeps_before_auth_selection() {
         providers: "  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models: [{name: up-model, alias: control-model}]\n      keys: [{api-key: key-FAKE-control-a}, {api-key: key-FAKE-control-b}]\n".to_owned(),
         routing: "routing:\n  session-affinity: true\n",
         caps: "request_interceptor,request_lifecycle_plugin",
-        extra: |_| Vec::new(),
+        extra: Box::new(|_| Vec::new()),
         rewriting_hooks: false,
     })
     .await
@@ -615,4 +617,250 @@ async fn a_pure_non_codex_responses_model_keeps_before_auth_selection() {
         second_key,
         "Go's selection follows the rewrite"
     );
+}
+
+/// A fake Home: hands out the queued credentials in order and counts released leases.
+struct Home {
+    picks: std::sync::Mutex<Vec<cpa_core::credential::Credential>>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl cpa_server::remote::RemoteDispatch for Home {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn dispatch(
+        &self,
+        _: cpa_server::remote::RemoteRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<cpa_server::remote::RemoteGrant, cpa_server::remote::RemoteError>>
+    {
+        let credential = self.picks.lock().unwrap().remove(0);
+        let released = self.released.clone();
+        Box::pin(async move {
+            Ok(cpa_server::remote::RemoteGrant {
+                credential,
+                end: Box::new(move || {
+                    released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    None
+                }),
+                cancel: None,
+                request_retry: None,
+                user_api_key: String::new(),
+                private: Default::default(),
+            })
+        })
+    }
+
+    fn models(
+        &self,
+        _: Vec<(String, String)>,
+        _: Vec<(String, String)>,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, cpa_server::remote::ModelsError>> {
+        unreachable!("no model lists")
+    }
+}
+
+/// A Codex credential a fake Home hands out: an API key (native) or Sign in with
+/// ChatGPT (legacy), pointing at `base`.
+fn home_credential(id: &str, siwc: bool, base: &str) -> cpa_core::credential::Credential {
+    let mut metadata = json!({"type": "codex", "access_token": "at-FAKE", "account_id": "acct-FAKE"});
+    if siwc {
+        metadata["use_siwc"] = true.into();
+        metadata["siwc"] = json!({"access_token": "siwc-at-FAKE"});
+    }
+    let mut c = cpa_core::credential::Credential::from_file(
+        Path::new("/fake"),
+        &Path::new("/fake").join(id),
+        metadata.as_object().unwrap().clone(),
+    )
+    .unwrap();
+    c.attributes.insert(
+        cpa_core::config::credentials::HOME_AUTH_INDEX.into(),
+        format!("idx-{id}"),
+    );
+    c.attributes.insert("base_url".into(), base.into());
+    if !siwc {
+        c.attributes.insert("api_key".into(), "key-FAKE-home".into());
+    }
+    c
+}
+
+/// Under Home a Codex pool may be native, so before-auth output is deferred. A native
+/// pick ignores it; a Sign in with ChatGPT pick gets the rewrite and the termination,
+/// as before; every lease is released and every lifecycle completes. Home runs no
+/// after-auth chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn home_picks_get_deferred_before_auth_only_when_not_native() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-plugins-home",
+        providers: String::new(),
+        routing: "",
+        caps: "request_interceptor,request_lifecycle_plugin",
+        extra: Box::new(|_| Vec::new()),
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    // An after-auth hook that would rewrite, to show Home still runs none.
+    fx.respond(
+        "request.intercept_after",
+        &json!({"ok": true, "result": {"Body": b64(r#"{"model":"gpt-5.5","input":"after-auth body"}"#)}}),
+    );
+    let base = fx.codex.base_url.clone();
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fx.rt.set_remote_dispatch(Some(Arc::new(Home {
+        picks: std::sync::Mutex::new(vec![
+            home_credential("native-1.json", false, &base),
+            home_credential("siwc-1.json", true, &base),
+            home_credential("native-2.json", false, &base),
+            home_credential("siwc-2.json", true, &base),
+        ]),
+        released: released.clone(),
+    })));
+    let original = r#"{"model":"gpt-5.5","stream":true,"input":"client question"}"#;
+    let rewritten = r#"{"model":"gpt-5.5","stream":true,"input":"before-auth body"}"#;
+    let terminate = || {
+        fx.respond_once(
+            "request.intercept_before",
+            &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
+        )
+    };
+
+    // Native pick: the client's body.
+    fx.rewrite_before_auth(rewritten);
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent = fx.codex.http().pop().expect("the native pick served it");
+    assert_eq!(String::from_utf8_lossy(&sent.body), original);
+
+    // Sign in with ChatGPT pick: the before-auth rewrite, and no after-auth rewrite.
+    fx.rewrite_before_auth(rewritten);
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent = fx.codex.http().pop().expect("the SIWC pick served it");
+    let body = String::from_utf8_lossy(&sent.body);
+    assert!(body.contains("before-auth body"), "{body}");
+    assert!(
+        !body.contains("after-auth body"),
+        "Home runs no after-auth chain: {body}"
+    );
+    assert_eq!(fx.calls("request.intercept_after"), 0);
+
+    // Native pick: a termination is ignored.
+    terminate();
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(fx.codex.http().len(), 3);
+
+    // Sign in with ChatGPT pick: the termination stops it before the upstream.
+    terminate();
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!((status, answer.as_str()), (403, "blocked"));
+    assert_eq!(fx.codex.http().len(), 3, "nothing sent after the termination");
+
+    assert_eq!(
+        released.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "every lease released"
+    );
+    assert!(fx.lifecycle_completions(4).await >= 4, "every lifecycle completed");
+}
+
+/// Upstream requests (path and body) of the credits test.
+type Seen = std::sync::Mutex<Vec<(String, String)>>;
+
+/// Codex always over quota; Antigravity over quota until a request asks for credits.
+async fn credits_upstream(
+    axum::extract::State(seen): axum::extract::State<Arc<Seen>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    seen.lock().unwrap().push((path.clone(), body.clone()));
+    let json = [("content-type", "application/json")];
+    if path.starts_with("/codex") {
+        let limit = r#"{"error":{"type":"usage_limit_reached","message":"limit"}}"#;
+        return (axum::http::StatusCode::TOO_MANY_REQUESTS, json, limit).into_response();
+    }
+    if path.contains("loadCodeAssist") {
+        // Credits are available, whenever the executor's lookup runs.
+        let credits = r#"{"paidTier":{"id":"g1-pro-tier","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":100,"minimumCreditAmountForUsage":1}]}}"#;
+        return (json, credits).into_response();
+    }
+    if !body.contains(r#""enabledCreditTypes":["GOOGLE_ONE_AI"]"#) {
+        let quota = r#"{"error":{"code":429,"message":"You have exhausted your capacity on this model.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3600s"}]}}"#;
+        return (axum::http::StatusCode::TOO_MANY_REQUESTS, json, quota).into_response();
+    }
+    let answer = r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"paid with credits"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7},"modelVersion":"claude-sonnet-4-6","responseId":"msg-credits"},"traceId":"t"}"#;
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {answer}\r\n\r\n"),
+    )
+        .into_response()
+}
+
+/// A Claude model a native Codex credential shares with Antigravity: after both fail on
+/// quota, the buffered credits fallback (which runs no after-auth chain, as in Go)
+/// still receives the deferred before-auth rewrite, and the native attempt never did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_credits_fallback_gets_the_deferred_before_auth_rewrite() {
+    let seen = Arc::new(Seen::default());
+    let upstream = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(credits_upstream).with_state(seen.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    };
+    let antigravity = format!("{upstream}/antigravity");
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-plugins-credits",
+        providers: format!(
+            "  codex:\n    - base-url: {upstream}/codex\n      models: [{{name: claude-sonnet-4-6}}]\n      keys: [{{api-key: key-FAKE-codex}}]\n"
+        ),
+        routing: "quota-exceeded:\n  antigravity-credits: true\nrouting:\n  retry:\n    request-retry: 0\n",
+        caps: "request_interceptor,request_lifecycle_plugin",
+        extra: Box::new(move |_| {
+            let mut metadata = serde_json::Map::new();
+            for (k, v) in [
+                ("type", "antigravity"),
+                ("access_token", "ya29.fake-credits"),
+                ("expired", "2099-01-01T00:00:00Z"),
+                ("project_id", "proj-credits"),
+                ("email", "credits@example.com"),
+            ] {
+                metadata.insert(k.into(), v.into());
+            }
+            let dir = Path::new("/fixture");
+            let mut c = cpa_core::credential::Credential::from_file(dir, &dir.join("ag.json"), metadata).unwrap();
+            c.attributes.insert("base_url".into(), antigravity.clone());
+            vec![c]
+        }),
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    let original = r#"{"model":"claude-sonnet-4-6","stream":false,"input":"client question"}"#;
+    fx.rewrite_before_auth(r#"{"model":"claude-sonnet-4-6","stream":false,"input":"before-auth body"}"#);
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200, "{answer}: {:?}", seen.lock().unwrap());
+    assert!(answer.contains("paid with credits"), "{answer}");
+    let seen = seen.lock().unwrap().clone();
+    let codex: Vec<_> = seen.iter().filter(|(p, _)| p.starts_with("/codex")).collect();
+    assert_eq!(codex.len(), 1, "the native attempt ran: {seen:?}");
+    assert_eq!(codex[0].1, original, "the native attempt got the client's body");
+    let credits: Vec<_> = seen
+        .iter()
+        .filter(|(_, b)| b.contains(r#""enabledCreditTypes":["GOOGLE_ONE_AI"]"#))
+        .collect();
+    assert_eq!(credits.len(), 1, "the credits fallback ran: {seen:?}");
+    assert!(credits[0].1.contains("before-auth body"), "{}", credits[0].1);
+    assert!(!credits[0].1.contains("client question"), "{}", credits[0].1);
 }

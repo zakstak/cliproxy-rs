@@ -784,7 +784,8 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
 /// Whether a native Codex attempt is possible for `call`: a Responses HTTP request
 /// (`Call::native`) whose selectable credentials for the model include a built-in Codex
 /// credential on a native profile without a plugin executor. Records the answer on the
-/// request. Under Home the credentials are remote, so a pool that includes Codex counts.
+/// request. Under Home the pool is remote and unknown, so every Responses HTTP request
+/// counts; its non-native attempts still receive the deferred before-auth result.
 fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<String>, String)) -> bool {
     let Some(native) = &call.native else {
         return false;
@@ -792,8 +793,9 @@ fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<Str
     let eligible = call.turn.is_none()
         && call.media.is_none()
         && call.operation == Operation::Generate
-        && providers.iter().any(|p| p.eq_ignore_ascii_case("codex"))
-        && (rt.remote_dispatch().is_some() || {
+        // Under Home the pool is remote and `providers` is just `home`: any Responses
+        // request may reach a native Codex credential there.
+        && (rt.remote_dispatch().is_some() || providers.iter().any(|p| p.eq_ignore_ascii_case("codex")) && {
             let cfg = rt.config();
             let registry = rt.registry();
             let aliases = registry::global_aliases(&cfg);
@@ -1178,6 +1180,7 @@ async fn run_routed(
             compact,
             trace,
             user_key: Default::default(),
+            before_auth: hooks,
         };
         return run_remote(context, remote, selection).await;
     }
@@ -1272,7 +1275,20 @@ async fn run_routed(
                 keep_model: call.selection_model.is_some(),
                 unauthorized: None,
             };
-            match attempt(rt, &cfg, &policy, &call, &request, usage.as_ref(), lease, target, hooks).await {
+            match attempt(
+                rt,
+                &cfg,
+                &policy,
+                &call,
+                &request,
+                usage.as_ref(),
+                lease,
+                target,
+                hooks,
+                hooks,
+            )
+            .await
+            {
                 Attempt::Done(done) => return Ok(done),
                 Attempt::Stop(fault) => return Err(fault.into_run_error()),
                 Attempt::Next(fault) => {
@@ -1375,6 +1391,9 @@ struct RemoteContext<'a> {
     /// The client key Home authenticated on the latest pick that sent one (Go
     /// `setHomeUserAPIKeyOnGinContext`, which keeps it for the rest of the request).
     user_key: std::sync::Mutex<String>,
+    /// The request's plugin hooks, for the deferred before-auth result only (#23). Home
+    /// runs no after-auth chain.
+    before_auth: Option<&'a crate::plugins::interceptors::Hooks>,
 }
 
 /// Go `homeRetryRoundExhaustedError`: the round ended; its timing decides the next.
@@ -1923,7 +1942,21 @@ async fn remote_round(
                 let mut lease = lease;
                 match cx.rt.prepare_remote(&mut lease, cx.cfg).await {
                     Ok(()) => (
-                        attempt(cx.rt, cx.cfg, cx.policy, cx.call, request, usage, lease, target, None).await,
+                        // Home runs no after-auth chain, but a deferred before-auth result
+                        // still reaches an attempt that is not native.
+                        attempt(
+                            cx.rt,
+                            cx.cfg,
+                            cx.policy,
+                            cx.call,
+                            request,
+                            usage,
+                            lease,
+                            target,
+                            None,
+                            cx.before_auth,
+                        )
+                        .await,
                         false,
                     ),
                     Err(error) => {
@@ -2160,10 +2193,13 @@ impl Credits<'_> {
             // Go's stream fallback runs the after-auth interceptor
             // (`executeStreamWithModelPool`); its non-stream fallback calls the executor
             // directly.
-            let hooks = hooks.filter(|_| request.stream);
+            // The deferred before-auth result reaches the credits attempt either way.
+            let after_auth = hooks.filter(|_| request.stream);
             // ponytail: a 401 inside a credits attempt retries with the refreshed
             // credential, which no longer carries the credits flag.
-            if let Attempt::Done(done) = attempt(rt, cfg, policy, call, request, usage, lease, target, hooks).await {
+            if let Attempt::Done(done) =
+                attempt(rt, cfg, policy, call, request, usage, lease, target, after_auth, hooks).await
+            {
                 return Ok(done);
             }
         }
@@ -2206,6 +2242,7 @@ async fn attempt(
     mut lease: Lease,
     target: Target<'_>,
     hooks: Option<&crate::plugins::interceptors::Hooks>,
+    before_auth: Option<&crate::plugins::interceptors::Hooks>,
 ) -> Attempt {
     let route_model = lease.selection.model.clone();
     let mut last = None;
@@ -2285,8 +2322,8 @@ async fn attempt(
         // Before-auth output held back for a possible native attempt reaches every other
         // attempt here, its termination included.
         if !native
-            && let Some(hooks) = hooks
-            && let Err(error) = hooks.apply_deferred(&mut req)
+            && let Some(before_auth) = before_auth
+            && let Err(error) = before_auth.apply_deferred(&mut req)
         {
             lease.complete(Outcome::Neutral(error.clone()));
             return Attempt::Stop(Fault { error, bootstrap: None });
