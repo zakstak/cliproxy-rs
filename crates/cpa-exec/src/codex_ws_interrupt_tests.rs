@@ -334,3 +334,56 @@ async fn a_buffered_turn_waits_for_the_acknowledgement_too() {
         "{events:?}"
     );
 }
+
+const ZERO_INTERRUPTED_R1: &str = r#"{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}"#;
+
+/// Canceled after `response.created`, before the first delta: upstream ends the response
+/// as interrupted with zero output tokens. That is the response Codex asked to stop, not
+/// a silent abort: it reaches the client with its ID and usage, the acknowledgement still
+/// follows, and the socket serves the next turn.
+#[tokio::test]
+async fn a_zero_token_interrupted_response_is_a_normal_end() {
+    let (up, url) = upstream(vec![
+        Act::Send(vec![CREATED]),
+        Act::Send(vec![ZERO_INTERRUPTED_R1, ACCEPTED_R1]),
+        Act::Send(vec![CREATED_R2, COMPLETED_R2]),
+    ])
+    .await;
+    let executor = CodexExecutor::new().unwrap();
+    let mut stream = start(&executor, &url, false).await;
+    next(&mut stream).await;
+    interrupt_r1(&executor).await;
+    let events = rest_of(stream).await;
+    assert_eq!(
+        kinds(&events),
+        ["response.incomplete", "response.interrupt.accepted"],
+        "{events:?}"
+    );
+    let incomplete = texts(&events)[0];
+    assert_eq!(gjson::get(incomplete, "response.id").str(), "r1");
+    assert_eq!(gjson::get(incomplete, "response.usage.input_tokens").i64(), 5);
+    assert_eq!(
+        gjson::get(incomplete, "response.incomplete_details.reason").str(),
+        "interrupted"
+    );
+    assert!(executor.ws.loss("conn-1").is_none(), "the socket was not dropped");
+    follow_up_is_clean(&executor, &url, &up).await;
+}
+
+/// The same shape without a reason is still an upstream abort: a request-scoped 502.
+#[tokio::test]
+async fn an_unexplained_zero_output_incomplete_still_fails() {
+    let (_up, url) = upstream(vec![Act::Send(vec![
+        CREATED,
+        r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
+    ])])
+    .await;
+    let executor = CodexExecutor::new().unwrap();
+    let events = rest_of(start(&executor, &url, false).await).await;
+    let error = events
+        .last()
+        .and_then(|e| e.as_ref().err())
+        .unwrap_or_else(|| panic!("{events:?}"));
+    assert_eq!(error.status, 502, "{error}");
+    assert_eq!(error.scope, FailureScope::Request);
+}
