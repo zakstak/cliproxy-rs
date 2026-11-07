@@ -84,6 +84,7 @@ impl Fixture {
         let sse = || Reply::sse(fixture("sse-completed").bytes());
         let codex = CaptureUpstream::start(Script {
             http: (0..40).map(|_| sse()).collect(),
+            ws: (0..40).map(|_| fixture("sse-completed").frames()).collect(),
             ..Script::default()
         })
         .await;
@@ -866,4 +867,76 @@ async fn the_credits_fallback_gets_the_deferred_before_auth_rewrite() {
     assert_eq!(credits.len(), 1, "the credits fallback ran: {seen:?}");
     assert!(credits[0].1.contains("before-auth body"), "{}", credits[0].1);
     assert!(!credits[0].1.contains("client question"), "{}", credits[0].1);
+}
+
+/// The native WebSocket route (#24) with the same hooks: before-auth runs when the turn
+/// starts, but its headers, body and path never reach the native turn, and no after-auth,
+/// response or chunk hook runs. The upstream socket gets the client's frame and the
+/// client gets the upstream's frames. The turn still completes its plugin lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_interceptors_cannot_rewrite_native_websocket_turns() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-ws-plugins",
+        providers: default_providers(&["key-FAKE-codex, websockets: true"]),
+        routing: "",
+        caps: "request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin",
+        extra: Box::new(|_| Vec::new()),
+        rewriting_hooks: true,
+    })
+    .await
+    else {
+        return;
+    };
+    fx.rewrite_before_auth(r#"{"type":"response.create","model":"gpt-native","input":"before-auth body"}"#);
+    let mut socket = wreq::Client::new()
+        .websocket(format!("{}/v1/responses", fx.base.replacen("http://", "ws://", 1)))
+        .header("authorization", "Bearer client-key-1")
+        .header("session-id", "client-session")
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+    let frame = String::from_utf8(fixture("ws-create-first").bytes().to_vec())
+        .unwrap()
+        .replacen(r#""model":"gpt-test""#, r#""model":"gpt-native""#, 1);
+    socket
+        .send(wreq::ws::message::Message::text(frame.clone()))
+        .await
+        .unwrap();
+    let want: Vec<String> = fixture("sse-completed")
+        .frames()
+        .into_iter()
+        .map(|f| String::from_utf8(f.to_vec()).unwrap())
+        .collect();
+    let mut got = Vec::new();
+    while got.len() < want.len() {
+        let next = tokio::time::timeout(Duration::from_secs(5), futures_util::StreamExt::next(&mut socket))
+            .await
+            .expect("an upstream frame");
+        match next {
+            Some(Ok(wreq::ws::message::Message::Text(text))) => got.push(text.as_str().to_owned()),
+            other => panic!("{other:?} after {got:?}"),
+        }
+    }
+    assert_eq!(got, want, "the upstream's frames");
+    let sockets = fx.codex.sockets();
+    assert_eq!(sockets.len(), 1, "the turn ran on an upstream socket");
+    assert_eq!(sockets[0].frames, [frame.as_bytes()], "the client's frame");
+    let handshake = &sockets[0].headers;
+    assert_eq!(handshake.get("x-codex-turn-state"), None, "no before-auth header");
+    assert_eq!(handshake.get("x-after"), None, "no after-auth header");
+    assert_ne!(
+        handshake.get("session-id").and_then(|v| v.to_str().ok()),
+        Some("plugin-session"),
+        "no before-auth session"
+    );
+    assert!(fx.codex.http().is_empty());
+    assert_eq!(fx.calls("request.intercept_before"), 1);
+    assert_eq!(fx.calls("request.intercept_after"), 0);
+    assert_eq!(fx.calls("response.intercept_stream_chunk"), 0);
+    assert_eq!(fx.calls("response.intercept_after"), 0);
+    drop(socket);
+    assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
 }

@@ -90,6 +90,9 @@ pub struct Script {
     /// For each client text frame, in order across all sockets, the frames to send back.
     /// Once exhausted, a further client frame gets no reply.
     pub ws: Vec<Vec<Bytes>>,
+    /// Client frames, numbered from 0 in order across all sockets, after whose replies the
+    /// upstream closes that socket (code 1000), as an upstream ending an idle socket does.
+    pub ws_close: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -98,6 +101,8 @@ struct State {
     ws_replies: Mutex<VecDeque<Vec<Bytes>>>,
     ws_handshake: Vec<(String, String)>,
     ws_reject: Option<Reply>,
+    ws_close: Vec<usize>,
+    ws_frames: Mutex<usize>,
     exchanges: Mutex<Vec<Exchange>>,
     sockets: Mutex<Vec<Socket>>,
 }
@@ -116,6 +121,7 @@ impl CaptureUpstream {
             ws_replies: Mutex::new(script.ws.into()),
             ws_handshake: script.ws_handshake,
             ws_reject: script.ws_reject,
+            ws_close: script.ws_close,
             ..State::default()
         });
         let shared = state.clone();
@@ -189,6 +195,11 @@ async fn relay(state: Arc<State>, index: usize, mut socket: WebSocket) {
             _ => continue,
         };
         state.sockets.lock().unwrap()[index].frames.push(frame);
+        let number = {
+            let mut frames = state.ws_frames.lock().unwrap();
+            *frames += 1;
+            *frames - 1
+        };
         let replies = state.ws_replies.lock().unwrap().pop_front().unwrap_or_default();
         for reply in replies {
             // A scripted frame that is not UTF-8 is a test bug: fail loudly.
@@ -196,6 +207,15 @@ async fn relay(state: Arc<State>, index: usize, mut socket: WebSocket) {
             if socket.send(Message::Text(text.into())).await.is_err() {
                 return;
             }
+        }
+        if state.ws_close.contains(&number) {
+            let _ = socket
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1000,
+                    reason: "bye".into(),
+                })))
+                .await;
+            return;
         }
     }
 }

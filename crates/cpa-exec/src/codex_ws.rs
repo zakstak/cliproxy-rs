@@ -1010,6 +1010,8 @@ struct Turn {
     items: OutputItems,
     saw_delta: bool,
     native: bool,
+    /// A native WebSocket turn (#24): events reach the client as upstream sent them.
+    passthrough: bool,
     /// A Codex client: it gets an upstream context-window rejection as a `response.failed`
     /// before the error (`request::codex_client`).
     codex_client: bool,
@@ -1109,12 +1111,17 @@ impl Turn {
         if let Some((error, body)) = response::terminal_failure(payload, self.cooling) {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
+            // A native turn delivers the upstream's failure event byte for byte, unless it
+            // is the context-window `error` a Codex client gets as `response.failed` (#5).
+            let event = self
+                .preserved_event(payload)
+                .or_else(|| self.passthrough.then(|| Bytes::from(text.clone())));
             return Frame::Failed {
                 error,
                 overload: response::is_overload(&body),
                 read: false,
                 status_frame: false,
-                event: self.preserved_event(payload),
+                event,
             };
         }
         let kind = gjson::get(payload, "type");
@@ -1138,7 +1145,6 @@ impl Turn {
             };
         }
         let bufferable = response::bufferable(payload);
-        let mut out = payload.to_owned();
         let terminal = matches!(
             kind.as_str(),
             "response.completed" | "response.done" | "response.incomplete"
@@ -1151,6 +1157,18 @@ impl Turn {
         if kind == "response.output_item.done" {
             self.items.collect(payload);
         }
+        if self.passthrough {
+            // Observation above read a copy; the client gets the frame as it arrived.
+            return Frame::Event {
+                raw_len,
+                out: Bytes::from(text),
+                bufferable,
+                terminal,
+                terminal_id,
+                ack,
+            };
+        }
+        let mut out = payload.to_owned();
         if terminal {
             out = response::normalize_completion(out);
             if !self.native {
@@ -1532,16 +1550,36 @@ impl CodexExecutor {
         exec_session: &ExecSession,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
-        let model = request::base_model(&req.model).to_owned();
-        let request::Shaped {
-            body,
-            optimized,
-            conflict,
-            finalize,
-        } = request::shape(&req, view, settings, Call::Websocket)?;
-        let (body, replay) = Replay::apply(&self.replay, &req, body).await;
-        let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
-        let body = turn_body(view, &req, settings, &finalize, body);
+        // The native WebSocket route (#24): the client's `response.create` frame goes
+        // upstream with only its `model` routed. No shaping, payload rules, prompt-cache
+        // key, reasoning replay, ID or namespace edits; nothing is restored on the way
+        // back (`docs/codex/CONTRACT.md` "Native WebSocket route").
+        let passthrough = crate::codex::native::route_ws(view, &req).is_some();
+        let (model, body, optimized, conflict, replay, cache) = if passthrough {
+            let model = crate::codex::native::upstream_model(&req)?;
+            let frame = crate::codex::native::routed(&req.body, &model)?;
+            // The frame passed the request boundary, so it is UTF-8.
+            let body = String::from_utf8(frame.to_vec())
+                .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
+            let cache = request::prompt_cache_id(&req, &body, Some(&exec_session.id), true);
+            let replay = Replay {
+                cache: self.replay.clone(),
+                scope: Default::default(),
+            };
+            (model, body, false, false, replay, cache)
+        } else {
+            let model = request::base_model(&req.model).to_owned();
+            let request::Shaped {
+                body,
+                optimized,
+                conflict,
+                finalize,
+            } = request::shape(&req, view, settings, Call::Websocket)?;
+            let (body, replay) = Replay::apply(&self.replay, &req, body).await;
+            let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
+            let body = turn_body(view, &req, settings, &finalize, body);
+            (model, body, optimized, conflict, replay, cache)
+        };
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let native = request::is_native(&req);
         let headers = request::ws_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), native);
@@ -1554,12 +1592,14 @@ impl CodexExecutor {
             .flatten()
             .map(|input| {
                 let initial =
-                    duplex::Prepared::new(&body, &req.original_body, optimized, conflict, native, replay.clone());
+                    duplex::Prepared::new(&body, &req.original_body, optimized, conflict, native, replay.clone())
+                        .with_passthrough(passthrough);
                 (input, initial)
             });
         let guard = session.turn.clone().lock_owned().await;
         let model_kept = model_kept(&req.original_body, &body);
-        let frame = request_frame(body);
+        // A native frame is already a `response.create`.
+        let frame = if passthrough { body } else { request_frame(body) };
         let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
         wire.ws_request(&target.url, &headers, frame.as_bytes());
@@ -1586,7 +1626,7 @@ impl CodexExecutor {
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
         let mut rx = conn.activate(preserves);
-        let mut restore = conn.restores(optimized, conflict);
+        let mut restore = !passthrough && conn.restores(optimized, conflict);
         if let Err(error) = conn.send(frame.clone()).await {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
@@ -1612,7 +1652,7 @@ impl CodexExecutor {
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
             rx = fresh.activate(preserves);
-            restore = fresh.restores(optimized, conflict);
+            restore = !passthrough && fresh.restores(optimized, conflict);
             wire.ws_request(&target.url, &headers, frame.as_bytes());
             if let Some(handshake) = &fresh_handshake {
                 wire.ws_handshake(101, handshake);
@@ -1639,6 +1679,7 @@ impl CodexExecutor {
             items: OutputItems::default(),
             saw_delta: false,
             native,
+            passthrough,
             codex_client: request::codex_client(&req),
             cooling: settings.model_level_cooling,
             quota: self.quota_handle(),

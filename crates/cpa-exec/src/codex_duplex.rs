@@ -80,6 +80,9 @@ pub(super) struct Prepared {
     conflict: bool,
     /// Native Codex request: completion output stays as upstream sent it.
     native: bool,
+    /// A request on the native WebSocket route (#24): sent as the client wrote it, with
+    /// only `model` routed, and its events reach the client as upstream sent them.
+    passthrough: bool,
     /// The request's reasoning replay scope (`replayScope`).
     replay: Replay,
 }
@@ -103,8 +106,14 @@ impl Prepared {
             optimized,
             conflict,
             native,
+            passthrough: false,
             replay,
         }
+    }
+
+    pub(super) fn with_passthrough(mut self, passthrough: bool) -> Self {
+        self.passthrough = passthrough;
+        self
     }
 
     /// The settings a response retains (Go keeps `reasoning` and `instructions`, never
@@ -477,12 +486,22 @@ impl Duplex {
             self.fail(local("websocket credential is no longer enabled"));
             return;
         }
-        if !cpa_common::json::std_valid(&frame) {
-            self.reject("invalid websocket request JSON");
-            return;
-        }
-        // ponytail: invalid UTF-8 inside JSON strings is replaced; Go forwards the bytes.
-        let payload = String::from_utf8_lossy(&frame).into_owned();
+        let payload = if self.initial.passthrough {
+            // The native route reads client frames through the request boundary: strict
+            // UTF-8 and JSON, the bytes kept as they are.
+            if let Err(error) = cpa_common::codex_body::CodexBody::parse(&frame) {
+                self.reject(&error.to_string());
+                return;
+            }
+            String::from_utf8_lossy(&frame).into_owned()
+        } else {
+            if !cpa_common::json::std_valid(&frame) {
+                self.reject("invalid websocket request JSON");
+                return;
+            }
+            // ponytail: invalid UTF-8 inside JSON strings is replaced; Go forwards the bytes.
+            String::from_utf8_lossy(&frame).into_owned()
+        };
         let kind = gjson::get(&payload, "type").str().to_owned();
         match kind.as_str() {
             "response.steer" => {
@@ -512,6 +531,18 @@ impl Duplex {
     /// translation or defaults (SIWC credentials lose `configuration_update` items);
     /// upstream validates unknown fields and input.
     fn steer(&mut self, mut payload: String) {
+        if self.initial.passthrough {
+            // The native route sends a steer as the client wrote it. The pinned client
+            // never sends one; OpenAI documents `response.steer` for the GPT-6 family on
+            // the API, and nothing documents it on the ChatGPT backend. Upstream decides.
+            let parent = gjson::get(&payload, "previous_response_id").str().to_owned();
+            if let Some(settings) = self.response_settings.get(&parent).cloned() {
+                self.steering_settings.insert(parent.clone(), settings);
+            }
+            self.unacknowledged.push(parent);
+            self.write(payload, None);
+            return;
+        }
         if crate::codex_siwc::enabled(&self.credential) {
             let stripped = cpa_common::thinking::strip_configuration_update_items(payload.as_bytes());
             if stripped != payload.as_bytes() {
@@ -530,6 +561,9 @@ impl Duplex {
     /// `processCreatePayload`.
     async fn create(&mut self, mut payload: String) {
         let append = gjson::get(&payload, "type").str() == "response.append";
+        if self.initial.passthrough && !append {
+            return self.native_create(payload);
+        }
         let mut parent = gjson::get(&payload, "previous_response_id").str().trim().to_owned();
         if append && parent.is_empty() && !self.response_id.is_empty() {
             parent.clone_from(&self.response_id);
@@ -601,9 +635,53 @@ impl Duplex {
         self.write(request_frame(body), Some((optimized, conflict)));
     }
 
-    /// `restoreMultiAgent` for an event of `prepared`'s request on this socket.
+    /// A `response.create` on the native route, sent while the connection's duplex
+    /// stream runs. The pinned client steers this way: it interrupts the running response
+    /// and sends a new create (`codex-api/src/endpoint/responses_websocket.rs:310-325`,
+    /// 824-839). The frame goes upstream as the client wrote it; only `model` is routed to
+    /// this socket's upstream model. A create for another model cannot use this socket
+    /// and asks the client to replay, as on the legacy path.
+    fn native_create(&mut self, payload: String) {
+        let parent = gjson::get(&payload, "previous_response_id").str().trim().to_owned();
+        if !self.accepted.is_empty() && parent != self.waiting_parent {
+            self.reject("response.create must continue the response waiting for required input");
+            return;
+        }
+        let model = gjson::get(&payload, "model").str().trim().to_owned();
+        if !model.is_empty() && model != self.req.model && model != self.initial_model {
+            self.fail(ExecError::replay_required());
+            return;
+        }
+        let upstream = if self.req.model.is_empty() {
+            self.initial_model.trim().to_owned()
+        } else {
+            self.req.model.trim().to_owned()
+        };
+        let frame = match crate::codex::native::routed(&Bytes::from(payload), &upstream) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        let body = String::from_utf8_lossy(&frame).into_owned();
+        let replay = Replay {
+            cache: self.initial.replay.cache.clone(),
+            scope: Default::default(),
+        };
+        let prepared = Prepared::new(&body, &frame, false, false, self.initial.native, replay).with_passthrough(true);
+        if self.pending.len() >= MAX_PENDING {
+            self.fail(local("too many outstanding response.create requests"));
+            return;
+        }
+        self.pending.push_back(prepared);
+        self.write(body, None);
+    }
+
+    /// `restoreMultiAgent` for an event of `prepared`'s request on this socket. A native
+    /// request's events are never restored: nothing renamed them.
     fn restores(&self, prepared: &Prepared) -> bool {
-        self.turn.conn.restores(prepared.optimized, prepared.conflict)
+        !prepared.passthrough && self.turn.conn.restores(prepared.optimized, prepared.conflict)
     }
 
     /// `releaseSteeringSettings`.
@@ -631,10 +709,15 @@ impl Duplex {
                 return self.fail(error);
             }
         };
-        let payload = text.trim();
-        if payload.is_empty() {
+        if text.trim().is_empty() {
             return;
         }
+        // A native connection hands each frame on as it arrived.
+        let payload = if self.initial.passthrough {
+            text.as_str()
+        } else {
+            text.trim()
+        };
         let kind = gjson::get(payload, "type").str().to_owned();
         let establishing = self.first_response && kind == "response.created";
         if kind == "response.created" && !self.response_created(payload) {
@@ -710,6 +793,9 @@ impl Duplex {
             }
         }
         let event = rejected.as_ref().unwrap_or(&self.current);
+        // Every event on a native connection reaches the client as upstream sent it, an
+        // append's too: response repair is not part of the append's legacy framing.
+        let passthrough = event.passthrough || self.initial.passthrough;
         let payload = response::restore(payload, self.restores(event));
         // Every rejection clears its own request's replay; only the first fails the
         // stream (and can enter bootstrap retry), later ones are events the client may
@@ -740,16 +826,20 @@ impl Duplex {
         if matches!(kind, "response.completed" | "response.done" | "response.incomplete") {
             self.response_active = false;
             self.automatic_active = false;
-            out = response::normalize_completion(out);
-            if !self.current.native {
-                out = self.turn.items.patch(out);
-            }
-            if kind != "response.incomplete" {
-                self.current.replay.completed(&out);
+            if !passthrough {
+                out = response::normalize_completion(out);
+                if !self.current.native {
+                    out = self.turn.items.patch(out);
+                }
+                if kind != "response.incomplete" {
+                    self.current.replay.completed(&out);
+                }
             }
         }
-        self.outbox
-            .push_back(Ok(Bytes::from(response::ensure_usage_details(out))));
+        if !passthrough {
+            out = response::ensure_usage_details(out);
+        }
+        self.outbox.push_back(Ok(Bytes::from(out)));
         if establishing {
             // Delivered before any locally generated error, so the handler also sees the
             // bootstrap succeed first.

@@ -95,9 +95,10 @@ impl CodexExecutor {
     }
 
     /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`):
-    /// credentials with `websockets` enabled keep a pooled upstream socket; others run
-    /// the HTTP stream with the session as prompt-cache identity and cannot continue
-    /// upstream state.
+    /// credentials with `websockets` enabled keep a pooled upstream socket, and a
+    /// `response.create` the server handed over as native goes on it unchanged
+    /// (`codex_native.rs`); others run the HTTP stream with the session as prompt-cache
+    /// identity and cannot continue upstream state.
     pub async fn execute_in_session(
         &self,
         credential: &Credential,
@@ -124,6 +125,21 @@ impl CodexExecutor {
     /// response mutation hooks away from the attempt.
     pub fn native_http(credential: &Credential, req: &ExecRequest) -> bool {
         native::eligible(&View::new(credential), req).is_some()
+    }
+
+    /// Whether a WebSocket turn whose client frame is `frame` takes the native WebSocket
+    /// route on `credential` (`codex_native.rs`, #24): the same handover as
+    /// [`Self::native_http`], for a `response.create` on a credential with `websockets`.
+    pub fn native_ws(credential: &Credential, req: &ExecRequest, frame: &[u8]) -> bool {
+        native::eligible_ws(&View::new(credential), req, frame).is_some()
+    }
+
+    /// Whether a WebSocket client frame is one the native WebSocket route serves (a
+    /// `response.create`), whatever the credential: with [`Self::native_profile`] and
+    /// [`Self::upstream_websocket`], the server's test of whether a pool can serve a turn
+    /// natively.
+    pub fn native_ws_frame(frame: &[u8]) -> bool {
+        native::creates(frame)
     }
 
     /// Whether `credential` is on a native profile (`chatgpt`, `api-key`, `compatible`;
@@ -1086,7 +1102,7 @@ fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -
 }
 
 #[path = "codex_native.rs"]
-mod native;
+pub(crate) mod native;
 
 #[cfg(test)]
 #[path = "codex_boundary_tests.rs"]

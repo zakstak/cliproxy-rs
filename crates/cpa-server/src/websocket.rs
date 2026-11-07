@@ -721,6 +721,9 @@ struct TurnCtx {
     preserve_output: bool,
     /// The serving credential is a Codex credential on an upstream socket.
     codex_socket: bool,
+    /// The attempt that answered ran on the native WebSocket route (#24): its events are
+    /// the upstream's frames, relayed as they are.
+    native_served: bool,
     tool_turn: Option<TurnCache>,
 }
 
@@ -1006,6 +1009,7 @@ impl Connection {
             attempted_mode: Mode::Http,
             preserve_output: false,
             codex_socket: false,
+            native_served: false,
             tool_turn: None,
         };
         let next_last_request = if native {
@@ -1021,7 +1025,7 @@ impl Connection {
             request.clone()
         };
         let model = gjson::get(&request, "model").str().to_owned();
-        let started = self.attempt(&request, &model, &mut ctx).await;
+        let started = self.attempt(&payload, &request, &model, &mut ctx).await;
         let forwarded = match started {
             Ok(started) => self.forward(socket, started, &cfg, &mut ctx).await,
             Err(error) => {
@@ -1232,8 +1236,16 @@ impl Connection {
 
     /// One turn through the shared dispatch loop (`ExecuteStreamWithAuthManager` with the
     /// pinned auth, the selected-auth callback and the execution session), including
-    /// bootstrap retries. Returns once the stream yielded its first event.
-    async fn attempt(&self, request: &str, model: &str, ctx: &mut TurnCtx) -> Result<Started, dispatch::Failure> {
+    /// bootstrap retries. Returns once the stream yielded its first event. `frame` is the
+    /// client's frame as it arrived: a native attempt (#24) sends it instead of `request`,
+    /// the frame this connection prepared for the legacy path.
+    async fn attempt(
+        &self,
+        frame: &str,
+        request: &str,
+        model: &str,
+        ctx: &mut TurnCtx,
+    ) -> Result<Started, dispatch::Failure> {
         /// What `WithSelectedAuthIDCallback` learned; the last call is the serving one.
         struct Selected {
             last: String,
@@ -1284,6 +1296,11 @@ impl Connection {
             on_selected: Some(on_selected),
             home: Some(self.home.clone()),
         });
+        let native = dispatch::NativeRequest::new(
+            Bytes::from(frame.to_owned()),
+            self.headers.clone(),
+            self.request_path.clone(),
+        );
         let call = dispatch::Call {
             entry: Format::OpenAIResponse,
             response: Format::OpenAIResponse,
@@ -1299,7 +1316,7 @@ impl Connection {
             execution_session: Some(self.session.clone()),
             request_path: self.request_path.clone(),
             peer: self.peer,
-            native: None,
+            native: Some(native.clone()),
             turn: Some(turn),
             media: None,
         };
@@ -1315,7 +1332,8 @@ impl Connection {
             ctx.last_attempted.clone_from(&s.last);
             ctx.pinned_attempted = s.pinned_attempted;
             ctx.attempted_mode = s.mode;
-            ctx.preserve_output = s.preserve_output;
+            ctx.native_served = native.served();
+            ctx.preserve_output = s.preserve_output || ctx.native_served;
             ctx.codex_socket = s.codex_socket;
         }
         match result? {
@@ -1409,7 +1427,18 @@ impl Connection {
                 Some(Ok(chunk)) => chunk,
             };
             deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
-            for mut payload in payloads_from_chunk(&chunk) {
+            // A native turn's chunk is one upstream frame, relayed as it arrived.
+            let payloads = if ctx.native_served {
+                let frame = String::from_utf8_lossy(&chunk).into_owned();
+                if frame.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![frame]
+                }
+            } else {
+                payloads_from_chunk(&chunk)
+            };
+            for mut payload in payloads {
                 let kind = gjson::get(&payload, "type").str().to_owned();
                 if kind == "response.created" {
                     response_started = true;
@@ -1429,7 +1458,9 @@ impl Connection {
                 // In duplex mode an error event after `response.created` is recoverable:
                 // the client may correct the request on this socket. Stream errors still
                 // close it.
-                if kind == "error" && !(response_started && duplex) {
+                // A native turn's `error` event reaches the client as upstream sent it; the
+                // executor's error follows and ends the connection (below).
+                if kind == "error" && !(response_started && duplex) && !ctx.native_served {
                     // `responsesWebsocketErrorMessageFromPayload`.
                     let mut status = gjson::get(&payload, "status").i64();
                     if status <= 0 {
@@ -1450,7 +1481,10 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
                 }
-                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
+                // On a native turn every upstream failure event is the client's own terminal
+                // event, as on the HTTP route; the classified error after it only closes.
+                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes())
+                    || (ctx.native_served && matches!(kind.as_str(), "error" | "response.failed"));
                 // The executor follows such an event with its classified error at once
                 // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
                 // scheduler even when the client interrupts or leaves during the write,
@@ -1473,6 +1507,14 @@ impl Connection {
                     return Forwarded::End;
                 }
                 if let Some(error) = committed {
+                    // A native turn delivered the upstream's own failure event, which the
+                    // client classifies and recovers from (`docs/codex/CONTRACT.md`
+                    // "WebSocket state"). No replay close, limit event or error event
+                    // follows it.
+                    if ctx.native_served {
+                        socket.terminate(CLOSE_SENT);
+                        return Forwarded::End;
+                    }
                     return self.failed(socket, ctx, &error, true).await;
                 }
                 if completed {

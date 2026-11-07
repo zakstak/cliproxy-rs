@@ -4,6 +4,12 @@
 //! (`tests/ws_fixtures/go/zz_rsfix_ws_test.go`). Here the same client frames and upstream
 //! script run through the Rust router and Codex executor; the frames the client sees,
 //! close codes, and what upstream received must match. Fake credentials only.
+//!
+//! Codex WebSocket credentials now take the native WebSocket route (#24,
+//! `docs/codex/CONTRACT.md` "Native WebSocket route"); the Go recordings stay as
+//! historical evidence for everything else. [`native_terminals`] and the upstream check
+//! in [`run_scenario`] encode the route's documented differences from Go
+//! (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route"); no recording changed.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -379,10 +385,68 @@ async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
     run_scenario(name, &scenario).await;
 }
 
+/// The native WebSocket route's terminal events (#24): a `response.completed`,
+/// `response.done` or `response.incomplete` of a turn served over an upstream socket
+/// reaches the client as upstream sent it. Go rebuilds `output` from the streamed items,
+/// renames `response.done` and adds zero usage details; the expected frame becomes the
+/// scripted upstream event with the same response ID. Only replies that Go's upstream
+/// read as WebSocket frames count: an HTTP-mode turn keeps Go's frames.
+fn native_terminals(scenario: &mut Value) {
+    const TERMINAL: [&str; 3] = ["response.completed", "response.done", "response.incomplete"];
+    let terminal = |text: &str| TERMINAL.contains(&gjson::get(text, "type").str());
+    let Some(go) = scenario["upstream"].as_array() else {
+        return;
+    };
+    // Replies are consumed in order by Go's upstream frames and HTTP requests.
+    let consumers: Vec<String> = go
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap().to_owned())
+        .filter(|k| k != "ws_dial")
+        .collect();
+    let mut raw = std::collections::HashMap::new();
+    let mut k = 0;
+    for step in scenario["steps"].as_array().unwrap() {
+        for reply in step["upstream"].as_array().into_iter().flatten() {
+            if consumers.get(k).map(String::as_str) == Some("ws_frame") {
+                for event in reply["events"].as_array().into_iter().flatten() {
+                    let event = event.as_str().unwrap();
+                    if terminal(event) {
+                        raw.insert(gjson::get(event, "response.id").str().to_owned(), event.to_owned());
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+    for step in scenario["steps"].as_array_mut().unwrap() {
+        for frame in step["frames"].as_array_mut().into_iter().flatten() {
+            let Some(text) = frame["text"].as_str().filter(|t| terminal(t)) else {
+                continue;
+            };
+            if let Some(event) = raw.get(gjson::get(text, "response.id").str()) {
+                frame["text"] = Value::String(event.clone());
+            }
+        }
+    }
+}
+
+/// The frame a native `response.create` sends upstream for the client's `sent`: the same
+/// bytes with only `model` routed to `model`.
+fn native_frame(sent: &str, model: &str) -> String {
+    let body = cpa_common::codex_body::CodexBody::parse(sent.as_bytes()).unwrap();
+    if body.get("model").and_then(|m| m.text()).as_deref() == Some(model) {
+        return sent.to_owned();
+    }
+    String::from_utf8(body.with_member("model", &serde_json::to_string(model).unwrap())).unwrap()
+}
+
 /// Runs one scenario and returns its runtime, for checks after the connection. A
 /// scenario without `upstream` (one not recorded from Go) skips the comparison of what
 /// upstream received.
 async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::Runtime> {
+    let mut scenario = scenario.clone();
+    native_terminals(&mut scenario);
+    let scenario = &scenario;
     let up = Arc::new(Upstream::default());
     for step in scenario["steps"].as_array().unwrap() {
         for reply in step["upstream"].as_array().into_iter().flatten() {
@@ -437,6 +501,8 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
 
     let mut last_id = String::new();
     let mut closed = false;
+    // The client's frames, as sent: what a native create must reach upstream as.
+    let mut sent: Vec<String> = Vec::new();
     for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
         let expected = go_frames(step);
         if closed {
@@ -462,6 +528,7 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         }
         if let Some(send) = step["send"].as_str() {
             let send = send.replace("{{last_response_id}}", &last_id);
+            sent.push(send.clone());
             socket.send(Message::text(send)).await.unwrap();
         }
         // A client that does not read for a while: large frames back up in the proxy's write.
@@ -555,12 +622,31 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         go_kinds,
         "{name}: upstream dials, frames and requests"
     );
+    // The client's creates and appends in order. Go frames both as `response.create`;
+    // a native create goes upstream as the client sent it, an append keeps Go's framing.
+    let mut requests = sent
+        .iter()
+        .filter(|s| matches!(gjson::get(s, "type").str(), "response.create" | "response.append"))
+        .peekable();
     for (i, (rust, go)) in captured.iter().zip(&go).enumerate() {
-        assert_eq!(
-            mask(&rust.body),
-            mask(&go_upstream_body(name, go["body"].as_str().unwrap_or_default())),
-            "{name}: upstream body #{i}"
-        );
+        let go_body = mask(&go_upstream_body(name, go["body"].as_str().unwrap_or_default()));
+        if rust.kind == "ws_frame"
+            && gjson::get(go["body"].as_str().unwrap_or_default(), "type").str() == "response.create"
+        {
+            let model = gjson::get(&rust.body, "model").str().to_owned();
+            // A create the proxy rejected locally never reached upstream: skip it.
+            let matched = requests.by_ref().find(|s| match gjson::get(s, "type").str() {
+                "response.create" => native_frame(s, &model) == rust.body,
+                _ => mask(&rust.body) == go_body,
+            });
+            assert!(
+                matched.is_some(),
+                "{name}: upstream frame #{i} is neither a client create as sent nor Go's append framing\n rust: {}\n   go: {go_body}",
+                rust.body
+            );
+        } else {
+            assert_eq!(mask(&rust.body), go_body, "{name}: upstream body #{i}");
+        }
         if let Some(hex) = go["body_hex"].as_str() {
             let rust_hex: String = rust.raw.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(rust_hex, hex, "{name}: upstream bytes #{i}");
@@ -647,8 +733,17 @@ async fn stream_ending_before_completion_closes_silently() {
 }
 
 #[tokio::test]
-async fn ws_multi_agent_v2_renames_upstream_and_restores_for_the_client() {
-    run("ws_multi_agent_v2").await;
+/// Go renames the `collaboration` namespace upstream and restores it for the client. The
+/// native WebSocket route sends the client's frame unrenamed (checked against the client's
+/// frame in [`run_scenario`]), so nothing is restored either: the client gets the scripted
+/// upstream event as it arrived (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket
+/// route").
+async fn ws_multi_agent_v2_is_neither_renamed_nor_restored() {
+    run_with("ws_multi_agent_v2", |scenario| {
+        let step = &mut scenario["steps"][0];
+        step["frames"][1]["text"] = step["upstream"][0]["events"][1].clone();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -685,7 +780,17 @@ async fn steering_upstream_close_after_accepted_steers_closes_the_client() {
 /// M2-0149: invalid JSON and unknown types are rejected locally; the socket stays usable.
 #[tokio::test]
 async fn steering_rejects_bad_frames_locally_and_recovers() {
-    run("steer_local_validation").await;
+    // The native route reads client frames through the request boundary, which names the
+    // first invalid byte (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route").
+    run_with("steer_local_validation", |scenario| {
+        let frame = &mut scenario["steps"][1]["frames"][1]["text"];
+        let text = frame.as_str().unwrap().replace(
+            "invalid websocket request JSON",
+            "request body is not valid JSON at byte 1",
+        );
+        *frame = Value::String(text);
+    })
+    .await;
 }
 
 /// M2-0146: a later upstream error is an event the client can correct on the socket.
@@ -1239,9 +1344,11 @@ mod context_window {
     /// Go's generic error frame for a client that is not Codex, on both transports.
     const GENERIC: &str = r#"{"type":"error","status":400,"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","code":"context_too_large"}}"#;
 
+    /// Over an upstream WebSocket the turn is native (#24): any client gets the upstream's
+    /// `response.failed` as it arrived. The HTTP fallback keeps Go's generic error.
     #[tokio::test]
     async fn other_clients_keep_the_classified_error() {
-        let frames = vec![text(CREATED), text(GENERIC), closed()];
+        let frames = vec![text(CREATED), text(FAILED), closed()];
         turn_as(
             "ws_other_client",
             None,
@@ -1385,12 +1492,30 @@ mod context_window {
             turn_paused("live_ws_slow_client_close", &[&live], frames, 300, Some("close_now")).await;
         }
 
+        /// A native WebSocket turn delivers the upstream's `error` event as it arrived; the
+        /// HTTP fallback keeps Go's generic error.
         #[tokio::test]
         async fn other_clients_keep_the_classified_error() {
-            for transport in [Transport::Websocket, Transport::Http] {
-                let frames = vec![text(GENERIC), closed()];
-                turn_as("live_other_client", None, transport, &[live()], "close", frames).await;
-            }
+            let frames = vec![text(live()), closed()];
+            turn_as(
+                "live_other_client",
+                None,
+                Transport::Websocket,
+                &[live()],
+                "close",
+                frames,
+            )
+            .await;
+            let frames = vec![text(GENERIC), closed()];
+            turn_as(
+                "live_other_client_http",
+                None,
+                Transport::Http,
+                &[live()],
+                "close",
+                frames,
+            )
+            .await;
         }
     }
 }

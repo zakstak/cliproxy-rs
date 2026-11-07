@@ -49,7 +49,7 @@ pub struct Call {
     /// The downstream peer (Go `Request.RemoteAddr`), when the listener provides it.
     pub peer: Option<std::net::SocketAddr>,
     /// The client's own bytes, for an attempt a Codex credential serves on the native
-    /// HTTP route (#23). Set only by the Responses HTTP routes.
+    /// HTTP (#23) or WebSocket (#24) route. Set only by the Responses routes.
     pub native: Option<Arc<NativeRequest>>,
     /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
     /// ordinary HTTP requests.
@@ -59,11 +59,12 @@ pub struct Call {
     pub media: Option<Arc<Media>>,
 }
 
-/// A Responses HTTP request that a Codex credential may serve on the native route
-/// (`docs/codex/CONTRACT.md` "Native HTTP route"). It holds the client's body, headers
-/// and route path before any rewrite (the Codex-client preparation, compact's `stream`
-/// deletion, plugin before-auth interceptors); other providers keep receiving the
-/// rewritten [`Call`].
+/// A Responses request that a Codex credential may serve on a native route
+/// (`docs/codex/CONTRACT.md` "Native HTTP route" and "Native WebSocket route"). It holds
+/// the client's body (a WebSocket turn's frame), headers and route path before any
+/// rewrite (the Codex-client preparation, compact's `stream` deletion, the WebSocket
+/// transcript and tool handling, plugin before-auth interceptors); other providers keep
+/// receiving the rewritten [`Call`].
 /// Each attempt records whether it ran natively, so the route and the response hooks
 /// treat the answer accordingly: the last attempt is the one that answered.
 pub struct NativeRequest {
@@ -781,16 +782,18 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
     }
 }
 
-/// Whether a native Codex attempt is possible for `call`: a Responses HTTP request
+/// Whether a native Codex attempt is possible for `call`: a Responses request
 /// (`Call::native`) whose selectable credentials for the model include a built-in Codex
-/// credential on a native profile without a plugin executor. Records the answer on the
-/// request. Under Home the pool is remote and unknown, so every Responses HTTP request
-/// counts; its non-native attempts still receive the deferred before-auth result.
+/// credential on a native profile without a plugin executor. A WebSocket turn also needs
+/// a `response.create` frame and a credential with `websockets`. Records the answer on
+/// the request. Under Home the pool is remote and unknown, so every such request counts;
+/// its non-native attempts still receive the deferred before-auth result.
 fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<String>, String)) -> bool {
     let Some(native) = &call.native else {
         return false;
     };
-    let eligible = call.turn.is_none()
+    let turn = call.turn.is_some();
+    let eligible = (!turn || cpa_exec::codex::CodexExecutor::native_ws_frame(&native.body))
         && call.media.is_none()
         && call.operation == Operation::Generate
         // Under Home the pool is remote and `providers` is just `home`: any Responses
@@ -810,6 +813,7 @@ fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<Str
                     && c.provider.trim().eq_ignore_ascii_case("codex")
                     && admit(c).is_some()
                     && cpa_exec::codex::CodexExecutor::native_profile(c)
+                    && (!turn || cpa_exec::codex::CodexExecutor::upstream_websocket(c))
                     && rt.plugin_runtime().executor(&rt.for_executor(c), &cfg).is_none()
             })
         });
@@ -2292,16 +2296,19 @@ async fn attempt(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
-        // The native Codex HTTP route (#23): the client's own bytes, and no request hook.
-        let native = call.native.as_ref().filter(|_| {
-            call.turn.is_none()
-                && call.media.is_none()
+        // The native Codex HTTP (#23) and WebSocket (#24) routes: the client's own bytes,
+        // and no request hook.
+        let native = call.native.as_ref().filter(|request| {
+            call.media.is_none()
                 && lease.credential.provider.trim().eq_ignore_ascii_case("codex")
                 && rt
                     .plugin_runtime()
                     .executor(&rt.for_executor(&lease.credential), cfg)
                     .is_none()
-                && cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req)
+                && match call.turn {
+                    None => cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req),
+                    Some(_) => cpa_exec::codex::CodexExecutor::native_ws(&lease.credential, &req, &request.body),
+                }
         });
         if let Some(request) = &call.native {
             request.mark(native.is_some());

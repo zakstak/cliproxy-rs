@@ -1,6 +1,8 @@
 //! The native Codex HTTP route (#23, and the HTTP half of #25): a Responses body from a
 //! Responses client, sent over HTTP to a `chatgpt`, `api-key` or `compatible` profile
-//! (`docs/codex/CONTRACT.md` "Native HTTP route").
+//! (`docs/codex/CONTRACT.md` "Native HTTP route"). The predicates and request edits of
+//! the native WebSocket route (#24) live here too; its socket handling is in
+//! `codex_ws.rs` and `codex_duplex.rs` ("Native WebSocket route").
 //!
 //! The request goes upstream as the client sent it. The only edits are the contract's
 //! permitted transformations: the upstream `model` of an alias, and `stream: true` for a
@@ -84,23 +86,67 @@ enum Call {
     Compact,
 }
 
+/// Whether a WebSocket turn on `view` may take the native route (#24): an eligible
+/// request on a credential with `websockets: true` whose frame is a `response.create`,
+/// the one request frame the pinned client sends (`codex-api/src/common.rs:400-406`).
+/// That covers a first turn, a continuation with `previous_response_id`, a prewarm with
+/// `generate: false`, and a create the client sends while a response runs. The
+/// Go-defined `response.append` keeps the legacy path: no first-party or documented
+/// source defines it, so the proxy's own handling is all it has. The server decides
+/// with this ([`CodexExecutor::native_ws`]); `frame` is the client's frame.
+pub(crate) fn eligible_ws(view: &View<'_>, req: &ExecRequest, frame: &[u8]) -> Option<Profile> {
+    eligible(view, req).filter(|_| view.websockets() && creates(frame))
+}
+
+/// Whether the executor serves a WebSocket turn natively, as [`route`] does for HTTP.
+pub(crate) fn route_ws(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
+    eligible_ws(view, req, &req.body).filter(|_| !req.stream_payloads)
+}
+
+/// Whether `frame` is a `response.create`. A frame the request boundary refuses counts
+/// too, so that the boundary rejects it on the native route instead of the legacy path
+/// rewriting it.
+pub(crate) fn creates(frame: &[u8]) -> bool {
+    match CodexBody::parse(frame) {
+        Ok(body) => body.get("type").and_then(|t| t.text()).as_deref() == Some("response.create"),
+        Err(_) => true,
+    }
+}
+
+/// The upstream model of a native request: the routed model, trimmed. A thinking suffix
+/// has no native meaning, so it is refused rather than turned into body fields.
+pub(crate) fn upstream_model(req: &ExecRequest) -> Result<String, ExecError> {
+    let suffix = cpa_common::thinking::parse_suffix(&req.model);
+    if suffix.has_suffix {
+        return Err(ExecError::local(
+            400,
+            FailureScope::Request,
+            format!(
+                "model suffix `({})` is not supported on native Codex Responses requests; set `reasoning` in the request body, or route an alias to a model without a suffix",
+                suffix.raw_suffix
+            ),
+        ));
+    }
+    Ok(req.model.trim().to_owned())
+}
+
+/// `frame` with `model` routed to `model`: the contract's one permitted request edit
+/// besides the buffered `stream` adaptation. The bytes are shared when the model
+/// already matches.
+pub(crate) fn routed(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
+    let body = CodexBody::parse(frame)?;
+    if body.get("model").and_then(|m| m.text()).as_deref() == Some(model) {
+        return Ok(frame.clone());
+    }
+    let quoted = serde_json::to_string(model).unwrap_or_default();
+    Ok(Bytes::from(body.with_member("model", &quoted)))
+}
+
 /// The upstream body: the client's bytes with only the permitted edits.
 fn upstream_body(req: &ExecRequest, profile: Profile, call: Call, model: &str) -> Result<Bytes, ExecError> {
-    let body = CodexBody::parse(&req.body)?;
-    let mut bytes = req.body.clone();
-    if body.get("model").and_then(|m| m.text()).as_deref() != Some(model) {
-        let quoted = serde_json::to_string(model).unwrap_or_default();
-        bytes = Bytes::from(body.with_member("model", &quoted));
-    }
+    let mut bytes = routed(&req.body, model)?;
     if call == Call::Buffered && profile == Profile::Chatgpt {
-        // Re-read only when the model edit produced new bytes.
-        let edited;
-        let current = if bytes.as_ptr() == req.body.as_ptr() {
-            &body
-        } else {
-            edited = CodexBody::parse(&bytes)?;
-            &edited
-        };
+        let current = CodexBody::parse(&bytes)?;
         let streamed =
             (current.get("stream").map(|m| m.kind) != Some(Kind::True)).then(|| current.with_member("stream", "true"));
         if let Some(streamed) = streamed {
@@ -131,18 +177,7 @@ impl CodexExecutor {
             (_, true) => Call::Stream,
             (_, false) => Call::Buffered,
         };
-        let suffix = cpa_common::thinking::parse_suffix(&req.model);
-        if suffix.has_suffix {
-            return Err(ExecError::local(
-                400,
-                FailureScope::Request,
-                format!(
-                    "model suffix `({})` is not supported on native Codex Responses requests; set `reasoning` in the request body, or route an alias to a model without a suffix",
-                    suffix.raw_suffix
-                ),
-            ));
-        }
-        let model = req.model.trim().to_owned();
+        let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
         // The body passed the boundary, so this never fails.
         let text = std::str::from_utf8(&body)
