@@ -115,7 +115,6 @@ impl CodexExecutor {
         let cache = request::session_uuid(&req, None);
         // No input-ID rewrite or payload rule either (#27): the body is the client's
         // Images request with only its model and `stream` routed.
-        let body = Bytes::from(body);
         // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
         let mut client = req.headers.clone();
         client.remove(http::header::USER_AGENT);
