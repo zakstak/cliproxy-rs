@@ -17,6 +17,8 @@ use regex::Regex;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+mod forward_port;
+
 #[derive(Deserialize)]
 struct Fixture {
     config: String,
@@ -260,12 +262,14 @@ async fn media_routes_match_go() {
         .expect("speech fixture lists the catalog")
         .response;
     let speech_entries = &catalog[catalog.find(r#"{"id":"grok-tts""#).expect("grok-tts listed")..catalog.len() - 2];
+    // The supported-model error lists GPT Image 2.6, a forward port past the recording
+    // (docs/DIFFERENCES-FROM-GO.md).
     let mut failures = replay("media", &media, |s| {
         if s.name.starts_with("models_grok_shell") {
             s.response
                 .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
         } else {
-            s.response.clone()
+            forward_port::gpt_image_26::error_message(&s.response)
         }
     })
     .await;
@@ -389,6 +393,13 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         let framing = ADDON_FRAMING.contains(&s.name.as_str());
         let compare_body = !STATUS_ONLY.contains(&s.name.as_str()) && !framing;
         let mut want_headers = s.response_headers.clone();
+        let want = expected(s);
+        // A body adjusted from Go's recording keeps Go's framing for the adjusted bytes.
+        if want != s.response
+            && let Some(length) = want_headers.get_mut("Content-Length")
+        {
+            *length = want.len().to_string();
+        }
         if !compare_body {
             headers.remove("Content-Length");
             want_headers.remove("Content-Length");
@@ -396,7 +407,6 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         if headers != want_headers {
             diffs.push(format!("headers:\n  go   {:?}\n  rust {headers:?}", s.response_headers));
         }
-        let want = expected(s);
         if compare_body && (response != want || response_b64 != s.response_b64) {
             diffs.push(format!("body:\n  go   {want}\n  rust {response}"));
         }

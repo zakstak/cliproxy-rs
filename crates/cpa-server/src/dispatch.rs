@@ -404,12 +404,14 @@ fn check_route_only(base: &str, call: &Call) -> Result<(), RunError> {
 /// Go `isXAISpeechOnlyModel`.
 const SPEECH_ONLY: [&str; 2] = ["grok-tts", "grok-voice-tts-1.0"];
 
-const IMAGE_ONLY: [&str; 8] = [
+const IMAGE_ONLY: [&str; 10] = [
     "gpt-image-1.5",
     "gpt-image-2",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
     "grok-imagine-image",
     "grok-imagine-image-quality",
     "grok-imagine-image-2.0",

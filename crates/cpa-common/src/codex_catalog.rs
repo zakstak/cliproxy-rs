@@ -717,6 +717,8 @@ fn image_or_video(id: &str) -> bool {
             | "gpt-image-2.5-flare"
             | "gpt-image-2.5-sunburst"
             | "gpt-image-2.5"
+            | "gpt-image-2.6-flare"
+            | "gpt-image-2.6-sunburst"
             | "grok-imagine-image"
             | "grok-imagine-image-2.0"
             | "grok-imagine-video"

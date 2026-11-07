@@ -18,6 +18,8 @@ use http_body::{Frame, SizeHint};
 use serde_json::Value;
 use tower::ServiceExt as _;
 
+mod forward_port;
+
 /// The client sends this many bytes per frame.
 const FRAME: usize = 16;
 
@@ -150,7 +152,10 @@ async fn body_limit_answers_match_go() {
         let want = (
             case["status"].as_u64().unwrap() as u16,
             case["content_type"].as_str().unwrap().to_owned(),
-            normalize(case["response"].as_str().unwrap()),
+            // GPT Image 2.6 is a forward port past the recording (docs/DIFFERENCES-FROM-GO.md).
+            normalize(&forward_port::gpt_image_26::error_message(
+                case["response"].as_str().unwrap(),
+            )),
         );
         // Handlers dd7b4334 left alone read their body through axum's extractor, whose
         // failure is a plain-text 400 where gin's handlers write their own JSON 400

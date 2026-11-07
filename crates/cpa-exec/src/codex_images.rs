@@ -36,12 +36,14 @@ const MAIN_MODEL: &str = "gpt-5.4-mini";
 /// `codexDefaultImageToolModel`.
 const DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
 /// Models the backend serves on its own Images endpoints (`codexIsDirectOpenAIImageModel`).
-const DIRECT_MODELS: [&str; 5] = [
+const DIRECT_MODELS: [&str; 7] = [
     "gpt-image-1.5",
     "gpt-image-2",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
 ];
 /// The Images API's source format name in payload rules and thinking.
 const SOURCE: &str = "openai-image";
@@ -1112,5 +1114,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Go `TestCodexExecutorDirectOpenAIImage25Models`, with the GPT Image 2.6 rows of
+    /// CLIProxyAPI PR #7261 (docs/DIFFERENCES-FROM-GO.md): each model, prefixed or not,
+    /// takes the direct Images route and goes upstream without its prefix and suffix. The
+    /// bare `gpt-image-2.6` is no direct model and keeps the Responses image tool.
+    #[test]
+    fn gpt_image_25_and_26_are_direct_models() {
+        let plain = Settings::default();
+        let form: &[u8] = b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--b--\r\n";
+        for base in [
+            "gpt-image-2.5",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+            "gpt-image-2.6-flare",
+            "gpt-image-2.6-sunburst",
+        ] {
+            for model in [
+                base.to_owned(),
+                format!("codex/{base}"),
+                format!("codex/{base}(high)"),
+                base.go_upper(),
+            ] {
+                // The request helper borrows a static body.
+                let json: &'static [u8] = serde_json::json!({"model": model, "prompt": "x"})
+                    .to_string()
+                    .into_bytes()
+                    .leak();
+                for body in [json, form] {
+                    assert_eq!(
+                        direct_model(&request(&model, &model, body), &plain).as_deref(),
+                        Some(base),
+                        "{model}"
+                    );
+                }
+            }
+        }
+        let json: &[u8] = br#"{"model":"gpt-image-2.6","prompt":"x"}"#;
+        assert_eq!(
+            direct_model(&request("gpt-image-2.6", "gpt-image-2.6", json), &plain),
+            None
+        );
     }
 }
