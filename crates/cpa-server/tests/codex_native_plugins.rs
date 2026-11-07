@@ -29,6 +29,9 @@ fn b64(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text)
 }
 
+/// Builds extra credentials from the Codex upstream's URL.
+type Extra = Box<dyn Fn(&str) -> Vec<cpa_core::credential::Credential>>;
+
 /// How [`Fixture::build`] sets up a proxy. `providers` is the YAML under `api-keys:`, with
 /// `{codex}` and `{control}` standing for the two capture upstreams.
 struct Setup<'a> {
@@ -37,7 +40,7 @@ struct Setup<'a> {
     routing: &'a str,
     caps: &'a str,
     /// Credentials beyond the config's, given the Codex upstream's URL.
-    extra: Box<dyn Fn(&str) -> Vec<cpa_core::credential::Credential>>,
+    extra: Extra,
     /// Install after-auth, response and chunk hooks that rewrite whenever they run.
     rewriting_hooks: bool,
 }
