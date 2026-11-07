@@ -446,6 +446,10 @@ Leading events are held under `stream-bootstrap-buffering`, but they are never c
 
 - An upstream `response.failed` or status-less `error` event reaches the client as it
   arrived. The connection then closes without another frame.
+- An account failure (classified 401, 403 or 429) keeps the classified delivery: the
+  subscription-limit event for an official Codex client (#6), or a silent close. Such an
+  event can carry the pooled account's identifiers and tokens, which the #6 allowlist
+  keeps from the client.
 - Two exceptions stay. A Codex client gets the status-less context-window `error` as
   `response.failed` (#5). An empty `response.incomplete` before any content is a
   request-scoped 502 (#7).

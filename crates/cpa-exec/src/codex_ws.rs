@@ -1112,10 +1112,14 @@ impl Turn {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
             // A native turn delivers the upstream's failure event byte for byte, unless it
-            // is the context-window `error` a Codex client gets as `response.failed` (#5).
+            // is the context-window `error` a Codex client gets as `response.failed` (#5),
+            // or an account failure (401, 403, 429). Such an event can carry the pooled
+            // account's identifiers, so it keeps the classified close and the allowlisted
+            // subscription-limit event (#6).
+            let account = matches!(error.status, 401 | 403 | 429);
             let event = self
                 .preserved_event(payload)
-                .or_else(|| self.passthrough.then(|| Bytes::from(text.clone())));
+                .or_else(|| (self.passthrough && !account).then(|| Bytes::from(text.clone())));
             return Frame::Failed {
                 error,
                 overload: response::is_overload(&body),
