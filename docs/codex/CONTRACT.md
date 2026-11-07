@@ -141,6 +141,8 @@ discretionary mutation, and a migrated route must not perform it.
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
+| Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
+| Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket | Native WebSocket turns (#3) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:198-222`). `openai-model` is left out when the routed model differs from the client's. No other header travels. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
@@ -217,8 +219,11 @@ content. Any other member, at any depth, passes as long as it is valid JSON.
 The Codex executor applies the boundary at its entry points, `CodexExecutor::execute`
 and `CodexExecutor::execute_in_session`, to every body whose source and response formats
 are both Responses: HTTP streaming, buffered, compact and WebSocket turns. A refused body
-fails there, before translation and before any upstream send. A body that passes still
-goes through the current request rewrites until #23 and #24 migrate its route. The
+fails there, before translation and before any upstream send. On the native HTTP and
+WebSocket routes a body that passes goes upstream unchanged except for the permitted
+transformations; on the paths that have not migrated it still goes through the request
+rewrites. A native WebSocket connection also reads each later client frame through the
+boundary. The
 boundary does not judge bodies from other client formats, which reach Codex through a
 cross-API translator (#27).
 
@@ -229,9 +234,9 @@ never reaches the Codex boundary.
 
 ### Remaining Go JSON callers on the Codex path
 
-The native HTTP route reads request bodies and response events only through the
-boundary. The callers below still use the Go helpers on the paths that have not migrated:
-the `siwc` profile, WebSocket turns and translated requests. Each either rewrites a
+The native HTTP and WebSocket routes read request bodies only through the boundary. The
+callers below still use the Go helpers on the paths that have not migrated: the `siwc`
+profile, the WebSocket HTTP fallback and `response.append`, and translated requests. Each either rewrites a
 payload, which its owning issue deletes, or reads a response, which #25 owns. The owning
 PR moves each surviving read to the boundary and deletes the Go-path code it replaces.
 `crates/cpa-common/src/json.rs` and the vendored gjson stay while other providers use
@@ -239,19 +244,19 @@ them.
 
 | Code | What it parses | Owner |
 | --- | --- | --- |
-| `crates/cpa-exec/src/codex_request.rs` `shape` and its helpers (`ensure_web_search_for_history`, `ensure_image_tool`, `normalize_parallel_tool_calls`, `sanitize_reasoning`, `normalize_tool_schemas`, `sanitize_input_ids`, `siwc_body`, `prompt_cache`, `is_lite`) | Request fields, for rewrites. The native HTTP route no longer calls them | #24 (WebSocket), #27 (translated), and the `siwc` profile once a source covers it |
+| `crates/cpa-exec/src/codex_request.rs` `shape` and its helpers (`ensure_web_search_for_history`, `ensure_image_tool`, `normalize_parallel_tool_calls`, `sanitize_reasoning`, `normalize_tool_schemas`, `sanitize_input_ids`, `siwc_body`, `prompt_cache`, `is_lite`) | Request fields, for rewrites. The native HTTP and WebSocket routes no longer call them | The WebSocket HTTP fallback and `response.append` (#28 decides both), #27 (translated), and the `siwc` profile once a source covers it |
 | `crates/cpa-exec/src/codex_request.rs` `routing_hint` | `service_tier` for `x-codex-routing-hint` | #26 |
 | `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits, used by the callers above | Deleted with its last caller, at the latest #28 |
-| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. The native HTTP route no longer calls it | #24, and the `siwc` profile |
+| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. The native routes no longer call it | The `siwc` profile, the WebSocket HTTP fallback, #28 |
 | `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs`, `codex_gemini.rs`, `codex_interactions.rs` | Cross-API translation | #27 |
-| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration. A native HTTP attempt receives the client's bytes instead, and nothing is restored | #24 (WebSocket), #28 for the settings; other providers keep the rewrite at their boundary |
+| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration. A native HTTP or WebSocket attempt receives the client's bytes instead, and nothing is restored | #28 for the settings; other providers and the WebSocket HTTP fallback keep the rewrite |
 | `crates/cpa-exec/src/codex_replay.rs` | Reasoning history replay | #27 |
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter | #27, coordinated with #15 |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count | #27 |
-| `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots. The native route passes the routed model to `open_for` instead | #24, #27 |
-| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native route reuses `terminal_failure`, `bufferable`, `meaningful_delta` and `empty_incomplete` to classify a copy of each event | #25 (WebSocket half), #28 |
-| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | WebSocket turns, continuation and steering frames | #24 |
-| `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers | #24 |
+| `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots. The native route passes the routed model to `open_for` instead | #27 |
+| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. Both native routes reuse `terminal_failure`, `bufferable`, `meaningful_delta` and `empty_incomplete` to classify a copy of each event; the WebSocket route's `ws_error` still rebuilds a status frame for failover and final delivery | #28, and the remaining WebSocket failure delivery (see [Native WebSocket route](#native-websocket-route)) |
+| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. A native frame is checked with `CodexBody` and forwarded; `gjson` still reads frame types, response IDs and model names for routing and bookkeeping | Legacy frames: #28. The bookkeeping reads stay |
+| `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A native attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the fallback frame | xAI and the HTTP fallback keep them; #28 |
 | `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A native attempt gets the client's bytes from `NativeRequest` instead | Other providers keep the rewrite; #28 |
 | `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers keep it |
 | `crates/cpa-exec/src/codex_live.rs`, `codex.rs` `alpha_search`, `crates/cpa-server/src/codex_alpha.rs`, `codex_models.rs`, `crates/cpa-common/src/codex_catalog.rs` | Realtime calls, Alpha Search and model catalogs | Outside this contract; they keep Go behaviour |
@@ -269,7 +274,8 @@ A request takes it when all of these hold:
 - both the client and response formats are Responses, and the request is a generation.
 
 The `siwc` profile keeps the legacy path, because no first-party source covers it. WebSocket
-turns keep it until #24, and translated requests keep it until #27.
+turns take the [native WebSocket route](#native-websocket-route), and translated requests
+keep the legacy path until #27.
 
 The request goes upstream as the client sent it, with only the permitted
 transformations: the routed `model`, and `stream: true` for a buffered client on
@@ -347,6 +353,174 @@ none fails at load. #28 rejects each setting once its last path migrates.
 | `upstream.codex.model-level-cooling` | Applied to failure classification |
 | `oauth.providers.codex.header-defaults`, `disable-codex-cloaking` and other header settings | Unchanged; #26 owns headers |
 
+## Native WebSocket route
+
+[#24](https://github.com/zakstak/cliproxy-rs/issues/24) and the WebSocket half of
+[#25](https://github.com/zakstak/cliproxy-rs/issues/25) put the following route in place.
+A turn of the Responses WebSocket (`GET /v1/responses` and its aliases) takes it when all
+of these hold:
+
+- the client frame is a `response.create`: a first turn, a continuation with
+  `previous_response_id`, a prewarm with `generate: false`, or a create the client sends
+  while a response runs;
+- the selected credential is a Codex credential served by the built-in executor, on the
+  `chatgpt`, `api-key` or `compatible` profile, with `websockets: true`.
+
+These turns do not take it:
+
+- A `siwc`, plugin-executor or other-provider credential, as on HTTP.
+- A Codex credential without `websockets`. Its turns run over HTTP, which is the
+  separate conversion described under [HTTP fallback](#websocket-http-fallback).
+- `response.append`. This frame comes from Go. No first-party or documented source
+  defines it, so it keeps Go's request handling: the parent response by default,
+  inherited `instructions`, the legacy shaping and payload rules. On a native connection
+  its events still reach the client unchanged, like every other event there.
+
+### Requests
+
+The frame goes upstream as the client sent it, and only `model` changes: the routed
+model replaces the value in place, or is added as the first member when the frame has
+none. The server keeps the client's frame, headers and route path in
+`dispatch::NativeRequest`. It does this before the transcript normalization
+(`websocket_requests::normalize`, and `normalize_passthrough`, which adds
+`stream: true`), the multi-agent and orphan-delegation preparation, the tool-call repair
+(`websocket_tools::prepare_fallback_turn`) and the plugin before-auth interceptors. Those
+steps now build only the frame for a fallback attempt. On a native turn the executor
+skips shaping, payload rules, the prompt-cache key, reasoning replay, ID sanitizing,
+namespace renames, Sign in with ChatGPT rules and the `type` re-tag. The prompt-cache
+identity goes into the handshake headers only, and #26 owns those headers.
+
+Plugin before-auth output follows the HTTP rule. A native attempt is possible when the
+frame is a `response.create` and the selectable credentials include a built-in Codex
+credential on a native profile with `websockets` and without a plugin executor. Under
+Home, every `response.create` counts. When a native attempt is possible, the before-auth
+result reaches only the attempts that are not native. Plugin after-auth, response and
+chunk interceptors never run on a native turn. WebSocket response observers are passive
+and still receive every frame.
+
+When the proxy's `codex.response-steering` setting is on, the connection keeps the
+upstream socket after its first response. The proxy then reads each later client frame
+through the [request boundary](#request-boundary). A frame that the boundary refuses gets
+a local `error` event, and the connection stays open.
+
+- A later `response.create` goes upstream with only `model` routed, as above.
+- A create for another model cannot use this socket, so the connection closes with
+  1012, the replay close.
+- `response.steer` goes upstream as the client wrote it, without payload rules. The
+  pinned client never sends this frame. OpenAI documents it for the GPT-6 family on the
+  API, and nothing documents it for the ChatGPT backend. The upstream decides whether to
+  accept it. The proxy adds nothing to it and makes no claim that it works.
+
+The pinned client steers with a different sequence. It sends `response.interrupt` for
+the running response, reads the acknowledgement and the interrupted
+`response.incomplete`, and then sends a new `response.create`
+(`responses_websocket.rs:310-325` and 824-839). The proxy forwards each of these frames
+unchanged, with or without `codex.response-steering`.
+
+A prewarm goes upstream, and its continuation stays on the same socket. The proxy never
+sends a prewarm or any other request of its own, so it sends no inference keepalive.
+
+### Socket and account ownership
+
+One client connection uses one upstream socket on one credential. A continuation runs
+only on the session's current socket. When it cannot, the connection closes with 1012,
+and the continuation never moves to another socket or account. When the upstream socket
+is lost, the client connection closes, and the client recovers on its own. On a new
+connection, a `previous_response_id` from the old one is refused locally with
+`previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
+bounded:
+
+- at most 16 outstanding creates;
+- a write queue of 16 frames;
+- 16 local items waiting for the client.
+
+The proxy reads client frames only while the write queue has room, so a stalled
+upstream backpressures the client. A full queue ends the connection with a local error.
+
+### Responses and failures
+
+The client receives each upstream text frame as it arrived. The proxy repairs no output,
+renames no `response.done`, adds no usage details, restores no namespace and reconciles
+no tool calls. Usage, capture, quota observation and failure classification read a copy.
+Leading events are held under `stream-bootstrap-buffering`, but they are never changed.
+
+- An upstream `response.failed` or status-less `error` event reaches the client as it
+  arrived. The connection then closes without another frame.
+- Two exceptions stay. A Codex client gets the status-less context-window `error` as
+  `response.failed` (#5). An empty `response.incomplete` before any content is a
+  request-scoped 502 (#7).
+- A wrapped `error` frame with a status (Go's status frame) and an overload failure keep
+  their classification and failover before anything is delivered. The final delivery of
+  such a failure is unchanged: a close code, the subscription-limit event for an official
+  Codex client (#6), a rebuilt request-fault `error` event, or a silent close.
+  Forwarding that frame byte for byte is remaining #25 work, because failover and credential
+  health depend on the rebuilt status.
+- On a `codex.response-steering` connection, a failure after the first response is an
+  event that the client may correct, as before.
+- The interrupt regressions stay. An interrupt acknowledgement that arrives after the
+  terminal event is still delivered. A late interrupt does not poison the next turn. An
+  interrupted `response.incomplete` passes unchanged.
+
+### Handshake metadata
+
+The client receives `x-codex-turn-state` and `openai-model` from the upstream handshake
+as a `response.metadata` event. The event comes before the first event of each turn that
+opened a socket, including a send retried on a fresh socket.
+[Permitted transformations](#permitted-transformations) lists this edit. Metadata that
+the upstream puts in an event (a `headers` member) reaches the client inside that event,
+unchanged, on every turn.
+
+The source sets two limits on this. The pinned client reads `x-reasoning-included` only
+from the handshake of a socket it opened itself (`responses_websocket.rs:617`). It also
+repeats `ServerModel` and `ServerReasoningIncluded` from that handshake on every request
+(lines 302-308). The proxy's downstream 101 carries neither header. No first-party
+mechanism sets them after the upgrade, so the proxy invents no per-turn event. A turn on
+a reused socket gets no metadata event, and reasoning-included metadata is not
+delivered.
+
+### WebSocket HTTP fallback
+
+A Codex credential without `websockets` serves the WebSocket route over HTTP. This is
+an explicit conversion, separate from the native route, and it keeps the earlier rules.
+The proxy merges the transcript of each turn, repairs tool calls, shapes the body, runs
+payload rules and posts an HTTP Responses request. A prewarm on such a credential is
+answered locally with a `resp_prewarm_` response that no provider produced, and its
+follow-up merges the warm-up input. A `previous_response_id` on such a connection is
+answered from the stored transcript, as in Go. A continuation of state held on an upstream
+socket cannot move to this transport, so it closes with 1012.
+
+An upstream handshake that answers 426 fails the turn with that status. No proxy-side
+HTTP conversion follows. The pinned client's own HTTP fallback runs only for its own
+upgrade, and the proxy's downstream upgrade has already succeeded.
+
+### Settings
+
+The settings below shape requests on the legacy paths. This table shows their effect on
+the native WebSocket route. None of them fails at load yet, because the HTTP fallback,
+`response.append`, `siwc` and translated paths still use them.
+
+| Setting | Native WebSocket route |
+| --- | --- |
+| `payload.default`, `payload.override`, `payload.filter` and their raw forms | Not applied to native creates or steers |
+| `client.codex.optimize-multi-agent-v2`, `upstream.codex.orphan-delegation-compatibility` | Not applied; the server prepares only the fallback frame |
+| `codex.response-steering` | Applied: it chooses the duplex transport, which comes from Go. Native frames inside it stay unchanged |
+| `upstream.codex.stream-bootstrap-buffering` and `stream-bootstrap-timeout` | Applied: leading events are held, never changed |
+| `upstream.codex.model-level-cooling` | Applied to failure classification |
+| `requests.streaming.keepalive-seconds` | Applied as ping control frames to the client |
+| A model alias with a thinking suffix | Refused with a 400 |
+| Alias `force-mapping` | Not applied |
+| Header settings | Unchanged; #26 owns headers |
+
+#28 owns the remaining obligations for these settings:
+
+- Reject or scope `payload.*`, `optimize-multi-agent-v2` and
+  `orphan-delegation-compatibility` once the HTTP fallback, `response.append`, `siwc` and
+  translated paths no longer use them.
+- Decide whether `codex.response-steering` and `response.append` stay. No first-party or
+  documented source covers either on `chatgpt`.
+- Decide whether the WebSocket HTTP fallback stays, and how its conversion is
+  qualified.
+
 ## Identity and headers
 
 The pinned client sends these request headers. The list is the evidence that
@@ -418,13 +592,15 @@ Passive accounting reads a copy and changes nothing.
   another socket. When the upstream socket is gone, the client sees the failure and
   recovers on its own.
 - The proxy forwards a client's prewarm and never sends its own. It sends no inference
-  keepalive.
+  keepalive. A prewarm on a credential without `websockets` is the
+  [HTTP fallback's](#websocket-http-fallback) local answer, labelled as such.
 - The proxy forwards `response.interrupt` and its acknowledgements unchanged.
-- A 426 handshake reaches the client as a 426, so the client's own fallback runs. Any
-  proxy-side HTTP fallback is an explicit, separate conversion that
-  [#24](https://github.com/zakstak/cliproxy-rs/issues/24) defines.
-- `response.steer`, `response.append` and the proxy's steering queue stay as they are
-  until #24 decides them. No PR may describe them as first-party behaviour.
+- A 426 handshake fails the turn with that status. The only proxy-side HTTP conversion
+  is the [WebSocket HTTP fallback](#websocket-http-fallback) for credentials without
+  `websockets`.
+- [Native WebSocket route](#native-websocket-route) states the handling of
+  `response.steer`, `response.append` and the steering queue. No PR may describe any of
+  them as first-party behaviour.
 
 ## Known deviations at the baseline
 
@@ -438,7 +614,7 @@ inventory. #22 and #28 own the full inventory.
 | `crates/cpa-exec/src/codex_request.rs:20-21` sends a fixed `codex-tui` macOS and iTerm identity | #26 |
 | `crates/cpa-exec/src/codex.rs` serves `chatgpt.com` through a Chrome TLS profile | #26 |
 | The Codex JSON paths read through gjson and Go coercion helpers. [Request boundary](#request-boundary) lists every caller and its owner | #22 to #27 |
-| Response steering frames (`response.steer`, `response.append`) and the duplex queue follow Go `codex_websockets_duplex.go` | #24 |
+| Response steering frames (`response.steer`, `response.append`) and the duplex queue follow Go `codex_websockets_duplex.go` | #24 forwards `response.steer` unchanged on native connections and keeps `response.append` and the queue; #28 decides whether they stay |
 
 ## Existing issue status
 
@@ -448,8 +624,10 @@ regression tests.
 - #1, #2, #4, #5, #6 and #8 are closed. Their tests are baselines, not proof that the
   migration is done.
 - #7 is fixed by the executor regression tests in PR #14. The issue is still open.
-- #3 is partly done by PR #16. Model metadata on a reused socket is unfinished. The
-  pinned client reads `x-reasoning-included` only from the handshake.
+- #3 is partly done by PR #16. The native WebSocket route covers the remaining part that
+  a source supports: event metadata passes unchanged, and a reconnected socket's handshake
+  is reported. Metadata on a reused socket and `x-reasoning-included` are limits that
+  the source sets. [Handshake metadata](#handshake-metadata) explains both.
 
 ## Implementation order
 
