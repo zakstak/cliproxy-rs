@@ -21,11 +21,27 @@ pub static PAIR: Registered = registered!(
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     let _ = ctx;
-    Ok(convert(body))
+    Ok(convert(body, ResponsesClient::Translated))
 }
 
-/// ConvertOpenAIResponsesRequestToCodex.
-pub(crate) fn convert(body: &[u8]) -> Vec<u8> {
+/// The client that built a Responses request. It decides whether the conversion forces
+/// `parallel_tool_calls` and rebuilds `include`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesClient {
+    /// Any Responses client other than official Codex. Go's rules apply:
+    /// `parallel_tool_calls` becomes `true` and `include` is rebuilt.
+    Translated,
+    /// An official Codex client. Codex sets `parallel_tool_calls` and `include` for the
+    /// OpenAI upstream it expects, so `parallel_tool_calls` keeps the client's value or
+    /// stays absent. `output_replay` also keeps `output.encrypted_content` in `include`.
+    /// Go v8.0.35 applies the `Translated` rules to every client
+    /// (docs/DIFFERENCES-FROM-GO.md).
+    NativeCodex { output_replay: bool },
+}
+
+/// ConvertOpenAIResponsesRequestToCodex, with the changes for a native Codex client
+/// ([`ResponsesClient`]).
+pub(crate) fn convert(body: &[u8], client: ResponsesClient) -> Vec<u8> {
     let mut raw = body.to_vec();
     let input = gj::get(&raw, "input");
     if input.kind == Kind::String {
@@ -35,8 +51,14 @@ pub(crate) fn convert(body: &[u8]) -> Vec<u8> {
     }
     set_required_bool(&mut raw, "stream", true);
     set_required_bool(&mut raw, "store", false);
-    set_required_bool(&mut raw, "parallel_tool_calls", true);
-    set_required_include(&mut raw);
+    let output_replay = match client {
+        ResponsesClient::Translated => {
+            set_required_bool(&mut raw, "parallel_tool_calls", true);
+            false
+        }
+        ResponsesClient::NativeCodex { output_replay } => output_replay,
+    };
+    set_required_include(&mut raw, output_replay);
     delete_fields(
         &mut raw,
         &["max_output_tokens", "max_completion_tokens", "temperature", "top_p"],
@@ -62,6 +84,9 @@ pub(crate) fn convert(body: &[u8]) -> Vec<u8> {
             delete_fields(&mut raw, &["service_tier"]);
         }
     }
+    // ponytail: native Codex loses its `prompt_cache_options` TTL here too. OpenAI's API
+    // documents the field, but no evidence shows that the ChatGPT Codex backend accepts
+    // it, and Go's SIWC rules reject it. Keep it per route once backend support is shown.
     delete_fields(
         &mut raw,
         &["truncation", "prompt_cache_options", "prompt_cache_retention"],
@@ -85,27 +110,40 @@ fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
 }
 
 /// Go `setCodexRequiredInclude`: `reasoning.encrypted_content`, plus
-/// `web_search_call.action.sources` when the client asked for it.
-fn set_required_include(raw: &mut Vec<u8>) {
-    const REASONING: &[u8] = b"reasoning.encrypted_content";
-    const SOURCES: &[u8] = b"web_search_call.action.sources";
+/// `web_search_call.action.sources` when the client asked for it. With `output_replay`,
+/// a requested `output.encrypted_content` follows them. An `include` that already has
+/// exactly those values in that order keeps its bytes. Every other value is dropped.
+fn set_required_include(raw: &mut Vec<u8>, output_replay: bool) {
+    const REASONING: &str = "reasoning.encrypted_content";
+    const SOURCES: &str = "web_search_call.action.sources";
+    const OUTPUT: &str = "output.encrypted_content";
     let current = gj::get(raw, "include");
-    let mut sources = false;
-    if current.is_array() {
-        let values = current.array();
-        let is = |i: usize, want: &[u8]| values[i].kind == Kind::String && &*values[i].bytes() == want;
-        sources = (0..values.len()).any(|i| is(i, SOURCES));
-        if (!sources && values.len() == 1 && is(0, REASONING))
-            || (sources && values.len() == 2 && is(0, REASONING) && is(1, SOURCES))
-        {
-            return;
-        }
-    }
-    let encoded = if sources {
-        r#"["reasoning.encrypted_content","web_search_call.action.sources"]"#
-    } else {
-        r#"["reasoning.encrypted_content"]"#
+    let values = if current.is_array() { current.array() } else { vec![] };
+    let requested = |want: &str| {
+        values
+            .iter()
+            .any(|v| v.kind == Kind::String && &*v.bytes() == want.as_bytes())
     };
+    let mut wanted = vec![REASONING];
+    if requested(SOURCES) {
+        wanted.push(SOURCES);
+    }
+    if output_replay && requested(OUTPUT) {
+        wanted.push(OUTPUT);
+    }
+    if current.is_array()
+        && values.len() == wanted.len()
+        && values
+            .iter()
+            .zip(&wanted)
+            .all(|(v, want)| v.kind == Kind::String && &*v.bytes() == want.as_bytes())
+    {
+        return;
+    }
+    let encoded = format!(
+        "[{}]",
+        wanted.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(",")
+    );
     gj::set_raw(raw, "include", encoded);
 }
 
@@ -407,12 +445,113 @@ mod tests {
                     r#"{{"model":"gpt-5.6","input":[{{"type":"message","role":"user","content":"hi"}}],"include":{include}}}"#
                 )
             };
-            let out = super::convert(body.as_bytes());
+            let out = super::convert(body.as_bytes(), super::ResponsesClient::Translated);
             assert_eq!(
                 crate::gj::get(&out, "include").raw.as_ref(),
                 want.as_bytes(),
                 "{include}"
             );
         }
+    }
+
+    const NATIVE: super::ResponsesClient = super::ResponsesClient::NativeCodex { output_replay: true };
+
+    /// The shape of a request from current Codex (core/src/client.rs `build_request`):
+    /// serde field order, `include` with output replay, and an explicit
+    /// `parallel_tool_calls`. Spacing marks bytes that a re-serialization would change.
+    fn codex_body(parallel: &str, include: &str) -> String {
+        format!(
+            r#"{{"model":"gpt-6.1-sol","instructions":"x","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]}}],"tools":[{{"type":"function","name":"f","parameters":{{"type":"object"}}}}],"tool_choice":"auto"{parallel},"reasoning":{{"effort":"high"}},"store":false,"stream":true{include},"prompt_cache_key":"k",  "text" : {{"verbosity":"low"}}}}"#
+        )
+    }
+
+    #[test]
+    fn native_codex_keeps_parallel_tool_calls_and_output_replay_bytes() {
+        let include = r#","include":["reasoning.encrypted_content","output.encrypted_content"]"#;
+        for parallel in [r#","parallel_tool_calls":false"#, r#","parallel_tool_calls":true"#, ""] {
+            let body = codex_body(parallel, include);
+            assert_eq!(
+                String::from_utf8(super::convert(body.as_bytes(), NATIVE)).unwrap(),
+                body,
+                "{parallel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn translated_clients_keep_gos_forced_fields() {
+        let include = r#","include":["reasoning.encrypted_content","output.encrypted_content"]"#;
+        for parallel in [r#","parallel_tool_calls":false"#, ""] {
+            let out = super::convert(
+                codex_body(parallel, include).as_bytes(),
+                super::ResponsesClient::Translated,
+            );
+            assert_eq!(crate::gj::get(&out, "parallel_tool_calls").raw.as_ref(), b"true");
+            assert_eq!(
+                crate::gj::get(&out, "include").raw.as_ref(),
+                br#"["reasoning.encrypted_content"]"#
+            );
+        }
+    }
+
+    #[test]
+    fn native_include_keeps_only_supported_values() {
+        let reasoning = r#"["reasoning.encrypted_content"]"#;
+        let replay = r#"["reasoning.encrypted_content","output.encrypted_content"]"#;
+        for (client, include, want) in [
+            // Without output replay (SIWC and compat upstreams), Go's include.
+            (
+                super::ResponsesClient::NativeCodex { output_replay: false },
+                replay,
+                reasoning,
+            ),
+            (NATIVE, "", reasoning),
+            (NATIVE, r#"["output.encrypted_content"]"#, replay),
+            (
+                NATIVE,
+                r#"["output.encrypted_content","reasoning.encrypted_content"]"#,
+                replay,
+            ),
+            (
+                NATIVE,
+                r#"["reasoning.encrypted_content","file_search_call.results","output.encrypted_content"]"#,
+                replay,
+            ),
+            (
+                NATIVE,
+                r#"["output.encrypted_content","web_search_call.action.sources"]"#,
+                r#"["reasoning.encrypted_content","web_search_call.action.sources","output.encrypted_content"]"#,
+            ),
+        ] {
+            let body = if include.is_empty() {
+                r#"{"model":"m","input":[]}"#.to_owned()
+            } else {
+                format!(r#"{{"model":"m","input":[],"include":{include}}}"#)
+            };
+            let out = super::convert(body.as_bytes(), client);
+            assert_eq!(
+                crate::gj::get(&out, "include").raw.as_ref(),
+                want.as_bytes(),
+                "{client:?} {include}"
+            );
+        }
+    }
+
+    /// The native path keeps every other Go rule, including the cache-option removal:
+    /// nothing shows that the ChatGPT Codex backend accepts `prompt_cache_options`.
+    #[test]
+    fn native_codex_still_drops_unsupported_fields() {
+        let body = br#"{"model":"m","input":"hi","parallel_tool_calls":false,"prompt_cache_options":{"ttl":"30m"},"prompt_cache_retention":"24h","max_output_tokens":5,"user":"u"}"#;
+        let out = super::convert(body, NATIVE);
+        for gone in [
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "max_output_tokens",
+            "user",
+        ] {
+            assert!(!crate::gj::get(&out, gone).exists(), "{gone}");
+        }
+        assert_eq!(crate::gj::get(&out, "parallel_tool_calls").raw.as_ref(), b"false");
+        assert_eq!(crate::gj::get(&out, "input.0.content.0.text").str(), "hi");
     }
 }

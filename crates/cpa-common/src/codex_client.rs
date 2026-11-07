@@ -90,6 +90,27 @@ pub fn is_codex_client_user_agent(user_agent: &str) -> bool {
         || ua.starts_with("codex_exec/")
 }
 
+/// Go `isCodexResponsesClientRequest`: an official Codex client by `User-Agent` or
+/// `originator`.
+pub fn is_codex_responses_client(headers: &HeaderMap) -> bool {
+    let get = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if is_codex_client_user_agent(&get("user-agent")) {
+        return true;
+    }
+    let originator = get("originator").go_lower();
+    matches!(originator.as_str(), "codex desktop" | "codex-tui" | "codex_cli_rs")
+        || ["codex desktop/", "codex-tui/", "codex_cli_rs/"]
+            .iter()
+            .any(|p| originator.starts_with(p))
+}
+
 /// Go `strings.EqualFold(value, ascii)` for an ASCII `ascii`: besides ASCII case, only
 /// U+017F (long s) and U+212A (Kelvin sign) fold onto ASCII letters.
 fn folds_to_ascii(value: &str, ascii: &str) -> bool {
