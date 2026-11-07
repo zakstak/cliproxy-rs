@@ -27,6 +27,11 @@
 //! the connection and, after the first `response.created`, takes the client's later frames
 //! (`response.steer`, more creates) from the connection's frame queue. That turn ends only
 //! with the connection.
+//!
+//! Handshake metadata: this 101 precedes the first request, which chooses the credential
+//! and the model, so the upstream socket's handshake comes later. A turn that opens a
+//! Codex socket passes its `x-codex-turn-state` and `openai-model` on as a
+//! `response.metadata` event before its first event (`handshake_metadata_event`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -584,6 +589,9 @@ fn session_auth(
 struct Started {
     first: Option<Bytes>,
     stream: ExecStream,
+    /// The serving attempt's upstream response headers: a Codex socket's handshake when
+    /// the attempt opened one, empty when it reused one.
+    headers: HeaderMap,
 }
 
 /// Per-turn facts the attempt and forward steps share.
@@ -595,6 +603,8 @@ struct TurnCtx {
     last_attempted: String,
     attempted_mode: Mode,
     preserve_output: bool,
+    /// The serving credential is a Codex credential on an upstream socket.
+    codex_socket: bool,
     tool_turn: Option<TurnCache>,
 }
 
@@ -876,6 +886,7 @@ impl Connection {
             last_attempted: self.pinned.clone(),
             attempted_mode: Mode::Http,
             preserve_output: false,
+            codex_socket: false,
             tool_turn: None,
         };
         let next_last_request = if native {
@@ -1098,12 +1109,14 @@ impl Connection {
             pinned_attempted: bool,
             mode: Mode,
             preserve_output: bool,
+            codex_socket: bool,
         }
         let selected = Arc::new(std::sync::Mutex::new(Selected {
             last: ctx.last_attempted.clone(),
             pinned_attempted: false,
             mode: ctx.attempted_mode,
             preserve_output: ctx.preserve_output,
+            codex_socket: ctx.codex_socket,
         }));
         self.duplex.store(false, Ordering::Release);
         self.replays.store(false, Ordering::Release);
@@ -1124,6 +1137,7 @@ impl Connection {
                 };
                 let codex = credential.provider.eq_ignore_ascii_case("codex");
                 s.preserve_output = native_request && codex;
+                s.codex_socket = codex && s.mode == Mode::Websocket;
                 // Shared since v8.0.35: API-key credentials steer too.
                 let full_duplex = steering && codex && s.mode == Mode::Websocket;
                 duplex.store(full_duplex, Ordering::Release);
@@ -1170,19 +1184,32 @@ impl Connection {
             ctx.pinned_attempted = s.pinned_attempted;
             ctx.attempted_mode = s.mode;
             ctx.preserve_output = s.preserve_output;
+            ctx.codex_socket = s.codex_socket;
         }
         match result? {
-            dispatch::Done::Stream { first, rest, .. } => Ok(Started { first, stream: rest }),
-            dispatch::Done::Buffered { body, .. } => Ok(Started {
+            dispatch::Done::Stream { headers, first, rest } => Ok(Started {
+                first,
+                stream: rest,
+                headers,
+            }),
+            dispatch::Done::Buffered { headers, body } => Ok(Started {
                 first: Some(body),
                 stream: futures_util::stream::empty().boxed(),
+                headers,
             }),
         }
     }
 
     /// `forwardResponsesWebsocket`.
     async fn forward(&self, socket: &mut Sink, started: Started, cfg: &Config, ctx: &mut TurnCtx) -> Forwarded {
-        let Started { first, stream } = started;
+        let Started { first, stream, headers } = started;
+        // Metadata from the handshake of the socket this turn opened, ahead of its first
+        // event. Only this turn gets it: a later turn on the same socket would receive a
+        // turn state that belongs to another turn.
+        let mut metadata = ctx
+            .codex_socket
+            .then(|| cpa_exec::codex::handshake_metadata_event(&headers))
+            .flatten();
         // `stream` completes its lease as it ends (dispatch).
         let mut stream = futures_util::stream::iter(first.map(Ok)).chain(stream).boxed();
         let keepalive = keepalive_interval(cfg);
@@ -1291,6 +1318,11 @@ impl Connection {
                     completed = true;
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
+                }
+                if let Some(metadata) = metadata.take()
+                    && !send_text(socket, metadata).await
+                {
+                    return Forwarded::End;
                 }
                 if !send_text(socket, payload).await {
                     return Forwarded::End;
