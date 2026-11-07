@@ -144,7 +144,7 @@ impl CodexExecutor {
         let body = Bytes::from(body);
         // `applyCodexDirectImageHeaders` drops the client's User-Agent; `image_headers`
         // never forwards it (the proxy builds every Images request).
-        let mut headers = request::image_headers(view, settings, &req.headers, model, cache.as_deref(), req.stream);
+        let mut headers = request::image_headers(view, &req.headers, model, cache.as_deref(), req.stream);
         if !content_type.is_empty()
             && let Ok(value) = http::HeaderValue::from_str(&content_type)
         {
@@ -266,7 +266,7 @@ impl CodexExecutor {
         let body = cpa_common::payload::apply(&settings.payload, &rules, body.into_bytes());
         let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         report_request(&req, Format::Codex, &body);
-        let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
+        let headers = request::image_headers(view, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self

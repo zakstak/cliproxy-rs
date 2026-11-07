@@ -418,3 +418,96 @@ async fn websocket_handshake_follows_the_policy() {
         }
     }
 }
+
+/// A Sign in with ChatGPT credential: its nested token authenticates, and it carries no
+/// account header.
+fn siwc_credential(base_url: &str, websockets: bool) -> Credential {
+    let mut credential = Credential::from_file(
+        Path::new("/fake"),
+        Path::new("/fake/codex-siwc.json"),
+        serde_json::json!({"type": "codex", "access_token": "outer-at-FAKE", "account_id": "acct-SELECTED",
+                           "use_siwc": true, "siwc": {"access_token": "siwc-at-FAKE"}})
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+    .unwrap();
+    credential.attributes.insert("base_url".into(), base_url.into());
+    if websockets {
+        credential.attributes.insert("websockets".into(), "true".into());
+    }
+    credential
+}
+
+/// Go builds the Sign in with ChatGPT `User-Agent` from the operator's
+/// `signin-with-chatgpt-identifier` (default `CLIProxyAPI`), so any identity could be
+/// configured. The identifier now only labels the consent screen; requests follow the
+/// policy over HTTP and the WebSocket, and keep the SIWC token as their credential.
+#[tokio::test]
+async fn siwc_requests_follow_the_policy_not_the_configured_identifier() {
+    let cfg = Config::parse(
+        "oauth: {providers: {codex: {signin-with-chatgpt-identifier: 'codex-tui/0.154.0 (Mac OS 26.5.2; arm64)'}}}\n",
+    )
+    .unwrap();
+    // Native over HTTP, with and without the caller's identity; translated over HTTP.
+    for (native, client, ua) in [
+        (true, &[("user-agent", NATIVE_UA)][..], NATIVE_UA),
+        (true, &[][..], PROXY_UA),
+        (false, &[("user-agent", "OpenAI/Python 2.1.0")][..], PROXY_UA),
+    ] {
+        let req = request(native, client);
+        let caller = req.headers.clone();
+        let up = http_turn(&siwc_credential("http://unused", false), req, &cfg).await;
+        let ctx = format!("http native={native}");
+        assert_eq!(up.header("user-agent"), ua, "{ctx}");
+        assert_eq!(up.header("authorization"), "Bearer siwc-at-FAKE", "{ctx}");
+        assert_eq!(header(&up.headers, "chatgpt-account-id"), None, "{ctx}");
+        assert_eq!(header(&up.headers, "originator"), None, "{ctx}");
+        assert!(!up.header("user-agent").contains("CLIProxyAPI"), "{ctx}");
+        assert_isolated(&up.headers, &caller, &ctx);
+    }
+    // Native over the WebSocket.
+    for (client, ua) in [(&[("user-agent", NATIVE_UA)][..], NATIVE_UA), (&[][..], PROXY_UA)] {
+        let (up, url) = ws_upstream().await;
+        let req = request(true, client);
+        let caller = req.headers.clone();
+        let session = ExecSession {
+            id: "conn-identity".into(),
+            continuation: false,
+            lease: None,
+        };
+        let executor = executor();
+        drain(
+            executor
+                .execute_in_session(&siwc_credential(&url, true), req, &cfg, &session)
+                .await,
+        )
+        .await
+        .unwrap();
+        executor.close_session("conn-identity");
+        let dials = up.dials.lock().unwrap().clone();
+        assert_eq!(dials.len(), 1);
+        let h = &dials[0];
+        assert_eq!(header(h, "user-agent"), Some(ua), "ws");
+        assert_eq!(header(h, "authorization"), Some("Bearer siwc-at-FAKE"), "ws");
+        assert_eq!(header(h, "chatgpt-account-id"), None, "ws");
+        assert_eq!(header(h, "openai-beta"), Some(crate::codex_request::WS_BETA), "ws");
+        assert_isolated(h, &caller, "ws");
+    }
+    // The identifier still names the agent on the consent screen.
+    let url = crate::codex_siwc::authorize_url(
+        "s",
+        "n",
+        "00000000-0000-4000-8000-000000000000",
+        "http://127.0.0.1:1455/auth/callback",
+        "c",
+        &crate::codex_siwc::identifier(&cfg),
+    )
+    .unwrap();
+    let hint = url::Url::parse(&url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "agent_name_hint")
+        .map(|(_, v)| v.into_owned());
+    assert_eq!(hint.as_deref(), Some("codex-tui/0.154.0 (Mac OS 26.5.2; arm64)"));
+}

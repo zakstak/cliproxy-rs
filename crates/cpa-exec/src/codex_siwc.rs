@@ -27,7 +27,9 @@ pub const SCOPE: &str = "openid profile email offline_access resource.invoke cha
 const EXPIRY_MARGIN: TimeDelta = TimeDelta::minutes(3);
 
 /// `oauth.providers.codex.signin-with-chatgpt-identifier`, trimmed, else `CLIProxyAPI`
-/// (Go `EffectiveSignInWithChatGPTIdentifier`).
+/// (Go `EffectiveSignInWithChatGPTIdentifier`): the agent name the consent screen shows
+/// (`agent_name_hint`). Go also builds the Sign in with ChatGPT request `User-Agent`
+/// from it; here it never reaches a request header (#26, `crate::codex_identity`).
 pub fn identifier(cfg: &Config) -> String {
     ["oauth", "providers", "codex", "signin-with-chatgpt-identifier"]
         .iter()
@@ -421,16 +423,6 @@ pub(crate) fn refresh_inputs(credential: &cpa_core::credential::Credential) -> (
             text(siwc, "device_id"),
         )
     })
-}
-
-/// Go `codexSIWCUserAgent`: `<identifier> (<GOOS>; <GOARCH>)`.
-pub fn user_agent(cfg: &Config) -> String {
-    format!(
-        "{} ({}; {})",
-        identifier(cfg),
-        crate::kimi_http::go_os(),
-        crate::kimi_http::go_arch()
-    )
 }
 
 /// Go `strconv.ParseBool`.

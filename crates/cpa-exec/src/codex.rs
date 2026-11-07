@@ -359,7 +359,6 @@ impl CodexExecutor {
         report_request(&req, Format::Codex, &body);
         let headers = request::http_headers(
             view,
-            settings,
             &req.headers,
             &body,
             &model,
@@ -436,7 +435,6 @@ impl CodexExecutor {
         report_request(&req, Format::Codex, &body);
         let headers = request::http_headers(
             view,
-            settings,
             &req.headers,
             &body,
             &model,
@@ -510,7 +508,6 @@ impl CodexExecutor {
         report_request(&req, Format::OpenAIResponse, &body);
         let headers = request::http_headers(
             view,
-            settings,
             &req.headers,
             &body,
             &model,

@@ -57,6 +57,7 @@ client also treats `originator` as an identity claim: `is_first_party_originator
 | An operator header `User-Agent` or `Originator` on a Codex credential (config `headers`, an auth file's `headers`, Home or a plugin store) | Applied over the identity | The Codex request fails with a credential-scoped 500 that names the header and the credential, never the value. Nothing goes upstream. |
 | An operator header `Authorization` or `chatgpt-account-id` whose value comes from the request (`$Header` or `$CPA-SESSION-ID`) | Let the caller choose the upstream credential or account | Refused the same way. A static operator value still applies. |
 | An operator header whose value copies a client credential header (`$Authorization`, `$Proxy-Authorization`, `$X-Api-Key`, `$X-Goog-Api-Key` or `$Cookie`) | Sent the proxy client key upstream under another name | Refused the same way. Copying any other client header still works. |
+| `oauth.providers.codex.signin-with-chatgpt-identifier` | Was the consent screen's agent name (`agent_name_hint` in the authorize URL) and the Sign in with ChatGPT request `User-Agent` | Keeps only the consent-screen label. It never reaches a request header, so it cannot claim another client. |
 | A model catalog `override_header` naming `User-Agent`, `Originator`, `Authorization` or `chatgpt-account-id` | Applied. The pinned catalog gives `gpt-5.6-luna` the `codex-tui` macOS identity | Those names are skipped. Other override headers still apply. |
 
 No setting replaces cloaking: the proxy has no opt-in to claim another client's identity,
@@ -72,7 +73,7 @@ and it sends no probe or keepalive request to test whether an identity is accept
 | Alpha Search | Caller's `User-Agent` and `originator`, else proxy (Go forced `originator: codex_cli_rs` over the caller's) |
 | Live calls, sidebands and hangups (HTTP and WebSocket) | Proxy `User-Agent` (Go sent `Go-http-client/1.1`); the caller's `Originator` from the live allowlist, else `cliproxy-rs` on direct sessions (Go claimed `Codex Desktop`) |
 | OAuth token exchange, refresh and device flow; Sign in with ChatGPT token grants, refresh and binding | Proxy `User-Agent` (Go sent `Go-http-client/1.1`) |
-| Sign in with ChatGPT Responses requests | Unchanged: `<signin-with-chatgpt-identifier> (<os>; <arch>)`, where the identifier is operator-set (default `CLIProxyAPI`) and the platform is the running host's. See [Unproven gates](#unproven-gates). |
+| Sign in with ChatGPT Responses requests (HTTP and WebSocket) | Caller's `User-Agent` on a native exchange, else proxy; no `originator` and no account header, as before. Go sent `<signin-with-chatgpt-identifier> (<GOOS>; <GOARCH>)`, an operator-chosen identity (default `CLIProxyAPI`). |
 
 ## Transport
 
@@ -187,10 +188,11 @@ This change was tested only against local mocks. Nothing here was sent to a real
 - Whether the backend serves `gpt-5.6-luna` to a request whose originator is not
   `codex-tui` is unknown. The pinned catalog's override suggests it might be gated, but
   no first-party source requires it. A native caller's own originator still passes.
-- The Sign in with ChatGPT `User-Agent` keeps its operator-set identifier, default
-  `CLIProxyAPI`, because Sign in with ChatGPT binding uses the same identifier and no
-  source says what the endpoint registers. Every Responses behaviour on that profile is
-  unknown in the contract.
+- Whether the Sign in with ChatGPT endpoint accepts `cliproxy-rs/<version>` (or a native
+  caller's own `User-Agent`) in place of Go's `<identifier> (<os>; <arch>)` is not
+  measured. No source shows that the endpoint requires the identifier in the
+  `User-Agent`; the binding's `agent_name_hint` still carries it. Every Responses
+  behaviour on that profile is unknown in the contract.
 - The live media relay's forward-proxy `CONNECT` line (`crates/cpa-server/src/realtime/dialer.rs`)
   still says `Go-http-client/1.1`. It goes to the operator's proxy, not to OpenAI.
 - `docs/codex/CONTRACT.md` lists the `codex-tui` identity and the Chrome profile as

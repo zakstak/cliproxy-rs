@@ -1734,11 +1734,23 @@ async fn siwc_requests_match_go() {
         let cfg = Config::parse(case["config"].as_str().unwrap_or("{}")).unwrap();
         let mock = Mock::start().await;
         let credential = credential(&synthetic, &mock.url);
-        // The recorder ran on linux/amd64; the User-Agent names the host's Go platform.
+        // Go sends `<signin-with-chatgpt-identifier> (<GOOS>; <GOARCH>)`, an
+        // operator-chosen identity. #26 (docs/DIFFERENCES-FROM-GO.md): a native caller's
+        // own User-Agent, else cliproxy-rs's. The image call is translated, so the
+        // proxy's. Every other recorded header still has to match.
         let mut sent_headers = case["sent_headers"].clone();
         if let Some(ua) = sent_headers.get_mut("user-agent") {
-            let host = format!("({}; {})", crate::kimi_http::go_os(), crate::kimi_http::go_arch());
-            ua[0] = ua[0].as_str().unwrap().replace("(linux; amd64)", &host).into();
+            assert!(
+                ua[0].as_str().unwrap().contains(" (linux; amd64)"),
+                "{name}: Go's SIWC identity"
+            );
+            let caller = case["headers"]
+                .as_object()
+                .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
+                .and_then(|(_, v)| v.as_str())
+                .map(str::trim)
+                .filter(|v| call != "image" && !v.is_empty());
+            ua[0] = caller.unwrap_or(PROXY_UA).into();
         }
         let go_upstream = serde_json::json!({
             "path": case["path"],

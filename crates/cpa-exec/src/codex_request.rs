@@ -68,8 +68,6 @@ pub(crate) struct Settings {
     pub response_steering: bool,
     /// `multimedia.gpt-image-2-base-model`, trimmed: the Images API's tool-call model.
     pub image_base_model: String,
-    /// `codexSIWCUserAgent`, read from the whole config (Go uses `e.cfg`, never the API-key view).
-    pub siwc_user_agent: String,
 }
 
 /// `upstream.codex.response-steering`; the older spellings are already moved there.
@@ -101,7 +99,6 @@ impl Settings {
         } else {
             Self::from(cfg)
         };
-        settings.siwc_user_agent = crate::codex_siwc::user_agent(cfg);
         // ponytail: Go's executor-side resolveCodexKeyConfig skips the prefix/proxy
         // tie-break of the shared resolver; they differ only for duplicate key+URL entries.
         settings.key_models = cpa_core::config::credentials::resolve_api_key_entry(cfg, "codex", view.credential)
@@ -186,7 +183,6 @@ impl Settings {
             home: None,
             response_steering: response_steering(cfg),
             image_base_model: text(&["multimedia", "gpt-image-2-base-model"]),
-            siwc_user_agent: crate::codex_siwc::user_agent(cfg),
         }
     }
 }
@@ -1475,10 +1471,8 @@ fn model_overrides(model: &str) -> Vec<(String, String)> {
 
 /// HTTP upstream headers (`applyCodexHeadersFromSources`, routing hint, model overrides).
 /// `origin` decides whose identity they carry ([`crate::codex_identity`]).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn http_headers(
     view: &View<'_>,
-    settings: &Settings,
     client: &HeaderMap,
     body: &str,
     model: &str,
@@ -1486,7 +1480,7 @@ pub(crate) fn http_headers(
     stream: bool,
     origin: Origin,
 ) -> HeaderMap {
-    let mut h = source_headers(view, settings, client, cache_id, stream, origin);
+    let mut h = source_headers(view, client, cache_id, stream, origin);
     routing_hint(&mut h, view, client, body, model);
     model_header_overrides(&mut h, model);
     h
@@ -1497,13 +1491,12 @@ pub(crate) fn http_headers(
 /// proxy's identity ([`Origin::Proxy`]).
 pub(crate) fn image_headers(
     view: &View<'_>,
-    settings: &Settings,
     client: &HeaderMap,
     model: &str,
     cache_id: Option<&str>,
     stream: bool,
 ) -> HeaderMap {
-    let mut h = source_headers(view, settings, client, cache_id, stream, Origin::Proxy);
+    let mut h = source_headers(view, client, cache_id, stream, Origin::Proxy);
     model_header_overrides(&mut h, model);
     h
 }
@@ -1511,14 +1504,13 @@ pub(crate) fn image_headers(
 /// `cacheHelper`'s `Session-Id`, then `applyCodexHeadersFromSources`.
 fn source_headers(
     view: &View<'_>,
-    settings: &Settings,
     client: &HeaderMap,
     cache_id: Option<&str>,
     stream: bool,
     origin: Origin,
 ) -> HeaderMap {
     if view.siwc {
-        return siwc_http_headers(view, settings, client, cache_id, stream);
+        return siwc_http_headers(view, client, cache_id, stream, origin);
     }
     let mut h = HeaderMap::new();
     if let Some(id) = cache_id {
@@ -1557,14 +1549,16 @@ fn source_headers(
 }
 
 /// The Sign in with ChatGPT branch of `applyCodexHeadersFromSources`: the session as
-/// `session_id` and the client request id, the SIWC User-Agent and operator headers; no
-/// originator, account id, client Codex headers or cloaking.
+/// `session_id` and the client request id, the policy's User-Agent and operator headers;
+/// no originator, account id or client Codex headers. Go sends
+/// `<signin-with-chatgpt-identifier> (<GOOS>; <GOARCH>)`, an operator-chosen identity;
+/// the identifier now only labels the consent screen (`agent_name_hint`, #26).
 fn siwc_http_headers(
     view: &View<'_>,
-    settings: &Settings,
     client: &HeaderMap,
     cache_id: Option<&str>,
     stream: bool,
+    origin: Origin,
 ) -> HeaderMap {
     let mut h = HeaderMap::new();
     set(&mut h, "content-type", "application/json");
@@ -1575,7 +1569,7 @@ fn siwc_http_headers(
         set(&mut h, "session_id", id);
         set(&mut h, "x-client-request-id", id);
     }
-    set(&mut h, "user-agent", &settings.siwc_user_agent);
+    set(&mut h, "user-agent", identity::user_agent(origin, client));
     set(
         &mut h,
         "accept",
@@ -1675,7 +1669,7 @@ pub(crate) fn ws_headers(
         set(&mut h, "authorization", &format!("Bearer {}", view.token));
     }
     if view.siwc {
-        siwc_ws_headers(&mut h, view, settings, client);
+        siwc_ws_headers(&mut h, view, client, origin);
         model_header_overrides(&mut h, model);
         return h;
     }
@@ -1750,9 +1744,9 @@ pub(crate) fn ws_headers(
 
 /// The Sign in with ChatGPT branch of `applyCodexWebsocketHeaders`: no conversation
 /// header, the session (prompt cache or client) also as the client request id, the
-/// SIWC User-Agent, the client's WebSocket beta header when it names one, then operator
-/// headers.
-fn siwc_ws_headers(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, client: &HeaderMap) {
+/// policy's User-Agent (see [`siwc_http_headers`]), the client's WebSocket beta header
+/// when it names one, then operator headers.
+fn siwc_ws_headers(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, origin: Origin) {
     h.remove("conversation_id");
     let existing = header(h, "session_id").trim().to_owned();
     let session = if existing.is_empty() {
@@ -1771,7 +1765,7 @@ fn siwc_ws_headers(h: &mut HeaderMap, view: &View<'_>, settings: &Settings, clie
         set(h, "session_id", &session);
         set(h, "x-client-request-id", &session);
     }
-    set(h, "user-agent", &settings.siwc_user_agent);
+    set(h, "user-agent", identity::user_agent(origin, client));
     let beta = header(client, "openai-beta").trim();
     let beta = if beta.contains("responses_websockets=") {
         beta
