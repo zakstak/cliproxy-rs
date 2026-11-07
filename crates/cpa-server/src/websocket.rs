@@ -458,6 +458,8 @@ impl LocalInterrupt {
             state.1 = Some(payload.to_owned());
             self.ready.notify_one();
         }
+        #[cfg(test)]
+        gate::reached("deliver", payload);
         true
     }
 
@@ -1184,7 +1186,10 @@ impl Connection {
     async fn forward(&self, socket: &mut Sink, started: Started, cfg: &Config, ctx: &mut TurnCtx) -> Forwarded {
         let Started { first, stream } = started;
         // `stream` completes its lease as it ends (dispatch).
-        let mut stream = futures_util::stream::iter(first.map(Ok)).chain(stream).boxed();
+        let mut stream = futures_util::stream::iter(first.map(Ok))
+            .chain(stream)
+            .boxed()
+            .peekable();
         let keepalive = keepalive_interval(cfg);
         let mut deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
         let mut turn = Turn::default();
@@ -1193,12 +1198,17 @@ impl Connection {
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
         let mut response_started = false;
+        // The last payload sent was an upstream context-window `response.failed`, which
+        // the executor follows with its own classified error (`preserved_failure`).
+        let mut preserved_event = false;
         let _local = self.local.begin();
         loop {
             let item = tokio::select! {
                 biased;
-                // Dropping the stream cancels the upstream request.
-                payload = self.local.next() => return interrupted(socket, &payload, &turn).await,
+                // Dropping the stream cancels the upstream request. A turn that already
+                // gave its client a context-window `response.failed` has its terminal
+                // event; an interrupt cannot add a second one.
+                payload = self.local.next(), if !preserved_event => return interrupted(socket, &payload, &turn).await,
                 item = stream.next() => item,
                 () = sleep_until(deadline) => {
                     if let Err(error) = socket.send(Message::Ping(Bytes::new())).await {
@@ -1229,19 +1239,7 @@ impl Connection {
                     socket.terminate(CLOSE_SENT);
                     return Forwarded::End;
                 }
-                Some(Err(error)) => {
-                    let failure = Failure::from_exec(&error);
-                    // Replay before the session-loss close, as at the turn's start.
-                    if ctx.suppress(failure.status) {
-                        return Forwarded::Suppressed;
-                    }
-                    if let Some(loss) = self.upstream_loss() {
-                        close_for_upstream_loss(socket, &loss).await;
-                        return Forwarded::End;
-                    }
-                    close_for_failure(socket, &failure).await;
-                    return Forwarded::End;
-                }
+                Some(Err(error)) => return self.failed(socket, ctx, &error, preserved_event).await,
                 Some(Ok(chunk)) => chunk,
             };
             deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
@@ -1292,11 +1290,51 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
                 }
+                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
+                // The executor follows such an event with its classified error at once
+                // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
+                // scheduler even when the client interrupts or leaves during the write.
+                let committed = if preserved_event {
+                    std::pin::Pin::new(&mut stream)
+                        .next_if(Result::is_err)
+                        .now_or_never()
+                        .flatten()
+                        .and_then(Result::err)
+                } else {
+                    None
+                };
                 if !send_text(socket, payload).await {
                     return Forwarded::End;
                 }
+                if let Some(error) = committed {
+                    return self.failed(socket, ctx, &error, true).await;
+                }
             }
         }
+    }
+
+    /// The turn's stream failed with `error`; `preserved_event`: the last payload sent was
+    /// an upstream context-window `response.failed`.
+    async fn failed(&self, socket: &mut Sink, ctx: &TurnCtx, error: &ExecError, preserved_event: bool) -> Forwarded {
+        let failure = Failure::from_exec(error);
+        // Replay before the session-loss close, as at the turn's start.
+        if ctx.suppress(failure.status) {
+            return Forwarded::Suppressed;
+        }
+        // The client already has the upstream's event for this failure (a context-window
+        // overflow, which Codex compacts on); a generic error event after it would replace
+        // that meaning. Go v8.0.35 differs (docs/DIFFERENCES-FROM-GO.md). Any other error,
+        // including one after a recoverable steering failure, closes as before.
+        if preserved_event && preserved_failure(&failure) {
+            socket.terminate(CLOSE_SENT);
+            return Forwarded::End;
+        }
+        if let Some(loss) = self.upstream_loss() {
+            close_for_upstream_loss(socket, &loss).await;
+            return Forwarded::End;
+        }
+        close_for_failure(socket, &failure).await;
+        Forwarded::End
     }
 }
 
@@ -1371,6 +1409,8 @@ fn lite_request(payload: &str, headers: &HeaderMap) -> bool {
 /// `writeResponsesWebsocketPayload`: the frame joins the timeline, then goes out.
 async fn send_text(socket: &mut Sink, payload: String) -> bool {
     socket.event("response", payload.as_bytes());
+    #[cfg(test)]
+    gate::pass("write", &payload).await;
     match socket.send(Message::Text(payload.into())).await {
         Ok(()) => true,
         Err(error) => {
@@ -1413,6 +1453,12 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
         return Some((CLOSE_MESSAGE_TOO_BIG, reason));
     }
     None
+}
+
+/// The executor's classified error for an upstream context-window `response.failed`
+/// (cpa-exec `terminal_failure`: status 400, `context_too_large`).
+fn preserved_failure(failure: &Failure) -> bool {
+    failure.status == 400 && gjson::get(&failure.text, "error.code").str() == "context_too_large"
 }
 
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,
@@ -1487,6 +1533,66 @@ fn gorilla_close(code: u16, reason: &str) -> String {
         text.push_str(reason);
     }
     text
+}
+
+/// Test pauses at named points of a connection, armed for payloads that contain a key,
+/// so a test can order events that otherwise race (a client frame during a write).
+#[cfg(test)]
+pub(crate) mod gate {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Semaphore;
+
+    pub(crate) struct Gate {
+        point: &'static str,
+        key: String,
+        /// One permit each time the point is reached.
+        pub(crate) reached: Semaphore,
+        /// `pass` waits for a permit here.
+        pub(crate) release: Semaphore,
+    }
+
+    static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
+
+    /// Arms `point` for payloads containing `key` until [`disarm`]; concurrent tests use
+    /// unique keys.
+    pub(crate) fn arm(point: &'static str, key: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            point,
+            key: key.to_owned(),
+            reached: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        GATES.lock().unwrap().push(gate.clone());
+        gate
+    }
+
+    /// Disarms `gate` and lets every waiter through.
+    pub(crate) fn disarm(gate: &Arc<Gate>) {
+        GATES.lock().unwrap().retain(|g| !Arc::ptr_eq(g, gate));
+        gate.release.add_permits(Semaphore::MAX_PERMITS / 2);
+    }
+
+    fn find(point: &str, payload: &str) -> Option<Arc<Gate>> {
+        let gates = GATES.lock().unwrap();
+        gates
+            .iter()
+            .find(|g| g.point == point && payload.contains(g.key.as_str()))
+            .cloned()
+    }
+
+    pub(crate) fn reached(point: &str, payload: &str) {
+        if let Some(gate) = find(point, payload) {
+            gate.reached.add_permits(1);
+        }
+    }
+
+    pub(crate) async fn pass(point: &str, payload: &str) {
+        if let Some(gate) = find(point, payload) {
+            gate.reached.add_permits(1);
+            let _ = gate.release.acquire().await.map(tokio::sync::SemaphorePermit::forget);
+        }
+    }
 }
 
 #[cfg(test)]
