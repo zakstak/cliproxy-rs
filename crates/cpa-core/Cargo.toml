@@ -2,12 +2,12 @@
 name = "cpa-core"
 description = "Part of cliproxy: config, credentials, formats and the execution envelope"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-exclude.workspace = true
 keywords = ["llm", "proxy", "cliproxy", "config"]
 categories.workspace = true
 

@@ -2,12 +2,12 @@
 name = "cpa-server"
 description = "Part of cliproxy: HTTP routes, client auth, credential selection and the management API"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-exclude.workspace = true
 keywords = ["llm", "proxy", "cliproxy", "api-gateway"]
 categories.workspace = true
 

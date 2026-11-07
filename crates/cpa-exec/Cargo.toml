@@ -2,12 +2,12 @@
 name = "cpa-exec"
 description = "Part of cliproxy: upstream provider executors"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-exclude.workspace = true
 keywords = ["llm", "proxy", "cliproxy"]
 categories.workspace = true
 

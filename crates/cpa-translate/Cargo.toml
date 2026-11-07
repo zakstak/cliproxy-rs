@@ -2,12 +2,12 @@
 name = "cpa-translate"
 description = "Part of cliproxy: request and response translation between the Anthropic, OpenAI and Gemini API formats"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-exclude.workspace = true
 keywords = ["llm", "openai", "anthropic", "gemini", "translation"]
 categories.workspace = true
 

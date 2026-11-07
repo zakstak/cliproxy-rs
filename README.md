@@ -1,7 +1,6 @@
 # cliproxy-rs
 
 [![CI](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/vayungodara/cliproxy-rs)](https://github.com/vayungodara/cliproxy-rs/releases/latest)
 [![Stars](https://img.shields.io/github/stars/vayungodara/cliproxy-rs)](https://github.com/vayungodara/cliproxy-rs/stargazers)
 
 Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one local endpoint, API translation, failover. Single Rust binary, CLIProxyAPI-compatible.
@@ -10,10 +9,10 @@ Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one l
 - **Several keys and providers behind one model name.** By default, a 429 cools that key for the model and the request moves to another ready key or provider with the same alias.
 - **One binary with the dashboard built in.** It reads CLIProxyAPI's `config.yaml` and credential files. Parity with CLIProxyAPI v8.0.35 is partial; [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) has the counts.
 
-This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) runs on Linux only, natively or in the Linux container, and has published no release binaries yet. Build it from source on Linux, or build and run the container on any host; see [Quick start](#quick-start).
+This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) runs on Linux only, natively or in the Linux container, and uses local builds without release publishing or package distribution. Build it from source on Linux, or build and run the container on any host; see [Quick start](#quick-start).
 
 <p align="center">
-  <a href="https://github.com/vayungodara/cliproxy-rs/releases/latest"><img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/hero.gif" alt="cliproxy-rs on 127.0.0.1:8317 translates a Codex CLI Responses request to Chat Completions for DeepSeek and moves it to a second key when the first answers 429. Claude Code's Messages requests reach GLM the same way. Kimi and OpenRouter are the other providers shown." width="880"></a>
+  <a href="docs/INSTALL.md"><img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/hero.gif" alt="cliproxy-rs on 127.0.0.1:8317 translates a Codex CLI Responses request to Chat Completions for DeepSeek and moves it to a second key when the first answers 429. Claude Code's Messages requests reach GLM the same way. Kimi and OpenRouter are the other providers shown." width="880"></a>
 </p>
 
 0.4.0 changes how some configs load. Read [Before you upgrade](https://github.com/vayungodara/cliproxy-rs/releases/tag/v0.4.0#:~:text=Before%20you%20upgrade) in the [release notes](https://github.com/vayungodara/cliproxy-rs/releases/tag/v0.4.0) first.
@@ -26,7 +25,7 @@ This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) runs o
 
 ## Quick start
 
-1. On Linux, [build from source](docs/INSTALL.md#from-source) and [write `config.yaml` with two keys](docs/INSTALL.md#first-run-without-the-install-script), then start `cliproxy --config config.yaml`. Once this fork publishes a release, `sh install.sh` from a checkout does this setup for you; until then it stops before changing anything.
+1. On Linux, [build from source](docs/INSTALL.md#from-source) and [write `config.yaml` with two keys](docs/INSTALL.md#first-run), then start `cliproxy --config config.yaml`.
 
    On Windows or macOS, run the Linux container: [Windows and macOS: run the Linux container](docs/INSTALL.md#windows-and-macos-run-the-linux-container). This fork has no native build for those systems. Codex CLI, Claude Code and your browser still run there and connect to the container. [INSTALL.md](docs/INSTALL.md) lists every way to install.
 
@@ -156,7 +155,7 @@ Personal use is still subject to each provider's terms, and providers can restri
 
 ### Several accounts
 
-Each sign-in creates a file in `auth-dir`. Routing chooses among ready credentials with `soonest-reset` (the default: the account whose weekly limit resets soonest goes first), `round-robin`, `fill-first` or `weighted-round-robin`. The installer enables session affinity to keep a conversation on one account. When the setting is omitted, the server default is off. A 429 can move the request to another ready credential for that model. [MULTI-ACCOUNT.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MULTI-ACCOUNT.md) covers routing and access from your other machines.
+Each sign-in creates a file in `auth-dir`. Routing chooses among ready credentials with `soonest-reset` (the default: the account whose weekly limit resets soonest goes first), `round-robin`, `fill-first` or `weighted-round-robin`. Set `routing.session-affinity: true` to keep a conversation on one account. When the setting is omitted, the server default is off. A 429 can move the request to another ready credential for that model. [MULTI-ACCOUNT.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MULTI-ACCOUNT.md) covers routing and access from your other machines.
 
 ## CLIProxyAPI compatibility
 
@@ -172,7 +171,6 @@ Before switching, read [MIGRATING-FROM-GO.md](https://github.com/vayungodara/cli
 
 Not in cliproxy-rs yet:
 
-- An AUR package.
 - Three plugin pieces: model discovery for each credential, response hooks on a buffered Claude answer, and sending your GitHub token on plugin store requests.
 - The remaining parity gaps and Go test cases, listed in [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md).
 

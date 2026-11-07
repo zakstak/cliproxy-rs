@@ -4,29 +4,13 @@ This guide connects a coding tool to your own accounts or API keys through clipr
 
 ## 1. Install and start it
 
-This fork has published no release binaries yet. On Linux, [build from source](INSTALL.md#from-source) and [write the config](INSTALL.md#first-run-without-the-install-script). On Windows or macOS, run the proxy in the Linux container, as [INSTALL.md](INSTALL.md#windows-and-macos-run-the-linux-container) shows. Either way, continue at step 2. This fork has no native Windows or macOS build, but your tools on those systems connect to the container the same way.
+On Linux, [build from source](INSTALL.md#from-source) and [write the config](INSTALL.md#first-run). On Windows or macOS, [build and run the Linux container](INSTALL.md#windows-and-macos-run-the-linux-container). This fork uses local builds without release publishing or package distribution.
 
-Once this fork publishes a release, `sh install.sh` from a checkout does the setup for you. The script downloads the release for your machine and checks it against the release's `SHA256SUMS`. It writes `~/.cliproxy-rs/config.yaml` with two new keys, starts the server in the background and checks that it answers. It ends like this:
-
-```text
-cliproxy-rs is running at http://127.0.0.1:8317
-  Dashboard  http://127.0.0.1:8317/management.html
-  Keys       /home/you/.cliproxy-rs/keys.env (show them with: cat /home/you/.cliproxy-rs/keys.env)
-  Config     /home/you/.cliproxy-rs/config.yaml
-  Log        /home/you/.cliproxy-rs/cliproxy.log
-  Stop       kill $(cat '/home/you/.cliproxy-rs/cliproxy.pid')
-```
-
-The port is 8317 unless something already uses it, CLIProxyAPI for example; then the script takes the next free one. `keys.env` holds two keys:
-
-- `CLIPROXY_MANAGEMENT_KEY` is the dashboard password.
-- `CLIPROXY_CLIENT_KEY` is what your tools send to the proxy.
-
-Only you can read the file, and the script never prints the keys. Run the same command again later to upgrade; it keeps your config and keys. [INSTALL.md](INSTALL.md) covers starting the proxy at login, Docker, building from source and writing the config yourself.
+Keep the management key for dashboard sign-in and the separate client key for your tools. [INSTALL.md](INSTALL.md) covers starting at login and running as a system service.
 
 ## 2. Open the dashboard
 
-Open <http://127.0.0.1:8317/management.html> in your browser (use your port if you picked another; the install script opens it for you). Sign in with `CLIPROXY_MANAGEMENT_KEY`. On a server without a browser, open an SSH tunnel from your own computer first, as [INSTALL.md](INSTALL.md#with-the-install-script) shows.
+Open <http://127.0.0.1:8317/management.html> in your browser, using your configured port. Sign in with the management key you saved during setup. On a server without a browser, keep the proxy on loopback and open an SSH tunnel from your own computer: `ssh -L 8317:127.0.0.1:8317 you@server`.
 
 On a new server, the Overview shows a short Get started card with three steps: connect an account, point a tool at the proxy, and send a test request. It goes away once all three are done, or when you dismiss it.
 

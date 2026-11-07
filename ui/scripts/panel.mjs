@@ -41,7 +41,7 @@ writeFileSync("dist-panel/management.html", html);
 const sha = createHash("sha256").update(html).digest("hex");
 writeFileSync("dist-panel/management.html.sha256", `${sha}  management.html\n`);
 
-// Keep the published checksum in PANEL.md in step with the file it describes.
+// Keep the checksum in PANEL.md in step with the local file it describes.
 const doc = readFileSync("PANEL.md", "utf8");
 const marked = doc.replace(/(<!-- sha256 -->)[\s\S]*?(<!-- \/sha256 -->)/, `$1\`${sha}\`$2`);
 if (marked !== doc) writeFileSync("PANEL.md", marked);

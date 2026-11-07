@@ -36,6 +36,14 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) tar
 - Mark deliberate simplifications with a `ponytail:` comment naming the ceiling and the upgrade path.
 - Prompt-cache changes must keep request semantics and stable prefixes, and show cache-read and cache-write usage for warm, changed-context and idle continuations before merge. Never add inference keepalive pings. `bench/claude-cache-live.sh` runs that check against a live Claude login, by hand.
 
+## Fork release versioning
+
+- Build this fork locally from source or with the Dockerfile. Keep Cargo publishing disabled. Do not add release publishing, registry uploads, installers or distribution packages unless explicitly requested. Preserve this policy when integrating upstream changes.
+- Use the upstream Rust project's version as the base, with a `-zak.N` suffix for fork releases. This is separate from the frozen Go reference version above.
+- Start at `N = 1` and increment for each fork release on the same upstream base: `v0.4.1-zak.1`, `v0.4.1-zak.2`, and so on. When adopting upstream `v0.4.2`, start at `v0.4.2-zak.1`.
+- The Cargo workspace version and `cliproxy --version` must equal the release tag without its leading `v`. Keep workspace dependency versions and lockfiles consistent when bumping the version.
+- Never move or reuse a published release tag.
+
 ## Review guidelines
 
 Flag, in order: behaviour that differs from Go v8.0.35 (`ae3ee3be`) without an entry in `docs/DIFFERENCES-FROM-GO.md` or an explicit partial/missing audit item, or, on Codex routes, behaviour that differs from `docs/codex/CONTRACT.md`, a payload change outside its permitted transformations, a setting, credential attribute, plugin hook or client header that rewrites a Codex request or is accepted and silently ignored instead of refused (the contract's "Settings" table lists each outcome), a request path that bypasses the native or translated route, or a Codex fixture without first-party or documented provenance; request or response bytes changed on passthrough; credentials or client keys reaching logs or the wrong side; tests that can touch the network or a real `auth-dir`; work on a request body that grows faster than linearly with its size. Skip style nits that `cargo fmt` and clippy already cover.

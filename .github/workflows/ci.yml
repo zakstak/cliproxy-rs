@@ -1,7 +1,6 @@
 # Formatting, lints, the full test suite and the harness build on every pull request and
 # push to master, plus the Linux size and idle gates and a check that native Windows and
-# macOS builds stop with the Linux-only build error. release.yml calls this workflow too, so a tagged release runs the same checks
-# before it builds anything.
+# macOS builds stop with the Linux-only build error.
 # One run per change: pushes to master, and pull requests through `pull_request` only. A
 # branch push used to start a second run of every job for the same commit. Runs are
 # grouped per pull request (or per ref outside one), and a newer push cancels the older
@@ -15,7 +14,6 @@ on:
     branches: [master, fork]
   pull_request:
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read
@@ -45,8 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Each shard sets only its own output; an empty output does not replace another
-    # leg's value. Outputs rather than artifacts, because release.yml calls this
-    # workflow and publishes every artifact of its run.
+    # leg's value. The counts job reads these outputs to verify shard coverage.
     outputs:
       counts-1: ${{ steps.counts.outputs.counts-1 }}
       counts-2: ${{ steps.counts.outputs.counts-2 }}
@@ -233,8 +230,8 @@ jobs:
 
   perf:
     name: ${{ matrix.gates }} (Linux)
-    # The release builds use Ubuntu 22.04 too, so the sizes compare with theirs, and its
-    # unprivileged user namespaces give bench/idle.sh a loopback-only network. The two
+    # Ubuntu 22.04 matches the historical size measurements, and its unprivileged user
+    # namespaces give bench/idle.sh a loopback-only network. The two
     # idle gates run on separate runners, so neither waits out the other's 60 s window;
     # each still has its machine to itself. Both build the same release binary.
     strategy:

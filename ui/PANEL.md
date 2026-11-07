@@ -1,6 +1,6 @@
 # Using the cliproxy-rs dashboard with Go CLIProxyAPI
 
-The cliproxy-rs dashboard also ships as one self-contained file, `dist-panel/management.html`, that drops into an existing Go CLIProxyAPI server in place of the official management panel. It is the same app the Rust binary embeds, built from the same source.
+The local dashboard build also produces one self-contained file, `dist-panel/management.html`, that drops into an existing Go CLIProxyAPI server in place of the official management panel. It is the same app the Rust binary embeds, built from the same source.
 
 Tested against unmodified CLIProxyAPI at commit `6fecc6e` (v8.0.10), both the release binary and a source build.
 
@@ -17,11 +17,11 @@ Tested against unmodified CLIProxyAPI at commit `6fecc6e` (v8.0.10), both the re
 - It does not render plugin-defined menu pages; plugins are listed, configured, enabled, installed and deleted.
 - It keeps no history beyond what the server reports (twenty 10-minute buckets per credential). The live usage view reads the server's usage queue, which removes those records for other consumers; it asks before starting.
 - "Check quota" asks the provider for usage through the server (`/requests/api-call` or a quota plugin) only when you press it.
-- It does not update itself. Updates come from replacing the file, by hand or through Go's release updater below.
+- It does not update itself. Build and replace the file by hand.
 
 ## Install by hand
 
-1. Download `management.html` and check it against the checksum below.
+1. Run `npm ci && npm run build` in `ui/`, then use `dist-panel/management.html` and check it against the checksum below.
 2. Put it where Go serves the panel from: `static/management.html` next to your `config.yaml`. If you set `WRITABLE_PATH`, it is `$WRITABLE_PATH/static/management.html`. `MANAGEMENT_STATIC_PATH` takes precedence over both: a path ending in `management.html` is the file itself, and any other path is a directory that holds `management.html`.
 3. Stop Go from replacing it with the official panel. In a v8 config:
 
@@ -36,20 +36,6 @@ Tested against unmodified CLIProxyAPI at commit `6fecc6e` (v8.0.10), both the re
 4. Open `http://<host>:<port>/management.html` and sign in with the management key. For access from another machine, also set `allow-remote: true` and use HTTPS.
 
 Place the file before the first visit to `/management.html`: if the file is missing on that visit, Go downloads the official panel into the same place.
-
-## Install through Go's updater
-
-Go can fetch the panel from a GitHub repository's latest release. Every cliproxy-rs release carries this file as `management.html`, built from the release commit:
-
-```yaml
-management:
-  panel-github-repository: "https://github.com/vayungodara/cliproxy-rs"
-  disable-auto-update-panel: false
-```
-
-Go reads `https://api.github.com/repos/vayungodara/cliproxy-rs/releases/latest`, takes the asset named exactly `management.html`, checks it against the asset's `sha256` digest when GitHub provides one, and writes it to `static/management.html`. It checks again every three hours and replaces the file when the release changes.
-
-The updater only sees published releases, not drafts. Until the first release is published, install by hand.
 
 ## Checksum
 
@@ -69,4 +55,4 @@ About 184 KB on disk and 71 KB gzip, of which 18 KB is the inlined font. The Jav
 
 ## Remove
 
-Remove `panel-github-repository` from the config (or set it back to empty), set `disable-auto-update-panel: false`, then delete `static/management.html`. Go downloads the official panel on the next visit. If `panel-github-repository` still points at cliproxy-rs, Go downloads this panel again instead.
+Remove `panel-github-repository` from the config (or set it back to empty), set `disable-auto-update-panel: false`, then delete `static/management.html`. Go downloads the official panel on the next visit.

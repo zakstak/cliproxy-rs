@@ -34,7 +34,7 @@ curl -s -m 2 http://127.0.0.1:8317/healthz; echo " exit=$?"
 
 ## 3. Install, configure and start
 
-This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) has published no release binaries yet, so build it from source. Do not use the upstream `vayungodara/cliproxy-rs` installer: it installs upstream builds, not this fork. The build needs `git`, a Rust toolchain (`cargo`), `cmake`, `clang` and `perl`; ask the user before installing any of them.
+This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) uses local builds without release publishing or package distribution. Build it from source. Do not use the upstream `vayungodara/cliproxy-rs` installer: it installs upstream builds, not this fork. The build needs `git`, a Rust toolchain (`cargo`), `cmake`, `clang` and `perl`; ask the user before installing any of them.
 
 ```sh
 git clone https://github.com/zakstak/cliproxy-rs.git ~/cliproxy-rs-src
@@ -42,7 +42,7 @@ cd ~/cliproxy-rs-src && cargo build --release -p cliproxy
 mkdir -p ~/.local/bin && install -m 0755 target/release/cliproxy ~/.local/bin/cliproxy
 ```
 
-Then follow [the first run without the install script](INSTALL.md#first-run-without-the-install-script): use port 8317, or the next free port if something answers there, and `auth-dir: "~/.cliproxy-rs/auth"`. Write the two keys into `~/.cliproxy-rs/keys.env` with `chmod 600`, in this format, with real values:
+Then follow [the first-run instructions](INSTALL.md#first-run): use port 8317, or the next free port if something answers there, and `auth-dir: "~/.cliproxy-rs/auth"`. Write the two keys into `~/.cliproxy-rs/keys.env` with `chmod 600`, in this format, with real values:
 
 ```sh
 CLIPROXY_PORT=8317
@@ -58,8 +58,6 @@ echo $! > ~/.cliproxy-rs/cliproxy.pid
 ```
 
 This keeps it running until the computer restarts. If it fails, read the last lines of `cliproxy.log` (they contain no keys) and fix what they report. In a container or sandbox that has its own service or process manager, run the same command under that manager instead.
-
-Once this fork publishes a release, `sh ~/cliproxy-rs-src/install.sh` does this step for you. Until then it stops with `no release is published yet`.
 
 ## 4. Verify
 
