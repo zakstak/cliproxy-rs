@@ -158,16 +158,11 @@ pub fn state_dir() -> Option<PathBuf> {
         return Some(Path::new(&w).join("discovery"));
     }
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let config_dir = if cfg!(target_os = "macos") {
-        env("HOME").map(|h| Path::new(&h).join("Library/Application Support"))
-    } else if cfg!(windows) {
-        env("AppData").map(PathBuf::from)
-    } else {
-        env("XDG_CONFIG_HOME")
-            .filter(|d| Path::new(d).is_absolute())
-            .map(PathBuf::from)
-            .or_else(|| env("HOME").map(|h| Path::new(&h).join(".config")))
-    };
+    // Go `os.UserConfigDir` on Linux.
+    let config_dir = env("XDG_CONFIG_HOME")
+        .filter(|d| Path::new(d).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| Path::new(&h).join(".config")));
     config_dir.map(|d| d.join("cpa").join("discovery"))
 }
 
@@ -208,14 +203,12 @@ fn persist(dir: &Path, path: &Path, id: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)?;
     let mut tmp = dir.join(format!("instance_id_{}.tmp", std::process::id()));
     for n in 0.. {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&tmp) {
             Ok(mut file) => {

@@ -3,7 +3,6 @@
 //! models applied), and a plugin executor serves those credentials through the
 //! ordinary selection loop. Plugin schedulers choose among built-in credentials.
 //! Private auth-dir, native test plugins, loopback-only upstreams.
-#![cfg(unix)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

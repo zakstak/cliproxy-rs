@@ -3,8 +3,6 @@
 //! through `persistCooldownStates` (sdk/cliproxy/auth/conductor_cooldown.go). Without
 //! that save a restart would restore the cooldown from the backend.
 
-#![cfg(unix)]
-
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

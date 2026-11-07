@@ -278,7 +278,6 @@ pub fn save(dir: &Path, records: Vec<Record>, now: SystemTime) -> Result<(), Str
 fn create_private_dir(dir: &Path) -> Result<(), String> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder
         .create(dir)

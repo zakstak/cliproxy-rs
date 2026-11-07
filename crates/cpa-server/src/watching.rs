@@ -57,7 +57,6 @@ struct Stat {
 }
 
 impl Stat {
-    #[cfg(unix)]
     fn of(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
@@ -65,24 +64,6 @@ impl Stat {
             ino: meta.ino(),
             mtime: (meta.mtime(), meta.mtime_nsec()),
             ctime: (meta.ctime(), meta.ctime_nsec()),
-        }
-    }
-
-    /// ponytail: Windows exposes no stable file identity or change time here, so a
-    /// same-size replacement with an unchanged modification time older than two
-    /// seconds goes unnoticed until its next change.
-    #[cfg(not(unix))]
-    fn of(meta: &std::fs::Metadata) -> Self {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or((0, 0), |d| (d.as_secs() as i64, i64::from(d.subsec_nanos())));
-        Self {
-            len: meta.len(),
-            ino: 0,
-            mtime,
-            ctime: (0, 0),
         }
     }
 }
@@ -159,7 +140,7 @@ fn log_auth_changes(before: &Snapshot, after: &Snapshot) {
 }
 
 pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
-    let first = targets(state, None);
+    let first = targets(state);
     // A plugin auth provider loaded, unloaded or fused changes what auth files load to
     // with no file changing: the change wakes this task, which reloads the auth folder.
     let plugin_auth = Arc::new(tokio::sync::Notify::new());
@@ -214,9 +195,8 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
             };
             // After an event, retarget before looking: a file that lands before the new
             // watch exists shows up in this look, and one that lands after raises an
-            // event. Cost per wake: a few watch calls (one stat per watched file on
-            // macOS), on the blocking pool.
-            let wake_targets = woke.then(|| targets(&state, observed.as_ref()));
+            // event. Cost per wake: a few watch calls, on the blocking pool.
+            let wake_targets = woke.then(|| targets(&state));
             // A panic in the work is caught inside the closure, so `events` always comes
             // back and notifications stay on.
             let looked = tokio::task::spawn_blocking({
@@ -286,7 +266,7 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 move || {
                     let loaded = catch_unwind(AssertUnwindSafe(|| reload_config(&state, read_config, &current)));
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        events.retarget(&targets(&state, Some(&current)));
+                        events.retarget(&targets(&state));
                     }));
                     (loaded.map_err(|_| ()), events)
                 }
@@ -352,13 +332,12 @@ fn record(cache: &mut HashCache, observed: Snapshot, read: Option<Snapshot>) -> 
     read
 }
 
-/// What the watch should cover: the config file, the auth folder of the published
-/// config, and the auth files last seen there.
-fn targets(state: &Management, current: Option<&Snapshot>) -> Targets {
+/// What the watch should cover: the config file and the auth folder of the published
+/// config.
+fn targets(state: &Management) -> Targets {
     Targets {
         config: state.path.clone(),
         auth_dir: state.rt.config().auth_dir.clone(),
-        files: current.map(|s| s.auth.keys().cloned().collect()).unwrap_or_default(),
     }
 }
 
@@ -647,7 +626,6 @@ mod tests {
     /// A config whose metadata reads as empty but whose contents cannot be read is
     /// recorded as the observation sees it, unreadable, so it does not reload every
     /// tick; it reloads once it changes.
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_unreadable_empty_config_converges() {
         let (state, dir) = state();
@@ -674,10 +652,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A cached hash can be stale when a same-size write keeps the metadata (Windows has
-    /// no inode or change time): once the reload read something else, the next
+    /// A cached hash can be stale when a same-size write keeps the metadata: once the reload read something else, the next
     /// observation reads afresh and agrees with it instead of reloading every tick.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_stale_cached_hash_does_not_reload_forever() {
         let (state, dir) = state();
@@ -911,7 +887,6 @@ mod tests {
     /// credential, as Go's full scan does; only a read that succeeded can mark a file
     /// incomplete. The watcher does not observe such an entry, so keeping it would
     /// leave the credential live after the entry is deleted.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_unreadable_file_drops_its_credential() {
         let (state, dir) = state();
@@ -930,7 +905,6 @@ mod tests {
     /// replaced by a link to `/dev/null` is dropped by the reload that replacement
     /// triggers, so deleting the link (which the watcher cannot see, having never
     /// observed it) leaves nothing live.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_replaced_by_a_special_file_link_drops_its_credential() {
         let (state, dir) = state();

@@ -5,7 +5,6 @@
 //! (results and the exact files written, with their permissions).
 
 // The file listing compares Unix permission bits.
-#![cfg(unix)]
 
 mod support;
 

@@ -267,7 +267,6 @@ fn instance_id_persists_and_reuses_a_valid_file() {
     let id = instance_id(Some(&fresh));
     assert!(id.len() == 4 && id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
     assert_eq!(std::fs::read_to_string(fresh.join("instance_id")).unwrap(), id);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(fresh.join("instance_id"))

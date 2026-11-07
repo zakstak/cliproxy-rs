@@ -16,7 +16,7 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use serde_json::{Map, Value, json};
 
-use crate::kimi_http::{BUILD_VERSION, auth_error, go_arch, go_os, hostname, rfc3339_utc};
+use crate::kimi_http::{BUILD_VERSION, auth_error, go_arch, hostname, rfc3339_utc};
 use crate::proxy::GoHeaders;
 use cpa_common::json::GoValue;
 
@@ -165,14 +165,10 @@ pub(crate) fn form(pairs: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-/// Device-flow device model (`getDeviceModel`), unlike the executor's lowercase form.
+/// Device-flow device model (`getDeviceModel` on Linux), unlike the executor's
+/// lowercase form.
 fn device_model() -> String {
-    match go_os() {
-        "darwin" => format!("macOS {}", go_arch()),
-        "windows" => format!("Windows {}", go_arch()),
-        "linux" => format!("Linux {}", go_arch()),
-        os => format!("{os} {}", go_arch()),
-    }
+    format!("Linux {}", go_arch())
 }
 
 /// Device authorization response (RFC 8628).
@@ -536,21 +532,8 @@ pub(crate) fn encode_credential(metadata: &Map<String, Value>) -> String {
 
 /// Writes a credential file atomically with mode 0600 in a 0700 directory.
 ///
-/// Go uses `os.Create` (0666 before umask) and an in-place write; on Unix a private temp
-/// file and rename is the deliberate, safer choice here (contracts review). Windows has
-/// no mode bits, so it gets Go's behaviour: create the directory, then create or
-/// truncate the file in place.
-#[cfg(not(unix))]
-pub(crate) fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    std::fs::write(path, contents)
-}
-
-/// Writes a credential file atomically with mode 0600 in a 0700 directory.
-///
 /// Go uses `os.Create` (0666 before umask) and an in-place write; a private temp file and
 /// rename is the deliberate, safer choice here (contracts review).
-#[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -587,18 +570,9 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()>
     result
 }
 
-/// Opens `url` in the desktop browser; returns whether a launcher started.
+/// Opens `url` in the desktop browser with `xdg-open`; returns whether it started.
 pub(crate) fn open_browser(url: &str) -> bool {
-    let launcher = match go_os() {
-        "darwin" => "open",
-        "windows" => "rundll32",
-        _ => "xdg-open",
-    };
-    let mut command = std::process::Command::new(launcher);
-    if go_os() == "windows" {
-        command.arg("url.dll,FileProtocolHandler");
-    }
-    command
+    std::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

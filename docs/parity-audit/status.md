@@ -20,7 +20,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M2 | 189 | 119 | 70 | 0 |
 | M3 | 424 | 222 | 196 | 6 |
 | M4 | 589 | 262 | 322 | 5 |
-| M5 | 331 | 225 | 105 | 1 |
+| M5 | 331 | 226 | 104 | 1 |
 | M6 | 267 | 151 | 107 | 9 |
 
 ### Gaps by area
@@ -33,7 +33,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | google | 3 | 73 | M3-0058, M3-0059, M3-0361 |
 | codex | 3 | 71 | M3-0362, M3-0363, M3-0364 |
 | openai-xai | 1 | 29 | M6-0217 |
-| manage | 0 | 129 | — |
+| manage | 0 | 128 | — |
 | translate | 0 | 73 | — |
 | device-providers | 0 | 28 | — |
 | home | 0 | 26 | — |
@@ -1882,7 +1882,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M5-0241 | internal/api/handlers/management/auth_files_delete_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Not ported by name. |
 | M5-0242 | internal/api/handlers/management/auth_files_devin_oauth_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Not ported by name. |
 | M5-0243 | internal/api/handlers/management/auth_files_download_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Not ported by name. |
-| M5-0244 | internal/api/handlers/management/auth_files_download_windows_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Not ported by name. |
+| M5-0244 | internal/api/handlers/management/auth_files_download_windows_test.go | covered | docs/DIFFERENCES-FROM-GO.md (Supported hosts: Linux only) |  | Deliberate fork difference: this fork builds only for Linux, and this Go test runs only on Windows (`_windows_test.go`), so its cases do not apply. |
 | M5-0245 | internal/api/handlers/management/auth_files_filter_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Suite changed since 6fecc6e; existing fixtures do not establish every v8.0.35 assertion. See the current Go declarations in checklist.md. |
 | M5-0246 | internal/api/handlers/management/auth_files_pagination_test.go | partial | crates/cpa-server/src/management*; tests/management.rs, tests/manage_go.rs (manage_go.json) | manage | Not ported by name. |
 | M5-0247 | internal/api/handlers/management/auth_files_patch_fields_test.go | partial | crates/cpa-server/src/management/auth_files.rs save_file_backed (Go's FileTokenStore.Save and PersistCodexAuthFile bytes) and runtime.rs CredentialStore::commit_file_backed (revision and file check, the write unless the document is equal, publication of the re-synthesized credential and its Provenance under one store lock; retries on the current record); src/management/auth_files.rs an_equal_save_still_publishes_the_record, numbers_follow_the_record_not_the_file; tests/management.rs a_codex_save_refuses_a_disk_subtree_its_loader_cannot_read; src/management/auth_files.rs a_refresh_after_a_patch_read_the_record_is_never_overwritten and a_patch_publishes_only_the_credential_it_changed; tests/manage_go.rs (manage_go.json, save_bytes: file bytes after status and fields saves), tests/management.rs fields_refuses_values_its_auth_loader_cannot_read; src/management/auth_files.rs a_codex_save_waits_for_the_credential_lock (a Codex save under the file's credential lock, as PersistCodexAuthFile), a_codex_save_stops_waiting_for_the_lock_at_shutdown | manage | Suite changed since 6fecc6e. ponytail: Go answers 404 when the record was re-registered (registration epoch) between read and apply; Rust applies the patch to the current record. Go's cases are not ported one by one. Deliberate differences (docs/DIFFERENCES-FROM-GO.md, Management JSON bodies and Auth file saves). |
@@ -2191,7 +2191,7 @@ Method: `docs/parity-audit/audit.py` regenerates this file. Routes come from `pr
 | M6-0184 | internal/pluginhost/host_test.go | partial | implementation cites host.go (crates/cpa-plugin/src/host.rs); no case matched by name | plugins | Suite changed since 6fecc6e; existing fixtures do not establish every v8.0.35 assertion. See the current Go declarations in checklist.md. |
 | M6-0185 | internal/pluginhost/http_bridge_test.go | partial | implementation cites http_bridge.go (crates/cpa-plugin/src/hosthttp.rs, crates/cpa-plugin/tests/host_http.rs); no case matched by name | plugins |  |
 | M6-0186 | internal/pluginhost/http_operation_bridge_test.go | partial | implementation cites http_operation_bridge.go (crates/cpa-plugin/src/hosthttp.rs); no case matched by name | plugins |  |
-| M6-0187 | internal/pluginhost/loader_windows_test.go | covered | docs/DIFFERENCES-FROM-GO.md (Plugins: loading plugins on Windows is not supported) |  | Deliberate difference by owner ruling: Windows plugin loading is unsupported, so these Windows loader cases do not apply. The moved shadow declarations are M6-0260. |
+| M6-0187 | internal/pluginhost/loader_windows_test.go | covered | docs/DIFFERENCES-FROM-GO.md (Supported hosts: Linux only) |  | Deliberate fork difference: this fork builds only for Linux, so the Windows loader cases do not apply. The moved shadow declarations are M6-0260. |
 | M6-0188 | internal/pluginhost/logging_test.go | partial | crates/cpa-plugin/src/callbacks.rs host_log; tests/go_host.rs host.log | plugins | Logging exists; Go's name/version/path field and error-wrapper cases are not reproduced. |
 | M6-0189 | internal/pluginhost/management_test.go | partial | implementation cites management.go (crates/cpa-plugin/src/management.rs); no case matched by name | plugins |  |
 | M6-0190 | internal/pluginhost/model_router_test.go | partial | implementation cites model_router.go (crates/cpa-plugin/src/routing.rs); no case matched by name | plugins | Suite changed since 6fecc6e; existing fixtures do not establish every v8.0.35 assertion. See the current Go declarations in checklist.md. |

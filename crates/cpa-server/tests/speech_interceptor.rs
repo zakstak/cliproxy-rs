@@ -2,7 +2,6 @@
 //! (sdk/api/handlers/openai/openai_speech_handlers.go): Go picks the audio type from
 //! the headers the interceptors changed, falling back to the requested format's type
 //! when they name no audio. The upstream's own type is not passed through.
-#![cfg(unix)]
 
 use std::path::Path;
 use std::sync::Arc;

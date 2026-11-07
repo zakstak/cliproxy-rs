@@ -30,7 +30,7 @@ body:
     id: system
     attributes:
       label: System
-      description: Operating system and how you installed it (install.sh, install.ps1, release binary, Docker, source).
+      description: Host (Linux distribution, or the container runtime and host system) and how you installed it (install.sh, release binary, Docker, source).
   - type: dropdown
     id: go
     attributes:

@@ -230,7 +230,6 @@ async fn login_matches_go_manager_and_file_store() {
                 }
                 let saved = std::fs::read_to_string(&path).unwrap();
                 assert_eq!(normalize_times(&saved), case["file"].as_str().unwrap(), "{name}: file");
-                #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

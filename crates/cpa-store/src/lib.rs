@@ -4,7 +4,7 @@
 //! and reports changes back through [`cpa_server::persist::StorePersister`].
 
 // Used only by the object-store tests, which assert Unix modes.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod fake_s3;
 mod git;
 mod object;

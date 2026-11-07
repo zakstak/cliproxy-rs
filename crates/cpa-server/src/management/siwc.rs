@@ -103,31 +103,14 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 /// The spelling two canonical paths are compared in, never used for I/O: Go's
-/// `filepath.Clean` (`.` dropped, `..` applied lexically, never above the root), with
-/// the verbatim `\\?\C:\` and `\\?\UNC\server\share` prefixes that
-/// `fs::canonicalize` gives on Windows written as `C:\` and `\\server\share`, as
-/// Go's `EvalSymlinks` and `Abs` spell them.
-///
-/// ponytail: a mapped drive that canonicalizes to its UNC share still differs from the
-/// drive-letter spelling once its folder is gone; resolving it needs the mount table.
+/// `filepath.Clean` (`.` dropped, `..` applied lexically, never above the root).
 fn clean(path: &Path) -> PathBuf {
-    use std::path::{Component, Prefix};
+    use std::path::Component;
     let mut out = PathBuf::new();
     let mut depth = 0usize;
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::VerbatimDisk(drive) => out.push(format!("{}:", char::from(drive))),
-                Prefix::VerbatimUNC(server, share) => {
-                    let mut unc = std::ffi::OsString::from(r"\\");
-                    unc.push(server);
-                    unc.push(r"\");
-                    unc.push(share);
-                    out.push(unc);
-                }
-                _ => out.push(prefix.as_os_str()),
-            },
-            Component::RootDir => out.push(component),
+            Component::Prefix(_) | Component::RootDir => out.push(component),
             Component::CurDir => {}
             Component::ParentDir if depth > 0 => {
                 out.pop();
@@ -145,58 +128,20 @@ fn clean(path: &Path) -> PathBuf {
 }
 
 /// Go `sameSIWCMutationPath`: one file (Go `os.SameFile`, which also catches hard links
-/// and another spelling on a case-insensitive file system), else one canonical path,
-/// compared case-insensitively on Windows.
+/// and another spelling on a case-insensitive file system), else one canonical path.
 pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     if let (Some(x), Some(y)) = (file_id(a), file_id(b))
         && x == y
     {
         return true;
     }
-    let (a, b) = (clean(&canonical(a)), clean(&canonical(b)));
-    if cfg!(windows) {
-        a.to_string_lossy().go_eq_fold(&b.to_string_lossy())
-    } else {
-        a == b
-    }
+    clean(&canonical(a)) == clean(&canonical(b))
 }
 
 /// The file `path` names after symlinks, as Go's `os.Stat` identifies it.
-#[cfg(unix)]
 fn file_id(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-}
-
-/// The file `path` names after symlinks, as Go's `os.Stat` identifies it: the volume
-/// serial number and file index (`GetFileInformationByHandle`).
-#[cfg(windows)]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-    };
-    let file = std::fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain integers and FILETIMEs; all zeros is valid.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: `file` stays open for the call and `info` outlives it.
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
-    (ok != 0).then(|| {
-        (
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        )
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_id(_: &Path) -> Option<(u64, u64)> {
-    None
 }
 
 /// Go `resolveSIWCBindFile`: the credential's real path inside `auth-dir` and its
@@ -879,7 +824,6 @@ mod tests {
 
     /// Go `TestSIWCMutationPathAliases`, plus what Go's `os.SameFile` adds: a hard link
     /// is the same file, and a file that is gone matches through its folder's real path.
-    #[cfg(unix)]
     #[test]
     fn mutation_paths_match_every_alias_of_the_file() {
         let dir = std::env::temp_dir().join(format!("cpa-siwc-alias-{}", uuid::Uuid::new_v4()));
@@ -902,7 +846,6 @@ mod tests {
 
     /// With the file and its folder both gone, the binding's canonical path (saved at
     /// start) and a mutation path compare as Go's `Abs` and `Clean` spell them.
-    #[cfg(unix)]
     #[test]
     fn a_gone_folder_compares_cleaned_paths() {
         let root = std::fs::canonicalize(std::env::temp_dir())
@@ -916,30 +859,6 @@ mod tests {
         assert!(same_path(&root.join("auth/./codex.json"), &bound));
         assert!(!same_path(&root.join("auth/../codex.json"), &bound));
         assert!(!same_path(&root.join("other/../auth/other.json"), &bound));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Windows: `fs::canonicalize` gives the verbatim `\\?\` spelling; once the folder
-    /// is gone, the ordinary spelling of the same path still matches, case-insensitively.
-    #[cfg(windows)]
-    #[test]
-    fn a_gone_folder_matches_the_verbatim_binding_path() {
-        let root = std::env::temp_dir().join(format!("cpa-siwc-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("auth")).unwrap();
-        std::fs::write(root.join(r"auth\codex.json"), "{}").unwrap();
-        let bound = std::fs::canonicalize(root.join(r"auth\codex.json")).unwrap();
-        let ordinary = PathBuf::from(bound.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
-        std::fs::remove_dir_all(root.join("auth")).unwrap();
-        assert!(same_path(&ordinary, &bound));
-        assert!(!same_path(&ordinary.with_file_name("other.json"), &bound));
-        assert!(same_path(
-            &PathBuf::from(ordinary.to_str().unwrap().replace(r"\auth\", r"\auth\.\..\AUTH\")),
-            &bound
-        ));
-        assert_eq!(
-            clean(Path::new(r"\\?\UNC\server\share\dir\f.json")),
-            PathBuf::from(r"\\server\share\dir\f.json")
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

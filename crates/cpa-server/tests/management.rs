@@ -419,7 +419,6 @@ async fn remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserve
 }
 
 /// Unix only: the read-only case needs Unix directory permissions.
-#[cfg(unix)]
 #[test]
 fn plaintext_secret_loads_from_a_read_only_config_and_inherited_keys() {
     use std::os::unix::fs::PermissionsExt;
@@ -1672,7 +1671,6 @@ async fn model_definitions_match_go_by_channel() {
 /// Go v8.0.35 `TestGetStaticModelDefinitions_FallsBackToPluginStaticModels`: a plugin
 /// channel lists the plugin's static models in plugin order. The plugin is the Go
 /// recorder test plugin.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_definitions_fall_back_to_plugin_static_models() {
     let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -2070,7 +2068,6 @@ async fn github_token_stays_out_of_the_v0_config_json() {
 /// v8 saves (`migrate` true), clearing and the refusals are the `model_catalog_sources`
 /// scenario in `manage_go.json`; the load refusals are its `load_errors`. Unix only:
 /// `/abs/models.json` is not absolute on Windows.
-#[cfg(unix)]
 #[tokio::test]
 async fn model_catalog_sources_survive_a_legacy_save() {
     let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n  devin-catalog: 'http://localhost/devin.json'\n";
@@ -2100,7 +2097,6 @@ async fn model_catalog_sources_survive_a_legacy_save() {
 /// it is, while the running config keeps the last valid source. Go marshals its valid
 /// in-memory config over the file and saves (DIFFERENCES: v0 setters over a refused file).
 /// Unix only: `/ok/models.json` is not absolute on Windows.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_v0_write_over_a_file_with_an_invalid_catalog_source_is_refused() {
     let raw = "models:\n  catalog: /ok/models.json\n";
@@ -2751,7 +2747,6 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     }
     let last_refresh = saved["last_refresh"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(last_refresh).is_ok() && last_refresh.ends_with('Z'));
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -3224,7 +3219,6 @@ async fn vertex_service_account_import() {
         .replace("us-central1", "us-east1");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), golden);
     // The service account holds a private key: never world-readable.
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -4437,7 +4431,6 @@ async fn siwc_binding_flows_follow_go() {
     }
 
     // The credential file itself may not be a symlink.
-    #[cfg(unix)]
     {
         let target = f.dir.join("auth").join("target.json");
         std::fs::rename(&file, &target).unwrap();

@@ -109,7 +109,6 @@ pub fn filter(include: &[String], exclude: &[String]) -> Result<Vec<Iface>, Stri
 }
 
 /// Go `net.Interfaces()` with addresses.
-#[cfg(unix)]
 pub fn interfaces() -> Result<Vec<Iface>, String> {
     use std::collections::BTreeMap;
     use std::ffi::CStr;
@@ -170,10 +169,4 @@ pub fn interfaces() -> Result<Vec<Iface>, String> {
     // SAFETY: `head` came from a successful getifaddrs.
     unsafe { libc::freeifaddrs(head) };
     Ok(by_index.into_values().collect())
-}
-
-// ponytail: LAN discovery is Unix-only; Windows needs GetAdaptersAddresses.
-#[cfg(not(unix))]
-pub fn interfaces() -> Result<Vec<Iface>, String> {
-    Err("network interface enumeration is not supported on this platform".into())
 }

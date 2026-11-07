@@ -339,14 +339,10 @@ impl Dsn {
             _ => bail!("cannot parse dsn: sslmode is invalid"),
         };
         // pgx: no TLS over Unix sockets.
-        #[cfg(unix)]
         let unix_only = config
             .get_hosts()
             .iter()
             .all(|h| matches!(h, tokio_postgres::config::Host::Unix(_)));
-        // tokio-postgres has Unix-socket hosts on Unix only.
-        #[cfg(not(unix))]
-        let unix_only = false;
         let root_cert = tls.root_cert.filter(|p| !p.is_empty()).map(PathBuf::from);
         // pgx: `require` with a root certificate verifies like `verify-ca`.
         let verify = matches!(mode, TlsMode::VerifyCa | TlsMode::VerifyFull)

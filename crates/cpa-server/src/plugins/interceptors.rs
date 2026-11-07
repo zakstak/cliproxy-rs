@@ -1237,7 +1237,6 @@ mod tests {
 
     /// Go detaches the observer from the request (`context.WithoutCancel`): an observer
     /// that calls `host.http.do` after its request was canceled still gets through.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     // Only CI's media relay job enables the feature, and it has no Go toolchain; the
     // workspace test job runs this test, where CPA_TEST_NO_SKIP fails a missing one.

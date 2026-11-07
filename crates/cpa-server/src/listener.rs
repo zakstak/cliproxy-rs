@@ -31,13 +31,9 @@ pub fn bind(host: &str, port: u16) -> io::Result<std::net::TcpListener> {
 }
 
 /// The host has no usable IPv6: the address family is unsupported or `::` cannot be
-/// assigned. Windows reports Winsock codes, not the C runtime's errno values.
+/// assigned.
 fn no_ipv6(e: &io::Error) -> bool {
-    #[cfg(not(windows))]
-    const EAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
-    #[cfg(windows)]
-    const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
-    e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(EAFNOSUPPORT)
+    e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EAFNOSUPPORT)
 }
 
 fn listen(domain: Domain, addr: SocketAddr, dual_stack: bool) -> io::Result<std::net::TcpListener> {
@@ -45,23 +41,12 @@ fn listen(domain: Domain, addr: SocketAddr, dual_stack: bool) -> io::Result<std:
     if dual_stack {
         socket.set_only_v6(false)?;
     }
-    // Go sets SO_REUSEADDR except on Windows, where it would let another socket bind a
-    // port already in use (net/sockopt_windows.go).
-    #[cfg(not(windows))]
+    // Go sets SO_REUSEADDR (net/sockopt_posix.go).
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     Ok(socket.into())
-}
-
-#[cfg(all(test, unix))]
-#[test]
-fn only_missing_ipv6_falls_back_to_ipv4() {
-    assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EAFNOSUPPORT)));
-    assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)));
-    assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EADDRINUSE)));
-    assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EACCES)));
 }
 
 /// ALPN offer in wire form, in Go's order (`NextProtos: {"h2", "http/1.1"}`); the
@@ -254,7 +239,6 @@ fn go_socket_defaults(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let interval = std::time::Duration::from_secs(15);
     let keepalive = socket2::TcpKeepalive::new().with_time(interval).with_interval(interval);
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     let keepalive = keepalive.with_retries(9);
     let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
 }
@@ -326,6 +310,14 @@ mod tests {
     use btls::x509::extension::SubjectAlternativeName;
     use btls::x509::{X509, X509NameBuilder};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn only_missing_ipv6_falls_back_to_ipv4() {
+        assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EAFNOSUPPORT)));
+        assert!(no_ipv6(&io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)));
+        assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EADDRINUSE)));
+        assert!(!no_ipv6(&io::Error::from_raw_os_error(libc::EACCES)));
+    }
 
     fn cfg(yaml: &str) -> Config {
         Config::parse(yaml).unwrap()
@@ -521,8 +513,6 @@ mod tests {
         assert!(accepted.nodelay().unwrap());
         let socket = socket2::SockRef::from(&accepted);
         assert!(socket.keepalive().unwrap());
-        // Windows cannot read keep-alive timings back.
-        #[cfg(target_os = "linux")]
         {
             assert_eq!(socket.tcp_keepalive_time().unwrap(), std::time::Duration::from_secs(15));
             assert_eq!(

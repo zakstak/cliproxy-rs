@@ -61,7 +61,6 @@ priority = 50
 command = '.config/private-tmpdir.sh'
 
 [[profile.default.scripts]]
-platform = { host = 'cfg(unix)' }
 filter = 'package(cpa-plugin) | binary_id(/^cpa-server::plugin_/) | binary_id(/^cliproxy::plugin_/)'
 setup = 'private-tmpdir'
 
@@ -71,7 +70,6 @@ setup = 'private-tmpdir'
 command = '.config/goplugins-dir.sh'
 
 [[profile.default.scripts]]
-platform = { host = 'cfg(unix)' }
 filter = 'all()'
 setup = 'goplugins-dir'
 

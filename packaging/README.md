@@ -1,12 +1,10 @@
 # Packaging
 
-Package files for the published release binaries. Nothing here is submitted automatically.
+Package files for the published release binaries. Nothing here is submitted automatically. This fork supports Linux only, so it keeps no Homebrew, winget or other Windows or macOS packages.
 
-- `homebrew/`: the tap formula, rendered from each release's `SHA256SUMS` and pushed to the tap by `.github/workflows/release.yml`.
 - `aur/`: `cliproxy-rs-bin` for Arch Linux, x86_64 and aarch64.
-- `winget/`: `VayunGodara.cliproxy-rs` for Windows, x64.
 
-The AUR and winget files are for v0.4.1. Their hashes are the release's `SHA256SUMS` entries.
+The AUR files are for v0.4.1. Their hashes are the release's `SHA256SUMS` entries.
 
 ## AUR
 
@@ -27,23 +25,3 @@ For a new release, set `pkgver`, set `pkgrel=1`, and copy the two `unknown-linux
 makepkg -f && namcap PKGBUILD *.pkg.tar.zst
 makepkg --printsrcinfo > .SRCINFO
 ```
-
-## winget
-
-Submissions are pull requests to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs). On Windows:
-
-```powershell
-winget validate --manifest packaging\winget\manifests\v\VayunGodara\cliproxy-rs\0.4.1
-winget install --manifest packaging\winget\manifests\v\VayunGodara\cliproxy-rs\0.4.1
-wingetcreate submit packaging\winget\manifests\v\VayunGodara\cliproxy-rs\0.4.1
-```
-
-`winget install --manifest` needs `winget settings --enable LocalManifestFiles` in an administrator shell. Without `wingetcreate`, fork winget-pkgs, copy the folder to the same path under `manifests/` and open the pull request.
-
-Later versions can be submitted once the package exists:
-
-```powershell
-wingetcreate update VayunGodara.cliproxy-rs --version <version> --urls https://github.com/vayungodara/cliproxy-rs/releases/download/v<version>/cliproxy-<version>-x86_64-pc-windows-msvc.zip --submit
-```
-
-The archive's folder name contains the version, so check that `RelativeFilePath` in the installer manifest names the new folder.

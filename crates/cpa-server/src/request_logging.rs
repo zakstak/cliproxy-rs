@@ -985,8 +985,7 @@ impl Spool {
         let path = dir.join(format!("{prefix}-{}.tmp", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        // Go's os.OpenFile modes; Windows ignores them.
-        #[cfg(unix)]
+        // Go's os.OpenFile modes.
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let file = options.open(&path)?;
         Ok(Self { file, path })
@@ -1809,7 +1808,6 @@ fn unique_file(dir: &Path, filename: &str) -> io::Result<File> {
         };
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
         match options.open(dir.join(name)) {
             Ok(file) => return Ok(file),

@@ -36,11 +36,10 @@ pub trait Loader: Send + Sync + 'static {
     ) -> Result<Arc<dyn PluginClient>, String>;
 }
 
-/// `dlopen`-based loader (Unix). Other platforms report plugins as unsupported.
+/// `dlopen`-based loader.
 pub struct NativeLoader;
 
 impl Loader for NativeLoader {
-    #[cfg(unix)]
     fn open(
         &self,
         file: &PluginFile,
@@ -49,21 +48,6 @@ impl Loader for NativeLoader {
     ) -> Result<Arc<dyn PluginClient>, String> {
         crate::native::NativeClient::open(&file.path, &file.id, handler, instance)
             .map(|c| Arc::new(c) as Arc<dyn PluginClient>)
-    }
-
-    // ponytail: Go's Windows loader shadow-copies the DLL and calls through
-    // syscall.NewCallback; not ported. Same error as Go builds without cgo.
-    #[cfg(not(unix))]
-    fn open(
-        &self,
-        file: &PluginFile,
-        _: Arc<dyn CallbackHandler>,
-        _: Arc<CallbackInstance>,
-    ) -> Result<Arc<dyn PluginClient>, String> {
-        Err(format!(
-            "standard dynamic library plugin loading requires cgo on this platform: {}",
-            file.path.display()
-        ))
     }
 }
 

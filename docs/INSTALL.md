@@ -1,142 +1,112 @@
 # Installing cliproxy-rs
 
-cliproxy-rs is one executable, `cliproxy` (`cliproxy.exe` on Windows), with the dashboard built in. It needs a `config.yaml` and a directory for credential files. Nothing else is installed.
+cliproxy-rs is one executable, `cliproxy`, with the dashboard built in. It needs a `config.yaml` and a directory for credential files. Nothing else is installed.
+
+## Supported hosts
+
+This fork runs on Linux only: natively on a Linux host, or in the Linux container from the repository's `Dockerfile`. It builds no native Windows or macOS binaries. A native Windows or macOS build stops at once with an error that points here.
+
+On a Windows or macOS computer, run the proxy in the Linux container ([Windows and macOS: run the Linux container](#windows-and-macos-run-the-linux-container)) or on a Linux machine you can reach. The tools that use the proxy, such as Codex CLI, Claude Code and the dashboard in your browser, still run on Windows and macOS and connect to it over HTTP.
+
+## Pick an installation path
+
+This fork, [zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs), has published no release binaries yet. Install it in one of two ways:
+
+- On a Linux host, [build it from source](#from-source), then [write the config](#first-run-without-the-install-script) or [run it as a service](#running-as-a-system-service).
+- On any host with a container runtime, [build and run the Linux container](#docker).
+
+The install script and the release archives below apply once this fork publishes a release. The upstream project's installer (`vayungodara/cliproxy-rs`) installs upstream builds, not this fork.
 
 ## With the install script
 
-On macOS or Linux:
+`install.sh` in this repository installs a release of this fork. Until one is published, it stops before it changes anything, with `no release is published yet; build from source`. On a system other than Linux, it also stops at once and points to the container. It needs no `sudo`, Rust or any other tool. Run it from a checkout:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh
+sh install.sh
 ```
 
-On Windows, in PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1 | iex
-```
-
-Neither needs `sudo`, administrator rights, Rust or any other tool. The first run:
+Once a release exists, the first run:
 
 1. Picks the release archive for your system, downloads it with the release's `SHA256SUMS`, and stops without installing anything if the checksum does not match.
-2. Installs the binary: `~/.local/bin/cliproxy` on macOS and Linux, `%LOCALAPPDATA%\Programs\cliproxy-rs\cliproxy.exe` on Windows.
-3. If `~/.cliproxy-rs/config.yaml` does not exist (`%USERPROFILE%\.cliproxy-rs` on Windows), writes it: the server listens on `127.0.0.1`, on port 8317 or the next free port if something such as CLIProxyAPI already uses 8317, with a credential folder `auth` and session affinity on. It creates a client key and a management key and saves both in `keys.env` next to the config. Only you can read the folder, and the script never prints the keys.
+2. Installs the binary as `~/.local/bin/cliproxy`.
+3. If `~/.cliproxy-rs/config.yaml` does not exist, writes it: the server listens on `127.0.0.1`, on port 8317 or the next free port if something such as CLIProxyAPI already uses 8317, with a credential folder `auth` and session affinity on. It creates a client key and a management key and saves both in `keys.env` next to the config. Only you can read the folder, and the script never prints the keys.
 4. Starts the server in the background, logging to `cliproxy.log`, and checks that `/healthz` answers.
 5. Prints the dashboard address and opens it in your browser when there is one.
 
-Sign in to the dashboard with the `CLIPROXY_MANAGEMENT_KEY` line from `keys.env` (`cat ~/.cliproxy-rs/keys.env`, or `Get-Content ~\.cliproxy-rs\keys.env` on Windows). Your tools use `CLIPROXY_CLIENT_KEY`.
+Sign in to the dashboard with the `CLIPROXY_MANAGEMENT_KEY` line from `keys.env` (`cat ~/.cliproxy-rs/keys.env`). Your tools use `CLIPROXY_CLIENT_KEY`.
 
-Running the script again upgrades the binary to the latest release and restarts the server. On macOS and Linux, a current binary is left alone only when the managed server is running and its last-start marker is at least as new as the binary. A rerun after `--binary-only` or an interrupted upgrade starts the installed version without downloading it again. Unix upgrades keep a hard link at `cliproxy.prev`; Windows stages and checks the replacement before renaming the running executable. Both restore the previous image and verify it answers if startup fails. Neither script changes an existing `config.yaml` or `keys.env`. Probes and printed dashboard addresses follow the configured host, port and TLS setting; wildcard hosts use loopback. The Windows installer requires a release with `--log-file` and `--working-dir`; older releases are refused before the existing installation changes.
+Running the script again upgrades the binary to the latest release and restarts the server. A current binary is left alone only when the managed server is running and its last-start marker is at least as new as the binary. A rerun after `--binary-only` or an interrupted upgrade starts the installed version without downloading it again. Upgrades keep a hard link at `cliproxy.prev`, and if startup fails the script restores the previous image and checks that it answers. The script never changes an existing `config.yaml` or `keys.env`. Probes and printed dashboard addresses follow the configured host, port and TLS setting; wildcard hosts use loopback.
 
 On a machine without a browser, such as a server you reach over SSH, keep the server on `127.0.0.1` and open an SSH tunnel from your own computer, for example `ssh -L 8317:127.0.0.1:8317 you@server`, then open `http://127.0.0.1:8317/management.html` there. [Tailscale](MULTI-ACCOUNT.md#reach-the-proxy-from-other-machines) works too. Never listen on `0.0.0.0` without client keys.
 
-Read [install.sh](../install.sh) or [install.ps1](../install.ps1) before you run them if you prefer.
+Read [install.sh](../install.sh) before you run it if you prefer.
 
 ### Options
 
-| install.sh | install.ps1 | Effect |
-| --- | --- | --- |
-| `--service` | `-Service` | Also start cliproxy-rs at login; see below. |
-| `--binary-only` | `-BinaryOnly` | Install or upgrade the binary and stop there. |
-| `--check` | — | Report installed and available versions without downloading a binary, changing files or restarting. |
+| Option | Effect |
+| --- | --- |
+| `--service` | Also start cliproxy-rs at login; see below. |
+| `--binary-only` | Install or upgrade the binary and stop there. |
+| `--check` | Report installed and available versions without downloading a binary, changing files or restarting. |
 
-Pass options to a piped script like this:
+Pass options after the script name, for example `sh install.sh --service`.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh -s -- --service
-```
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1))) -Service
-```
-
-Both scripts read these environment variables:
+The script reads these environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CLIPROXY_VERSION` | the latest release | Release tag to install, such as `v0.1.0`. |
-| `CLIPROXY_INSTALL_DIR` | `~/.local/bin`, or `%LOCALAPPDATA%\Programs\cliproxy-rs` | Where the binary goes. |
-| `CLIPROXY_HOME` | `~/.cliproxy-rs`, or `%USERPROFILE%\.cliproxy-rs` | Config, keys, credentials and log. |
+| `CLIPROXY_INSTALL_DIR` | `~/.local/bin` | Where the binary goes. |
+| `CLIPROXY_HOME` | `~/.cliproxy-rs` | Config, keys, credentials and log. |
 | `CLIPROXY_NO_OPEN` | unset | Set to `1` to never open a browser. |
-| `CLIPROXY_RELEASES` | `https://github.com/vayungodara/cliproxy-rs/releases` | Release page base URL for a mirror or installer tests. Unless `CLIPROXY_VERSION` is set, a HEAD request for `<base>/latest` must redirect to a final URL ending in `/tag/<tag>`: the installers read the tag from that URL. It must also serve `/download/<tag>/SHA256SUMS` and the platform archive under `/download/<tag>/`. |
+| `CLIPROXY_RELEASES` | `https://github.com/zakstak/cliproxy-rs/releases` | Release page base URL for a mirror or installer tests. Unless `CLIPROXY_VERSION` is set, a HEAD request for `<base>/latest` must redirect to a final URL ending in `/tag/<tag>`: the installer reads the tag from that URL. It must also serve `/download/<tag>/SHA256SUMS` and the platform archive under `/download/<tag>/`. |
 
 Use only a mirror you trust. The installer checks the archive against the `SHA256SUMS` file from that same mirror.
 
 ### Start at login
 
-Without `--service`, the server runs until the computer restarts (on Windows, until you sign out). With it:
+Without `--service`, the server runs until the computer restarts. With it, the script writes a systemd user unit, `~/.config/systemd/user/cliproxy.service`, and enables and starts it. The unit runs while you are logged in; for a server that should run without a login session, run `loginctl enable-linger` once. Stop it with `systemctl --user disable --now cliproxy`.
 
-- Linux: a systemd user unit, `~/.config/systemd/user/cliproxy.service`, enabled and started. It runs while you are logged in; for a server that should run without a login session, run `loginctl enable-linger` once. Stop it with `systemctl --user disable --now cliproxy`.
-- macOS: a launchd agent, `~/Library/LaunchAgents/io.github.vayungodara.cliproxy-rs.plist`, which also restarts the server if it crashes. Stop it with `launchctl bootout gui/$(id -u)/io.github.vayungodara.cliproxy-rs` and delete the file.
-- Windows: an entry named `cliproxy-rs` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that runs `cliproxy.exe --config ... --log-file ... --working-dir ...` directly when you sign in. A console or Windows Terminal window may flash briefly before the server detaches. The working directory is your config folder, including at sign-in, so its `.env` and relative paths resolve as they do after installation. No PowerShell, WMI or cmd.exe launcher remains. Process logs rotate at 10 MiB. With a positive `logs-max-total-size-mb`, they share that budget with the normal log directory, including rotations outside that directory; the existing cleaner runs every minute. With the default `0`, normal logs remain unlimited, but `--log-file` rotations have a separate 32 MiB total cap, enforced at startup and rotation without another timer. Neither cleanup path deletes the active output file, which can exceed the budget. `logging-to-file: true` still writes `main.log` for the dashboard. Remove the entry with `Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name cliproxy-rs`.
+For a binary you built yourself, write the same unit by hand. Adjust the paths:
+
+```ini
+# ~/.config/systemd/user/cliproxy.service
+[Unit]
+Description=cliproxy-rs
+
+[Service]
+ExecStart=%h/.local/bin/cliproxy --config %h/.cliproxy-rs/config.yaml
+WorkingDirectory=%h/.cliproxy-rs
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then run `systemctl --user daemon-reload` and `systemctl --user enable --now cliproxy`.
 
 Once set up, later upgrades restart the server through the same mechanism. The System page checks for a new release only when clicked, with an anonymous HEAD request cached for 12 h. Set `CLIPROXY_NO_UPDATE_CHECK=1` in the server's environment before starting it to disable these checks. Release checks use the configured `proxy-url`, or the environment proxy when none is set, and never send tokens or cookies; proxy credentials go only to your proxy, with TLS verification on and redirects off.
 
 ### Removing it
 
-Stop the server (`kill $(cat ~/.cliproxy-rs/cliproxy.pid)` or the Unix service command above), then delete the binary. On Windows, select the process by its config path, because a direct sign-in launch does not update the installer's pid file:
-
-```powershell
-$config = Join-Path $env:USERPROFILE '.cliproxy-rs\config.yaml'
-Get-CimInstance Win32_Process -Filter "Name LIKE 'cliproxy%.exe'" |
-  Where-Object { $_.CommandLine -and $_.CommandLine.Contains($config) } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId }
-```
-
-Use your actual config path if you set `CLIPROXY_HOME`. This leaves other configurations sharing the binary directory running. `~/.cliproxy-rs` holds your config, keys and signed-in accounts; delete it only if you no longer need them.
-
-## Homebrew
-
-On macOS or Linux, install from the tap:
-
-```sh
-brew install vayungodara/tap/cliproxy-rs
-brew services start cliproxy-rs
-```
-
-The formula downloads the release binary for Apple silicon, Intel macOS, Linux arm64 or Linux x86_64; it does not compile Rust. Linux needs glibc 2.35 or newer, as with the release archives. Homebrew may also install its own runtime dependencies on older Linux systems; these are separate from the cliproxy binary.
-
-On first install, it creates `$(brew --prefix)/etc/cliproxy-rs/config.yaml`, listening only on `127.0.0.1:8317`, with generated client and management keys in `keys.env` beside it. The directory is private and the config and keys are readable only by the installing user. Sign-in credentials go in its `auth` subdirectory. An upgrade never replaces an existing config or keys. If the config is missing but `keys.env` remains, the formula reuses those keys.
-
-Open `http://127.0.0.1:8317/management.html` and use `CLIPROXY_MANAGEMENT_KEY` from `keys.env` to sign in. Your tools use `CLIPROXY_CLIENT_KEY`. If another server uses port 8317, change `server.port` in the config before starting the service. Run the service as your own user, without `sudo`.
-
-The service passes the config path explicitly, so it does not depend on the current directory. Logs go to `$(brew --prefix)/var/log/cliproxy-rs.log`. Stop it with `brew services stop cliproxy-rs`; remove the binary with `brew uninstall cliproxy-rs`. Your config, keys and sign-in credentials remain until you delete them yourself.
-
-For maintainers: add `HOMEBREW_TAP_TOKEN` to this repository's Actions secrets. Give that token contents write access to the tap only. Publishing a stable release renders `Formula/cliproxy-rs.rb` from the release's `SHA256SUMS` and commits it to the tap. Without the token, the job skips the update; prereleases do not update the formula. Publishing does not rerun the release builds. The template lives in [`packaging/homebrew/cliproxy-rs.rb`](../packaging/homebrew/cliproxy-rs.rb).
-
-## Scoop
-
-On Windows, install from the bucket:
-
-```powershell
-scoop bucket add vayungodara https://github.com/vayungodara/scoop-bucket
-scoop install vayungodara/cliproxy-rs
-```
-
-Scoop installs the binary only. Create the config and keys as in [First run without the install script](#first-run-without-the-install-script).
+Stop the server (`kill $(cat ~/.cliproxy-rs/cliproxy.pid)` or the service command above), then delete the binary. `~/.cliproxy-rs` holds your config, keys and signed-in accounts; delete it only if you no longer need them.
 
 ## From a release
 
-Each [release](https://github.com/vayungodara/cliproxy-rs/releases) has an archive per platform and a `SHA256SUMS` file:
+This fork has published no releases yet. `.github/workflows/release.yml` builds, for each tagged release of this fork, an archive per Linux platform and a `SHA256SUMS` file:
 
 | Platform | Archive |
 | --- | --- |
 | Linux x86_64 | `cliproxy-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux arm64 | `cliproxy-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Apple silicon | `cliproxy-<version>-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `cliproxy-<version>-x86_64-apple-darwin.tar.gz` |
-| Windows x86_64 | `cliproxy-<version>-x86_64-pc-windows-msvc.zip` |
 
 The release also carries `management.html`, the dashboard as a single file for Go CLIProxyAPI servers (see [ui/PANEL.md](../ui/PANEL.md)). The Rust binary does not need it.
 
 Check the download before you run it:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS      # Linux
-shasum -a 256 --check --ignore-missing SHA256SUMS  # macOS
+sha256sum --check --ignore-missing SHA256SUMS
 ```
-
-On Windows, compare the output of `Get-FileHash cliproxy-<version>-x86_64-pc-windows-msvc.zip` with the line in `SHA256SUMS`.
 
 Unpack and put the binary on your `PATH`:
 
@@ -146,25 +116,23 @@ sudo install -m 0755 cliproxy-<version>-x86_64-unknown-linux-gnu/cliproxy /usr/l
 cliproxy --version
 ```
 
-The macOS binaries are not signed or notarized. If Gatekeeper blocks the first run, remove the quarantine flag with `xattr -d com.apple.quarantine /usr/local/bin/cliproxy`.
-
 The Linux binaries link against glibc and libstdc++ and run on current distributions (Debian 12, Ubuntu 22.04 and later, Fedora, Arch). For Alpine or other musl systems, build from source or use the Docker image.
 
 ## From source
 
-For contributors, and for systems without a release binary such as Alpine or other musl systems. You need a Rust toolchain (stable, 1.88 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
+This is the way to install this fork on a Linux host today. You need a Rust toolchain (stable, 1.88 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get install -y build-essential cmake clang perl git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-On macOS, `xcode-select --install` and `brew install cmake` are enough. On Windows, install Visual Studio Build Tools with the C++ workload, CMake, LLVM (bindgen needs `libclang`) and NASM (BoringSSL's x86_64 assembly), for example `choco install cmake llvm nasm`, and put NASM on `PATH`. The Windows build is produced by the release workflow and has not been tested by hand.
+The build target must be Linux. A `cargo build` for a Windows or macOS target stops with an error that points to the container instead.
 
 Then build:
 
 ```sh
-git clone https://github.com/vayungodara/cliproxy-rs.git
+git clone https://github.com/zakstak/cliproxy-rs.git
 cd cliproxy-rs
 cargo build --release -p cliproxy
 ./target/release/cliproxy --version
@@ -176,7 +144,9 @@ The dashboard in `ui/dist` is committed, so Node is not needed for a normal buil
 
 ## Docker
 
-The repository's `Dockerfile` builds the binary and copies it into a small Debian image that runs as an unprivileged user. The build compiles BoringSSL and needs about 2 GB of memory; on a small machine add `--build-arg BUILD_JOBS=1`.
+The repository's `Dockerfile` builds the binary and copies it into a small Debian image that runs as an unprivileged user (uid and gid 10001). The build compiles BoringSSL and needs about 2 GB of memory; on a small machine add `--build-arg BUILD_JOBS=1`. This is also how to run the proxy on Windows and macOS; see [Windows and macOS: run the Linux container](#windows-and-macos-run-the-linux-container).
+
+On a Linux host, a bind mount keeps the config and credentials in a folder you can read:
 
 ```sh
 docker build -t cliproxy-rs .
@@ -194,13 +164,86 @@ Inside the container the config is `/data/config.yaml`. In that config:
 
 The image declares no `VOLUME`, so `/data` persists only where you mount one: `-v` as above, a named Docker volume, or your host's volume feature. On Railway, attach a Railway Volume mounted at `/data`; Railway mounts volumes as root, so also set `RAILWAY_RUN_UID=0` on the service, as [Railway's volume docs](https://docs.railway.com/volumes#permissions) say for images that run as another user (the proxy then runs as root). Without a mount, credentials and dashboard changes stay in the container and are lost when it is removed. Images up to 0.2.5 declared `VOLUME ["/data"]`, so a container started from one without a mount kept `/data` in an anonymous volume; reattach or copy that volume before you recreate the container from a newer image.
 
-The server must be able to write to `data/`: it saves the hashed management key into `config.yaml` on first start, and the dashboard writes settings and credential files. If it cannot, the key stays in plain text and saves fail, which is what the `chown` above prevents. Publish the port on `127.0.0.1` unless other machines need access; see [running it safely](GETTING-STARTED.md#running-it-safely).
+The server must be able to write to `/data`: it saves the hashed management key into `config.yaml` on first start, and the dashboard writes settings and credential files. If it cannot, the key stays in plain text and saves fail, which is what the `chown` above prevents. Publish the port on `127.0.0.1` unless other machines need access; see [running it safely](GETTING-STARTED.md#running-it-safely).
 
-Browser sign-in inside a container needs the OAuth callback ports (54545 for Claude, 1455 for Codex) published to your machine, so it is usually easier to sign in from the dashboard and paste the final callback URL, or to use `--codex-device-login`, Kimi or Meta, which use device codes:
+### Sign in to accounts from a container
+
+A browser sign-in ends with a redirect to a callback port on `127.0.0.1`. How that redirect reaches the proxy depends on where you start the sign-in.
+
+**From the dashboard (recommended).** For Claude, Codex and Antigravity, the server starts a callback forwarder on the provider's port, listening on all of the container's interfaces. It redirects the browser on to `http://127.0.0.1:<server.port>/<provider>/callback`. For that to work:
+
+- Publish each callback port with the same number on the host: 54545 (Claude), 1455 (Codex) and 51121 (Antigravity).
+- Publish the server port with the same number too (`-p 127.0.0.1:8317:8317` for the default `server.port: 8317`), because the redirect names `server.port`.
+
+```sh
+docker run -d --name cliproxy \
+  -p 127.0.0.1:8317:8317 -p 127.0.0.1:54545:54545 -p 127.0.0.1:1455:1455 -p 127.0.0.1:51121:51121 \
+  -v "$PWD/data:/data" cliproxy-rs
+```
+
+**From the command line inside the container.** These logins run their own callback listener instead of the forwarder:
+
+- `--claude-login` (port 54545) and `--antigravity-login` (port 51121) listen on all interfaces, so the published ports above reach them. Add `--no-browser` and open the printed URL on the host.
+- `--codex-login` (port 1455), `-siwc-bind` (port 1455) and `--devin-login` listen only on the container's own `127.0.0.1`, which a published port cannot reach. Sign in from the dashboard or use a device-code login instead. `--devin-login` also offers to paste the redirect URL after five seconds.
+
+Device-code logins need no callback port: `--codex-device-login`, Kimi, Meta and xAI. If you cannot publish the callback ports, use one of those, or paste the final callback URL into the dashboard:
 
 ```sh
 docker exec -it cliproxy cliproxy --config /data/config.yaml --codex-device-login
 ```
+
+### Windows and macOS: run the Linux container
+
+This fork has no native Windows or macOS build. On those systems, run the same Linux container with a container runtime such as Docker Desktop or Podman. Your tools keep running natively and connect to `http://127.0.0.1:8317`.
+
+A named volume avoids host file ownership differences: the volume starts with the image's `/data`, owned by the container user. These commands work in a POSIX shell and in PowerShell:
+
+1. Build the image and create the volume:
+
+   ```sh
+   docker build -t cliproxy-rs .
+   docker volume create cliproxy-data
+   ```
+
+2. Write `config.yaml` on your computer with the settings from [Docker](#docker), for example:
+
+   ```yaml
+   server:
+     host: ""
+     port: 8317
+   access:
+     api-keys:
+       - "PASTE-CLIENT-KEY"
+   management:
+     secret-key: "PASTE-MANAGEMENT-KEY"
+     allow-remote: true
+   oauth:
+     auth-dir: "/data/auth"
+   ```
+
+3. Copy it into the volume as the container user, so the server can rewrite it later:
+
+   ```sh
+   cat config.yaml | docker run --rm -i -v cliproxy-data:/data --entrypoint sh cliproxy-rs -c 'mkdir -p /data/auth && cat > /data/config.yaml'
+   ```
+
+   In PowerShell, use `Get-Content config.yaml | docker run ...` with the same arguments.
+
+4. Start the proxy with the server and callback ports published:
+
+   ```sh
+   docker run -d --name cliproxy --restart unless-stopped -p 127.0.0.1:8317:8317 -p 127.0.0.1:54545:54545 -p 127.0.0.1:1455:1455 -p 127.0.0.1:51121:51121 -v cliproxy-data:/data cliproxy-rs
+   ```
+
+5. Check it with `curl http://127.0.0.1:8317/healthz`, then open `http://127.0.0.1:8317/management.html`.
+
+The volume keeps the config and every signed-in account when you remove and recreate the container, for example to move to a newer image. `--restart unless-stopped` starts the proxy again when the container runtime starts.
+
+These steps were tested with rootless Podman on a Linux x86_64 host. They have not been tested on Windows or macOS hosts, on Docker Desktop, or on arm64. Check these points on such a host:
+
+- Whether the container runtime starts at login, which `--restart unless-stopped` needs to bring the proxy back after a reboot.
+- That the browser on the host reaches the published `127.0.0.1` ports, which the callback redirects use.
+- On an Apple silicon Mac, the image builds for arm64 Linux. That build has not been tested.
 
 ## First run without the install script
 
@@ -231,7 +274,7 @@ The server reloads `config.yaml` and the credential directory when they change. 
 
 ## Running as a system service
 
-For a per-user service, use the install script's `--service`. On a Linux server, a system unit like this runs it under a dedicated user:
+For a per-user service, use the systemd user unit from [Start at login](#start-at-login). On a Linux server, a system unit like this runs it under a dedicated user:
 
 ```ini
 # /etc/systemd/system/cliproxy.service
@@ -261,4 +304,3 @@ journalctl -u cliproxy -f
 
 The server writes to `config.yaml` (when the dashboard saves settings or hashes a plaintext management key) and to the credential directory, so both must be writable by the service user.
 
-On Windows, to run it as a system service without a signed-in user, wrap it with a service manager such as NSSM.

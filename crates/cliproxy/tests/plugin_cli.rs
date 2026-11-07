@@ -4,7 +4,6 @@
 //! plugin (exit code, output, the execute request and the auth files written).
 
 // Native plugins load only on Unix (the host's `native` module).
-#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;

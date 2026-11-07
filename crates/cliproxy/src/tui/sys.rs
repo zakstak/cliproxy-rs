@@ -3,18 +3,10 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Go `openBrowser`: starts the platform opener without waiting for it.
+/// Go `openBrowser` on Linux: starts `xdg-open` without waiting for it.
 pub fn open_browser(url: &str) -> std::io::Result<()> {
-    let mut cmd = if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else if cfg!(windows) {
-        let mut c = Command::new("rundll32");
-        c.arg("url.dll,FileProtocolHandler");
-        c
-    } else {
-        Command::new("xdg-open")
-    };
-    cmd.arg(url)
+    Command::new("xdg-open")
+        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -26,12 +18,9 @@ fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
-/// atotto's copy command: wl-copy under Wayland (when wl-paste exists too), then
-/// xclip, xsel, termux-clipboard-set and clip.exe; pbcopy on macOS.
+/// atotto's Linux copy command: wl-copy under Wayland (when wl-paste exists too), then
+/// xclip, xsel, termux-clipboard-set and clip.exe (WSL).
 fn copy_command() -> Option<Vec<&'static str>> {
-    if cfg!(target_os = "macos") {
-        return Some(vec!["pbcopy"]);
-    }
     if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) && on_path("wl-copy") && on_path("wl-paste") {
         return Some(vec!["wl-copy"]);
     }

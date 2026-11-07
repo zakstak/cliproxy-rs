@@ -22,7 +22,7 @@ pub(super) fn go_custom(doc: &Value) -> Result<()> {
 pub fn catalog_sources(section: Option<&Value>) -> Result<()> {
     for name in ["catalog", "codex-catalog", "devin-catalog"] {
         let source = text(section, name, "");
-        if source.is_empty() || go_is_abs(&source, cfg!(windows)) {
+        if source.is_empty() || go_is_abs(&source) {
             continue;
         }
         let url = go_url::parse(&source);
@@ -33,67 +33,9 @@ pub fn catalog_sources(section: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
-/// Go `filepath.IsAbs` (internal/filepathlite): a leading `/` on Unix; on Windows a
-/// drive letter or `\\` volume (UNC, `\\.\`, `\\?\`, `\??\`) followed by a separator.
-pub fn go_is_abs(path: &str, windows: bool) -> bool {
-    if !windows {
-        return path.starts_with('/');
-    }
-    let p = path.as_bytes();
-    let sep = |b: u8| b == b'\\' || b == b'/';
-    let l = windows_volume_len(p);
-    if l == 0 {
-        return false;
-    }
-    if sep(p[0]) && sep(p[1]) {
-        return true;
-    }
-    p.get(l).is_some_and(|&b| sep(b))
-}
-
-/// Go `volumeNameLen` for Windows.
-fn windows_volume_len(p: &[u8]) -> usize {
-    let sep = |b: u8| b == b'\\' || b == b'/';
-    // `pathHasPrefixFold`: separators match either separator, then a separator or the end.
-    let prefix = |prefix: &[u8]| {
-        p.len() >= prefix.len()
-            && prefix.iter().zip(p).all(|(&want, &got)| {
-                if sep(want) {
-                    sep(got)
-                } else {
-                    want.eq_ignore_ascii_case(&got)
-                }
-            })
-            && p.get(prefix.len()).is_none_or(|&b| sep(b))
-    };
-    // `uncLen`: up to the second separator after the prefix.
-    let unc = |from: usize| {
-        p.iter()
-            .enumerate()
-            .skip(from)
-            .filter(|(_, b)| sep(**b))
-            .nth(1)
-            .map_or(p.len(), |(i, _)| i)
-    };
-    if p.len() >= 2 && p[1] == b':' {
-        2
-    } else if p.is_empty() || !sep(p[0]) {
-        0
-    } else if prefix(br"\\.\UNC") {
-        unc(br"\\.\UNC\".len())
-    } else if prefix(br"\\.") || prefix(br"\\?") || prefix(br"\??") {
-        if p.len() == 3 {
-            return 3;
-        }
-        match p[4..].iter().position(|&b| sep(b)) {
-            Some(i) => 4 + i,
-            None => p.len(),
-        }
-    } else if p.len() >= 2 && sep(p[1]) {
-        unc(2)
-    } else {
-        0
-    }
+/// Go `filepath.IsAbs` on Linux: a leading `/`.
+pub fn go_is_abs(path: &str) -> bool {
+    path.starts_with('/')
 }
 
 /// Present non-null value, else Go's pre-decode default.
@@ -326,8 +268,7 @@ pub fn parse_duration(s: &str) -> Option<i64> {
 mod tests {
     use super::{Value, go_is_abs, in_flight, parse_duration};
 
-    /// Go 1.26.4 `TestIsAbs` (path/filepath/path_test.go): `isabstests` on Unix; on
-    /// Windows `winisabstests`, every Unix case false, and every Unix case behind `c:`.
+    /// Go 1.26.4 `TestIsAbs` (path/filepath/path_test.go): `isabstests`.
     #[test]
     fn absolute_paths_follow_go_filepath_is_abs() {
         let unix = [
@@ -340,31 +281,8 @@ mod tests {
             ("./", false),
             ("lala", false),
         ];
-        let windows = [
-            (r"C:\", true),
-            (r"c\", false),
-            (r"c::", false),
-            (r"c:", false),
-            (r"/", false),
-            (r"\", false),
-            (r"\Windows", false),
-            (r"c:a\b", false),
-            (r"c:\a\b", true),
-            (r"c:/a/b", true),
-            (r"\\host\share", true),
-            (r"\\host\share\", true),
-            (r"\\host\share\foo", true),
-            (r"//host/share/foo/bar", true),
-            (r"\\?\a\b\c", true),
-            (r"\??\a\b\c", true),
-        ];
         for (path, want) in unix {
-            assert_eq!(go_is_abs(path, false), want, "{path:?}");
-            assert!(!go_is_abs(path, true), "windows {path:?}");
-            assert_eq!(go_is_abs(&format!("c:{path}"), true), want, "windows c:{path:?}");
-        }
-        for (path, want) in windows {
-            assert_eq!(go_is_abs(path, true), want, "windows {path:?}");
+            assert_eq!(go_is_abs(path), want, "{path:?}");
         }
     }
 

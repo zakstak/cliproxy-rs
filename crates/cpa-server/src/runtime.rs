@@ -3919,8 +3919,7 @@ pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<(
         // create_new is O_CREAT|O_EXCL: it never follows or reuses an existing path.
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // Go's 0600; on Windows Go ignores mode bits and creates the file plainly.
-        #[cfg(unix)]
+        // Go's 0600.
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&tmp) {
             Ok(file) => break (tmp, file),
@@ -4077,7 +4076,6 @@ fn test_hook(site: &'static str, id: &str) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     thread_local! {
@@ -4367,7 +4365,6 @@ pub(crate) mod tests {
         // A stale temp-file-looking path and a symlink must not be reused or followed.
         let victim = dir.join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(
             &victim,
             dir.join(format!(".claude-a.json.{}.0.tmp", std::process::id())),
@@ -4390,7 +4387,6 @@ pub(crate) mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "{\"type\":\"claude\",\"access_token\":\"new\",\"zz_unknown\":{\"k\":[1,2]},\"email\":\"a@x.test\",\"disabled\":true}\n"
         );
-        #[cfg(unix)]
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(
             std::fs::read_to_string(&victim).unwrap(),
@@ -4768,7 +4764,6 @@ pub(crate) mod tests {
             "an unreadable file's snapshot was applied"
         );
         // A FIFO in its place is not opened (reading one blocks until a writer appears).
-        #[cfg(unix)]
         {
             std::fs::remove_dir(&path).unwrap();
             let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
@@ -5297,7 +5292,6 @@ pub(crate) mod tests {
         lease.complete(Outcome::Failure(quota));
         let file = dir.join("a.cds");
         let written = std::fs::read_to_string(&file).expect("cooldown written");
-        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -7764,7 +7758,6 @@ pub(crate) mod tests {
     /// A plugin-routed refresh job that panics records no deadline of the plugin's, so
     /// the refresh state backs it off like any failure instead of starting it again on
     /// the next scan.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(feature = "media-relay", ignore = "needs the Go plugin toolchain")]
     async fn a_panicking_plugin_refresh_backs_off() {

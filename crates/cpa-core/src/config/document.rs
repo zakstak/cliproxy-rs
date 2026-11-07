@@ -637,8 +637,7 @@ impl ConfigDocument {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
-        // Unix: a new file is private. Windows has no mode bits (Go's mode is ignored).
-        #[cfg(unix)]
+        // A new file is private.
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(path)?;
         file.write_all(text.as_bytes())?;

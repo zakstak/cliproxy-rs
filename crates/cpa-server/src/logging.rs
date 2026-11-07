@@ -525,9 +525,7 @@ impl RotatingFile {
         }
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(true);
-        // lumberjack: 0600, or the mode of the file being rotated. Windows has no
-        // mode bits (Go's mode is ignored there).
-        #[cfg(unix)]
+        // lumberjack: 0600, or the mode of the file being rotated.
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             options.mode(previous.map_or(0o600, |info| info.permissions().mode() & 0o7777));
@@ -590,7 +588,6 @@ fn prune_process_rotations(path: &Path, max_bytes: u64) {
 fn create_dir(dir: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o755);
     builder.create(dir)
 }
@@ -856,7 +853,6 @@ mod tests {
         let mut file = RotatingFile::new(path.clone());
         // New file: directory created, mode 0600.
         assert_eq!(file.write(b"12345", 10).unwrap(), 5);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -961,7 +957,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn process_pruning_does_not_drop_a_line_when_directory_scanning_fails() {
         use std::os::unix::fs::PermissionsExt;
@@ -1192,7 +1187,6 @@ mod tests {
         emit("after-clean\n");
         assert!(read(&cli).ends_with("after-clean\n"));
 
-        #[cfg(unix)]
         {
             let alias = dir.join("alias");
             std::os::unix::fs::symlink(&dir, &alias).unwrap();
@@ -1246,7 +1240,6 @@ mod tests {
         );
         emit("still-linked-inside\n");
         assert!(read(&inside).ends_with("still-linked-inside\n"));
-        #[cfg(unix)]
         {
             let alias = dir.join("alias-logs");
             std::os::unix::fs::symlink(&logs, &alias).unwrap();
@@ -1256,11 +1249,6 @@ mod tests {
             );
             std::fs::remove_file(alias).unwrap();
         }
-        #[cfg(windows)]
-        assert_eq!(
-            enforce_size_limit(&logs, 1, Some(&logs.join("PROCESS.LOG")), Some(&spelling)).unwrap(),
-            0
-        );
 
         // Restore stdout for the rest of the process.
         *OUTPUT.lock().unwrap() = Output::Stdout;
