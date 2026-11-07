@@ -272,7 +272,7 @@ enum Seen {
     /// #5 context-window conversion.
     Failure {
         error: ExecError,
-        body: String,
+        body: Bytes,
         deliver: Option<Bytes>,
     },
 }
@@ -291,30 +291,89 @@ struct Observer {
     saw_delta: bool,
 }
 
+/// The lines of one framed event, split as the shared SSE framer splits them: `\r\n`,
+/// a lone `\r` and a lone `\n` each end a line.
+fn sse_lines(frame: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = frame;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let Some(end) = rest.iter().position(|&b| b == b'\r' || b == b'\n') else {
+            let line = rest;
+            rest = &[];
+            return Some(line);
+        };
+        let line = &rest[..end];
+        let crlf = rest[end] == b'\r' && rest.get(end + 1) == Some(&b'\n');
+        rest = &rest[end + if crlf { 2 } else { 1 }..];
+        Some(line)
+    })
+}
+
 /// The `event:` name and `data` payload of one framed SSE event. Several `data:` lines
-/// join with newlines, as SSE defines.
+/// join with newlines, as SSE defines, in one growing buffer.
 fn parse_frame(frame: &[u8]) -> (Option<&str>, Option<Cow<'_, str>>) {
-    let text = String::from_utf8_lossy(frame);
     let mut name = None;
     let mut data: Option<Cow<'_, str>> = None;
-    let borrowed = match text {
-        Cow::Borrowed(text) => text,
+    for line in sse_lines(frame) {
         // An event that is not UTF-8 carries no payload the observer can read.
-        Cow::Owned(_) => return (None, None),
-    };
-    for line in borrowed.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Ok(line) = std::str::from_utf8(line) else {
+            return (None, None);
+        };
         if let Some(value) = line.strip_prefix("event:") {
             name = Some(value.trim());
         } else if let Some(value) = line.strip_prefix("data:") {
             let value = value.strip_prefix(' ').unwrap_or(value);
-            data = Some(match data {
-                None => Cow::Borrowed(value),
-                Some(previous) => Cow::Owned(format!("{previous}\n{value}")),
-            });
+            match &mut data {
+                None => data = Some(Cow::Borrowed(value)),
+                Some(Cow::Owned(joined)) => {
+                    joined.push('\n');
+                    joined.push_str(value);
+                }
+                Some(Cow::Borrowed(first)) => {
+                    let mut joined = String::with_capacity(first.len() + value.len() + 1);
+                    joined.push_str(first);
+                    joined.push('\n');
+                    joined.push_str(value);
+                    data = Some(Cow::Owned(joined));
+                }
+            }
         }
     }
     (name, data)
+}
+
+/// What the client receives for a failure it does not see as an event (a buffered
+/// answer, or a failure before anything was delivered): the provider's error object in
+/// the API's error envelope, byte for byte, with the event's `sequence_number` as
+/// spelled; the whole event when it carries no error object. Nothing is filled in.
+fn delivered_failure(payload: &str) -> Bytes {
+    let whole = || Bytes::copy_from_slice(payload.as_bytes());
+    let Ok(event) = CodexBody::parse(payload.as_bytes()) else {
+        return whole();
+    };
+    fn object<'a>(m: Option<&cpa_common::codex_body::Member<'a>>) -> Option<&'a [u8]> {
+        m.filter(|m| m.kind == Kind::Object).map(|m| m.raw)
+    }
+    let mut error = None;
+    if let Some(response) = object(event.get("response"))
+        && let Ok(response) = CodexBody::parse(response)
+    {
+        error = object(response.get("error"));
+    }
+    let Some(error) = error.or_else(|| object(event.get("error"))) else {
+        return whole();
+    };
+    let mut out = Vec::with_capacity(error.len() + 48);
+    out.extend_from_slice(b"{\"error\":");
+    out.extend_from_slice(error);
+    if let Some(sequence) = event.get("sequence_number") {
+        out.extend_from_slice(b",\"sequence_number\":");
+        out.extend_from_slice(sequence.raw);
+    }
+    out.push(b'}');
+    Bytes::from(out)
 }
 
 impl Observer {
@@ -324,12 +383,7 @@ impl Observer {
             // Each physical line as scanned, and none after the event that ends the
             // response.
             let last = matches!(seen, Seen::Terminal | Seen::EmptyIncomplete | Seen::Failure { .. });
-            let mut lines = frame.split(|&b| b == b'\n').peekable();
-            while let Some(line) = lines.next() {
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
-                if lines.peek().is_none() && line.is_empty() {
-                    break;
-                }
+            for line in sse_lines(frame) {
                 self.wire.chunk(line);
                 if last && line.starts_with(b"data:") {
                     break;
@@ -351,7 +405,8 @@ impl Observer {
         if self.usage.enabled() {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
-        if let Some((error, body)) = response::terminal_failure(payload, self.model_level_cooling) {
+        // Classification reads a copy; the client receives `delivered_failure`.
+        if let Some((error, _classified)) = response::terminal_failure(payload, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client
@@ -364,6 +419,7 @@ impl Observer {
                     })),
                     Cow::Borrowed(_) => None,
                 });
+            let body = delivered_failure(payload);
             return Seen::Failure { error, body, deliver };
         }
         if response::meaningful_delta(payload) {
@@ -424,9 +480,10 @@ fn response_unreadable() -> ExecError {
 }
 
 /// A failure event as a direct error: the scheduler reads its classification, and the
-/// client receives `body`, the event's error object in the API's error envelope.
-fn direct(mut error: ExecError, body: String) -> ExecError {
-    error.body = Bytes::from(body);
+/// client receives `body` ([`delivered_failure`]). An in-stream failure arrived on an
+/// HTTP 200, so the classified status is the only one there is to send.
+fn direct(mut error: ExecError, body: Bytes) -> ExecError {
+    error.body = body;
     error.direct = true;
     error.headers.insert(
         http::header::CONTENT_TYPE,

@@ -189,6 +189,7 @@ fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecErr
         headers: Box::new(headers),
         retry_after,
         direct: false,
+        delivered_status: None,
         addon: None,
         diagnostic: None,
     }

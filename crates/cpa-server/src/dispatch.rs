@@ -60,20 +60,26 @@ pub struct Call {
 }
 
 /// A Responses HTTP request that a Codex credential may serve on the native route
-/// (`docs/codex/CONTRACT.md` "Native HTTP route"). `body` is the client's body before any
-/// route rewrite (the Codex-client preparation, compact's `stream` deletion, plugin
-/// request interceptors); other providers keep receiving the rewritten [`Call::body`].
+/// (`docs/codex/CONTRACT.md` "Native HTTP route"). It holds the client's body, headers
+/// and route path before any rewrite (the Codex-client preparation, compact's `stream`
+/// deletion, plugin before-auth interceptors); other providers keep receiving the
+/// rewritten [`Call`].
 /// Each attempt records whether it ran natively, so the route and the response hooks
 /// treat the answer accordingly: the last attempt is the one that answered.
 pub struct NativeRequest {
     pub body: Bytes,
+    /// The client's headers and route path, before plugin before-auth interceptors.
+    pub headers: HeaderMap,
+    pub path: String,
     served: std::sync::atomic::AtomicBool,
 }
 
 impl NativeRequest {
-    pub fn new(body: Bytes) -> Arc<Self> {
+    pub fn new(body: Bytes, headers: HeaderMap, path: String) -> Arc<Self> {
         Arc::new(Self {
             body,
+            headers,
+            path,
             served: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -2207,6 +2213,8 @@ async fn attempt(
             Some(request) => {
                 req.body = request.body.clone();
                 req.original_body = request.body.clone();
+                req.headers = request.headers.clone();
+                req.request_path = request.path.clone();
                 true
             }
             None => false,

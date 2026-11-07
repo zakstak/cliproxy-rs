@@ -535,6 +535,7 @@ fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         headers: Box::default(),
         retry_after,
         direct: false,
+        delivered_status: None,
         addon: None,
         diagnostic: None,
     }

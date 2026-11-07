@@ -294,7 +294,7 @@ impl CodexExecutor {
 
     /// [`Self::open`] for a known upstream `model` (the quota-snapshot key). With
     /// `direct`, a non-2xx answer keeps its classification (status and scope) for the
-    /// scheduler, and the client receives the upstream body and filtered headers
+    /// scheduler, and the client receives the upstream status, body and filtered headers
     /// unchanged (the native HTTP route).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_for(
@@ -338,10 +338,11 @@ impl CodexExecutor {
             crate::codex_replay::clear_on_invalid_signature(&self.replay, replay, status, &body);
             let mut error = response::status_error(status, &body, upstream.headers, settings.model_level_cooling);
             if direct {
-                // The status stays the classified one: it differs from the upstream's
-                // only for a usage or capacity limit, which is sent as 429.
+                // `status` stays the scheduler's classification (a usage or capacity
+                // limit is classified 429); the client gets the upstream's own status.
                 error.body = body;
                 error.direct = true;
+                error.delivered_status = Some(status);
             }
             return Err(error);
         }

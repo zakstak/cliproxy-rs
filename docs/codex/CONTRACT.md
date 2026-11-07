@@ -272,9 +272,12 @@ turns keep it until #24, and translated requests keep it until #27.
 
 The request goes upstream as the client sent it, with only the permitted
 transformations: the routed `model`, and `stream: true` for a buffered client on
-`chatgpt`. The server keeps the client's bytes in `dispatch::NativeRequest`, from before
-the Codex-client ingress rewrite, compact's `stream` deletion and plugin request
-interceptors, so a native attempt never sees their output. The boundary validates those
+`chatgpt`. The server keeps the client's body, headers and route path in
+`dispatch::NativeRequest`, from before the Codex-client ingress rewrite, compact's
+`stream` deletion and plugin before-auth interceptors, so a native attempt never sees
+their output. A before-auth interceptor still runs, because it runs before a credential
+is chosen; its header changes can still affect credential selection and session
+affinity, but none of its output reaches the native request. The boundary validates those
 bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,
 tool or namespace preparation, or plugin `after_auth` hook runs. A model with a thinking
 suffix, such as `gpt-5.5(high)`, is refused with a 400, because the suffix would need a
@@ -284,7 +287,8 @@ The response reaches the client as the upstream sent it:
 
 - A stream's events are forwarded byte for byte, unknown and private events included,
   with no event renamed, no output repaired and no usage added. Usage, capture and
-  failure classification read a copy.
+  failure classification read a copy. The observer splits lines as the shared SSE
+  framer does (`\r\n`, `\r` or `\n`) and joins a multiline `data` field in one pass.
 - Leading handshake events are held under `stream-bootstrap-buffering`. A failure that
   arrives before anything was delivered fails over to another credential when its scope
   allows it; otherwise the provider's event is delivered. After something was delivered,
@@ -292,14 +296,19 @@ The response reaches the client as the upstream sent it:
 - A stream that ends without a terminal event ends for the client too, without a local
   event. The attempt records a request-scoped 408.
 - An upstream HTTP error keeps its classification for the scheduler, and the client
-  receives its body and filtered headers unchanged. Its status is the classified one,
-  which differs from the upstream's only when the body is a usage or capacity limit,
-  sent as 429.
+  receives the upstream's status, body and filtered headers unchanged
+  (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit
+  as 429 while the client still gets the upstream's 400 or 503.
 - A buffered `chatgpt` answer is the terminal event's `response` object, byte for byte.
-  A failure becomes `{"error":...}` with the provider's error object. On `api-key` and
-  `compatible`, a JSON answer passes unchanged. Compaction answers pass unchanged.
-- Plugin response and chunk interceptors do not run. The plugin lifecycle still
-  completes. The alias `force-mapping` model rewrite does not run either.
+  On `api-key` and `compatible`, a JSON answer passes unchanged. Compaction answers pass
+  unchanged.
+- A failure event the client does not receive as an event (a buffered answer, or a
+  failure before anything was delivered that the scheduler fails over) is delivered as
+  `{"error":<the provider's error object>,"sequence_number":<as sent>}`, byte for byte
+  from the event, or as the whole event when it has no error object. Nothing is filled
+  in. It arrived on an HTTP 200, so its status is the classified one.
+- Plugin after-auth, response and chunk interceptors do not run. The plugin lifecycle
+  still completes. The alias `force-mapping` model rewrite does not run either.
 
 The settings that shape requests on the legacy path have this effect on the native
 route. None of them is obsolete yet, because the legacy paths still use each one, so

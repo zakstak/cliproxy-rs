@@ -497,7 +497,8 @@ pub async fn responses(
     }
     // A native Codex attempt gets the client's own bytes (#23); the rewrite below is for
     // every other provider.
-    let native = dispatch::NativeRequest::new(body.clone());
+    let path = dispatch::route_path(matched.as_ref(), &original.0);
+    let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
     let body = Bytes::from(cpa_common::codex_client::prepare_responses_request(
         &headers, &body, &settings,
     ));
@@ -510,7 +511,7 @@ pub async fn responses(
         peer: dispatch::peer(peer),
         query: String::new(),
         headers,
-        path: dispatch::route_path(matched.as_ref(), &original.0),
+        path,
     };
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(
@@ -1078,7 +1079,8 @@ pub async fn compact(
         Err(rejection) => return read_failed(&rejection),
     };
     // A native Codex attempt gets the client's own bytes (#23), before the rewrites below.
-    let native = dispatch::NativeRequest::new(body.clone());
+    let path = dispatch::route_path(matched.as_ref(), &original.0);
+    let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
     // Go `prepareCodexOrphanDelegation` (compact skips the multi-agent tool step).
     let settings = cpa_common::codex_client::Settings::from_config(&rt.config());
     let mut body = Bytes::from(cpa_common::codex_client::rewrite_orphan_delegation_input(
@@ -1108,7 +1110,7 @@ pub async fn compact(
         peer: dispatch::peer(peer),
         query: String::new(),
         headers,
-        path: dispatch::route_path(matched.as_ref(), &original.0),
+        path,
     };
     let call = call(
         req,

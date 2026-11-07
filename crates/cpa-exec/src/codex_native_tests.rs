@@ -437,3 +437,214 @@ async fn split_data_lines_pass_unchanged() {
     assert!(error.is_none(), "{error:?}");
     assert_eq!(text(&out), stream);
 }
+
+fn observer() -> Observer {
+    Observer {
+        usage: Default::default(),
+        wire: Default::default(),
+        capture_lines: true,
+        model_level_cooling: false,
+        codex_client: false,
+        items: 0,
+        saw_delta: false,
+    }
+}
+
+/// `chunks` through the shared framer and the native stream: what the client receives
+/// and the error that ended it.
+async fn through(chunks: &[&[u8]], hold: Option<Option<Duration>>) -> (Vec<u8>, Option<ExecError>) {
+    let upstream = futures_util::stream::iter(
+        chunks
+            .iter()
+            .map(|c| Ok::<_, ExecError>(Bytes::copy_from_slice(c)))
+            .collect::<Vec<_>>(),
+    );
+    let mut stream = passthrough(crate::upstream::framed(upstream), observer(), hold);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(bytes) => out.extend_from_slice(&bytes),
+            Err(error) => return (out, Some(error)),
+        }
+    }
+    (out, None)
+}
+
+const CREATED: &str = r#"{"type":"response.created","response":{"id":"r"}}"#;
+const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"r","output":[],"n":12345678901234567890}}"#;
+
+fn framed_with(eol: &str) -> String {
+    format!(
+        "event: response.created{eol}data: {CREATED}{eol}{eol}event: response.completed{eol}data: {COMPLETED}{eol}{eol}"
+    )
+}
+
+/// CR-only, CRLF and mixed line endings, in one piece or split anywhere (between `\r`
+/// and `\n` included), with and without held handshake events: the client gets the
+/// exact bytes and the terminal event is recognized.
+#[tokio::test]
+async fn every_sse_line_ending_and_split_passes_unchanged() {
+    let mixed =
+        format!("event: response.created\r\ndata: {CREATED}\r\r\nevent: response.completed\rdata: {COMPLETED}\n\r\n");
+    for body in [framed_with("\r"), framed_with("\r\n"), framed_with("\n"), mixed] {
+        let bytes = body.as_bytes();
+        for hold in [None, Some(None), Some(Some(Duration::from_secs(30)))] {
+            for split in [bytes.len(), 1, 7, bytes.len() / 2] {
+                let chunks: Vec<&[u8]> = bytes.chunks(split.max(1)).collect();
+                let (out, error) = through(&chunks, hold).await;
+                assert!(error.is_none(), "{body:?} split={split}: {error:?}");
+                assert_eq!(text(&out), body, "split={split}");
+            }
+        }
+        // A buffered answer reads the same terminal event.
+        let object = observer().aggregate(bytes).unwrap();
+        assert_eq!(
+            text(&object),
+            r#"{"id":"r","output":[],"n":12345678901234567890}"#,
+            "{body:?}"
+        );
+    }
+}
+
+/// A large multiline event joins in one pass: 60 000 `data:` lines, 3 MB of payload.
+#[test]
+fn a_large_multiline_event_parses_linearly() {
+    let lines = 60_000;
+    let mut frame = String::from("event: response.output_text.delta\n");
+    for i in 0..lines {
+        frame.push_str(&format!("data: {i:0>48}\n"));
+    }
+    frame.push('\n');
+    let (_, data) = parse_frame(frame.as_bytes());
+    let data = data.unwrap();
+    assert_eq!(data.len(), lines * 48 + (lines - 1));
+    assert!(data.starts_with(&format!("{:0>48}\n", 0)));
+    assert!(data.ends_with(&format!("{:0>48}", lines - 1)));
+}
+
+/// A failure the client does not see as an event carries the provider's error object
+/// byte for byte: no message filled in, unknown fields and number spellings kept.
+#[tokio::test]
+async fn failures_deliver_the_raw_error_object() {
+    let error =
+        r#"{"type":"usage_limit_reached","message":null,"resets_at":12345678901234567890,"x_future":{"n":1.50}}"#;
+    let omitted = r#"{"code":"usage_limit_reached","x_future":[]}"#;
+    for raw in [error, omitted] {
+        let failed =
+            format!(r#"{{"type":"response.failed","sequence_number":7.0,"response":{{"id":"r","error":{raw}}}}}"#);
+        let expected = format!(r#"{{"error":{raw},"sequence_number":7.0}}"#);
+        // Before anything was delivered, on a held stream: the attempt fails with it.
+        let sse = format!("data: {CREATED}\n\ndata: {failed}\n\n");
+        let (out, error) = through(&[sse.as_bytes()], Some(None)).await;
+        let error = error.expect("fails");
+        assert!(out.is_empty());
+        assert!(error.direct);
+        assert_eq!(text(&error.body), expected);
+        // A buffered answer: the same.
+        let error = observer().aggregate(sse.as_bytes()).unwrap_err();
+        assert_eq!(text(&error.body), expected);
+    }
+    // An `error` event's own object, and an event without any: the whole event.
+    let event = r#"{"type":"error","error":{"code":"server_is_overloaded","message":""}}"#;
+    let error = observer()
+        .aggregate(format!("data: {event}\n\n").as_bytes())
+        .unwrap_err();
+    assert_eq!(
+        text(&error.body),
+        r#"{"error":{"code":"server_is_overloaded","message":""}}"#
+    );
+    let bare = r#"{"type":"response.failed","response":{"id":"r","status":"failed"}}"#;
+    let error = observer()
+        .aggregate(format!("data: {bare}\n\n").as_bytes())
+        .unwrap_err();
+    assert_eq!(text(&error.body), bare);
+}
+
+/// The client gets the upstream's own HTTP status; the scheduler keeps the classified one.
+#[tokio::test]
+async fn upstream_http_status_is_delivered_apart_from_classification() {
+    let mock = Mock::start().await;
+    for (status, body) in [
+        (
+            400,
+            r#"{"error":{"type":"usage_limit_reached","message":null,"resets_at":1738888888}}"#,
+        ),
+        (
+            503,
+            r#"{"error":{"code":"model_at_capacity","message":"Selected model is at capacity.","x":1.50}}"#,
+        ),
+    ] {
+        mock.script("/responses", vec![json(status, body)]);
+        let error = executor()
+            .execute(
+                &credential(Kind::OAuth, &mock.url),
+                request(fixture("http-request-full").bytes(), "gpt-test", true, None),
+                &Config::default(),
+            )
+            .await
+            .err()
+            .expect("an error");
+        assert_eq!(error.delivered_status, Some(status));
+        assert_eq!(error.status, 429, "classified as a limit for the scheduler");
+        assert_eq!(text(&error.body), body);
+        assert!(error.direct);
+    }
+}
+
+/// The two narrow exceptions stay: an empty `response.incomplete` without a client-side
+/// reason before any delivery is a 502; with `interrupted` it passes unchanged.
+#[tokio::test]
+async fn empty_incomplete_keeps_its_narrow_exception() {
+    let empty = r#"{"type":"response.incomplete","response":{"id":"r","output":[],"usage":{"output_tokens":0}}}"#;
+    let (out, error) = through(&[format!("data: {empty}\n\n").as_bytes()], None).await;
+    assert!(out.is_empty());
+    assert_eq!(error.unwrap().status, 502);
+    let interrupted = r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"output_tokens":0}}}"#;
+    let sse = format!("data: {interrupted}\n\n");
+    let (out, error) = through(&[sse.as_bytes()], None).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&out), sse);
+}
+
+/// An API key on api.openai.com is the `api-key` profile. The request is captured as it
+/// would be sent, then a dead loopback proxy stops it: nothing leaves the machine.
+#[tokio::test]
+async fn the_api_openai_com_profile_maps_without_traffic() {
+    let mut credential = credential(Kind::Key, "https://api.openai.com/v1");
+    credential
+        .attributes
+        .insert("proxy_url".into(), "http://127.0.0.1:9".into());
+    assert_eq!(Profile::of(&View::new(&credential)), Some(Profile::ApiKey));
+    let tap = std::sync::Arc::new(crate::codex_testkit::Wiretap::default());
+    let body = fixture("http-request-full").bytes();
+    let mut req = request(body.clone(), "gpt-test", true, None);
+    req.usage = cpa_core::exec::UsageSink::default().with_capture(cpa_core::exec::CaptureSink::new(tap.clone()));
+    let error = executor()
+        .execute(&credential, req, &Config::default())
+        .await
+        .err()
+        .expect("no route out");
+    assert_eq!(error.scope, FailureScope::Transport, "{error:?}");
+    let sent = tap.taps().into_iter().find_map(|t| match t {
+        crate::codex_testkit::Tap::Request { url, body, headers, .. } => Some((url, body, headers)),
+        _ => None,
+    });
+    let (url, sent, headers) = sent.expect("the request was captured");
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+    assert_eq!(sent, text(&body));
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer key-FAKE")
+    );
+    for (base, profile) in [
+        ("https://API.OPENAI.COM/v1", Profile::ApiKey),
+        ("https://relay.example/v1", Profile::Compatible),
+    ] {
+        assert_eq!(Profile::of(&View::new(&credential_with(base))), Some(profile), "{base}");
+    }
+}
+
+fn credential_with(base: &str) -> Credential {
+    credential(Kind::Key, base)
+}

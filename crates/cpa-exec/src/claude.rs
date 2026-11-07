@@ -841,6 +841,7 @@ fn upstream_error(
             headers: Box::new(headers),
             body,
             direct: true,
+            delivered_status: None,
             addon: None,
             diagnostic: None,
         };
@@ -856,6 +857,7 @@ fn upstream_error(
             body
         },
         direct: false,
+        delivered_status: None,
         addon: None,
         diagnostic: None,
     };

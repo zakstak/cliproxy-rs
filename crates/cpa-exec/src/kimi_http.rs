@@ -159,6 +159,7 @@ pub(crate) async fn status_error(upstream: crate::proxy::Upstream) -> ExecError 
         headers: Box::new(upstream.headers),
         retry_after: None,
         direct: false,
+        delivered_status: None,
         addon: None,
         diagnostic: None,
     }

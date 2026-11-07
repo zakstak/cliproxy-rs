@@ -81,6 +81,7 @@ pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
         headers: Box::default(),
         retry_after: None,
         direct: false,
+        delivered_status: None,
         addon: None,
         diagnostic: None,
     }

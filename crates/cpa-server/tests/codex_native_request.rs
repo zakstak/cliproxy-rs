@@ -480,3 +480,27 @@ async fn operator_rules_cannot_rewrite_native_bodies() {
     let sent = proxy.upstream.http().pop().unwrap();
     assert_eq!(String::from_utf8_lossy(&sent.body), body);
 }
+
+/// The final failure after the attempts run out: the upstream's own status and body,
+/// although the scheduler classified the usage limit as a 429 and cooled the credential.
+#[tokio::test]
+async fn the_final_failure_keeps_the_upstream_status_and_body() {
+    let body =
+        r#"{"error":{"type":"usage_limit_reached","message":null,"resets_at":12345678901234567890,"x":{"n":1.50}}}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::json(400, body)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((status, answer.as_str()), (400, body));
+    assert_eq!(proxy.upstream.http().len(), 1, "one attempt, no replay");
+    // The credential is cooled as a usage limit: the next request does not reach it.
+    let (status, _, _) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!(status, 429);
+    assert_eq!(proxy.upstream.http().len(), 1);
+}

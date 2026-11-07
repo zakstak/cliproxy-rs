@@ -710,6 +710,10 @@ pub struct ExecError {
     /// Send status, body and filtered headers to the client unchanged instead of the
     /// route's normal error shape (claude_executor_fast_error.go).
     pub direct: bool,
+    /// For a `direct` error, the status the client receives when it differs from
+    /// `status`, which stays the scheduler's classification (the Codex native route
+    /// delivers the upstream's own status while a usage limit is classified as 429).
+    pub delivered_status: Option<u16>,
     /// Headers this error hands the client under `requests.passthrough-headers` (Go
     /// `ErrorMessage.Addon`, filled only from errors with `Headers()`: Codex and xAI
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the
@@ -728,6 +732,7 @@ impl ExecError {
             headers: Box::default(),
             retry_after: None,
             direct: false,
+            delivered_status: None,
             addon: None,
             diagnostic: None,
         }
