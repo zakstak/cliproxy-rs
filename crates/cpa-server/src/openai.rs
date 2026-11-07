@@ -572,7 +572,7 @@ pub async fn responses(
 }
 
 /// Go `isCodexResponsesClientRequest`.
-fn codex_client(headers: &HeaderMap) -> bool {
+pub(crate) fn codex_client(headers: &HeaderMap) -> bool {
     let get = |k: &str| {
         headers
             .get(k)
