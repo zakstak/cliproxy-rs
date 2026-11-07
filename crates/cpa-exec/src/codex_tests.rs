@@ -2058,3 +2058,54 @@ fn native_codex_websocket_turns_keep_tool_parallelism_and_output_replay() {
     assert_eq!(field(&other, "parallel_tool_calls"), "true", "{other}");
     assert_eq!(field(&other, "include"), reasoning, "{other}");
 }
+
+/// Issue #8: a WebSocket turn from an official Codex client keeps an explicit
+/// `service_tier`, and the handshake's routing hint names the same tier. Other Responses
+/// clients keep Go's rule, which drops `flex`.
+#[test]
+fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
+    let shaped = |ua: &str, tier: &str| {
+        let credential = oauth_credential("http://127.0.0.1:1");
+        let mut req = plain_request(true, None);
+        (req.source_format, req.response_format) = (Format::OpenAIResponse, Format::OpenAIResponse);
+        req.headers.insert("user-agent", ua.parse().unwrap());
+        req.body = Bytes::from(format!(
+            r#"{{"model":"gpt-5.4","input":[],"store":false,"stream":true{tier}}}"#
+        ));
+        req.original_body = req.body.clone();
+        let view = View::new(&credential);
+        let settings = Settings::scoped(&Config::default(), &view);
+        let body = request::shape(&req, &view, &settings, Call::Websocket).unwrap().body;
+        let headers = request::ws_headers(&view, &settings, &req.headers, &body, "gpt-5.4", None, true);
+        let hint = headers
+            .get("x-codex-routing-hint")
+            .map(|v| v.to_str().unwrap().to_owned());
+        (gjson::get(&body, "service_tier").json().to_owned(), hint)
+    };
+    let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
+    for (tier, want, want_hint) in [
+        (r#","service_tier":"flex""#, r#""flex""#, "model=gpt-5.4;tier=flex"),
+        (
+            r#","service_tier":"priority""#,
+            r#""priority""#,
+            "model=gpt-5.4;tier=priority",
+        ),
+        (
+            r#","service_tier":"ultrafast""#,
+            r#""ultrafast""#,
+            "model=gpt-5.4;tier=ultrafast",
+        ),
+        (r#","service_tier":"scale""#, r#""scale""#, "model=gpt-5.4;tier=scale"),
+        ("", "", "model=gpt-5.4"),
+    ] {
+        assert_eq!(
+            shaped(codex, tier),
+            (want.to_owned(), Some(want_hint.to_owned())),
+            "{tier}"
+        );
+    }
+    assert_eq!(
+        shaped("OpenAI/Python 2.1.0", r#","service_tier":"flex""#),
+        (String::new(), Some("model=gpt-5.4".to_owned()))
+    );
+}
