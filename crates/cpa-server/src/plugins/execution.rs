@@ -521,7 +521,7 @@ pub(crate) fn scheduler_context(
     super::SchedulerContext {
         stream: call.stream,
         options: cpa_plugin::api::SchedulerOptions {
-            headers: super::go_request_header(&call.headers),
+            headers: super::go_request_header(call.selection_inputs().0),
             metadata,
         },
     }

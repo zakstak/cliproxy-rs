@@ -28,17 +28,50 @@ fn b64(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text)
 }
 
+/// How [`Fixture::build`] sets up a proxy. `providers` is the YAML under `api-keys:`, with
+/// `{codex}` and `{control}` standing for the two capture upstreams.
+struct Setup<'a> {
+    name: &'a str,
+    providers: String,
+    routing: &'a str,
+    caps: &'a str,
+    /// Credentials beyond the config's, given the Codex upstream's URL.
+    extra: fn(&str) -> Vec<cpa_core::credential::Credential>,
+    /// Install after-auth, response and chunk hooks that rewrite whenever they run.
+    rewriting_hooks: bool,
+}
+
+fn default_providers(keys: &[&str]) -> String {
+    let keys: String = keys.iter().map(|k| format!("{{api-key: {k}}}, ")).collect();
+    format!(
+        "  codex:\n    - base-url: {{codex}}\n      models: [{{name: gpt-native}}]\n      keys: [{}]\n  openai-compatibility:\n    - name: Acme\n      base-url: {{control}}/v1\n      models:\n        - name: up-model\n          alias: control-model\n      keys:\n        - api-key: key-FAKE-control\n",
+        keys.trim_end_matches(", ")
+    )
+}
+
 impl Fixture {
     async fn start() -> Option<Self> {
         Self::start_with("codex-native-plugins", &["key-FAKE-codex"], "").await
     }
 
-    /// A proxy with one Codex API-key credential per entry of `keys`, all on one capture
-    /// upstream, plus the control provider; `routing` is extra config.
+    /// One Codex API-key credential per entry of `keys` plus the control provider;
+    /// `routing` is extra config.
     async fn start_with(name: &str, keys: &[&str], routing: &str) -> Option<Self> {
+        Self::build(Setup {
+            name,
+            providers: default_providers(keys),
+            routing,
+            caps: "request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin",
+            extra: |_| Vec::new(),
+            rewriting_hooks: true,
+        })
+        .await
+    }
+
+    async fn build(setup: Setup<'_>) -> Option<Self> {
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let built = cpa_plugin::testing::built_plugins(tmp, "codex_native_plugins")?;
-        let dir = cpa_plugin::testing::scratch(tmp, name);
+        let dir = cpa_plugin::testing::scratch(tmp, setup.name);
         let (auths, plugins, records) = (dir.join("auths"), dir.join("plugins"), dir.join("records"));
         for d in [&auths, &plugins, &records.join("respond/mutator")] {
             std::fs::create_dir_all(d).unwrap();
@@ -52,22 +85,25 @@ impl Fixture {
         .await;
         let chat = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
         let control = CaptureUpstream::start(Script {
-            http: vec![Reply::json(200, chat), Reply::json(200, chat)],
+            http: (0..40).map(|_| Reply::json(200, chat)).collect(),
             ..Script::default()
         })
         .await;
-        let keys: String = keys.iter().map(|k| format!("{{api-key: {k}}}, ")).collect();
+        let providers = setup
+            .providers
+            .replace("{codex}", &codex.base_url)
+            .replace("{control}", &control.base_url);
         let yaml = format!(
-            "auth-dir: {}\naccess:\n  api-keys: [client-key-1]\n{routing}api-keys:\n  codex:\n    - base-url: {}\n      models: [{{name: gpt-native}}]\n      keys: [{}]\n  openai-compatibility:\n    - name: Acme\n      base-url: {}/v1\n      models:\n        - name: up-model\n          alias: control-model\n      keys:\n        - api-key: key-FAKE-control\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    mutator:\n      enabled: true\n      label: mutator\n      record: {}\n      caps: request_interceptor,response_interceptor,stream_chunk_interceptor,request_lifecycle_plugin\n",
+            "auth-dir: {}\naccess:\n  api-keys: [client-key-1]\n{}api-keys:\n{providers}plugins:\n  enabled: true\n  dir: {}\n  configs:\n    mutator:\n      enabled: true\n      label: mutator\n      record: {}\n      caps: {}\n",
             auths.display(),
-            codex.base_url,
-            keys.trim_end_matches(", "),
-            control.base_url,
+            setup.routing,
             plugins.display(),
-            records.display()
+            records.display(),
+            setup.caps
         );
         let cfg = Config::parse(&yaml).unwrap();
-        let credentials = cpa_core::config::credentials::load(&cfg);
+        let mut credentials = cpa_core::config::credentials::load(&cfg);
+        credentials.extend((setup.extra)(&codex.base_url));
         let executors = Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
@@ -88,6 +124,9 @@ impl Fixture {
             codex,
             control,
         };
+        if !setup.rewriting_hooks {
+            return Some(fixture);
+        }
         // Hooks that rewrite whenever they run.
         fixture.respond(
             "request.intercept_after",
@@ -361,5 +400,219 @@ async fn before_auth_body_rewrites_do_not_derive_the_native_session() {
         sent.headers["session-id"],
         from_original.as_str(),
         "derived from the client's body"
+    );
+}
+
+const MIXED: &str = "  codex:\n    - base-url: {codex}\n      models: [{name: gpt-mixed}]\n      keys: [{api-key: key-FAKE-codex}]\n  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models:\n        - name: up-model\n          alias: gpt-mixed\n      keys:\n        - api-key: key-FAKE-control\n";
+
+/// A model a native Codex credential shares with another provider. Each attempt gets
+/// what its route allows: a native Codex attempt the client's request, the other
+/// provider the before-auth rewrite; a before-auth termination stops only the other
+/// provider's attempt; and the plugin scheduler always sees the client's headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_pool_applies_before_auth_only_to_attempts_that_are_not_native() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-plugins-mixed",
+        providers: MIXED.to_owned(),
+        routing: "",
+        caps: "request_interceptor,request_lifecycle_plugin,scheduler",
+        extra: |_| Vec::new(),
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    let original = r#"{"model":"gpt-mixed","stream":false,"input":"client question"}"#;
+    let rewritten = r#"{"model":"gpt-mixed","stream":false,"input":"before-auth body"}"#;
+    let picks = || -> Vec<Value> {
+        cpa_server::testing::records(&fx.records.join("mutator.jsonl"))
+            .into_iter()
+            .filter(|r| r["method"] == "scheduler.pick")
+            .map(|r| serde_json::from_str(r["request"].as_str().unwrap()).unwrap())
+            .collect()
+    };
+    let rewrite = || {
+        fx.respond_once(
+            "request.intercept_before",
+            &json!({"ok": true, "result": {
+                "Headers": {"Session-Id": ["plugin-session"], "X-Plugin": ["1"]},
+                "Body": b64(rewritten),
+            }}),
+        )
+    };
+    let terminate = || {
+        fx.respond_once(
+            "request.intercept_before",
+            &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
+        )
+    };
+    let client = [("session-id", "client-session")];
+
+    // The plugin scheduler is offered both providers and leaves the choice to the
+    // built-in selector, which serves the native Codex credential.
+    fx.respond("scheduler.pick", &json!({"ok": true, "result": {"handled": false}}));
+    rewrite();
+    let (status, answer) = fx.post("/v1/responses", &client, original).await;
+    assert_eq!(status, 200, "{answer}");
+    let pick = picks().pop().expect("the plugin scheduler was asked");
+    let candidate = |provider: &str| {
+        pick["Candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["Provider"] == provider)
+            .map(|c| c["ID"].as_str().unwrap().to_owned())
+            .unwrap_or_else(|| panic!("no {provider} candidate: {pick}"))
+    };
+    let (codex_id, other_id) = (candidate("codex"), candidate("openai-compatible-acme"));
+    let sent = fx.codex.http().pop().expect("the native credential served it");
+    assert_eq!(
+        String::from_utf8_lossy(&sent.body),
+        original,
+        "native: the client's body"
+    );
+    assert_eq!(sent.headers["session-id"], "client-session");
+    assert!(!sent.headers.contains_key("x-plugin"));
+    let pick_auth = |id: &str| {
+        fx.respond_once(
+            "scheduler.pick",
+            &json!({"ok": true, "result": {"handled": true, "auth_id": id}}),
+        )
+    };
+
+    // The other provider's attempt keeps the rewrite.
+    pick_auth(&other_id);
+    rewrite();
+    let (status, answer) = fx.post("/v1/responses", &client, original).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent = fx.control.http().pop().expect("the other provider served it");
+    let body = String::from_utf8_lossy(&sent.body);
+    assert!(
+        body.contains("before-auth body"),
+        "the other provider keeps the rewrite: {body}"
+    );
+
+    // A before-auth termination stops the other provider's attempt only.
+    let (codex, control) = (fx.codex.http().len(), fx.control.http().len());
+    pick_auth(&codex_id);
+    terminate();
+    let (status, answer) = fx.post("/v1/responses", &client, original).await;
+    assert_eq!(status, 200, "native attempts ignore the termination: {answer}");
+    assert_eq!(fx.codex.http().len(), codex + 1);
+    pick_auth(&other_id);
+    terminate();
+    let (status, answer) = fx.post("/v1/responses", &client, original).await;
+    assert_eq!((status, answer.as_str()), (403, "blocked"));
+    assert_eq!(fx.control.http().len(), control, "a terminated attempt sends nothing");
+
+    // Every pick saw the client's headers, never the plugin's.
+    let all = picks();
+    assert!(all.len() >= 4, "{} picks", all.len());
+    for pick in &all {
+        assert_eq!(
+            pick["Options"]["Headers"]["Session-Id"],
+            json!(["client-session"]),
+            "{pick}"
+        );
+        assert!(pick["Options"]["Headers"].get("X-Plugin").is_none(), "{pick}");
+    }
+}
+
+/// A model only a Sign in with ChatGPT credential serves cannot be served natively:
+/// before-auth output and termination apply as in Go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_siwc_only_pool_keeps_before_auth() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-plugins-siwc",
+        providers: "  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models: [{name: up-model, alias: control-model}]\n      keys: [{api-key: key-FAKE-control}]\n".to_owned(),
+        routing: "",
+        caps: "request_interceptor,request_lifecycle_plugin",
+        extra: |codex| {
+            let metadata = json!({
+                "type": "codex", "access_token": "at-FAKE", "account_id": "acct-FAKE",
+                "use_siwc": true, "siwc": {"access_token": "siwc-at-FAKE"},
+            });
+            let mut c = cpa_core::credential::Credential::from_file(
+                Path::new("/fake"),
+                Path::new("/fake/codex-siwc.json"),
+                metadata.as_object().unwrap().clone(),
+            )
+            .unwrap();
+            c.attributes.insert("base_url".into(), codex.into());
+            vec![c]
+        },
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    let original = r#"{"model":"gpt-5.5","stream":true,"input":"client question"}"#;
+    fx.rewrite_before_auth(r#"{"model":"gpt-5.5","stream":true,"input":"before-auth body"}"#);
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent = fx.codex.http().pop().expect("the SIWC credential served it");
+    let body = String::from_utf8_lossy(&sent.body);
+    assert!(
+        body.contains("before-auth body"),
+        "the legacy path keeps the rewrite: {body}"
+    );
+    fx.respond_once(
+        "request.intercept_before",
+        &json!({"ok": true, "result": {"Terminate": true, "StatusCode": 403, "ResponseBody": b64("blocked")}}),
+    );
+    let (status, answer) = fx.post("/v1/responses", &[], original).await;
+    assert_eq!((status, answer.as_str()), (403, "blocked"));
+    assert!(fx.codex.http().len() == 1, "nothing sent after the termination");
+}
+
+/// A Responses model only another provider serves keeps Go's selection: a before-auth
+/// `Session-Id` rewrite moves it to the credential that session is bound to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pure_non_codex_responses_model_keeps_before_auth_selection() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-native-plugins-non-codex",
+        providers: "  openai-compatibility:\n    - name: Acme\n      base-url: {control}/v1\n      models: [{name: up-model, alias: control-model}]\n      keys: [{api-key: key-FAKE-control-a}, {api-key: key-FAKE-control-b}]\n".to_owned(),
+        routing: "routing:\n  session-affinity: true\n",
+        caps: "request_interceptor,request_lifecycle_plugin",
+        extra: |_| Vec::new(),
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    let body = r#"{"model":"control-model","stream":false,"input":"hi"}"#;
+    let send = |session: String| {
+        let fx = &fx;
+        async move {
+            let (status, answer) = fx.post("/v1/responses", &[("session-id", &session)], body).await;
+            assert_eq!(status, 200, "{answer}");
+            let sent = fx.control.http().pop().expect("the control provider served it");
+            sent.headers["authorization"].to_str().unwrap().to_owned()
+        }
+    };
+    let mut bound: Vec<(String, String)> = Vec::new();
+    for i in 0..12 {
+        let session = format!("session-{i}");
+        let key = send(session.clone()).await;
+        if bound.iter().all(|(_, k)| *k != key) {
+            bound.push((session, key));
+        }
+        if bound.len() == 2 {
+            break;
+        }
+    }
+    let [(first, first_key), (second, second_key)] = <[_; 2]>::try_from(bound).expect("two keys bound");
+    assert_eq!(send(first.clone()).await, first_key);
+    fx.respond_once(
+        "request.intercept_before",
+        &json!({"ok": true, "result": {"Headers": {"Session-Id": [second.clone()]}}}),
+    );
+    assert_eq!(
+        send(first.clone()).await,
+        second_key,
+        "Go's selection follows the rewrite"
     );
 }

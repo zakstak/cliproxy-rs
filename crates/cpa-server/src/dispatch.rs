@@ -71,6 +71,10 @@ pub struct NativeRequest {
     /// The client's headers and route path, before plugin before-auth interceptors.
     pub headers: HeaderMap,
     pub path: String,
+    /// A credential that may serve the request is on the native route
+    /// ([`native_possible`]): selection reads the client's request and before-auth
+    /// output is deferred to the attempts that are not native.
+    possible: std::sync::atomic::AtomicBool,
     served: std::sync::atomic::AtomicBool,
 }
 
@@ -80,8 +84,14 @@ impl NativeRequest {
             body,
             headers,
             path,
+            possible: std::sync::atomic::AtomicBool::new(false),
             served: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether a native Codex attempt is possible for this request.
+    pub fn possible(&self) -> bool {
+        self.possible.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the attempt that answered ran on the native route.
@@ -135,14 +145,13 @@ pub enum MediaKind {
 
 impl Call {
     /// `WithPinnedAuthID` of a session turn, media call or host model callback.
-    /// The headers and body that choose the session, affinity and credential. A
-    /// Responses HTTP request is chosen by the client's own request, before plugin
-    /// before-auth output (#23): it may be served by the native Codex route, and in a
-    /// mixed pool the provider is not known until selection.
+    /// The headers and body that choose the session, affinity and credential. When a
+    /// native Codex attempt is possible ([`native_possible`]), they are the client's own
+    /// request, before any rewrite (#23); otherwise the rewritten call, as in Go.
     pub(crate) fn selection_inputs(&self) -> (&HeaderMap, &Bytes) {
         match &self.native {
-            Some(native) => (&native.headers, &native.body),
-            None => (&self.headers, &self.body),
+            Some(native) if native.possible() => (&native.headers, &native.body),
+            _ => (&self.headers, &self.body),
         }
     }
 
@@ -757,12 +766,11 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         trace.prompt_prefix(call.entry, &call.body);
     }
     let mut call = call;
-    // Only the native Codex route can serve a Responses request whose providers are all
-    // Codex: before-auth output and termination must not reach it (#23). A mixed pool
-    // keeps them for its other providers; a native attempt there restores the client's
-    // request, and selection reads the client's request either way.
-    let native_only = call.native.is_some() && resolved.0.iter().all(|p| p.eq_ignore_ascii_case("codex"));
-    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1, native_only).await?;
+    // When a credential that may serve this request is on the native Codex route,
+    // before-auth output and termination are held back from the call and applied only to
+    // the attempts that are not native (#23).
+    let defer = native_possible(rt, &call, &resolved);
+    let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1, defer).await?;
     let native = call.native.clone();
     let result = retry_bootstrap(rt, call, trace, &resolved, hooks.as_ref()).await;
     match hooks {
@@ -771,6 +779,40 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
         Some(hooks) => hooks.finish(result, trace).await,
         None => result,
     }
+}
+
+/// Whether a native Codex attempt is possible for `call`: a Responses HTTP request
+/// (`Call::native`) whose selectable credentials for the model include a built-in Codex
+/// credential on a native profile without a plugin executor. Records the answer on the
+/// request. Under Home the credentials are remote, so a pool that includes Codex counts.
+fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<String>, String)) -> bool {
+    let Some(native) = &call.native else {
+        return false;
+    };
+    let eligible = call.turn.is_none()
+        && call.media.is_none()
+        && call.operation == Operation::Generate
+        && providers.iter().any(|p| p.eq_ignore_ascii_case("codex"))
+        && (rt.remote_dispatch().is_some() || {
+            let cfg = rt.config();
+            let registry = rt.registry();
+            let aliases = registry::global_aliases(&cfg);
+            let selection = Selection {
+                providers: providers.clone(),
+                model: call.selection_model.clone().unwrap_or_else(|| model.clone()),
+                ..Selection::default()
+            };
+            let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors, rt.plugin_runtime());
+            rt.store().snapshot().iter().any(|c| {
+                !c.disabled
+                    && c.provider.trim().eq_ignore_ascii_case("codex")
+                    && admit(c).is_some()
+                    && cpa_exec::codex::CodexExecutor::native_profile(c)
+                    && rt.plugin_runtime().executor(&rt.for_executor(c), &cfg).is_none()
+            })
+        });
+    native.possible.store(eligible, std::sync::atomic::Ordering::Release);
+    eligible
 }
 
 /// The bootstrap retry rounds of one resolved request.
@@ -2240,6 +2282,15 @@ async fn attempt(
             }
             None => false,
         };
+        // Before-auth output held back for a possible native attempt reaches every other
+        // attempt here, its termination included.
+        if !native
+            && let Some(hooks) = hooks
+            && let Err(error) = hooks.apply_deferred(&mut req)
+        {
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
         // Go `applyRequestAfterAuthInterceptor`: a termination ends the request before
         // the executor runs, without a result for the credential.
         if let Some(hooks) = hooks.filter(|_| !native)

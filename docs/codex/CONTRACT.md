@@ -276,15 +276,22 @@ transformations: the routed `model`, and `stream: true` for a buffered client on
 `chatgpt`. The server keeps the client's body, headers and route path in
 `dispatch::NativeRequest`, from before the Codex-client ingress rewrite, compact's
 `stream` deletion and plugin before-auth interceptors, so a native attempt never sees
-their output. The session, session affinity, the LCP prefix, Home dispatch headers, the plugin
-scheduler context and the executor's session metadata all come from the client's own
-request too (`Call::selection_inputs`), so before-auth output cannot choose the session or
-the credential of a native attempt. When every provider of the model is Codex, only the
-native route can serve the request: the before-auth interceptors still run (the plugin
-sees the request and its lifecycle runs), but their headers, body, path and termination
-are not applied. When the model is shared with another provider, before-auth output still
-reaches the other provider's attempts and its termination still ends the request, while
-selection reads the client's request for every provider and a native attempt restores it.
+their output.
+
+Plugin before-auth interceptors run once, before a credential is chosen, so their output
+follows one rule. A native attempt is possible when the selectable credentials for the
+model include a built-in Codex credential on a native profile without a plugin executor;
+under Home, whose credentials are remote, when the pool includes Codex. When it is
+possible, the before-auth result (headers, body, path and termination) is held back from
+the request and applied to each attempt that is not native: a Sign in with ChatGPT,
+plugin-executor or other-provider attempt gets it, termination included, and a native
+attempt never does. The session, session affinity, the LCP prefix, Home dispatch headers,
+the plugin scheduler's headers and context, and the executor's session metadata then come
+from the client's own request (`Call::selection_inputs`), so before-auth output cannot
+choose the session or the credential. When a native attempt is not possible (a model only
+Sign in with ChatGPT credentials or other providers serve), before-auth applies as in Go,
+selection included.
+
 A request that asks for unframed stream payloads (a plugin model callback) keeps the
 legacy path. The boundary validates those
 bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,

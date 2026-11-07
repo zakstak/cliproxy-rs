@@ -126,6 +126,13 @@ impl CodexExecutor {
         native::eligible(&View::new(credential), req).is_some()
     }
 
+    /// Whether `credential` is on a native profile (`chatgpt`, `api-key`, `compatible`;
+    /// not `siwc`), whatever the request: the server's test of whether a pool can serve a
+    /// Responses request natively.
+    pub fn native_profile(credential: &Credential) -> bool {
+        native::Profile::of(&View::new(credential)).is_some()
+    }
+
     /// Whether `credential` keeps upstream state on a WebSocket (Go:
     /// `websocketUpstreamSupportsIncrementalInput`).
     pub fn upstream_websocket(credential: &Credential) -> bool {
