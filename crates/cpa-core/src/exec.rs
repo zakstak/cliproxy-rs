@@ -717,8 +717,8 @@ pub struct ExecError {
     /// The provider's own failure frame for the client, when it differs from `body`,
     /// which stays the scheduler's classification. The native Codex WebSocket route
     /// sets it for a failure the client may see as sent; never for an account failure,
-    /// whose frame can name the pooled account.
-    pub delivered_event: Option<Bytes>,
+    /// whose frame can name the pooled account. Boxed: errors are the cold path.
+    pub delivered_event: Option<Box<Bytes>>,
     /// Headers this error hands the client under `requests.passthrough-headers` (Go
     /// `ErrorMessage.Addon`, filled only from errors with `Headers()`: Codex and xAI
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the

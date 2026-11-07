@@ -1271,7 +1271,7 @@ impl Turn {
     /// pooled account or carry its tokens.
     fn deliver_as_sent(&self, error: &mut ExecError, frame: &str) {
         if self.passthrough && !account_failure(error.status) {
-            error.delivered_event = Some(Bytes::copy_from_slice(frame.as_bytes()));
+            error.delivered_event = Some(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
         }
     }
 

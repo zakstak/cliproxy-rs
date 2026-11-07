@@ -834,7 +834,7 @@ impl Duplex {
             {
                 Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),
                 None if passthrough => {
-                    error.delivered_event = Some(Bytes::copy_from_slice(payload.as_bytes()));
+                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(payload.as_bytes())));
                 }
                 None => {}
             }
