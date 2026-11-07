@@ -215,6 +215,7 @@ impl Conductor {
             execution_session: Some(self.session.clone()),
             request_path: "/v1/responses".into(),
             peer: None,
+            native: None,
             turn: Some(Arc::new(SessionTurn {
                 session: ExecSession {
                     id: self.session.clone(),

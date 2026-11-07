@@ -119,6 +119,13 @@ impl CodexExecutor {
         self.stream_with_session(&view, &settings, req, Some(&session.id)).await
     }
 
+    /// Whether `req` on `credential` takes the native HTTP route (`codex_native.rs`). The
+    /// server then gives the executor the client's own bytes and keeps request and
+    /// response mutation hooks away from the attempt.
+    pub fn native_http(credential: &Credential, req: &ExecRequest) -> bool {
+        native::route(&View::new(credential), req).is_some()
+    }
+
     /// Whether `credential` keeps upstream state on a WebSocket (Go:
     /// `websocketUpstreamSupportsIncrementalInput`).
     pub fn upstream_websocket(credential: &Credential) -> bool {
@@ -210,9 +217,14 @@ impl CodexExecutor {
             return count_tokens(&req, cfg);
         }
         check_response_format(&req)?;
+        let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
+        if let Some(profile) = native::route(&view, &req) {
+            // The native route reads the body through the boundary itself.
+            let settings = Settings::scoped(cfg, &view);
+            return self.native(&view, &settings, req, profile).await;
+        }
         check_native_body(&req)?;
         crate::codex_siwc::require_token(credential)?;
-        let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         match (req.alt.as_deref(), req.stream) {
             (Some("responses/compact"), true) => Err(ExecError::local(
@@ -265,8 +277,41 @@ impl CodexExecutor {
     ) -> Result<crate::proxy::Upstream, ExecError> {
         // The shaped body names the base model, the key of per-model quota snapshots.
         let model = gjson::get(&body, "model").str().to_owned();
-        wire.request(&url, &headers, body.as_bytes());
-        let mut upstream = match self.post(view, &url, &headers, Bytes::from(body)).await {
+        self.open_for(
+            view,
+            settings,
+            url,
+            headers,
+            Bytes::from(body),
+            replay,
+            wire,
+            error_body,
+            &model,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::open`] for a known upstream `model` (the quota-snapshot key). With
+    /// `direct`, a non-2xx answer keeps its classification (status and scope) for the
+    /// scheduler, and the client receives the upstream body and filtered headers
+    /// unchanged (the native HTTP route).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_for(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        url: String,
+        headers: HeaderMap,
+        body: Bytes,
+        replay: &crate::codex_replay::Scope,
+        wire: &Wire,
+        error_body: ErrorBody,
+        model: &str,
+        direct: bool,
+    ) -> Result<crate::proxy::Upstream, ExecError> {
+        wire.request(&url, &headers, &body);
+        let mut upstream = match self.post(view, &url, &headers, body).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 // ponytail: the text is this executor's transport message, not net/http's
@@ -276,7 +321,7 @@ impl CodexExecutor {
             }
         };
         wire.metadata(upstream.status, &upstream.headers);
-        self.quota.observe(&view.credential.id, &model, &upstream.headers);
+        self.quota.observe(&view.credential.id, model, &upstream.headers);
         let status = upstream.status;
         upstream.headers.remove(http::header::CONTENT_ENCODING);
         upstream.headers.remove(http::header::CONTENT_LENGTH);
@@ -291,12 +336,14 @@ impl CodexExecutor {
             };
             wire.chunk(&body);
             crate::codex_replay::clear_on_invalid_signature(&self.replay, replay, status, &body);
-            return Err(response::status_error(
-                status,
-                &body,
-                upstream.headers,
-                settings.model_level_cooling,
-            ));
+            let mut error = response::status_error(status, &body, upstream.headers, settings.model_level_cooling);
+            if direct {
+                // The status stays the classified one: it differs from the upstream's
+                // only for a usage or capacity limit, which is sent as 429.
+                error.body = body;
+                error.direct = true;
+            }
+            return Err(error);
         }
         Ok(upstream)
     }
@@ -1029,6 +1076,9 @@ fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -
     )
     .boxed()
 }
+
+#[path = "codex_native.rs"]
+mod native;
 
 #[cfg(test)]
 #[path = "codex_boundary_tests.rs"]

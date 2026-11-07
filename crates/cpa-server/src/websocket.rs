@@ -1299,6 +1299,7 @@ impl Connection {
             execution_session: Some(self.session.clone()),
             request_path: self.request_path.clone(),
             peer: self.peer,
+            native: None,
             turn: Some(turn),
             media: None,
         };

@@ -48,12 +48,44 @@ pub struct Call {
     pub request_path: String,
     /// The downstream peer (Go `Request.RemoteAddr`), when the listener provides it.
     pub peer: Option<std::net::SocketAddr>,
+    /// The client's own bytes, for an attempt a Codex credential serves on the native
+    /// HTTP route (#23). Set only by the Responses HTTP routes.
+    pub native: Option<Arc<NativeRequest>>,
     /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
     /// ordinary HTTP requests.
     pub turn: Option<Arc<SessionTurn>>,
     /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
     /// types), `None` for inference routes.
     pub media: Option<Arc<Media>>,
+}
+
+/// A Responses HTTP request that a Codex credential may serve on the native route
+/// (`docs/codex/CONTRACT.md` "Native HTTP route"). `body` is the client's body before any
+/// route rewrite (the Codex-client preparation, compact's `stream` deletion, plugin
+/// request interceptors); other providers keep receiving the rewritten [`Call::body`].
+/// Each attempt records whether it ran natively, so the route and the response hooks
+/// treat the answer accordingly: the last attempt is the one that answered.
+pub struct NativeRequest {
+    pub body: Bytes,
+    served: std::sync::atomic::AtomicBool,
+}
+
+impl NativeRequest {
+    pub fn new(body: Bytes) -> Arc<Self> {
+        Arc::new(Self {
+            body,
+            served: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the attempt that answered ran on the native route.
+    pub fn served(&self) -> bool {
+        self.served.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark(&self, native: bool) {
+        self.served.store(native, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// How a media route runs through [`run`]: which executor operation serves it, and the
@@ -709,8 +741,11 @@ pub async fn run_with_bootstrap_retries(rt: &Arc<Runtime>, call: Call, trace: &T
     }
     let mut call = call;
     let hooks = crate::plugins::interceptors::start(rt, trace, &mut call, &resolved.1).await?;
+    let native = call.native.clone();
     let result = retry_bootstrap(rt, call, trace, &resolved, hooks.as_ref()).await;
     match hooks {
+        // A native Codex answer reaches the client without response interceptors.
+        Some(hooks) if native.is_some_and(|n| n.served()) => hooks.finish_native(result),
         Some(hooks) => hooks.finish(result, trace).await,
         None => result,
     }
@@ -771,9 +806,11 @@ async fn run_primed(
     resolved: (Vec<String>, String),
     hooks: Option<&Arc<crate::plugins::interceptors::Hooks>>,
 ) -> Result<Done, RunError> {
+    let native = call.native.clone();
     let result = run_routed(rt, call, trace, resolved, hooks.map(|h| &**h)).await;
+    let native = native.is_some_and(|n| n.served());
     match (hooks, result) {
-        (Some(hooks), Ok(done @ Done::Stream { .. })) => {
+        (Some(hooks), Ok(done @ Done::Stream { .. })) if !native => {
             hooks.prime(Ok(done), trace).await.map_err(|failure| RunError {
                 failure,
                 bootstrap: true,
@@ -2152,9 +2189,31 @@ async fn attempt(
         if let Some(on_selected) = call.on_selected() {
             on_selected(&lease.credential);
         }
+        // The native Codex HTTP route (#23): the client's own bytes, and no request hook.
+        let native = call.native.as_ref().filter(|_| {
+            call.turn.is_none()
+                && call.media.is_none()
+                && lease.credential.provider.trim().eq_ignore_ascii_case("codex")
+                && rt
+                    .plugin_runtime()
+                    .executor(&rt.for_executor(&lease.credential), cfg)
+                    .is_none()
+                && cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req)
+        });
+        if let Some(request) = &call.native {
+            request.mark(native.is_some());
+        }
+        let native = match native {
+            Some(request) => {
+                req.body = request.body.clone();
+                req.original_body = request.body.clone();
+                true
+            }
+            None => false,
+        };
         // Go `applyRequestAfterAuthInterceptor`: a termination ends the request before
         // the executor runs, without a result for the credential.
-        if let Some(hooks) = hooks
+        if let Some(hooks) = hooks.filter(|_| !native)
             && let Err(error) = hooks
                 .after_auth(
                     &mut req,
@@ -2249,7 +2308,8 @@ async fn attempt(
             Ok(response) => match finish(call, response).await {
                 Ok(done) => {
                     let done = track_usage(done, tracker.take());
-                    let done = if target.alias.force_mapping && !target.alias.original_alias.is_empty() {
+                    // A native Codex answer keeps the upstream's model name.
+                    let done = if !native && target.alias.force_mapping && !target.alias.original_alias.is_empty() {
                         rewrite_model(done, &target.alias.original_alias)
                     } else {
                         done
@@ -2803,6 +2863,7 @@ mod tests {
             execution_session: None,
             request_path: String::new(),
             peer: None,
+            native: None,
             turn: None,
             media: None,
         };

@@ -132,12 +132,15 @@ discretionary mutation, and a migrated route must not perform it.
 | --- | --- | --- |
 | Replace the client's `Authorization` with the selected credential's token, and set `chatgpt-account-id` from that credential on `chatgpt` | All profiles | Provider requirement. The client's key authenticates to the proxy only and never travels upstream. |
 | Map the client path (`/v1/responses`, `/backend-api/codex/responses` and their `/compact` forms) to the profile's base URL plus `/responses` or `/responses/compact` | All profiles | Explicit routing choice. |
-| Replace `model` with the upstream model of an operator-configured alias or a caller-selected route | All profiles | Explicit routing choice. Only the `model` value changes. |
+| Replace `model` with the upstream model of an operator-configured alias or a caller-selected route, or add it as the first member when the body has none | All profiles | Explicit routing choice. Only the `model` value changes. |
 | Wrap an HTTP Responses body in a `response.create` frame by adding `"type":"response.create"` | A credential with `websockets: true` that serves an HTTP client over a WebSocket | Transport envelope. No other field changes. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
 | Convert Chat Completions, Claude Messages or Gemini requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [#27](https://github.com/zakstak/cliproxy-rs/issues/27) defines each pair. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
+| Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
+| Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
+| Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
 Until it lands, header behaviour stays as it is; see
@@ -225,31 +228,95 @@ never reaches the Codex boundary.
 
 ### Remaining Go JSON callers on the Codex path
 
-At this commit, no Codex caller has moved from the Go helpers to the boundary yet. Every
-caller below either rewrites a payload, which its owning issue deletes, or reads a
-response, which #25 owns. The owning PR moves each surviving read to the boundary and
-deletes the Go-path code it replaces. `crates/cpa-common/src/json.rs` and the vendored
-gjson stay while other providers use them.
+The native HTTP route reads request bodies and response events only through the
+boundary. The callers below still use the Go helpers on the paths that have not migrated:
+the `siwc` profile, WebSocket turns and translated requests. Each either rewrites a
+payload, which its owning issue deletes, or reads a response, which #25 owns. The owning
+PR moves each surviving read to the boundary and deletes the Go-path code it replaces.
+`crates/cpa-common/src/json.rs` and the vendored gjson stay while other providers use
+them.
 
 | Code | What it parses | Owner |
 | --- | --- | --- |
-| `crates/cpa-exec/src/codex_request.rs` `shape` and its helpers (`ensure_web_search_for_history`, `ensure_image_tool`, `normalize_parallel_tool_calls`, `sanitize_reasoning`, `normalize_tool_schemas`, `sanitize_input_ids`, `siwc_body`, `prompt_cache`, `is_lite`) | Native request fields, for rewrites | #23 (HTTP), #24 (WebSocket) |
+| `crates/cpa-exec/src/codex_request.rs` `shape` and its helpers (`ensure_web_search_for_history`, `ensure_image_tool`, `normalize_parallel_tool_calls`, `sanitize_reasoning`, `normalize_tool_schemas`, `sanitize_input_ids`, `siwc_body`, `prompt_cache`, `is_lite`) | Request fields, for rewrites. The native HTTP route no longer calls them | #24 (WebSocket), #27 (translated), and the `siwc` profile once a source covers it |
 | `crates/cpa-exec/src/codex_request.rs` `routing_hint` | `service_tier` for `x-codex-routing-hint` | #26 |
 | `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits, used by the callers above | Deleted with its last caller, at the latest #28 |
-| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter | #23, #24 |
+| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. The native HTTP route no longer calls it | #24, and the `siwc` profile |
 | `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs`, `codex_gemini.rs`, `codex_interactions.rs` | Cross-API translation | #27 |
-| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration | #23, #24 for requests, #25 for responses, #28 for the settings |
+| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration. A native HTTP attempt receives the client's bytes instead, and nothing is restored | #24 (WebSocket), #28 for the settings; other providers keep the rewrite at their boundary |
 | `crates/cpa-exec/src/codex_replay.rs` | Reasoning history replay | #27 |
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter | #27, coordinated with #15 |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count | #27 |
-| `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots | #25 |
-| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits | #25 |
+| `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots. The native route passes the routed model to `open_for` instead | #24, #27 |
+| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native route reuses `terminal_failure`, `bufferable`, `meaningful_delta` and `empty_incomplete` to classify a copy of each event | #25 (WebSocket half), #28 |
 | `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | WebSocket turns, continuation and steering frames | #24 |
 | `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers | #24 |
-| `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact | #23 |
-| `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer | #25 |
+| `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A native attempt gets the client's bytes from `NativeRequest` instead | Other providers keep the rewrite; #28 |
+| `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers keep it |
 | `crates/cpa-exec/src/codex_live.rs`, `codex.rs` `alpha_search`, `crates/cpa-server/src/codex_alpha.rs`, `codex_models.rs`, `crates/cpa-common/src/codex_catalog.rs` | Realtime calls, Alpha Search and model catalogs | Outside this contract; they keep Go behaviour |
 | `crates/cpa-exec/src/codex_oauth.rs`, `codex_refresh.rs`, `codex_siwc.rs`, `codex_siwc_bind.rs` | Token endpoints and credential files | Outside this contract; they keep Go behaviour |
+
+## Native HTTP route
+
+[#23](https://github.com/zakstak/cliproxy-rs/issues/23) and the HTTP half of
+[#25](https://github.com/zakstak/cliproxy-rs/issues/25) put the following route in place.
+A request takes it when all of these hold:
+
+- it arrives on `/v1/responses`, `/backend-api/codex/responses` or their `/compact` forms;
+- the selected credential is a Codex credential served by the built-in executor, on the
+  `chatgpt`, `api-key` or `compatible` profile;
+- both the client and response formats are Responses, and the request is a generation.
+
+The `siwc` profile keeps the legacy path, because no first-party source covers it. WebSocket
+turns keep it until #24, and translated requests keep it until #27.
+
+The request goes upstream as the client sent it, with only the permitted
+transformations: the routed `model`, and `stream: true` for a buffered client on
+`chatgpt`. The server keeps the client's bytes in `dispatch::NativeRequest`, from before
+the Codex-client ingress rewrite, compact's `stream` deletion and plugin request
+interceptors, so a native attempt never sees their output. The boundary validates those
+bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,
+tool or namespace preparation, or plugin `after_auth` hook runs. A model with a thinking
+suffix, such as `gpt-5.5(high)`, is refused with a 400, because the suffix would need a
+body change the contract does not permit.
+
+The response reaches the client as the upstream sent it:
+
+- A stream's events are forwarded byte for byte, unknown and private events included,
+  with no event renamed, no output repaired and no usage added. Usage, capture and
+  failure classification read a copy.
+- Leading handshake events are held under `stream-bootstrap-buffering`. A failure that
+  arrives before anything was delivered fails over to another credential when its scope
+  allows it; otherwise the provider's event is delivered. After something was delivered,
+  a failure ends the stream after its event and is never replayed on another credential.
+- A stream that ends without a terminal event ends for the client too, without a local
+  event. The attempt records a request-scoped 408.
+- An upstream HTTP error keeps its classification for the scheduler, and the client
+  receives its body and filtered headers unchanged. Its status is the classified one,
+  which differs from the upstream's only when the body is a usage or capacity limit,
+  sent as 429.
+- A buffered `chatgpt` answer is the terminal event's `response` object, byte for byte.
+  A failure becomes `{"error":...}` with the provider's error object. On `api-key` and
+  `compatible`, a JSON answer passes unchanged. Compaction answers pass unchanged.
+- Plugin response and chunk interceptors do not run. The plugin lifecycle still
+  completes. The alias `force-mapping` model rewrite does not run either.
+
+The settings that shape requests on the legacy path have this effect on the native
+route. None of them is obsolete yet, because the legacy paths still use each one, so
+none fails at load. #28 rejects each setting once its last path migrates.
+
+| Setting | Native HTTP route |
+| --- | --- |
+| `payload.default`, `payload.override`, `payload.filter` and their raw forms | Not applied |
+| `client.codex.optimize-multi-agent-v2` | Not applied to Codex attempts; other providers keep it |
+| `upstream.codex.orphan-delegation-compatibility` | Not applied to Codex attempts; other providers keep it |
+| `multimedia.disable-image-generation` (the image tool the executor adds) | No tool is added |
+| Web search history (`ensure_web_search_for_history`) | No tool is added |
+| A model alias with a thinking suffix | Refused with a 400 |
+| Alias `force-mapping` (the model name in responses) | Not applied |
+| `upstream.codex.stream-bootstrap-buffering` and `stream-bootstrap-timeout` | Applied: leading handshake events are held, never changed |
+| `upstream.codex.model-level-cooling` | Applied to failure classification |
+| `oauth.providers.codex.header-defaults`, `disable-codex-cloaking` and other header settings | Unchanged; #26 owns headers |
 
 ## Identity and headers
 

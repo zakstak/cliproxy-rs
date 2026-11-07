@@ -644,6 +644,36 @@ impl Hooks {
         }
     }
 
+    /// Ends a request a Codex credential answered on the native HTTP route (#23): no
+    /// response or chunk interceptor runs on it, and only the lifecycle completes.
+    // ponytail: a native stream's lifecycle completes as succeeded when the stream ends,
+    // even after a mid-stream failure; the failure still reaches the client and the
+    // credential's outcome. Report it here too if a plugin needs it.
+    pub(crate) fn finish_native(self: Arc<Self>, result: Result<Done, Failure>) -> Result<Done, Failure> {
+        match result {
+            Err(failure) => {
+                let terminated = *self.terminated.lock().unwrap_or_else(|e| e.into_inner());
+                self.lifecycle.fail(&failure, terminated);
+                Err(failure)
+            }
+            Ok(Done::Buffered { headers, body }) => {
+                self.lifecycle.complete(COMPLETION_SUCCEEDED, 200, "");
+                Ok(Done::Buffered { headers, body })
+            }
+            Ok(Done::Stream { headers, first, rest }) => {
+                let end = futures_util::stream::once(async move {
+                    self.lifecycle.complete(COMPLETION_SUCCEEDED, 200, "");
+                })
+                .filter_map(|()| async { None });
+                Ok(Done::Stream {
+                    headers,
+                    first,
+                    rest: rest.chain(end).boxed(),
+                })
+            }
+        }
+    }
+
     /// Runs a stream's chunk interceptors up to its first delivered chunk (Go reads
     /// through dropped chunks before committing, inside the bootstrap retries) and wraps
     /// the rest, which completes the lifecycle. An error before any delivered chunk is

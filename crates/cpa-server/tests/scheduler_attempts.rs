@@ -486,11 +486,13 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         (&[failed], "/v1/responses", codex_ua, failed, false, 200),
         (&[live], "/v1/responses", codex_ua, live_failed, false, 200),
         (&[created, failed], "/v1/responses", codex_ua, failed, false, 200),
+        // Any other Responses client takes the native route (#23): the upstream's events
+        // reach it byte for byte, the live `error` event included.
         (&[created, failed], "/v1/responses", "openai-node/5", "", true, 200),
-        (&[failed], "/v1/responses", "openai-node/5", "", true, 400),
-        (&[live], "/v1/responses", "openai-node/5", "", true, 400),
-        (&[failed], "/v1/responses", "openai-node/5", "", false, 400),
-        (&[live], "/v1/responses", "openai-node/5", "", false, 400),
+        (&[failed], "/v1/responses", "openai-node/5", "", true, 200),
+        (&[live], "/v1/responses", "openai-node/5", "", true, 200),
+        (&[failed], "/v1/responses", "openai-node/5", "", false, 200),
+        (&[live], "/v1/responses", "openai-node/5", "", false, 200),
         (&[created, failed], "/v1/responses", "openai-node/5", "", false, 200),
         // Chat Completions shows nothing before the first output, so it fails the start.
         (
@@ -513,6 +515,7 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
                 }
             })
             .collect();
+        let sse_copy = sse.clone();
         let app = axum::Router::new().fallback(move || {
             let sse = sse.clone();
             async move { ([("content-type", "text/event-stream")], sse).into_response() }
@@ -549,6 +552,7 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
         } else {
             r#"{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"huge"}]}"#
         };
+        let sent_sse = sse_copy.clone();
         let response = wreq::Client::new()
             .post(format!("{url}{path}"))
             .header("user-agent", ua)
@@ -576,8 +580,10 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
                 format!("data: {want}\n")
             };
             assert!(text.contains(&line), "{case}: {text}");
+        } else if path == "/v1/responses" {
+            assert_eq!(text, sent_sse, "{case}: the upstream's events, byte for byte");
         } else {
-            // Go's classified error, unchanged.
+            // A translated client keeps Go's classified error.
             assert!(!text.contains("context_length_exceeded"), "{case}: {text}");
             assert!(text.contains("context_too_large"), "{case}: {text}");
         }

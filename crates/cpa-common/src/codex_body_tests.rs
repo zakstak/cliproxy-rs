@@ -191,3 +191,37 @@ fn messages_never_echo_the_body() {
         assert!(!String::from_utf8_lossy(&exec.body).contains("SECRET"));
     }
 }
+
+#[test]
+fn string_members_decode() {
+    let raw = json(r#"{"model":"gpt~u002d5","n":1}"#);
+    let body = CodexBody::parse(&raw).unwrap();
+    assert_eq!(body.get("model").unwrap().text().as_deref(), Some("gpt-5"));
+    assert_eq!(body.get("n").unwrap().text(), None);
+    let plain = br#"{"model":"gpt-5"}"#;
+    let body = CodexBody::parse(plain).unwrap();
+    assert!(matches!(
+        body.get("model").unwrap().text(),
+        Some(Cow::Borrowed("gpt-5"))
+    ));
+}
+
+/// Setting a member changes only that member's value bytes, or adds it first.
+#[test]
+fn with_member_edits_one_value_in_place() {
+    let raw = br#"{ "model" : "alias", "n":1.50, "x":{"model":"inner"} }"#;
+    let body = CodexBody::parse(raw).unwrap();
+    assert_eq!(
+        body.with_member("model", r#""gpt-5""#),
+        br#"{ "model" : "gpt-5", "n":1.50, "x":{"model":"inner"} }"#
+    );
+    assert_eq!(
+        body.with_member("stream", "true"),
+        br#"{"stream":true, "model" : "alias", "n":1.50, "x":{"model":"inner"} }"#
+    );
+    let empty = CodexBody::parse(b" { } ").unwrap();
+    assert_eq!(empty.with_member("stream", "true"), br#" {"stream":true } "#);
+    let flag = br#"{"stream":false,"a":[]}"#;
+    let body = CodexBody::parse(flag).unwrap();
+    assert_eq!(body.with_member("stream", "true"), br#"{"stream":true,"a":[]}"#);
+}

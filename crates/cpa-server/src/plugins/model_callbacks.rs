@@ -150,6 +150,7 @@ impl ModelExecutor for Executor {
                 execution_session,
                 request_path,
                 peer: None,
+                native: None,
                 turn: None,
                 media,
             };

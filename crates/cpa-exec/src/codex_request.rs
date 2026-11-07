@@ -1394,11 +1394,25 @@ pub(crate) fn prompt_cache(
     ws_session: Option<&str>,
     websocket: bool,
 ) -> (String, Option<String>) {
+    match prompt_cache_id(req, &body, ws_session, websocket) {
+        Some(id) => (set_str_if_different(body, "prompt_cache_key", &id), Some(id)),
+        None => (body, None),
+    }
+}
+
+/// The prompt cache identity [`prompt_cache`] would write, without writing it: the
+/// native HTTP route sends it only in headers (#26 owns which).
+pub(crate) fn prompt_cache_id(
+    req: &ExecRequest,
+    body: &str,
+    ws_session: Option<&str>,
+    websocket: bool,
+) -> Option<String> {
     let original = String::from_utf8_lossy(&req.body);
     let client_key = gjson::get(&original, "prompt_cache_key");
     let mut id = match req.source_format {
         Format::Claude => {
-            let mut model = gjson::get(&body, "model").str().trim().to_owned();
+            let mut model = gjson::get(body, "model").str().trim().to_owned();
             if model.is_empty() {
                 model = base_model(&req.model);
             }
@@ -1418,10 +1432,7 @@ pub(crate) fn prompt_cache(
         )
         .to_string();
     }
-    if id.is_empty() {
-        return (body, None);
-    }
-    (set_str_if_different(body, "prompt_cache_key", &id), Some(id))
+    (!id.is_empty()).then_some(id)
 }
 
 fn set(headers: &mut HeaderMap, name: &str, value: &str) {

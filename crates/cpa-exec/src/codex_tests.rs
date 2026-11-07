@@ -256,6 +256,67 @@ fn executor() -> CodexExecutor {
     CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new()))
 }
 
+/// A recorded case that now takes the native HTTP route (#23): Go's bytes no longer
+/// apply to it, the contract does (`docs/codex/CONTRACT.md` "Native HTTP route").
+fn native_case(case: &Value, base_url: &str) -> bool {
+    case["exec_metadata"]["execution_session_id"].as_str().is_none()
+        && CodexExecutor::native_http(&credential(case, base_url), &request(case))
+}
+
+/// The native contract for a recorded case: the upstream body is the client's with
+/// only the permitted edits, a model suffix is refused before any upstream request, and
+/// a successful stream reaches the client as the upstream sent it.
+fn assert_native_contract(
+    name: &str,
+    case: &Value,
+    result: &Result<ExecResponse, ExecError>,
+    items: &[Result<Bytes, ExecError>],
+    captured: &[Captured],
+) {
+    let req = request(case);
+    if cpa_common::thinking::parse_suffix(&req.model).has_suffix {
+        let error = result
+            .as_ref()
+            .err()
+            .unwrap_or_else(|| panic!("{name}: a suffix is refused"));
+        assert_eq!(error.status, 400, "{name}");
+        assert!(captured.is_empty(), "{name}: nothing is sent");
+        return;
+    }
+    // The first hop: a redirect's later hops follow the HTTP client's method rules.
+    let sent = captured
+        .first()
+        .unwrap_or_else(|| panic!("{name}: an upstream request"));
+    use cpa_common::codex_body::CodexBody;
+    let mut expected = req.body.to_vec();
+    let body = CodexBody::parse(&req.body).unwrap();
+    if body.get("model").and_then(|m| m.text()).as_deref() != Some(req.model.trim()) {
+        expected = body.with_member("model", &serde_json::to_string(req.model.trim()).unwrap());
+    }
+    let oauth = !case["attributes"]["api_key"].as_str().is_some_and(|k| !k.is_empty());
+    if oauth && !req.stream && req.alt.is_none() {
+        let edited = expected.clone();
+        let reread = CodexBody::parse(&edited).unwrap();
+        if reread.get("stream").map(|m| m.raw) != Some(&b"true"[..]) {
+            expected = reread.with_member("stream", "true");
+        }
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&sent.body),
+        String::from_utf8_lossy(&expected),
+        "{name}: native upstream body"
+    );
+    let reply = reply(case);
+    let sse = reply
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.starts_with("text/event-stream"));
+    if req.stream && sse && reply.status == 200 && items.iter().all(Result::is_ok) && result.is_ok() {
+        let out: Vec<u8> = items.iter().flat_map(|i| i.as_ref().unwrap().to_vec()).collect();
+        assert_eq!(String::from_utf8_lossy(&out), reply.body, "{name}: native events");
+    }
+}
+
 #[tokio::test]
 async fn executor_matches_go_on_every_fixture_case() {
     let executor = executor();
@@ -283,6 +344,10 @@ async fn executor_matches_go_on_every_fixture_case() {
         }
         let (result, items) = run(&executor, case, &mock).await;
         let captured = mock.take();
+        if native_case(case, &mock.url) {
+            assert_native_contract(name, case, &result, &items, &captured);
+            continue;
+        }
         match case["hops"].as_array() {
             Some(hops) => {
                 assert_eq!(captured.len(), hops.len(), "{name}: upstream requests");
@@ -706,7 +771,13 @@ async fn usage_records_see_upstream_payloads() {
         }
         let reports = recorded.0.lock().unwrap().clone();
         let upstream_format = if compact { Format::OpenAIResponse } else { Format::Codex };
-        let sent = case["upstream"]["body"].as_str().unwrap().to_owned();
+        // A native case records the body it sent: the client's, with only the permitted
+        // edits (`executor_matches_go_on_every_fixture_case` checks those bytes).
+        let sent = if native_case(case, &mock.url) {
+            String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
+        } else {
+            case["upstream"]["body"].as_str().unwrap().to_owned()
+        };
         assert_eq!(
             reports[0],
             ("request", upstream_format, sent),
@@ -767,8 +838,11 @@ async fn usage_records_the_payload_override_reasoning_effort() {
             ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
             ResponseBody::Buffered(_) => {}
         }
+        let native = native_case(case, &mock.url);
         let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
-        assert_eq!(gjson::get(&sent, "reasoning.effort").str(), "high", "{name}: upstream");
+        // Payload rules never reach a native body (#23); other paths keep Go's override.
+        let effort = if native { "" } else { "high" };
+        assert_eq!(gjson::get(&sent, "reasoning.effort").str(), effort, "{name}: upstream");
         let reports = recorded.0.lock().unwrap().clone();
         assert_eq!(reports[0].0, "request", "{name}");
         assert_eq!(reports[0].2, sent, "{name}: the usage record reads the sent body");
@@ -1368,7 +1442,9 @@ async fn direct_images_return_the_read_error_of_a_broken_error_body() {
 }
 
 /// A streamed (or buffered, `stream: false`) Responses request whose upstream sends `sse`:
-/// the client frames and the in-stream error, or the attempt's error.
+/// the client frames and the in-stream error, or the attempt's error. It runs on a Sign
+/// in with ChatGPT credential, which keeps the legacy line scanner these Go cases pin;
+/// the native route forwards events unchanged (`codex_native_tests.rs`).
 async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<String>, Option<ExecError>), ExecError> {
     let mock = Mock::start().await;
     mock.script(
@@ -1385,6 +1461,7 @@ async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<St
         "payload": r#"{"model":"gpt-5.4","input":"hello"}"#,
         "stream": stream,
         "attributes": {"api_key": "test"},
+        "metadata": {"type": "codex", "use_siwc": true, "siwc": {"access_token": "siwc-at-FAKE"}},
     });
     let cfg = Config::parse(&format!("codex:\n  stream-bootstrap-buffering: {buffering}\n")).unwrap();
     let response = executor()
@@ -1650,7 +1727,15 @@ async fn replayed_web_search_history_matches_go() {
             }
             String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
         };
-        assert_eq!(sent, case["sent"].as_str().unwrap(), "{name}");
+        // The HTTP calls take the native route (#23): the client's body goes upstream
+        // unchanged, without the web search or image tool. The WebSocket shape keeps Go's
+        // bytes until #24.
+        let expected = if call == "websocket" {
+            case["sent"].as_str().unwrap()
+        } else {
+            case["payload"].as_str().unwrap()
+        };
+        assert_eq!(sent, expected, "{name}");
     }
 }
 
@@ -1974,12 +2059,15 @@ async fn payload_filters_remove_late_codex_additions() {
                 ResponseBody::Buffered(_) => {}
             }
             let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
-            let image = gjson::get(&sent, r#"tools.#(type=="image_generation")"#).exists();
-            assert_eq!(image, model == "gpt-5.6-luna", "{model} stream={stream}: {sent}");
-            if model == "gpt-5.6-sol" {
-                assert!(!gjson::get(&sent, "instructions").exists(), "{sent}");
-                assert!(!gjson::get(&sent, "prompt_cache_key").exists(), "{sent}");
-            }
+            // A Responses request on an API key takes the native route (#23): the executor
+            // adds nothing late, so no rule has anything to remove, and the payload rules
+            // do not run. Only the routed `model` is added. Translated requests keep the
+            // late additions and the barrier until #27.
+            assert_eq!(
+                sent,
+                format!(r#"{{"model":"{model}","input":"hello","prompt_cache_key":"injected-cache"}}"#),
+                "{model} stream={stream}"
+            );
         }
     }
 }

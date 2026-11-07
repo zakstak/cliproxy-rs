@@ -1,7 +1,8 @@
-//! `service_tier` on Codex requests through the real router (issue #8). An official Codex
-//! client keeps every explicit tier, `flex` included, and the generated
-//! `x-codex-routing-hint` names the same tier as the body. Other clients keep Go's rule
-//! (only `priority`, alias `fast`, and `ultrafast`). An upstream that refuses a tier
+//! `service_tier` on Codex requests through the real router (issue #8, #23). Every
+//! Responses client keeps its explicit tier byte for byte, `flex` and `fast` included, and
+//! the generated `x-codex-routing-hint` names the tier the body carries. Translated
+//! clients (Chat Completions) keep Go's rule (only `priority`, alias `fast`, and
+//! `ultrafast`). An upstream that refuses a tier
 //! reaches the client with its own status and message. Loopback upstream, fake tokens and
 //! a private `auth-dir`; nothing here shows that a real subscription backend accepts
 //! `flex`.
@@ -178,7 +179,9 @@ async fn native_codex_keeps_explicit_tiers_in_body_and_routing_hint() {
             Some(r#""ultrafast""#),
             "model=gpt-5.5;tier=ultrafast",
         ),
-        (Some(r#""fast""#), Some(r#""priority""#), "model=gpt-5.5;tier=priority"),
+        // The native route (#23) forwards the client's spelling; the generated hint
+        // names the tier the body carries.
+        (Some(r#""fast""#), Some(r#""fast""#), "model=gpt-5.5;tier=fast"),
         (None, None, "model=gpt-5.5"),
         // A tier only a catalog would name: forwarded for the upstream to decide.
         (Some(r#""scale""#), Some(r#""scale""#), "model=gpt-5.5;tier=scale"),
@@ -229,11 +232,12 @@ async fn native_codex_receives_the_upstream_tier_refusal() {
 #[tokio::test]
 async fn translated_clients_keep_gos_service_tier_rule() {
     let proxy = proxy(false).await;
+    // Any Responses client takes the native route (#23) and keeps its tier as sent.
     let python = [("user-agent", "OpenAI/Python 2.1.0")];
     for (sent, want, want_hint) in [
-        (r#""flex""#, None, "model=gpt-5.5"),
-        (r#""scale""#, None, "model=gpt-5.5"),
-        (r#""fast""#, Some(r#""priority""#), "model=gpt-5.5;tier=priority"),
+        (r#""flex""#, Some(r#""flex""#), "model=gpt-5.5;tier=flex"),
+        (r#""scale""#, Some(r#""scale""#), "model=gpt-5.5;tier=scale"),
+        (r#""fast""#, Some(r#""fast""#), "model=gpt-5.5;tier=fast"),
         (r#""ultrafast""#, Some(r#""ultrafast""#), "model=gpt-5.5;tier=ultrafast"),
     ] {
         let (status, text, headers, body) = send(&proxy, "/v1/responses", &python, responses_body(Some(sent))).await;

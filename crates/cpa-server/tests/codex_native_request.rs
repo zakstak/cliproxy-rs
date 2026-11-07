@@ -1,8 +1,8 @@
-//! Native Codex Responses requests through the real router (issue #2): an official Codex
-//! client keeps `parallel_tool_calls` (false, true or omitted) and its output-replay
-//! `include`, while other Responses clients keep Go's forced values. Standard, Responses
-//! Lite and Sign in with ChatGPT credentials, against a loopback upstream with fake
-//! tokens and a private `auth-dir`.
+//! Native Codex Responses requests through the real router (#2, #23): on the `chatgpt` and
+//! `api-key` profiles every Responses client's body reaches the upstream byte for byte,
+//! with only the contract's permitted edits, and the upstream's answer reaches the client
+//! byte for byte (`docs/codex/CONTRACT.md` "Native HTTP route"). Sign in with ChatGPT
+//! keeps the legacy path. Loopback upstreams, fake tokens and a private `auth-dir`.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -144,60 +144,6 @@ fn field(body: &str, path: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn native_codex_keeps_tool_parallelism_and_output_replay() {
-    let proxy = proxy(false).await;
-    let codex = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
-    for parallel in [Some(false), Some(true), None] {
-        let (headers, sent) = send(&proxy, &codex, body(parallel, REPLAY)).await;
-        assert_eq!(
-            field(&sent, "/parallel_tool_calls"),
-            parallel.map(|p| p.to_string()),
-            "{parallel:?}: {sent}"
-        );
-        assert!(sent.contains(&format!(r#""include":{REPLAY}"#)), "{sent}");
-        assert!(
-            sent.contains(r#",  "text" : {"verbosity":"low"}"#),
-            "untouched bytes: {sent}"
-        );
-        // Still removed: no evidence shows that the ChatGPT Codex backend accepts it.
-        assert_eq!(field(&sent, "/prompt_cache_options"), None);
-        assert_eq!(headers["authorization"], "Bearer at-FAKE", "client key never forwarded");
-    }
-    // Codex identified by `originator` alone.
-    let (_, sent) = send(&proxy, &[("originator", "codex_cli_rs")], body(Some(false), REPLAY)).await;
-    assert_eq!(field(&sent, "/parallel_tool_calls").as_deref(), Some("false"));
-}
-
-#[tokio::test]
-async fn translated_responses_clients_keep_gos_forced_fields() {
-    let proxy = proxy(false).await;
-    for parallel in [Some(false), None] {
-        let (_, sent) = send(&proxy, &[("user-agent", "OpenAI/Python 2.1.0")], body(parallel, REPLAY)).await;
-        assert_eq!(field(&sent, "/parallel_tool_calls").as_deref(), Some("true"), "{sent}");
-        assert_eq!(
-            field(&sent, "/include").as_deref(),
-            Some(r#"["reasoning.encrypted_content"]"#)
-        );
-    }
-}
-
-#[tokio::test]
-async fn native_responses_lite_still_serializes_tool_calls() {
-    let proxy = proxy(false).await;
-    let (_, sent) = send(
-        &proxy,
-        &[
-            ("user-agent", CODEX_UA),
-            ("x-openai-internal-codex-responses-lite", "true"),
-        ],
-        body(Some(true), REPLAY),
-    )
-    .await;
-    assert_eq!(field(&sent, "/parallel_tool_calls").as_deref(), Some("false"), "{sent}");
-    assert!(sent.contains(&format!(r#""include":{REPLAY}"#)), "{sent}");
-}
-
-#[tokio::test]
 async fn native_siwc_keeps_parallelism_and_drops_unproven_fields() {
     let proxy = proxy(true).await;
     let (headers, sent) = send(&proxy, &[("user-agent", CODEX_UA)], body(Some(false), REPLAY)).await;
@@ -255,7 +201,282 @@ async fn codex_request_boundary_refuses_before_the_upstream_send() {
         proxy.seen.lock().unwrap().is_empty(),
         "a refused body reached the upstream"
     );
+    // Compact used to delete a non-`true` `stream` before anything read it, so a mistyped
+    // one was cleaned and accepted. The boundary reads the client's own bytes now.
+    let response = wreq::Client::new()
+        .post(format!("{}/v1/responses/compact", proxy.url))
+        .header("authorization", "Bearer client-key")
+        .body(r#"{"model":"gpt-5.5","stream":"yes","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("request field `stream` must be a boolean"), "{text}");
+    assert!(proxy.seen.lock().unwrap().is_empty());
     // A valid body on the same route still goes through.
     let (_, sent) = send(&proxy, &[], body(Some(false), REPLAY)).await;
     assert!(sent.contains(r#""model":"gpt-5.5""#), "{sent}");
+}
+
+// The native HTTP route through the real router, with the shared capture upstream.
+
+use cpa_exec::codex_contract::fixture;
+use cpa_server::testing::codex_capture::{CaptureUpstream, Reply, Script};
+
+struct Native {
+    url: String,
+    upstream: CaptureUpstream,
+    _auth_dir: AuthDir,
+}
+
+/// A proxy whose one Codex credential (`api_key` set for the `api-key` profile, else a
+/// ChatGPT OAuth token) points at a capture upstream answering `script`.
+async fn native(api_key: bool, script: Script, extra_config: &str) -> Native {
+    let upstream = CaptureUpstream::start(script).await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\n{extra_config}",
+        auth_dir.0.display()
+    ))
+    .unwrap();
+    let mut credential = credential(false, &upstream.base_url);
+    if api_key {
+        credential.attributes.insert("api_key".into(), "key-FAKE".into());
+    }
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        devices: Default::default(),
+        openai: Default::default(),
+        google: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, vec![credential], executors));
+    Native {
+        url: serve(cpa_server::router(rt)).await,
+        upstream,
+        _auth_dir: auth_dir,
+    }
+}
+
+/// A fixture body routed to a model the Codex catalog serves. The model value is the only
+/// difference from the fixture.
+fn routed(name: &str) -> String {
+    String::from_utf8(fixture(name).bytes().to_vec()).unwrap().replacen(
+        r#""model":"gpt-test""#,
+        r#""model":"gpt-5.5""#,
+        1,
+    )
+}
+
+fn text_of(name: &str) -> String {
+    String::from_utf8(fixture(name).bytes().to_vec()).unwrap()
+}
+
+async fn post(url: &str, path: &str, headers: &[(&str, &str)], body: String) -> (u16, HeaderMap, String) {
+    let mut request = wreq::Client::new()
+        .post(format!("{url}{path}"))
+        .header("authorization", "Bearer client-key")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.body(body).send().await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    (status, headers, response.text().await.unwrap())
+}
+
+const NATIVE_REQUESTS: [&str; 5] = [
+    "http-request-full",
+    "http-request-lite",
+    "http-request-compaction",
+    "http-request-minimal",
+    "probe-request-unknown-fields",
+];
+
+/// Every Responses client, official or not, on both native profiles: the upstream gets
+/// the client's bytes and the client gets the upstream's events, each byte for byte.
+#[tokio::test]
+async fn native_requests_and_events_pass_through_the_route_unchanged() {
+    let codex = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    let ordinary = [("user-agent", "OpenAI/Python 2.1.0"), ("originator", "")];
+    for api_key in [false, true] {
+        let replies = (0..NATIVE_REQUESTS.len() * 2)
+            .map(|_| Reply::sse(fixture("sse-completed").bytes()))
+            .collect();
+        let proxy = native(
+            api_key,
+            Script {
+                http: replies,
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        for headers in [&codex[..], &ordinary[..1]] {
+            for name in NATIVE_REQUESTS {
+                let body = routed(name);
+                let (status, response_headers, answer) = post(&proxy.url, "/v1/responses", headers, body.clone()).await;
+                assert_eq!(status, 200, "{name}: {answer}");
+                assert_eq!(response_headers["content-type"], "text/event-stream");
+                assert_eq!(answer, text_of("sse-completed"), "{name}: client bytes");
+                let sent = proxy.upstream.http().pop().unwrap();
+                assert_eq!(String::from_utf8_lossy(&sent.body), body, "{name}: upstream bytes");
+                assert_eq!(
+                    sent.headers["authorization"],
+                    if api_key { "Bearer key-FAKE" } else { "Bearer at-FAKE" },
+                    "the client key never travels upstream"
+                );
+            }
+        }
+    }
+}
+
+/// Events the legacy framer dropped or rewrote for Codex clients reach them unchanged.
+#[tokio::test]
+async fn private_and_unknown_events_reach_codex_clients() {
+    let stream = concat!(
+        "event: codex.rate_limits\ndata: {\"type\":\"codex.rate_limits\",\"primary\":{\"used_percent\":1.50}}\n\n",
+        "data: {\"type\":\"responsesapi.websocket_timing\",\"t\":1}\n\n",
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_9\"}}\n\n",
+        "data: {\"type\":\"response.future_event\",\"n\":12345678901234567890}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"output\":[]}}\n\n",
+    );
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(stream)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(
+        &proxy.url,
+        "/v1/responses",
+        &[("user-agent", CODEX_UA)],
+        routed("http-request-full"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(answer, stream);
+}
+
+/// A buffered client on the `chatgpt` profile: `stream: true` upstream (the only change)
+/// and the terminal event's `response` object back, byte for byte. On an API key the
+/// request and its JSON answer pass unchanged.
+#[tokio::test]
+async fn buffered_clients_get_the_destination_contract() {
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let terminal = String::from_utf8(fixture("sse-completed").frames().pop().unwrap().to_vec()).unwrap();
+    let object = terminal[terminal.find(r#""response":"#).unwrap() + 11..terminal.len() - 1].to_owned();
+
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+    assert_eq!((status, answer.as_str()), (200, object.as_str()));
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), full, "only `stream` changes");
+
+    let json = r#"{"id":"resp_1","object":"response","status":"completed","output":[],"usage":null,"x":1.50}"#;
+    let proxy = native(
+        true,
+        Script {
+            http: vec![Reply::json(200, json)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+    assert_eq!((status, answer.as_str()), (200, json));
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), buffered);
+}
+
+/// Compaction keeps its body, `stream: false` included, and its answer.
+#[tokio::test]
+async fn compaction_passes_through_the_route_unchanged() {
+    let answer =
+        r#"{"id":"cmp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"ENC"}]}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::json(200, answer)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let body = routed("http-request-compaction").replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let (status, _, got) = post(&proxy.url, "/v1/responses/compact", &[], body.clone()).await;
+    assert_eq!((status, got.as_str()), (200, answer));
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(sent.uri.path(), "/responses/compact");
+    assert_eq!(String::from_utf8_lossy(&sent.body), body);
+}
+
+/// An upstream error reaches the client with its body; the request-scoped context-window
+/// failure arrives as the provider's own event.
+#[tokio::test]
+async fn upstream_failures_reach_the_client_unchanged() {
+    let limit = text_of("http-error-usage-limit-429");
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::json(429, limit.clone())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((status, answer.as_str()), (429, limit.as_str()));
+    // The usage limit cools the only credential, so the next case gets its own proxy.
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-failed-context-window").bytes())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!(status, 200);
+    assert_eq!(answer, text_of("sse-failed-context-window"));
+}
+
+/// Payload rules and the Codex-client ingress rewrite cannot reach a native body.
+#[tokio::test]
+async fn operator_rules_cannot_rewrite_native_bodies() {
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "payload:\n  override:\n    - models: [{name: gpt-5.5}]\n      params: {instructions: injected, store: true}\n  filter:\n    - models: [{name: gpt-5.5}]\n      params: [prompt_cache_options, service_tier]\nupstream:\n  codex:\n    orphan-delegation-compatibility: true\nclient:\n  codex:\n    optimize-multi-agent-v2: true\n",
+    )
+    .await;
+    let body = routed("http-request-full");
+    let (status, _, _) = post(
+        &proxy.url,
+        "/v1/responses",
+        &[("user-agent", CODEX_UA), ("x-openai-subagent", "collab_spawn")],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), body);
 }

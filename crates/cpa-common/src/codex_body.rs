@@ -121,10 +121,23 @@ pub struct Member<'a> {
     pub raw: &'a [u8],
 }
 
+impl<'a> Member<'a> {
+    /// The unescaped text of a string value, borrowed when it has no escapes.
+    pub fn text(&self) -> Option<Cow<'a, str>> {
+        if self.kind != Kind::String {
+            return None;
+        }
+        // The value passed the scanner, so it is UTF-8 and a well-formed string.
+        let text = std::str::from_utf8(self.raw).ok()?;
+        Scanner { text, at: 0 }.string(true).ok().flatten()
+    }
+}
+
 /// A body that passed the boundary: the top-level members in document order, each
 /// pointing into the caller's bytes.
 #[derive(Debug)]
 pub struct CodexBody<'a> {
+    raw: &'a [u8],
     members: Vec<Member<'a>>,
 }
 
@@ -170,12 +183,42 @@ impl<'a> CodexBody<'a> {
                 return Err(BodyError::FieldType { field, expected });
             }
         }
-        Ok(Self { members })
+        Ok(Self { raw, members })
     }
 
     /// The top-level member named `key`. Keys are unique, so there is at most one.
     pub fn get(&self, key: &str) -> Option<&Member<'a>> {
         self.members.iter().find(|m| m.key == key)
+    }
+
+    /// The body with top-level `key` set to `value`, a JSON value the caller wrote. An
+    /// existing member keeps its position and only its value bytes change; a missing one
+    /// is added as the first member. Every other byte is copied unchanged, once. This is
+    /// the edit behind the contract's permitted transformations (`model` routing, the
+    /// buffered `stream` adaptation); it is not a general editing tool.
+    pub fn with_member(&self, key: &str, value: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.raw.len() + key.len() + value.len() + 4);
+        match self.get(key) {
+            Some(member) => {
+                let start = member.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
+                out.extend_from_slice(&self.raw[..start]);
+                out.extend_from_slice(value.as_bytes());
+                out.extend_from_slice(&self.raw[start + member.raw.len()..]);
+            }
+            None => {
+                // The root object's `{` is the first byte that is not whitespace.
+                let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
+                out.extend_from_slice(&self.raw[..open]);
+                out.extend_from_slice(serde_json::to_string(key).unwrap_or_default().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(value.as_bytes());
+                if !self.members.is_empty() {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&self.raw[open..]);
+            }
+        }
+        out
     }
 }
 
