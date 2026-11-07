@@ -216,6 +216,136 @@ pub(crate) fn clean_parameters(parameters: &Res<'_>) -> Vec<u8> {
     cleaned
 }
 
+/// `name` as one gjson path component: its path syntax characters escaped.
+fn escape_path(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(
+            c,
+            '.' | '*' | '?' | '|' | '#' | '@' | '\\' | '!' | '=' | '<' | '>' | '%' | ':'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A Gemini `Schema` (OpenAPI subset) with JSON Schema's lower-case type names: `type`
+/// is converted only where the Gemini schema defines a schema (the object itself,
+/// `properties` values, `items` and `anyOf` entries). Literal data (`enum`, `default`,
+/// `example`), unknown members and their values stay as sent.
+fn gemini_schema_types(schema: &Res<'_>) -> Vec<u8> {
+    fn walk(schema: &Res<'_>, path: &str, edits: &mut Vec<(String, Vec<u8>)>) {
+        if !schema.is_object() {
+            return;
+        }
+        let kind = schema.get("type");
+        if kind.kind == Kind::String {
+            let lower = go_lower(&kind.s);
+            if lower != kind.s.as_ref() {
+                edits.push((format!("{path}type"), lower));
+            }
+        }
+        let properties = schema.get("properties");
+        if properties.is_object() {
+            for (name, child) in properties.map() {
+                let name = escape_path(&String::from_utf8_lossy(&name));
+                walk(&child, &format!("{path}properties.{name}."), edits);
+            }
+        }
+        walk(&schema.get("items"), &format!("{path}items."), edits);
+        let any = schema.get("anyOf");
+        if any.is_array() {
+            for (i, child) in any.array().iter().enumerate() {
+                walk(child, &format!("{path}anyOf.{i}."), edits);
+            }
+        }
+    }
+    let mut edits = Vec::new();
+    walk(schema, "", &mut edits);
+    let mut out = schema.raw.to_vec();
+    for (path, value) in edits {
+        gj::set_str(&mut out, &path, value);
+    }
+    out
+}
+
+/// The Codex translated route's tool choice from a Gemini `toolConfig` (either
+/// spelling): `NONE` and `AUTO` map directly; `ANY` becomes `required`, a single named
+/// function, or the documented Responses `allowed_tools` restriction for a proper subset.
+/// A mode or restriction with no Responses form is refused, never widened.
+fn strict_tool_choice(
+    out: &mut Vec<u8>,
+    root: &Res<'_>,
+    names: &HashMap<Vec<u8>, Vec<u8>>,
+    drops: &mut crate::common::UserTurnDrops,
+) {
+    let mut config = Res::default();
+    for path in [
+        "toolConfig.functionCallingConfig",
+        "toolConfig.function_calling_config",
+        "tool_config.function_calling_config",
+        "tool_config.functionCallingConfig",
+    ] {
+        let found = root.get(path);
+        if found.exists() {
+            config = found;
+            break;
+        }
+    }
+    if !config.exists() {
+        return;
+    }
+    let allowed: Vec<Vec<u8>> = first_of(&config, ["allowedFunctionNames", "allowed_function_names"])
+        .array()
+        .iter()
+        .map(|n| n.bytes().into_owned())
+        .collect();
+    let declared: Vec<Vec<u8>> = names.keys().cloned().collect();
+    let mode = config.get("mode");
+    let mode = if mode.kind == Kind::String {
+        go_lower(trim_space(&mode.s))
+    } else {
+        Vec::new()
+    };
+    match mode.as_slice() {
+        b"none" if allowed.is_empty() => {
+            gj::set_str(out, "tool_choice", "none");
+        }
+        b"" | b"auto" | b"mode_unspecified" if allowed.is_empty() => {
+            gj::set_str(out, "tool_choice", "auto");
+        }
+        b"any" => {
+            if allowed.is_empty() || declared.iter().all(|d| allowed.contains(d)) {
+                gj::set_str(out, "tool_choice", "required");
+            } else if allowed.iter().any(|a| !declared.contains(a)) {
+                drops.drop_part("allowedFunctionNames entry naming no declared function");
+            } else if let [only] = allowed.as_slice() {
+                let mut choice = br#"{"type":"function","name":""}"#.to_vec();
+                gj::set_str(&mut choice, "name", mapped_name(names, only));
+                gj::set_raw(out, "tool_choice", choice);
+            } else {
+                let tools: Vec<Vec<u8>> = allowed
+                    .iter()
+                    .map(|name| {
+                        let mut tool = br#"{"type":"function","name":""}"#.to_vec();
+                        gj::set_str(&mut tool, "name", mapped_name(names, name));
+                        tool
+                    })
+                    .collect();
+                let mut choice = br#"{"type":"allowed_tools","mode":"required","tools":[]}"#.to_vec();
+                gj::set_raw(&mut choice, "tools", gj::join(&tools));
+                gj::set_raw(out, "tool_choice", choice);
+            }
+        }
+        other => {
+            let mode = String::from_utf8_lossy(other).into_owned();
+            drops.drop_part(&format!("functionCallingConfig mode {mode} with allowedFunctionNames"));
+        }
+    }
+}
+
 /// setCodexToolChoiceFromGeminiToolConfig.
 fn set_tool_choice(out: &mut Vec<u8>, config: &Res<'_>) {
     if !config.exists() {
@@ -433,10 +563,12 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
                     // Strict: the client's schema; only Gemini's upper-case `type` names
                     // become JSON Schema's (below). Go also drops `$schema` and adds
                     // `additionalProperties: false`.
-                    let parameters = if strict {
-                        parameters.raw.to_vec()
-                    } else {
-                        clean_parameters(&parameters)
+                    // A Gemini `parameters` schema gets JSON Schema's type names at its
+                    // schema positions only; `parametersJsonSchema` is JSON Schema already.
+                    let parameters = match (strict, declaration.get("parameters").exists()) {
+                        (true, true) => gemini_schema_types(&parameters),
+                        (true, false) => parameters.raw.to_vec(),
+                        (false, _) => clean_parameters(&parameters),
                     };
                     gj::set_raw(&mut item, "parameters", parameters);
                 }
@@ -448,7 +580,11 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
     }
 
     gj::set_bool(&mut out, "parallel_tool_calls", true);
-    set_tool_choice(&mut out, &root.get("toolConfig.functionCallingConfig"));
+    if strict {
+        strict_tool_choice(&mut out, &root, &names, &mut drops);
+    } else {
+        set_tool_choice(&mut out, &root.get("toolConfig.functionCallingConfig"));
+    }
 
     // Google's Python SDK sends snake_case thinking fields.
     let mut effort: Option<Vec<u8>> = None;
@@ -485,7 +621,12 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
     gj::set_bool(&mut out, "store", false);
     gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
 
-    let paths = cpa_common::gemini_schema::walk(&gj::get(&out, "tools"), b"type");
+    // Strict mode converted each `parameters` schema above, at its schema positions.
+    let paths = if strict {
+        Vec::new()
+    } else {
+        cpa_common::gemini_schema::walk(&gj::get(&out, "tools"), b"type")
+    };
     for path in paths {
         let full = [&b"tools."[..], &path].concat();
         let value = gj::get(&out, &full);

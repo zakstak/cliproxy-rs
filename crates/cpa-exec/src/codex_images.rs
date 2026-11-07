@@ -634,42 +634,76 @@ fn json_text(raw: &[u8]) -> Option<String> {
 }
 
 /// Images API fields the `image_generation` tool expresses (OpenAI Images API and the
-/// Responses image generation tool): any other field, or `n` above 1, is refused before
-/// anything is sent (#27). Go drops them.
-fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
-    const FIELDS: [&str; 11] = [
-        "model",
-        "prompt",
-        "size",
-        "quality",
-        "background",
-        "output_format",
-        "output_compression",
-        "partial_images",
-        "moderation",
-        "response_format",
-        "stream",
-    ];
-    let root = gjson::parse(raw);
-    let mut refused = None;
-    root.each(|key, value| {
-        let key = key.str();
-        let one = key == "n" && (value.kind() == Kind::Null || value.f64() == 1.0);
-        if !(FIELDS.contains(&key) || extra.contains(&key) || one) {
-            refused = Some(key.to_owned());
-            return false;
+/// Responses image generation tool). Any other field, or `n` above 1, is refused before
+/// anything is sent (#27); Go drops them.
+const TOOL_FIELDS: [&str; 11] = [
+    "model",
+    "prompt",
+    "size",
+    "quality",
+    "background",
+    "output_format",
+    "output_compression",
+    "partial_images",
+    "moderation",
+    "response_format",
+    "stream",
+];
+
+fn unexpressible(field: &str) -> ExecError {
+    ExecError::local(
+        400,
+        cpa_core::exec::FailureScope::Request,
+        format!(
+            "unsupported conversion: `{field}` cannot be expressed by the Codex image generation tool; remove it or send the request to a provider that accepts it"
+        ),
+    )
+}
+
+/// Checks each `(field, number)` of a request: a [`TOOL_FIELDS`] or `extra` field, or `n`
+/// of 1; anything else is refused.
+fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, extra: &[&str]) -> Result<(), ExecError> {
+    for (field, number) in fields {
+        let one = field == "n" && number.is_none_or(|n| n == 1.0);
+        if !(TOOL_FIELDS.contains(&field) || extra.contains(&field) || one) {
+            return Err(unexpressible(field));
         }
+    }
+    Ok(())
+}
+
+fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
+    let root = gjson::parse(raw);
+    let mut fields = Vec::new();
+    root.each(|key, value| {
+        let number = match value.kind() {
+            Kind::Null => None,
+            _ => Some(value.f64()),
+        };
+        fields.push((key.str().to_owned(), number));
         true
     });
-    match refused {
-        None => Ok(()),
-        Some(field) => Err(ExecError::local(
-            400,
-            cpa_core::exec::FailureScope::Request,
-            format!(
-                "unsupported conversion: `{field}` cannot be expressed by the Codex image generation tool; remove it or send the request to a provider that accepts it"
-            ),
-        )),
+    check_fields(fields.iter().map(|(k, n)| (k.as_str(), *n)), extra)
+}
+
+/// An image the tool request carries: a URL (a data URL included) or an uploaded file.
+enum Image {
+    Url(String),
+    File(String),
+}
+
+/// A JSON image reference (`{"image_url":...}` or `{"file_id":...}`, the Images API
+/// forms the Responses `input_image` and `input_image_mask` also take). Anything else is
+/// refused rather than dropped.
+fn image_reference(value: &gjson::Value<'_>, what: &str) -> Result<Image, ExecError> {
+    let url = value.get("image_url").str().trim().to_owned();
+    let file = value.get("file_id").str().trim().to_owned();
+    match (url.is_empty(), file.is_empty()) {
+        (false, true) => Ok(Image::Url(url)),
+        (true, false) => Ok(Image::File(file)),
+        _ => Err(unexpressible(&format!(
+            "{what} without exactly one image_url or file_id"
+        ))),
     }
 }
 
@@ -697,13 +731,14 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     expressible(&raw, &["images", "mask", "input_fidelity"])?;
     let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
     let images_value = gjson::get(&raw, "images");
-    let images: Vec<String> = if images_value.kind() == Kind::Array {
+    let images: Vec<Image> = if images_value.kind() == Kind::Array {
         images_value
             .array()
             .iter()
-            .map(|img| img.get("image_url").str().trim().to_owned())
-            .filter(|url| !url.is_empty())
-            .collect()
+            .map(|img| image_reference(img, "an image"))
+            .collect::<Result<_, _>>()?
+    } else if images_value.exists() {
+        return Err(unexpressible("images that is not an array"));
     } else {
         Vec::new()
     };
@@ -720,9 +755,12 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
             "moderation",
         ],
     );
-    let mask = gjson::get(&raw, "mask.image_url").str().trim().to_owned();
-    if !mask.is_empty() {
-        tool = set_str(&tool, "input_image_mask.image_url", &mask);
+    let mask = gjson::get(&raw, "mask");
+    if mask.exists() && mask.kind() != Kind::Null {
+        tool = match image_reference(&mask, "a mask")? {
+            Image::Url(url) => set_str(&tool, "input_image_mask.image_url", &url),
+            Image::File(id) => set_str(&tool, "input_image_mask.file_id", &id),
+        };
     }
     Ok(Prepared {
         body: responses_request(&prompt, &images, &tool),
@@ -748,6 +786,29 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
     let form =
         multipart::read_form(body, boundary).map_err(|e| plain_err(format!("parse multipart form failed: {e}")))?;
     let value = |key: &str| form.value(key).trim().to_owned();
+    // The same field policy as JSON (#27): form values the tool expresses, and image and
+    // mask files; anything else is refused.
+    check_fields(
+        form.values.iter().map(|(key, _)| {
+            let number = (key == "n").then(|| value("n").parse::<f64>().unwrap_or(f64::NAN));
+            (key.as_str(), number)
+        }),
+        &["input_fidelity"],
+    )?;
+    if let Some((file, _)) = form
+        .files
+        .iter()
+        .find(|(key, _)| !matches!(key.as_str(), "image" | "image[]" | "mask"))
+    {
+        return Err(unexpressible(&format!("file field {file}")));
+    }
+    if !form.files("image").is_empty() && !form.files("image[]").is_empty() {
+        // Only one of the two image fields would be read.
+        return Err(unexpressible("both image and image[] files"));
+    }
+    if form.files("mask").len() > 1 {
+        return Err(unexpressible("more than one mask file"));
+    }
     let mut tool = r#"{"type":"image_generation","action":"edit"}"#.to_owned();
     tool = set_str(&tool, "model", &tool_model(&value("model"), route_model));
     for field in [
@@ -768,7 +829,7 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
             tool = set_raw(&tool, field, &n.to_string());
         }
     }
-    let images: Vec<String> = image_files(&form).iter().map(data_url).collect();
+    let images: Vec<Image> = image_files(&form).iter().map(|f| Image::Url(data_url(f))).collect();
     if let Some(mask) = form.files("mask").first() {
         tool = set_str(&tool, "input_image_mask.image_url", &data_url(mask));
     }
@@ -815,7 +876,7 @@ fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str])
 }
 
 /// `codexBuildImagesResponsesRequest`.
-fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
+fn responses_request(prompt: &str, images: &[Image], tool: &str) -> String {
     // Only what the conversion needs (#27): the model, the forced `image_generation`
     // tool with the client's image settings, the prompt and images, `stream` (the answer
     // is read from events) and `store: false` as the pinned client sends. No default
@@ -827,8 +888,11 @@ fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
         req = set_raw(&req, "tools", &format!("[{tool}]"));
     }
     let mut content = vec![set_str(r#"{"type":"input_text","text":""}"#, "text", prompt)];
-    for image in images.iter().filter(|i| !i.trim().is_empty()) {
-        content.push(set_str(r#"{"type":"input_image","image_url":""}"#, "image_url", image));
+    for image in images {
+        content.push(match image {
+            Image::Url(url) => set_str(r#"{"type":"input_image","image_url":""}"#, "image_url", url),
+            Image::File(id) => set_str(r#"{"type":"input_image","file_id":""}"#, "file_id", id),
+        });
     }
     let input = format!(
         r#"[{{"type":"message","role":"user","content":[{}]}}]"#,

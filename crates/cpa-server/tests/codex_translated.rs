@@ -857,3 +857,170 @@ async fn direct_images_are_not_rewritten() {
         "{body}"
     );
 }
+
+// Review 5812490964: Gemini tool selection and schema literals, value-level controls,
+// failed tool results.
+
+fn gemini_tools(config_key: &str, config: Value) -> Value {
+    json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{"functionDeclarations": [
+            {"name": "alpha", "parameters": {"type": "OBJECT", "properties": {}}},
+            {"name": "beta", "parameters": {"type": "OBJECT", "properties": {}}},
+            {"name": "gamma", "parameters": {"type": "OBJECT", "properties": {}}}
+        ]}],
+        config_key: config
+    })
+}
+
+/// A Gemini `ANY` restriction to a proper subset of the declared tools stays a
+/// restriction (the Responses `allowed_tools` choice), in both spellings; one allowed name
+/// becomes that function; a mode with no Responses form is refused.
+#[tokio::test]
+async fn gemini_tool_restrictions_are_not_widened() {
+    let path = "/v1beta/models/gpt-5.5:generateContent";
+    let subset = [
+        gemini_tools(
+            "toolConfig",
+            json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["alpha", "beta"]}}),
+        ),
+        gemini_tools(
+            "tool_config",
+            json!({"function_calling_config": {"mode": "ANY", "allowed_function_names": ["alpha", "beta"]}}),
+        ),
+    ];
+    for request in subset {
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, path, &request).await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(
+            sent(&proxy)["tool_choice"],
+            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "alpha"}, {"type": "function", "name": "beta"}]})
+        );
+    }
+    let proxy = make(vec![completed()], "").await;
+    let one = gemini_tools(
+        "tool_config",
+        json!({"function_calling_config": {"mode": "ANY", "allowed_function_names": ["gamma"]}}),
+    );
+    post(&proxy.url, path, &one).await;
+    assert_eq!(
+        sent(&proxy)["tool_choice"],
+        json!({"type": "function", "name": "gamma"})
+    );
+    let proxy = make(vec![completed()], "").await;
+    let none = gemini_tools("tool_config", json!({"function_calling_config": {"mode": "NONE"}}));
+    post(&proxy.url, path, &none).await;
+    assert_eq!(sent(&proxy)["tool_choice"], "none");
+    let proxy = make(vec![completed()], "").await;
+    let validated = gemini_tools("toolConfig", json!({"functionCallingConfig": {"mode": "VALIDATED"}}));
+    let (status, answer) = post(&proxy.url, path, &validated).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer.contains("unsupported conversion") && answer.contains("validated"),
+        "{answer}"
+    );
+    assert!(proxy.upstream.http().is_empty());
+}
+
+/// Only Gemini schema `type` names become JSON Schema's: literal values (`enum`,
+/// `default`), a property named `type`, unknown extensions and `parametersJsonSchema`
+/// keep their data.
+#[tokio::test]
+async fn gemini_schema_literals_are_not_rewritten() {
+    let request = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{"functionDeclarations": [
+            {"name": "tiered", "parameters": {
+                "type": "OBJECT",
+                "x-meta": {"type": "VIP", "const": {"type": "VIP"}},
+                "properties": {
+                    "tier": {"type": "STRING", "enum": ["VIP"], "default": "VIP"},
+                    "type": {"type": "STRING", "example": {"type": "VIP"}},
+                    "list": {"type": "ARRAY", "items": {"type": "INTEGER"}}
+                }
+            }},
+            {"name": "json_schema", "parametersJsonSchema": {"type": "object", "properties": {"k": {"const": {"type": "VIP"}}}}}
+        ]}]
+    });
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1beta/models/gpt-5.5:generateContent", &request).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_eq!(
+        body["tools"][0]["parameters"],
+        json!({
+            "type": "object",
+            "x-meta": {"type": "VIP", "const": {"type": "VIP"}},
+            "properties": {
+                "tier": {"type": "string", "enum": ["VIP"], "default": "VIP"},
+                "type": {"type": "string", "example": {"type": "VIP"}},
+                "list": {"type": "array", "items": {"type": "integer"}}
+            }
+        })
+    );
+    assert_eq!(
+        body["tools"][1]["parameters"],
+        json!({"type": "object", "properties": {"k": {"const": {"type": "VIP"}}}})
+    );
+}
+
+/// Controls the converter handles are checked by value: Chat JSON mode becomes the
+/// Responses JSON format and any Chat tier is kept; a Claude tier, tool choice or
+/// thinking type with no Responses form is refused.
+#[tokio::test]
+async fn converted_controls_are_checked_by_value() {
+    let mut json_mode = chat_request(false);
+    json_mode["response_format"] = json!({"type": "json_object"});
+    json_mode["service_tier"] = json!("flex");
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/chat/completions", &json_mode).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_eq!(body["text"]["format"], json!({"type": "json_object"}), "{body}");
+    assert_eq!(body["service_tier"], "flex", "{body}");
+
+    let mut tier = claude_request(false);
+    tier["service_tier"] = json!("standard_only");
+    let mut choice = claude_request(false);
+    choice["tool_choice"] = json!({"type": "bogus"});
+    let mut thinking = claude_request(false);
+    thinking["thinking"] = json!({"type": "interleaved"});
+    let mut format = chat_request(false);
+    format["response_format"] = json!({"type": "grammar"});
+    for (path, request, field) in [
+        ("/v1/messages", tier, "service_tier"),
+        ("/v1/messages", choice, "tool_choice"),
+        ("/v1/messages", thinking, "thinking"),
+        ("/v1/chat/completions", format, "response_format"),
+    ] {
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, path, &request).await;
+        assert_eq!(status, 400, "{path} {field}: {answer}");
+        assert!(
+            answer.contains("unsupported conversion") && answer.contains(field),
+            "{answer}"
+        );
+        assert!(proxy.upstream.http().is_empty(), "{field}: nothing was sent");
+    }
+}
+
+/// A failed Claude tool result (`is_error: true`) has no Responses form and is refused
+/// before the send, with string or block content; an ordinary result is sent.
+#[tokio::test]
+async fn failed_tool_results_are_refused() {
+    for content in [json!("ENOENT"), json!([{"type": "text", "text": "ENOENT"}])] {
+        let mut request = claude_request(false);
+        request["messages"][2]["content"][0]["content"] = content.clone();
+        request["messages"][2]["content"][0]["is_error"] = json!(true);
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &request).await;
+        assert_eq!(status, 400, "{content}: {answer}");
+        assert!(answer.contains("is_error"), "{answer}");
+        assert!(proxy.upstream.http().is_empty(), "{content}: nothing was sent");
+        request["messages"][2]["content"][0]["is_error"] = json!(false);
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &request).await;
+        assert_eq!(status, 200, "{content}: an ordinary result: {answer}");
+    }
+}

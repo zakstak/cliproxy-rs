@@ -2479,3 +2479,85 @@ async fn the_image_tool_adapter_adds_nothing() {
         );
     }
 }
+
+/// The image tool adapter keeps every image reference it accepts (#27): a JSON edit's
+/// file-ID image and file-ID mask become the Responses `input_image` and
+/// `input_image_mask` of the same form, and an image without a reference is refused.
+/// Multipart edits follow the same field policy as JSON.
+#[tokio::test]
+async fn image_references_are_kept_or_refused() {
+    let executor = executor();
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+    );
+    let form = |fields: &str| {
+        format!(
+            "--XB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit it\r\n{fields}--XB\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--XB--\r\n"
+        )
+    };
+    let field =
+        |name: &str, value: &str| format!("--XB\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
+    let extra_file = "--XB\r\nContent-Disposition: form-data; name=\"thumbnail\"; filename=\"t.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n";
+    let cases: Vec<(String, &str, Option<&str>)> = vec![
+        (
+            r#"{"prompt":"edit it","images":[{"file_id":"file-IMG"},{"image_url":"https://example.com/b.png"}],"mask":{"file_id":"file-MASK"}}"#.into(),
+            "application/json",
+            None,
+        ),
+        (
+            r#"{"prompt":"edit it","images":[{"file_id":"file-IMG"},{"detail":"high"}]}"#.into(),
+            "application/json",
+            Some("an image without exactly one image_url or file_id"),
+        ),
+        (form(&field("n", "2")), "multipart/form-data; boundary=XB", Some("`n`")),
+        (form(&field("style", "vivid")), "multipart/form-data; boundary=XB", Some("style")),
+        (form(extra_file), "multipart/form-data; boundary=XB", Some("thumbnail")),
+    ];
+    for (body, content_type, refused) in cases {
+        let mock = Mock::start().await;
+        mock.script(
+            "/responses",
+            vec![Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: sse.into(),
+            }],
+        );
+        let case = serde_json::json!({"source": "openai", "model": "gpt-5.4", "payload": body, "attributes": {}, "metadata": {"type": "codex", "access_token": "at-FAKE"}});
+        let credential = credential(&case, &mock.url);
+        let mut req = request(&case);
+        req.request_path = "/v1/images/edits".into();
+        req.headers
+            .insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
+        let result = executor
+            .images(&credential, req, "/v1/images/edits", &Config::default())
+            .await;
+        let captured = mock.take();
+        if let Some(field) = refused {
+            let error = result.err().unwrap_or_else(|| panic!("{field}: refused"));
+            assert_eq!(error.status, 400, "{field}");
+            assert!(
+                String::from_utf8_lossy(&error.body).contains(field),
+                "{field}: {:?}",
+                error.body
+            );
+            assert!(captured.is_empty(), "{field}: nothing is sent");
+            continue;
+        }
+        result.unwrap();
+        let sent: Value = serde_json::from_slice(&captured[0].body).unwrap();
+        let content = &sent["input"][0]["content"];
+        assert_eq!(
+            content[1],
+            serde_json::json!({"type": "input_image", "file_id": "file-IMG"}),
+            "{sent}"
+        );
+        assert_eq!(content[2]["image_url"], "https://example.com/b.png", "{sent}");
+        assert_eq!(
+            sent["tools"][0]["input_image_mask"],
+            serde_json::json!({"file_id": "file-MASK"}),
+            "{sent}"
+        );
+    }
+}

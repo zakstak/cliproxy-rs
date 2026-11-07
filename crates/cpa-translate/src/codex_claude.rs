@@ -546,6 +546,13 @@ impl Messages<'_> {
 /// representable source, a PDF document, text; anything else is refused.
 fn tool_result(part: &Res<'_>, mut strict: Option<&mut UserTurnDrops>) -> Vec<u8> {
     let mut output = br#"{"type":"function_call_output"}"#.to_vec();
+    if let Some(drops) = strict.as_deref_mut()
+        && part.get("is_error").kind == Kind::True
+    {
+        // Responses `function_call_output` has no failure status: refused, not sent as an
+        // ordinary result.
+        drops.drop_part("tool_result with is_error: true");
+    }
     let id = part.get("tool_use_id").bytes();
     let call_id = if strict.is_some() {
         id.to_vec()

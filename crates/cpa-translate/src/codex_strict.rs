@@ -22,6 +22,9 @@ enum Rule {
     /// Not sent, because it does not change the generation, and the ChatGPT backend has
     /// no field that takes it (stated per field in the contract).
     NotSent,
+    /// Converted for the values this check accepts (adding what the converter does not
+    /// express itself to the Responses body); any other value is refused.
+    Values(fn(&Res<'_>, &mut Vec<u8>) -> bool),
 }
 
 fn unsupported(field: &str, at: &str) -> Error {
@@ -48,6 +51,62 @@ fn falsy(v: &Res<'_>) -> bool {
 
 fn one(v: &Res<'_>) -> bool {
     null(v) || (v.kind == Kind::Number && v.float() == 1.0)
+}
+
+fn string_in(v: &Res<'_>, allowed: &[&str]) -> bool {
+    v.kind == Kind::String && allowed.iter().any(|a| v.s.eq_ignore_ascii_case(a.as_bytes()))
+}
+
+/// Claude `service_tier`: `auto` is the default; `fast` and `priority` become
+/// `priority` (the converter). `standard_only` has no Responses equivalent.
+fn claude_tier(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
+    null(v) || string_in(v, &["auto", "fast", "priority"])
+}
+
+/// Claude `speed`: `fast` becomes `priority` (the converter); `standard` is the default.
+fn claude_speed(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
+    null(v) || string_in(v, &["fast", "standard"])
+}
+
+/// Claude `tool_choice` types the converter maps; anything else would widen to `auto`.
+fn claude_tool_choice(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
+    if null(v) {
+        return true;
+    }
+    let kind = v.get("type");
+    match kind.s.as_ref() {
+        b"auto" | b"any" | b"none" => true,
+        b"tool" => !v.get("name").bytes().is_empty(),
+        _ => false,
+    }
+}
+
+/// Claude `thinking` types the converter maps.
+fn claude_thinking(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
+    null(v) || string_in(&v.get("type"), &["enabled", "adaptive", "auto", "disabled"])
+}
+
+/// Chat `response_format`: `text` and `json_schema` (the converter), and `json_object`
+/// as the Responses `text.format` of the same name.
+fn chat_response_format(v: &Res<'_>, out: &mut Vec<u8>) -> bool {
+    if null(v) {
+        return true;
+    }
+    match v.get("type").s.as_ref() {
+        b"text" => true,
+        b"json_schema" => v.get("json_schema.schema").exists(),
+        b"json_object" => {
+            gj::set_raw(out, "text.format", br#"{"type":"json_object"}"#);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Gemini `service_tier`: `priority` and `fast` become `priority` (the converter);
+/// `standard` is the default.
+fn gemini_tier(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
+    null(v) || string_in(v, &["priority", "fast", "standard"])
 }
 
 fn text_only(v: &Res<'_>) -> bool {
@@ -81,6 +140,14 @@ fn apply(object: &Res<'_>, rules: &[(&str, Rule)], at: &str, out: &mut Vec<u8>) 
                     return Err(unsupported(&key, at));
                 }
             }
+            Rule::Values(check) => {
+                if !check(&value, out) {
+                    return Err(unsupported(
+                        &format!("{key}: {}", String::from_utf8_lossy(&value.raw)),
+                        at,
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -93,10 +160,10 @@ const CLAUDE: &[(&str, Rule)] = &[
     ("system", Rule::Converted),
     ("stream", Rule::Converted),
     ("tools", Rule::Converted),
-    ("tool_choice", Rule::Converted),
-    ("thinking", Rule::Converted),
-    ("service_tier", Rule::Converted),
-    ("speed", Rule::Converted),
+    ("tool_choice", Rule::Values(claude_tool_choice)),
+    ("thinking", Rule::Values(claude_thinking)),
+    ("service_tier", Rule::Values(claude_tier)),
+    ("speed", Rule::Values(claude_speed)),
     ("output_config", Rule::Converted),
     ("max_tokens", Rule::Map("max_output_tokens")),
     ("temperature", Rule::Map("temperature")),
@@ -119,8 +186,9 @@ const CHAT: &[(&str, Rule)] = &[
     ("tool_choice", Rule::Converted),
     ("parallel_tool_calls", Rule::Converted),
     ("reasoning_effort", Rule::Converted),
-    ("service_tier", Rule::Converted),
-    ("response_format", Rule::Converted),
+    // The same tier names in both APIs (`auto`, `default`, `flex`, `scale`, `priority`).
+    ("service_tier", Rule::Map("service_tier")),
+    ("response_format", Rule::Values(chat_response_format)),
     ("text", Rule::Converted),
     ("verbosity", Rule::Map("text.verbosity")),
     ("max_tokens", Rule::Map("max_output_tokens")),
@@ -167,7 +235,7 @@ const GEMINI: &[(&str, Rule)] = &[
     ("tool_config", Rule::Converted),
     ("generationConfig", Rule::Converted),
     ("generation_config", Rule::Converted),
-    ("service_tier", Rule::Converted),
+    ("service_tier", Rule::Values(gemini_tier)),
 ];
 
 const GEMINI_GENERATION: &[(&str, Rule)] = &[
