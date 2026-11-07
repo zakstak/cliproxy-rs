@@ -354,10 +354,18 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
     v.kind() == Kind::True || (v.kind() == Kind::String && v.str().trim().eq_ignore_ascii_case("true"))
 }
 
-/// Codex/Responses formats on both sides.
+/// Codex/Responses formats on both sides ([`responses_pair`]).
 pub(crate) fn responses_formats(req: &ExecRequest) -> bool {
+    responses_pair(req.source_format, req.response_format)
+}
+
+/// Whether a client and a response format are both Responses, in either spelling
+/// (`openai-response` or `codex`): the formats of the native route. The server uses the
+/// same test to keep a request's own bytes for that route
+/// ([`crate::codex::CodexExecutor::responses_pair`]).
+pub(crate) fn responses_pair(source: Format, response: Format) -> bool {
     let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
-    codexish(req.source_format) && codexish(req.response_format)
+    codexish(source) && codexish(response)
 }
 
 /// `helps.IsNativeCodexRequest`: Codex/Responses formats on both sides plus the lite marker.

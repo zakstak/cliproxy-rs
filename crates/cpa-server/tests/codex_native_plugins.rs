@@ -1014,3 +1014,156 @@ async fn plugin_translators_cannot_rewrite_codex_translated_traffic() {
     }
     assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
 }
+
+/// One host callback from the plugin labelled `caller`, as the plugin makes it.
+fn host_call(
+    host: &cpa_plugin::Host,
+    instance: &Arc<cpa_plugin::client::CallbackInstance>,
+    method: &str,
+    request: &Value,
+) -> Value {
+    let bytes =
+        cpa_plugin::testing::call_from_plugin(host, "caller", instance, method, &serde_json::to_vec(request).unwrap())
+            .unwrap();
+    let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["ok"], true, "{method}: {envelope}");
+    envelope["result"].clone()
+}
+
+/// #28 (review r4502650014): a plugin model callback whose entry and exit protocols are
+/// both Responses, in either spelling (`openai-response` or `codex`), takes the native
+/// route exactly as the executor decides it (`responses_formats`). For each of the four
+/// pairs, buffered and streamed, the second plugin's hooks all try to rewrite: before-auth
+/// headers, session, body and path; after-auth headers and body; the response and each
+/// chunk. The Codex upstream gets the callback's own bytes on `/responses` with none of
+/// those headers, and the callback gets the upstream's answer unchanged: the terminal
+/// `response` object, or the event lines as sent. No after-auth, response or chunk hook
+/// runs. An OpenAI-compatible model through the same callback keeps every hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responses_callbacks_in_either_spelling_take_the_native_route() {
+    // Its own scratch directory: the hook counts below read this test's records only.
+    let Some(fx) = Fixture::start_with("codex-native-plugins-callbacks", &["key-FAKE-codex"], "").await else {
+        return;
+    };
+    let host = fx.rt.plugins().clone();
+    let instance = Arc::new(cpa_plugin::client::CallbackInstance::default());
+    let guard = cpa_plugin::testing::callback_context(
+        &host,
+        "caller",
+        instance.clone(),
+        cpa_plugin::callbacks::RequestScope::default(),
+    );
+    let sse = String::from_utf8(fixture("sse-completed").bytes().to_vec()).unwrap();
+    let lines: Vec<String> = sse
+        .split(['\r', '\n'])
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let completed = fixture("sse-completed").frames().last().unwrap().to_vec();
+    let terminal = cpa_common::codex_body::CodexBody::parse(&completed).unwrap();
+    let response_object = String::from_utf8(terminal.get("response").unwrap().raw.to_vec()).unwrap();
+    let mut sent = 0;
+    for entry in ["openai-response", "codex"] {
+        for exit in ["openai-response", "codex"] {
+            for stream in [false, true] {
+                let name = format!("{entry} -> {exit} stream={stream}");
+                // Spacing and member order that a re-serialization would change.
+                let body = format!(
+                    r#"{{ "model" : "gpt-native", "stream" : {stream}, "input" : [ {{"type":"message","role":"user","content":"callback {entry} {exit}"}} ] }}"#
+                );
+                fx.rewrite_before_auth(r#"{"model":"gpt-native","input":"before-auth body"}"#);
+                let request = json!({"host_callback_id": guard.id(), "entry_protocol": entry, "exit_protocol": exit,
+                    "model": "gpt-native", "stream": stream, "body": b64(&body),
+                    "headers": {"Session-Id": ["callback-session"]}});
+                let (h, i) = (host.clone(), instance.clone());
+                let got = tokio::task::spawn_blocking(move || {
+                    if !stream {
+                        let answer = host_call(&h, &i, "host.model.execute", &request);
+                        return vec![
+                            String::from_utf8(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(answer["body"].as_str().unwrap())
+                                    .unwrap(),
+                            )
+                            .unwrap(),
+                        ];
+                    }
+                    let opened = host_call(&h, &i, "host.model.execute_stream", &request);
+                    let read = json!({"stream_id": opened["stream_id"]});
+                    let mut chunks = Vec::new();
+                    loop {
+                        let chunk = host_call(&h, &i, "host.model.stream_read", &read);
+                        assert_eq!(chunk["error"], "", "{chunk}");
+                        if chunk["done"] == true {
+                            break;
+                        }
+                        chunks.push(
+                            String::from_utf8(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(chunk["payload"].as_str().unwrap())
+                                    .unwrap(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    chunks
+                })
+                .await
+                .unwrap();
+                if stream {
+                    assert_eq!(got, lines, "{name}: the event lines as sent");
+                } else {
+                    assert_eq!(got, [response_object.clone()], "{name}: the terminal response object");
+                }
+                sent += 1;
+                let exchanges = fx.codex.http();
+                assert_eq!(exchanges.len(), sent, "{name}: one upstream request");
+                let upstream = exchanges.last().unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&upstream.body),
+                    body,
+                    "{name}: the callback's bytes"
+                );
+                assert_eq!(upstream.uri.path(), "/responses", "{name}: no before-auth path");
+                for header in ["x-after", "x-codex-turn-state"] {
+                    assert!(
+                        upstream.headers.get(header).is_none(),
+                        "{name}: {header} reached the upstream"
+                    );
+                }
+                for value in upstream.headers.get_all("session-id") {
+                    assert!(
+                        !matches!(value.to_str().unwrap(), "plugin-session" | "after-session"),
+                        "{name}: a hook chose the session: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        fx.calls("request.intercept_after"),
+        0,
+        "no after-auth hook on a native callback"
+    );
+    assert_eq!(fx.calls("response.intercept_after"), 0);
+    assert_eq!(fx.calls("response.intercept_stream_chunk"), 0);
+
+    // The control: an OpenAI-compatible model through the same callback keeps every hook.
+    let request = json!({"host_callback_id": guard.id(), "entry_protocol": "openai", "model": "control-model",
+        "body": b64(r#"{"model":"control-model","messages":[{"role":"user","content":"hi"}]}"#)});
+    let (h, i) = (host.clone(), instance.clone());
+    let answer = tokio::task::spawn_blocking(move || host_call(&h, &i, "host.model.execute", &request))
+        .await
+        .unwrap();
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(answer["body"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(body, br#"{"rewritten":"response"}"#, "the response hook ran");
+    let control = fx.control.http().pop().expect("the control request");
+    assert!(
+        String::from_utf8_lossy(&control.body).contains("after-auth body"),
+        "the after-auth hook ran"
+    );
+    assert_eq!(fx.calls("request.intercept_after"), 1);
+    drop(guard);
+}

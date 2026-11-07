@@ -305,7 +305,8 @@ choose the session or the credential. When a native attempt is not possible (a m
 Sign in with ChatGPT credentials or other providers serve), before-auth applies as in Go,
 selection included.
 
-A plugin model callback with Responses entry and exit protocols takes this route like a
+A plugin model callback whose entry and exit protocols are both Responses, in either
+spelling (`openai-response` or `codex`, the executor's own test), takes this route like a
 client request: the server keeps the callback's own bytes in `NativeRequest`, other
 plugins' before-auth output reaches only the attempts that are not native, and the
 executor hands the callback each line of an upstream event as its own chunk, bytes

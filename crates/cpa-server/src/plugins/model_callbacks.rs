@@ -135,7 +135,9 @@ impl ModelExecutor for Executor {
             // A Responses callback may reach a Codex credential: it takes the native route
             // with the plugin's own bytes, as a client request does (#28), and other
             // plugins' before-auth output reaches only the attempts that are not native.
-            let native = (entry == Format::OpenAIResponse && response == Format::OpenAIResponse && media.is_none())
+            // Eligibility is the executor's own test: Responses on both sides, in either
+            // spelling. Media calls have their own route.
+            let native = (cpa_exec::codex::CodexExecutor::responses_pair(entry, response) && media.is_none())
                 .then(|| crate::dispatch::NativeRequest::new(req.body.clone(), headers.clone(), request_path.clone()));
             let call = Call {
                 entry,

@@ -154,6 +154,14 @@ impl CodexExecutor {
         )
     }
 
+    /// Whether `source` and `response` are the native route's formats: Responses on both
+    /// sides, in either spelling (`openai-response` or `codex`). A caller that builds a
+    /// request for the native route (`dispatch::NativeRequest`) uses this, so its
+    /// eligibility cannot drift from the executor's.
+    pub fn responses_pair(source: Format, response: Format) -> bool {
+        request::responses_pair(source, response)
+    }
+
     /// Whether a WebSocket client frame is one the native WebSocket route serves (a
     /// `response.create`), whatever the credential: with [`Self::native_profile`] and
     /// [`Self::upstream_websocket`], the server's test of whether a pool can serve a turn
