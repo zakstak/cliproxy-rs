@@ -1193,8 +1193,9 @@ impl Connection {
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
         let mut response_started = false;
-        // The upstream's own `response.failed` reached the client in this turn.
-        let mut failed_forwarded = false;
+        // The last payload sent was an upstream context-window `response.failed`, which
+        // the executor follows with its own classified error (`preserved_failure`).
+        let mut preserved_event = false;
         let _local = self.local.begin();
         loop {
             let item = tokio::select! {
@@ -1240,8 +1241,9 @@ impl Connection {
                     // The client already has the upstream's event for this failure (a
                     // context-window overflow, which Codex compacts on); a generic error
                     // event after it would replace that meaning. Go v8.0.35 differs
-                    // (docs/DIFFERENCES-FROM-GO.md).
-                    if failed_forwarded && exposed(&failure) {
+                    // (docs/DIFFERENCES-FROM-GO.md). Any other error, including one after
+                    // a recoverable steering failure, closes as before.
+                    if preserved_event && preserved_failure(&failure) {
                         socket.terminate(CLOSE_SENT);
                         return Forwarded::End;
                     }
@@ -1260,7 +1262,6 @@ impl Connection {
                 if kind == "response.created" {
                     response_started = true;
                     completed = false;
-                    failed_forwarded = false;
                     turn.reset();
                 }
                 turn.collect(&payload);
@@ -1296,7 +1297,6 @@ impl Connection {
                     close_for_failure(socket, &failure).await;
                     return Forwarded::End;
                 }
-                failed_forwarded |= kind == "response.failed";
                 // Codex acknowledges `response.interrupt` with an interrupted
                 // `response.incomplete`; the connection stays open for the next request.
                 if completion || kind == "response.incomplete" {
@@ -1304,6 +1304,7 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
                 }
+                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
                 if !send_text(socket, payload).await {
                     return Forwarded::End;
                 }
@@ -1425,6 +1426,12 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
         return Some((CLOSE_MESSAGE_TOO_BIG, reason));
     }
     None
+}
+
+/// The executor's classified error for an upstream context-window `response.failed`
+/// (cpa-exec `terminal_failure`: status 400, `context_too_large`).
+fn preserved_failure(failure: &Failure) -> bool {
+    failure.status == 400 && gjson::get(&failure.text, "error.code").str() == "context_too_large"
 }
 
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,

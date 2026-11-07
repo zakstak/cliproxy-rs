@@ -938,6 +938,7 @@ mod context_window {
             "close",
             frames,
             Some(pause_ms),
+            None,
         )
         .await;
     }
@@ -950,9 +951,10 @@ mod context_window {
         read: &str,
         frames: Vec<Value>,
     ) {
-        turn_with(name, user_agent, transport, events, read, frames, None).await;
+        turn_with(name, user_agent, transport, events, read, frames, None, None).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn turn_with(
         name: &str,
         user_agent: Option<&str>,
@@ -961,6 +963,7 @@ mod context_window {
         read: &str,
         frames: Vec<Value>,
         pause_ms: Option<u64>,
+        then: Option<&str>,
     ) {
         let (config, websockets) = match transport {
             Transport::Websocket => ("host: \"\"\n", true),
@@ -983,7 +986,7 @@ mod context_window {
                 "send": SEND,
                 "read": read,
                 "pause_ms": pause_ms,
-                "upstream": [{ "events": events }],
+                "upstream": [{ "events": events, "then": then }],
                 "frames": frames,
             }],
         });
@@ -999,7 +1002,7 @@ mod context_window {
             rt.store().cooldowns(&credential.id)
         );
         // A steering failure after `response.created` leaves the attempt open.
-        if read == "close" {
+        if read == "close" && then.is_none() {
             assert_eq!(
                 (rt.store().stats().success, rt.store().stats().failure),
                 (0, 1),
@@ -1159,5 +1162,48 @@ mod context_window {
             frames,
         )
         .await;
+    }
+
+    /// A steering failure after `response.created` leaves the socket open; when the
+    /// upstream later closes it for an unrelated reason, the client gets that close as
+    /// it would without the earlier failure. The forwarded event stands only for its own
+    /// classified error, not for anything after it.
+    async fn steering_failure_then(name: &str, user_agent: Option<&str>, failed: &str, then: &str, reason: &str) {
+        let frames = vec![text(CREATED), text(failed), json!({ "close": 1009, "reason": reason })];
+        turn_with(
+            name,
+            user_agent,
+            Transport::Steering,
+            &[CREATED, failed],
+            "close",
+            frames,
+            None,
+            Some(then),
+        )
+        .await;
+    }
+
+    /// Another recoverable failure code (`invalid_prompt` is request-scoped too).
+    const INVALID_PROMPT: &str = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","status":"failed","error":{"code":"invalid_prompt","message":"Invalid prompt."}}}"#;
+
+    #[tokio::test]
+    async fn steering_context_failure_then_upstream_close1009() {
+        steering_failure_then("steering_ctx_close1009", Some(CODEX_UA), FAILED, "close1009", "too big").await;
+        let name = "steering_ctx_close1009_spaced";
+        steering_failure_then(name, Some(CODEX_UA), FAILED, "close1009_spaced", " oversized ").await;
+    }
+
+    #[tokio::test]
+    async fn steering_other_failure_then_upstream_close1009() {
+        let name = "steering_invalid_prompt_close1009";
+        steering_failure_then(name, Some(CODEX_UA), INVALID_PROMPT, "close1009", "too big").await;
+        let name = "steering_other_client_invalid_prompt_close1009";
+        steering_failure_then(name, None, INVALID_PROMPT, "close1009", "too big").await;
+    }
+
+    #[tokio::test]
+    async fn steering_other_client_context_failure_then_upstream_close1009() {
+        let name = "steering_other_client_ctx_close1009";
+        steering_failure_then(name, None, FAILED, "close1009_spaced", " oversized ").await;
     }
 }
