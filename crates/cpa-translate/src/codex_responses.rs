@@ -25,7 +25,8 @@ fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// The client that built a Responses request. It decides whether the conversion forces
-/// `parallel_tool_calls` and rebuilds `include`.
+/// `parallel_tool_calls`, rebuilds `include` and drops unlisted `service_tier` values
+/// (see `set_service_tier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesClient {
     /// Any Responses client other than official Codex. Go's rules apply:
@@ -63,27 +64,7 @@ pub(crate) fn convert(body: &[u8], client: ResponsesClient) -> Vec<u8> {
         &mut raw,
         &["max_output_tokens", "max_completion_tokens", "temperature", "top_p"],
     );
-    let tier = gj::get(&raw, "service_tier");
-    if tier.exists() {
-        if tier.kind == Kind::String {
-            let value = tier.bytes().into_owned();
-            match tier.str().trim().go_lower().as_str() {
-                "priority" | "fast" => {
-                    if value != b"priority" {
-                        gj::set_str(&mut raw, "service_tier", "priority");
-                    }
-                }
-                "ultrafast" => {
-                    if value != b"ultrafast" {
-                        gj::set_str(&mut raw, "service_tier", "ultrafast");
-                    }
-                }
-                _ => delete_fields(&mut raw, &["service_tier"]),
-            }
-        } else {
-            delete_fields(&mut raw, &["service_tier"]);
-        }
-    }
+    set_service_tier(&mut raw, client != ResponsesClient::Translated);
     // ponytail: native Codex loses its `prompt_cache_options` TTL here too. OpenAI's API
     // documents the field, but no evidence shows that the ChatGPT Codex backend accepts
     // it, and Go's SIWC rules reject it. Keep it per route once backend support is shown.
@@ -99,6 +80,41 @@ pub(crate) fn convert(body: &[u8], client: ResponsesClient) -> Vec<u8> {
     raw = system_role_to_developer(raw);
     raw = normalize_builtin_tools(raw);
     normalize_empty_function_call_arguments(raw)
+}
+
+/// Go's `service_tier` rule: `priority` (alias `fast`) and `ultrafast` are kept, matched
+/// after trimming and Go lower-casing and written in canonical form; every other value is
+/// deleted, so the request falls back to the default tier.
+///
+/// A `native` Codex client never loses an explicit tier (issue #8). `flex` joins the
+/// canonical values: current Codex sends it even when the model catalog does not list it
+/// (`ModelInfo::supports_service_tier`, openai/codex `e0aa043`). Any other value, a tier
+/// only a catalog names or a malformed one, keeps its bytes, so the upstream either
+/// applies it or answers with its own error instead of silently serving the default
+/// tier. The executor's routing hint reads the final body, so it names the same tier.
+/// Go v8.0.35 applies the deleting rule to every client (docs/DIFFERENCES-FROM-GO.md).
+fn set_service_tier(raw: &mut Vec<u8>, native: bool) {
+    let tier = gj::get(raw, "service_tier");
+    if !tier.exists() {
+        return;
+    }
+    let canonical = (tier.kind == Kind::String).then(|| match tier.str().trim().go_lower().as_str() {
+        "priority" | "fast" => Some("priority"),
+        "ultrafast" => Some("ultrafast"),
+        "flex" if native => Some("flex"),
+        _ => None,
+    });
+    match canonical.flatten() {
+        Some(canonical) => {
+            if *tier.bytes() != *canonical.as_bytes() {
+                gj::set_str(raw, "service_tier", canonical);
+            }
+        }
+        None if native => {}
+        None => {
+            gj::delete(raw, "service_tier");
+        }
+    }
 }
 
 fn set_required_bool(raw: &mut Vec<u8>, path: &str, value: bool) {
@@ -553,5 +569,67 @@ mod tests {
         }
         assert_eq!(crate::gj::get(&out, "parallel_tool_calls").raw.as_ref(), b"false");
         assert_eq!(crate::gj::get(&out, "input.0.content.0.text").str(), "hi");
+    }
+
+    /// `service_tier` after conversion: `None` when deleted, else its raw JSON.
+    fn tier_after(client: super::ResponsesClient, tier: &str) -> Option<String> {
+        let body = format!(r#"{{"model":"m","input":[],"service_tier":{tier},  "text" : {{}}}}"#);
+        let out = super::convert(body.as_bytes(), client);
+        assert!(
+            String::from_utf8_lossy(&out).contains(r#",  "text" : {}"#),
+            "{tier}: other bytes kept"
+        );
+        let value = crate::gj::get(&out, "service_tier");
+        value.exists().then(|| String::from_utf8_lossy(&value.raw).into_owned())
+    }
+
+    /// Go `ConvertOpenAIResponsesRequestToCodex`: only priority (alias fast) and
+    /// ultrafast survive, so a translated client's flex falls back to the default tier.
+    #[test]
+    fn translated_clients_keep_gos_service_tier_rule() {
+        for (tier, want) in [
+            (r#""priority""#, Some(r#""priority""#)),
+            (r#"" Fast ""#, Some(r#""priority""#)),
+            (r#""ULTRAFAST""#, Some(r#""ultrafast""#)),
+            (r#""flex""#, None),
+            (r#""scale""#, None),
+            (r#""default""#, None),
+            (r#""""#, None),
+            ("42", None),
+            ("null", None),
+        ] {
+            assert_eq!(
+                tier_after(super::ResponsesClient::Translated, tier).as_deref(),
+                want,
+                "{tier}"
+            );
+        }
+    }
+
+    /// Issue #8: a native Codex client never loses an explicit tier. Known values are
+    /// written in canonical form; anything else keeps its bytes for the upstream to
+    /// accept or refuse.
+    #[test]
+    fn native_codex_keeps_every_explicit_service_tier() {
+        for client in [NATIVE, super::ResponsesClient::NativeCodex { output_replay: false }] {
+            for (tier, want) in [
+                (r#""flex""#, r#""flex""#),
+                (r#"" Flex ""#, r#""flex""#),
+                (r#""priority""#, r#""priority""#),
+                (r#""fast""#, r#""priority""#),
+                (r#""ultrafast""#, r#""ultrafast""#),
+                (r#""scale""#, r#""scale""#),
+                (r#""default""#, r#""default""#),
+                (r#""""#, r#""""#),
+                ("42", "42"),
+                ("null", "null"),
+                (r#"{"tier":"flex"}"#, r#"{"tier":"flex"}"#),
+            ] {
+                assert_eq!(tier_after(client, tier).as_deref(), Some(want), "{client:?} {tier}");
+            }
+        }
+        // An omitted tier stays omitted.
+        let out = super::convert(br#"{"model":"m","input":[]}"#, NATIVE);
+        assert!(!crate::gj::get(&out, "service_tier").exists());
     }
 }
