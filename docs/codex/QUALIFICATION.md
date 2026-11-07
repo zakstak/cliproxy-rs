@@ -113,7 +113,7 @@ These are local runs, not CI. GitHub Actions is disabled on this fork, so no hos
 
 ## 4. Delivery state and landing order (#20 reconciliation)
 
-Checked on 2026-11-07.
+Checked on 2026-11-07, at #42 (`5eda74e7`). This section is a snapshot of that head. The optional combined landing candidate, which merges these PRs locally, is recorded in [LANDING-CANDIDATE.md](LANDING-CANDIDATE.md); nothing in it is merged on `fork`.
 
 ### Status of the pieces
 
