@@ -206,6 +206,23 @@ export function cleanEvent(raw: Data): Event {
     output: Number(raw.tokens?.output_tokens) || 0,
   };
 }
+/** One answer of the cliproxy-rs `GET /observability/usage/live` feed, reduced to display fields. */
+export type LivePage = { cursor: number; gap: boolean; more: boolean; statistics: boolean; events: Event[] };
+const isObject = (v: unknown): v is Data => typeof v === "object" && v !== null && !Array.isArray(v);
+/** Parse a live-feed answer. Anything that is not one throws, so a wrong server cannot pass as an empty feed. */
+export function livePage(raw: unknown): LivePage {
+  if (!isObject(raw) || !Number.isSafeInteger(raw.cursor) || raw.cursor < 0 || !Array.isArray(raw.records))
+    throw new Error("Unexpected live feed format.");
+  return {
+    cursor: raw.cursor,
+    gap: raw.gap === true,
+    more: raw.more === true,
+    statistics: raw.usage_statistics_enabled !== false,
+    events: raw.records.filter(isObject).map(cleanEvent),
+  };
+}
+/** The live view keeps the last hour, at most 2,000 events, in this tab only. */
+export const keepEvents = (events: Event[], now: number) => events.filter((e) => e.at > now - 60 * 60_000).slice(-2000);
 const median = (v: number[]) => {
   const s = v.filter((n) => n > 0).sort((a, b) => a - b);
   return s.length ? s[Math.floor((s.length - 1) / 2)] : null;

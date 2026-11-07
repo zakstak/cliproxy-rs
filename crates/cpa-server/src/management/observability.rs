@@ -1,5 +1,6 @@
 //! `GET /server/latest-version`, `GET /observability/usage/api-keys` and
-//! `GET /observability/usage/queue` (Go config_basic.go, api_key_usage.go, usage.go).
+//! `GET /observability/usage/queue` (Go config_basic.go, api_key_usage.go, usage.go),
+//! and the cliproxy-rs `GET /observability/usage/live` feed for the dashboard.
 
 use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
@@ -195,6 +196,57 @@ pub(crate) async fn usage_queue(State(state): State<Arc<Management>>, RawQuery(r
         .collect();
     // Records are embedded as stored (usageQueueRecord.MarshalJSON).
     super::json_ordered(StatusCode::OK, &Value::Array(records))
+}
+
+/// `GET /observability/usage/live` (cliproxy-rs only): the dashboard's view of usage
+/// records, read by cursor without taking them off the queue. `after` is the `cursor`
+/// of the previous answer; without it the reader starts at the newest record. `count`
+/// (default and maximum [`crate::usage::LIVE_MAX_PAGE`]) bounds one page.
+///
+/// `{"cursor": n, "gap": bool, "more": bool, "usage_statistics_enabled": bool,
+/// "records": [...]}`. Records are embedded byte for byte when they are JSON and as a
+/// JSON string otherwise, like the queue.
+pub(crate) async fn usage_live(State(state): State<Arc<Management>>, RawQuery(raw): RawQuery) -> Response {
+    let q = Query::parse(raw);
+    let after = match q.first("after").trim() {
+        "" => None,
+        v => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return fail(StatusCode::BAD_REQUEST, "after must be a cursor from a previous answer"),
+        },
+    };
+    let count = match q.first("count").trim() {
+        "" => crate::usage::LIVE_MAX_PAGE,
+        v => match v.parse::<i64>() {
+            Ok(n) if n > 0 => {
+                usize::try_from(n).map_or(crate::usage::LIVE_MAX_PAGE, |n| n.min(crate::usage::LIVE_MAX_PAGE))
+            }
+            _ => return fail(StatusCode::BAD_REQUEST, "count must be a positive integer"),
+        },
+    };
+    let queue = state.rt.usage_queue();
+    let page = queue.live_read(after, count);
+    let mut out = format!(
+        r#"{{"cursor":{},"gap":{},"more":{},"usage_statistics_enabled":{},"records":["#,
+        page.cursor,
+        page.gap,
+        page.more,
+        queue.accepts()
+    );
+    for (i, record) in page.records.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match serde_json::from_slice::<&serde_json::value::RawValue>(record) {
+            Ok(raw) => out.push_str(raw.get()),
+            Err(_) => {
+                let quoted = cpa_common::json::quote(String::from_utf8_lossy(record).as_bytes());
+                out.push_str(&String::from_utf8(quoted).expect("JSON text is UTF-8"));
+            }
+        }
+    }
+    out.push_str("]}");
+    super::json_body(StatusCode::OK, out)
 }
 
 #[cfg(test)]

@@ -612,6 +612,11 @@ pub fn router(state: Arc<Management>) -> Router {
             "observability/usage/queue",
             methods().get(guarded!(s, observability::usage_queue)),
         ),
+        // cliproxy-rs only: the dashboard's non-destructive view of the same records.
+        (
+            "observability/usage/live",
+            methods().get(guarded!(s, observability::usage_live)),
+        ),
         ("oauth/auth-url", methods().get(guarded!(s, oauth::auth_url))),
         ("oauth/status", methods().get(guarded!(s, oauth::status))),
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),

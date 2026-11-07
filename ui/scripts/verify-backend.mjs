@@ -43,6 +43,7 @@ try {
   await call("/credentials");
   await call("/observability/usage/api-keys");
   await call("/observability/usage/queue?count=50");
+  await call("/observability/usage/live");
   await call("/plugins");
   await call("/plugins/store");
   await call("/server/latest-version");
