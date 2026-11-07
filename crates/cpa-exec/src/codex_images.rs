@@ -113,35 +113,8 @@ impl CodexExecutor {
         // No synthesized prompt-cache key in the body (#27); the session identity reaches
         // the headers only, and #26 owns those.
         let cache = request::session_uuid(&req, None);
-        let body = json_body(body);
-        // The payload rules run last (868e137), on the body's JSON view.
-        let original = if req.original_body.is_empty() {
-            &req.body
-        } else {
-            &req.original_body
-        };
-        let requested = if req.requested_model.trim().is_empty() {
-            req.model.trim()
-        } else {
-            req.requested_model.trim()
-        };
-        let client_content_type = request::header(&req.headers, "content-type");
-        let (body, content_type) =
-            crate::payload_media::apply(&body, &content_type, original, client_content_type, |view, original| {
-                let rules = cpa_common::payload::Request {
-                    target_executor: "codex",
-                    model,
-                    requested_model: requested,
-                    protocol: "openai",
-                    from_protocol: SOURCE,
-                    root: "",
-                    original,
-                    request_path: path,
-                    headers: Some(&req.headers),
-                };
-                cpa_common::payload::apply(&settings.payload, &rules, view)
-            })
-            .map_err(plain_err)?;
+        // No input-ID rewrite or payload rule either (#27): the body is the client's
+        // Images request with only its model and `stream` routed.
         let body = Bytes::from(body);
         // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
         let mut client = req.headers.clone();
@@ -244,27 +217,7 @@ impl CodexExecutor {
         // No synthesized prompt-cache key in the body (#27); the session identity reaches
         // the headers only, and #26 owns those. The input is the adapter's own.
         let cache = request::session_uuid(&req, None);
-        let body = request::sanitize_input_ids(body);
-        // The payload rules run last (868e137), as the codex executor, on the
-        // prepared image request.
-        let requested = if req.requested_model.trim().is_empty() {
-            req.model.trim()
-        } else {
-            req.requested_model.trim()
-        };
-        let rules = cpa_common::payload::Request {
-            target_executor: "codex",
-            model: main_model,
-            requested_model: requested,
-            protocol: "codex",
-            from_protocol: SOURCE,
-            root: "",
-            original: prepared.body.as_bytes(),
-            request_path: path,
-            headers: Some(&req.headers),
-        };
-        let body = cpa_common::payload::apply(&settings.payload, &rules, body.into_bytes());
-        let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        // No input-ID rewrite or payload rule (#27): the body is the adapter's conversion.
         report_request(&req, Format::Codex, &body);
         let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
@@ -506,15 +459,6 @@ fn main_model(configured: &str) -> &str {
     }
 }
 
-/// Input-id sanitising on a direct JSON body. No prompt-cache key is synthesized (#27).
-fn json_body(body: Bytes) -> Bytes {
-    if !cpa_common::json::std_valid(&body) {
-        return body;
-    }
-    let text = String::from_utf8_lossy(&body).into_owned();
-    Bytes::from(request::sanitize_input_ids(text))
-}
-
 /// `codexPrepareDirectOpenAIImageEditPayload`: JSON as for generations; a multipart edit
 /// is rewritten to JSON with data URLs.
 fn direct_edit_payload(
@@ -690,9 +634,50 @@ fn json_text(raw: &[u8]) -> Option<String> {
     cpa_common::json::std_valid(raw).then(|| String::from_utf8_lossy(raw).into_owned())
 }
 
+/// Images API fields the `image_generation` tool expresses (OpenAI Images API and the
+/// Responses image generation tool): any other field, or `n` above 1, is refused before
+/// anything is sent (#27). Go drops them.
+fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
+    const FIELDS: [&str; 11] = [
+        "model",
+        "prompt",
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "output_compression",
+        "partial_images",
+        "moderation",
+        "response_format",
+        "stream",
+    ];
+    let root = gjson::parse(raw);
+    let mut refused = None;
+    root.each(|key, value| {
+        let key = key.str();
+        let one = key == "n" && (value.kind() == Kind::Null || value.f64() == 1.0);
+        if !(FIELDS.contains(&key) || extra.contains(&key) || one) {
+            refused = Some(key.to_owned());
+            return false;
+        }
+        true
+    });
+    match refused {
+        None => Ok(()),
+        Some(field) => Err(ExecError::local(
+            400,
+            cpa_core::exec::FailureScope::Request,
+            format!(
+                "unsupported conversion: `{field}` cannot be expressed by the Codex image generation tool; remove it or send the request to a provider that accepts it"
+            ),
+        )),
+    }
+}
+
 /// `codexPrepareOpenAIImageGenerationJSON`.
 fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image generation request JSON"))?;
+    expressible(&raw, &[])?;
     let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
     let tool = tool_json(
         &raw,
@@ -710,6 +695,7 @@ fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError>
 /// `codexPrepareOpenAIImageEditJSON`.
 fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image edit request JSON"))?;
+    expressible(&raw, &["images", "mask", "input_fidelity"])?;
     let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
     let images_value = gjson::get(&raw, "images");
     let images: Vec<String> = if images_value.kind() == Kind::Array {
@@ -831,7 +817,12 @@ fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str])
 
 /// `codexBuildImagesResponsesRequest`.
 fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
-    let mut req = r#"{"instructions":"","stream":true,"reasoning":{"effort":"medium","summary":"auto"},"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
+    // Only what the conversion needs (#27): the model, the forced `image_generation`
+    // tool with the client's image settings, the prompt and images, `stream` (the answer
+    // is read from events) and `store: false` as the pinned client sends. No default
+    // instructions, reasoning, `parallel_tool_calls` or `include` (Go adds them).
+    let mut req =
+        r#"{"stream":true,"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
     req = set_str(&req, "model", MAIN_MODEL);
     if !tool.is_empty() && gjson::valid(tool) {
         req = set_raw(&req, "tools", &format!("[{tool}]"));
@@ -874,9 +865,7 @@ fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecErr
     if siwc {
         return Ok(request::siwc_body(out, request::Call::Stream, false, false));
     }
-    let mut bytes = out.into_bytes();
-    cpa_common::codex_client::normalize_codex_instructions(&mut bytes);
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(out)
 }
 
 /// `codexExtractImageResults`: image calls from the completed output, else from the

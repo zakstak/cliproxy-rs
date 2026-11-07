@@ -284,6 +284,15 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
 
     let system = first_of(&root, ["system_instruction.parts", "systemInstruction.parts"]);
     if system.is_array() {
+        if strict
+            && system
+                .array()
+                .iter()
+                .any(|p| is_gemini_thought_part(p) || !p.get("text").exists())
+        {
+            // Strict: a system part that is not text is refused, not dropped.
+            drops.drop_part("system instruction part that is not text");
+        }
         let parts: Vec<Vec<u8>> = system
             .array()
             .iter()
@@ -310,6 +319,12 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
             }
             for part in parts.array() {
                 if is_gemini_thought_part(&part) {
+                    // Strict: a thought with text is reasoning Codex cannot carry, and is
+                    // refused. A `thoughtSignature` alone is Gemini's state for its own
+                    // model, which no other model reads.
+                    if strict && !part.get("text").bytes().is_empty() {
+                        drops.drop_part("thought");
+                    }
                     continue;
                 }
                 let text = part.get("text");
@@ -415,7 +430,15 @@ fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Erro
                 }
                 let parameters = first_of(&declaration, ["parameters", "parametersJsonSchema"]);
                 if parameters.exists() {
-                    gj::set_raw(&mut item, "parameters", clean_parameters(&parameters));
+                    // Strict: the client's schema; only Gemini's upper-case `type` names
+                    // become JSON Schema's (below). Go also drops `$schema` and adds
+                    // `additionalProperties: false`.
+                    let parameters = if strict {
+                        parameters.raw.to_vec()
+                    } else {
+                        clean_parameters(&parameters)
+                    };
+                    gj::set_raw(&mut item, "parameters", parameters);
                 }
                 gj::set_bool(&mut item, "strict", false);
                 tool_items.push(item);

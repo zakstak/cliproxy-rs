@@ -432,9 +432,20 @@ impl Messages<'_> {
                     }
                     b"thinking" => {
                         if role != b"assistant" {
+                            if self.strict {
+                                self.drops.drop_part("thinking");
+                            }
                             continue;
                         }
                         let Some(signature) = self.reasoning_signature(part) else {
+                            // Strict: reasoning Codex cannot carry (text, or another
+                            // provider's signature) is refused; an empty block holds nothing.
+                            let empty = part.get("thinking").bytes().is_empty()
+                                && trim_space(&part.get("signature").bytes()).is_empty();
+                            if self.strict && !empty {
+                                self.drops
+                                    .drop_part("thinking block without a Codex reasoning signature");
+                            }
                             continue;
                         };
                         flush(&mut self.items, &mut current);
@@ -474,14 +485,17 @@ impl Messages<'_> {
                             self.pending_tool_uses.push(id.clone());
                         }
                         let mut call = br#"{"type":"function_call"}"#.to_vec();
-                        gj::set_str(&mut call, "call_id", shorten_call_id(&id));
+                        // Strict: the client's call ID, unshortened (no source states a limit).
+                        let call_id = if self.strict { id.clone() } else { shorten_call_id(&id) };
+                        gj::set_str(&mut call, "call_id", call_id);
                         gj::set_str(&mut call, "name", mapped_name(self.names, &part.get("name").bytes()));
                         gj::set_str(&mut call, "arguments", &part.get("input").raw);
                         self.items.push(call);
                     }
                     b"tool_result" => {
                         flush(&mut self.items, &mut current);
-                        self.items.push(tool_result(part));
+                        let item = tool_result(part, self.strict.then_some(&mut self.drops));
+                        self.items.push(item);
                         sendable += 1;
                     }
                     // Strict: a block Codex cannot express is refused, not dropped.
@@ -527,30 +541,50 @@ impl Messages<'_> {
     }
 }
 
-/// A `tool_result` block as a `function_call_output` item.
-fn tool_result(part: &Res<'_>) -> Vec<u8> {
+/// A `tool_result` block as a `function_call_output` item. `strict` (the Codex
+/// translated route's drops) keeps the call ID and every nested block: an image in any
+/// representable source, a PDF document, text; anything else is refused.
+fn tool_result(part: &Res<'_>, mut strict: Option<&mut UserTurnDrops>) -> Vec<u8> {
     let mut output = br#"{"type":"function_call_output"}"#.to_vec();
-    gj::set_str(
-        &mut output,
-        "call_id",
-        shorten_call_id(&part.get("tool_use_id").bytes()),
-    );
+    let id = part.get("tool_use_id").bytes();
+    let call_id = if strict.is_some() {
+        id.to_vec()
+    } else {
+        shorten_call_id(&id)
+    };
+    gj::set_str(&mut output, "call_id", call_id);
     let content = part.get("content");
     let mut items = vec![];
     if content.is_array() {
         for block in content.array() {
-            match block.get("type").bytes().as_ref() {
-                b"image" => {
+            let kind = block.get("type").bytes().into_owned();
+            match (kind.as_slice(), strict.as_deref_mut()) {
+                (b"image", None) => {
                     if let Some(url) = image_data_url(&block.get("source")) {
                         items.push(input_image(&url));
                     }
                 }
-                b"text" => {
+                (b"image", Some(drops)) => match image_input_part(&block.get("source")) {
+                    Some(image) => items.push(image),
+                    None => drops.drop_part("image in a tool_result"),
+                },
+                (b"document", Some(drops)) => match document_data_url(&block) {
+                    Some(url) => {
+                        let mut file = br#"{"type":"input_file","file_data":"","filename":"document.pdf"}"#.to_vec();
+                        gj::set_str(&mut file, "file_data", url);
+                        items.push(file);
+                    }
+                    None => drops.drop_part("document in a tool_result"),
+                },
+                (b"text", _) => {
                     let mut text = br#"{"type":"input_text","text":""}"#.to_vec();
                     gj::set_str(&mut text, "text", block.get("text").bytes());
                     items.push(text);
                 }
-                _ => {}
+                (other, Some(drops)) => {
+                    drops.drop_part(&format!("{} in a tool_result", String::from_utf8_lossy(other)))
+                }
+                (_, None) => {}
             }
         }
     }
@@ -606,6 +640,10 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
             for block in system.array() {
                 if block.get("type").bytes().as_ref() == b"text" {
                     add(&block.get("text").bytes());
+                } else if strict {
+                    // Strict: a system block Codex cannot express is refused.
+                    let kind = String::from_utf8_lossy(&block.get("type").bytes()).into_owned();
+                    state.drops.drop_part(&format!("{kind} system block"));
                 }
             }
         }
@@ -659,12 +697,27 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
                     gj::set_str(&mut item, "name", &short);
                 }
             }
-            gj::set_raw(
-                &mut item,
-                "parameters",
-                normalize_tool_parameters(&tool.get("input_schema").raw),
-            );
-            for path in ["input_schema", "parameters.$schema", "cache_control", "defer_loading"] {
+            // Strict: the client's schema as sent. Go normalizes it (drops `$schema`,
+            // `$id` and unsupported `pattern`s, adds `type` and `properties`), with no
+            // destination source requiring that.
+            let schema = tool.get("input_schema");
+            if !strict {
+                gj::set_raw(&mut item, "parameters", normalize_tool_parameters(&schema.raw));
+            } else if schema.is_object() {
+                gj::set_raw(&mut item, "parameters", &schema.raw);
+            } else {
+                state.drops.drop_part("tool without an object input_schema");
+            }
+            let cleanup: &[&str] = if strict {
+                &["input_schema", "cache_control", "defer_loading"]
+            } else {
+                &["input_schema", "parameters.$schema", "cache_control", "defer_loading"]
+            };
+            if strict && tool.get("defer_loading").kind == Kind::True {
+                // Deferred tool loading (tool search) has no Responses form.
+                state.drops.drop_part("deferred tool (defer_loading)");
+            }
+            for path in cleanup {
                 if gj::get(&item, path).exists() {
                     gj::delete(&mut item, path);
                 }

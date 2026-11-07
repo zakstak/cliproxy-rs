@@ -604,8 +604,11 @@ The strict mode is the Codex route's alone.
 | --- | --- | --- |
 | Messages and contents become Responses `input` items: `message`, `function_call`, `function_call_output`, `reasoning` | All | OpenAI Responses API input items; first-party `protocol/src/models.rs` `ResponseItem` |
 | A system prompt becomes a leading `developer` message (Claude `system`, a Chat `system` message, Gemini `systemInstruction`); an Interactions system instruction becomes `instructions` | All | First-party base instructions as a developer message (`core/src/client.rs:1214-1224`); Responses `instructions` |
-| A tool declaration becomes `{"type":"function","name","description","parameters","strict"}` from Claude `input_schema`, Chat `function.parameters` or Gemini `parameters` | All | Responses function tools; first-party `tools/src/responses_api.rs:33-45` (`strict: false`) |
-| A tool call and its result keep the caller's call ID and tool name | All | Responses `call_id` pairing |
+| A tool declaration becomes `{"type":"function","name","description","parameters","strict"}` from Claude `input_schema`, Chat `function.parameters` or Gemini `parameters`. The schema is the caller's, as sent: `$schema`, `pattern`, `patternProperties` and unknown keywords stay. A Gemini upper-case `type` name becomes the JSON Schema name. A Claude tool without an object `input_schema` is refused | All | Responses function tools; first-party `tools/src/responses_api.rs:33-45` (`strict: false` when the caller sets none); Gemini `Type` enum against JSON Schema `type` |
+| A tool call and its result keep the caller's call ID, however long, and tool name | All | Responses `call_id` pairing |
+| Generation controls map to their Responses fields: `max_tokens`, `max_completion_tokens`, `maxOutputTokens` and `max_output_tokens` become `max_output_tokens`; `temperature`, `top_p`/`topP`, Chat `user`, `safety_identifier`, `metadata`, `prompt_cache_key`, `prompt_cache_retention` and `verbosity` map unchanged | All | The Responses fields of the same name and meaning. The ChatGPT backend's acceptance of each is the upstream's to judge |
+| A control at its API default needs nothing: an empty `stop`/`stop_sequences`/`stopSequences`, zero penalties, `n` or `candidateCount` of 1, `logprobs: false`, text-only modalities, `store: false`, Gemini `responseMimeType: text/plain` | All | The default means the same in both APIs |
+| Claude `metadata` (an end-user identifier for abuse detection) and Chat `stream_options` are not sent | Claude, Chat | Neither changes the generation. The ChatGPT backend takes no `safety_identifier` (Go removes it from every Codex request), and Responses always reports usage |
 | A tool name over 64 bytes is shortened, and the response maps the short name back | Claude, Chat, Gemini, Interactions | OpenAI function names allow at most 64 characters |
 | Claude `tool_result` content becomes `function_call_output` text or input parts | Claude | Responses `function_call_output.output` |
 | The client's thinking becomes `reasoning.effort`: a Claude budget, adaptive thinking with `output_config.effort`, or disabled thinking; Chat `reasoning_effort`; a Gemini `thinkingLevel` or budget; Interactions reasoning settings; a model suffix | All | Responses `reasoning.effort`. The budget-to-level table is Go's (`cpa_common::thinking`), and with no thinking setting nothing is sent |
@@ -623,19 +626,38 @@ The strict mode is the Codex route's alone.
 
 #### Refusals
 
-Any content part or tool that Codex cannot express is refused with a 400 before any
-upstream request, and the message names it. Examples:
+Any request field, control, content part or tool that Codex cannot express is refused
+with a 400 before any upstream request, and the message names it. Request fields and
+controls:
+
+- any top-level field without a rule;
+- Claude `top_k` or non-empty `stop_sequences`;
+- Chat `stop`, `n` above 1, a non-zero penalty, `seed`, `logit_bias`, `logprobs`,
+  `store: true` (the encrypted-reasoning round trip needs `store: false`), audio or
+  other non-text modalities, or a message `name`;
+- Gemini `topK`, `stopSequences`, `candidateCount` above 1, a JSON
+  `responseMimeType`, `safetySettings` or `cachedContent`;
+- Interactions penalties, `stop_sequences` or `response_format`.
+
+Content, including content nested in tool results and system prompts:
 
 - Claude `redacted_thinking`, server tool blocks and other unknown blocks;
-- a Claude document that is not an inline PDF;
-- a Chat `refusal` part, or an audio part without data;
-- Gemini `executableCode`, code execution results, and built-in Gemini tools such as
-  search;
-- an Interactions part with no Responses form.
+- a thinking block with reasoning text or a signature that is not Codex encrypted
+  content;
+- a document that is not an inline PDF, at the top level or in a `tool_result`;
+- any other block in a `tool_result`; text and images in any representable source
+  (data, URL, file ID) are kept;
+- a non-text system block;
+- a deferred tool (`defer_loading: true`);
+- a Chat `refusal` part, an audio part without data, a tool result without its call, a
+  duplicated call ID, or a call of an unknown type;
+- Gemini `executableCode` and other non-text parts it cannot convert, a thought with
+  text, a non-text system part, and built-in Gemini tools such as search;
+- an Interactions thought step, a step with no content, or a part with no Responses
+  form.
 
-A sample message: `unsupported conversion: a \`redacted_thinking\` content part cannot be
-expressed in a Codex Responses request; remove it or send the request to a provider
-that accepts it`.
+A sample message: `unsupported conversion: \`top_k\` has no Codex Responses
+equivalent; remove it or send the request to a provider that accepts it`.
 
 ### Responses
 
@@ -654,19 +676,28 @@ Responses client, or the strict conversion. No Codex-client rewrite, default or 
 rule changes it. The response carries `x-cliproxy-token-count: local-estimate`, because
 the number is this proxy's tokenizer estimate, not provider usage.
 
-The Images API adapter no longer synthesizes a prompt-cache key.
+The Images API adapter has two paths, and both are free of payload rules, input-ID
+rewrites and synthesized prompt-cache keys.
+
+- A direct request (an image model on the direct list, or a configured API-key image
+  model) reaches the provider's Images endpoint as the client sent it, with only its
+  model and `stream` routed.
+- The tool adapter builds a Responses request containing only what the conversion
+  needs: the model, the forced `image_generation` tool with the client's image
+  settings, the prompt and images, `stream: true` and `store: false`. It sends no
+  default `instructions`, reasoning, `parallel_tool_calls` or `include`. An Images JSON
+  field the tool cannot express (`style`, `user`, `n` above 1, and others) is refused.
+  #33 owns the image model IDs.
 
 ### Remaining limits
 
-- The image adapter still builds its request with defaults (`reasoning.effort:
-  medium`, `instructions: ""`, `include`, `parallel_tool_calls`) and runs payload rules.
-  No source covers the image backend. #33 owns its model IDs and #28 its settings.
-- Tool schemas are normalized by the translators: `$schema` and `$id` are removed, a
-  `pattern` with an unsupported `\p{...}` escape is removed, and a missing object
-  `type` or `properties` is added. Removing a `pattern` drops a validation constraint.
-  No source proves that the upstream refuses those patterns.
-- A call ID over 64 bytes is shortened with a hash suffix and is not mapped back. The
-  64-byte limit is Go's and has no source.
+- A Claude `tool_result` with `is_error: true` is sent as its output without the flag,
+  because Responses `function_call_output` has no error field. The output text is the
+  only carrier of the failure. Refusing would block ordinary tool-failure turns; this
+  needs a product decision.
+- A multipart Images edit is not checked against the tool's fields the way JSON
+  requests are.
+- A Gemini `thoughtSignature` is not sent: it is Gemini's state for its own model.
 - The `siwc` profile keeps the legacy path, without the replay cache.
 
 ## Identity and headers

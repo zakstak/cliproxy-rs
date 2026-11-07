@@ -100,6 +100,7 @@ mod codex_claude_response;
 mod codex_gemini;
 mod codex_interactions;
 mod codex_responses;
+mod codex_strict;
 mod common;
 mod gemini;
 mod gemini_chat_request;
@@ -432,7 +433,8 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
     let upstream = Format::Codex;
     Some(deep_stack(levels(&[body]), || {
         let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
-        let out = convert(ctx, body)?;
+        let mut out = convert(ctx, body)?;
+        codex_strict::controls(client, body, &mut out)?;
         Ok(thinking::apply_summary_for_model(
             out,
             upstream.as_str(),

@@ -1524,7 +1524,7 @@ impl UserTurnDrops {
             Some(kind) => {
                 let kind = if kind.is_empty() { "unknown" } else { kind };
                 Err(crate::Error(format!(
-                    "unsupported conversion: a `{kind}` content part cannot be expressed in a {destination} request; remove it or send the request to a provider that accepts it"
+                    "unsupported conversion: `{kind}` cannot be expressed in a {destination} request; remove it or send the request to a provider that accepts it"
                 )))
             }
         }

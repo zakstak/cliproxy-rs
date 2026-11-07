@@ -561,3 +561,299 @@ async fn a_home_pick_takes_the_translated_route() {
     }
     assert_eq!(released.load(Ordering::SeqCst), 1, "the lease is released");
 }
+
+// Review 5812377412: generation controls, nested content, schemas, call IDs and images.
+
+/// [`proxy`], for tests that keep a `proxy` binding.
+async fn make(replies: Vec<Reply>, extra_config: &str) -> Proxy {
+    proxy(replies, extra_config).await
+}
+
+/// Explicit generation controls reach the upstream as their documented Responses fields
+/// (`max_output_tokens`, `temperature`, `top_p`, ...), and a control with no Responses
+/// equivalent is refused before anything is sent.
+#[tokio::test]
+async fn generation_controls_map_or_are_refused() {
+    let mut claude = claude_request(false);
+    claude["max_tokens"] = json!(1);
+    claude["temperature"] = json!(0.25);
+    claude["top_p"] = json!(0.5);
+    let mut chat = chat_request(false);
+    chat["max_completion_tokens"] = json!(7);
+    chat["temperature"] = json!(0.25);
+    chat["prompt_cache_key"] = json!("client-key-for-caching");
+    let gemini = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {"maxOutputTokens": 9, "temperature": 0.25, "topP": 0.5}
+    });
+    let interactions =
+        json!({"model": "gpt-5.5", "input": "hi", "generation_config": {"max_output_tokens": 11, "temperature": 0.25}});
+    let mapped = [
+        (
+            "/v1/messages",
+            claude,
+            json!({"max_output_tokens": 1, "temperature": 0.25, "top_p": 0.5}),
+        ),
+        (
+            "/v1/chat/completions",
+            chat,
+            json!({"max_output_tokens": 7, "temperature": 0.25, "prompt_cache_key": "client-key-for-caching"}),
+        ),
+        (
+            "/v1beta/models/gpt-5.5:generateContent",
+            gemini,
+            json!({"max_output_tokens": 9, "temperature": 0.25, "top_p": 0.5}),
+        ),
+        (
+            "/v1beta/interactions",
+            interactions,
+            json!({"max_output_tokens": 11, "temperature": 0.25}),
+        ),
+    ];
+    for (path, request, want) in mapped {
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, path, &request).await;
+        assert_eq!(status, 200, "{path}: {answer}");
+        let body = sent(&proxy);
+        for (field, value) in want.as_object().unwrap() {
+            assert_eq!(&body[field], value, "{path}: {field} in {body}");
+        }
+    }
+    let mut top_k = claude_request(false);
+    top_k["top_k"] = json!(5);
+    let mut stop = claude_request(false);
+    stop["stop_sequences"] = json!(["END"]);
+    let mut chat_stop = chat_request(false);
+    chat_stop["stop"] = json!(["END"]);
+    let mut chat_n = chat_request(false);
+    chat_n["n"] = json!(2);
+    let mut chat_penalty = chat_request(false);
+    chat_penalty["presence_penalty"] = json!(0.5);
+    let mut chat_seed = chat_request(false);
+    chat_seed["seed"] = json!(42);
+    let gemini_top_k =
+        json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"topK": 4}});
+    let gemini_json = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"responseMimeType": "application/json"}});
+    let gemini_safety = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "safetySettings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}]});
+    let interactions_penalty =
+        json!({"model": "gpt-5.5", "input": "hi", "generation_config": {"presence_penalty": 0.5}});
+    let refused = [
+        ("/v1/messages", top_k, "top_k"),
+        ("/v1/messages", stop, "stop_sequences"),
+        ("/v1/chat/completions", chat_stop, "stop"),
+        ("/v1/chat/completions", chat_n, "`n`"),
+        ("/v1/chat/completions", chat_penalty, "presence_penalty"),
+        ("/v1/chat/completions", chat_seed, "seed"),
+        ("/v1beta/models/gpt-5.5:generateContent", gemini_top_k, "topK"),
+        (
+            "/v1beta/models/gpt-5.5:generateContent",
+            gemini_json,
+            "responseMimeType",
+        ),
+        (
+            "/v1beta/models/gpt-5.5:generateContent",
+            gemini_safety,
+            "safetySettings",
+        ),
+        ("/v1beta/interactions", interactions_penalty, "presence_penalty"),
+    ];
+    for (path, request, field) in refused {
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, path, &request).await;
+        assert_eq!(status, 400, "{path} {field}: {answer}");
+        assert!(
+            answer.contains("unsupported conversion") && answer.contains(field),
+            "{path}: {answer}"
+        );
+        assert!(proxy.upstream.http().is_empty(), "{path} {field}: nothing was sent");
+    }
+}
+
+/// Nested and handled content is kept or refused, never partly sent: a tool result with
+/// text and an image URL keeps both; a tool result with text and an unsupported block, a
+/// thinking block with reasoning text but no Codex signature, a non-text system block, a
+/// Gemini thought, an Interactions thought step, a Chat result without its call and a
+/// Chat call of an unknown type are refused before the send.
+#[tokio::test]
+async fn nested_content_is_kept_or_refused() {
+    let mut kept = claude_request(false);
+    kept["messages"][2]["content"][0]["content"] = json!([
+        {"type": "text", "text": "18C"},
+        {"type": "image", "source": {"type": "url", "url": "https://example.com/chart.png"}}
+    ]);
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &kept).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    let output = &items(&body, "function_call_output")[0]["output"];
+    assert_eq!(output[0]["text"], "18C", "{body}");
+    assert_eq!(output[1]["image_url"], "https://example.com/chart.png", "{body}");
+
+    let mut mixed = claude_request(false);
+    mixed["messages"][2]["content"][0]["content"] = json!([
+        {"type": "text", "text": "18C"},
+        {"type": "search_result", "source": "https://example.com", "title": "t", "content": []}
+    ]);
+    let mut foreign = claude_request(false);
+    foreign["messages"][1]["content"][0] =
+        json!({"type": "thinking", "thinking": "I should call the tool.", "signature": "EqQBCkgIBxABGAIqQKlaude"});
+    let mut system = claude_request(false);
+    system["system"] = json!([{"type": "text", "text": "Be brief."}, {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}]);
+    let gemini_thought = json!({"contents": [
+        {"role": "user", "parts": [{"text": "hi"}]},
+        {"role": "model", "parts": [{"text": "Let me think.", "thought": true}, {"text": "Hello"}]},
+        {"role": "user", "parts": [{"text": "again"}]}
+    ]});
+    let interactions_thought = json!({"model": "gpt-5.5", "input": [
+        {"type": "user_input", "content": "hi"},
+        {"type": "thought", "content": "private reasoning"},
+        {"type": "user_input", "content": "again"}
+    ]});
+    let orphan_result = json!({"model": "gpt-5.5", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "call_missing", "content": "18C"}
+    ]});
+    let unknown_call = json!({"model": "gpt-5.5", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "computer", "computer": {}}]},
+        {"role": "user", "content": "go on"}
+    ]});
+    let cases = [
+        ("/v1/messages", mixed, "search_result"),
+        ("/v1/messages", foreign, "thinking"),
+        ("/v1/messages", system, "system block"),
+        ("/v1beta/models/gpt-5.5:generateContent", gemini_thought, "thought"),
+        ("/v1beta/interactions", interactions_thought, "thought"),
+        (
+            "/v1/chat/completions",
+            orphan_result,
+            "tool message without a matching tool call",
+        ),
+        ("/v1/chat/completions", unknown_call, "computer"),
+    ];
+    for (path, request, part) in cases {
+        let proxy = make(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, path, &request).await;
+        assert_eq!(status, 400, "{path} {part}: {answer}");
+        assert!(
+            answer.contains("unsupported conversion") && answer.contains(part),
+            "{path}: {answer}"
+        );
+        assert!(proxy.upstream.http().is_empty(), "{path} {part}: nothing was sent");
+    }
+}
+
+/// A caller's tool schema reaches the upstream as sent: `$schema`, a nested `pattern`
+/// with a `\p{...}` escape, `patternProperties` and an unknown keyword stay. Gemini's
+/// upper-case type names become JSON Schema's, the one documented dialect change, and no
+/// `additionalProperties` is added.
+#[tokio::test]
+async fn tool_schemas_keep_their_constraints() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "pattern": "^\\p{Lu}\\p{Ll}+$"},
+            "tags": {"type": "object", "patternProperties": {"^\\p{L}+$": {"type": "string"}}},
+            "limit": {"type": "integer", "x-unit": "items"}
+        },
+        "required": ["name"]
+    });
+    let mut claude = claude_request(false);
+    claude["tools"][0]["input_schema"] = schema.clone();
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &claude).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(sent(&proxy)["tools"][0]["parameters"], schema, "the caller's schema");
+
+    let gemini = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{"functionDeclarations": [{"name": "lookup", "parameters": {
+            "type": "OBJECT",
+            "properties": {"name": {"type": "STRING", "pattern": "^\\p{Lu}"}},
+            "required": ["name"]
+        }}]}]
+    });
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1beta/models/gpt-5.5:generateContent", &gemini).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        sent(&proxy)["tools"][0]["parameters"],
+        json!({"type": "object", "properties": {"name": {"type": "string", "pattern": "^\\p{Lu}"}}, "required": ["name"]}),
+        "only the type names change"
+    );
+}
+
+/// A call ID longer than 64 bytes reaches the upstream unchanged on both the call and
+/// its result, so they still correlate.
+#[tokio::test]
+async fn long_call_ids_stay_unchanged() {
+    let id = format!("toolu_{}", "x".repeat(100));
+    let mut claude = claude_request(false);
+    claude["messages"][1]["content"][1]["id"] = json!(id);
+    claude["messages"][2]["content"][0]["tool_use_id"] = json!(id);
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &claude).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_eq!(items(&body, "function_call")[0]["call_id"], json!(id));
+    assert_eq!(items(&body, "function_call_output")[0]["call_id"], json!(id));
+
+    let call = format!("call_{}", "y".repeat(100));
+    let mut chat = chat_request(false);
+    chat["messages"][2]["tool_calls"][0]["id"] = json!(call);
+    chat["messages"][3]["tool_call_id"] = json!(call);
+    let proxy = make(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/chat/completions", &chat).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_eq!(items(&body, "function_call")[0]["call_id"], json!(call));
+    assert_eq!(items(&body, "function_call_output")[0]["call_id"], json!(call));
+}
+
+const IMAGE_RULES: &str = "payload:\n  override:\n    - models: [{name: \"*\"}]\n      params: {model: policy/image-model, instructions: injected, reasoning.effort: high, \"audit.-1\": once}\n";
+
+/// A direct Images request (an API-key credential with a configured image model) reaches
+/// the provider's Images endpoint as the client sent it, with only its model routed:
+/// payload rules cannot rewrite it.
+#[tokio::test]
+async fn direct_images_are_not_rewritten() {
+    let upstream = CaptureUpstream::start(Script {
+        http: vec![Reply::json(
+            200,
+            r#"{"created":1713833628,"data":[{"b64_json":"AA=="}]}"#,
+        )],
+        ..Script::default()
+    })
+    .await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\ncodex-api-key:\n  - api-key: key-FAKE\n    base-url: {}\n    models:\n      - name: gpt-image-2\n{IMAGE_RULES}",
+        auth_dir.0.display(),
+        upstream.base_url
+    ))
+    .unwrap();
+    let credentials = cpa_core::config::credentials::from_config(&cfg);
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors()));
+    let proxy = Proxy {
+        url: serve(cpa_server::router(rt)).await,
+        upstream,
+        _auth_dir: auth_dir,
+    };
+    let (status, answer) = post(
+        &proxy.url,
+        "/v1/images/generations",
+        &json!({"model": "gpt-image-2", "prompt": "a cat"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    let http = proxy.upstream.http();
+    assert_eq!(http[0].uri.path(), "/images/generations");
+    let body: Value = serde_json::from_slice(&http[0].body).unwrap();
+    assert_eq!(body["model"], "gpt-image-2", "{body}");
+    assert_eq!(body["prompt"], "a cat");
+    assert!(
+        body.get("audit").is_none() && body.get("instructions").is_none(),
+        "{body}"
+    );
+}

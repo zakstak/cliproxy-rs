@@ -285,6 +285,8 @@ struct Input {
     items: Vec<Vec<u8>>,
     /// Parts Codex cannot express: refused, not dropped.
     drops: crate::common::UserTurnDrops,
+    /// The Codex translated route's rules ([`codex_strict`]).
+    strict: bool,
 }
 
 impl Input {
@@ -361,6 +363,11 @@ impl Input {
                 self.items.push(item);
             }
             b"model_output" | b"assistant" => self.content(&step.get("content"), "assistant"),
+            b"thought" | b"reasoning" if self.strict => {
+                // Reasoning text Codex cannot carry is refused, not sent in a shape the
+                // destination does not define.
+                self.drops.drop_part("thought step");
+            }
             b"thought" | b"reasoning" => {
                 let mut text = content_text(&step.get("content"));
                 if text.is_empty() {
@@ -380,6 +387,10 @@ impl Input {
                 let role = default_role(&step.get("role").bytes(), role);
                 let content = step.get("content");
                 let text = step.get("text");
+                if self.strict && !content.exists() && !text.exists() {
+                    let kind = String::from_utf8_lossy(&step.get("type").bytes()).into_owned();
+                    self.drops.drop_part(&format!("{kind} step"));
+                }
                 if content.exists() {
                     self.content(&content, role);
                 } else if text.exists() {
@@ -498,7 +509,7 @@ pub(crate) fn cleaned_parameters(params: &Res<'_>) -> Vec<u8> {
 
 /// codexToolFromDeclaration, as json.Marshal writes the map (sorted keys); `None` when
 /// the parameters are not valid JSON (Marshal fails).
-fn tool_from_declaration(declaration: &Res<'_>) -> Option<Vec<u8>> {
+fn tool_from_declaration(declaration: &Res<'_>, strict: bool) -> Option<Vec<u8>> {
     let mut out = b"{".to_vec();
     let description = declaration.get("description");
     if description.exists() {
@@ -513,7 +524,12 @@ fn tool_from_declaration(declaration: &Res<'_>) -> Option<Vec<u8>> {
         &["parameters", "parametersJsonSchema", "parameters_json_schema"],
     );
     if params.exists() {
-        let cleaned = cleaned_parameters(&params);
+        // Strict: the client's schema as sent (Go drops `$schema` and more).
+        let cleaned = if strict {
+            params.raw.to_vec()
+        } else {
+            cleaned_parameters(&params)
+        };
         if !gj::std_valid(&cleaned) {
             return None;
         }
@@ -583,6 +599,12 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
             gj::set_str(&mut out, "reasoning.summary", summary);
         }
         for (source, target) in COPY_RAW_PATHS {
+            // Strict: only fields Responses defines (the penalties and `response_format`
+            // have no Responses field; `codex_strict` refuses them unless at default).
+            let undefined = matches!(target, "presence_penalty" | "frequency_penalty" | "response_format");
+            if strict && undefined {
+                continue;
+            }
             let value = cfg.get(source);
             if value.exists() {
                 gj::set_raw(&mut out, target, &value.raw);
@@ -598,6 +620,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
     let mut input = Input {
         items: vec![],
         drops: Default::default(),
+        strict,
     };
     let value = root.get("input");
     if value.kind == Kind::String {
@@ -630,13 +653,13 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
                     if declarations.is_array() {
                         declarations.each(|_, d| {
                             if d.get("name").exists() {
-                                normalized.push(tool_from_declaration(&d));
+                                normalized.push(tool_from_declaration(&d, strict));
                             }
                             true
                         });
                     }
                 } else if tool.get("name").exists() {
-                    normalized.push(tool_from_declaration(&tool));
+                    normalized.push(tool_from_declaration(&tool, strict));
                 }
                 true
             });

@@ -258,6 +258,22 @@ fn executor() -> CodexExecutor {
 
 /// A recorded case that now takes the native HTTP route (#23): Go's bytes no longer
 /// apply to it, the contract does (`docs/codex/CONTRACT.md` "Native HTTP route").
+/// No request was recorded: the attempt ended before the send.
+fn result_refused(taps: &[Tap]) -> bool {
+    !taps.iter().any(|t| matches!(t, Tap::Request { .. }))
+}
+
+/// Go's image-tool request without the defaults #27 removes (`instructions`,
+/// `reasoning`, `parallel_tool_calls`, `include`), and the Rust body, both as JSON
+/// (docs/DIFFERENCES-FROM-GO.md, "Codex translated route").
+fn image_tool_bodies(go: &str, rust: &[u8]) -> (Value, Value) {
+    let mut go: Value = serde_json::from_str(go).unwrap();
+    for key in ["instructions", "reasoning", "parallel_tool_calls", "include"] {
+        go.as_object_mut().unwrap().remove(key);
+    }
+    (go, serde_json::from_slice(rust).unwrap())
+}
+
 /// A recorded case the translated route serves (#27): a Claude, Chat Completions,
 /// Gemini or Interactions request on a native profile.
 fn translated_case(case: &Value, base_url: &str) -> bool {
@@ -825,7 +841,20 @@ async fn usage_records_see_upstream_payloads() {
         let recorded = Arc::new(Recorded::default());
         let mut req = request(case);
         req.usage = cpa_core::exec::UsageSink::new(recorded.clone());
-        match executor.execute(&credential, req, &cfg).await.unwrap().body {
+        let response = match executor.execute(&credential, req, &cfg).await {
+            Ok(response) => response,
+            // A conversion the translated route refuses sends and records nothing (#27).
+            Err(error) if translated_case(case, &mock.url) => {
+                assert_eq!(error.status, 400, "{name}");
+                assert!(
+                    mock.take().is_empty() && recorded.0.lock().unwrap().is_empty(),
+                    "{name}"
+                );
+                continue;
+            }
+            Err(error) => panic!("{name}: {error:?}"),
+        };
+        match response.body {
             ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
             ResponseBody::Buffered(_) => {}
         }
@@ -894,11 +923,22 @@ async fn usage_records_the_payload_override_reasoning_effort() {
         );
         req.body = Bytes::from(body);
         req.usage = cpa_core::exec::UsageSink::new(recorded.clone());
-        match executor.execute(&credential, req, &cfg).await.unwrap().body {
+        let (native, translated) = (native_case(case, &mock.url), translated_case(case, &mock.url));
+        let response = match executor.execute(&credential, req, &cfg).await {
+            Ok(response) => response,
+            // The translated Claude case carries a thinking block with reasoning text and
+            // no Codex signature, which the translated route refuses before the send (#27).
+            Err(error) if translated => {
+                assert_eq!(error.status, 400, "{name}");
+                assert!(mock.take().is_empty(), "{name}: nothing is sent");
+                continue;
+            }
+            Err(error) => panic!("{name}: {error:?}"),
+        };
+        match response.body {
             ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
             ResponseBody::Buffered(_) => {}
         }
-        let (native, translated) = (native_case(case, &mock.url), translated_case(case, &mock.url));
         let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
         // Payload rules never reach a native (#23) or translated (#27) body; other paths
         // keep Go's override. The translated Claude case keeps the client's own thinking
@@ -947,14 +987,15 @@ async fn direct_images_send_the_configured_upstream_model() {
             "gpt-image-2",
             "openai/gpt-image-2-cpr",
             "openai/gpt-image-2-cpr",
-            "policy/image-model",
+            // Payload rules no longer reach the Images adapter (#27).
+            "openai/gpt-image-2-cpr",
             override_rules.as_str(),
         ),
         (
             "gpt-image-2",
             "openai/gpt-image-2-cpr",
             "openai/gpt-image-2-cpr",
-            "",
+            "openai/gpt-image-2-cpr",
             filter_rules.as_str(),
         ),
     ] {
@@ -1027,9 +1068,7 @@ async fn direct_images_send_the_configured_upstream_model() {
                 "{resolved} {request_path}"
             );
             assert_eq!(sent["prompt"], "diagnostic", "{request_path}");
-            if rules.contains("audit") {
-                assert_eq!(sent["audit"], serde_json::json!(["once"]), "{request_path}");
-            }
+            assert!(sent.get("audit").is_none(), "{request_path}: no payload rule ran");
         }
     }
 }
@@ -1089,6 +1128,14 @@ async fn images_match_go_on_every_fixture_case() {
         };
         let result = executor.images(&credential, req, request_path, &cfg).await;
         let captured = mock.take();
+        if name == "tool_generation_nonstream_b64" {
+            // `n: 2` and `style` cannot be expressed by the image tool: refused before the
+            // send (#27). Go drops them.
+            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
+            assert_eq!(error.status, 400, "{name}");
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+            continue;
+        }
         match case.get("upstream").filter(|u| !u.is_null()) {
             None => assert!(captured.is_empty(), "{name}: no upstream request"),
             Some(go) => {
@@ -1099,6 +1146,11 @@ async fn images_match_go_on_every_fixture_case() {
                     let go_body: Value = serde_json::from_str(go["body"].as_str().unwrap()).unwrap();
                     let rust_body: Value = serde_json::from_slice(&captured[0].body).unwrap();
                     assert_eq!(rust_body, go_body, "{name}: upstream body fields");
+                    go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
+                }
+                if path == "/responses" {
+                    let (go_body, rust_body) = image_tool_bodies(go["body"].as_str().unwrap(), &captured[0].body);
+                    assert_eq!(rust_body, go_body, "{name}: the tool request without Go's defaults");
                     go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
                 }
                 assert_same_upstream(name, &captured[0], &go);
@@ -1229,7 +1281,13 @@ async fn capture_records_each_attempt_as_go_does() {
             while stream.next().await.is_some() {}
         }
         let taps = tap.taps();
-        let sent = &mock.take()[0];
+        let all = mock.take();
+        if all.is_empty() && translated_case(case, &mock.url) {
+            // A conversion the translated route refuses sends nothing (#27).
+            assert!(result_refused(&taps), "{name}");
+            continue;
+        }
+        let sent = &all[0];
         // The request: Go's header map is what went out, less what the transport adds.
         let Tap::Request {
             url,
@@ -1890,7 +1948,12 @@ async fn siwc_requests_match_go() {
             let mut req = request(&synthetic);
             (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
             executor.images(&credential, req, path, &cfg).await.unwrap();
-            assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
+            let sent = mock.take().pop().unwrap();
+            let (go_body, rust_body) = image_tool_bodies(go_upstream["body"].as_str().unwrap(), &sent.body);
+            assert_eq!(rust_body, go_body, "{name}: the tool request without Go's defaults");
+            let mut go_upstream = go_upstream;
+            go_upstream["body"] = Value::String(String::from_utf8_lossy(&sent.body).into_owned());
+            assert_same_upstream(name, &sent, &go_upstream);
             continue;
         }
         let (path, content_type, reply) = if call == "compact" {
@@ -2351,4 +2414,68 @@ fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
         shaped("OpenAI/Python 2.1.0", r#","service_tier":"flex""#),
         (String::new(), Some("model=gpt-5.4".to_owned()))
     );
+}
+
+/// The Images API tool adapter (#27) sends only what the conversion needs: the model,
+/// the forced `image_generation` tool with the client's settings, the prompt, `stream`
+/// and `store`. Payload rules cannot rewrite it, and an Images field the tool cannot
+/// express is refused before anything is sent.
+#[tokio::test]
+async fn the_image_tool_adapter_adds_nothing() {
+    let executor = executor();
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+    );
+    let rules = "payload:\n  override:\n    - models: [{name: \"*\"}]\n      params: {model: policy/image-model, instructions: injected, reasoning.effort: high, \"audit.-1\": once}\n";
+    for (body, refused) in [
+        (r#"{"prompt":"a cat","size":"1024x1024"}"#, None),
+        (r#"{"prompt":"a cat","style":"vivid"}"#, Some("style")),
+        (r#"{"prompt":"a cat","n":2}"#, Some("`n`")),
+    ] {
+        let mock = Mock::start().await;
+        mock.script(
+            "/responses",
+            vec![Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: sse.into(),
+            }],
+        );
+        let case = serde_json::json!({"source": "openai", "model": "gpt-5.4", "payload": body, "attributes": {}, "metadata": {"type": "codex", "access_token": "at-FAKE"}});
+        let credential = credential(&case, &mock.url);
+        let mut req = request(&case);
+        req.request_path = "/v1/images/generations".into();
+        let result = executor
+            .images(
+                &credential,
+                req,
+                "/v1/images/generations",
+                &Config::parse(rules).unwrap(),
+            )
+            .await;
+        let captured = mock.take();
+        if let Some(field) = refused {
+            let error = result.err().unwrap_or_else(|| panic!("{field}: refused"));
+            assert_eq!(error.status, 400, "{field}");
+            assert!(String::from_utf8_lossy(&error.body).contains(field), "{field}");
+            assert!(captured.is_empty(), "{field}: nothing is sent");
+            continue;
+        }
+        result.unwrap();
+        let sent: Value = serde_json::from_slice(&captured[0].body).unwrap();
+        let mut keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["input", "model", "store", "stream", "tool_choice", "tools"],
+            "{sent}"
+        );
+        assert_eq!(sent["tools"][0]["type"], "image_generation");
+        assert_eq!(sent["tools"][0]["size"], "1024x1024");
+        assert!(
+            !sent.to_string().contains("policy/image-model"),
+            "no payload rule: {sent}"
+        );
+    }
 }
