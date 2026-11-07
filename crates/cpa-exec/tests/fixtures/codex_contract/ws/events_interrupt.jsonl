@@ -1,0 +1,4 @@
+{"type":"response.created","response":{"id":"resp_fixture_1"}}
+{"type":"response.interrupt.accepted","response_id":"resp_fixture_1"}
+{"type":"response.output_item.interrupted","item_id":"rs_fixture_2","output_index":1}
+{"type":"response.incomplete","response":{"id":"resp_fixture_1","incomplete_details":{"reason":"interrupted"},"output":[]}}

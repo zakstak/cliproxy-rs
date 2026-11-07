@@ -28,7 +28,15 @@ struct Request {
     path: String,
 }
 
-fn call(req: Request, entry: Format, model: String, body: Bytes, stream: bool, alt: Option<String>) -> Call {
+fn call(
+    req: Request,
+    entry: Format,
+    model: String,
+    body: Bytes,
+    stream: bool,
+    alt: Option<String>,
+    native: Option<Arc<dispatch::NativeRequest>>,
+) -> Call {
     Call {
         entry,
         response: entry,
@@ -44,6 +52,7 @@ fn call(req: Request, entry: Format, model: String, body: Bytes, stream: bool, a
         execution_session: None,
         request_path: req.path,
         peer: req.peer,
+        native,
         turn: None,
         media: None,
     }
@@ -159,7 +168,7 @@ pub async fn chat_completions(
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(
         &rt,
-        call(req, Format::OpenAI, model, body, stream, alt),
+        call(req, Format::OpenAI, model, body, stream, alt, None),
         move |result| async move {
             match result {
                 Err(failure) => errors::openai(&failure),
@@ -227,7 +236,7 @@ pub async fn completions(
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(
         &rt,
-        call(req, Format::OpenAI, model, Bytes::from(chat), stream, None),
+        call(req, Format::OpenAI, model, Bytes::from(chat), stream, None, None),
         move |result| async move {
             match result {
                 Err(failure) => errors::openai(&failure),
@@ -486,9 +495,16 @@ pub async fn responses(
     if cpa_common::codex_client::multi_agent_client(&headers, settings.optimize_multi_agent_v2) {
         crate::model_updater::codex_client_catalog_wanted();
     }
-    let body = Bytes::from(cpa_common::codex_client::prepare_responses_request(
-        &headers, &body, &settings,
-    ));
+    // A native Codex attempt gets the client's own bytes (#23); the rewrite below is for
+    // every other provider.
+    let path = dispatch::route_path(matched.as_ref(), &original.0);
+    let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
+    // A body the preparation leaves alone keeps the client's buffer, so a native request
+    // holds one copy of its body, not two (#29, docs/BENCHMARKS.md).
+    let body = match cpa_common::codex_client::prepare_responses_request_if_changed(&headers, &body, &settings) {
+        Some(prepared) => Bytes::from(prepared),
+        None => body,
+    };
     let fields = peek(&body);
     let stream = fields.get("stream") == Some(&Value::Bool(true));
     let model = gojson::gjson_string(fields.get("model"));
@@ -498,12 +514,20 @@ pub async fn responses(
         peer: dispatch::peer(peer),
         query: String::new(),
         headers,
-        path: dispatch::route_path(matched.as_ref(), &original.0),
+        path,
     };
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(
         &rt,
-        call(req, Format::OpenAIResponse, model, body, stream, None),
+        call(
+            req,
+            Format::OpenAIResponse,
+            model,
+            body,
+            stream,
+            None,
+            Some(native.clone()),
+        ),
         move |result| async move {
             match result {
                 Err(failure) if stream => {
@@ -522,6 +546,10 @@ pub async fn responses(
                 }
                 Err(failure) => errors::openai(&failure),
                 Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
+                // A native Codex answer: the upstream's events, byte for byte.
+                Ok(Done::Stream { first, rest, .. }) if native.served() => {
+                    respond::sse(respond::stream(first, rest, NativeSse, keepalive))
+                }
                 Ok(Done::Stream { first, mut rest, .. }) => {
                     // Go commits only once a data frame (or a terminal error) is ready.
                     let mut framer = ResponsesSse::new(codex_client);
@@ -758,6 +786,23 @@ fn stream_error_frame(codex: bool, status: u16, text: &str, seq: i64, lead: bool
             .raw("sequence_number", &seq.to_string())
             .finish();
         Bytes::from(format!("{lead}event: error\ndata: {chunk}\n\n"))
+    }
+}
+
+/// A native Codex stream (#23): every upstream event is written as it arrived. A
+/// failure after the stream started ends it without a local event, so a truncated
+/// response stays visible as one.
+struct NativeSse;
+
+impl Writer for NativeSse {
+    fn chunk(&mut self, event: Bytes) -> Vec<Bytes> {
+        vec![event]
+    }
+    fn error(&mut self, _: &ExecError) -> Vec<Bytes> {
+        Vec::new()
+    }
+    fn end(&mut self) -> Vec<Bytes> {
+        Vec::new()
     }
 }
 
@@ -1036,6 +1081,9 @@ pub async fn compact(
         },
         Err(rejection) => return read_failed(&rejection),
     };
+    // A native Codex attempt gets the client's own bytes (#23), before the rewrites below.
+    let path = dispatch::route_path(matched.as_ref(), &original.0);
+    let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
     // Go `prepareCodexOrphanDelegation` (compact skips the multi-agent tool step).
     let settings = cpa_common::codex_client::Settings::from_config(&rt.config());
     let mut body = Bytes::from(cpa_common::codex_client::rewrite_orphan_delegation_input(
@@ -1065,7 +1113,7 @@ pub async fn compact(
         peer: dispatch::peer(peer),
         query: String::new(),
         headers,
-        path: dispatch::route_path(matched.as_ref(), &original.0),
+        path,
     };
     let call = call(
         req,
@@ -1074,6 +1122,7 @@ pub async fn compact(
         body,
         false,
         Some("responses/compact".into()),
+        Some(native),
     );
     dispatch::serve(&rt, call, |result| async move {
         match result {

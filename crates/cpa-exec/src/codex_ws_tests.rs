@@ -204,8 +204,13 @@ fn credential(base_url: &str) -> Credential {
     credential
 }
 
+/// A turn as the server hands it over: the client's frame, which is a
+/// `response.create` (the tag is added when a test body leaves it out).
 fn request(body: &str) -> ExecRequest {
-    let body = Bytes::from(body.to_owned());
+    let body = match cpa_common::codex_body::CodexBody::parse(body.as_bytes()) {
+        Ok(parsed) if parsed.get("type").is_none() => Bytes::from(parsed.with_member("type", r#""response.create""#)),
+        _ => Bytes::from(body.to_owned()),
+    };
     ExecRequest {
         operation: Operation::Generate,
         source_format: Format::OpenAIResponse,
@@ -1636,8 +1641,9 @@ fn codex_client_request(body: &str) -> ExecRequest {
 /// The live context-window rejection reaches a Codex client as the `response.failed`
 /// Codex compacts on, followed by Go's classified 400 `context_too_large`, which is also
 /// the one loss the session reports. With bootstrap buffering, and when the upstream
-/// closes the socket right after the event, the same holds. Other clients get only
-/// Go's classified error.
+/// closes the socket right after the event, the same holds. Other clients get the
+/// classified error carrying the upstream's frame as sent, for delivery once failover is
+/// decided (the native route, #24, #28).
 #[tokio::test]
 async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
     let live = LIVE_CONTEXT_ERROR.trim();
@@ -1701,8 +1707,7 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
         };
         assert_eq!(code(error), "context_too_large", "{name}");
         // A Codex client's turn ends its connection after the event itself: no loss is
-        // reported, not even a close right after the event. For other clients the
-        // classified error, or such a close, is the loss, as in Go.
+        // reported, not even a close right after the event.
         if codex_client {
             assert!(
                 executor.ws.loss("conn-1").is_none(),
@@ -1710,9 +1715,14 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
                 executor.ws.loss("conn-1").map(|l| code(&l))
             );
         } else {
-            tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1"))
-                .await
-                .unwrap_or_else(|_| panic!("{name}: the session's loss was not reported"));
+            assert_eq!(
+                error
+                    .delivered_event
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                Some(live.to_owned()),
+                "{name}: the frame as sent"
+            );
         }
     }
 }

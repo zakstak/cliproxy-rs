@@ -734,6 +734,14 @@ async fn realtime_websockets_match_go() {
                         ("Chatgpt-Account-Id", Some((_, account))) => theirs = vec![account.clone()],
                         _ => {}
                     }
+                    // #26 (docs/DIFFERENCES-FROM-GO.md): where the client sent no
+                    // Originator, Go claims `Codex Desktop`; cliproxy-rs names itself.
+                    let client_originator = case["headers"]
+                        .as_object()
+                        .is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("originator")));
+                    if name == "Originator" && theirs == ["Codex Desktop"] && !client_originator {
+                        theirs = vec!["cliproxy-rs".to_owned()];
+                    }
                     let ours: Vec<String> = seen
                         .headers
                         .get_all(name.as_str())

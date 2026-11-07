@@ -47,7 +47,7 @@ cliproxy-rs is a Rust rewrite of [CLIProxyAPI](https://github.com/router-for-me/
   </picture>
 </p>
 
-The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,054 covered, 871 partial and 26 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
+The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,053 covered, 872 partial and 26 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
 
 ## How it compares
 

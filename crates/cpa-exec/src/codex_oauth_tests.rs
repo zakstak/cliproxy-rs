@@ -22,14 +22,26 @@ fn token_body() -> String {
 }
 
 /// The request fields Go's client puts on the wire (headers it sets plus its transport's
-/// Accept-Encoding and default User-Agent).
+/// Accept-Encoding). Go's User-Agent is net/http's `Go-http-client` default; the proxy
+/// names itself instead (#26, docs/DIFFERENCES-FROM-GO.md).
 fn assert_same_request(rust: &crate::codex_testkit::Captured, go: &Value) {
     assert_eq!(rust.method, go["method"].as_str().unwrap());
     assert_eq!(rust.path, go["path"].as_str().unwrap());
     assert_eq!(String::from_utf8_lossy(&rust.body), go["body"].as_str().unwrap());
-    for name in ["content-type", "accept", "user-agent", "accept-encoding"] {
+    for name in ["content-type", "accept", "accept-encoding"] {
         assert_eq!(rust.header(name), go["headers"][name][0].as_str().unwrap(), "{name}");
     }
+    assert!(
+        go["headers"]["user-agent"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("Go-http-client/")
+    );
+    assert_eq!(
+        rust.header("user-agent"),
+        crate::codex_identity::USER_AGENT,
+        "user-agent"
+    );
 }
 
 fn tokens_json(t: &Tokens) -> Value {

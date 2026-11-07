@@ -12,7 +12,7 @@ use crate::{Error, Registered, ResponseCtx, gemini};
 
 pub static PAIR: Registered = registered!(
     Gemini -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body)),
+    request: |ctx, body| convert(ctx.model, body, false),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: Some(gemini::token_count),
@@ -216,6 +216,288 @@ pub(crate) fn clean_parameters(parameters: &Res<'_>) -> Vec<u8> {
     cleaned
 }
 
+/// A Gemini `Schema` (OpenAPI subset) with JSON Schema's lower-case type names: `type`
+/// is converted only where the Gemini schema defines a schema (the object itself,
+/// `properties` values, `items` and `anyOf` entries). Every other byte, literal data
+/// (`enum`, `default`, `example`), unknown members, property names and their escapes
+/// included, is copied as sent. One pass over the input: each byte is read once and
+/// written once, so wide coding-agent schemas cost time linear in their size. Input that
+/// is not well-formed JSON is returned unchanged.
+fn gemini_schema_types(schema: &Res<'_>) -> Vec<u8> {
+    let raw = schema.raw.as_ref();
+    let mut renderer = SchemaTypes {
+        input: raw,
+        at: 0,
+        out: Vec::with_capacity(raw.len()),
+    };
+    match renderer.value(Position::Schema) {
+        Some(()) if renderer.rest_is_space() => renderer.out,
+        _ => raw.to_vec(),
+    }
+}
+
+/// The decoded bytes of a JSON string literal (quotes included in `literal`).
+fn unquote(literal: &[u8]) -> Option<Vec<u8>> {
+    serde_json::from_slice::<String>(literal).ok().map(String::into_bytes)
+}
+
+/// Where a JSON value sits in a Gemini schema.
+#[derive(Clone, Copy, PartialEq)]
+enum Position {
+    /// A schema object: its `type` is converted.
+    Schema,
+    /// The `properties` map: each member value is a schema.
+    Properties,
+    /// The `anyOf` array: each element is a schema.
+    Schemas,
+    /// Anything else: copied as is.
+    Literal,
+}
+
+struct SchemaTypes<'a> {
+    input: &'a [u8],
+    at: usize,
+    out: Vec<u8>,
+}
+
+impl SchemaTypes<'_> {
+    fn space(&mut self) {
+        while let Some(&b) = self.input.get(self.at) {
+            if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                break;
+            }
+            self.out.push(b);
+            self.at += 1;
+        }
+    }
+
+    fn rest_is_space(&self) -> bool {
+        self.input[self.at..]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    }
+
+    /// The span of the string starting at `at`, quotes included, without copying it.
+    fn string_span(&mut self) -> Option<(usize, usize)> {
+        let start = self.at;
+        if self.input.get(start) != Some(&b'"') {
+            return None;
+        }
+        let mut i = start + 1;
+        while let Some(&b) = self.input.get(i) {
+            match b {
+                b'\\' => i += 2,
+                b'"' => {
+                    self.at = i + 1;
+                    return Some((start, i + 1));
+                }
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    fn value(&mut self, position: Position) -> Option<()> {
+        self.space();
+        match *self.input.get(self.at)? {
+            b'{' => self.object(position),
+            b'[' => self.array(position),
+            b'"' => {
+                let (start, end) = self.string_span()?;
+                self.out.extend_from_slice(&self.input[start..end]);
+                Some(())
+            }
+            _ => {
+                let start = self.at;
+                while let Some(&b) = self.input.get(self.at) {
+                    if matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                        break;
+                    }
+                    self.at += 1;
+                }
+                (self.at > start).then(|| self.out.extend_from_slice(&self.input[start..self.at]))
+            }
+        }
+    }
+
+    fn object(&mut self, position: Position) -> Option<()> {
+        self.out.push(b'{');
+        self.at += 1;
+        self.space();
+        if self.input.get(self.at) == Some(&b'}') {
+            self.out.push(b'}');
+            self.at += 1;
+            return Some(());
+        }
+        loop {
+            self.space();
+            let (start, end) = self.string_span()?;
+            let key = &self.input[start..end];
+            self.out.extend_from_slice(key);
+            self.space();
+            if self.input.get(self.at) != Some(&b':') {
+                return None;
+            }
+            self.out.push(b':');
+            self.at += 1;
+            // Keys compare by meaning: an escaped key is decoded first (only those pay).
+            let decoded = if key.contains(&b'\\') {
+                unquote(key)?
+            } else {
+                key[1..key.len() - 1].to_vec()
+            };
+            let child = match (position, decoded.as_slice()) {
+                (Position::Schema, b"type") => {
+                    self.space();
+                    if self.input.get(self.at) == Some(&b'"') {
+                        let (start, end) = self.string_span()?;
+                        let literal = &self.input[start..end];
+                        if literal.contains(&b'\\') {
+                            let lower = go_lower(&unquote(literal)?);
+                            self.out.extend_from_slice(&gj::quote(&lower));
+                        } else {
+                            self.out.extend_from_slice(&go_lower(literal));
+                        }
+                        None
+                    } else {
+                        Some(Position::Literal)
+                    }
+                }
+                (Position::Schema, b"properties") => Some(Position::Properties),
+                (Position::Schema, b"items") => Some(Position::Schema),
+                (Position::Schema, b"anyOf") => Some(Position::Schemas),
+                (Position::Properties, _) => Some(Position::Schema),
+                _ => Some(Position::Literal),
+            };
+            if let Some(child) = child {
+                self.value(child)?;
+            }
+            self.space();
+            match self.input.get(self.at)? {
+                b',' => {
+                    self.out.push(b',');
+                    self.at += 1;
+                }
+                b'}' => {
+                    self.out.push(b'}');
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn array(&mut self, position: Position) -> Option<()> {
+        self.out.push(b'[');
+        self.at += 1;
+        self.space();
+        if self.input.get(self.at) == Some(&b']') {
+            self.out.push(b']');
+            self.at += 1;
+            return Some(());
+        }
+        let element = if position == Position::Schemas {
+            Position::Schema
+        } else {
+            Position::Literal
+        };
+        loop {
+            self.value(element)?;
+            self.space();
+            match self.input.get(self.at)? {
+                b',' => {
+                    self.out.push(b',');
+                    self.at += 1;
+                }
+                b']' => {
+                    self.out.push(b']');
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// The Codex translated route's tool choice from a Gemini `toolConfig` (either
+/// spelling): `NONE` and `AUTO` map directly; `ANY` becomes `required`, a single named
+/// function, or the documented Responses `allowed_tools` restriction for a proper subset.
+/// A mode or restriction with no Responses form is refused, never widened.
+fn strict_tool_choice(
+    out: &mut Vec<u8>,
+    root: &Res<'_>,
+    names: &HashMap<Vec<u8>, Vec<u8>>,
+    drops: &mut crate::common::UserTurnDrops,
+) {
+    let mut config = Res::default();
+    for path in [
+        "toolConfig.functionCallingConfig",
+        "toolConfig.function_calling_config",
+        "tool_config.function_calling_config",
+        "tool_config.functionCallingConfig",
+    ] {
+        let found = root.get(path);
+        if found.exists() {
+            config = found;
+            break;
+        }
+    }
+    if !config.exists() {
+        return;
+    }
+    let allowed: Vec<Vec<u8>> = first_of(&config, ["allowedFunctionNames", "allowed_function_names"])
+        .array()
+        .iter()
+        .map(|n| n.bytes().into_owned())
+        .collect();
+    // `names` holds every declared function; the set makes coverage one pass.
+    let allowed_set: std::collections::HashSet<&[u8]> = allowed.iter().map(Vec::as_slice).collect();
+    let mode = config.get("mode");
+    let mode = if mode.kind == Kind::String {
+        go_lower(trim_space(&mode.s))
+    } else {
+        Vec::new()
+    };
+    match mode.as_slice() {
+        b"none" if allowed.is_empty() => {
+            gj::set_str(out, "tool_choice", "none");
+        }
+        b"" | b"auto" | b"mode_unspecified" if allowed.is_empty() => {
+            gj::set_str(out, "tool_choice", "auto");
+        }
+        b"any" => {
+            // An undeclared name is refused first, even when the rest covers every function.
+            if allowed.iter().any(|a| !names.contains_key(a)) {
+                drops.drop_part("allowedFunctionNames entry naming no declared function");
+            } else if allowed.is_empty() || names.keys().all(|d| allowed_set.contains(d.as_slice())) {
+                gj::set_str(out, "tool_choice", "required");
+            } else if let [only] = allowed.as_slice() {
+                let mut choice = br#"{"type":"function","name":""}"#.to_vec();
+                gj::set_str(&mut choice, "name", mapped_name(names, only));
+                gj::set_raw(out, "tool_choice", choice);
+            } else {
+                let tools: Vec<Vec<u8>> = allowed
+                    .iter()
+                    .map(|name| {
+                        let mut tool = br#"{"type":"function","name":""}"#.to_vec();
+                        gj::set_str(&mut tool, "name", mapped_name(names, name));
+                        tool
+                    })
+                    .collect();
+                let mut choice = br#"{"type":"allowed_tools","mode":"required","tools":[]}"#.to_vec();
+                gj::set_raw(&mut choice, "tools", gj::join(&tools));
+                gj::set_raw(out, "tool_choice", choice);
+            }
+        }
+        other => {
+            let mode = String::from_utf8_lossy(other).into_owned();
+            drops.drop_part(&format!("functionCallingConfig mode {mode} with allowedFunctionNames"));
+        }
+    }
+}
+
 /// setCodexToolChoiceFromGeminiToolConfig.
 fn set_tool_choice(out: &mut Vec<u8>, config: &Res<'_>) {
     if !config.exists() {
@@ -251,8 +533,21 @@ fn effort_of(level: &Res<'_>) -> Vec<u8> {
 }
 
 /// ConvertGeminiRequestToCodex.
-fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions` or reasoning effort, and a refusal for any part or
+/// tool Codex cannot express. The registered pair, which other Responses providers
+/// share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert(ctx.model, body, true)
+}
+
+fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Error> {
+    let mut drops = crate::common::UserTurnDrops::default();
+    let mut out = if strict {
+        br#"{"model":"","input":[]}"#.to_vec()
+    } else {
+        br#"{"model":"","instructions":"","input":[]}"#.to_vec()
+    };
     let root = gj::parse(raw);
     let names = short_name_map(raw);
     let mut items: Vec<Vec<u8>> = vec![];
@@ -271,6 +566,15 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
 
     let system = first_of(&root, ["system_instruction.parts", "systemInstruction.parts"]);
     if system.is_array() {
+        if strict
+            && system
+                .array()
+                .iter()
+                .any(|p| is_gemini_thought_part(p) || !p.get("text").exists())
+        {
+            // Strict: a system part that is not text is refused, not dropped.
+            drops.drop_part("system instruction part that is not text");
+        }
         let parts: Vec<Vec<u8>> = system
             .array()
             .iter()
@@ -297,6 +601,12 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
             }
             for part in parts.array() {
                 if is_gemini_thought_part(&part) {
+                    // Strict: a thought with text is reasoning Codex cannot carry, and is
+                    // refused. A `thoughtSignature` alone is Gemini's state for its own
+                    // model, which no other model reads.
+                    if strict && !part.get("text").bytes().is_empty() {
+                        drops.drop_part("thought");
+                    }
                     continue;
                 }
                 let text = part.get("text");
@@ -356,7 +666,17 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
                     };
                     gj::set_str(&mut item, "call_id", &id);
                     items.push(item);
+                    continue;
                 }
+                // A part Codex cannot express (code execution, executable code, video
+                // metadata and the like) is refused, not dropped.
+                let kind = part
+                    .map()
+                    .into_iter()
+                    .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+                    .find(|key| key != "thought" && key != "thoughtSignature")
+                    .unwrap_or_default();
+                drops.drop_part(&kind);
             }
         }
     }
@@ -369,6 +689,14 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
         for tool in tools.array() {
             let declarations = tool.get("functionDeclarations");
             if !declarations.is_array() {
+                // A built-in Gemini tool (search, code execution) has no Codex equivalent.
+                let kind = tool
+                    .map()
+                    .into_iter()
+                    .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+                    .next()
+                    .unwrap_or_default();
+                drops.drop_part(&format!("tool {kind}"));
                 continue;
             }
             for declaration in declarations.array() {
@@ -384,7 +712,17 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
                 }
                 let parameters = first_of(&declaration, ["parameters", "parametersJsonSchema"]);
                 if parameters.exists() {
-                    gj::set_raw(&mut item, "parameters", clean_parameters(&parameters));
+                    // Strict: the client's schema; only Gemini's upper-case `type` names
+                    // become JSON Schema's (below). Go also drops `$schema` and adds
+                    // `additionalProperties: false`.
+                    // A Gemini `parameters` schema gets JSON Schema's type names at its
+                    // schema positions only; `parametersJsonSchema` is JSON Schema already.
+                    let parameters = match (strict, declaration.get("parameters").exists()) {
+                        (true, true) => gemini_schema_types(&parameters),
+                        (true, false) => parameters.raw.to_vec(),
+                        (false, _) => clean_parameters(&parameters),
+                    };
+                    gj::set_raw(&mut item, "parameters", parameters);
                 }
                 gj::set_bool(&mut item, "strict", false);
                 tool_items.push(item);
@@ -394,7 +732,11 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
     }
 
     gj::set_bool(&mut out, "parallel_tool_calls", true);
-    set_tool_choice(&mut out, &root.get("toolConfig.functionCallingConfig"));
+    if strict {
+        strict_tool_choice(&mut out, &root, &names, &mut drops);
+    } else {
+        set_tool_choice(&mut out, &root.get("toolConfig.functionCallingConfig"));
+    }
 
     // Google's Python SDK sends snake_case thinking fields.
     let mut effort: Option<Vec<u8>> = None;
@@ -416,16 +758,27 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
             }
         }
     }
-    gj::set_str(
-        &mut out,
-        "reasoning.effort",
-        effort.unwrap_or_else(|| b"medium".to_vec()),
-    );
+    // Strict: only the client's own thinking choice; without one the model's default
+    // applies. Go defaults to `medium`.
+    match effort {
+        Some(effort) => {
+            gj::set_str(&mut out, "reasoning.effort", effort);
+        }
+        None if !strict => {
+            gj::set_str(&mut out, "reasoning.effort", "medium");
+        }
+        None => {}
+    }
     gj::set_bool(&mut out, "stream", true);
     gj::set_bool(&mut out, "store", false);
     gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
 
-    let paths = cpa_common::gemini_schema::walk(&gj::get(&out, "tools"), b"type");
+    // Strict mode converted each `parameters` schema above, at its schema positions.
+    let paths = if strict {
+        Vec::new()
+    } else {
+        cpa_common::gemini_schema::walk(&gj::get(&out, "tools"), b"type")
+    };
     for path in paths {
         let full = [&b"tools."[..], &path].concat();
         let value = gj::get(&out, &full);
@@ -437,7 +790,10 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
             gj::set_str(&mut out, &full, &lower);
         }
     }
-    out
+    if strict {
+        drops.strict_result("Codex Responses")?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -750,4 +1106,64 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod schema_type_tests {
+    use super::gemini_schema_types;
+    use cpa_common::json as gj;
+
+    fn convert(schema: &str) -> String {
+        String::from_utf8(gemini_schema_types(&gj::parse(schema.as_bytes()))).unwrap()
+    }
+
+    /// Only `type` at schema positions changes; every other byte is the input's:
+    /// whitespace, number spellings, literal objects with a `type` key, extensions,
+    /// escaped property names (a dot, a quote, an escaped `type`) and an escaped keyword.
+    #[test]
+    fn only_schema_type_names_change() {
+        let input = concat!(
+            r#"{ "type" : "OBJECT", "x-ext": {"type": "OBJECT", "n": 1.50},"#,
+            r#" "properties": {"a.b": {"type": "STRING", "enum": [{"type": "VIP"}]},"#,
+            r#" "q\"uote": {"type": "INTEGER", "maximum": 1e3},"#,
+            r#" "\u0074ype": {"\u0074ype": "NUMBER", "default": {"type": "VIP"}},"#,
+            r#" "list": {"type": "ARRAY", "items": {"type": "BOOLEAN"}},"#,
+            r#" "either": {"anyOf": [{"type": "STRING"}, {"type": "NULL", "example": "STRING"}]}}}"#,
+        );
+        let want = concat!(
+            r#"{ "type" : "object", "x-ext": {"type": "OBJECT", "n": 1.50},"#,
+            r#" "properties": {"a.b": {"type": "string", "enum": [{"type": "VIP"}]},"#,
+            r#" "q\"uote": {"type": "integer", "maximum": 1e3},"#,
+            r#" "\u0074ype": {"\u0074ype": "number", "default": {"type": "VIP"}},"#,
+            r#" "list": {"type": "array", "items": {"type": "boolean"}},"#,
+            r#" "either": {"anyOf": [{"type": "string"}, {"type": "null", "example": "STRING"}]}}}"#,
+        );
+        assert_eq!(convert(input), want);
+    }
+
+    /// A wide coding-agent schema (20,000 properties, each with literal data that holds a
+    /// `type` key) converts in one pass, byte for byte.
+    #[test]
+    fn a_wide_schema_converts_byte_for_byte() {
+        let n = 20_000;
+        let property =
+            |i: usize, kind: &str| format!(r#""p{i}":{{"type":"{kind}","enum":["VIP"],"x-meta":{{"type":"OBJECT"}}}}"#);
+        let input: Vec<String> = (0..n).map(|i| property(i, "STRING")).collect();
+        let want: Vec<String> = (0..n).map(|i| property(i, "string")).collect();
+        let input = format!(r#"{{"type":"OBJECT","properties":{{{}}}}}"#, input.join(","));
+        let want = format!(r#"{{"type":"object","properties":{{{}}}}}"#, want.join(","));
+        assert_eq!(convert(&input), want);
+    }
+
+    /// Input that is not well-formed JSON comes back unchanged.
+    #[test]
+    fn malformed_input_is_unchanged() {
+        for input in [
+            r#"{"type":"OBJECT""#,
+            r#"{"type":"OBJECT"} trailing"#,
+            r#"{"type" "OBJECT"}"#,
+        ] {
+            assert_eq!(convert(input), input);
+        }
+    }
 }

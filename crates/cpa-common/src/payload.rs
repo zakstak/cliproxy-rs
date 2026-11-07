@@ -633,6 +633,26 @@ fn raw_value(value: &Param) -> Option<Vec<u8>> {
     }
 }
 
+/// What `multimedia.disable-image-generation` removes from a body on `request_path`:
+/// the `image_generation` entries of top-level `tools`, or a top-level `tool_choice`
+/// that names the tool, read as Go's strip reads them. Executors that never edit a body
+/// (Codex) refuse such a request instead of stripping it.
+pub fn disabled_image_tool(mode: ImageGeneration, request_path: &str, payload: &[u8]) -> Option<&'static str> {
+    if !strip_image_generation(mode, request_path) {
+        return None;
+    }
+    let tools = json::get(payload, "tools");
+    if tools.is_array()
+        && tools
+            .array()
+            .iter()
+            .any(|t| *t.get("type").str() == *"image_generation")
+    {
+        return Some("tools");
+    }
+    names_tool(&json::get(payload, "tool_choice"), "image_generation").then_some("tool_choice")
+}
+
 fn strip_image_generation(mode: ImageGeneration, request_path: &str) -> bool {
     match mode {
         ImageGeneration::All => true,
@@ -1331,9 +1351,9 @@ fn remove_tool_type(payload: &[u8], tools_path: &str, tool_type: &str) -> Vec<u8
     json::try_set_raw(payload, tools_path, joined).unwrap_or_else(|_| payload.to_vec())
 }
 
-fn remove_tool_choice(payload: &[u8], path: &str, tool_type: &str) -> Vec<u8> {
-    let choice = json::get(payload, path);
-    let delete = match choice.kind {
+/// Whether a `tool_choice` value names `tool_type` (Go's strip condition).
+fn names_tool(choice: &Res<'_>, tool_type: &str) -> bool {
+    match choice.kind {
         Kind::String => choice.str().trim().go_eq_fold(tool_type),
         Kind::Json => {
             let kind = choice.get("type").str().trim().to_owned();
@@ -1341,8 +1361,12 @@ fn remove_tool_choice(payload: &[u8], path: &str, tool_type: &str) -> Vec<u8> {
                 || (kind.go_eq_fold("tool") && choice.get("name").str().trim().go_eq_fold(tool_type))
         }
         _ => false,
-    };
-    if delete {
+    }
+}
+
+fn remove_tool_choice(payload: &[u8], path: &str, tool_type: &str) -> Vec<u8> {
+    let choice = json::get(payload, path);
+    if names_tool(&choice, tool_type) {
         json::try_delete(payload, path).unwrap_or_else(|_| payload.to_vec())
     } else {
         payload.to_vec()

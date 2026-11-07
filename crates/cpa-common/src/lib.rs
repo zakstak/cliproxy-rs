@@ -30,6 +30,7 @@
 //! lives in cpa-exec instead.
 
 pub mod cache;
+pub mod codex_body;
 pub mod codex_catalog;
 pub mod codex_client;
 pub mod gemini_schema;

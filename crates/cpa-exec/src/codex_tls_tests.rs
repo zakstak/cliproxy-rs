@@ -1,11 +1,9 @@
-//! The chatgpt.com ClientHello against Go's: `tests/fixtures/codex_chrome_hello.json`
-//! was captured from Go's own `newUtlsRoundTripper` (uTLS v1.8.2 `HelloChrome_Auto`) by
-//! `tests/reference/codex/zz_rsfix_chrome_hello_test.go`. Both sides randomize GREASE,
-//! extension order and the ECH GREASE payload, so the comparison uses the same
-//! normalization as the generator.
+//! The chatgpt.com transport (#26): this proxy's own TLS client, no browser fingerprint.
+//! The ClientHello is captured from the production client on a local listener. Go's
+//! uTLS `HelloChrome_Auto` recording (`codex_chrome_hello.json`) is retired with the
+//! profile; docs/codex/IDENTITY.md compares both with the first-party client.
 
 use super::*;
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::io::AsyncReadExt;
 
@@ -92,7 +90,7 @@ fn parse(record: &[u8]) -> Hello {
     }
 }
 
-/// The production Chrome client's first record, sent to a local listener that closes.
+/// The production chatgpt.com client's first record, sent to a local listener that closes.
 async fn capture() -> Vec<u8> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -116,55 +114,65 @@ async fn capture() -> Vec<u8> {
     capture.await.unwrap()
 }
 
+/// No Chrome (or other browser) fingerprint: no GREASE, no ALPS, no certificate
+/// compression, no ECH GREASE and one stable extension order, which uTLS
+/// `HelloChrome_Auto` all had. ALPN still offers HTTP/2 and HTTP/1.1, and TLS 1.3 and
+/// 1.2 stay available, as in the first-party reqwest/rustls client.
 #[tokio::test]
-async fn chatgpt_clienthello_matches_go_chrome_profile() {
-    let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chrome_hello.json")).unwrap();
-    let go = &fixture["hellos"][0];
-    let strings = |v: &Value| -> Vec<String> {
-        v.as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s.as_str().unwrap().to_owned())
-            .collect()
-    };
-    let go_contents: BTreeMap<String, String> = go["contents"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-        .collect();
-    let go_payloads: BTreeSet<u64> = fixture["hellos"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["ech_payload_len"].as_u64().unwrap())
-        .collect();
+async fn chatgpt_clienthello_has_no_browser_fingerprint() {
     let mut orders = BTreeSet::new();
-    for _ in 0..12 {
-        let hello = parse(&capture().await);
-        assert_eq!(hello.ciphers, strings(&go["ciphers"]), "cipher suites");
-        let mut sorted = hello.extensions.clone();
-        sorted.sort();
-        assert_eq!(sorted, strings(&go["extensions"]), "extension set");
-        assert_eq!(hello.contents, go_contents, "extension contents");
-        assert_eq!(hello.key_shares, strings(&go["key_shares"]), "key shares");
+    for _ in 0..6 {
+        let record = capture().await;
+        let hello = parse(&record);
         assert!(
-            [144, 176, 208, 240].contains(&hello.ech_payload),
-            "ECH GREASE payload {} (Go saw {go_payloads:?})",
-            hello.ech_payload
+            !hello.ciphers.iter().any(|c| c == "GREASE"),
+            "GREASE cipher: {:?}",
+            hello.ciphers
+        );
+        assert!(
+            !hello.extensions.iter().any(|e| e == "GREASE"),
+            "GREASE extension: {:?}",
+            hello.extensions
+        );
+        for (code, what) in [
+            ("4469", "ALPS"),
+            ("44cd", "ALPS (new codepoint)"),
+            ("001b", "certificate compression"),
+            ("fe0d", "ECH GREASE"),
+        ] {
+            assert!(
+                !hello.extensions.iter().any(|e| e == code),
+                "{what} offered: {:?}",
+                hello.extensions
+            );
+        }
+        // application_layer_protocol_negotiation: h2, then http/1.1.
+        assert_eq!(
+            hello.contents.get("0010").map(String::as_str),
+            Some("000c02683208687474702f312e31"),
+            "ALPN"
+        );
+        let versions = hello.contents.get("002b").expect("supported_versions");
+        assert!(versions.contains("0304") && versions.contains("0303"), "{versions}");
+        assert_eq!(hello.ech_payload, 0, "no ECH payload");
+        // The evidence docs/codex/IDENTITY.md records (`--nocapture`).
+        eprintln!(
+            "ciphers {:?}\nextensions {:?}\nkey shares {:?}",
+            hello.ciphers, hello.extensions, hello.key_shares
         );
         orders.insert(hello.extensions);
     }
-    assert!(
-        orders.len() > 1,
-        "extensions are permuted per connection, as Chrome does"
+    assert_eq!(
+        orders.len(),
+        1,
+        "one extension order, not a permuted browser one: {orders:?}"
     );
 }
 
 /// `TestFallbackRoundTripperRoutesProtectedHosts`, Codex rows.
 #[test]
-fn only_https_chatgpt_uses_the_chrome_profile() {
-    for (url, chrome) in [
+fn only_https_chatgpt_uses_the_chatgpt_client() {
+    for (url, chatgpt) in [
         ("https://chatgpt.com/backend-api/codex/responses", true),
         ("https://ChatGPT.com:8443/backend-api/codex/responses", true),
         ("https://caller@chatgpt.com/backend-api/codex", true),
@@ -173,7 +181,7 @@ fn only_https_chatgpt_uses_the_chrome_profile() {
         ("https://api.openai.com/v1/responses", false),
         ("http://127.0.0.1:8080/responses", false),
     ] {
-        assert_eq!(is_chatgpt(url), chrome, "{url}");
+        assert_eq!(is_chatgpt(url), chatgpt, "{url}");
     }
 }
 
@@ -408,7 +416,7 @@ async fn chatgpt_keep_alive_switch_applies_per_request() {
     let (transport, url) = (up.transport(), up.url());
     let ((a, a_tunnels), (b, b_tunnels)) = (counting_proxy(up.addr).await, counting_proxy(up.addr).await);
     let pooled = || {
-        let cache = transport.chrome.lock().unwrap();
+        let cache = transport.chatgpt.lock().unwrap();
         cache.iter().filter(|((_, keep_alive, _), _)| *keep_alive).count()
     };
     for proxy in [&a, &b, &a, &b] {
@@ -432,8 +440,8 @@ async fn chatgpt_keep_alive_switch_applies_per_request() {
     );
 }
 
-/// Go dials a dedicated uTLS connection for every chatgpt.com request. With
-/// `chatgpt-keep-alive` on, the Chrome client keeps its connections instead
+/// Go dials a dedicated connection for every chatgpt.com request. With
+/// `chatgpt-keep-alive` on, the chatgpt.com client keeps its connections instead
 /// (docs/DIFFERENCES-FROM-GO.md): sequential requests share one connection over HTTP/2
 /// and HTTP/1.1.
 #[tokio::test]
@@ -462,7 +470,7 @@ async fn chatgpt_client_multiplexes_concurrent_http2_requests() {
     assert_eq!(up.pairs(), 1, "both requests in flight on it together");
 }
 
-/// At most two connections ([`CHROME_IDLE_PER_HOST`]) stay idle: after four concurrent HTTP/1.1
+/// At most two connections ([`CHATGPT_IDLE_PER_HOST`]) stay idle: after four concurrent HTTP/1.1
 /// requests (four connections) the client closes the two extra ones, and the next burst
 /// reuses the two it kept.
 #[tokio::test]

@@ -308,6 +308,9 @@ impl CodexOAuth {
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
         headers.set("Accept", "application/json");
+        // Every token grant is the proxy's own request: it names cliproxy-rs, where Go
+        // sent net/http's `Go-http-client` default (#26, `crate::codex_identity`).
+        headers.set("User-Agent", crate::codex_identity::USER_AGENT);
         let upstream = crate::proxy::send(&self.client, url, headers, body, None)
             .await
             .map_err(|_| failed())?;

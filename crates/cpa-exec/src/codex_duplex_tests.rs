@@ -294,12 +294,17 @@ async fn steering_lifecycle() {
                     seen.insert("pending");
                     client.send(r#"{"type":"response.create","previous_response_id":"r2","instructions":"New settings","input":[{"type":"function_call_output","call_id":"c1","output":"ok"}]}"#).await;
                 }
+                ("response.output_item.done", _) => {
+                    assert_eq!(get(&chunk, "item.content.0.text"), "STEER_OK", "successor output");
+                    seen.insert("item");
+                }
                 ("response.completed", "r3") => {
+                    // As the upstream sent it: the proxy repairs no output (#24, #28).
                     assert_eq!(
-                        get(&chunk, "response.output.0.content.0.text"),
-                        "STEER_OK",
-                        "successor output missing or contaminated by preceding response"
+                        chunk,
+                        r#"{"type":"response.completed","response":{"id":"r3","output":[]}}"#
                     );
+                    assert!(seen.contains("item"), "successor output arrives before its completion");
                     seen.insert("successor");
                     client
                         .send(r#"{"type":"response.steer","previous_response_id":"missing","input":"recover me"}"#)
@@ -321,28 +326,21 @@ async fn steering_lifecycle() {
     }
 }
 
-/// `TestCodexDuplexAppendInheritsContextAndInstructions`.
+/// Go's `TestCodexDuplexAppendInheritsContextAndInstructions` built a create from a
+/// `response.append` (the parent, model and instructions filled in). No first-party or
+/// documented source defines the frame, so a steering connection refuses it with a local
+/// error event and stays open; nothing reaches the upstream (#28).
 #[tokio::test]
-async fn append_inherits_context_and_instructions() {
+async fn append_is_refused_on_the_open_connection() {
     let up = Scripted::start(|mut c: Peer| async move {
-        let first = c.read().await;
-        if get(&first, "instructions") != "Initial system instructions" {
-            c.error(format!("first instructions: {first}"));
-        }
+        c.read().await;
         c.write(r#"{"type":"response.created","response":{"id":"resp-1","output":[]}}"#)
             .await;
         c.write(r#"{"type":"response.completed","response":{"id":"resp-1","output":[]}}"#)
             .await;
-        let second = c.read().await;
-        for (path, want) in [
-            ("type", "response.create"),
-            ("previous_response_id", "resp-1"),
-            ("model", "gpt-6-astra"),
-            ("instructions", "Initial system instructions"),
-        ] {
-            if get(&second, path) != want {
-                c.error(format!("second {path} = {:?}, want {want}", get(&second, path)));
-            }
+        let next = c.read().await;
+        if get(&next, "type") != "response.create" || get(&next, "previous_response_id") != "resp-1" {
+            c.error(format!("only the client's create follows the refused append: {next}"));
         }
         c.write(r#"{"type":"response.created","response":{"id":"resp-2","output":[]}}"#)
             .await;
@@ -359,19 +357,32 @@ async fn append_inherits_context_and_instructions() {
             Format::Codex,
         )
         .await;
+    let mut refused = false;
     while let Some(chunk) = next(&mut stream).await {
         let chunk = chunk.unwrap();
         let (event, id) = (get(&chunk, "type"), get(&chunk, "response.id"));
         if event == "response.completed" && id == "resp-1" {
-            // previous_response_id, model and instructions all omitted.
             client
                 .send(r#"{"type":"response.append","input":[{"role":"user","content":"turn 2"}]}"#)
+                .await;
+        }
+        if event == "error" {
+            assert_eq!(get(&chunk, "status"), "400", "{chunk}");
+            assert_eq!(
+                get(&chunk, "error.message"),
+                crate::codex::native::APPEND_REFUSED,
+                "{chunk}"
+            );
+            refused = true;
+            client
+                .send(r#"{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp-1","input":[{"role":"user","content":"turn 2"}]}"#)
                 .await;
         }
         if event == "response.completed" && id == "resp-2" {
             break;
         }
     }
+    assert!(refused, "the append was refused");
     drop(stream);
     up.finish().await;
 }
@@ -761,110 +772,6 @@ async fn rejected_create_metadata() {
     }
 }
 
-/// Go's `validCodexReasoningEncryptedContentForTestSeed`.
-fn encrypted_seed(seed: u8) -> String {
-    use base64::Engine as _;
-    let mut payload = vec![0u8; 1 + 8 + 16 + 16 + 32];
-    payload[0] = 0x80;
-    for (i, byte) in payload.iter_mut().enumerate().skip(9) {
-        *byte = seed.wrapping_add(i as u8);
-    }
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-}
-
-/// `TestCodexDuplexLaterInvalidSignatureClearsReplay`: a later invalid-signature
-/// rejection clears the rejected request's replay scope only, before the client resends.
-#[tokio::test]
-async fn later_invalid_signature_clears_replay() {
-    for kind in ["response.failed", "error", "error_without_status"] {
-        for started in [false, true] {
-            let encrypted = encrypted_seed(51);
-            let seen = encrypted.clone();
-            let up = Scripted::start(move |mut c: Peer| {
-                let encrypted = seen.clone();
-                async move {
-                    c.read().await;
-                    c.write(r#"{"type":"response.created","response":{"id":"first","output":[]}}"#).await;
-                    c.write(r#"{"type":"response.completed","response":{"id":"first","output":[]}}"#).await;
-                    c.read().await;
-                    if started {
-                        c.write(r#"{"type":"response.created","response":{"id":"rejected","output":[]}}"#).await;
-                    }
-                    c.write(match kind {
-                        "response.failed" => r#"{"type":"response.failed","response":{"id":"rejected","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}}"#,
-                        "error" => r#"{"type":"error","status":400,"body":{"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}}"#,
-                        _ => r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}"#,
-                    })
-                    .await;
-                    let corrected = c.read().await;
-                    if corrected.contains(&encrypted) {
-                        c.error("corrected create resent rejected encrypted reasoning".into());
-                    }
-                    c.write(r#"{"type":"response.created","response":{"id":"corrected","output":[]}}"#).await;
-                    c.write(r#"{"type":"response.completed","response":{"id":"corrected","output":[]}}"#).await;
-                    c.idle().await;
-                }
-            })
-            .await;
-            let client = Client::new(&format!("replay-{kind}-{started}"));
-            let request = |session: &str| {
-                serde_json::json!({
-                    "type": "response.create",
-                    "model": MODEL,
-                    "metadata": {"user_id": serde_json::json!({"session_id": session}).to_string()},
-                    "messages": [{"role": "user", "content": "continue"}],
-                })
-                .to_string()
-            };
-            let (first, rejected) = (request("first"), request("rejected"));
-            let cache = client.executor.replay.clone();
-            let item = format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":"{encrypted}"}}"#);
-            for session in ["first", "rejected", "unrelated"] {
-                let scope = format!("claude:{session}:agent:main");
-                assert!(
-                    cache.append(MODEL, &scope, &[item.clone().into_bytes()]),
-                    "cache seed failed"
-                );
-            }
-            let mut stream = client.start(&up.url, &first, Format::Claude).await;
-            let (mut failed, mut completed) = (false, false);
-            while let Some(chunk) = next(&mut stream).await {
-                let chunk = chunk.unwrap_or_else(|e| panic!("{kind}/{started}: {e}"));
-                let (event, id) = (get(&chunk, "type"), get(&chunk, "response.id"));
-                if event == "response.completed" && id == "first" {
-                    client.send(&rejected).await;
-                }
-                if event == "response.failed" || event == "error" {
-                    failed = true;
-                    assert!(
-                        cache.get(MODEL, "claude:rejected:agent:main").is_none(),
-                        "{kind}/{started}: rejected scope retained invalid reasoning"
-                    );
-                    for session in ["first", "unrelated"] {
-                        assert!(
-                            cache.get(MODEL, &format!("claude:{session}:agent:main")).is_some(),
-                            "{kind}/{started}: cleared unrelated scope {session}"
-                        );
-                    }
-                    client.send(&rejected).await;
-                }
-                if event == "response.completed" && id == "corrected" {
-                    completed = true;
-                    break;
-                }
-            }
-            drop(stream);
-            assert!(
-                failed && completed,
-                "{kind}/{started}: failed={failed} corrected={completed}"
-            );
-            up.finish().await;
-        }
-    }
-}
-
-// ----------------------------------------------------- codex_websockets_duplex_initial_failure_test.go
-
 /// The four upstream rejections of `TestCodexDuplexInitialFailure`: (name, payload,
 /// status, quota, headers).
 const INITIAL_FAILURES: [(&str, &str, u16, bool, bool); 4] = [
@@ -1088,46 +995,6 @@ async fn capture_records_duplex_frames() {
     let responses: Vec<&Tap> = taps.iter().filter(|t| matches!(t, Tap::WsResponse(_))).collect();
     assert_eq!(responses.len(), 3, "created, accepted and completed: {taps:#?}");
     assert_eq!(*responses[1], Tap::WsResponse(ACCEPTED.into()));
-}
-
-/// Go mutates the socket's multi-agent v2 state in its serial writer, right before the
-/// create's write (`codex_websockets_duplex.go:210`). A create still queued behind a
-/// blocked write must not change how the running response's events are restored.
-#[tokio::test]
-async fn queued_create_keeps_the_namespace_state_until_written() {
-    let up = Scripted::start(|mut c: Peer| async move {
-        c.read().await;
-        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
-            .await;
-        // Stops reading: the large create below fills the socket buffers.
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    })
-    .await;
-    let client = Client::new("namespace-state");
-    let mut stream = client
-        .start(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex)
-        .await;
-    let created = next(&mut stream).await.unwrap().unwrap();
-    assert_eq!(get(&created, "type"), "response.created");
-    let conn = client.executor.ws.session("namespace-state").current().unwrap();
-    // An earlier request on this socket renamed the collaboration namespace.
-    conn.multi_agent.store(true, Ordering::SeqCst);
-    let large = format!(
-        r#"{{"type":"response.create","input":[{{"role":"user","content":"{}"}}]}}"#,
-        // Twice what loopback socket buffers can hold (4 MiB send plus 6 MiB receive).
-        "x".repeat(20 << 20)
-    );
-    client.send(&large).await;
-    // Uses the upstream names itself (`multiAgentV2Conflict`), but waits behind `large`.
-    client
-        .send(r#"{"type":"response.create","tools":[{"type":"namespace","name":"collaboration-optimize","tools":[]}],"input":[]}"#)
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        conn.multi_agent.load(Ordering::SeqCst),
-        "a create that was not written yet changed the socket's namespace state"
-    );
-    drop(stream);
 }
 
 /// Go's reader waits inside `EmitWebSocketResponseEvent` while its writer goroutine keeps
@@ -1403,26 +1270,24 @@ async fn a_progress_failure_stops_client_input_during_an_observation() {
     up.finish().await;
 }
 
-/// Sign in with ChatGPT on a steering socket (7b0319fb): creates get the SIWC WebSocket
-/// body rules, and a steer only loses its `configuration_update` items.
+/// Sign in with ChatGPT on a steering socket: Go gave creates its SIWC WebSocket body
+/// rules and stripped `configuration_update` items from steers. The `siwc` profile is
+/// native now (#28), so the create and the steer go upstream as the client wrote them,
+/// with only the create's `model` routed.
 #[tokio::test]
-async fn siwc_creates_and_steers_drop_configuration_updates() {
+async fn siwc_creates_and_steers_pass_unchanged() {
+    const CREATE: &str = r#"{"type":"response.create","model":"gpt-6-astra","temperature":0.5,"input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"type":"message","role":"user","content":"hi"}]}"#;
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"message","role":"user","content":"steer"}]}"#;
     let up = Scripted::start(|mut c: Peer| async move {
         let first = c.read().await;
-        if gjson::get(&first, "temperature").exists()
-            || first.contains("configuration_update")
-            || get(&first, "store") != "false"
-            || get(&first, "reasoning.effort") != "low"
-        {
-            c.error(format!("first create kept SIWC-unsupported fields: {first}"));
+        if first != CREATE {
+            c.error(format!("first create changed: {first}"));
         }
         c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
             .await;
         let steer = c.read().await;
-        if steer
-            != r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"message","role":"user","content":"steer"}]}"#
-        {
-            c.error(format!("steer: {steer}"));
+        if steer != STEER {
+            c.error(format!("steer changed: {steer}"));
         }
         c.write(r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}"#)
             .await;
@@ -1437,9 +1302,7 @@ async fn siwc_creates_and_steers_drop_configuration_updates() {
     credential
         .metadata
         .insert("siwc".into(), serde_json::json!({"access_token": "siwc-at"}));
-    let mut req = request(
-        r#"{"model":"gpt-6-astra","temperature":0.5,"input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"type":"message","role":"user","content":"hi"}]}"#,
-    );
+    let mut req = request(CREATE);
     (req.model, req.requested_model, req.execution_session) =
         (MODEL.into(), MODEL.into(), Some(client.session.clone()));
     let session = ExecSession {
@@ -1458,11 +1321,7 @@ async fn siwc_creates_and_steers_drop_configuration_updates() {
     while let Some(chunk) = next(&mut stream).await {
         let chunk = chunk.unwrap();
         match get(&chunk, "type").as_str() {
-            "response.created" => {
-                client
-                    .send(r#"{"type":"response.steer","previous_response_id":"r1","temperature":1,"input":[{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"message","role":"user","content":"steer"}]}"#)
-                    .await
-            }
+            "response.created" => client.send(STEER).await,
             "response.completed" => break,
             _ => {}
         }
@@ -1471,22 +1330,19 @@ async fn siwc_creates_and_steers_drop_configuration_updates() {
     up.finish().await;
 }
 
-/// `TestCodexDuplexSteerPayloadBarrier` (868e137): a steer frame passes the payload
-/// rules (here gated on its own `type`) and keeps `type` `response.steer`.
+/// Go's `TestCodexDuplexSteerPayloadBarrier` (868e137) ran the payload rules on a steer.
+/// No Codex route applies payload rules (#28): with an override or a filter configured,
+/// the steer goes upstream as the client wrote it.
 #[tokio::test]
-async fn steer_frames_pass_the_payload_rules() {
+async fn steer_frames_ignore_the_payload_rules() {
     for filter in [false, true] {
         let up = Scripted::start(move |mut c: Peer| async move {
             c.read().await;
             c.write(r#"{"type":"response.created","response":{"id":"parent","output":[]}}"#)
                 .await;
             let got = c.read().await;
-            if get(&got, "type") != "response.steer" || get(&got, "previous_response_id") != "parent" {
-                c.error(format!("steer framing changed: {got}"));
-            }
-            let input = gjson::get(&got, "input");
-            if filter && input.exists() || !filter && input.str() != "configured" {
-                c.error(format!("steer payload bypassed config: {got}"));
+            if got != r#"{"type":"response.steer","previous_response_id":"parent","input":"original"}"# {
+                c.error(format!("filter={filter}: steer changed: {got}"));
             }
             c.idle().await;
         })

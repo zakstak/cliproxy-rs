@@ -644,6 +644,7 @@ where
         execution_session: None,
         request_path: r.path.clone(),
         peer: r.peer,
+        native: None,
         turn: None,
         media: Some(Arc::new(Media {
             kind: MediaKind::Videos,

@@ -76,6 +76,8 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
             headers: Box::new(headers),
             body,
             direct: false,
+            delivered_status: None,
+            delivered_event: None,
             addon: None,
             diagnostic: None,
         });

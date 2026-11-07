@@ -12,7 +12,7 @@ use super::{
     Config, Error, LEVEL_AUTO, LEVEL_HIGH, LEVEL_MAX, LEVEL_NONE, LEVEL_XHIGH, Mode, ModelCaps, SuffixResult,
     convert_budget_to_level, convert_level_to_budget, extract_configuration_update_config, is_responses_format,
     is_user_defined_model, lookup_model_info, parse_level_suffix, parse_numeric_suffix, parse_special_suffix,
-    parse_suffix, strip_configuration_updates, strip_responses_effort, strip_thinking_config, with_str,
+    parse_suffix, strip_configuration_updates, strip_responses_effort, strip_thinking_config,
 };
 use crate::gostr::GoStr;
 use crate::json;
@@ -531,31 +531,6 @@ pub fn extract_reasoning_effort(body: &[u8], provider: &str, model: &str) -> Str
         config = extract_codex_usage_config(body);
     }
     effort_from_config(&config)
-}
-
-/// `HasThinkingSuffix`: the model carries a suffix that parses to a thinking config.
-pub fn has_thinking_suffix(model: &str) -> bool {
-    let suffix = parse_suffix(model);
-    suffix.has_suffix && parse_suffix_to_config(&suffix.raw_suffix).is_set()
-}
-
-/// `StripConfigurationUpdates`: drops `configuration_update` input items, reasoning untouched.
-pub fn strip_configuration_update_items(body: &[u8]) -> Vec<u8> {
-    strip_configuration_updates(body)
-}
-
-/// `CollapseConfigurationUpdates`: drops `configuration_update` input items and, unless
-/// `keep_top_level_effort`, sets the last item's effort as the top-level `reasoning.effort`.
-pub fn collapse_configuration_updates(body: &[u8], keep_top_level_effort: bool) -> Vec<u8> {
-    let updated = strip_configuration_updates(body);
-    if keep_top_level_effort {
-        return updated;
-    }
-    let effort = effort_from_config(&extract_configuration_update_config(body));
-    if effort.is_empty() {
-        return updated;
-    }
-    with_str(&updated, "reasoning.effort", &effort)
 }
 
 /// `ExtractTranslatedReasoningEffort`: the final provider payload's effort.

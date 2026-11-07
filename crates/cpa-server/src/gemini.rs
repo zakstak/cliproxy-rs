@@ -61,6 +61,7 @@ pub async fn action(
         execution_session: None,
         request_path: dispatch::route_path(matched.as_ref(), &uri),
         peer: dispatch::peer(peer),
+        native: None,
         turn: None,
         media: None,
     };
@@ -175,6 +176,7 @@ pub async fn interactions(
         execution_session: None,
         request_path: dispatch::route_path(matched.as_ref(), &uri),
         peer: dispatch::peer(peer),
+        native: None,
         turn: None,
         media: None,
     };

@@ -254,6 +254,8 @@ fn terminated(resp: &RequestInterceptResponse) -> Failure {
         headers: Box::new(header_map(&resp.response_headers)),
         retry_after: None,
         direct: true,
+        delivered_status: None,
+        delivered_event: None,
         addon: None,
         diagnostic: None,
     })
@@ -305,6 +307,17 @@ pub(crate) struct BeforeAuth {
     pub headers: Header,
     pub body: Option<Bytes>,
     pub path: Option<String>,
+    /// A termination held back for the attempts that are not native (#23).
+    pub termination: Option<ExecError>,
+}
+
+/// Before-auth output held back from the call because a native Codex attempt is
+/// possible (#23): applied to each attempt that is not native, never to a native one.
+pub(crate) struct Deferred {
+    headers: Option<HeaderMap>,
+    body: Option<Bytes>,
+    path: Option<String>,
+    termination: Option<ExecError>,
 }
 
 /// Go `applyRequestInterceptorsBeforeAuth`.
@@ -319,12 +332,14 @@ pub(crate) async fn before_auth(
     headers: Header,
     body: &Bytes,
     metadata: &Metadata,
+    defer: bool,
 ) -> Result<BeforeAuth, Failure> {
     if !host.has_request_interceptors() {
         return Ok(BeforeAuth {
             headers,
             body: None,
             path: None,
+            termination: None,
         });
     }
     let req = RequestInterceptRequest {
@@ -342,13 +357,18 @@ pub(crate) async fn before_auth(
     let resp = host
         .intercept_request_before_auth(req, &lifecycle.skip_plugin, &lifecycle.scope)
         .await;
-    let out = BeforeAuth {
+    let mut out = BeforeAuth {
         headers: final_headers(&headers, &resp.headers),
         body: Some(resp.body.clone()).filter(|b| !b.is_empty()),
         path: Some(resp.path.trim().to_owned()).filter(|p| !p.is_empty()),
+        termination: None,
     };
     if resp.terminate {
         let failure = terminated(&resp);
+        if defer && let Failure::Exec(error) = failure {
+            out.termination = Some(error);
+            return Ok(out);
+        }
         lifecycle.fail(&failure, Some(""));
         return Err(failure);
     }
@@ -368,6 +388,8 @@ pub(crate) struct AfterAuth {
 pub(crate) struct Hooks {
     host: cpa_plugin::Host,
     pub(crate) lifecycle: Arc<Lifecycle>,
+    /// Before-auth output held back for the attempts that are not native (#23).
+    deferred: Option<Deferred>,
     source_format: String,
     response_format: String,
     model: String,
@@ -399,6 +421,9 @@ pub(crate) struct Request<'a> {
     pub body: &'a Bytes,
     pub metadata: Metadata,
     pub caller: Option<&'a Caller>,
+    /// Hold the before-auth output and termination back from the call for the attempts
+    /// that are not native (a native Codex attempt is possible, #23).
+    pub defer: bool,
 }
 
 impl Hooks {
@@ -419,6 +444,7 @@ impl Hooks {
             req.stream,
             req.metadata.clone(),
         );
+        let original = req.headers.clone();
         let before = before_auth(
             &host,
             &lifecycle,
@@ -429,15 +455,23 @@ impl Hooks {
             req.headers,
             req.body,
             &req.metadata,
+            req.defer,
         )
         .await?;
         let mut metadata = req.metadata;
         if let Some(path) = &before.path {
             metadata.insert("request_path".into(), Value::String(path.clone()));
         }
+        let deferred = req.defer.then(|| Deferred {
+            headers: (before.headers != original).then(|| header_map(&before.headers)),
+            body: before.body.clone(),
+            path: before.path.clone(),
+            termination: before.termination.clone(),
+        });
         let hooks = Arc::new(Self {
             host,
             lifecycle,
+            deferred,
             source_format: req.source_format.to_owned(),
             response_format: req.response_format.to_owned(),
             model: req.model.to_owned(),
@@ -451,6 +485,31 @@ impl Hooks {
             terminated: Mutex::new(None),
         });
         Ok((hooks, before))
+    }
+
+    /// The held-back before-auth output for an attempt that is not native (#23): its
+    /// headers, body and path, or its termination, which ends the request as Go's
+    /// before-auth termination would. A no-op when nothing was held back.
+    pub(crate) fn apply_deferred(&self, req: &mut ExecRequest) -> Result<(), ExecError> {
+        let Some(deferred) = &self.deferred else {
+            return Ok(());
+        };
+        if let Some(error) = &deferred.termination {
+            *self.terminated.lock().unwrap_or_else(|e| e.into_inner()) = Some("");
+            self.lifecycle.fail(&Failure::Exec(error.clone()), Some(""));
+            return Err(error.clone());
+        }
+        if let Some(headers) = &deferred.headers {
+            req.headers = headers.clone();
+        }
+        if let Some(body) = &deferred.body {
+            req.body = body.clone();
+            req.original_body = body.clone();
+        }
+        if let Some(path) = &deferred.path {
+            req.request_path = path.clone();
+        }
+        Ok(())
     }
 
     /// Go `applyRequestAfterAuthInterceptor` for one attempt on `credential`: rewrites
@@ -641,6 +700,36 @@ impl Hooks {
             }
             // Primed by [`Hooks::prime`]: the stream completes the lifecycle itself.
             Ok(done) => Ok(done),
+        }
+    }
+
+    /// Ends a request a Codex credential answered on the native HTTP route (#23): no
+    /// response or chunk interceptor runs on it, and only the lifecycle completes.
+    // ponytail: a native stream's lifecycle completes as succeeded when the stream ends,
+    // even after a mid-stream failure; the failure still reaches the client and the
+    // credential's outcome. Report it here too if a plugin needs it.
+    pub(crate) fn finish_native(self: Arc<Self>, result: Result<Done, Failure>) -> Result<Done, Failure> {
+        match result {
+            Err(failure) => {
+                let terminated = *self.terminated.lock().unwrap_or_else(|e| e.into_inner());
+                self.lifecycle.fail(&failure, terminated);
+                Err(failure)
+            }
+            Ok(Done::Buffered { headers, body }) => {
+                self.lifecycle.complete(COMPLETION_SUCCEEDED, 200, "");
+                Ok(Done::Buffered { headers, body })
+            }
+            Ok(Done::Stream { headers, first, rest }) => {
+                let end = futures_util::stream::once(async move {
+                    self.lifecycle.complete(COMPLETION_SUCCEEDED, 200, "");
+                })
+                .filter_map(|()| async { None });
+                Ok(Done::Stream {
+                    headers,
+                    first,
+                    rest: rest.chain(end).boxed(),
+                })
+            }
         }
     }
 
@@ -962,11 +1051,15 @@ fn model_detail(body: bytes::Bytes, id: &str) -> (u16, bytes::Bytes) {
 /// when no plugin intercepts requests, observes their lifecycle or watches upstream
 /// WebSocket frames: the request runs
 /// untouched, as in Go where every hook is then a no-op.
+/// `defer`: a native Codex attempt is possible, so the before-auth output and
+/// termination are held back from `call` for the attempts that are not native
+/// ([`Hooks::apply_deferred`]). The interceptors still run once, here.
 pub(crate) async fn start(
     rt: &Runtime,
     trace: &Trace,
     call: &mut Call,
     model: &str,
+    defer: bool,
 ) -> Result<Option<Arc<Hooks>>, Failure> {
     let host = rt.plugins();
     let needed = host.has_request_interceptors()
@@ -998,10 +1091,13 @@ pub(crate) async fn start(
             body: &call.body,
             metadata: super::execution::execution_metadata(call, model),
             caller: Some(&call.caller),
+            defer,
         },
     )
     .await?;
-    hooks.apply(call, &headers, before.headers, before.body, before.path);
+    if !defer {
+        hooks.apply(call, &headers, before.headers, before.body, before.path);
+    }
     Ok(Some(hooks))
 }
 
@@ -1299,6 +1395,7 @@ mod tests {
                 body: &body,
                 metadata: Metadata::new(),
                 caller: None,
+                defer: false,
             },
         )
         .await

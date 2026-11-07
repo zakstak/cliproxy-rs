@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture_1"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_fixture_1","summary":[],"encrypted_content":"ENCRYPTED-OPAQUE-FIXTURE-2"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_fixture_1","output_index":1,"content_index":0,"delta":"Done."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_fixture_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Done.","annotations":[]}],"phase":"final_answer"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture_1","end_turn":true,"usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1024,"cache_write_tokens":128,"cache_write_tokens_details":{"ttl_30m_tokens":128,"ttl_12h_tokens":0}},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":12},"total_tokens":1240}}}
+

@@ -513,6 +513,7 @@ impl Prepared {
             execution_session: None,
             request_path: self.path.clone(),
             peer: self.peer,
+            native: None,
             turn: None,
             media: Some(Arc::new(Media {
                 kind: MediaKind::Images,

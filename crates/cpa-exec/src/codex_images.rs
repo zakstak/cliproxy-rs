@@ -77,6 +77,7 @@ impl CodexExecutor {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         crate::codex_siwc::require_token(credential)?;
+        crate::codex_identity::check_credential(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
@@ -110,41 +111,14 @@ impl CodexExecutor {
         if req.usage.enabled() {
             req.usage.request(Format::OpenAI, &body);
         }
+        // No synthesized prompt-cache key in the body (#27); the session identity reaches
+        // the headers only, and #26 owns those.
         let cache = request::session_uuid(&req, None);
-        let body = json_body(body, cache.as_deref());
-        // The payload rules run last (868e137), on the body's JSON view.
-        let original = if req.original_body.is_empty() {
-            &req.body
-        } else {
-            &req.original_body
-        };
-        let requested = if req.requested_model.trim().is_empty() {
-            req.model.trim()
-        } else {
-            req.requested_model.trim()
-        };
-        let client_content_type = request::header(&req.headers, "content-type");
-        let (body, content_type) =
-            crate::payload_media::apply(&body, &content_type, original, client_content_type, |view, original| {
-                let rules = cpa_common::payload::Request {
-                    target_executor: "codex",
-                    model,
-                    requested_model: requested,
-                    protocol: "openai",
-                    from_protocol: SOURCE,
-                    root: "",
-                    original,
-                    request_path: path,
-                    headers: Some(&req.headers),
-                };
-                cpa_common::payload::apply(&settings.payload, &rules, view)
-            })
-            .map_err(plain_err)?;
-        let body = Bytes::from(body);
-        // `applyCodexDirectImageHeaders`: the client's User-Agent is not forwarded.
-        let mut client = req.headers.clone();
-        client.remove(http::header::USER_AGENT);
-        let mut headers = request::image_headers(view, settings, &client, model, cache.as_deref(), req.stream);
+        // No input-ID rewrite or payload rule either (#27): the body is the client's
+        // Images request with only its model and `stream` routed.
+        // `applyCodexDirectImageHeaders` drops the client's User-Agent; `image_headers`
+        // never forwards it (the proxy builds every Images request).
+        let mut headers = request::image_headers(view, &req.headers, model, cache.as_deref(), req.stream);
         if !content_type.is_empty()
             && let Ok(value) = http::HeaderValue::from_str(&content_type)
         {
@@ -238,35 +212,13 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let prepared = prepare(&req, path)?;
         let main_model = main_model(&settings.image_base_model);
-        let body = tool_body(&prepared.body, main_model, view.siwc)?;
+        let body = tool_body(&prepared.body, main_model)?;
+        // No synthesized prompt-cache key in the body (#27); the session identity reaches
+        // the headers only, and #26 owns those. The input is the adapter's own.
         let cache = request::session_uuid(&req, None);
-        let body = match &cache {
-            Some(id) => set_str_if_different(body, "prompt_cache_key", id),
-            None => body,
-        };
-        let body = request::sanitize_input_ids(body);
-        // The payload rules run last (868e137), as the codex executor, on the
-        // prepared image request.
-        let requested = if req.requested_model.trim().is_empty() {
-            req.model.trim()
-        } else {
-            req.requested_model.trim()
-        };
-        let rules = cpa_common::payload::Request {
-            target_executor: "codex",
-            model: main_model,
-            requested_model: requested,
-            protocol: "codex",
-            from_protocol: SOURCE,
-            root: "",
-            original: prepared.body.as_bytes(),
-            request_path: path,
-            headers: Some(&req.headers),
-        };
-        let body = cpa_common::payload::apply(&settings.payload, &rules, body.into_bytes());
-        let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        // No input-ID rewrite or payload rule (#27): the body is the adapter's conversion.
         report_request(&req, Format::Codex, &body);
-        let headers = request::image_headers(view, settings, &req.headers, main_model, cache.as_deref(), true);
+        let headers = request::image_headers(view, &req.headers, main_model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self
@@ -276,7 +228,6 @@ impl CodexExecutor {
                 url,
                 headers,
                 body,
-                &Default::default(),
                 &wire,
                 crate::codex::ErrorBody::Strict,
             )
@@ -507,20 +458,6 @@ fn main_model(configured: &str) -> &str {
     }
 }
 
-/// `cacheHelper` on a direct body: the prompt cache key and input-id sanitising apply to
-/// JSON bodies only.
-fn json_body(body: Bytes, cache: Option<&str>) -> Bytes {
-    if !cpa_common::json::std_valid(&body) {
-        return body;
-    }
-    let text = String::from_utf8_lossy(&body).into_owned();
-    let text = match cache {
-        Some(id) => set_str_if_different(text, "prompt_cache_key", id),
-        None => text,
-    };
-    Bytes::from(request::sanitize_input_ids(text))
-}
-
 /// `codexPrepareDirectOpenAIImageEditPayload`: JSON as for generations; a multipart edit
 /// is rewritten to JSON with data URLs.
 fn direct_edit_payload(
@@ -696,9 +633,84 @@ fn json_text(raw: &[u8]) -> Option<String> {
     cpa_common::json::std_valid(raw).then(|| String::from_utf8_lossy(raw).into_owned())
 }
 
+/// Images API fields the `image_generation` tool expresses (OpenAI Images API and the
+/// Responses image generation tool). Any other field, or `n` above 1, is refused before
+/// anything is sent (#27); Go drops them.
+const TOOL_FIELDS: [&str; 11] = [
+    "model",
+    "prompt",
+    "size",
+    "quality",
+    "background",
+    "output_format",
+    "output_compression",
+    "partial_images",
+    "moderation",
+    "response_format",
+    "stream",
+];
+
+fn unexpressible(field: &str) -> ExecError {
+    ExecError::local(
+        400,
+        cpa_core::exec::FailureScope::Request,
+        format!(
+            "unsupported conversion: `{field}` cannot be expressed by the Codex image generation tool; remove it or send the request to a provider that accepts it"
+        ),
+    )
+}
+
+/// Checks each `(field, number)` of a request: a [`TOOL_FIELDS`] or `extra` field, or `n`
+/// of 1; anything else is refused.
+fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, extra: &[&str]) -> Result<(), ExecError> {
+    for (field, number) in fields {
+        let one = field == "n" && number.is_none_or(|n| n == 1.0);
+        if !(TOOL_FIELDS.contains(&field) || extra.contains(&field) || one) {
+            return Err(unexpressible(field));
+        }
+    }
+    Ok(())
+}
+
+fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
+    let root = gjson::parse(raw);
+    let mut fields = Vec::new();
+    root.each(|key, value| {
+        let number = match value.kind() {
+            Kind::Null => None,
+            _ => Some(value.f64()),
+        };
+        fields.push((key.str().to_owned(), number));
+        true
+    });
+    check_fields(fields.iter().map(|(k, n)| (k.as_str(), *n)), extra)
+}
+
+/// An image the tool request carries: a URL (a data URL included) or an uploaded file.
+enum Image {
+    Url(String),
+    File(String),
+}
+
+/// A JSON image reference (`{"image_url":...}` or `{"file_id":...}`, the Images API
+/// forms the Responses `input_image` and `input_image_mask` also take). Anything else is
+/// refused rather than dropped.
+fn image_reference(value: &gjson::Value<'_>, what: &str) -> Result<Image, ExecError> {
+    let url = value.get("image_url").str().trim().to_owned();
+    let file = value.get("file_id").str().trim().to_owned();
+    match (url.is_empty(), file.is_empty()) {
+        (false, true) => Ok(Image::Url(url)),
+        (true, false) => Ok(Image::File(file)),
+        _ => Err(unexpressible(&format!(
+            "{what} without exactly one image_url or file_id"
+        ))),
+    }
+}
+
 /// `codexPrepareOpenAIImageGenerationJSON`.
 fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image generation request JSON"))?;
+    expressible(&raw, &[])?;
     let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
     let tool = tool_json(
         &raw,
@@ -716,15 +728,17 @@ fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError>
 /// `codexPrepareOpenAIImageEditJSON`.
 fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image edit request JSON"))?;
+    expressible(&raw, &["images", "mask", "input_fidelity"])?;
     let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
     let images_value = gjson::get(&raw, "images");
-    let images: Vec<String> = if images_value.kind() == Kind::Array {
+    let images: Vec<Image> = if images_value.kind() == Kind::Array {
         images_value
             .array()
             .iter()
-            .map(|img| img.get("image_url").str().trim().to_owned())
-            .filter(|url| !url.is_empty())
-            .collect()
+            .map(|img| image_reference(img, "an image"))
+            .collect::<Result<_, _>>()?
+    } else if images_value.exists() {
+        return Err(unexpressible("images that is not an array"));
     } else {
         Vec::new()
     };
@@ -741,9 +755,12 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
             "moderation",
         ],
     );
-    let mask = gjson::get(&raw, "mask.image_url").str().trim().to_owned();
-    if !mask.is_empty() {
-        tool = set_str(&tool, "input_image_mask.image_url", &mask);
+    let mask = gjson::get(&raw, "mask");
+    if mask.exists() && mask.kind() != Kind::Null {
+        tool = match image_reference(&mask, "a mask")? {
+            Image::Url(url) => set_str(&tool, "input_image_mask.image_url", &url),
+            Image::File(id) => set_str(&tool, "input_image_mask.file_id", &id),
+        };
     }
     Ok(Prepared {
         body: responses_request(&prompt, &images, &tool),
@@ -769,6 +786,29 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
     let form =
         multipart::read_form(body, boundary).map_err(|e| plain_err(format!("parse multipart form failed: {e}")))?;
     let value = |key: &str| form.value(key).trim().to_owned();
+    // The same field policy as JSON (#27): form values the tool expresses, and image and
+    // mask files; anything else is refused.
+    check_fields(
+        form.values.iter().map(|(key, _)| {
+            let number = (key == "n").then(|| value("n").parse::<f64>().unwrap_or(f64::NAN));
+            (key.as_str(), number)
+        }),
+        &["input_fidelity"],
+    )?;
+    if let Some((file, _)) = form
+        .files
+        .iter()
+        .find(|(key, _)| !matches!(key.as_str(), "image" | "image[]" | "mask"))
+    {
+        return Err(unexpressible(&format!("file field {file}")));
+    }
+    if !form.files("image").is_empty() && !form.files("image[]").is_empty() {
+        // Only one of the two image fields would be read.
+        return Err(unexpressible("both image and image[] files"));
+    }
+    if form.files("mask").len() > 1 {
+        return Err(unexpressible("more than one mask file"));
+    }
     let mut tool = r#"{"type":"image_generation","action":"edit"}"#.to_owned();
     tool = set_str(&tool, "model", &tool_model(&value("model"), route_model));
     for field in [
@@ -789,7 +829,7 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
             tool = set_raw(&tool, field, &n.to_string());
         }
     }
-    let images: Vec<String> = image_files(&form).iter().map(data_url).collect();
+    let images: Vec<Image> = image_files(&form).iter().map(|f| Image::Url(data_url(f))).collect();
     if let Some(mask) = form.files("mask").first() {
         tool = set_str(&tool, "input_image_mask.image_url", &data_url(mask));
     }
@@ -836,15 +876,23 @@ fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str])
 }
 
 /// `codexBuildImagesResponsesRequest`.
-fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
-    let mut req = r#"{"instructions":"","stream":true,"reasoning":{"effort":"medium","summary":"auto"},"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
+fn responses_request(prompt: &str, images: &[Image], tool: &str) -> String {
+    // Only what the conversion needs (#27): the model, the forced `image_generation`
+    // tool with the client's image settings, the prompt and images, `stream` (the answer
+    // is read from events) and `store: false` as the pinned client sends. No default
+    // instructions, reasoning, `parallel_tool_calls` or `include` (Go adds them).
+    let mut req =
+        r#"{"stream":true,"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
     req = set_str(&req, "model", MAIN_MODEL);
     if !tool.is_empty() && gjson::valid(tool) {
         req = set_raw(&req, "tools", &format!("[{tool}]"));
     }
     let mut content = vec![set_str(r#"{"type":"input_text","text":""}"#, "text", prompt)];
-    for image in images.iter().filter(|i| !i.trim().is_empty()) {
-        content.push(set_str(r#"{"type":"input_image","image_url":""}"#, "image_url", image));
+    for image in images {
+        content.push(match image {
+            Image::Url(url) => set_str(r#"{"type":"input_image","image_url":""}"#, "image_url", url),
+            Image::File(id) => set_str(r#"{"type":"input_image","file_id":""}"#, "file_id", id),
+        });
     }
     let input = format!(
         r#"[{{"type":"message","role":"user","content":[{}]}}]"#,
@@ -854,7 +902,7 @@ fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
 }
 
 /// `prepareCodexOpenAIImageBody`: thinking, then the Codex request rules.
-fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecError> {
+fn tool_body(body: &str, main_model: &str) -> Result<String, ExecError> {
     let thought = cpa_common::thinking::apply_thinking_with_source_payload(
         body.as_bytes(),
         body.as_bytes(),
@@ -877,12 +925,7 @@ fn tool_body(body: &str, main_model: &str, siwc: bool) -> Result<String, ExecErr
     ] {
         out = delete(&out, key);
     }
-    if siwc {
-        return Ok(request::siwc_body(out, request::Call::Stream, false, false));
-    }
-    let mut bytes = out.into_bytes();
-    cpa_common::codex_client::normalize_codex_instructions(&mut bytes);
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(out)
 }
 
 /// `codexExtractImageResults`: image calls from the completed output, else from the

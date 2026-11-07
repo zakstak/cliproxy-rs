@@ -181,8 +181,10 @@ async fn observer_plugins_receive_every_upstream_websocket_frame() {
         return;
     };
     fx.respond("request.intercept_before", &json!({"ok": true, "result": {}}));
-    // Go recomputes the canonical session after an after-auth header rewrite; the
-    // observer sees the executed attempt's metadata.
+    // Go recomputes the canonical session after an after-auth header rewrite. The turn
+    // runs on the native WebSocket route (#24), which never runs request interceptors
+    // after selection, so the rewrite cannot reach it: the observer sees the session the
+    // connection chose. Observers are passive and keep receiving every frame.
     fx.respond(
         "request.intercept_after",
         &json!({"ok": true, "result": {"Headers": {"X-Session-ID": ["after-auth"]}}}),
@@ -219,8 +221,13 @@ async fn observer_plugins_receive_every_upstream_websocket_frame() {
             assert_eq!(event["AuthID"], fx.auth_id.as_str());
             assert_eq!(event["AuthType"], "api_key");
             assert_eq!(event["Metadata"]["selected_auth_id"], fx.auth_id.as_str());
-            assert_eq!(event["Metadata"]["canonical_session_id"], "header:after-auth");
+            let session = event["Metadata"]["canonical_session_id"].as_str().unwrap();
+            assert!(session.starts_with("execution:"), "turn {turn}: {session}");
         }
+        assert!(
+            fx.calls("request.intercept_after").is_empty(),
+            "turn {turn}: an after-auth interceptor ran on a native turn"
+        );
         if turn == 1 {
             assert_ne!(seen[0]["RequestID"], seen[3]["RequestID"], "each turn has its own ID");
         }

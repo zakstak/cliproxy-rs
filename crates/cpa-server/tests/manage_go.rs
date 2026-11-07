@@ -300,26 +300,43 @@ fn oauth_only_presence_matches_go() {
     };
     let cases = fixture()["oauth_only"].as_array().unwrap().clone();
     assert_eq!(cases.len(), 6);
+    // #26 (docs/DIFFERENCES-FROM-GO.md): Go accepts a Codex `header-defaults.user-agent`;
+    // cliproxy-rs refuses it. That case is checked without the key, and its field drops
+    // out of Go's list.
+    const CODEX_UA: &str = "header-defaults: {user-agent: x}, ";
+    const CODEX_UA_FIELD: &str = "codex-header-defaults.user-agent";
+    let without_codex_ua = |yaml: &str| {
+        if yaml.contains(CODEX_UA) {
+            let error = Config::parse(yaml).expect_err("refused").to_string();
+            assert!(
+                error.contains("header-defaults.user-agent is no longer supported"),
+                "{error}"
+            );
+        }
+        yaml.replace(CODEX_UA, "")
+    };
+    assert!(cases.iter().any(|c| c["yaml"].as_str().unwrap().contains(CODEX_UA)));
     for case in &cases {
-        let yaml = case["yaml"].as_str().unwrap();
+        let yaml = without_codex_ua(case["yaml"].as_str().unwrap());
         let want: std::collections::BTreeSet<String> = case["fields"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|f| to_v8(f.as_str().unwrap()))
+            .filter_map(serde_json::Value::as_str)
+            .filter(|f| *f != CODEX_UA_FIELD)
+            .map(to_v8)
             .collect();
-        assert_eq!(Config::parse(yaml).unwrap().oauth_only, want, "{yaml}");
+        assert_eq!(Config::parse(&yaml).unwrap().oauth_only, want, "{yaml}");
     }
     // Go `ForAPIKey`: those fields read as zero for API-key credentials; the shared
     // `upstream.codex` value written at its historical path stays.
-    let cfg = Config::parse(cases[1]["yaml"].as_str().unwrap()).unwrap();
+    let cfg = Config::parse(&without_codex_ua(cases[1]["yaml"].as_str().unwrap())).unwrap();
     let view = cfg.for_api_key();
     assert_eq!(
         view.document["upstream"]["codex"]["disable-codex-cloaking"],
         serde_yaml_ng::Value::Bool(true)
     );
     let codex = &view.document["oauth"]["providers"]["codex"];
-    assert_eq!(codex["header-defaults"]["user-agent"], serde_yaml_ng::Value::from(""));
     assert!(codex["live-media-relay"].get("ice-servers").is_none());
     assert_eq!(
         view.document["oauth"]["providers"]["aistudio"]["ws-auth"],

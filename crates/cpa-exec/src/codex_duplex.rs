@@ -25,9 +25,8 @@ use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Replay, Turn, Upstream, request_frame, transport, ws_error};
-use crate::codex_json::{set_raw, set_str};
-use crate::codex_request::{self as request, Call, Settings, View};
+use super::{Read, Turn, Upstream, transport, ws_error};
+use crate::codex_request::View;
 use crate::codex_response as response;
 
 /// Bound on queued and outstanding `response.create` requests.
@@ -66,58 +65,23 @@ impl SteeringInput {
     }
 }
 
-/// What the duplex reads of one request's settings (Go `codexWebsocketPrepared`).
+/// What the duplex reads of one request (Go `codexWebsocketPrepared`). Every request on
+/// a duplex connection is a native frame (#24, #28): sent as the client wrote it, with
+/// only `model` routed, and its events reach the client as upstream sent them.
 #[derive(Clone, Default)]
 pub(super) struct Prepared {
-    /// Raw `instructions` of the shaped body (Go `clientBody`).
-    instructions: Option<String>,
-    /// Raw `instructions` of the client payload (Go `originalPayload`); retained
-    /// response settings drop it.
-    original_instructions: Option<String>,
-    /// The multi-agent v2 optimization renamed the `collaboration` namespace.
-    optimized: bool,
-    /// The request already used the upstream names (`multiAgentV2Conflict`).
-    conflict: bool,
-    /// Native Codex request: completion output stays as upstream sent it.
+    /// Native Codex request (the Responses Lite marker).
     native: bool,
-    /// The request's reasoning replay scope (`replayScope`).
-    replay: Replay,
 }
 
 impl Prepared {
-    pub(super) fn new(
-        body: &str,
-        original: &[u8],
-        optimized: bool,
-        conflict: bool,
-        native: bool,
-        replay: Replay,
-    ) -> Self {
-        let raw = |json: &str| {
-            let value = gjson::get(json, "instructions");
-            value.exists().then(|| value.json().to_owned())
-        };
-        Self {
-            instructions: raw(body),
-            original_instructions: raw(&String::from_utf8_lossy(original)),
-            optimized,
-            conflict,
-            native,
-            replay,
-        }
+    pub(super) fn new(native: bool) -> Self {
+        Self { native }
     }
 
-    /// The settings a response retains (Go keeps `reasoning` and `instructions`, never
-    /// request history or headers; `reasoning` only feeds per-response usage here).
+    /// The settings a response retains.
     fn retained(&self) -> Self {
-        Self {
-            original_instructions: None,
-            ..self.clone()
-        }
-    }
-
-    fn instructions(&self) -> Option<&str> {
-        self.instructions.as_deref().or(self.original_instructions.as_deref())
+        self.clone()
     }
 }
 
@@ -145,10 +109,9 @@ pub(super) struct Duplex {
     /// The bootstrap request: the template for later creates (Go `req`, `opts`).
     req: ExecRequest,
     credential: Credential,
-    proxy: crate::proxy::Proxy,
-    cpa_session: Option<String>,
-    settings: Settings,
-    exec_session: String,
+    /// `multimedia.disable-image-generation`: a later frame carrying the tool it disables
+    /// is refused like the bootstrap create.
+    image_generation: cpa_common::payload::ImageGeneration,
     initial: Prepared,
     /// The bootstrap request's client model (Go `initial.originalPayload` `model`).
     initial_model: String,
@@ -198,15 +161,10 @@ impl Drop for Duplex {
 /// One frame for the writer task.
 struct Outgoing {
     frame: String,
-    /// A create's multi-agent v2 state `(optimized, conflict)`; steers carry none.
-    namespace: Option<(bool, bool)>,
 }
 
-/// The network half of Go's writer goroutine: frames in order. A create updates the
-/// socket's namespace state only when it reaches the writer (`setMultiAgentV2Optimized`),
-/// so a create still queued behind a blocked write cannot change how the running
-/// response's events are restored. Then the live account check (`WebsocketAuthEnabled`)
-/// right before `writeCodexWebsocketMessage`.
+/// The network half of Go's writer goroutine: frames in order, each after the live
+/// account check (`WebsocketAuthEnabled`) right before `writeCodexWebsocketMessage`.
 async fn write_loop(
     conn: Arc<Upstream>,
     input: Arc<SteeringInput>,
@@ -214,10 +172,7 @@ async fn write_loop(
     wire: crate::codex_capture::Wire,
     mut queue: mpsc::Receiver<Outgoing>,
 ) -> Result<(), ExecError> {
-    while let Some(Outgoing { frame, namespace }) = queue.recv().await {
-        if let Some((optimized, conflict)) = namespace {
-            conn.note_multi_agent(optimized, conflict);
-        }
+    while let Some(Outgoing { frame }) = queue.recv().await {
         if !(input.enabled)(&credential) {
             return Err(local("websocket credential is no longer enabled"));
         }
@@ -253,8 +208,7 @@ impl Duplex {
         initial: Prepared,
         req: ExecRequest,
         view: &View<'_>,
-        settings: &Settings,
-        exec_session: &str,
+        image_generation: cpa_common::payload::ImageGeneration,
     ) -> ExecStream {
         // Turns on a session are serialised, so no other stream holds the frames.
         let frames = input.frames.clone().lock_owned().await;
@@ -279,10 +233,7 @@ impl Duplex {
             input,
             req,
             credential: view.credential.clone(),
-            proxy: view.proxy.clone(),
-            cpa_session: view.session.clone(),
-            settings: settings.clone(),
-            exec_session: exec_session.to_owned(),
+            image_generation,
             current: initial.clone(),
             pending: VecDeque::from([initial.clone()]),
             initial,
@@ -454,8 +405,8 @@ impl Duplex {
     }
 
     /// Hands a frame to the writer task; callers checked for room.
-    fn write(&mut self, frame: String, namespace: Option<(bool, bool)>) {
-        match self.writes.try_send(Outgoing { frame, namespace }) {
+    fn write(&mut self, frame: String) {
+        match self.writes.try_send(Outgoing { frame }) {
             Ok(()) => {}
             // The writer stopped on an error it reports through its handle.
             Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -477,11 +428,12 @@ impl Duplex {
             self.fail(local("websocket credential is no longer enabled"));
             return;
         }
-        if !cpa_common::json::std_valid(&frame) {
-            self.reject("invalid websocket request JSON");
+        // The native route reads client frames through the request boundary: strict
+        // UTF-8 and JSON, the bytes kept as they are.
+        if let Err(error) = cpa_common::codex_body::CodexBody::parse(&frame) {
+            self.reject(&error.to_string());
             return;
         }
-        // ponytail: invalid UTF-8 inside JSON strings is replaced; Go forwards the bytes.
         let payload = String::from_utf8_lossy(&frame).into_owned();
         let kind = gjson::get(&payload, "type").str().to_owned();
         match kind.as_str() {
@@ -508,33 +460,60 @@ impl Duplex {
         }
     }
 
-    /// A steer goes upstream as the client sent it plus the payload rules: no create
-    /// translation or defaults (SIWC credentials lose `configuration_update` items);
-    /// upstream validates unknown fields and input.
-    fn steer(&mut self, mut payload: String) {
-        if crate::codex_siwc::enabled(&self.credential) {
-            let stripped = cpa_common::thinking::strip_configuration_update_items(payload.as_bytes());
-            if stripped != payload.as_bytes() {
-                payload = String::from_utf8_lossy(&stripped).into_owned();
-            }
+    /// A steer goes upstream as the client wrote it. The pinned client never sends one;
+    /// OpenAI documents `response.steer` for the GPT-6 family on the API, and nothing
+    /// documents it on the ChatGPT backend. The upstream decides; the proxy adds nothing.
+    fn steer(&mut self, payload: String) {
+        if !self.image_tool_allowed(&payload) {
+            return;
         }
-        let payload = request::steer_rules(&self.req, &self.settings, payload);
         let parent = gjson::get(&payload, "previous_response_id").str().to_owned();
         if let Some(settings) = self.response_settings.get(&parent).cloned() {
             self.steering_settings.insert(parent.clone(), settings);
         }
         self.unacknowledged.push(parent);
-        self.write(payload, None);
+        self.write(payload);
     }
 
-    /// `processCreatePayload`.
-    async fn create(&mut self, mut payload: String) {
-        let append = gjson::get(&payload, "type").str() == "response.append";
-        let mut parent = gjson::get(&payload, "previous_response_id").str().trim().to_owned();
-        if append && parent.is_empty() && !self.response_id.is_empty() {
-            parent.clone_from(&self.response_id);
-            payload = set_str(&payload, "previous_response_id", &parent);
+    /// Whether `payload` may go upstream under `multimedia.disable-image-generation`; a
+    /// frame carrying the disabled tool gets a local error event instead.
+    fn image_tool_allowed(&mut self, payload: &str) -> bool {
+        match cpa_common::payload::disabled_image_tool(
+            self.image_generation,
+            &self.req.request_path,
+            payload.as_bytes(),
+        ) {
+            None => true,
+            Some(field) => {
+                let error = crate::codex_request::image_tool_refused(field);
+                self.reject(&String::from_utf8_lossy(&error.body));
+                false
+            }
         }
+    }
+
+    /// `processCreatePayload`. A `response.append`, which comes from Go and no
+    /// first-party or documented source defines, is refused with a local error event on
+    /// a connection that stays open (#28).
+    async fn create(&mut self, payload: String) {
+        if gjson::get(&payload, "type").str() == "response.append" {
+            self.reject(crate::codex::native::APPEND_REFUSED);
+            return;
+        }
+        self.native_create(payload)
+    }
+
+    /// A `response.create` on the native route, sent while the connection's duplex
+    /// stream runs. The pinned client steers this way: it interrupts the running response
+    /// and sends a new create (`codex-api/src/endpoint/responses_websocket.rs:310-325`,
+    /// 824-839). The frame goes upstream as the client wrote it; only `model` is routed to
+    /// this socket's upstream model. A create for another model cannot use this socket
+    /// and asks the client to replay, as on the legacy path.
+    fn native_create(&mut self, payload: String) {
+        if !self.image_tool_allowed(&payload) {
+            return;
+        }
+        let parent = gjson::get(&payload, "previous_response_id").str().trim().to_owned();
         if !self.accepted.is_empty() && parent != self.waiting_parent {
             self.reject("response.create must continue the response waiting for required input");
             return;
@@ -544,66 +523,26 @@ impl Duplex {
             self.fail(ExecError::replay_required());
             return;
         }
-        if model.is_empty() {
-            let model = if self.req.model.is_empty() {
-                self.initial_model.trim()
-            } else {
-                self.req.model.as_str()
-            };
-            payload = set_str(&payload, "model", model);
-        }
-        if append && !gjson::get(&payload, "instructions").exists() {
-            let target = self.response_settings.get(&parent).unwrap_or(&self.initial);
-            if let Some(instructions) = target.instructions().or(self.initial.instructions()) {
-                payload = set_raw(&payload, "instructions", instructions);
-            }
-        }
-        let mut next = self.req.clone();
-        next.body = Bytes::from(payload);
-        next.original_body = next.body.clone();
-        let view = View {
-            proxy: self.proxy.clone(),
-            session: self.cpa_session.clone(),
-            ..View::new(&self.credential)
+        let upstream = if self.req.model.is_empty() {
+            self.initial_model.trim().to_owned()
+        } else {
+            self.req.model.trim().to_owned()
         };
-        let request::Shaped {
-            body,
-            optimized,
-            conflict,
-            finalize,
-        } = match request::shape(&next, &view, &self.settings, Call::Websocket) {
-            Ok(shaped) => shaped,
+        let frame = match crate::codex::native::routed(&Bytes::from(payload), &upstream) {
+            Ok(frame) => frame,
             Err(error) => {
                 self.fail(error);
                 return;
             }
         };
-        let (body, replay) = Replay::apply(&self.initial.replay.cache, &next, body).await;
-        // ponytail: Go starts a usage record per response; this stream reports every
-        // response's events to the bootstrap attempt's record and keeps its request.
-        let (body, _) = request::prompt_cache(&next, body, Some(&self.exec_session), true);
-        let body = super::turn_body(&view, &next, &self.settings, &finalize, body);
-        // Go also fails when the URL differs from the bootstrap's; it cannot here, since
-        // both come from the same credential.
-        let prepared = Prepared::new(
-            &body,
-            &next.original_body,
-            optimized,
-            conflict,
-            request::is_native(&next),
-            replay,
-        );
+        let body = String::from_utf8_lossy(&frame).into_owned();
+        let prepared = Prepared::new(self.initial.native);
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
         }
         self.pending.push_back(prepared);
-        self.write(request_frame(body), Some((optimized, conflict)));
-    }
-
-    /// `restoreMultiAgent` for an event of `prepared`'s request on this socket.
-    fn restores(&self, prepared: &Prepared) -> bool {
-        self.turn.conn.restores(prepared.optimized, prepared.conflict)
+        self.write(body);
     }
 
     /// `releaseSteeringSettings`.
@@ -631,10 +570,11 @@ impl Duplex {
                 return self.fail(error);
             }
         };
-        let payload = text.trim();
-        if payload.is_empty() {
+        if text.trim().is_empty() {
             return;
         }
+        // A native connection hands each frame on as it arrived.
+        let payload = text.as_str();
         let kind = gjson::get(payload, "type").str().to_owned();
         let establishing = self.first_response && kind == "response.created";
         if kind == "response.created" && !self.response_created(payload) {
@@ -668,18 +608,18 @@ impl Duplex {
         let classify = |payload: &str| {
             ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
         };
-        if !self.first_response && failure {
-            // Account health does not depend on which queued request failed: the stream
-            // ends with the original classification and is not replayed elsewhere.
-            if let Some(error) = classify(payload).filter(|e| matches!(e.status, 401 | 403 | 429)) {
-                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
-                self.outbox.push_back(Err(error));
-                self.done = true;
-                return;
-            }
+        // An account failure on a native connection never reaches the client as sent,
+        // whichever request it belongs to: its frame can name the pooled account. The
+        // error alone ends the stream, and the server delivers the allowlisted
+        // subscription-limit event (#6) or closes silently.
+        if failure && let Some(error) = classify(payload).filter(|e| super::account_failure(e.status)) {
+            self.turn.wire.ws_exec_error("upstream_error", &error);
+            self.outbox.push_back(Err(error));
+            self.done = true;
+            return;
         }
-        // The request this event belongs to: a rejected pending create, else the running one.
-        let mut rejected = None;
+        // A failure before `response.created` rejects the oldest pending create, which
+        // leaves the queue; a failure of the running response ends it.
         if !self.first_response && failure {
             let mut failed = gjson::get(payload, "response.id").str().to_owned();
             if failed.is_empty() {
@@ -699,7 +639,7 @@ impl Duplex {
                 return;
             }
             match self.pending.pop_front() {
-                Some(create) if !current_failure => rejected = Some(create),
+                Some(_) if !current_failure => {}
                 popped => {
                     if let Some(popped) = popped {
                         self.pending.push_front(popped);
@@ -709,47 +649,44 @@ impl Duplex {
                 }
             }
         }
-        let event = rejected.as_ref().unwrap_or(&self.current);
-        let payload = response::restore(payload, self.restores(event));
-        // Every rejection clears its own request's replay; only the first fails the
-        // stream (and can enter bootstrap retry), later ones are events the client may
-        // correct on this socket.
-        let terminal = classify(&payload);
+        // Every event reaches the client as upstream sent it: nothing is repaired or
+        // restored.
+        // Only the first rejection fails the stream (and can enter bootstrap retry);
+        // later ones are events the client may correct on this socket.
+        let terminal = classify(payload);
         if let Some(error) = &terminal {
-            event.replay.clear(&payload, cooling);
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
         if self.first_response
-            && let Some(error) = terminal
+            && let Some(mut error) = terminal
         {
             // Later failures already reach the client as events (below); an initial
-            // context-window failure does too, so Codex can compact and retry.
-            if self.turn.codex_client
-                && let Some(event) = cpa_common::codex_client::context_window_failure_event(&payload)
+            // context-window failure does too, so Codex can compact and retry (#5). On a
+            // native connection any other initial failure travels on the error as the
+            // upstream sent it, for delivery once failover is decided.
+            match self
+                .turn
+                .codex_client
+                .then(|| cpa_common::codex_client::context_window_failure_event(payload))
+                .flatten()
             {
-                self.outbox.push_back(Ok(Bytes::from(event.into_owned())));
+                Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),
+                None => {
+                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(payload.as_bytes())));
+                }
             }
             self.outbox.push_back(Err(error));
             self.done = true;
             return;
         }
-        let mut out = payload.into_owned();
         if kind == "response.output_item.done" {
-            self.turn.items.collect(&out);
+            self.turn.items.collect(payload);
         }
         if matches!(kind, "response.completed" | "response.done" | "response.incomplete") {
             self.response_active = false;
             self.automatic_active = false;
-            out = response::normalize_completion(out);
-            if !self.current.native {
-                out = self.turn.items.patch(out);
-            }
-            if kind != "response.incomplete" {
-                self.current.replay.completed(&out);
-            }
         }
-        self.outbox
-            .push_back(Ok(Bytes::from(response::ensure_usage_details(out))));
+        self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
         if establishing {
             // Delivered before any locally generated error, so the handler also sees the
             // bootstrap succeed first.

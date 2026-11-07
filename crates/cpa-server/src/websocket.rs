@@ -79,6 +79,13 @@ const CLOSE_SERVICE_RESTART: u16 = 1012;
 /// Close code 1009 (message too big).
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const TURN_STATE: &str = "x-codex-turn-state";
+
+/// The error a `generate: false` prewarm gets under Home before this connection's first
+/// pick, when no credential or transport is known yet.
+const HOME_PREWARM_UNSUPPORTED: &str = "response.create with generate: false (prewarm) is not supported before Home selects a credential for this connection: the serving transport is unknown, and the proxy does not invent a response. Send the first request without generate: false.";
+
+/// The error a `generate: false` prewarm gets when only the HTTP fallback can serve it.
+const CODEX_PREWARM_UNSUPPORTED: &str = "response.create with generate: false (prewarm) is not supported for Codex credentials without websockets: there is no upstream socket to prewarm, and the proxy does not invent a response. Enable websockets on the Codex credential, or send the request without generate: false.";
 // ponytail: gorilla reads messages of any size; 64 MiB (the HTTP body cap) bounds
 // per-connection memory instead.
 const MAX_MESSAGE: usize = crate::MAX_REQUEST_BYTES;
@@ -243,6 +250,9 @@ struct Failure {
     /// The client-safe subscription-limit event a native Codex client gets
     /// (`websocket_limit`), when the failure is one.
     limit: Option<String>,
+    /// The provider's own failure frame a native Codex turn delivers as sent
+    /// ([`ExecError::delivered_event`]); never set for an account failure.
+    delivered: Option<String>,
 }
 
 impl Failure {
@@ -255,6 +265,7 @@ impl Failure {
             payload: None,
             replay: e.is_replay_required(),
             addon: e.addon.clone(),
+            delivered: delivered(e),
         }
     }
 
@@ -269,12 +280,16 @@ impl Failure {
                     payload: None,
                     replay: e.is_replay_required(),
                     addon: e.addon.clone(),
+                    delivered: delivered(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
             // event is added.
+            // Also an upstream executor error that a Home round ended with a retry hint:
+            // a native turn's frame still reaches the client as sent.
             dispatch::Failure::Remote { error: e, .. } => Self {
                 limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
+                delivered: delivered(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -298,6 +313,7 @@ impl Failure {
             replay: false,
             addon: None,
             limit: crate::websocket_limit::from_error_event(payload, unix_now()),
+            delivered: None,
         }
     }
 
@@ -309,8 +325,15 @@ impl Failure {
             replay: false,
             addon: None,
             limit: None,
+            delivered: None,
         }
     }
+}
+
+fn delivered(e: &ExecError) -> Option<String> {
+    e.delivered_event
+        .as_ref()
+        .map(|frame| String::from_utf8_lossy(frame).into_owned())
 }
 
 /// The limit event for an executor error: the frame's headers (addon) first, then the
@@ -721,6 +744,9 @@ struct TurnCtx {
     preserve_output: bool,
     /// The serving credential is a Codex credential on an upstream socket.
     codex_socket: bool,
+    /// The attempt that answered ran on the native WebSocket route (#24): its events are
+    /// the upstream's frames, relayed as they are.
+    native_served: bool,
     tool_turn: Option<TurnCache>,
 }
 
@@ -825,13 +851,12 @@ impl Connection {
                 break;
             };
             sink.event("request", &frame);
-            let payload = String::from_utf8_lossy(&frame).into_owned();
             // The turn wins ties so frames already received reach the client before a
             // simultaneous upstream-loss signal closes the connection. A duplex turn owns
             // closure: it drains acknowledgements and pending events in order first. A
             // client that went away cancels the turn (Go's reader cancels the request).
             let flow = {
-                let turn = self.turn(&mut sink, payload);
+                let turn = self.turn(&mut sink, frame);
                 tokio::pin!(turn);
                 tokio::select! {
                     biased;
@@ -877,7 +902,11 @@ impl Connection {
         sink.finish(client).await;
     }
 
-    async fn turn(&mut self, socket: &mut Sink, payload: String) -> Flow {
+    /// One client frame. `frame` keeps the client's bytes for a native attempt (#24),
+    /// which reads them through the request boundary; the fallback path reads a lossy
+    /// UTF-8 copy, as before.
+    async fn turn(&mut self, socket: &mut Sink, frame: Bytes) -> Flow {
+        let payload = String::from_utf8_lossy(&frame).into_owned();
         let cfg = self.rt.config();
         let explicit_model = field(&payload, "model");
         let mut request_model = explicit_model.clone();
@@ -922,6 +951,25 @@ impl Connection {
             };
 
         let is_prewarm = !use_upstream_ws && requests::is_local_prewarm(&payload);
+        let home_unknown = self.rt.remote_dispatch().is_some() && self.credential(&self.pinned).is_none();
+        if is_prewarm && (home_unknown || self.codex_may_serve(&request_model)) {
+            // Go answers this prewarm locally with a made-up response. A Codex credential
+            // without an upstream socket has no provider prewarm to forward, and a Codex
+            // client must never receive output no provider produced (#24). Under Home,
+            // before the first pick, the serving credential and its transport are unknown,
+            // so the prewarm cannot be forwarded or answered either. The request fails;
+            // the connection stays open.
+            let message = if home_unknown {
+                HOME_PREWARM_UNSUPPORTED
+            } else {
+                CODEX_PREWARM_UNSUPPORTED
+            };
+            let frame = error_payload(400, message, None);
+            return match send_text(socket, frame).await {
+                true => Flow::Next,
+                false => Flow::End,
+            };
+        }
         let kind = field(&payload, "type");
         let replacement = |payload: &str, last: &str| {
             let input = gjson::get(payload, "input");
@@ -953,8 +1001,17 @@ impl Connection {
                 allow_bypass,
             )
         };
-        let (mut request, updated) = match normalized {
-            Ok(pair) => pair,
+        let (mut request, updated, fallback_error) = match normalized {
+            Ok((request, updated)) => (request, updated, None),
+            // A fallback-only refusal (such as a string `input`, which only the HTTP
+            // fallback cannot convert) cannot decide a native attempt: the request
+            // boundary judges the client's frame there, and the provider the rest
+            // (`docs/codex/CONTRACT.md` "Native WebSocket route"). Any attempt that is not
+            // native still ends with this error, before anything is sent. A missing
+            // previous response is the connection's state, not the frame's: it stays local.
+            Err(error) if kind == CREATE && !is_prewarm && error.status != 409 => {
+                (payload.clone(), self.last_request.clone(), Some(error))
+            }
             Err(error) => {
                 // Request-shape errors keep the connection open.
                 let frame = error_payload(error.status, &error.message, None);
@@ -972,7 +1029,7 @@ impl Connection {
         if cpa_common::codex_client::multi_agent_client(&self.headers, client.optimize_multi_agent_v2) {
             crate::model_updater::codex_client_catalog_wanted();
         }
-        if client.optimize_multi_agent_v2 || client.orphan_delegation {
+        if fallback_error.is_none() && (client.optimize_multi_agent_v2 || client.orphan_delegation) {
             let prepared =
                 cpa_common::codex_client::prepare_responses_request(&self.headers, request.as_bytes(), &client);
             request = String::from_utf8(prepared).unwrap_or(request);
@@ -1006,9 +1063,10 @@ impl Connection {
             attempted_mode: Mode::Http,
             preserve_output: false,
             codex_socket: false,
+            native_served: false,
             tool_turn: None,
         };
-        let next_last_request = if native {
+        let next_last_request = if native || fallback_error.is_some() {
             let model = field(&request, "model");
             if !model.is_empty() {
                 self.passthrough_model = model;
@@ -1021,9 +1079,23 @@ impl Connection {
             request.clone()
         };
         let model = gjson::get(&request, "model").str().to_owned();
-        let started = self.attempt(&request, &model, &mut ctx).await;
+        let started = self
+            .attempt(&frame, &request, &model, fallback_error.as_ref(), &mut ctx)
+            .await;
         let forwarded = match started {
             Ok(started) => self.forward(socket, started, &cfg, &mut ctx).await,
+            // No native attempt served the frame: the fallback's refusal stands, as an
+            // error frame on a connection that stays open.
+            Err(_)
+                if !ctx.native_served
+                    && let Some(error) = &fallback_error =>
+            {
+                let frame = error_payload(error.status, &error.message, None);
+                return match send_text(socket, frame).await {
+                    true => Flow::Next,
+                    false => Flow::End,
+                };
+            }
             Err(error) => {
                 let failure = Failure::from_dispatch(&error);
                 // A pinned continuation's credential failure also lost the session's
@@ -1076,6 +1148,16 @@ impl Connection {
             self.pending_calls = pending;
         }
         Flow::Next
+    }
+
+    /// Whether a Codex credential may serve a turn for `model`: the pinned credential is
+    /// one, or nothing is pinned and the model's pool holds one.
+    fn codex_may_serve(&self, model: &str) -> bool {
+        let codex = |c: &Credential| c.provider.trim().eq_ignore_ascii_case("codex");
+        match self.credential(&self.pinned) {
+            Some(pinned) => codex(&pinned),
+            None => self.available(model).iter().any(|c| codex(c)),
+        }
     }
 
     fn credential(&self, id: &str) -> Option<Arc<Credential>> {
@@ -1174,15 +1256,20 @@ impl Connection {
         home: Option<(&str, &crate::remote::Availability)>,
     ) -> bool {
         let (providers, key) = self.providers(model);
-        if !providers.contains(&provider_key(credential)) {
-            return false;
-        }
         match home {
+            // A Home pick: Home's pool is remote, so the local registry need not list its
+            // provider or model. The pick itself proves the route: it is still kept (the
+            // credential resolves only while its lease lives), it was granted for this
+            // model (`pinned_key`), and Home's availability snapshot still allows it.
             Some((pinned_key, snapshot)) => {
                 crate::remote::available_for_model(credential, snapshot, &key, SystemTime::now())
                     && pinned_key.trim().go_eq_fold(key.trim())
             }
-            None => self.usable(credential, &key) && self.rt.registry().client_supports(&credential.id, &key),
+            None => {
+                providers.contains(&provider_key(credential))
+                    && self.usable(credential, &key)
+                    && self.rt.registry().client_supports(&credential.id, &key)
+            }
         }
     }
 
@@ -1232,8 +1319,17 @@ impl Connection {
 
     /// One turn through the shared dispatch loop (`ExecuteStreamWithAuthManager` with the
     /// pinned auth, the selected-auth callback and the execution session), including
-    /// bootstrap retries. Returns once the stream yielded its first event.
-    async fn attempt(&self, request: &str, model: &str, ctx: &mut TurnCtx) -> Result<Started, dispatch::Failure> {
+    /// bootstrap retries. Returns once the stream yielded its first event. `frame` is the
+    /// client's frame as it arrived: a native attempt (#24) sends it instead of `request`,
+    /// the frame this connection prepared for the legacy path.
+    async fn attempt(
+        &self,
+        frame: &Bytes,
+        request: &str,
+        model: &str,
+        fallback_error: Option<&WsError>,
+        ctx: &mut TurnCtx,
+    ) -> Result<Started, dispatch::Failure> {
         /// What `WithSelectedAuthIDCallback` learned; the last call is the serving one.
         struct Selected {
             last: String,
@@ -1284,6 +1380,8 @@ impl Connection {
             on_selected: Some(on_selected),
             home: Some(self.home.clone()),
         });
+        let native = dispatch::NativeRequest::new(frame.clone(), self.headers.clone(), self.request_path.clone())
+            .with_fallback_error(fallback_error.map(|e| (e.status, e.message.clone())));
         let call = dispatch::Call {
             entry: Format::OpenAIResponse,
             response: Format::OpenAIResponse,
@@ -1299,6 +1397,7 @@ impl Connection {
             execution_session: Some(self.session.clone()),
             request_path: self.request_path.clone(),
             peer: self.peer,
+            native: Some(native.clone()),
             turn: Some(turn),
             media: None,
         };
@@ -1314,7 +1413,8 @@ impl Connection {
             ctx.last_attempted.clone_from(&s.last);
             ctx.pinned_attempted = s.pinned_attempted;
             ctx.attempted_mode = s.mode;
-            ctx.preserve_output = s.preserve_output;
+            ctx.native_served = native.served();
+            ctx.preserve_output = s.preserve_output || ctx.native_served;
             ctx.codex_socket = s.codex_socket;
         }
         match result? {
@@ -1408,7 +1508,18 @@ impl Connection {
                 Some(Ok(chunk)) => chunk,
             };
             deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
-            for mut payload in payloads_from_chunk(&chunk) {
+            // A native turn's chunk is one upstream frame, relayed as it arrived.
+            let payloads = if ctx.native_served {
+                let frame = String::from_utf8_lossy(&chunk).into_owned();
+                if frame.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![frame]
+                }
+            } else {
+                payloads_from_chunk(&chunk)
+            };
+            for mut payload in payloads {
                 let kind = gjson::get(&payload, "type").str().to_owned();
                 if kind == "response.created" {
                     response_started = true;
@@ -1654,6 +1765,11 @@ async fn close_for_failure(socket: &mut Sink, failure: &Failure, codex_client: b
     } else if let Some(limit) = failure.limit.as_ref().filter(|_| codex_client) {
         socket.event("response", limit.as_bytes());
         let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(limit.clone().into()))).await;
+    } else if let Some(frame) = &failure.delivered {
+        // A native Codex turn: the provider's frame, as sent (docs/codex/CONTRACT.md
+        // "Native WebSocket route").
+        socket.event("response", frame.as_bytes());
+        let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(frame.clone().into()))).await;
     } else if exposed(failure) {
         let payload = failure
             .payload

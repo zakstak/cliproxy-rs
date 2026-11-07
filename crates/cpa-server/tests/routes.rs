@@ -1420,6 +1420,7 @@ async fn session_turns_honour_pin_callback_and_session() {
         execution_session: Some("ws-1".into()),
         request_path: "/v1/responses".into(),
         peer: None,
+        native: None,
         turn: Some(turn),
         media: None,
     };

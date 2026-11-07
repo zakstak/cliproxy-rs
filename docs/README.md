@@ -11,5 +11,6 @@ New here? Start with [Getting started](GETTING-STARTED.md).
 | [Install](INSTALL.md) | Supported hosts (Linux and the Linux container), building from source, Docker, the install script, starting at login |
 | [Moving from CLIProxyAPI](MIGRATING-FROM-GO.md) | Switching from the Go server and back |
 | [Differences from CLIProxyAPI](DIFFERENCES-FROM-GO.md) | What behaves differently on purpose, and what cliproxy-rs adds |
+| [Codex wire contract](codex/CONTRACT.md) | What Codex routes send and deliver, per endpoint and transport, from first-party Codex and OpenAI's documentation |
 | [Compatibility and parity](PARITY.md) | What works today and the item-by-item audit against CLIProxyAPI |
 | [Benchmarks](BENCHMARKS.md) | Memory, startup and throughput against CLIProxyAPI |

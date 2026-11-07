@@ -42,7 +42,7 @@
   <Load res={store.config} what="Payload rules">
     {#snippet children()}
       <section class="section">
-        <p class="muted">{kinds.find((k) => k[0] === kind)?.[1]} Rules match on model name and, optionally, protocol.</p>
+        <p class="muted">{kinds.find((k) => k[0] === kind)?.[1]} Rules match on model and protocol, never Codex.</p>
         {#if rules.length}
           <ul class="list">
             {#each rules as rule, i}

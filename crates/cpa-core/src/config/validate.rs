@@ -1,18 +1,56 @@
 //! Go's custom checks in `ParseConfigBytes` beyond YAML shape: credential in-flight
 //! bounds (internal/config/credential_in_flight.go), the Codex Live media relay
 //! (internal/config/codex_live.go), and the model catalog sources Go checks while
-//! decoding (internal/registry/catalog_config.go). Messages are Go's.
+//! decoding (internal/registry/catalog_config.go). Messages are Go's, except for the
+//! Codex identity check, which Go does not have (#26, docs/DIFFERENCES-FROM-GO.md).
 
 use anyhow::{Result, bail};
 use serde_yaml_ng::Value;
 
 use super::go_url;
 
-/// Runs both checks on the canonical v8 document.
+/// Runs the checks on the canonical v8 document.
 pub(super) fn go_custom(doc: &Value) -> Result<()> {
     let at = |path: &[&str]| path.iter().try_fold(doc, |node, part| node.get(*part));
     in_flight(at(&["credentials", "in-flight"]))?;
-    live_media_relay(at(&["oauth", "providers", "codex", "live-media-relay"]))
+    live_media_relay(at(&["oauth", "providers", "codex", "live-media-relay"]))?;
+    codex_identity(at(&["oauth", "providers", "codex", "header-defaults"]))
+}
+
+/// The Codex `header-defaults.user-agent` (legacy `codex-header-defaults`) set the
+/// identity of every OAuth Codex request. Codex requests now send the caller's own
+/// identity or cliproxy-rs's (#26), so a configured value is refused rather than
+/// silently ignored: at startup, on a reload (the running config stays) and on a
+/// Management API write. `beta-features` is protocol negotiation and stays.
+fn codex_identity(section: Option<&Value>) -> Result<()> {
+    if text(section, "user-agent", "").trim().is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "oauth.providers.codex.header-defaults.user-agent is no longer supported: Codex requests send \
+         the caller's own User-Agent or cliproxy-rs's; remove the setting (see docs/DIFFERENCES-FROM-GO.md)"
+    )
+}
+
+/// A `codex-api-key` model marked `is-compat` chose Go's compatibility rewrites for a
+/// Codex request: the compat Claude translator and dropped output replay. Codex requests
+/// are no longer rewritten (#28): the `compatible` profile forwards the native body and
+/// the translated route has one strict conversion, so the flag would silently do nothing.
+/// It is refused at startup, on a reload (the running config stays) and on a Management
+/// API write. Other providers keep `is-compat`.
+pub(super) fn codex_compat(cfg: &super::Config) -> Result<()> {
+    for entry in super::credentials::api_key_entries(cfg, "codex") {
+        for (i, model) in entry.models.iter().enumerate() {
+            if model.get("is-compat") == Some(&serde_json::Value::Bool(true)) {
+                bail!(
+                    "codex-api-key[{}].models[{i}].is-compat is no longer supported: Codex requests are not \
+                     rewritten for compatible upstreams; remove the flag (see docs/DIFFERENCES-FROM-GO.md)",
+                    entry.index
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v8.0.35 `CatalogSources.Validate` (internal/registry/catalog_config.go): each model
@@ -267,6 +305,66 @@ pub fn parse_duration(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{Value, go_is_abs, in_flight, parse_duration};
+
+    /// #26: a configured Codex `header-defaults.user-agent` is refused in the v8 layout
+    /// and through each legacy spelling that migrates to it; an empty one and
+    /// `beta-features` stay valid. The message names the key, never its value.
+    #[test]
+    fn codex_user_agent_default_is_refused() {
+        let refused = [
+            "oauth: {providers: {codex: {header-defaults: {user-agent: 'codex-tui/0.154.0 (Mac OS 26.5.2; arm64)'}}}}\n",
+            "codex-header-defaults: {user-agent: legacy-agent}\n",
+            "codex: {header-defaults: {user-agent: flat-agent}}\n",
+        ];
+        for yaml in refused {
+            let error = crate::config::Config::parse(yaml).expect_err(yaml).to_string();
+            assert!(
+                error.contains("oauth.providers.codex.header-defaults.user-agent is no longer supported"),
+                "{error}"
+            );
+            assert!(!error.contains("Mac OS") && !error.contains("legacy-agent"), "{error}");
+            assert!(
+                crate::config::Config::parse_payload(yaml).is_err(),
+                "Management API writes too"
+            );
+        }
+        for yaml in [
+            "oauth: {providers: {codex: {header-defaults: {user-agent: '', beta-features: b1}}}}\n",
+            "oauth: {providers: {codex: {header-defaults: {beta-features: b1}}}}\n",
+            "upstream: {claude: {header-defaults: {user-agent: claude-cli/2.0}}}\n",
+        ] {
+            assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");
+        }
+    }
+
+    /// #28: a `codex-api-key` model marked `is-compat` is refused, in the legacy and the
+    /// v8 layout, at load and on a Management API write (`parse_payload`); `false`, a
+    /// Codex model without the flag and every other provider's `is-compat` stay valid.
+    #[test]
+    fn codex_is_compat_is_refused() {
+        let refused = [
+            "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, alias: b, is-compat: true}]}]\n",
+            "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://x.test\n      models: [{name: m}, {name: a, alias: b, is-compat: true}]\n      keys: [{api-key: k}]\n",
+        ];
+        for yaml in refused {
+            let error = crate::config::Config::parse(yaml).expect_err(yaml).to_string();
+            assert!(error.contains(".is-compat is no longer supported"), "{error}");
+            assert!(error.starts_with("codex-api-key[0].models["), "{error}");
+            assert!(
+                crate::config::Config::parse_payload(yaml).is_err(),
+                "Management API writes too"
+            );
+        }
+        for yaml in [
+            "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, is-compat: false}]}]\n",
+            "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a}]}]\n",
+            "claude-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, alias: b, is-compat: true}]}]\n",
+            "gemini-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
+            "xai-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
+        ] {
+            assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");
+        }
+    }
 
     /// Go 1.26.4 `TestIsAbs` (path/filepath/path_test.go): `isabstests`.
     #[test]
