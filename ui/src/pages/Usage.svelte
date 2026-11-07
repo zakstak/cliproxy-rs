@@ -33,7 +33,7 @@
   // record off the usage queue, so collectors and other tabs see every record too.
   const feed = "/observability/usage/live";
   let live = $state(false),
-    cursor: number | null = null,
+    cursor: string | null = null,
     // Bumped on start and stop, so a read that was in flight cannot move the new cursor.
     run = 0,
     events = $state.raw<Event[]>([]),
@@ -41,7 +41,7 @@
     missed = $state(false),
     statistics = $state(true);
   const stats = $derived(usageStats(events));
-  const read = async (after: number | null) => {
+  const read = async (after: string | null) => {
     const page = livePage(await api(after === null ? feed : `${feed}?after=${after}`));
     statistics = page.statistics;
     return page;

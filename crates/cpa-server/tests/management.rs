@@ -2559,7 +2559,7 @@ async fn usage_live_observes_without_taking_records_from_the_queue() {
         }
         r.send()
     };
-    let live = |after: Option<u64>| {
+    let live = |after: Option<String>| {
         let q = after.map_or(String::new(), |a| format!("?after={a}"));
         get(
             format!("v8/management/observability/usage/live{q}"),
@@ -2575,7 +2575,7 @@ async fn usage_live_observes_without_taking_records_from_the_queue() {
             )
             .send()
     };
-    let cursor = |v: &Value| v["cursor"].as_u64().unwrap();
+    let cursor = |v: &Value| v["cursor"].as_str().unwrap().to_owned();
     let ids = |records: &Value| -> Vec<String> {
         records
             .as_array()
@@ -2591,7 +2591,7 @@ async fn usage_live_observes_without_taking_records_from_the_queue() {
         let r = get("v8/management/observability/usage/live".into(), key).await.unwrap();
         assert_eq!(r.status(), 401, "key {key:?}");
     }
-    for q in ["?after=x", "?after=-1", "?count=0", "?count=x"] {
+    for q in ["?after=x", "?after=1", "?after=-1", "?count=0", "?count=x"] {
         let r = get(
             format!("v8/management/observability/usage/live{q}"),
             Some("fake-management-only"),
@@ -2636,6 +2636,25 @@ async fn usage_live_observes_without_taking_records_from_the_queue() {
     assert_eq!(again["records"], a["records"], "re-reading takes nothing");
     let empty: Value = live(Some(cursor(&a))).await.unwrap().json().await.unwrap();
     assert_eq!(empty["records"], json!([]));
+    // A cursor from another process (another epoch) with an in-range number: a gap,
+    // and every kept record, instead of silently skipping some.
+    let (epoch, seq) = cursor(&a)
+        .split_once('.')
+        .map(|(e, s)| (e.to_owned(), s.parse::<u64>().unwrap()))
+        .unwrap();
+    let foreign_epoch = if epoch == "0000000000000000" {
+        "0000000000000001"
+    } else {
+        "0000000000000000"
+    };
+    let foreign: Value = live(Some(format!("{foreign_epoch}.{}", seq - 2)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(foreign["gap"], true);
+    assert_eq!(foreign["records"], a["records"]);
 
     // The collector still gets every record, split across both queue spellings.
     let first: Value = get(

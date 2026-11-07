@@ -114,7 +114,7 @@ impl Default for UsageQueue {
             items: Mutex::default(),
             usage_subscribers: std::sync::Arc::default(),
             error_subscribers: std::sync::Arc::default(),
-            live: Mutex::default(),
+            live: Mutex::new(LiveFeed::new()),
         }
     }
 }
@@ -251,7 +251,7 @@ impl UsageQueue {
 
     /// One page of the dashboard's live feed after `after` (see [`LiveFeed::read`]).
     /// Nothing is removed: the queue and other readers are unaffected.
-    pub fn live_read(&self, after: Option<u64>, count: usize) -> LivePage {
+    pub fn live_read(&self, after: Option<LiveCursor>, count: usize) -> LivePage {
         self.live_lock().read(after, count, Instant::now())
     }
 
@@ -279,8 +279,10 @@ pub const LIVE_IDLE: Duration = Duration::from_secs(60);
 /// state per reader. Memory is bounded by [`LIVE_MAX_RECORDS`] and [`LIVE_MAX_BYTES`]
 /// whatever the number of readers; a reader that falls behind gets a gap, never
 /// back-pressure on the request path.
-#[derive(Default)]
 struct LiveFeed {
+    /// Random per feed (so per process): cursors from another feed are recognised by
+    /// it, however their sequence numbers compare with this one's.
+    epoch: u64,
     /// A contiguous run of sequence numbers, oldest first.
     records: VecDeque<(u64, Arc<[u8]>)>,
     bytes: usize,
@@ -298,7 +300,7 @@ pub struct LivePage {
     /// The records after the reader's cursor, oldest first.
     pub records: Vec<Arc<[u8]>>,
     /// The cursor for the next read.
-    pub cursor: u64,
+    pub cursor: LiveCursor,
     /// Records between the reader's cursor and this page are no longer available:
     /// they were evicted, arrived while nobody watched, or the cursor is not from this
     /// process.
@@ -307,7 +309,54 @@ pub struct LivePage {
     pub more: bool,
 }
 
+/// A position in one live feed, opaque to readers: `<16 hex digits of the feed's
+/// epoch>.<sequence number>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveCursor {
+    epoch: u64,
+    seq: u64,
+}
+
+impl std::fmt::Display for LiveCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}.{}", self.epoch, self.seq)
+    }
+}
+
+impl std::str::FromStr for LiveCursor {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let (epoch, seq) = s.split_once('.').ok_or(())?;
+        if epoch.len() != 16
+            || !epoch.bytes().all(|b| b.is_ascii_hexdigit())
+            || !seq.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(());
+        }
+        Ok(Self {
+            epoch: u64::from_str_radix(epoch, 16).map_err(|_| ())?,
+            seq: seq.parse().map_err(|_| ())?,
+        })
+    }
+}
+
 impl LiveFeed {
+    fn new() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4().as_u64_pair().0,
+            records: VecDeque::new(),
+            bytes: 0,
+            last: 0,
+            floor: 0,
+            read_at: None,
+        }
+    }
+
+    fn cursor(&self, seq: u64) -> LiveCursor {
+        LiveCursor { epoch: self.epoch, seq }
+    }
+
     fn watched(&self, now: Instant) -> bool {
         self.read_at
             .is_some_and(|at| now.saturating_duration_since(at) <= LIVE_IDLE)
@@ -340,19 +389,21 @@ impl LiveFeed {
     }
 
     /// Records after `after`, at most `count`. Without a cursor the reader starts at
-    /// the newest record and gets none. A cursor before the floor, or after the last
-    /// sequence number (another process), reads from the oldest kept record with `gap`.
-    fn read(&mut self, after: Option<u64>, count: usize, now: Instant) -> LivePage {
+    /// the newest record and gets none. A cursor from another feed (another process),
+    /// before the floor or past the last sequence number reads from the oldest kept
+    /// record with `gap`.
+    fn read(&mut self, after: Option<LiveCursor>, count: usize, now: Instant) -> LivePage {
         self.read_at = Some(now);
         let Some(after) = after else {
             return LivePage {
                 records: Vec::new(),
-                cursor: self.last,
+                cursor: self.cursor(self.last),
                 gap: false,
                 more: false,
             };
         };
-        let gap = after < self.floor || after > self.last;
+        let gap = after.epoch != self.epoch || after.seq < self.floor || after.seq > self.last;
+        let after = after.seq;
         let from = if gap { self.floor } else { after };
         // Every kept record is newer than the floor, and their numbers are contiguous.
         let skip = self.records.front().map_or(0, |(first, _)| {
@@ -362,7 +413,7 @@ impl LiveFeed {
         let cursor = records.last().map_or(from, |(seq, _)| *seq);
         LivePage {
             records: records.into_iter().map(|(_, payload)| payload.clone()).collect(),
-            cursor,
+            cursor: self.cursor(cursor),
             gap,
             more: self.records.back().is_some_and(|(seq, _)| *seq > cursor),
         }
@@ -575,8 +626,9 @@ mod tests {
         let q = on();
         let cursor = q.live_read(None, 10).cursor;
         q.enqueue(b"a".to_vec());
-        let page = q.live_read(Some(9_999), 10);
-        assert!(page.gap, "a cursor from another process");
+        let past = LiveCursor { seq: 9_999, ..cursor };
+        let page = q.live_read(Some(past), 10);
+        assert!(page.gap, "a sequence number this feed never reached");
         assert_eq!(texts(&page), [b"a".as_slice()]);
         q.configure(false, &cfg("{}\n"));
         q.configure(true, &cfg("observability: {usage: {usage-statistics-enabled: true}}\n"));
@@ -585,5 +637,55 @@ mod tests {
         q.configure(true, &cfg("{}\n"));
         q.enqueue(b"statistics off".to_vec());
         assert!(q.live_read(Some(page.cursor), 10).records.is_empty());
+    }
+
+    /// A replacement process numbers its records from 1 again. A cursor from the old
+    /// process whose number falls inside the new range must not skip the new records.
+    #[test]
+    fn cursors_from_another_feed_with_overlapping_numbers_report_a_gap() {
+        let old = on();
+        let start = old.live_read(None, 10).cursor;
+        for i in 0..3 {
+            old.enqueue(format!("old-{i}").into_bytes());
+        }
+        let old_cursor = old.live_read(Some(start), 10).cursor;
+        assert_eq!(old_cursor.seq, 3);
+
+        let new = on();
+        new.live_read(None, 10);
+        for i in 0..5 {
+            new.enqueue(format!("new-{i}").into_bytes());
+        }
+        let page = new.live_read(Some(old_cursor), 10);
+        assert!(page.gap, "another feed's cursor");
+        assert_eq!(
+            texts(&page),
+            [b"new-0".as_slice(), b"new-1", b"new-2", b"new-3", b"new-4"],
+            "nothing skipped although 3 is within the new range"
+        );
+        assert!(
+            !new.live_read(Some(page.cursor), 10).gap,
+            "the new cursor is continuous"
+        );
+    }
+
+    #[test]
+    fn cursors_round_trip_and_reject_anything_else() {
+        let c = LiveCursor { epoch: 0xab, seq: 42 };
+        assert_eq!(c.to_string(), "00000000000000ab.42");
+        assert_eq!("00000000000000ab.42".parse(), Ok(c));
+        for bad in [
+            "",
+            "42",
+            "ab.42",
+            "00000000000000ab.",
+            "00000000000000ab.-1",
+            "00000000000000zz.1",
+            "00000000000000ab.1.2",
+            "000000000000000ab.1",
+            "00000000000000ab.99999999999999999999",
+        ] {
+            assert!(bad.parse::<LiveCursor>().is_err(), "{bad}");
+        }
     }
 }

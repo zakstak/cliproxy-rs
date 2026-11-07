@@ -203,16 +203,16 @@ pub(crate) async fn usage_queue(State(state): State<Arc<Management>>, RawQuery(r
 /// of the previous answer; without it the reader starts at the newest record. `count`
 /// (default and maximum [`crate::usage::LIVE_MAX_PAGE`]) bounds one page.
 ///
-/// `{"cursor": n, "gap": bool, "more": bool, "usage_statistics_enabled": bool,
+/// `{"cursor": "opaque", "gap": bool, "more": bool, "usage_statistics_enabled": bool,
 /// "records": [...]}`. Records are embedded byte for byte when they are JSON and as a
 /// JSON string otherwise, like the queue.
 pub(crate) async fn usage_live(State(state): State<Arc<Management>>, RawQuery(raw): RawQuery) -> Response {
     let q = Query::parse(raw);
     let after = match q.first("after").trim() {
         "" => None,
-        v => match v.parse::<u64>() {
-            Ok(n) => Some(n),
-            Err(_) => return fail(StatusCode::BAD_REQUEST, "after must be a cursor from a previous answer"),
+        v => match v.parse::<crate::usage::LiveCursor>() {
+            Ok(c) => Some(c),
+            Err(()) => return fail(StatusCode::BAD_REQUEST, "after must be a cursor from a previous answer"),
         },
     };
     let count = match q.first("count").trim() {
@@ -227,7 +227,7 @@ pub(crate) async fn usage_live(State(state): State<Arc<Management>>, RawQuery(ra
     let queue = state.rt.usage_queue();
     let page = queue.live_read(after, count);
     let mut out = format!(
-        r#"{{"cursor":{},"gap":{},"more":{},"usage_statistics_enabled":{},"records":["#,
+        r#"{{"cursor":"{}","gap":{},"more":{},"usage_statistics_enabled":{},"records":["#,
         page.cursor,
         page.gap,
         page.more,

@@ -7,12 +7,12 @@
 // 2026-11-03 to 52,000 B for 0.4.2's owner-approved Accounts page, Connect result and
 // sign-in recovery, and on 2026-11-05 to 53,500 B once the Connect result was built (the
 // 52,000 B line was set before it existed; the Accounts search box was already cut), and on
-// 2026-11-07 to 53,800 B for the non-destructive live usage feed (cursor, gap and
-// statistics-off notes; issue #12), pending owner approval.
+// 2026-11-07 to 53,900 B for the non-destructive live usage feed (cursor, gap and
+// statistics-off notes, Rust-only route policy; issue #12), pending owner approval.
 import { readdirSync, readFileSync, copyFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 
-const BUDGET = { js: 53_800, css: 6_853 };
+const BUDGET = { js: 53_900, css: 6_853 };
 
 copyFileSync("dist/index.html", "dist/management.html");
 const html = readFileSync("dist/index.html", "utf8");
