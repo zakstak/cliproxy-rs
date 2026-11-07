@@ -25,7 +25,7 @@ use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
-pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput};
+pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
 
 pub struct CodexExecutor {
     /// Chrome profile for chatgpt.com, Go's standard transport elsewhere, per proxy.

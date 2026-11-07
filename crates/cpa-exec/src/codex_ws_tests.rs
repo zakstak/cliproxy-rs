@@ -1819,3 +1819,65 @@ fn ws_url_follows_go() {
         }
     }
 }
+
+fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        headers.insert(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    headers
+}
+
+/// Only `x-codex-turn-state` and `openai-model` leave the handshake, in an event Codex
+/// reads; cookies, credentials and other upstream headers never do.
+#[test]
+fn handshake_metadata_event_carries_only_the_allowlist() {
+    let handshake = header_map(&[
+        ("x-codex-turn-state", "ts-upstream"),
+        ("openai-model", "gpt-served"),
+        ("x-reasoning-included", ""),
+        ("set-cookie", "session=SECRET"),
+        ("authorization", "Bearer SECRET"),
+        ("x-request-id", "req-1"),
+        ("x-openai-model", "other"),
+    ]);
+    let event = handshake_metadata_event(&handshake).expect("an event");
+    assert_eq!(
+        event,
+        r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-upstream","openai-model":"gpt-served"}}"#
+    );
+
+    let model_only = header_map(&[("openai-model", "gpt-served"), ("x-codex-turn-state", "  ")]);
+    assert_eq!(
+        handshake_metadata_event(&model_only).as_deref(),
+        Some(r#"{"type":"response.metadata","headers":{"openai-model":"gpt-served"}}"#)
+    );
+    // Codex reads `x-reasoning-included` only from a handshake; an event cannot carry it.
+    let reasoning_only = header_map(&[("x-reasoning-included", ""), ("set-cookie", "a=b")]);
+    assert_eq!(handshake_metadata_event(&reasoning_only), None);
+    assert_eq!(handshake_metadata_event(&HeaderMap::new()), None);
+}
+
+/// Upstream's `openai-model` reaches the server only when the proxy sent the client's
+/// model unchanged; otherwise Codex would report the proxy's own rewrite as a reroute.
+#[test]
+fn returned_handshake_drops_the_model_the_proxy_rewrote() {
+    assert!(model_kept(br#"{"model":"gpt-5.5"}"#, r#"{"model":"gpt-5.5"}"#));
+    assert!(model_kept(br#"{"model":"GPT-5.5"}"#, r#"{"model":"gpt-5.5"}"#));
+    assert!(!model_kept(br#"{"model":"gpt-alias"}"#, r#"{"model":"gpt-5.5"}"#));
+    assert!(!model_kept(br#"{"model":"gpt-5.5(high)"}"#, r#"{"model":"gpt-5.5"}"#));
+    assert!(!model_kept(br#"{"input":[]}"#, r#"{"model":"gpt-5.5"}"#));
+    // ASCII case only, as Codex compares: the Kelvin sign is not `k`.
+    assert!(!model_kept("{\"model\":\"\u{212A}\"}".as_bytes(), r#"{"model":"k"}"#));
+
+    let handshake = header_map(&[("openai-model", "gpt-5.5"), ("x-codex-turn-state", "ts")]);
+    let kept = returned_handshake(Some(handshake.clone()), true);
+    assert_eq!(kept, handshake);
+    let rewritten = returned_handshake(Some(handshake), false);
+    assert!(rewritten.get("openai-model").is_none());
+    assert_eq!(rewritten.get("x-codex-turn-state").unwrap(), "ts");
+    assert!(returned_handshake(None, true).is_empty());
+}

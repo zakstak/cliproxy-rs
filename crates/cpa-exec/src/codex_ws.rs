@@ -1558,6 +1558,7 @@ impl CodexExecutor {
                 (input, initial)
             });
         let guard = session.turn.clone().lock_owned().await;
+        let model_kept = model_kept(&req.original_body, &body);
         let frame = request_frame(body);
         let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
@@ -1657,7 +1658,7 @@ impl CodexExecutor {
             let stream = duplex::Duplex::start(turn, input, initial, req, view, settings, &exec_session.id).await;
             return Ok(ExecResponse {
                 status: 200,
-                headers: handshake.unwrap_or_default(),
+                headers: returned_handshake(handshake, model_kept),
                 body: ResponseBody::Stream(stream),
             });
         }
@@ -1676,10 +1677,61 @@ impl CodexExecutor {
         };
         Ok(ExecResponse {
             status: 200,
-            headers: handshake.unwrap_or_default(),
+            headers: returned_handshake(handshake, model_kept),
             body: ResponseBody::Stream(writes.gate(stream)),
         })
     }
+}
+
+/// Codex's handshake header naming the model that served the request.
+const OPENAI_MODEL: &str = "openai-model";
+/// Codex's sticky-routing token for the turn.
+const TURN_STATE: &str = "x-codex-turn-state";
+
+/// Whether the frame sent upstream names the model the client asked for. Codex compares
+/// `openai-model` with the model it sent, ignoring ASCII case.
+fn model_kept(original: &[u8], upstream: &str) -> bool {
+    use cpa_common::json::{Kind, get};
+    let (original, upstream) = (get(original, "model"), get(upstream.as_bytes(), "model"));
+    original.kind == Kind::String && upstream.kind == Kind::String && original.s.eq_ignore_ascii_case(&upstream.s)
+}
+
+/// The handshake of a turn that opened its socket, as the server sees it. Codex treats
+/// an `openai-model` that differs from the model it sent as a reroute and warns the user
+/// that the account was flagged. When this proxy changed the model (alias, payload rule,
+/// thinking suffix), upstream's answer describes that change, so it is dropped. A reused
+/// socket has no handshake.
+fn returned_handshake(handshake: Option<HeaderMap>, model_kept: bool) -> HeaderMap {
+    let mut handshake = handshake.unwrap_or_default();
+    if !model_kept {
+        handshake.remove(OPENAI_MODEL);
+    }
+    handshake
+}
+
+/// Handshake metadata from a newly opened upstream socket, as a `response.metadata` event
+/// that a Codex client reads: `x-codex-turn-state` and `openai-model` from its `headers`.
+/// The downstream socket was upgraded before the first request chose a credential and a
+/// model, so these headers cannot go into its handshake. Codex reads
+/// `x-reasoning-included` only from a handshake, so it is not carried. Only the
+/// headers named here are carried; `None` when the handshake has none of them.
+pub fn handshake_metadata_event(handshake: &HeaderMap) -> Option<String> {
+    let mut headers = serde_json::Map::new();
+    for name in [TURN_STATE, OPENAI_MODEL] {
+        let value = handshake
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if let Some(value) = value {
+            headers.insert(name.to_owned(), value.into());
+        }
+    }
+    if headers.is_empty() {
+        return None;
+    }
+    let event = serde_json::json!({"type": "response.metadata", "headers": headers});
+    Some(event.to_string())
 }
 
 /// tungstenite's reports of a peer that went away without a close frame, which
