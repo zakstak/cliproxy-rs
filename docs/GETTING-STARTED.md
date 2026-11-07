@@ -4,19 +4,9 @@ This guide connects a coding tool to your own accounts or API keys through clipr
 
 ## 1. Install and start it
 
-On macOS or Linux:
+This fork has published no release binaries yet. On Linux, [build from source](INSTALL.md#from-source) and [write the config](INSTALL.md#first-run-without-the-install-script). On Windows or macOS, run the proxy in the Linux container, as [INSTALL.md](INSTALL.md#windows-and-macos-run-the-linux-container) shows. Either way, continue at step 2. This fork has no native Windows or macOS build, but your tools on those systems connect to the container the same way.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh
-```
-
-On Windows, in PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1 | iex
-```
-
-The script downloads the release for your machine and checks it against the release's `SHA256SUMS`. It writes `~/.cliproxy-rs/config.yaml` with two new keys, starts the server in the background and checks that it answers. It ends like this:
+Once this fork publishes a release, `sh install.sh` from a checkout does the setup for you. The script downloads the release for your machine and checks it against the release's `SHA256SUMS`. It writes `~/.cliproxy-rs/config.yaml` with two new keys, starts the server in the background and checks that it answers. It ends like this:
 
 ```text
 cliproxy-rs is running at http://127.0.0.1:8317
@@ -36,7 +26,7 @@ Only you can read the file, and the script never prints the keys. Run the same c
 
 ## 2. Open the dashboard
 
-The script opens <http://127.0.0.1:8317/management.html> in your browser (use your port if it picked another). Sign in with `CLIPROXY_MANAGEMENT_KEY`. On a server without a browser, open an SSH tunnel from your own computer first, as [INSTALL.md](INSTALL.md#with-the-install-script) shows.
+Open <http://127.0.0.1:8317/management.html> in your browser (use your port if you picked another; the install script opens it for you). Sign in with `CLIPROXY_MANAGEMENT_KEY`. On a server without a browser, open an SSH tunnel from your own computer first, as [INSTALL.md](INSTALL.md#with-the-install-script) shows.
 
 On a new server, the Overview shows a short Get started card with three steps: connect an account, point a tool at the proxy, and send a test request. It goes away once all three are done, or when you dismiss it.
 

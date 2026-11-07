@@ -18,10 +18,8 @@ uname -s; uname -m
 
 | Output | Use |
 |---|---|
-| `Linux` with `x86_64` or `aarch64` | `install.sh` (step 3) |
-| `Darwin` with `arm64` or `x86_64` | `install.sh` (step 3) |
-| Windows (no `uname`, or `MINGW`/`MSYS` in its output) | `install.ps1` in PowerShell (step 3), or WSL with `install.sh` |
-| anything else | build from source (step 3) |
+| `Linux` | build from source (step 3) |
+| `Darwin`, or Windows (no `uname`, or `MINGW`/`MSYS` in its output) | Stop. This fork runs only on Linux. Tell the user, and offer the Linux container ([INSTALL.md](INSTALL.md#windows-and-macos-run-the-linux-container)) or a Linux machine or WSL distribution, where you continue at step 2. |
 
 ## 2. Look for an existing install
 
@@ -31,32 +29,20 @@ ls -d ~/.cliproxy-rs ~/.cli-proxy-api 2>/dev/null
 curl -s -m 2 http://127.0.0.1:8317/healthz; echo " exit=$?"
 ```
 
-- If `~/.cliproxy-rs/config.yaml` exists, cliproxy-rs is already set up. Ask the user before going on. Running the installer again only upgrades the binary and restarts the server; it never changes the config or the keys.
-- If `cli-proxy-api` or `CLIProxyAPI` exists, or `~/.cli-proxy-api` exists, or something answers on port 8317, the user probably runs CLIProxyAPI. Tell the user and ask: migrate it (see [Migrating from CLIProxyAPI](#migrating-from-cliproxyapi)) or install cliproxy-rs next to it. The installer installs next to it without touching it: it takes the next free port and its own auth folder.
+- If `~/.cliproxy-rs/config.yaml` exists, cliproxy-rs is already set up. Ask the user before going on. Rebuilding only replaces the binary; never overwrite the config or `keys.env`.
+- If `cli-proxy-api` or `CLIProxyAPI` exists, or `~/.cli-proxy-api` exists, or something answers on port 8317, the user probably runs CLIProxyAPI. Tell the user and ask: migrate it (see [Migrating from CLIProxyAPI](#migrating-from-cliproxyapi)) or install cliproxy-rs next to it. To install next to it, pick another free port in step 3 and keep the auth folder separate.
 
 ## 3. Install, configure and start
 
-On macOS and Linux:
+This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) has published no release binaries yet, so build it from source. Do not use the upstream `vayungodara/cliproxy-rs` installer: it installs upstream builds, not this fork. The build needs `git`, a Rust toolchain (`cargo`), `cmake`, `clang` and `perl`; ask the user before installing any of them.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh
+git clone https://github.com/zakstak/cliproxy-rs.git ~/cliproxy-rs-src
+cd ~/cliproxy-rs-src && cargo build --release -p cliproxy
+mkdir -p ~/.local/bin && install -m 0755 target/release/cliproxy ~/.local/bin/cliproxy
 ```
 
-On Windows, in PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1 | iex
-```
-
-The installer:
-
-1. Downloads the release binary, checks it against the release's checksums and installs it as `~/.local/bin/cliproxy` (`%LOCALAPPDATA%\Programs\cliproxy-rs\cliproxy.exe` on Windows).
-2. Writes `~/.cliproxy-rs/config.yaml` (`%USERPROFILE%\.cliproxy-rs` on Windows) with a free port, starting at 8317, and session affinity on. It creates a client key and a management key and saves them in `~/.cliproxy-rs/keys.env`, readable only by the user.
-3. Starts the server in the background, logging to `~/.cliproxy-rs/cliproxy.log`, and waits for `/healthz`.
-
-It prints the dashboard address and file locations, never the keys. If it fails, it says why in one line; read the last lines of `cliproxy.log` (they contain no keys) and fix what they report.
-
-`keys.env` looks like this, with real values:
+Then follow [the first run without the install script](INSTALL.md#first-run-without-the-install-script): use port 8317, or the next free port if something answers there, and `auth-dir: "~/.cliproxy-rs/auth"`. Write the two keys into `~/.cliproxy-rs/keys.env` with `chmod 600`, in this format, with real values:
 
 ```sh
 CLIPROXY_PORT=8317
@@ -64,15 +50,16 @@ CLIPROXY_CLIENT_KEY=sk-...
 CLIPROXY_MANAGEMENT_KEY=...
 ```
 
-If there is no release binary for the system, build from source. That needs `git`, a Rust toolchain (`cargo`), `cmake`, `clang` and `perl`; ask the user before installing any of them. Then follow [the first run without the install script](INSTALL.md#first-run-without-the-install-script), writing the two keys into `~/.cliproxy-rs/keys.env` in the format above with `chmod 600`.
+Start the server in the background and keep its log:
 
 ```sh
-git clone https://github.com/vayungodara/cliproxy-rs.git ~/cliproxy-rs-src
-cd ~/cliproxy-rs-src && cargo build --release -p cliproxy
-mkdir -p ~/.local/bin && install -m 0755 target/release/cliproxy ~/.local/bin/cliproxy
+cd ~/.cliproxy-rs && nohup ~/.local/bin/cliproxy --config ~/.cliproxy-rs/config.yaml >>cliproxy.log 2>&1 &
+echo $! > ~/.cliproxy-rs/cliproxy.pid
 ```
 
-The installer starts the server with `nohup`, which keeps it running until the computer restarts. In a container or sandbox that has its own service or process manager, use that manager instead: stop the background server with `kill $(cat ~/.cliproxy-rs/cliproxy.pid)` and run `~/.local/bin/cliproxy --config ~/.cliproxy-rs/config.yaml` under the manager.
+This keeps it running until the computer restarts. If it fails, read the last lines of `cliproxy.log` (they contain no keys) and fix what they report. In a container or sandbox that has its own service or process manager, run the same command under that manager instead.
+
+Once this fork publishes a release, `sh ~/cliproxy-rs-src/install.sh` does this step for you. Until then it stops with `no release is published yet`.
 
 ## 4. Verify
 
@@ -82,25 +69,11 @@ curl -fsS "http://127.0.0.1:$CLIPROXY_PORT/healthz"; echo
 curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $CLIPROXY_CLIENT_KEY" "http://127.0.0.1:$CLIPROXY_PORT/v1/models"
 ```
 
-On Windows, in PowerShell:
-
-```powershell
-$k = @{}; Get-Content ~\.cliproxy-rs\keys.env | Where-Object { $_ -match '^(\w+)=(.*)$' } | ForEach-Object { $k[$Matches[1]] = $Matches[2] }
-Invoke-RestMethod "http://127.0.0.1:$($k.CLIPROXY_PORT)/healthz"
-(Invoke-WebRequest "http://127.0.0.1:$($k.CLIPROXY_PORT)/v1/models" -Headers @{ Authorization = "Bearer $($k.CLIPROXY_CLIENT_KEY)" } -UseBasicParsing).StatusCode
-```
-
-Expect `{"status":"ok"}` (PowerShell shows `status: ok`) and then `200`. A `401` means the key in `keys.env` and the one in `config.yaml` differ.
+Expect `{"status":"ok"}` and then `200`. A `401` means the key in `keys.env` and the one in `config.yaml` differ.
 
 ## 5. Start at login (only if the user wants it)
 
-Ask the user first. If they agree, run the installer again with `--service`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh -s -- --service
-```
-
-On Windows: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.ps1))) -Service`. This adds a systemd user unit on Linux, a launchd agent on macOS or a sign-in entry on Windows; [INSTALL.md](INSTALL.md#start-at-login) has the details and how to undo it.
+Ask the user first. If they agree, stop the background server (`kill $(cat ~/.cliproxy-rs/cliproxy.pid)`), then write and enable the systemd user unit from [INSTALL.md](INSTALL.md#start-at-login), which also says how to undo it.
 
 ## 6. Open the dashboard
 
@@ -109,7 +82,7 @@ If the user sits at this computer and it has a desktop:
 ```sh
 . ~/.cliproxy-rs/keys.env
 URL="http://127.0.0.1:$CLIPROXY_PORT/management.html"
-(open "$URL" || xdg-open "$URL") >/dev/null 2>&1 || echo "Open $URL in a browser"
+xdg-open "$URL" >/dev/null 2>&1 || echo "Open $URL in a browser"
 ```
 
 If no browser can open here (a server over SSH, a container, a remote sandbox), print the address and tell the user how to reach it from their own computer without exposing it to the internet:
@@ -162,7 +135,7 @@ After the user has signed in, confirm with the `/v1/models` request from step 4:
 
 - Several Claude or Codex accounts: see [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md) for routing strategies and limits.
 - Codex accounts: set `"websockets": true` in each Codex account's file in `~/.cliproxy-rs/auth` to use the faster WebSocket transport.
-- Session affinity: keep `routing.session-affinity: true`, which the installer sets.
+- Session affinity: keep `routing.session-affinity: true` (add it to the config if it is missing).
 - Other machines: use [Tailscale](https://tailscale.com/) instead of opening a port to the internet; see [Reach the proxy from other machines](MULTI-ACCOUNT.md#reach-the-proxy-from-other-machines). Never expose the proxy to the internet without client keys.
 
 ## Migrating from CLIProxyAPI
