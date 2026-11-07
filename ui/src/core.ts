@@ -206,6 +206,33 @@ export function cleanEvent(raw: Data): Event {
     output: Number(raw.tokens?.output_tokens) || 0,
   };
 }
+/** Routes only cliproxy-rs serves. Go is never probed, so they are off there without asking. */
+const rustOnly = new Set(["GET /observability/usage/live"]);
+/**
+ * Whether to offer a route: off when a probe or a call found it missing, and off on Go for
+ * routes Go does not have. `caps` holds "METHOD /path" → false; `path` may carry a query.
+ */
+export const capable = (kind: string, caps: Record<string, false>, method: string, path: string) => {
+  const id = `${method} ${path.split("?")[0]}`;
+  return caps[id] !== false && !(kind === "go" && rustOnly.has(id));
+};
+/** One answer of the cliproxy-rs `GET /observability/usage/live` feed, reduced to display fields. */
+export type LivePage = { cursor: string; gap: boolean; more: boolean; statistics: boolean; events: Event[] };
+const isObject = (v: unknown): v is Data => typeof v === "object" && v !== null && !Array.isArray(v);
+/** Parse a live-feed answer. Anything that is not one throws, so a wrong server cannot pass as an empty feed. */
+export function livePage(raw: unknown): LivePage {
+  if (!isObject(raw) || typeof raw.cursor !== "string" || !/^[0-9a-f]{16}\.\d+$/.test(raw.cursor) || !Array.isArray(raw.records))
+    throw new Error("Unexpected live feed format.");
+  return {
+    cursor: raw.cursor,
+    gap: raw.gap === true,
+    more: raw.more === true,
+    statistics: raw.usage_statistics_enabled !== false,
+    events: raw.records.filter(isObject).map(cleanEvent),
+  };
+}
+/** The live view keeps the last hour, at most 2,000 events, in this tab only. */
+export const keepEvents = (events: Event[], now: number) => events.filter((e) => e.at > now - 60 * 60_000).slice(-2000);
 const median = (v: number[]) => {
   const s = v.filter((n) => n > 0).sort((a, b) => a - b);
   return s.length ? s[Math.floor((s.length - 1) / 2)] : null;

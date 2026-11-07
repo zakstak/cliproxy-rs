@@ -782,7 +782,7 @@ async fn forward_usage(rt: Arc<Runtime>, client: Client, stop: CancellationToken
             // push fails, and the rest goes back to the queue.
             if stop.is_cancelled() || client.lpush_usage(item).await.is_err() {
                 for rest in &items[i..] {
-                    rt.usage_queue().enqueue(rest.clone());
+                    rt.usage_queue().requeue(rest.clone());
                 }
                 if !sleep(Duration::from_secs(1)).await {
                     return;

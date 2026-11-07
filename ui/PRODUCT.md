@@ -15,13 +15,13 @@ They come with these questions, in this order: is traffic flowing, which credent
 
 ## Non-negotiables
 
-- Honest data. Every read shows one of loading, empty, error, not available, or data. Nothing is invented. Telemetry comes from server-side `recent_requests` buckets; the destructive usage queue is opt-in and stays in the tab.
+- Honest data. Every read shows one of loading, empty, error, not available, or data. Nothing is invented. Telemetry comes from server-side `recent_requests` buckets. The live request view reads a separate feed that copies usage records without removing them from the usage queue, starts on request, says when requests were missed, and keeps events in the tab.
 - The management key lives in memory only. It is never written to browser storage. Reloading signs out.
 - Accessibility: a complete keyboard path, visible focus, WCAG AA contrast in both themes, status never shown by colour alone, reduced motion respected.
-- A small, fast bundle: at most 52,000 B of JavaScript and 6,853 B of CSS, gzip. The ceilings began as the sizes of the dashboard this one replaced (42,642 B and 6,853 B); JavaScript was raised three times, for the beginner onboarding, for the Claude usage parser and plan limits, and for 0.4.2's Accounts page, Connect result and sign-in recovery, all asked for. `npm run build` fails past them. No runtime dependencies beyond Svelte, and no chart library.
+- A small, fast bundle: at most 53,900 B of JavaScript and 6,853 B of CSS, gzip. The ceilings began as the sizes of the dashboard this one replaced (42,642 B and 6,853 B). JavaScript was raised for the beginner onboarding, for the Claude usage parser and plan limits, for 0.4.2's Accounts page, Connect result and sign-in recovery (52,000 B), once the Connect result was built (53,500 B), and for the non-destructive live usage feed (53,900 B; the bundle was 53,863 B after that change). `npm run build` fails past them. No runtime dependencies beyond Svelte, and no chart library.
 
 ## Scope
 
 Overview, accounts (credentials with their quotas) and connecting accounts (OAuth, device codes, callback paste, Vertex import), provider API keys, client keys, models (aliases, exclusions, catalog), payload rules, configuration (JSON and YAML with a reviewed diff and a stale-write check), logs, usage, plugins and system.
 
-Out of scope: accounts or billing, a historical telemetry database, invented Rust-only endpoints, and process metrics the API does not expose.
+Out of scope: accounts or billing, a historical telemetry database, Rust-only endpoints other than the live usage feed (which keeps the live view from consuming the usage queue), and process metrics the API does not expose.

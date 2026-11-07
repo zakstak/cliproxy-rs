@@ -2577,6 +2577,219 @@ async fn usage_queue_pops_records_in_order() {
     server.abort();
 }
 
+/// The dashboard's `GET /observability/usage/live` over the served app, with records
+/// produced by real `/v1/messages` requests to a local mock Claude upstream: it needs
+/// the management key, two readers see the same records without competing, and the
+/// queue collector (v8 and v0 spellings) still gets every record it gets with no reader.
+#[tokio::test]
+async fn usage_live_observes_without_taking_records_from_the_queue() {
+    let upstream = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|| async {
+            axum::Json(json!({
+                "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-fake",
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let f = Fixture::from_yaml("usagelive", |auth, hash| {
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\naccess:\n  api-keys: [fake-client]\nobservability:\n  usage:\n    usage-statistics-enabled: true\nclaude-api-key:\n  - api-key: sk-fake-upstream\n    base-url: {upstream_url}\n",
+            auth.display()
+        )
+    });
+    cpa_server::install_registry(&f.rt);
+    // As the binary composes it, minus layers this test does not exercise.
+    let app = cpa_server::observability::router(
+        &f.rt,
+        cpa_server::app(f.rt.clone(), management::router(f.state.clone())),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = wreq::Client::new();
+    let get = |path: String, key: Option<&'static str>| {
+        let mut r = client.get(format!("{base}/{path}"));
+        if let Some(key) = key {
+            r = r.bearer_auth(key);
+        }
+        r.send()
+    };
+    let live = |after: Option<String>| {
+        let q = after.map_or(String::new(), |a| format!("?after={a}"));
+        get(
+            format!("v8/management/observability/usage/live{q}"),
+            Some("fake-management-only"),
+        )
+    };
+    let request = || {
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", "fake-client")
+            .json(
+                &json!({"model": "claude-opus-5-5", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .send()
+    };
+    let cursor = |v: &Value| v["cursor"].as_str().unwrap().to_owned();
+    let ids = |records: &Value| -> Vec<String> {
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["request_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Management auth: no key, a client key and a wrong key are all refused, and no
+    // refused read counts as a viewer.
+    for key in [None, Some("fake-client"), Some("wrong")] {
+        let r = get("v8/management/observability/usage/live".into(), key).await.unwrap();
+        assert_eq!(r.status(), 401, "key {key:?}");
+    }
+    for q in ["?after=x", "?after=1", "?after=-1", "?count=0", "?count=x"] {
+        let r = get(
+            format!("v8/management/observability/usage/live{q}"),
+            Some("fake-management-only"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status(), 400, "{q}");
+    }
+
+    // Baseline with no viewer: the collector gets both records.
+    for _ in 0..2 {
+        let r = request().await.unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    }
+    let baseline: Value = get(
+        "v8/management/observability/usage/queue?count=10".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(baseline.as_array().unwrap().len(), 2);
+
+    // Two dashboard tabs start, then three requests arrive.
+    let tab_a: Value = live(None).await.unwrap().json().await.unwrap();
+    let tab_b: Value = live(None).await.unwrap().json().await.unwrap();
+    assert_eq!(tab_a["records"], json!([]), "a new viewer starts at the newest record");
+    assert_eq!(tab_a["usage_statistics_enabled"], true);
+    for _ in 0..3 {
+        assert_eq!(request().await.unwrap().status(), 200);
+    }
+    let a: Value = live(Some(cursor(&tab_a))).await.unwrap().json().await.unwrap();
+    let b: Value = live(Some(cursor(&tab_b))).await.unwrap().json().await.unwrap();
+    let seen = ids(&a["records"]);
+    assert_eq!(seen.len(), 3);
+    assert!(seen.iter().all(|id| !id.is_empty()) && seen[0] != seen[1] && seen[1] != seen[2]);
+    assert_eq!(a["records"], b["records"], "both tabs see the same records");
+    assert_eq!((a["gap"].as_bool(), a["more"].as_bool()), (Some(false), Some(false)));
+    let again: Value = live(Some(cursor(&tab_a))).await.unwrap().json().await.unwrap();
+    assert_eq!(again["records"], a["records"], "re-reading takes nothing");
+    let empty: Value = live(Some(cursor(&a))).await.unwrap().json().await.unwrap();
+    assert_eq!(empty["records"], json!([]));
+    // A cursor from another process (another epoch) with an in-range number: a gap,
+    // and every kept record, instead of silently skipping some.
+    let (epoch, seq) = cursor(&a)
+        .split_once('.')
+        .map(|(e, s)| (e.to_owned(), s.parse::<u64>().unwrap()))
+        .unwrap();
+    let foreign_epoch = if epoch == "0000000000000000" {
+        "0000000000000001"
+    } else {
+        "0000000000000000"
+    };
+    let foreign: Value = live(Some(format!("{foreign_epoch}.{}", seq - 2)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(foreign["gap"], true);
+    assert_eq!(foreign["records"], a["records"]);
+
+    // The collector still gets every record, split across both queue spellings.
+    let first: Value = get(
+        "v8/management/observability/usage/queue?count=2".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rest: Value = get(
+        "v0/management/usage-queue?count=10".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let mut collected = ids(&first);
+    collected.extend(ids(&rest));
+    assert_eq!(collected, ids(&a["records"]), "same records, same order");
+    // Records are byte-identical to the queue's (the schema is unchanged).
+    assert_eq!(
+        a["records"].as_array().unwrap().iter().collect::<Vec<_>>(),
+        first
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(rest.as_array().unwrap())
+            .collect::<Vec<_>>()
+    );
+
+    // A slow tab that never reads again: the feed stays capped and the queue intact.
+    let slow = cursor(&a);
+    let queue = f.rt.usage_queue();
+    for i in 0..cpa_server::usage::LIVE_MAX_RECORDS + 10 {
+        queue.enqueue(format!(r#"{{"request_id":"synthetic-{i}"}}"#).into_bytes());
+    }
+    let behind: Value = live(Some(slow)).await.unwrap().json().await.unwrap();
+    assert_eq!(behind["gap"], true);
+    assert_eq!(behind["more"], true);
+    assert_eq!(
+        behind["records"].as_array().unwrap().len(),
+        cpa_server::usage::LIVE_MAX_PAGE
+    );
+    assert_eq!(
+        behind["records"][0]["request_id"], "synthetic-10",
+        "the oldest kept record"
+    );
+    let drained: Value = get(
+        "v8/management/observability/usage/queue?count=5000".into(),
+        Some("fake-management-only"),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        drained.as_array().unwrap().len(),
+        cpa_server::usage::LIVE_MAX_RECORDS + 10,
+        "the queue lost nothing to the slow viewer"
+    );
+    server.abort();
+}
+
 /// api-call HEAD: Go's transport never asks for gzip on HEAD, so the upstream sees no
 /// Accept-Encoding and a gzip Content-Encoding on the answer is relayed untouched.
 #[tokio::test]

@@ -4,12 +4,15 @@ import { test } from "node:test";
 import {
   ago,
   buckets,
+  capable,
   cleanEvent,
   credState,
   accountRow,
   equal,
   fieldPath,
+  keepEvents,
   level,
+  livePage,
   lineDiff,
   otherSignals,
   quotaWindows,
@@ -101,6 +104,33 @@ test("usage events keep display fields only and summarise by model", () => {
   assert.deepEqual([s.count, s.failed, s.latency, s.ttft], [3, 1, 100, 40]);
   assert.deepEqual(s.models.map((m) => [m.model, m.count]), [["m", 2], ["daily", 1]]);
   assert.equal(usageStats([]).latency, null);
+});
+
+test("live usage pages parse strictly and keep display fields only", () => {
+  const page = livePage({
+    cursor: "00000000000000ab.7",
+    gap: true,
+    more: false,
+    usage_statistics_enabled: true,
+    records: [{ model: "m", api_key: "secret-client", timestamp: at(0) }, "not json", null],
+  });
+  assert.deepEqual([page.cursor, page.gap, page.more, page.statistics, page.events.length], ["00000000000000ab.7", true, false, true, 1]);
+  assert.equal(JSON.stringify(page).includes("secret"), false);
+  assert.equal(livePage({ cursor: "0000000000000000.0", records: [], usage_statistics_enabled: false }).statistics, false);
+  for (const bad of [[], { cursor: 7, records: [] }, { cursor: "7", records: [] }, { cursor: "00000000000000ab.7" }, null, "x"])
+    assert.throws(() => livePage(bad), /Unexpected live feed format/);
+  const old = cleanEvent({ timestamp: at(-61 * 60_000) });
+  const fresh = Array.from({ length: 2001 }, () => cleanEvent({ timestamp: at(0) }));
+  assert.equal(keepEvents([old, ...fresh], now).length, 2000);
+});
+
+test("Rust-only routes are off on Go without a probe; other routes follow probes", () => {
+  const live = ["GET", "/observability/usage/live?count=0"] as const;
+  assert.equal(capable("go", {}, ...live), false);
+  assert.equal(capable("go", {}, "GET", "/observability/usage/queue?count=0"), true, "Go's own routes stay on");
+  assert.equal(capable("rust", {}, ...live), true);
+  assert.equal(capable("unknown", {}, ...live), true, "until its probe answers");
+  assert.equal(capable("rust", { "GET /observability/usage/live": false }, ...live), false, "a probe or call found it missing");
 });
 
 test("quota is percent used, not remaining; unknown payloads stay empty", () => {

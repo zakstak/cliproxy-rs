@@ -1,5 +1,5 @@
-import { api, connect, disconnect, configValue, route, ApiError } from "./api";
-import { equal, fieldPath, reconcile, type Data, type Window } from "./core";
+import { api, connect, disconnect, configValue, ApiError } from "./api";
+import { capable, equal, fieldPath, reconcile, type Data, type Window } from "./core";
 
 export const pages = [
   ["overview", "Overview"],
@@ -121,7 +121,7 @@ class Store {
     this.dirty = false;
   }
   can(method: string, path: string) {
-    return this.caps[`${method} ${route(path)}`] !== false;
+    return capable(this.kind, this.caps, method, path);
   }
   /**
    * Find unimplemented actions before they are offered. Each probe is a request Go rejects
