@@ -4,7 +4,6 @@
 //! A native Codex request reaches the upstream and the client unchanged, and its plugin
 //! lifecycle still completes. A non-Codex control (an OpenAI-compatible provider) keeps
 //! every hook. Loopback upstreams, fake keys and a private `auth-dir`.
-#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
