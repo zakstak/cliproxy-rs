@@ -106,6 +106,7 @@ impl CodexExecutor {
         session: &ExecSession,
     ) -> Result<ExecResponse, ExecError> {
         check_response_format(&req)?;
+        check_native_body(&req)?;
         crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
@@ -209,6 +210,7 @@ impl CodexExecutor {
             return count_tokens(&req, cfg);
         }
         check_response_format(&req)?;
+        check_native_body(&req)?;
         crate::codex_siwc::require_token(credential)?;
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
@@ -848,6 +850,18 @@ pub(crate) fn explicit_session(req: &ExecRequest) -> Option<String> {
     cpa_common::session::cpa_session_id(req.session.as_deref())
 }
 
+/// The Codex request boundary ([`cpa_common::codex_body`]) for a body a Responses client
+/// sent to a Responses route: HTTP streaming, buffered, compact and WebSocket turns. A
+/// body it refuses fails here, before translation and before any upstream send, with a
+/// client-safe request error. Other source formats arrive through a cross-API translator
+/// and keep its parsing until #27.
+fn check_native_body(req: &ExecRequest) -> Result<(), ExecError> {
+    if request::responses_formats(req) {
+        cpa_common::codex_body::CodexBody::parse(&req.body)?;
+    }
+    Ok(())
+}
+
 fn check_response_format(req: &ExecRequest) -> Result<(), ExecError> {
     let identity = matches!(req.response_format, Format::Codex | Format::OpenAIResponse);
     if identity || cpa_translate::pair(req.response_format, Format::Codex).is_some() {
@@ -1015,6 +1029,10 @@ fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -
     )
     .boxed()
 }
+
+#[cfg(test)]
+#[path = "codex_boundary_tests.rs"]
+mod boundary_tests;
 
 #[cfg(test)]
 #[path = "codex_tests.rs"]

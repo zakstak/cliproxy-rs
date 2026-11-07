@@ -181,8 +181,75 @@ below spell out what that means for the fields Codex sends.
   and clears encrypted content for non-OpenAI providers (lines 1231-1250). These are
   client decisions. The proxy repeats neither of them.
 - Raw JSON spelling. Number spelling, string escapes and key order survive inspection.
-  [#22](https://github.com/zakstak/cliproxy-rs/issues/22) defines malformed input,
-  duplicate keys and size limits.
+  [Request boundary](#request-boundary) defines malformed input, duplicate keys and
+  size limits.
+
+## Request boundary
+
+`cpa_common::codex_body::CodexBody::parse` is the one parser for Codex request bodies
+([#22](https://github.com/zakstak/cliproxy-rs/issues/22)). It lives in `cpa-common` so
+that executor, server and translator code all reach the same policy. It reads the body
+once, in place, and returns the top-level members as slices of the caller's bytes. It
+never copies the body, never builds a value tree and never re-serializes. It checks
+numbers against the JSON grammar without converting them, so `1e400` and a 40-digit
+integer pass with their spelling.
+
+The boundary refuses a body for the following reasons, with these client-facing errors:
+
+| Rule | Status | Message |
+| --- | --- | --- |
+| Larger than 64 MiB, the server's request limit | 413 | `request body exceeds 67108864 bytes` |
+| Not UTF-8 | 400 | `request body is not valid UTF-8 at byte N` |
+| Not RFC 8259 JSON, including content after the root value, a control character in a string, and a lone or mismatched surrogate escape | 400 | `request body is not valid JSON at byte N` |
+| A key repeated in any object, compared after unescaping | 400 | `request body repeats an object key at byte N` |
+| Arrays and objects nested more than 100 levels deep, counting the root object | 400 | `request body nests deeper than 100 levels at byte N` |
+| A root that is not an object | 400 | `request body must be a JSON object` |
+| `model` not a string, `stream` not a boolean, or `previous_response_id` neither a string nor null | 400 | ``request field `model` must be a string``, and the same for the other two |
+
+Every refusal is a request fault (`FailureScope::Request`), so it never fails over to
+another credential. Messages name byte offsets and protocol fields only, never body
+content. Any other member, at any depth, passes as long as it is valid JSON.
+
+The Codex executor applies the boundary at its entry points, `CodexExecutor::execute`
+and `CodexExecutor::execute_in_session`, to every body whose source and response formats
+are both Responses: HTTP streaming, buffered, compact and WebSocket turns. A refused body
+fails there, before translation and before any upstream send. A body that passes still
+goes through the current request rewrites until #23 and #24 migrate its route. The
+boundary does not judge bodies from other client formats, which reach Codex through a
+cross-API translator (#27).
+
+The shared ingress parser `cpa_server::claude::peek` reads `model` and `stream` for
+every provider before a credential is chosen. It keeps its Go behaviour: it already fails
+on trailing content and on a repeated top-level `model` or `stream`, and such a body
+never reaches the Codex boundary.
+
+### Remaining Go JSON callers on the Codex path
+
+At this commit, no Codex caller has moved from the Go helpers to the boundary yet. Every
+caller below either rewrites a payload, which its owning issue deletes, or reads a
+response, which #25 owns. The owning PR moves each surviving read to the boundary and
+deletes the Go-path code it replaces. `crates/cpa-common/src/json.rs` and the vendored
+gjson stay while other providers use them.
+
+| Code | What it parses | Owner |
+| --- | --- | --- |
+| `crates/cpa-exec/src/codex_request.rs` `shape` and its helpers (`ensure_web_search_for_history`, `ensure_image_tool`, `normalize_parallel_tool_calls`, `sanitize_reasoning`, `normalize_tool_schemas`, `sanitize_input_ids`, `siwc_body`, `prompt_cache`, `is_lite`) | Native request fields, for rewrites | #23 (HTTP), #24 (WebSocket) |
+| `crates/cpa-exec/src/codex_request.rs` `routing_hint` | `service_tier` for `x-codex-routing-hint` | #26 |
+| `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits, used by the callers above | Deleted with its last caller, at the latest #28 |
+| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter | #23, #24 |
+| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs`, `codex_gemini.rs`, `codex_interactions.rs` | Cross-API translation | #27 |
+| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration | #23, #24 for requests, #25 for responses, #28 for the settings |
+| `crates/cpa-exec/src/codex_replay.rs` | Reasoning history replay | #27 |
+| `crates/cpa-exec/src/codex_images.rs` | The Images API adapter | #27, coordinated with #15 |
+| `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count | #27 |
+| `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots | #25 |
+| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits | #25 |
+| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | WebSocket turns, continuation and steering frames | #24 |
+| `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers | #24 |
+| `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact | #23 |
+| `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer | #25 |
+| `crates/cpa-exec/src/codex_live.rs`, `codex.rs` `alpha_search`, `crates/cpa-server/src/codex_alpha.rs`, `codex_models.rs`, `crates/cpa-common/src/codex_catalog.rs` | Realtime calls, Alpha Search and model catalogs | Outside this contract; they keep Go behaviour |
+| `crates/cpa-exec/src/codex_oauth.rs`, `codex_refresh.rs`, `codex_siwc.rs`, `codex_siwc_bind.rs` | Token endpoints and credential files | Outside this contract; they keep Go behaviour |
 
 ## Identity and headers
 
@@ -274,7 +341,7 @@ inventory. #22 and #28 own the full inventory.
 | The same converter forces `parallel_tool_calls: true` and deletes unknown `service_tier` values unless the caller is an official Codex client, and canonicalizes known tiers for every caller (`codex_responses.rs:55-60`, 96-118) | #23, #24 |
 | `crates/cpa-exec/src/codex_request.rs:20-21` sends a fixed `codex-tui` macOS and iTerm identity | #26 |
 | `crates/cpa-exec/src/codex.rs` serves `chatgpt.com` through a Chrome TLS profile | #26 |
-| The Codex JSON paths read through gjson and Go coercion helpers (`crates/cpa-exec/src/codex_json.rs`, `crates/cpa-common/src/json.rs`) | #22 |
+| The Codex JSON paths read through gjson and Go coercion helpers. [Request boundary](#request-boundary) lists every caller and its owner | #22 to #27 |
 | Response steering frames (`response.steer`, `response.append`) and the duplex queue follow Go `codex_websockets_duplex.go` | #24 |
 
 ## Existing issue status

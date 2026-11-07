@@ -365,7 +365,7 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
 }
 
 /// Codex/Responses formats on both sides.
-fn responses_formats(req: &ExecRequest) -> bool {
+pub(crate) fn responses_formats(req: &ExecRequest) -> bool {
     let codexish = |f: Format| matches!(f, Format::Codex | Format::OpenAIResponse);
     codexish(req.source_format) && codexish(req.response_format)
 }

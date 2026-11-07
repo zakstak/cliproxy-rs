@@ -214,3 +214,48 @@ async fn native_siwc_keeps_parallelism_and_drops_unproven_fields() {
         "Go's SIWC unsupported field"
     );
 }
+
+/// The Codex request boundary (#22) refuses an ambiguous or mistyped native body through
+/// the real routes, with a client-safe 400, before anything is sent upstream.
+#[tokio::test]
+async fn codex_request_boundary_refuses_before_the_upstream_send() {
+    let proxy = proxy(false).await;
+    let cases = [
+        (
+            "/v1/responses",
+            r#"{"model":"gpt-5.5","input":[{"type":"message","type":"message","role":"user","content":"hi"}]}"#,
+            "request body repeats an object key at byte 46",
+        ),
+        (
+            "/v1/responses",
+            r#"{"model":"gpt-5.5","previous_response_id":7,"input":[]}"#,
+            "request field `previous_response_id` must be a string or null",
+        ),
+        (
+            "/v1/responses/compact",
+            r#"{"model":"gpt-5.5","input":[],"input":"again"}"#,
+            "request body repeats an object key at byte 30",
+        ),
+    ];
+    for (path, body, message) in cases {
+        let response = wreq::Client::new()
+            .post(format!("{}{path}", proxy.url))
+            .header("authorization", "Bearer client-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 400, "{path} {body}: {text}");
+        assert!(text.contains(message), "{path} {body}: {text}");
+    }
+    assert!(
+        proxy.seen.lock().unwrap().is_empty(),
+        "a refused body reached the upstream"
+    );
+    // A valid body on the same route still goes through.
+    let (_, sent) = send(&proxy, &[], body(Some(false), REPLAY)).await;
+    assert!(sent.contains(r#""model":"gpt-5.5""#), "{sent}");
+}
