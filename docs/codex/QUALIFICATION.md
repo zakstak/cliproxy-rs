@@ -105,11 +105,70 @@ The allocator measures peak live heap and allocation calls, not time or bytes re
 | `cargo check --locked --manifest-path harness/rust/Cargo.toml` | passed |
 | `cargo fmt --all --check` | passed |
 
-The one failure is `home::tests::home_plugin_finalization_waits_for_the_applied_config` (`crates/cliproxy/src/home.rs`). It fails the same way in this environment at the fork's base before the migration stack (`origin/fork`, `c610d7d8fe99291325573630c4ec99ad8ac86d2e`) and at the stack heads checked (`b555216b`, `7d9d6811`, `1c0a8bce`). It is a pre-existing failure here; its cause has not been established.
+The one failure is `home::tests::home_plugin_finalization_waits_for_the_applied_config` (`crates/cliproxy/src/home.rs`). It fails the same way in this environment at the fork's base before the migration stack (`origin/fork`, `c610d7d8fe99291325573630c4ec99ad8ac86d2e`) and at the stack heads checked (`b555216b`, `7d9d6811`, `1c0a8bce`). It is a pre-existing failure here, and this PR did not change it.
+
+PR #35, a test-only PR that is not merged, diagnoses it. The test counts every RPUSH the fake Home receives. Once another test in the same binary has installed the process-wide log subscriber, this test's own plugin reload adds two `app-log` RPUSHes, which the count reads as early finalization. #35 counts every RPUSH except `app-log`. With #35 merged onto `7fe3f8e3` in a throwaway worktree (not committed), the `cliproxy` unit tests passed 162/162 (uid 1000, `--network none`, `CPA_TEST_NO_SKIP=1`).
 
 These are local runs, not CI. GitHub Actions is disabled on this fork, so no hosted check has run.
 
-## 4. Unproven live gates
+## 4. Delivery state and landing order (#20 reconciliation)
+
+Checked on 2026-11-07.
+
+### Status of the pieces
+
+- **Merged on `fork`:** #9, #10, #11, #13, #14, #16, #17 and #18, including #14 (#1, #7), #16 (#3), #17 (#6), #10 (#5), #13 (#4), and #11 and #18 (#2, #8).
+- **Not merged:** every migration PR below, and #30 and #35.
+- **Open issues:** every issue in the tracker except #1, #2, #4, #5, #6 and #8.
+- **Hosted CI:** has never run on any of them, because GitHub Actions is disabled on this fork. Every check named on this page is a local run.
+- **Live acceptance:** unproven (section 5).
+
+A completed review is evidence for one head. It does not merge or close anything.
+
+### Open PRs and their reviewed heads
+
+Each head is the PR head. Each has a completed independent Codex review with no findings at that head, and the parent's source review.
+
+| PR | Issue | Head | Base |
+| --- | --- | --- | --- |
+| #30 | #19 (fork: Linux only) | `a61a7e8e7f22dcda17185a9e241f7835b15168d6` | `fork` |
+| #35 | test isolation, #29 and #20 qualification | `98a7898b8db5370c3b50e7a3c9f7d802871a2651` | `fork` |
+| #31 | #21 | `389556556ec55836b79cc6566915790c6d59d087` | `fork` |
+| #34 | #22 (part) | `aaa077284c0a0a521d0f0291bf3ee96c03ff6912` | #31 |
+| #36 | #23, #25 HTTP half | `7656e7038a9948973190ca02f70dbe45b7b851ca` | #34 |
+| #38 | #24, #25 WebSocket half, #3 | `5b2e4382f4c618a290806ea15496763cf874c699` | #36 |
+| #39 | #27 | `b555216b40bfeb2c10e7acf6ca67f9a7409ed6fa` | #38 |
+| #37 | #26 | `e21db759050c27b9b8f07e83f31c2d248ca5b3a9` | `fork` |
+| #40 | #28, and #37's commits through the merge `7d9d6811` | `1c0a8bced211f71fad97bd21f3ee9b88fee780a3` | #39 |
+| #41 | #29 | `7fe3f8e3552f4d78ded93c9022a42db84c777d3b` | #40 |
+
+### Landing order
+
+1. **#30.** It is not in the migration stack's history.
+   - Trial merges without committing found conflicts with #31 (`crates/cpa-exec/Cargo.toml`, `docs/DIFFERENCES-FROM-GO.md`), with #37 (`crates/cpa-core/src/config/validate.rs`, `crates/cpa-server/src/runtime.rs`) and with #41's head (those four files plus `README.md`, `docs/PARITY.md` and `docs/parity-audit/status.md`).
+   - Landing #30 first therefore needs those conflicts resolved in the layers that meet them, as reviewed changes. The resolutions are not part of any PR yet.
+2. **#35.** It is independent and merges cleanly onto #41's head.
+3. **#31, #34, #36, #38, #39,** in that order. Each is retargeted to `fork` after the one below it lands.
+4. **#37, then #40, then #41.**
+   - #40 already contains #37's original commits (`030a8ac0`, `f1f8c829`, `a728745c`, `e21db759`) through its merge `7d9d6811`. So #37 must land with those commits intact: by a merge commit, or only through #40.
+   - A squash or rebase of #37 would create different commits for the same changes, and #40 would then conflict with them or repeat them.
+
+### Remaining gaps
+
+These criteria are not delivered by the migration or by merged code:
+
+- **#3, handshake-only metadata the client reads only from its own handshake.** This is the presence-based `x-reasoning-included`, and a turn on a reused socket gets no `response.metadata` event.
+  - The pinned client reads `x-reasoning-included` only from the upgrade response of a socket it opened (`responses_websocket.rs:617`).
+  - The proxy's downstream 101 is sent before the first frame chooses a credential and model, so it cannot carry the upstream handshake ([CONTRACT.md](CONTRACT.md#handshake-metadata)).
+  - Delivering it needs a design decision. The source offers no mechanism, so it is not an implementation gap a test can close. The other #3 criteria have tests: `response.metadata` for the opening turn and for a send retried on a fresh socket; handshake-only, event-only and both cases; a model the proxy rewrote; the allowlist. Those tests are on `fork` through #16, or in #38.
+- **Merging, and hosted CI on the merged result.** Neither has happened.
+- **The live gates in section 5.**
+
+#7's criteria all have tests on `fork` from the merged #14: `named_reasons_are_not_silent_aborts` (interrupted, `content_filter` and `max_output_tokens` are not aborts), `a_zero_token_interrupted_response_is_a_normal_end` (ID, usage, acknowledgement, and the socket serves the next turn through `follow_up_is_clean`), and the unexplained empty `response.incomplete` that stays a 502. The native route keeps that exception (`empty_incomplete_keeps_its_narrow_exception`, in #36). Closing #7 is the owner's call.
+
+The other implementation issues (#21 to #29) are mapped criterion by criterion in the ownership matrix above. Each is delivered by its open PR, not by `fork`.
+
+## 5. Unproven live gates
 
 Local mocks cannot show these, and nothing here claims them:
 

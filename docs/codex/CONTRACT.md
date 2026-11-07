@@ -843,6 +843,10 @@ regression tests.
   is reported. Metadata on a reused socket and `x-reasoning-included` are limits that
   the source sets. [Handshake metadata](#handshake-metadata) explains both.
 
+[QUALIFICATION.md](QUALIFICATION.md#4-delivery-state-and-landing-order-20-reconciliation)
+has the current state: which pieces are merged, each open PR's reviewed head, the landing
+order, and the criteria still open (#3's handshake-only metadata needs a design decision).
+
 ## Implementation order
 
 The order below keeps every route either fully on the old behaviour or fully on the
