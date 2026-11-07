@@ -13,7 +13,8 @@
 //! A WebSocket turn on a credential without `websockets` also comes here
 //! ([`CodexExecutor::native_ws_http`]): the first-party `response.create` frame is the
 //! HTTP request body plus its `type` tag (`codex-api/src/common.rs:315-339`), so the
-//! frame goes upstream without `type`, with only its `model` routed.
+//! frame goes upstream without `type`, with its `model` routed and `stream: true` (a
+//! WebSocket turn always delivers events).
 //!
 //! The response reaches the client as the upstream sent it. A stream's events are
 //! forwarded byte for byte; observation (usage, capture, failure classification) reads
@@ -133,9 +134,13 @@ pub(crate) fn refused_frame(frame: &[u8]) -> ExecError {
 pub const APPEND_REFUSED: &str = "`response.append` is not supported on Codex credentials: no first-party or documented source defines it; send a `response.create` (with `previous_response_id` to continue a response)";
 
 /// The HTTP body of a WebSocket `response.create` frame: the frame without its `type`
-/// tag, with `model` routed. A continuation (`previous_response_id`) needs the state of
-/// an upstream socket this credential does not keep, so it is refused with the replay
-/// close; a prewarm (`generate: false`) has no HTTP meaning and is refused.
+/// tag, with `model` routed and `stream: true`. A WebSocket turn always delivers its
+/// response as events, and the first-party frame carries the HTTP request's own `stream`
+/// (`codex-api/src/common.rs:315-339`), so a frame that omits it or sets `false` asks for
+/// the event stream over HTTP: the transport adaptation of docs/codex/CONTRACT.md. A
+/// continuation (`previous_response_id`) needs the state of an upstream socket this
+/// credential does not keep, so it is refused with the replay close; a prewarm
+/// (`generate: false`) has no HTTP meaning and is refused.
 pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
     let body = CodexBody::parse(frame)?;
     if body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null) {
@@ -149,7 +154,12 @@ pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecErro
         ));
     }
     let untagged = CodexBody::parse(frame)?.without_member("type");
-    routed(&Bytes::from(untagged), model)
+    let body = routed(&Bytes::from(untagged), model)?;
+    let current = CodexBody::parse(&body)?;
+    if current.get("stream").map(|m| m.kind) == Some(Kind::True) {
+        return Ok(body);
+    }
+    Ok(Bytes::from(current.with_member("stream", "true")))
 }
 
 /// Whether `frame` is a `response.create`. A frame the request boundary refuses counts
@@ -329,6 +339,18 @@ impl CodexExecutor {
             saw_delta: false,
         };
         let (status, headers) = (upstream.status, upstream.headers);
+        if ws_session.is_some() && !sse {
+            // A WebSocket turn asked for the event stream; a success without one has no
+            // events to deliver, and the proxy invents none. Nothing reached the client,
+            // so another credential may serve the turn.
+            let error = ExecError::local(
+                502,
+                FailureScope::Credential,
+                "codex upstream answered a WebSocket turn without an event stream (`stream: true` was requested)",
+            );
+            observer.wire.exec_error(&error);
+            return Err(error);
+        }
         if call == Call::Stream && sse {
             let hold = settings.bootstrap_buffering.then_some(settings.bootstrap_timeout);
             let mut stream = passthrough(

@@ -412,8 +412,13 @@ fn assert_native_contract(
         .unwrap_or_else(|| panic!("{name}: an upstream request"));
     let mut expected = req.body.to_vec();
     if ws_session {
-        // The WebSocket frame's HTTP body: the frame without its `type` tag.
+        // The WebSocket frame's HTTP body: the frame without its `type` tag, asking for
+        // the event stream.
         expected = CodexBody::parse(&req.body).unwrap().without_member("type");
+        let untagged = CodexBody::parse(&expected).unwrap();
+        if untagged.get("stream").map(|m| m.kind) != Some(Kind::True) {
+            expected = untagged.with_member("stream", "true");
+        }
     }
     let body = CodexBody::parse(&expected).unwrap();
     if body.get("model").and_then(|m| m.text()).as_deref() != Some(req.model.trim()) {

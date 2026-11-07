@@ -1339,3 +1339,112 @@ async fn an_append_is_refused_on_a_codex_connection() {
     assert!(read(&mut socket, &[]).await.closed.is_some(), "the connection closes");
     assert_eq!(upstream_frames(&proxy, 0).len(), 1, "the append sent nothing");
 }
+
+/// An HTTP Responses upstream that answers as the API does: an SSE stream for a
+/// `stream: true` body, otherwise one JSON Response object. It records each body.
+async fn request_sensitive_upstream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let bodies = seen.clone();
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let bodies = bodies.clone();
+        async move {
+            use axum::response::IntoResponse;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            let streamed = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["stream"].as_bool())
+                == Some(true);
+            bodies.lock().unwrap().push(text);
+            if streamed {
+                (
+                    [("content-type", "text/event-stream")],
+                    fixture("sse-completed").bytes().to_vec(),
+                )
+                    .into_response()
+            } else {
+                (
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp_json","object":"response","status":"completed","output":[]}"#,
+                )
+                    .into_response()
+            }
+        }
+    });
+    let addr = serve(app).await;
+    (format!("http://{addr}"), seen)
+}
+
+/// A first turn on a credential without `websockets` whose frame omits `stream` or sets
+/// it to `false`: a WebSocket turn always delivers events, so the HTTP body asks for the
+/// event stream (`stream: true`, the transport adaptation in docs/codex/CONTRACT.md) and
+/// the client gets the upstream's events, ending with `response.completed`. Nothing else
+/// in the frame changes. Against an upstream that answers a non-streamed body with one
+/// JSON object, as the API does.
+#[tokio::test]
+async fn a_turn_over_http_asks_for_the_event_stream_whatever_the_frame_says() {
+    for profile in [Profile::Chatgpt, Profile::Compatible] {
+        for (name, stream) in [("omitted", None), ("false", Some("false"))] {
+            let (base, seen) = request_sensitive_upstream().await;
+            let proxy = proxy_with(Script::default(), "", |_| vec![credential(profile, &base, false)]).await;
+            let mut socket = connect(&proxy).await;
+            let frame = match stream {
+                None => r#"{"type":"response.create","model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#.to_owned(),
+                Some(value) => format!(
+                    r#"{{"type":"response.create","model":"gpt-5.5","stream":{value},"input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]}}]}}"#
+                ),
+            };
+            socket.send(Message::text(frame.clone())).await.unwrap();
+            let turn = read(&mut socket, &TERMINAL).await;
+            assert_eq!(turn.frames, events("sse-completed"), "{profile:?} {name}: {turn:?}");
+            assert_eq!(turn.closed, None, "{profile:?} {name}: the connection stays open");
+            let sent = seen.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "{profile:?} {name}");
+            let untagged = cpa_common::codex_body::CodexBody::parse(frame.as_bytes())
+                .unwrap()
+                .without_member("type");
+            let want = cpa_common::codex_body::CodexBody::parse(&untagged)
+                .unwrap()
+                .with_member("stream", "true");
+            assert_eq!(
+                sent[0],
+                String::from_utf8(want).unwrap(),
+                "{profile:?} {name}: only `stream` changes"
+            );
+        }
+    }
+}
+
+/// An upstream that answers a WebSocket turn's `stream: true` HTTP request with a plain
+/// JSON object has no events to deliver: the turn fails, the client never receives the
+/// bare object, and the proxy invents no event.
+#[tokio::test]
+async fn a_turn_over_http_refuses_an_answer_without_an_event_stream() {
+    let proxy = proxy_with(
+        Script {
+            http: vec![cpa_server::testing::codex_capture::Reply::json(
+                200,
+                r#"{"id":"resp_json","object":"response","status":"completed","output":[]}"#,
+            )],
+            ..Script::default()
+        },
+        "",
+        |url| vec![credential(Profile::Compatible, url, false)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let turn = read(&mut socket, &[]).await;
+    assert!(turn.closed.is_some(), "the turn ends: {turn:?}");
+    assert!(
+        !turn.frames.iter().any(|f| f.contains("resp_json")),
+        "the bare object never reaches the client: {turn:?}"
+    );
+    assert!(
+        !turn.frames.iter().any(|f| f.contains("response.completed")),
+        "no fabricated event: {turn:?}"
+    );
+    assert_eq!(proxy.upstream.http().len(), 1);
+}
