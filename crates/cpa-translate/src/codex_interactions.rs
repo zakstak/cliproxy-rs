@@ -9,7 +9,7 @@ use crate::{Error, Registered, ResponseCtx};
 
 pub static PAIR: Registered = registered!(
     Interactions -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body, ctx.stream)),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: None,
@@ -283,6 +283,8 @@ fn json_string(value: &Res<'_>) -> Vec<u8> {
 
 struct Input {
     items: Vec<Vec<u8>>,
+    /// Parts Codex cannot express: refused, not dropped.
+    drops: crate::common::UserTurnDrops,
 }
 
 impl Input {
@@ -298,15 +300,20 @@ impl Input {
             self.text(role, &content.s);
         } else if content.is_array() {
             content.each(|_, part| {
-                if let Some(item) = message_part(&part, role).filter(|i| !i.is_empty()) {
-                    self.items.push(message(role, &item));
-                }
+                self.part(&part, role);
                 true
             });
-        } else if content.is_object()
-            && let Some(item) = message_part(content, role).filter(|i| !i.is_empty())
-        {
-            self.items.push(message(role, &item));
+        } else if content.is_object() {
+            self.part(content, role);
+        }
+    }
+
+    fn part(&mut self, part: &Res<'_>, role: &str) {
+        match message_part(part, role).filter(|i| !i.is_empty()) {
+            Some(item) => self.items.push(message(role, &item)),
+            None => self
+                .drops
+                .drop_part(&String::from_utf8_lossy(&part.get("type").bytes())),
         }
     }
 
@@ -528,9 +535,20 @@ pub(crate) fn set_raw_if_different(out: &mut Vec<u8>, path: &str, value: &Res<'_
 }
 
 /// ConvertInteractionsRequestToCodex.
-fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions`, and a refusal for any part Codex cannot express.
+/// The registered pair, which other Responses providers share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert(ctx.model, body, ctx.stream, true)
+}
+
+fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8>, crate::Error> {
     let root = gj::parse(raw);
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
+    let mut out = if strict {
+        br#"{"model":"","input":[]}"#.to_vec()
+    } else {
+        br#"{"model":"","instructions":"","input":[]}"#.to_vec()
+    };
     gj::set_str(&mut out, "model", model);
     if stream || root.get("stream").bool() {
         gj::set_bool(&mut out, "stream", true);
@@ -577,7 +595,10 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
         }
     }
 
-    let mut input = Input { items: vec![] };
+    let mut input = Input {
+        items: vec![],
+        drops: Default::default(),
+    };
     let value = root.get("input");
     if value.kind == Kind::String {
         input.text("user", &value.s);
@@ -650,7 +671,10 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Vec<u8> {
             set_raw_if_different(&mut out, path, &value);
         }
     }
-    out
+    if strict {
+        input.drops.strict_result("Codex Responses")?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------

@@ -258,6 +258,62 @@ fn executor() -> CodexExecutor {
 
 /// A recorded case that now takes the native HTTP route (#23): Go's bytes no longer
 /// apply to it, the contract does (`docs/codex/CONTRACT.md` "Native HTTP route").
+/// A recorded case the translated route serves (#27): a Claude, Chat Completions,
+/// Gemini or Interactions request on a native profile.
+fn translated_case(case: &Value, base_url: &str) -> bool {
+    case["exec_metadata"]["execution_session_id"].as_str().is_none()
+        && super::translated::route(&View::new(&credential(case, base_url)), &request(case))
+}
+
+/// The translated contract for a recorded case (docs/DIFFERENCES-FROM-GO.md, "Codex
+/// translated route"): the upstream body is the built-in strict conversion with only the
+/// routed model and `stream`, so Go's injected `instructions`, reasoning default,
+/// prompt-cache key, replayed reasoning, tools and payload rules are absent; a refused
+/// conversion sends nothing.
+fn assert_translated_contract(
+    name: &str,
+    case: &Value,
+    result: &Result<ExecResponse, ExecError>,
+    captured: &[Captured],
+) {
+    let mut req = request(case);
+    if case["resolved_compat"] == true {
+        // As `run` binds it: the conversion reads the model's thinking capabilities.
+        let raw = serde_json::json!({"id": req.model, "is_compat": true});
+        req.resolved_model = Some(cpa_core::exec::ResolvedModel {
+            info: cpa_core::registry::ModelInfo::from_raw(raw.as_object().unwrap().clone()).unwrap(),
+            source: cpa_core::exec::ResolvedSource::ApiKey,
+        });
+    }
+    let model = super::request::base_model(&req.model);
+    match super::translated::upstream_body(&req, &model) {
+        Err(expected) => {
+            let error = result
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("{name}: the conversion is refused"));
+            assert_eq!(error.status, expected.status, "{name}");
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+        }
+        Ok(expected) => {
+            let sent = captured
+                .first()
+                .unwrap_or_else(|| panic!("{name}: an upstream request"));
+            let body = String::from_utf8_lossy(&sent.body);
+            assert_eq!(body, expected, "{name}: translated upstream body");
+            let source = String::from_utf8_lossy(&req.body);
+            assert!(!body.contains("cpa_codex_replay_turn"), "{name}: no replay marker");
+            assert!(!body.contains(r#""instructions":"""#), "{name}: no empty instructions");
+            if !source.contains("prompt_cache_key") {
+                assert!(!body.contains("prompt_cache_key"), "{name}: no synthesized cache key");
+            }
+            if !source.contains("image_generation") {
+                assert!(!body.contains("image_generation"), "{name}: no injected image tool");
+            }
+        }
+    }
+}
+
 fn native_case(case: &Value, base_url: &str) -> bool {
     case["exec_metadata"]["execution_session_id"].as_str().is_none()
         && CodexExecutor::native_http(&credential(case, base_url), &request(case))
@@ -346,6 +402,10 @@ async fn executor_matches_go_on_every_fixture_case() {
         let captured = mock.take();
         if native_case(case, &mock.url) {
             assert_native_contract(name, case, &result, &items, &captured);
+            continue;
+        }
+        if translated_case(case, &mock.url) {
+            assert_translated_contract(name, case, &result, &captured);
             continue;
         }
         match case["hops"].as_array() {
@@ -773,7 +833,7 @@ async fn usage_records_see_upstream_payloads() {
         let upstream_format = if compact { Format::OpenAIResponse } else { Format::Codex };
         // A native case records the body it sent: the client's, with only the permitted
         // edits (`executor_matches_go_on_every_fixture_case` checks those bytes).
-        let sent = if native_case(case, &mock.url) {
+        let sent = if native_case(case, &mock.url) || translated_case(case, &mock.url) {
             String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
         } else {
             case["upstream"]["body"].as_str().unwrap().to_owned()
@@ -838,10 +898,16 @@ async fn usage_records_the_payload_override_reasoning_effort() {
             ResponseBody::Stream(mut stream) => while stream.next().await.is_some() {},
             ResponseBody::Buffered(_) => {}
         }
-        let native = native_case(case, &mock.url);
+        let (native, translated) = (native_case(case, &mock.url), translated_case(case, &mock.url));
         let sent = String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap();
-        // Payload rules never reach a native body (#23); other paths keep Go's override.
-        let effort = if native { "" } else { "high" };
+        // Payload rules never reach a native (#23) or translated (#27) body; other paths
+        // keep Go's override. The translated Claude case keeps the client's own thinking
+        // budget (2048 tokens, `medium`).
+        let effort = match (native, translated) {
+            (true, _) => "",
+            (_, true) => "medium",
+            _ => "high",
+        };
         assert_eq!(gjson::get(&sent, "reasoning.effort").str(), effort, "{name}: upstream");
         let reports = recorded.0.lock().unwrap().clone();
         assert_eq!(reports[0].0, "request", "{name}");
@@ -2075,7 +2141,7 @@ async fn payload_filters_remove_late_codex_additions() {
 /// Go 868e137 gives CountTokens the payload barrier: the rules run on the shaped body
 /// before the tokenizer, so a configured `input` changes the count.
 #[test]
-fn count_tokens_sees_the_payload_rules() {
+fn count_tokens_ignores_the_payload_rules_and_is_marked_local() {
     let count = |config: &str| {
         let mut req = plain_request(false, None);
         req.operation = Operation::CountTokens;
@@ -2092,8 +2158,14 @@ fn count_tokens_sees_the_payload_rules() {
     let configured = count(
         "payload:\n  override:\n    - models: [{name: gpt-5.4}]\n      params: {input.0.content.0.text: one two three four five six seven eight nine ten}\n",
     );
+    // #27: the count reads the body the request would send, which payload rules no
+    // longer change on the native and translated routes.
     assert!(plain > 0);
-    assert!(configured > plain + 5, "{plain} -> {configured}");
+    assert_eq!(configured, plain, "{plain} -> {configured}");
+    let mut req = plain_request(false, None);
+    req.operation = Operation::CountTokens;
+    let out = super::count_tokens(&req, &Config::default()).unwrap();
+    assert_eq!(out.headers[super::LOCAL_TOKEN_COUNT], "local-estimate");
 }
 
 /// zakstak/cliproxy-rs#5: an upstream context-window `response.failed` reaches a

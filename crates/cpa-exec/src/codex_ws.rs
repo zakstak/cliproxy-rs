@@ -896,41 +896,6 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
     Some((status, out))
 }
 
-/// A request's reasoning replay (Claude clients only): the executor's cache and the
-/// request's scope.
-#[derive(Clone, Default)]
-pub(super) struct Replay {
-    cache: Arc<crate::codex_replay::Cache>,
-    scope: crate::codex_replay::Scope,
-}
-
-impl Replay {
-    /// `applyCodexReasoningReplayCacheRequired`: cached turns inserted into `body`.
-    async fn apply(cache: &Arc<crate::codex_replay::Cache>, req: &ExecRequest, body: String) -> (String, Self) {
-        let (body, scope) = crate::codex_replay::apply(cache, req, body).await;
-        let replay = Self {
-            cache: cache.clone(),
-            scope,
-        };
-        (body, replay)
-    }
-
-    /// `clearCodexReasoningReplayOnWebsocketError` or `...OnInvalidSignature` for a
-    /// rejection event: an invalid thinking signature drops the cached reasoning.
-    fn clear(&self, payload: &str, cooling: bool) {
-        if let Some((status, body)) = ws_error_body(payload) {
-            crate::codex_replay::clear_on_invalid_signature(&self.cache, &self.scope, status, body.as_bytes());
-        } else if let Some((error, body)) = response::terminal_failure(payload, cooling) {
-            crate::codex_replay::clear_on_invalid_signature(&self.cache, &self.scope, error.status, body.as_bytes());
-        }
-    }
-
-    /// `cacheCodexReasoningReplayFromCompleted`.
-    fn completed(&self, payload: &str) {
-        crate::codex_replay::cache_completed(&self.cache, &self.scope, payload.as_bytes());
-    }
-}
-
 /// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status.
 pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecError> {
     let (status, out) = ws_error_body(payload)?;
@@ -1026,7 +991,6 @@ struct Turn {
     usage: cpa_core::exec::UsageSink,
     /// The upstream model, for per-model quota snapshots.
     model: String,
-    replay: Replay,
     /// The attempt's wire capture (Go's `api.websocket.*` timeline events).
     wire: crate::codex_capture::Wire,
     /// Inside the bootstrap window, where Go records an empty incomplete as a
@@ -1098,7 +1062,6 @@ impl Turn {
         let payload = response::restore(payload, self.restore);
         let payload = payload.as_ref();
         if let Some(mut error) = ws_error(payload, self.cooling) {
-            self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
             self.deliver_as_sent(&mut error, &text);
             return Frame::Failed {
@@ -1110,7 +1073,6 @@ impl Turn {
             };
         }
         if let Some((mut error, body)) = response::terminal_failure(payload, self.cooling) {
-            self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
             // The context-window `error` a Codex client gets as `response.failed` (#5) is
             // delivered ahead of the error; any other failure of a native turn travels on
@@ -1176,9 +1138,6 @@ impl Turn {
             out = response::normalize_completion(out);
             if !self.native {
                 out = self.items.patch(out);
-            }
-            if kind != "response.incomplete" {
-                self.replay.completed(&out);
             }
         }
         Frame::Event {
@@ -1592,18 +1551,14 @@ impl CodexExecutor {
         // key, reasoning replay, ID or namespace edits; nothing is restored on the way
         // back (`docs/codex/CONTRACT.md` "Native WebSocket route").
         let passthrough = crate::codex::native::route_ws(view, &req).is_some();
-        let (model, body, optimized, conflict, replay, cache) = if passthrough {
+        let (model, body, optimized, conflict, cache) = if passthrough {
             let model = crate::codex::native::upstream_model(&req)?;
             let frame = crate::codex::native::routed(&req.body, &model)?;
             // The frame passed the request boundary, so it is UTF-8.
             let body = String::from_utf8(frame.to_vec())
                 .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
             let cache = request::prompt_cache_id(&req, &body, Some(&exec_session.id), true);
-            let replay = Replay {
-                cache: self.replay.clone(),
-                scope: Default::default(),
-            };
-            (model, body, false, false, replay, cache)
+            (model, body, false, false, cache)
         } else {
             let model = request::base_model(&req.model).to_owned();
             let request::Shaped {
@@ -1612,10 +1567,9 @@ impl CodexExecutor {
                 conflict,
                 finalize,
             } = request::shape(&req, view, settings, Call::Websocket)?;
-            let (body, replay) = Replay::apply(&self.replay, &req, body).await;
             let (body, cache) = request::prompt_cache(&req, body, Some(&exec_session.id), true);
             let body = turn_body(view, &req, settings, &finalize, body);
-            (model, body, optimized, conflict, replay, cache)
+            (model, body, optimized, conflict, cache)
         };
         crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
         let native = request::is_native(&req);
@@ -1628,9 +1582,8 @@ impl CodexExecutor {
             .then(|| session.steering())
             .flatten()
             .map(|input| {
-                let initial =
-                    duplex::Prepared::new(&body, &req.original_body, optimized, conflict, native, replay.clone())
-                        .with_passthrough(passthrough);
+                let initial = duplex::Prepared::new(&body, &req.original_body, optimized, conflict, native)
+                    .with_passthrough(passthrough);
                 (input, initial)
             });
         let guard = session.turn.clone().lock_owned().await;
@@ -1725,7 +1678,6 @@ impl CodexExecutor {
             restore,
             usage: req.usage.clone(),
             model: model.clone(),
-            replay,
             wire,
             bootstrapping: false,
             ack_wait: self.ws.ack_wait,
@@ -1740,23 +1692,15 @@ impl CodexExecutor {
                 body: ResponseBody::Stream(stream),
             });
         }
-        // The response waits for the Home replay writes it caused, as on HTTP.
-        let writes = turn.replay.scope.writes.clone();
         let stream = if settings.bootstrap_buffering {
-            match bootstrap(turn, settings.bootstrap_timeout, started).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    writes.settle().await;
-                    return Err(error);
-                }
-            }
+            bootstrap(turn, settings.bootstrap_timeout, started).await?
         } else {
             rest(turn)
         };
         Ok(ExecResponse {
             status: 200,
             headers: returned_handshake(handshake, model_kept),
-            body: ResponseBody::Stream(writes.gate(stream)),
+            body: ResponseBody::Stream(stream),
         })
     }
 }

@@ -12,7 +12,7 @@ use crate::{Error, Registered, RequestCtx, codex_claude_response as response, op
 
 pub static PAIR: Registered = registered!(
     Claude -> Codex,
-    request: |ctx, body| convert(ctx.model, body, false),
+    request: |ctx, body| convert(ctx.model, body, false, false),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: Some(openai_claude::claude_input_tokens),
@@ -21,7 +21,15 @@ pub static PAIR: Registered = registered!(
 /// ConvertClaudeRequestToCodexWithCompat: assistant thinking blocks with empty or
 /// unknown-format signatures are kept for compatibility endpoints.
 pub fn request_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    convert(ctx.model, body, true)
+    convert(ctx.model, body, true, false)
+}
+
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no reasoning effort the client did not choose, the client's tool `strict`,
+/// and a refusal for any block Codex cannot express. The registered pair, which other
+/// Responses providers share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+    convert(ctx.model, body, false, true)
 }
 
 const NAME_LIMIT: usize = 64;
@@ -352,6 +360,8 @@ fn input_image(url: &[u8]) -> Vec<u8> {
 struct Messages<'m> {
     model: &'m str,
     preserve: bool,
+    /// The Codex translated route's rules ([`codex_strict`]).
+    strict: bool,
     names: &'m HashMap<Vec<u8>, Vec<u8>>,
     items: Vec<Vec<u8>>,
     pending_tool_uses: Vec<Vec<u8>>,
@@ -439,7 +449,7 @@ impl Messages<'_> {
                                 current.push(image);
                                 sendable += 1;
                             }
-                            None if user => self.drops.drop_part("image"),
+                            None if user || self.strict => self.drops.drop_part("image"),
                             None => {}
                         }
                     }
@@ -453,7 +463,7 @@ impl Messages<'_> {
                                 current.push(file);
                                 sendable += 1;
                             }
-                            None if user => self.drops.drop_part(&String::from_utf8_lossy(&kind)),
+                            None if user || self.strict => self.drops.drop_part(&String::from_utf8_lossy(&kind)),
                             None => {}
                         }
                     }
@@ -474,6 +484,8 @@ impl Messages<'_> {
                         self.items.push(tool_result(part));
                         sendable += 1;
                     }
+                    // Strict: a block Codex cannot express is refused, not dropped.
+                    other if self.strict => self.drops.drop_part(&String::from_utf8_lossy(other)),
                     _ => {}
                 }
             }
@@ -557,14 +569,20 @@ fn eq_fold(value: &[u8], token: &str) -> bool {
 
 /// convertClaudeRequestToCodex. A user turn left empty because its only attachment
 /// cannot be sent is refused.
-fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
+fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<u8>, Error> {
+    // Strict: no top-level `instructions`; the system prompt is a developer item.
+    let mut out = if strict {
+        br#"{"model":"","input":[]}"#.to_vec()
+    } else {
+        br#"{"model":"","instructions":"","input":[]}"#.to_vec()
+    };
     let root = gj::parse(raw);
     let names = original_to_short(raw);
     gj::set_str(&mut out, "model", model);
     let mut state = Messages {
         model,
         preserve,
+        strict,
         names: &names,
         items: vec![],
         pending_tool_uses: vec![],
@@ -651,7 +669,10 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
                     gj::delete(&mut item, path);
                 }
             }
-            if gj::get(&item, "strict").kind != Kind::False {
+            // Strict: the client's `strict`, else `false` as the pinned client sends. Go
+            // forces `false`.
+            let current = gj::get(&item, "strict").kind;
+            if (strict && !matches!(current, Kind::True | Kind::False)) || (!strict && current != Kind::False) {
                 gj::set_bool(&mut item, "strict", false);
             }
             tool_items.push(item);
@@ -665,7 +686,9 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
         !(disable_parallel.exists() && disable_parallel.bool()),
     );
 
-    let mut effort: Vec<u8> = b"medium".to_vec();
+    // Strict: only the client's own thinking choice; without one the model's default
+    // applies. Go defaults to `medium`.
+    let mut effort: Vec<u8> = if strict { Vec::new() } else { b"medium".to_vec() };
     let thinking = root.get("thinking");
     if thinking.is_object() {
         match thinking.get("type").bytes().as_ref() {
@@ -686,7 +709,9 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
                 } else {
                     vec![]
                 };
-                effort = if explicit.is_empty() {
+                // Strict: adaptive thinking without an explicit effort leaves it to the
+                // model. Go sends `xhigh`.
+                effort = if explicit.is_empty() && !strict {
                     b"xhigh".to_vec()
                 } else {
                     explicit
@@ -702,7 +727,9 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
             _ => {}
         }
     }
-    gj::set_str(&mut out, "reasoning.effort", &effort);
+    if !effort.is_empty() {
+        gj::set_str(&mut out, "reasoning.effort", &effort);
+    }
     let mut tier = service_tier(&root.get("service_tier"));
     let speed = root.get("speed");
     if speed.kind == Kind::String && speed.s.as_ref() == b"fast" {
@@ -741,6 +768,10 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
         gj::set_raw(&mut out, "tools", gj::join(&tool_items));
     }
     gj::set_items(&mut out, "input", &state.items);
-    state.drops.strict_result("Codex Responses")?;
+    if strict {
+        state.drops.strict_result("Codex Responses")?;
+    } else {
+        state.drops.result()?;
+    }
     Ok(out)
 }

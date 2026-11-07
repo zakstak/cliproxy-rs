@@ -25,7 +25,7 @@ use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Replay, Turn, Upstream, request_frame, transport, ws_error};
+use super::{Read, Turn, Upstream, request_frame, transport, ws_error};
 use crate::codex_json::{set_raw, set_str};
 use crate::codex_request::{self as request, Call, Settings, View};
 use crate::codex_response as response;
@@ -83,19 +83,10 @@ pub(super) struct Prepared {
     /// A request on the native WebSocket route (#24): sent as the client wrote it, with
     /// only `model` routed, and its events reach the client as upstream sent them.
     passthrough: bool,
-    /// The request's reasoning replay scope (`replayScope`).
-    replay: Replay,
 }
 
 impl Prepared {
-    pub(super) fn new(
-        body: &str,
-        original: &[u8],
-        optimized: bool,
-        conflict: bool,
-        native: bool,
-        replay: Replay,
-    ) -> Self {
+    pub(super) fn new(body: &str, original: &[u8], optimized: bool, conflict: bool, native: bool) -> Self {
         let raw = |json: &str| {
             let value = gjson::get(json, "instructions");
             value.exists().then(|| value.json().to_owned())
@@ -107,7 +98,6 @@ impl Prepared {
             conflict,
             native,
             passthrough: false,
-            replay,
         }
     }
 
@@ -612,7 +602,6 @@ impl Duplex {
                 return;
             }
         };
-        let (body, replay) = Replay::apply(&self.initial.replay.cache, &next, body).await;
         // ponytail: Go starts a usage record per response; this stream reports every
         // response's events to the bootstrap attempt's record and keeps its request.
         let (body, _) = request::prompt_cache(&next, body, Some(&self.exec_session), true);
@@ -625,7 +614,6 @@ impl Duplex {
             optimized,
             conflict,
             request::is_native(&next),
-            replay,
         );
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
@@ -665,11 +653,7 @@ impl Duplex {
             }
         };
         let body = String::from_utf8_lossy(&frame).into_owned();
-        let replay = Replay {
-            cache: self.initial.replay.cache.clone(),
-            scope: Default::default(),
-        };
-        let prepared = Prepared::new(&body, &frame, false, false, self.initial.native, replay).with_passthrough(true);
+        let prepared = Prepared::new(&body, &frame, false, false, self.initial.native).with_passthrough(true);
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
@@ -815,12 +799,10 @@ impl Duplex {
         // append's too: response repair is not part of the append's legacy framing.
         let passthrough = event.passthrough || self.initial.passthrough;
         let payload = response::restore(payload, self.restores(event));
-        // Every rejection clears its own request's replay; only the first fails the
-        // stream (and can enter bootstrap retry), later ones are events the client may
-        // correct on this socket.
+        // Only the first rejection fails the stream (and can enter bootstrap retry);
+        // later ones are events the client may correct on this socket.
         let terminal = classify(&payload);
         if let Some(error) = &terminal {
-            event.replay.clear(&payload, cooling);
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
         if self.first_response
@@ -857,9 +839,6 @@ impl Duplex {
                 out = response::normalize_completion(out);
                 if !self.current.native {
                     out = self.turn.items.patch(out);
-                }
-                if kind != "response.incomplete" {
-                    self.current.replay.completed(&out);
                 }
             }
         }

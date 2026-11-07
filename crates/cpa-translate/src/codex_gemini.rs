@@ -12,7 +12,7 @@ use crate::{Error, Registered, ResponseCtx, gemini};
 
 pub static PAIR: Registered = registered!(
     Gemini -> Codex,
-    request: |ctx, body| Ok(convert(ctx.model, body)),
+    request: |ctx, body| convert(ctx.model, body, false),
     non_stream: non_stream,
     go_stream: go_stream,
     token_count: Some(gemini::token_count),
@@ -251,8 +251,21 @@ fn effort_of(level: &Res<'_>) -> Vec<u8> {
 }
 
 /// ConvertGeminiRequestToCodex.
-fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
-    let mut out = br#"{"model":"","instructions":"","input":[]}"#.to_vec();
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions` or reasoning effort, and a refusal for any part or
+/// tool Codex cannot express. The registered pair, which other Responses providers
+/// share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert(ctx.model, body, true)
+}
+
+fn convert(model: &str, raw: &[u8], strict: bool) -> Result<Vec<u8>, crate::Error> {
+    let mut drops = crate::common::UserTurnDrops::default();
+    let mut out = if strict {
+        br#"{"model":"","input":[]}"#.to_vec()
+    } else {
+        br#"{"model":"","instructions":"","input":[]}"#.to_vec()
+    };
     let root = gj::parse(raw);
     let names = short_name_map(raw);
     let mut items: Vec<Vec<u8>> = vec![];
@@ -356,7 +369,17 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
                     };
                     gj::set_str(&mut item, "call_id", &id);
                     items.push(item);
+                    continue;
                 }
+                // A part Codex cannot express (code execution, executable code, video
+                // metadata and the like) is refused, not dropped.
+                let kind = part
+                    .map()
+                    .into_iter()
+                    .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+                    .find(|key| key != "thought" && key != "thoughtSignature")
+                    .unwrap_or_default();
+                drops.drop_part(&kind);
             }
         }
     }
@@ -369,6 +392,14 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
         for tool in tools.array() {
             let declarations = tool.get("functionDeclarations");
             if !declarations.is_array() {
+                // A built-in Gemini tool (search, code execution) has no Codex equivalent.
+                let kind = tool
+                    .map()
+                    .into_iter()
+                    .map(|(key, _)| String::from_utf8_lossy(&key).into_owned())
+                    .next()
+                    .unwrap_or_default();
+                drops.drop_part(&format!("tool {kind}"));
                 continue;
             }
             for declaration in declarations.array() {
@@ -416,11 +447,17 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
             }
         }
     }
-    gj::set_str(
-        &mut out,
-        "reasoning.effort",
-        effort.unwrap_or_else(|| b"medium".to_vec()),
-    );
+    // Strict: only the client's own thinking choice; without one the model's default
+    // applies. Go defaults to `medium`.
+    match effort {
+        Some(effort) => {
+            gj::set_str(&mut out, "reasoning.effort", effort);
+        }
+        None if !strict => {
+            gj::set_str(&mut out, "reasoning.effort", "medium");
+        }
+        None => {}
+    }
     gj::set_bool(&mut out, "stream", true);
     gj::set_bool(&mut out, "store", false);
     gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
@@ -437,7 +474,10 @@ fn convert(model: &str, raw: &[u8]) -> Vec<u8> {
             gj::set_str(&mut out, &full, &lower);
         }
     }
-    out
+    if strict {
+        drops.strict_result("Codex Responses")?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 pub static PAIR: Registered = registered!(
     OpenAI -> Codex,
-    request: |ctx, body| convert(ctx.model, body, ctx.stream),
+    request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
     token_count: None,
@@ -135,24 +135,41 @@ struct PendingCall {
     consumed: bool,
 }
 
-fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Error> {
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions` or reasoning effort, the client's
+/// `parallel_tool_calls`, and a refusal for any part Codex cannot express. The
+/// registered pair, which other Responses providers share, keeps Go's conversion.
+pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    convert(ctx.model, body, ctx.stream, true)
+}
+
+fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8>, crate::Error> {
     let mut drops = UserTurnDrops::default();
     let root = gj::parse(raw);
     let tools = root.get("tools");
     let tool_list = tools.array();
-    let mut out = br#"{"instructions":""}"#.to_vec();
+    // Strict: no top-level `instructions`. System messages become developer items, and
+    // the pinned client sends none either (`codex-api/src/common.rs:286-314`).
+    let mut out = if strict {
+        b"{}".to_vec()
+    } else {
+        br#"{"instructions":""}"#.to_vec()
+    };
     gj::set_bool(&mut out, "stream", stream);
     let effort = gj::get(raw, "reasoning_effort");
+    // Strict: only the client's own choice; without one the model's default applies.
     if effort.exists() {
         AnyValue::from_res(&effort).set(&mut out, "reasoning.effort");
-    } else {
+    } else if !strict {
         gj::set_str(&mut out, "reasoning.effort", "medium");
     }
     let tier = service_tier(&root.get("service_tier"));
     if !tier.is_empty() {
         gj::set_str(&mut out, "service_tier", tier);
     }
-    gj::set_bool(&mut out, "parallel_tool_calls", true);
+    // Strict: the client's choice, else the API default (`true`).
+    let parallel = root.get("parallel_tool_calls");
+    gj::set_bool(&mut out, "parallel_tool_calls", !strict || parallel.kind != Kind::False);
     gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
     gj::set_str(&mut out, "model", model);
 
@@ -297,6 +314,8 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
                                 drops.drop_part("input_audio");
                             }
                         }
+                        // Strict: a part Codex cannot express in this role is refused.
+                        other if strict => drops.drop_part(&String::from_utf8_lossy(other)),
                         _ => {}
                     }
                 }
@@ -497,7 +516,12 @@ fn convert(model: &str, raw: &[u8], stream: bool) -> Result<Vec<u8>, crate::Erro
         }
     }
     gj::set_bool(&mut out, "store", false);
-    drops.strict_result("Codex Responses").map(|()| out)
+    if strict {
+        drops.strict_result("Codex Responses")
+    } else {
+        drops.result()
+    }
+    .map(|()| out)
 }
 
 /// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
@@ -646,6 +670,7 @@ mod tests {
                 case["model"].as_str().unwrap(),
                 case["in"].as_str().unwrap().as_bytes(),
                 case["stream"].as_bool().unwrap(),
+                false,
             )
             .unwrap();
             assert_eq!(

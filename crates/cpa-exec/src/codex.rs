@@ -35,7 +35,6 @@ pub struct CodexExecutor {
     /// Upstream Responses WebSocket sockets per downstream session.
     pub(crate) ws: Arc<crate::codex_ws::Pool>,
     /// Claude clients' reasoning replay (process-wide in Go).
-    pub(crate) replay: Arc<crate::codex_replay::Cache>,
     /// Base for OAuth Alpha Search, which Go never derives from credential attributes.
     alpha_base_url: String,
     /// Live call, sideband and hangup URLs (`codex_live`).
@@ -73,7 +72,6 @@ impl CodexExecutor {
             oauth,
             quota: Arc::default(),
             ws: Default::default(),
-            replay: Arc::default(),
             alpha_base_url: DEFAULT_BASE_URL.into(),
             live: Default::default(),
         }
@@ -248,6 +246,9 @@ impl CodexExecutor {
             // The native route reads the body through the boundary itself.
             return self.native(&view, &settings, req, profile).await;
         }
+        if translated::route(&view, &req) {
+            return self.translated(&view, &settings, req).await;
+        }
         check_native_body(&req)?;
         match (req.alt.as_deref(), req.stream) {
             (Some("responses/compact"), true) => Err(ExecError::local(
@@ -294,7 +295,6 @@ impl CodexExecutor {
         url: String,
         headers: HeaderMap,
         body: String,
-        replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
     ) -> Result<crate::proxy::Upstream, ExecError> {
@@ -306,7 +306,6 @@ impl CodexExecutor {
             url,
             headers,
             Bytes::from(body),
-            replay,
             wire,
             error_body,
             &model,
@@ -327,7 +326,6 @@ impl CodexExecutor {
         url: String,
         headers: HeaderMap,
         body: Bytes,
-        replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
         model: &str,
@@ -358,7 +356,6 @@ impl CodexExecutor {
                 }
             };
             wire.chunk(&body);
-            crate::codex_replay::clear_on_invalid_signature(&self.replay, replay, status, &body);
             let mut error = response::status_error(status, &body, upstream.headers, settings.model_level_cooling);
             if direct {
                 // `status` stays the scheduler's classification (a usage or capacity
@@ -381,13 +378,10 @@ impl CodexExecutor {
         url: String,
         headers: HeaderMap,
         body: String,
-        replay: &crate::codex_replay::Scope,
         wire: &Wire,
         error_body: ErrorBody,
     ) -> Result<ExecResponse, ExecError> {
-        let upstream = self
-            .open(view, settings, url, headers, body, replay, wire, error_body)
-            .await?;
+        let upstream = self.open(view, settings, url, headers, body, wire, error_body).await?;
         let (status, headers) = (upstream.status, upstream.headers);
         let sse = headers
             .get(http::header::CONTENT_TYPE)
@@ -423,7 +417,6 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::Stream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
         let (body, cache) = request::prompt_cache(&req, body, ws_session, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
@@ -431,41 +424,19 @@ impl CodexExecutor {
         let url = format!("{}/responses", view.base_url);
         let started = Instant::now();
         let wire = Wire::new(req.capture(), view.credential);
-        // The response waits for the Home replay writes it caused (Go writes inline).
-        let writes = scope.writes.clone();
-        let sent = self
-            .send(
-                view,
-                settings,
-                url,
-                headers,
-                body.clone(),
-                &scope,
-                &wire,
-                ErrorBody::Strict,
-            )
-            .await;
-        let res = match sent {
-            Ok(res) => res,
-            Err(error) => {
-                writes.settle().await;
-                return Err(error);
-            }
-        };
+        let res = self
+            .send(view, settings, url, headers, body.clone(), &wire, ErrorBody::Strict)
+            .await?;
         let upstream = events(res.body);
         let processor = Processor::new(request::is_native(&req), settings.model_level_cooling)
             .codex_client(request::codex_client(&req))
             .grok_keepalive(&req.headers)
             .restoring(restore)
-            .replaying(self.replay.clone(), scope)
             .reporting(req.usage.clone())
             .capturing(wire);
         let stream = if settings.bootstrap_buffering {
             match response::bootstrap(upstream, processor, settings.bootstrap_timeout, started).await {
-                Bootstrap::Reject(error) => {
-                    writes.settle().await;
-                    return Err(error);
-                }
+                Bootstrap::Reject(error) => return Err(error),
                 Bootstrap::Stream(stream) => stream,
             }
         } else {
@@ -474,7 +445,7 @@ impl CodexExecutor {
         Ok(ExecResponse {
             status: res.status,
             headers: res.headers,
-            body: ResponseBody::Stream(writes.gate(client_stream(&req, &body, stream))),
+            body: ResponseBody::Stream(client_stream(&req, &body, stream)),
         })
     }
 
@@ -491,27 +462,15 @@ impl CodexExecutor {
             finalize,
             ..
         } = request::shape(&req, view, settings, Call::NonStream)?;
-        let (body, scope) = crate::codex_replay::apply(&self.replay, &req, body).await;
         let (body, cache) = request::prompt_cache(&req, body, None, false);
         let body = finalize.apply(&req, settings, request::sanitize_input_ids(body));
         report_request(&req, Format::Codex, &body);
         let headers = request::http_headers(view, settings, &req.headers, &body, &model, cache.as_deref(), true);
         let url = format!("{}/responses", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
-        // The response waits for the Home replay writes it caused (Go writes inline).
-        let writes = scope.writes.clone();
         let result = async {
             let res = self
-                .open(
-                    view,
-                    settings,
-                    url,
-                    headers,
-                    body.clone(),
-                    &scope,
-                    &wire,
-                    ErrorBody::Lossy,
-                )
+                .open(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
                 .await?;
             // Go reads the whole body (`io.ReadAll`, whatever its type), records every
             // byte that arrived, then parses it, a read error's partial tail included.
@@ -529,7 +488,6 @@ impl CodexExecutor {
             wire.chunk(&data);
             let mut processor = Processor::new(false, settings.model_level_cooling)
                 .restoring(restore)
-                .replaying(self.replay.clone(), scope)
                 .reporting(req.usage.clone());
             // `bytes.Split(data, "\n")`: every line in order, an unterminated tail included.
             if let Some(completed) = processor.buffered(&data)? {
@@ -545,7 +503,6 @@ impl CodexExecutor {
             Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
         }
         .await;
-        writes.settle().await;
         result
     }
 
@@ -564,16 +521,7 @@ impl CodexExecutor {
         let url = format!("{}/responses/compact", view.base_url);
         let wire = Wire::new(req.capture(), view.credential);
         let res = self
-            .send(
-                view,
-                settings,
-                url,
-                headers,
-                body.clone(),
-                &Default::default(),
-                &wire,
-                ErrorBody::Lossy,
-            )
+            .send(view, settings, url, headers, body.clone(), &wire, ErrorBody::Lossy)
             .await
             .map_err(compact_error)?;
         let data = match res.body {
@@ -746,71 +694,16 @@ impl CodexExecutor {
 
 /// `CountTokens` (codex_executor_tokens.go): the request shaped as for Codex, counted
 /// locally with the model's tiktoken encoding; nothing is sent upstream.
-fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecError> {
-    use crate::codex_json::{delete, set_bool_if_different, set_str, set_str_if_different};
+fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecError> {
     let model = request::base_model(&req.model);
-    // Go reads is-compat only from the attempt's binding here (APIKeyModelIsCompat).
-    let is_compat = req.resolved_model.as_ref().is_some_and(|r| r.is_compat());
-    let client = crate::codex_client::Client::new(&req.headers, cfg, "codex", is_compat);
-    let caps = req
-        .resolved_model
-        .as_ref()
-        .map(|r| cpa_common::thinking::ModelCaps::from(&r.info));
-    let ctx = cpa_translate::RequestCtx {
-        model: &model,
-        stream: false,
-        tool_search: false,
-    };
-    let translated = crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.body, &client)
-        .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?;
-    // The rule baseline: the translated original, else the translated body before
-    // thinking. Go counts with a failed translation's partial body; this refuses.
-    let original = if req.original_body.is_empty() {
-        translated.body.clone()
+    // The body the request would send: a Responses client's own bytes, or the built-in
+    // translation (#27). No Codex-client rewrite, default instructions or payload rule
+    // changes what is counted.
+    let body = if request::responses_formats(req) {
+        req.body.to_vec()
     } else {
-        crate::codex_client::translate_request(req.source_format, Format::Codex, &ctx, &req.original_body, &client)
-            .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))?
-            .body
+        translated::upstream_body(req, &model)?.into_bytes()
     };
-    let body = cpa_common::thinking::apply_request_thinking(&cpa_common::thinking::RequestThinking {
-        body: &translated.body,
-        payload: &req.body,
-        original: &req.original_body,
-        model: &req.model,
-        from: req.source_format.as_str(),
-        to: Format::Codex.as_str(),
-        provider: "codex",
-        resolved: caps.as_ref().map(Some),
-        has_request_transformer: cpa_translate::pair(req.source_format, Format::Codex).is_some(),
-        updates_changed: translated.configuration_updates_changed,
-    })
-    .map_err(|e| ExecError::local(e.status(), FailureScope::Request, e.message))?;
-    let mut body = String::from_utf8_lossy(&body).into_owned();
-    body = set_str_if_different(body, "model", &model);
-    for key in [
-        "previous_response_id",
-        "generate",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-    ] {
-        body = delete(&body, key);
-    }
-    body = set_bool_if_different(body, "stream", false);
-    if !request::is_native(req) {
-        let instructions = gjson::get(&body, "instructions");
-        if !instructions.exists() || instructions.kind() == gjson::Kind::Null {
-            body = set_str(&body, "instructions", "");
-        }
-    }
-    let body = crate::payload_barrier::Barrier {
-        executor: "codex",
-        model: &model,
-        protocol: Format::Codex.as_str(),
-        root: "",
-        original: &original,
-    }
-    .apply(cfg, req, body.into_bytes());
     let encoding = crate::codex_tokens::encoding_for_model(&model);
     let count = crate::codex_tokens::count_input_tokens(encoding, &body).map_err(|e| {
         ExecError::local(
@@ -822,9 +715,12 @@ fn count_tokens(req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecErr
     let usage =
         format!(r#"{{"response":{{"usage":{{"input_tokens":{count},"output_tokens":0,"total_tokens":{count}}}}}}}"#);
     let payload = cpa_translate::translate_token_count(req.response_format, Format::Codex, count, usage.as_bytes());
+    // The count is this proxy's tokenizer estimate, never provider-reported usage.
+    let mut headers = HeaderMap::new();
+    headers.insert(LOCAL_TOKEN_COUNT, http::HeaderValue::from_static("local-estimate"));
     Ok(ExecResponse {
         status: 200,
-        headers: HeaderMap::new(),
+        headers,
         body: ResponseBody::Buffered(Bytes::from(payload)),
     })
 }
@@ -1103,6 +999,12 @@ fn translate_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -
 
 #[path = "codex_native.rs"]
 pub(crate) mod native;
+
+#[path = "codex_translated.rs"]
+mod translated;
+
+/// The response header that marks a token count as this proxy's local estimate.
+pub const LOCAL_TOKEN_COUNT: &str = "x-cliproxy-token-count";
 
 #[cfg(test)]
 #[path = "codex_boundary_tests.rs"]

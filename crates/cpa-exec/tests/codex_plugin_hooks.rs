@@ -186,87 +186,66 @@ async fn sent(req: ExecRequest) -> Value {
 
 const UPDATE: &str = r#"{"model":"opaque-route","reasoning":{"effort":"medium"},"input":[{"type":"configuration_update","reasoning":{"effort":"low"}},{"role":"user","content":"hi"}]}"#;
 
-/// `TestPluginConfigurationUpdateNormalizationIsAuthoritative` and
-/// `TestRequestPairPreservesPluginConfigurationUpdateIntent` through the executor: a
-/// plugin that deletes the `configuration_update` item leaves the request's own effort,
-/// one that rewrites it wins, and thinking reads the working translation's intent.
-/// Equal payloads are normalized once, distinct ones once each.
+/// Go's `TestPluginConfigurationUpdateNormalizationIsAuthoritative` lets a plugin
+/// normalizer decide a Codex request's thinking. A Responses request on a native profile
+/// takes the native route (#23): no normalizer runs, and the upstream gets the client's
+/// bytes, its own `configuration_update` included (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
-async fn plugin_configuration_update_edits_decide_codex_thinking() {
-    for (name, effort, want) in [("delete", None, "medium"), ("rewrite", Some("high"), "high")] {
-        for distinct in [false, true] {
-            let fake = Arc::new(Fake {
-                edit: Some(match effort {
-                    None => Box::new(|body: &[u8]| {
-                        let mut v: Value = serde_json::from_slice(body).unwrap();
-                        v["input"].as_array_mut().unwrap().remove(0);
-                        serde_json::to_vec(&v).unwrap()
-                    }),
-                    Some(effort) => Box::new(move |body: &[u8]| set_effort(body, effort)),
+async fn plugin_normalizers_cannot_change_native_codex_requests() {
+    for effort in [None, Some("high")] {
+        let fake = Arc::new(Fake {
+            edit: Some(match effort {
+                None => Box::new(|body: &[u8]| {
+                    let mut v: Value = serde_json::from_slice(body).unwrap();
+                    v["input"].as_array_mut().unwrap().remove(0);
+                    serde_json::to_vec(&v).unwrap()
                 }),
-                ..Default::default()
-            });
-            let _hooks = install(Some(fake.clone()), true);
-            let original = if distinct {
-                r#"{"input":[{"role":"user","content":"different"}]}"#
-            } else {
-                UPDATE
-            };
-            let body = sent(request(Format::OpenAIResponse, "opaque-route", UPDATE, original, false)).await;
-            assert_eq!(body["reasoning"]["effort"], want, "{name} distinct={distinct}: {body}");
-            assert_eq!(
-                fake.seen.lock().unwrap().len(),
-                1 + distinct as usize,
-                "{name} distinct={distinct}"
-            );
-        }
+                Some(effort) => Box::new(move |body: &[u8]| set_effort(body, effort)),
+            }),
+            ..Default::default()
+        });
+        let _hooks = install(Some(fake.clone()), true);
+        let body = sent(request(Format::OpenAIResponse, "opaque-route", UPDATE, UPDATE, false)).await;
+        assert_eq!(
+            body,
+            serde_json::from_str::<Value>(UPDATE).unwrap(),
+            "the client's request"
+        );
+        assert!(fake.seen.lock().unwrap().is_empty(), "no normalizer ran");
     }
-    // Without a plugin the source's configuration_update decides.
-    let _hooks = install(None, false);
-    let body = sent(request(Format::OpenAIResponse, "opaque-route", UPDATE, UPDATE, false)).await;
-    assert_eq!(body["reasoning"]["effort"], "low", "{body}");
 }
 
-/// `TestTranslateRequestWithAPIKeyModelCompatibility_InvokesPluginNormalizers` for the
-/// Codex executor's compat path (Claude to Codex): the normalizer runs once, after the
-/// compat translator and the summary config, and its edit reaches the upstream. Hooks
-/// installed with no plugin offering one leave the upstream bytes unchanged.
+/// Go's `TestTranslateRequestWithAPIKeyModelCompatibility_InvokesPluginNormalizers` lets a
+/// normalizer edit a translated Codex request. On the translated route (#27) no
+/// normalizer runs, with or without one installed, and the upstream body is the built-in
+/// conversion (docs/DIFFERENCES-FROM-GO.md, "Codex translated route").
 #[tokio::test]
-async fn plugin_normalizers_run_after_the_codex_compat_translator() {
+async fn plugin_normalizers_cannot_change_translated_codex_requests() {
     let claude = r#"{"model":"opaque-route","max_tokens":64,"thinking":{"type":"enabled","budget_tokens":2048,"display":"summarized"},"messages":[{"role":"user","content":"hello"}]}"#;
     let plain = {
         let _hooks = install(None, false);
         sent(request(Format::Claude, "opaque-route", claude, claude, true)).await
     };
+    assert!(
+        plain["reasoning"]["summary"].is_string(),
+        "the client's summary choice: {plain}"
+    );
     let fake = Arc::new(Fake {
         edit: Some(Box::new(mark)),
         ..Default::default()
     });
-    {
-        let _hooks = install(Some(fake.clone()), false);
-        let inactive = sent(request(Format::Claude, "opaque-route", claude, claude, true)).await;
-        assert_eq!(inactive, plain);
-        assert!(fake.seen.lock().unwrap().is_empty());
-    }
     let _hooks = install(Some(fake.clone()), true);
     let body = sent(request(Format::Claude, "opaque-route", claude, claude, true)).await;
-    assert_eq!(body["plugin_call"], 1, "{body}");
-    let seen = fake.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    let hooked: Value = serde_json::from_slice(&seen[0]).unwrap();
-    // The hook sees the Codex body with the summary config already applied.
-    assert!(hooked["input"].is_array(), "{hooked}");
-    assert_eq!(
-        hooked["reasoning"]["summary"], plain["reasoning"]["summary"],
-        "{hooked}"
-    );
-    assert!(plain["reasoning"]["summary"].is_string(), "{plain}");
+    assert_eq!(body, plain, "the normalizer cannot change it");
+    assert!(body.get("plugin_call").is_none(), "{body}");
+    assert!(fake.seen.lock().unwrap().is_empty(), "no normalizer ran");
 }
 
-/// `TestCodexExecutorCountTokensPreservesToolNumberSchemas`: the normalizer sees the
-/// translated Codex body with `yield_time_ms` still a number, with and without compat.
+/// Go's `TestCodexExecutorCountTokensPreservesToolNumberSchemas` counted a normalized
+/// body. The local count (#27) reads the body the request would send, which no
+/// normalizer changes, and is marked as a local estimate.
 #[tokio::test]
-async fn count_tokens_normalizes_the_translated_tool_schemas() {
+async fn count_tokens_reads_the_unnormalized_body_and_is_marked_local() {
     let sources = [
         (
             Format::OpenAIResponse,
@@ -288,11 +267,10 @@ async fn count_tokens_normalizes_the_translated_tool_schemas() {
                 .await
                 .unwrap_or_else(|e| panic!("{e:?}"));
             assert!(matches!(response.body, cpa_core::exec::ResponseBody::Buffered(ref b) if !b.is_empty()));
-            let seen = fake.seen.lock().unwrap();
-            let hooked: Value = serde_json::from_slice(seen.last().expect("normalized")).unwrap();
-            assert_eq!(
-                hooked["tools"][0]["parameters"]["properties"]["yield_time_ms"]["type"], "number",
-                "{source:?} compat={compat}: {hooked}"
+            assert_eq!(response.headers[cpa_exec::codex::LOCAL_TOKEN_COUNT], "local-estimate");
+            assert!(
+                fake.seen.lock().unwrap().is_empty(),
+                "{source:?} compat={compat}: no normalizer ran"
             );
         }
     }

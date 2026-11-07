@@ -697,9 +697,6 @@ pub(crate) struct Processor {
     pub completed: Option<String>,
     /// The request renamed the `collaboration` namespace (multi-agent v2).
     restore: bool,
-    /// Claude clients' reasoning replay: cached from completed turns, cleared on an
-    /// invalid-signature failure.
-    replay: Option<(std::sync::Arc<crate::codex_replay::Cache>, crate::codex_replay::Scope)>,
     /// Usage records see every upstream payload in Codex format (`observeCodexTokenEvent`).
     usage: cpa_core::exec::UsageSink,
     /// Grok Build clients get keepalive events as SSE comments (`grokbuild`).
@@ -722,7 +719,6 @@ impl Processor {
             model_level_cooling,
             completed: None,
             restore: false,
-            replay: None,
             usage: Default::default(),
             grok_keepalive: false,
             codex_client: false,
@@ -763,28 +759,6 @@ impl Processor {
     pub fn reporting(mut self, usage: cpa_core::exec::UsageSink) -> Self {
         self.usage = usage;
         self
-    }
-
-    /// Caches completed turns and clears on invalid signatures for this replay scope.
-    pub fn replaying(
-        mut self,
-        cache: std::sync::Arc<crate::codex_replay::Cache>,
-        scope: crate::codex_replay::Scope,
-    ) -> Self {
-        self.replay = Some((cache, scope));
-        self
-    }
-
-    fn replay_failure(&self, status: u16, body: &str) {
-        if let Some((cache, scope)) = &self.replay {
-            crate::codex_replay::clear_on_invalid_signature(cache, scope, status, body.as_bytes());
-        }
-    }
-
-    fn replay_completed(&self, payload: &str) {
-        if let Some((cache, scope)) = &self.replay {
-            crate::codex_replay::cache_completed(cache, scope, payload.as_bytes());
-        }
     }
 
     /// Restores the client's `collaboration` names in every payload before anything
@@ -862,7 +836,6 @@ impl Processor {
                             .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
                     }
                     if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
-                        self.replay_failure(error.status, &body);
                         if self.codex_client
                             && let Some(event) = cpa_common::codex_client::context_window_failure_event(payload)
                         {
@@ -894,15 +867,11 @@ impl Processor {
                     let mut payload = payload.to_owned();
                     match gjson::get(&payload, "type").str() {
                         "response.output_item.done" => self.items.collect(&payload),
-                        kind @ ("response.completed" | "response.incomplete" | "response.done") => {
-                            let incomplete = kind == "response.incomplete";
+                        "response.completed" | "response.incomplete" | "response.done" => {
                             terminal = true;
                             payload = normalize_completion(payload);
                             if !self.preserve_native {
                                 payload = self.items.patch(payload);
-                            }
-                            if !incomplete {
-                                self.replay_completed(&payload);
                             }
                             self.completed = Some(payload.clone());
                         }
@@ -964,21 +933,16 @@ impl Processor {
                 if meaningful_delta(payload) {
                     self.saw_delta = true;
                 }
-                if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
-                    self.replay_failure(error.status, &body);
+                if let Some((error, _)) = terminal_failure(payload, self.model_level_cooling) {
                     return Err(error);
                 }
                 match gjson::get(payload, "type").str() {
                     "response.output_item.done" => self.items.collect(payload),
-                    kind @ ("response.completed" | "response.incomplete") => {
+                    "response.completed" | "response.incomplete" => {
                         if empty_incomplete(payload, self.items.len(), self.saw_delta) {
                             return Err(request_scoped(502, EMPTY_INCOMPLETE_MESSAGE));
                         }
-                        let completed = self.items.patch(payload.to_owned());
-                        if kind == "response.completed" {
-                            self.replay_completed(&completed);
-                        }
-                        return Ok(Some(completed));
+                        return Ok(Some(self.items.patch(payload.to_owned())));
                     }
                     _ => {}
                 }

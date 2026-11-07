@@ -110,8 +110,10 @@ impl CodexExecutor {
         if req.usage.enabled() {
             req.usage.request(Format::OpenAI, &body);
         }
+        // No synthesized prompt-cache key in the body (#27); the session identity reaches
+        // the headers only, and #26 owns those.
         let cache = request::session_uuid(&req, None);
-        let body = json_body(body, cache.as_deref());
+        let body = json_body(body);
         // The payload rules run last (868e137), on the body's JSON view.
         let original = if req.original_body.is_empty() {
             &req.body
@@ -239,11 +241,9 @@ impl CodexExecutor {
         let prepared = prepare(&req, path)?;
         let main_model = main_model(&settings.image_base_model);
         let body = tool_body(&prepared.body, main_model, view.siwc)?;
+        // No synthesized prompt-cache key in the body (#27); the session identity reaches
+        // the headers only, and #26 owns those. The input is the adapter's own.
         let cache = request::session_uuid(&req, None);
-        let body = match &cache {
-            Some(id) => set_str_if_different(body, "prompt_cache_key", id),
-            None => body,
-        };
         let body = request::sanitize_input_ids(body);
         // The payload rules run last (868e137), as the codex executor, on the
         // prepared image request.
@@ -276,7 +276,6 @@ impl CodexExecutor {
                 url,
                 headers,
                 body,
-                &Default::default(),
                 &wire,
                 crate::codex::ErrorBody::Strict,
             )
@@ -507,17 +506,12 @@ fn main_model(configured: &str) -> &str {
     }
 }
 
-/// `cacheHelper` on a direct body: the prompt cache key and input-id sanitising apply to
-/// JSON bodies only.
-fn json_body(body: Bytes, cache: Option<&str>) -> Bytes {
+/// Input-id sanitising on a direct JSON body. No prompt-cache key is synthesized (#27).
+fn json_body(body: Bytes) -> Bytes {
     if !cpa_common::json::std_valid(&body) {
         return body;
     }
     let text = String::from_utf8_lossy(&body).into_owned();
-    let text = match cache {
-        Some(id) => set_str_if_different(text, "prompt_cache_key", id),
-        None => text,
-    };
     Bytes::from(request::sanitize_input_ids(text))
 }
 

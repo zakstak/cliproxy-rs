@@ -219,7 +219,6 @@ impl CodexExecutor {
                 url,
                 headers,
                 body.clone(),
-                &Default::default(),
                 &wire,
                 error_body,
                 &model,

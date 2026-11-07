@@ -940,3 +940,59 @@ async fn plugin_interceptors_cannot_rewrite_native_websocket_turns() {
     drop(socket);
     assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
 }
+
+/// Plugin request normalizers and translators and response normalizers (the
+/// `request.normalize`, `request.translate`, `response.translate`,
+/// `response.normalize_before` and `response.normalize_after` hooks) cannot change a
+/// Codex translated request or its answer (#27): a Claude request reaches the upstream as
+/// the built-in conversion and the client gets the built-in translation of the upstream
+/// answer, while none of those hooks is called. The plugin lifecycle still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_translators_cannot_rewrite_codex_translated_traffic() {
+    let Some(fx) = Fixture::build(Setup {
+        name: "codex-translated-plugins",
+        providers: default_providers(&["key-FAKE-codex"]),
+        routing: "",
+        caps: "request_normalizer,request_translator,response_translator,response_before_translator,response_after_translator,request_lifecycle_plugin",
+        extra: Box::new(|_| Vec::new()),
+        rewriting_hooks: false,
+    })
+    .await
+    else {
+        return;
+    };
+    for method in [
+        "request.normalize",
+        "request.translate",
+        "response.translate",
+        "response.normalize_before",
+        "response.normalize_after",
+    ] {
+        fx.respond(
+            method,
+            &json!({"ok": true, "result": {"Body": b64(r#"{"plugin":"rewrote this"}"#)}}),
+        );
+    }
+    let claude = r#"{"model":"gpt-native","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+    let (status, answer) = fx.post("/v1/messages", &[("x-api-key", "client-key-1")], claude).await;
+    assert_eq!(status, 200, "{answer}");
+    assert!(
+        answer.contains("Done."),
+        "the built-in translation of the answer: {answer}"
+    );
+    assert!(!answer.contains("rewrote this"), "{answer}");
+    let sent = fx.codex.http().pop().expect("the Codex upstream got the request");
+    let body = String::from_utf8_lossy(&sent.body);
+    assert!(body.contains(r#""text":"hello""#), "{body}");
+    assert!(!body.contains("rewrote this"), "{body}");
+    for method in [
+        "request.normalize",
+        "request.translate",
+        "response.translate",
+        "response.normalize_before",
+        "response.normalize_after",
+    ] {
+        assert_eq!(fx.calls(method), 0, "{method}");
+    }
+    assert!(fx.lifecycle_completions(1).await >= 1, "lifecycle completion");
+}

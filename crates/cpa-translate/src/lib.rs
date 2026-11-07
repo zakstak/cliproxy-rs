@@ -416,21 +416,23 @@ pub fn translate_request_tracked(
     }
 }
 
-/// The built-in translation of a registered pair, without plugin request normalizers or
-/// plugin translators: the Codex translated route (`docs/codex/CONTRACT.md`
-/// "Translated route"), whose wire body no hook may change. The thinking summary
-/// pipeline runs, as it converts the client's own reasoning-summary choice. `None` when
-/// the pair is not registered.
-pub fn builtin_request(
-    client: Format,
-    upstream: Format,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-) -> Option<Result<Vec<u8>, Error>> {
-    let pair = pair(client, upstream)?;
+/// The Codex translated route's request conversion (`docs/codex/CONTRACT.md`
+/// "Translated route"): the built-in converter of `client` into Codex in its strict
+/// mode, without plugin request normalizers or plugin translators, whose output no hook
+/// may change. The thinking summary pipeline runs, as it converts the client's own
+/// reasoning-summary choice. `None` for a source the route does not convert.
+pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Option<Result<Vec<u8>, Error>> {
+    let convert: RequestFn = match client {
+        Format::Claude => codex_claude::codex_strict,
+        Format::OpenAI => codex_chat_request::codex_strict,
+        Format::Gemini => codex_gemini::codex_strict,
+        Format::Interactions => codex_interactions::codex_strict,
+        _ => return None,
+    };
+    let upstream = Format::Codex;
     Some(deep_stack(levels(&[body]), || {
         let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
-        let out = (pair.request)(ctx, body)?;
+        let out = convert(ctx, body)?;
         Ok(thinking::apply_summary_for_model(
             out,
             upstream.as_str(),
@@ -441,7 +443,7 @@ pub fn builtin_request(
 }
 
 /// A registered pair's non-stream response translation without plugin response hooks
-/// (see [`builtin_request`]).
+/// (see [`codex_request`]).
 pub fn builtin_non_stream(
     client: Format,
     upstream: Format,
@@ -452,7 +454,7 @@ pub fn builtin_non_stream(
 }
 
 /// A registered pair's stream translation without plugin response hooks (see
-/// [`builtin_request`]).
+/// [`codex_request`]).
 pub fn builtin_stream(client: Format, upstream: Format, ctx: &ResponseCtx<'_>) -> Option<Box<dyn StreamTranslator>> {
     registered(client, upstream).map(|r| {
         stream::framed(
