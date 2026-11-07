@@ -210,6 +210,7 @@ Go was faster in the 0.1.0 launch build's synthetic runs. It served 1,568 non-st
 - [Client settings](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/CLIENTS.md), [several accounts](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MULTI-ACCOUNT.md) and [configuration](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/CONFIGURATION.md).
 - [Moving from CLIProxyAPI](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MIGRATING-FROM-GO.md) and [differences from Go](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/DIFFERENCES-FROM-GO.md).
 - [Parity](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) and [benchmarks](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/BENCHMARKS.md).
+- [Working in the zakstak fork](docs/FORK.md): branches, upstream sync and contributing fixes upstream.
 
 ## Security
 
