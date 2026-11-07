@@ -1,7 +1,10 @@
 #!/bin/sh
-# Installs cliproxy-rs on macOS or Linux, sets it up and starts it.
+# Installs a zakstak/cliproxy-rs release on Linux, sets it up and starts it. This fork
+# supports Linux only: on Windows or macOS, run the Linux container instead
+# (docs/INSTALL.md). The fork has published no release yet; until it does, this script
+# stops before changing anything, and you build from source (docs/INSTALL.md).
 #
-#   curl -fsSL https://raw.githubusercontent.com/vayungodara/cliproxy-rs/master/install.sh | sh
+#   sh install.sh        # from a checkout of this repository
 #
 # The first run downloads the release for this machine, checks it against the release's
 # SHA256SUMS and installs ~/.local/bin/cliproxy. It writes ~/.cliproxy-rs/config.yaml with
@@ -11,7 +14,7 @@
 # restarts the server; an existing config.yaml or keys.env is never changed.
 #
 # Options (when piping, pass them as: sh -s -- --service):
-#   --service      also start cliproxy-rs at login, with a systemd user unit or a launchd agent
+#   --service      also start cliproxy-rs at login, with a systemd user unit
 #   --binary-only  only install or upgrade the binary
 #   --check        report installed and available versions without changing anything
 #
@@ -21,7 +24,7 @@
 #   CLIPROXY_HOME         config, keys, credentials and log (default: $HOME/.cliproxy-rs)
 #   CLIPROXY_NO_OPEN=1    never open a browser
 #   CLIPROXY_RELEASES     release page base URL, for mirrors and tests
-#                         (default: https://github.com/vayungodara/cliproxy-rs/releases)
+#                         (default: https://github.com/zakstak/cliproxy-rs/releases)
 set -eu
 
 fail() {
@@ -31,18 +34,14 @@ fail() {
 
 # Everything runs from main, so a download cut short cannot run half a script.
 main() {
-  releases="${CLIPROXY_RELEASES:-https://github.com/vayungodara/cliproxy-rs/releases}"
+  releases="${CLIPROXY_RELEASES:-https://github.com/zakstak/cliproxy-rs/releases}"
   dir="${CLIPROXY_INSTALL_DIR:-$HOME/.local/bin}"
   home="${CLIPROXY_HOME:-$HOME/.cliproxy-rs}"
   bin="$dir/cliproxy"
   config="$home/config.yaml" keys="$home/keys.env" log="$home/cliproxy.log" pidfile="$home/cliproxy.pid"
-  label=io.github.vayungodara.cliproxy-rs
   os=$(uname -s)
-  if [ "$os" = Darwin ]; then
-    unit="$HOME/Library/LaunchAgents/$label.plist"
-  else
-    unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cliproxy.service"
-  fi
+  [ "$os" = Linux ] || fail "cliproxy-rs supports Linux only, and this is $os. On Windows or macOS, run the Linux container instead (docs/INSTALL.md#docker); clients on this machine can still connect to it."
+  unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cliproxy.service"
 
   setup=1 service='' check='' requested_service=''
   for arg in "$@"; do
@@ -60,8 +59,6 @@ main() {
   case "$os-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) target=x86_64-unknown-linux-gnu ;;
     Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
-    Darwin-arm64) target=aarch64-apple-darwin ;;
-    Darwin-x86_64) target=x86_64-apple-darwin ;;
     *) fail "there is no release binary for $os $(uname -m); build from source (docs/INSTALL.md)" ;;
   esac
 
@@ -87,20 +84,16 @@ main() {
   if [ -n "$current" ]; then
     [ -n "$setup" ] || return 0
     if [ -z "$requested_service" ] && [ -f "$config" ]; then
-      # -nt is supported by both Linux /bin/sh and macOS /bin/sh.
+      # -nt is supported by dash, bash and busybox sh.
       # shellcheck disable=SC3013
       if [ -z "$service" ]; then
         if managed_pid && pid_running "$pid" && [ ! "$bin" -nt "$pidfile" ]; then return 0; fi
       elif [ ! "$bin" -nt "$unit" ]; then
-        if [ "$os" = Darwin ]; then
-          if launchctl print "gui/$(id -u)/$label" 2>/dev/null | grep -q 'state = running'; then return 0; fi
-        elif systemctl --user is-active --quiet cliproxy.service; then
-          return 0
-        fi
+        if systemctl --user is-active --quiet cliproxy.service; then return 0; fi
       fi
     fi
   fi
-  if [ -n "$setup" ] && [ -n "$service" ] && [ "$os" != Darwin ]; then
+  if [ -n "$setup" ] && [ -n "$service" ]; then
     systemctl --user show-environment >/dev/null 2>&1 ||
       fail "systemd user services are not available here; run this without --service"
   fi
@@ -114,11 +107,7 @@ main() {
     curl -fsSL --retry 3 -o "$tmp/SHA256SUMS" "$releases/download/$tag/SHA256SUMS" || fail "could not download SHA256SUMS from release $tag"
     expected=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
     [ -n "$expected" ] || fail "$name.tar.gz is not listed in SHA256SUMS"
-    if command -v sha256sum >/dev/null 2>&1; then
-      actual=$(sha256sum "$tmp/$name.tar.gz" | awk '{ print $1 }')
-    else
-      actual=$(shasum -a 256 "$tmp/$name.tar.gz" | awk '{ print $1 }')
-    fi
+    actual=$(sha256sum "$tmp/$name.tar.gz" | awk '{ print $1 }')
     [ "$actual" = "$expected" ] || fail "checksum mismatch for $name.tar.gz; nothing was installed"
 
     tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
@@ -179,30 +168,6 @@ EOF
       (cd "$home" && exec nohup "$bin" --config "$config" </dev/null >>"$log" 2>&1) &
       echo $! >"$pidfile" || return 1
       how="kill \$(cat '$pidfile')"
-    elif [ "$os" = Darwin ]; then
-      mkdir -p "$(dirname "$unit")" || return 1
-      cat >"$unit" <<EOF || return 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$label</string>
-  <key>ProgramArguments</key><array><string>$bin</string><string>--config</string><string>$config</string></array>
-  <key>WorkingDirectory</key><string>$home</string>
-  <key>StandardOutPath</key><string>$log</string>
-  <key>StandardErrorPath</key><string>$log</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-</dict>
-</plist>
-EOF
-      domain="gui/$(id -u)"
-      if launchctl print "$domain/$label" >/dev/null 2>&1; then
-        launchctl kickstart -k "$domain/$label" || return 1
-      else
-        launchctl bootstrap "$domain" "$unit" || return 1
-      fi
-      how="launchctl bootout $domain/$label (and delete $unit to stop starting it at login)"
     else
       mkdir -p "$(dirname "$unit")" || return 1
       cat >"$unit" <<EOF || return 1
@@ -239,13 +204,11 @@ EOF
 
   opened=
   if [ -t 1 ] && [ -z "${CLIPROXY_NO_OPEN:-}" ]; then
-    if [ "$os" = Darwin ]; then
-      open "$url" && opened=1
-    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null 2>&1; then
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null 2>&1; then
       xdg-open "$url" >/dev/null 2>&1 && opened=1
     fi
   fi
-  if [ -z "$opened" ] && { [ -n "${SSH_CONNECTION:-}" ] || [ "$os${DISPLAY:-}${WAYLAND_DISPLAY:-}" = Linux ]; }; then
+  if [ -z "$opened" ] && { [ -n "${SSH_CONNECTION:-}" ] || [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }; then
     printf '\nNo browser on this machine? Keep the server on 127.0.0.1 and reach it from your own computer\n'
     printf 'through an SSH tunnel, then open the dashboard address there:\n'
     printf '  ssh -L %s:127.0.0.1:%s %s@%s\n' "$port" "$port" "$(id -un)" "$(hostname)"
@@ -279,7 +242,6 @@ swap_binary() {
     backup=1
   fi
   mv -f "$dir/.cliproxy.new" "$bin" || return 1
-  [ "$os" != Darwin ] || xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
   printf 'Installed %s at %s\n' "$("$bin" --version 2>/dev/null | tail -n 1)" "$bin"
 }
 
@@ -325,8 +287,6 @@ wait_healthy() {
       sleep 1
       if [ -z "$service" ]; then
         managed_pid && pid_running "$pid" || return 1
-      elif [ "$os" = Darwin ]; then
-        launchctl print "gui/$(id -u)/$label" 2>/dev/null | grep -q 'state = running' || return 1
       else systemctl --user is-active --quiet cliproxy.service || return 1; fi
       return 0
     fi
@@ -373,39 +333,16 @@ managed_pid() {
   pid=$(cat "$pidfile" 2>/dev/null) || return 1
   case "$pid" in '' | *[!0-9]*) return 1 ;; esac
   [ "$pid" -gt 0 ] || return 1
-  if [ "$os" = Linux ]; then
-    # procfs verifies ownership without procps; never signal an unknown stale PID.
-    command=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
-  elif [ "$os" = Darwin ]; then
-    # Seatbelt refuses setuid ps; bash 3.2's substitution status is not reliable.
-    if ! ps -p $$ -o pid= >/dev/null 2>&1; then
-      # pgrep is not setuid. Never trust liveness alone for a stale pid file.
-      pgrep -x 'cliproxy([.]prev)?' 2>/dev/null | grep -qx "$pid"
-      return $?
-    fi
-    command=$(ps -p "$pid" -o ucomm= 2>/dev/null) || return 1
-    command=$(printf '%s\n' "$command" | sed 's/^[ ]*//;s/[ ]*$//')
-  else
-    command=$(ps -p "$pid" -o comm= 2>/dev/null) || return 1
-    command=$(printf '%s\n' "$command" | sed 's/^[ ]*//;s/[ ]*$//')
-  fi
+  # procfs verifies ownership without procps; never signal an unknown stale PID.
+  command=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
   case "$command" in cliproxy | cliproxy.prev) return 0 ;; *) return 1 ;; esac
 }
 
 pid_running() {
   kill -0 "$1" 2>/dev/null || return 1
-  if [ "$os" = Linux ]; then
-    state=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
-    state=${state##*) }
-    case "$state" in '' | Z\ *) return 1 ;; esac
-  else
-    if [ "$os" = Darwin ] && ! ps -p $$ -o pid= >/dev/null 2>&1; then
-      pgrep -x 'cliproxy([.]prev)?' 2>/dev/null | grep -qx "$1"
-      return $?
-    fi
-    state=$(ps -p "$1" -o stat= 2>/dev/null) || return 1
-    case "$state" in '' | *Z*) return 1 ;; esac
-  fi
+  state=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  state=${state##*) }
+  case "$state" in '' | Z\ *) return 1 ;; esac
   return 0
 }
 
