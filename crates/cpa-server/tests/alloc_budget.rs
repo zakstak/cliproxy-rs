@@ -9,7 +9,8 @@
 //! key whose base-url is the fake upstream). The Codex route is measured at about 100 KB,
 //! 306 KB, 1.9 MB and 7.6 MB, without and with a model alias (the native route's one body
 //! edit), and translated from Claude Messages and from Gemini with large tool schemas
-//! (#29), so the ratios show how preparation scales with the body. `/v1/messages/count_tokens` with the same
+//! with a fixed set of tool schemas (#29): the peak heap and allocation count at each sampled
+//! size, not a measure of time or computational complexity. `/v1/messages/count_tokens` with the same
 //! Claude bodies is counted too: an OAuth credential counts locally with the shared
 //! o200k_base encoder, which the warm-up builds. The same Claude bodies then go to a
 //! Claude OAuth login through the server's request capture, from a client that is not

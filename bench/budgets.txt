@@ -178,9 +178,11 @@ alloc.1900k.allocations         6_710  3
 # +48 bytes and +6 allocations per request.
 # 2026-11-07: Codex native route (#23, #28) and the Responses handler keeping the client's
 # buffer when the Codex-client preparation leaves it alone (#29): a request whose model
-# needs no routing adds no copy of its body, so its peak is the same at every size
+# needs no routing held no copy of its body in these runs: its peak was the same at every sampled size
 # (84,460 bytes at 122 KB and at 7.7 MB; was 2.0x the body, and 8.8x before #23).
-# Allocation counts are the same at every size. 100k and 7600k are new.
+# Allocation counts were the same at every sampled size. 100k and 7600k are new. Raw output, three
+# runs each on rustc 1.99.1 and on CI's pinned 1.99.0, both on one local machine at
+# 894e24c7: bench/results/2026-11-07-codex-alloc.txt. Not yet measured on CI's runners.
 alloc.codex.100k.peak_bytes          84_460  2
 alloc.codex.100k.allocations            939  3
 alloc.codex.306k.peak_bytes          84_460  2
@@ -191,19 +193,22 @@ alloc.codex.7600k.peak_bytes         84_460  2
 alloc.codex.7600k.allocations           939  3
 
 # 2026-11-07: the same bodies for a model alias, so `model` is routed: the one native
-# body edit (#23), one copy of the body (1.0x at 1.9 MB and 7.7 MB).
+# body edit (#23), one copy of the body (1.0x at 1.9 MB and 7.7 MB). 856 allocations in
+# every run of bench/results/2026-11-07-codex-alloc.txt (an earlier, uncommitted run
+# counted 858 once; the line now holds the recorded value).
 alloc.codex.alias.100k.peak_bytes       198_009  2
-alloc.codex.alias.100k.allocations          858  3
-alloc.codex.alias.1900k.peak_bytes    1_991_359  2
-alloc.codex.alias.1900k.allocations         858  3
+alloc.codex.alias.100k.allocations          856  3
+alloc.codex.alias.1900k.peak_bytes    1_991_511  2
+alloc.codex.alias.1900k.allocations         856  3
 alloc.codex.alias.7600k.peak_bytes    7_748_431  2
-alloc.codex.alias.7600k.allocations         858  3
+alloc.codex.alias.7600k.allocations         856  3
 
 # 2026-11-07: the Claude bodies above sent to the Codex model through /v1/messages: the
-# translated route (#27) converts them to Responses and the answer back. 4.0x the body
-# at 1.8 MB and 7.4 MB, the same ratio at every size: the strict conversion's output,
-# the shared reasoning step's copy (cpa_common::thinking, which other providers share),
-# and the server's Claude ingress (the Claude route above is 4.0x too).
+# translated route (#27) converts them to Responses and the answer back. 4.4x the body
+# at 119 KB and 4.0x at 1.8 MB and 7.4 MB. Not attributed by measurement; by reading the
+# code, the peak includes the strict conversion's output and the copy that the shared
+# reasoning step (cpa_common::thinking, which other providers share) returns, and the
+# Claude route above measures 4.0x too.
 alloc.codex.claude.100k.peak_bytes        522_797  2
 alloc.codex.claude.100k.allocations         2_647  3
 alloc.codex.claude.1900k.peak_bytes     7_441_814  2
@@ -211,13 +216,15 @@ alloc.codex.claude.1900k.allocations       10_117  3
 alloc.codex.claude.7600k.peak_bytes    29_649_658  2
 alloc.codex.claude.7600k.allocations       34_069  3
 
+# Each 2026-11-07 value is the largest of the six runs in
+# bench/results/2026-11-07-codex-alloc.txt.
 # 2026-11-07: Gemini requests for the Codex model whose size starts with 48 large tool
 # schemas (upper-case types converted at schema positions only, #27), then turns of
 # function calls and large responses. 3.8x to 4.5x the body.
 alloc.codex.gemini.400k.peak_bytes      2_402_207  2
 alloc.codex.gemini.400k.allocations        35_524  3
 alloc.codex.gemini.1900k.peak_bytes     7_565_550  2
-alloc.codex.gemini.1900k.allocations       41_392  3
+alloc.codex.gemini.1900k.allocations       41_394  3
 alloc.codex.gemini.7600k.peak_bytes    29_806_962  2
 alloc.codex.gemini.7600k.allocations       63_784  3
 

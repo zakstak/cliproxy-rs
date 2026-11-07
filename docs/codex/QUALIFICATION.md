@@ -4,7 +4,7 @@ This page is the receipt for the Codex migration ([#20](https://github.com/zakst
 
 1. Source evidence: what the first-party client and the provider documentation define ([CONTRACT.md](CONTRACT.md)).
 2. Local mock results: what the server does at its real ingress and egress, against loopback upstreams, with fake credentials and private `auth-dir`s.
-3. Measured performance: heap per request and scaling ([BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request-and-scaling)).
+3. Measured performance: heap per request for sampled workloads ([BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request)).
 4. Unproven live gates: what no local test can show.
 
 No result here comes from a real account, and none was sent to a provider.
@@ -73,14 +73,41 @@ The meta and xAI executors, which share the registered translators, keep Go's co
 
 ## 3. Measured performance
 
-[BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request-and-scaling) has the setup, commands and numbers. In short, from the counting allocator in the test profile:
+[BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request) has the setup, commands, compilers and tables. The raw output is in [`bench/results/2026-11-07-codex-alloc.txt`](../../bench/results/2026-11-07-codex-alloc.txt), taken at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`.
 
-- A native request that needs no routing holds 84 KB of preparation heap at every body size from 122 KB to 7.7 MB. That is down from 2.0x the body, after removing an always-on body copy in the Responses handler.
-- An alias adds one copy of the body.
-- The translated route is about 4x the body at every size, for Claude and for Gemini with large schemas.
-- Every workload scales linearly.
+These are heap observations from the counting allocator in the test profile, for sampled synthetic workloads. There were six runs, three each on rustc 1.99.1 and on CI's pinned 1.99.0, on one local machine:
 
-`bench/budgets.txt` gates these numbers.
+- A native request that needs no routing peaked at 84 KB of preparation heap, with 939 allocations, at every sampled size from 122 KB to 7.7 MB. That is down from 2.0x the body, after removing an always-on body copy in the Responses handler.
+- An alias added one copy of the body.
+- The translated route peaked at between 3.8x and 4.5x the body for the sampled Claude and Gemini requests. In the Gemini requests the 48 tool schemas are the same at every size; only the conversation turns grow.
+
+The allocator measures peak live heap and allocation calls, not time or bytes read. So these results establish nothing about computational scaling, and nothing about growth with schema size.
+
+`bench/budgets.txt` gates the values. They were not measured on GitHub's runners.
+
+## Local verification receipt
+
+**Full workspace, at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`, clean tree.** This follows `.github/workflows/ci.yml`:
+- rootless podman as uid 1000, `--network none` (loopback only), the shared heavy-build lock, `CARGO_BUILD_JOBS=2`, `nice -n 19`;
+- `CPA_TEST_NO_SKIP=1`;
+- PostgreSQL 15 server binaries (`CPA_TEST_PG_BIN`, from a local image that adds only Debian's `postgresql` package);
+- the host's Go 1.27.3 with the plugin modules;
+- rustc 1.99.1;
+- private auth dirs.
+
+`cargo-nextest` is not installed there, so `cargo test` ran the same targets.
+
+| Step | Result |
+| --- | --- |
+| `cargo test --workspace --locked --offline --no-fail-fast` | 91 test binaries: 2,268 passed, 1 failed, 2 ignored |
+| `cargo test --manifest-path vendor/gjson/Cargo.toml` | passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed |
+| `cargo check --locked --manifest-path harness/rust/Cargo.toml` | passed |
+| `cargo fmt --all --check` | passed |
+
+The one failure is `home::tests::home_plugin_finalization_waits_for_the_applied_config` (`crates/cliproxy/src/home.rs`). It fails the same way in this environment at the fork's base before the migration stack (`origin/fork`, `c610d7d8fe99291325573630c4ec99ad8ac86d2e`) and at the stack heads checked (`b555216b`, `7d9d6811`, `1c0a8bce`). It is a pre-existing failure here; its cause has not been established.
+
+These are local runs, not CI. GitHub Actions is disabled on this fork, so no hosted check has run.
 
 ## 4. Unproven live gates
 

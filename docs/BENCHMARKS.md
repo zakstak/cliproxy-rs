@@ -296,7 +296,7 @@ Measured on 2026-10-28 with the same load, through `soak.yml`'s `go` input ([run
   | `MALLOC_ARENA_MAX=2` | 51.8 to 59.2 | 111.8 | 155.0 | 42.6 |
 
   A 1 MiB threshold took 26.6 MB (17%) off the peak for 16 to 19% more CPU per request, and 256 KiB 33.8 MB for 27 to 31% more: every large buffer then comes from fresh, zeroed pages. The server sets none of these; `MALLOC_MMAP_THRESHOLD_` in its environment remains an option for anyone who would trade that CPU for the lower peak.
-- Peak per request: the Claude route peaks at 6.0x its body (11,083,177 bytes of live heap for a 1,843,825-byte request), count_tokens on the same body at 7.3x (13,530,973 bytes, in 1,630,109 allocations) and the Codex route at 8.8x (16,783,275 bytes for 1,916,052). `crates/cpa-server/tests/alloc_budget.rs` now gates all three. Codex request shaping rewrote the body pass by pass, each pass a new copy. (That shaping was deleted with the Codex migration; [Codex request preparation](#codex-request-preparation-heap-per-request-and-scaling) has today's numbers.)
+- Peak per request: the Claude route peaks at 6.0x its body (11,083,177 bytes of live heap for a 1,843,825-byte request), count_tokens on the same body at 7.3x (13,530,973 bytes, in 1,630,109 allocations) and the Codex route at 8.8x (16,783,275 bytes for 1,916,052). `crates/cpa-server/tests/alloc_budget.rs` now gates all three. Codex request shaping rewrote the body pass by pass, each pass a new copy. (That shaping was deleted with the Codex migration; [Codex request preparation](#codex-request-preparation-heap-per-request) has today's numbers.)
 
 ### Gates
 
@@ -377,7 +377,7 @@ Snapshots after a burst of 100 requests and 60 seconds idle, with the load gener
 - A cloaked 1.9 MB request still allocates 32 buffers of 256 KiB or more and peaks at 5.1x its body: each remaining rewrite returns a new copy. Recording the edits from one walk and splicing them into one output, as `signals.rs` does for cache_control, is the way to the 3x target (`ponytail:` note in `crates/cpa-exec/src/claude.rs`).
 - glibc still keeps what a burst freed until the next trim: when the server goes quiet, or at the forced trim that comes once a minute while it stays busy. Fresh pages for every large buffer (`MALLOC_MMAP_THRESHOLD_`) would remove that too, at the CPU cost above. Forcing that trim every 10 seconds while busy instead is not part of this change: `malloc_trim` locks each arena in turn, so request threads can wait on it although it runs on the blocking pool. In one soak run of this change with it, between the two above, the median of the sampled RSS was 67.6 MB against 78.4 and 79.2 MB, `VmHWM` 112.5 MB against 111.4 and 117.1 MB, CPU 58 ms per request against 57, and the time to first byte at p99 of each batch 2,153 to 2,289 ms against 2,215 to 2,266 ms. The soak records no maximum time to first byte. On an intermediate build with the 200-request load of the attribution runs, it lowered `VmHWM` from 159.8 and 163.9 MB to 147.2 and 151.1 MB.
 - hyper keeps an idle client connection's read buffer at the size its last upload grew it to, up to about 400 KB. That limit is also hyper's limit on request headers, so lowering it would refuse headers Go accepts (Go reads up to 1 MB).
-- Codex request shaping still makes 44 large buffers for a 1.9 MB request (`ponytail:` note in `crates/cpa-exec/src/codex_request.rs`).
+- Codex request shaping still made 44 large buffers for a 1.9 MB request. (That shaping was deleted with the Codex migration; see [Codex request preparation](#codex-request-preparation-heap-per-request).)
 - CPU: the field's hour used 283 s of CPU for 567 requests, 0.5 s each, about 8 times this soak's. The soak cannot say why: the field server's CPU, TLS on both sides, the signing and the response lengths all differ.
 
 ### Gates
@@ -618,52 +618,75 @@ N=1200 C=8 SERVER_CPUS=0-3 LOAD_CPUS=0-3 bench/messages.sh /tmp/soak rust target
 - The 99th percentile time to first byte was 3 to 9 ms higher with two threads; the median did not move. `worker-threads` or `TOKIO_WORKER_THREADS` raises the count where that matters.
 - Raw results: [`bench/results/2026-10-05-workers.jsonl`](../bench/results/2026-10-05-workers.jsonl).
 
-## Codex request preparation: heap per request and scaling
+## Codex request preparation: heap per request
 
-Measured on 2026-11-07 for the Codex migration's qualification ([#29](https://github.com/zakstak/cliproxy-rs/issues/29)): the heap that preparing one Codex request costs, from the client's body to the upstream send, and how it grows with the body.
+Measured on 2026-11-07 for the Codex migration's qualification ([#29](https://github.com/zakstak/cliproxy-rs/issues/29)): the heap that preparing one Codex request costs, from the client's body to the upstream send, for a few sampled workloads and body sizes. The harness measures peak live heap and allocation calls. It does not measure time, CPU or how many bytes a step reads, so these results say nothing about computational scaling.
 
 ### Setup
 
-- Harness: the counting global allocator of [`crates/cpa-server/tests/alloc_budget.rs`](../crates/cpa-server/tests/alloc_budget.rs), which forwards every call to the system allocator and records live bytes and allocation calls, in that test binary only. The request body is built before counting starts and handed to the router, so it is not counted itself; the fake upstream runs on its own uncounted thread. Each size is sent once to warm up, then three times; the gate keeps the smallest peak and call count of the three.
-- Build: the test profile (`cargo test`, debug, with the workspace's `[profile.test.package.*]` overrides), rustc 1.99.1 (58cf8f9c3) in the non-root build container, Linux 7.2, AMD Ryzen 7 9800X3D. CI pins rustc 1.99.0 (`RUST_TOOLCHAIN`); the budgets come from this run and allow 2% for peaks and 3% for counts.
-- Revision: the `opus/codex-qualify-29` branch, whose PR body names the head these numbers were taken at.
-- Workloads, all synthetic, streamed, through `/v1/responses` or the client format's route to a Codex API key whose base-url is the fake upstream:
-  - `codex`: a Responses conversation (18 KB of instructions, 24 function tools, reasoning items with encrypted content, function calls and their large outputs) at about 122 KB, 322 KB, 1.9 MB and 7.7 MB, for a model that needs no routing.
+- Harness: the counting global allocator of [`crates/cpa-server/tests/alloc_budget.rs`](../crates/cpa-server/tests/alloc_budget.rs). It forwards every call to the system allocator and records live bytes and allocation calls, in that test binary only.
+  - The request body is built before counting starts and handed to the router, so it is not counted itself.
+  - The fake upstream runs on its own uncounted thread.
+  - Each size is sent once to warm up, then three times; each output line keeps the smallest peak and call count of the three.
+- Source revision: `894e24c7e2443263ed2bf1a977b52637f3b9e4df`, clean tree.
+- Build: the test profile (`cargo test`, debug, with the workspace's `[profile.test.package.*]` overrides). Two compilers were used: rustc 1.99.1 (58cf8f9c3), the build image's default, and rustc 1.99.0 (b940084d7), the toolchain CI pins (`RUST_TOOLCHAIN`).
+- Machine and environment: one local machine (AMD Ryzen 7 9800X3D, Linux 7.2). Rootless podman, uid 1000, `--network none`, `CARGO_BUILD_JOBS=2`, `nice -n 19`. Not measured on GitHub's runners, where CI would gate these budgets; Actions is disabled on this fork.
+- Workloads, all synthetic, streamed, through `/v1/responses` or the client format's route, to a Codex API key whose base-url is the fake upstream:
+  - `codex`: a Responses conversation (18 KB of instructions, 24 function tools, reasoning items with encrypted content, function calls and their large outputs) at about 122 KB, 322 KB, 1.9 MB and 7.7 MB, for a model that needs no routing. Only the number of conversation turns grows with the size.
   - `codex.alias`: the same bodies for an operator alias, so `model` is routed: the native route's one body edit.
-  - `codex.claude`: the Claude Messages conversation of the Claude rows above, sent to the Codex model, so the translated route converts it.
-  - `codex.gemini`: Gemini requests whose first 360 KB are 48 tool schemas with 40 properties each and upper-case types (converted at schema positions only), then turns of function calls and responses.
+  - `codex.claude`: the Claude Messages conversation of the Claude rows above, sent to the Codex model, so the translated route converts it. Only the turns grow.
+  - `codex.gemini`: Gemini requests that start with the same 48 tool schemas of 40 properties each at every size, followed by more or fewer conversation turns. The schema part is fixed, so these rows do not show how preparation grows with schema size.
 
 ```sh
+# Three runs per compiler, each:
 cargo test --locked --offline -p cpa-server --test alloc_budget -- --nocapture
 ```
 
+Raw output, with the revision, compiler and command of each run: [`bench/results/2026-11-07-codex-alloc.txt`](../bench/results/2026-11-07-codex-alloc.txt). It was produced by a script that refuses a dirty tree; the receipt in that file is its output.
+
 ### Results
 
-Three runs, identical to the byte except one peak of 84,308 instead of 84,460 bytes.
+Six runs, three per compiler. The ranges are over all six; both compilers gave the same values, apart from peaks varying by up to 152 bytes from run to run and the Gemini 1.9 MB count reading 41,392 to 41,394.
 
 | Workload | Body (bytes) | Peak live heap (bytes) | Peak / body | Allocations |
 | --- | --- | --- | --- | --- |
-| codex, 100k | 122,550 | 84,460 | 0.69 | 939 |
-| codex, 306k | 321,828 | 84,460 | 0.26 | 939 |
+| codex, 100k | 122,550 | 84,308 to 84,460 | 0.69 | 939 |
+| codex, 306k | 321,828 | 84,308 to 84,460 | 0.26 | 939 |
 | codex, 1900k | 1,916,052 | 84,460 | 0.04 | 939 |
-| codex, 7600k | 7,672,972 | 84,460 | 0.01 | 939 |
-| codex.alias, 100k | 122,554 | 198,009 | 1.62 | 856 |
-| codex.alias, 1900k | 1,916,056 | 1,991,359 | 1.04 | 856 |
-| codex.alias, 7600k | 7,672,976 | 7,748,431 | 1.01 | 856 |
+| codex, 7600k | 7,672,972 | 84,308 to 84,460 | 0.01 | 939 |
+| codex.alias, 100k | 122,554 | 197,857 to 198,009 | 1.61 to 1.62 | 856 |
+| codex.alias, 1900k | 1,916,056 | 1,991,359 to 1,991,511 | 1.04 | 856 |
+| codex.alias, 7600k | 7,672,976 | 7,748,279 to 7,748,431 | 1.01 | 856 |
 | codex.claude, 100k | 118,598 | 522,797 | 4.41 | 2,647 |
 | codex.claude, 1900k | 1,843,817 | 7,441,814 | 4.04 | 10,117 |
 | codex.claude, 7600k | 7,381,557 | 29,649,658 | 4.02 | 34,069 |
 | codex.gemini, 400k | 540,237 | 2,402,207 | 4.45 | 35,524 |
-| codex.gemini, 1900k | 1,985,577 | 7,565,550 | 3.81 | 41,392 |
+| codex.gemini, 1900k | 1,985,577 | 7,565,550 | 3.81 | 41,392 to 41,394 |
 | codex.gemini, 7600k | 7,511,877 | 29,806,962 | 3.97 | 63,784 |
 
-### What the numbers say
+### What the numbers show
 
-- A native request that needs no routing adds no copy of its body: its peak is the same 84 KB and 939 allocations at every size. Before this change it was 2.0x the body, because the Responses handler always copied the body for the Codex-client preparation that only other providers use, whether or not the preparation applied; it now keeps the client's buffer when the preparation leaves it alone. Before #23 the same route was 8.8x (the request was rewritten pass by pass).
-- An alias adds one copy, the `model` edit: 1.0x the body at 1.9 MB and 7.7 MB.
-- The translated route is 4.0x the body for Claude Messages and 3.8x to 4.5x for Gemini with large schemas, with the same ratio from 100 KB to 7.6 MB: every step is linear in the body, and none walks it again per element. The allocation count grows with the number of messages and schema properties, not with their size. The converted body is now one buffer shared by the upstream send and the response translator (it was copied for the send); that removed a held copy but not the peak, which comes during the conversion: the strict converter's output, the copy that the shared reasoning step (`cpa_common::thinking`, which other providers share) returns, and the server's Claude ingress (the Claude route itself is 4.0x).
-- Not measured: CPU time, a release build, the WebSocket routes (their frames take the same native handover) and the cost under concurrency.
-- Raw output: the three runs' lines are the `alloc_budget` output; the numbers above are the `alloc.codex.*` lines of [`bench/budgets.txt`](../bench/budgets.txt), which now gate them.
+These are heap observations for these workloads on this machine:
+
+- **Native, no routing:** the peak is the same 84 KB, and the allocation count the same 939, from 122 KB to 7.7 MB. So, for these bodies, preparation holds no copy of the body.
+  - Before this change the peak was 2.0x the body: the Responses handler always copied the body for the Codex-client preparation that only other providers use. It now keeps the client's buffer when that preparation leaves the body alone (`prepare_responses_request_if_changed`).
+  - Before #23 the same route was 8.8x the body.
+- **Native with an alias:** the peak is about the body's size plus that fixed part, 1.0x the body at 1.9 MB and 7.7 MB: one copy, the `model` edit.
+- **Translated:**
+  - From Claude Messages, the peak was between 4.0x and 4.4x the body at the three sizes. From Gemini, it was between 3.8x and 4.5x the body.
+  - The allocation count grows with the number of turns.
+  - The converted body is now one buffer shared by the upstream send and the response translator; it used to be copied for the send. That removed one held allocation; the peak did not change.
+  - What makes up the remaining peak was not attributed by measurement. By reading the code, it includes the strict converter's output and the copy returned by the shared reasoning step (`cpa_common::thinking`, which other providers share and this change leaves alone). The Claude route itself measures 4.0x its body above.
+
+These results do not show:
+- execution time, CPU or bytes rescanned, so nothing about computational complexity;
+- how preparation grows with schema size, since the Gemini schemas are fixed;
+- a release build;
+- the WebSocket routes;
+- concurrency;
+- results on GitHub's runners.
+
+`bench/budgets.txt` gates these values in the test that produced them. Each value is the largest of the six runs. The tolerances (2% for peaks, 3% for counts) are the file's usual ones. That both compilers produced the same values on this machine is a measurement, not a guarantee that the tolerances cover CI's runners.
 
 ## History
 
