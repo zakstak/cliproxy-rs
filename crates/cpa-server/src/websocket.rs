@@ -851,13 +851,12 @@ impl Connection {
                 break;
             };
             sink.event("request", &frame);
-            let payload = String::from_utf8_lossy(&frame).into_owned();
             // The turn wins ties so frames already received reach the client before a
             // simultaneous upstream-loss signal closes the connection. A duplex turn owns
             // closure: it drains acknowledgements and pending events in order first. A
             // client that went away cancels the turn (Go's reader cancels the request).
             let flow = {
-                let turn = self.turn(&mut sink, payload);
+                let turn = self.turn(&mut sink, frame);
                 tokio::pin!(turn);
                 tokio::select! {
                     biased;
@@ -903,7 +902,11 @@ impl Connection {
         sink.finish(client).await;
     }
 
-    async fn turn(&mut self, socket: &mut Sink, payload: String) -> Flow {
+    /// One client frame. `frame` keeps the client's bytes for a native attempt (#24),
+    /// which reads them through the request boundary; the fallback path reads a lossy
+    /// UTF-8 copy, as before.
+    async fn turn(&mut self, socket: &mut Sink, frame: Bytes) -> Flow {
+        let payload = String::from_utf8_lossy(&frame).into_owned();
         let cfg = self.rt.config();
         let explicit_model = field(&payload, "model");
         let mut request_model = explicit_model.clone();
@@ -998,8 +1001,17 @@ impl Connection {
                 allow_bypass,
             )
         };
-        let (mut request, updated) = match normalized {
-            Ok(pair) => pair,
+        let (mut request, updated, fallback_error) = match normalized {
+            Ok((request, updated)) => (request, updated, None),
+            // A fallback-only refusal (such as a string `input`, which only the HTTP
+            // fallback cannot convert) cannot decide a native attempt: the request
+            // boundary judges the client's frame there, and the provider the rest
+            // (`docs/codex/CONTRACT.md` "Native WebSocket route"). Any attempt that is not
+            // native still ends with this error, before anything is sent. A missing
+            // previous response is the connection's state, not the frame's: it stays local.
+            Err(error) if kind == CREATE && !is_prewarm && error.status != 409 => {
+                (payload.clone(), self.last_request.clone(), Some(error))
+            }
             Err(error) => {
                 // Request-shape errors keep the connection open.
                 let frame = error_payload(error.status, &error.message, None);
@@ -1017,7 +1029,7 @@ impl Connection {
         if cpa_common::codex_client::multi_agent_client(&self.headers, client.optimize_multi_agent_v2) {
             crate::model_updater::codex_client_catalog_wanted();
         }
-        if client.optimize_multi_agent_v2 || client.orphan_delegation {
+        if fallback_error.is_none() && (client.optimize_multi_agent_v2 || client.orphan_delegation) {
             let prepared =
                 cpa_common::codex_client::prepare_responses_request(&self.headers, request.as_bytes(), &client);
             request = String::from_utf8(prepared).unwrap_or(request);
@@ -1054,7 +1066,7 @@ impl Connection {
             native_served: false,
             tool_turn: None,
         };
-        let next_last_request = if native {
+        let next_last_request = if native || fallback_error.is_some() {
             let model = field(&request, "model");
             if !model.is_empty() {
                 self.passthrough_model = model;
@@ -1067,9 +1079,23 @@ impl Connection {
             request.clone()
         };
         let model = gjson::get(&request, "model").str().to_owned();
-        let started = self.attempt(&payload, &request, &model, &mut ctx).await;
+        let started = self
+            .attempt(&frame, &request, &model, fallback_error.as_ref(), &mut ctx)
+            .await;
         let forwarded = match started {
             Ok(started) => self.forward(socket, started, &cfg, &mut ctx).await,
+            // No native attempt served the frame: the fallback's refusal stands, as an
+            // error frame on a connection that stays open.
+            Err(_)
+                if !ctx.native_served
+                    && let Some(error) = &fallback_error =>
+            {
+                let frame = error_payload(error.status, &error.message, None);
+                return match send_text(socket, frame).await {
+                    true => Flow::Next,
+                    false => Flow::End,
+                };
+            }
             Err(error) => {
                 let failure = Failure::from_dispatch(&error);
                 // A pinned continuation's credential failure also lost the session's
@@ -1298,9 +1324,10 @@ impl Connection {
     /// the frame this connection prepared for the legacy path.
     async fn attempt(
         &self,
-        frame: &str,
+        frame: &Bytes,
         request: &str,
         model: &str,
+        fallback_error: Option<&WsError>,
         ctx: &mut TurnCtx,
     ) -> Result<Started, dispatch::Failure> {
         /// What `WithSelectedAuthIDCallback` learned; the last call is the serving one.
@@ -1353,11 +1380,8 @@ impl Connection {
             on_selected: Some(on_selected),
             home: Some(self.home.clone()),
         });
-        let native = dispatch::NativeRequest::new(
-            Bytes::from(frame.to_owned()),
-            self.headers.clone(),
-            self.request_path.clone(),
-        );
+        let native = dispatch::NativeRequest::new(frame.clone(), self.headers.clone(), self.request_path.clone())
+            .with_fallback_error(fallback_error.map(|e| (e.status, e.message.clone())));
         let call = dispatch::Call {
             entry: Format::OpenAIResponse,
             response: Format::OpenAIResponse,

@@ -373,8 +373,10 @@ These turns do not take it:
   separate conversion described under [HTTP fallback](#websocket-http-fallback).
 - `response.append`. This frame comes from Go. No first-party or documented source
   defines it, so it keeps Go's request handling: the parent response by default,
-  inherited `instructions`, the legacy shaping and payload rules. On a native connection
-  its events still reach the client unchanged, like every other event there.
+  inherited `instructions`, the legacy shaping and payload rules. On a native
+  `codex.response-steering` connection its events still reach the client unchanged, like
+  every other event there: a namespace its shaping renamed is not restored. In ordinary
+  mode an append is its own legacy turn, and it keeps that turn's restoration.
 
 ### Requests
 
@@ -385,7 +387,15 @@ none. The server keeps the client's frame, headers and route path in
 (`websocket_requests::normalize`, and `normalize_passthrough`, which adds
 `stream: true`), the multi-agent and orphan-delegation preparation, the tool-call repair
 (`websocket_tools::prepare_fallback_turn`) and the plugin before-auth interceptors. Those
-steps now build only the frame for a fallback attempt. On a native turn the executor
+steps now build only the frame for a fallback attempt, and they cannot refuse a frame
+that a native attempt may carry. When the fallback cannot convert a `response.create`
+(for example a string or `null` `input`), its error stops every attempt that is not
+native, before anything is sent, and the client gets the same error frame as before on
+a connection that stays open. A missing previous response is connection state, not a
+property of the frame, so it is still refused locally. The server keeps the frame's own
+bytes, binary frames included, until the request boundary reads them. A frame that is
+not UTF-8 is refused with the boundary's error, not forwarded with replacement
+characters. On a native turn the executor
 skips shaping, payload rules, the prompt-cache key, reasoning replay, ID sanitizing,
 namespace renames, Sign in with ChatGPT rules and the `type` re-tag. The prompt-cache
 identity goes into the handshake headers only, and #26 owns those headers.

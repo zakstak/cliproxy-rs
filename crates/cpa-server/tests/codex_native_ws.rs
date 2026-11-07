@@ -1073,3 +1073,236 @@ async fn a_home_continuation_that_cannot_stay_never_moves() {
     drop(socket);
     wait_released(&home, 1).await;
 }
+
+// The Codex review of #38 (threads 4501618723, 4501618725, 4501618727): a native frame never depends on fallback-only
+// preparation, keeps its bytes until the request boundary reads them, and nothing on a
+// native connection is restored.
+
+/// `ws-create-first` with `input` replaced: a string or `null` passes the request
+/// boundary, which type-checks routing fields only; the provider judges the rest.
+fn with_input(name: &str, input: &str) -> String {
+    let frame = client_frame(name, "gpt-5.5");
+    let body = cpa_common::codex_body::CodexBody::parse(frame.as_bytes()).unwrap();
+    String::from_utf8(body.with_member("input", input)).unwrap()
+}
+
+/// A native first create and continuation whose `input` the HTTP fallback could not
+/// convert (a string, `null`) reach the upstream socket unchanged, locally and under
+/// Home. The fallback's array rule does not decide a native attempt.
+#[tokio::test]
+async fn a_native_frame_never_depends_on_fallback_preparation() {
+    let first = with_input("ws-create-first", r#""List the files.""#);
+    let null = with_input("ws-create-first", "null");
+    let continuation = with_input("ws-create-continuation", r#""and the hidden ones""#);
+    let replies = || replies(&["sse-completed", "sse-completed", "sse-completed"]);
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: replies(),
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    for frame in [&first, &continuation, &null] {
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{frame}"
+        );
+    }
+    assert_eq!(proxy.upstream.sockets().len(), 1);
+    assert_eq!(
+        upstream_frames(&proxy, 0),
+        [first.clone(), continuation.clone(), null],
+        "as sent"
+    );
+
+    let home = home_proxy(
+        Script {
+            ws: replies(),
+            ..Script::default()
+        },
+        "",
+        |url| vec![Ok(home_credential(url))],
+    )
+    .await;
+    let mut socket = connect(&home.proxy).await;
+    for frame in [&first, &continuation] {
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "Home: {frame}"
+        );
+    }
+    assert_eq!(upstream_frames(&home.proxy, 0), [first, continuation], "Home: as sent");
+    assert_eq!(home.dispatched.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(socket);
+    wait_released(&home, 1).await;
+}
+
+/// The fallback keeps its conversion rule: a Codex credential without `websockets` refuses
+/// a string `input` with the same error frame as before, sends nothing, and the
+/// connection stays usable.
+#[tokio::test]
+async fn the_fallback_still_refuses_what_it_cannot_convert() {
+    let proxy = proxy_with(
+        Script {
+            http: vec![cpa_server::testing::codex_capture::Reply::sse(
+                fixture("sse-completed").bytes(),
+            )],
+            ..Script::default()
+        },
+        "",
+        |url| vec![credential(Profile::Chatgpt, url, false)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(with_input("ws-create-first", r#""List the files.""#)))
+        .await
+        .unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    assert_eq!(refused.closed, None, "{refused:?}");
+    assert!(
+        refused.frames[0].contains("websocket request requires array field: input"),
+        "{refused:?}"
+    );
+    assert!(proxy.upstream.http().is_empty() && proxy.upstream.sockets().is_empty());
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let turn = read(&mut socket, &TERMINAL).await;
+    assert_eq!(
+        gjson::get(turn.frames.last().unwrap(), "type").str(),
+        "response.completed"
+    );
+    assert_eq!(proxy.upstream.http().len(), 1);
+}
+
+/// `ws-create-first` as bytes with an invalid UTF-8 byte inside a string.
+fn invalid_utf8_frame() -> Vec<u8> {
+    let frame = client_frame("ws-create-first", "gpt-5.5");
+    let at = frame.find("List the files.").unwrap();
+    let mut bytes = frame.into_bytes();
+    bytes[at] = 0xff;
+    bytes
+}
+
+/// A binary frame keeps its bytes until the request boundary reads them: invalid UTF-8
+/// is refused with the boundary's error and reaches no upstream socket, on a first turn,
+/// a later turn, and a response-steering connection, where the connection stays open.
+/// A valid binary frame goes upstream byte for byte.
+#[tokio::test]
+async fn a_binary_frame_keeps_its_bytes_until_the_boundary() {
+    let invalid = invalid_utf8_frame();
+    let at = invalid.iter().position(|b| *b == 0xff).unwrap();
+    let message = format!("request body is not valid UTF-8 at byte {at}");
+
+    // First turn.
+    let proxy = proxy(Profile::Chatgpt, Script::default(), "").await;
+    let mut socket = connect(&proxy).await;
+    socket.send(Message::binary(invalid.clone())).await.unwrap();
+    let refused = read(&mut socket, &[]).await;
+    assert_eq!(refused.frames.len(), 1, "{refused:?}");
+    assert!(refused.frames[0].contains(&message), "{refused:?}");
+    assert!(!refused.frames[0].contains('\u{fffd}'));
+    assert!(proxy.upstream.sockets().is_empty(), "nothing reached the upstream");
+
+    // A later turn, after a valid binary frame.
+    let proxy = proxy_with_steering(false).await;
+    let mut socket = connect(&proxy).await;
+    let valid = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::binary(valid.clone().into_bytes())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    socket.send(Message::binary(invalid.clone())).await.unwrap();
+    let refused = read(&mut socket, &[]).await;
+    assert!(refused.frames.iter().any(|f| f.contains(&message)), "{refused:?}");
+    assert_eq!(
+        upstream_frames(&proxy, 0),
+        [valid.clone()],
+        "only the valid frame, as sent"
+    );
+
+    // A response-steering connection: the duplex refuses it and stays open.
+    let proxy = proxy_with_steering(true).await;
+    let mut socket = connect(&proxy).await;
+    socket.send(Message::binary(valid.clone().into_bytes())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    socket.send(Message::binary(invalid)).await.unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    assert!(refused.frames.iter().any(|f| f.contains(&message)), "{refused:?}");
+    assert_eq!(refused.closed, None);
+    assert_eq!(upstream_frames(&proxy, 0), [valid]);
+}
+
+async fn proxy_with_steering(steering: bool) -> Proxy {
+    proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: replies(&["sse-completed", "sse-completed"]),
+            ..Script::default()
+        },
+        if steering { STEERING } else { "" },
+    )
+    .await
+}
+
+/// On a native response-steering connection a `response.append` keeps its legacy
+/// shaping, the multi-agent namespace rename included, but its upstream frames reach the
+/// client as sent: nothing on a native connection is restored.
+#[tokio::test]
+async fn an_append_on_a_native_connection_is_not_restored() {
+    let created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
+    let call = r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_s","call_id":"call_s","namespace":"collaboration-optimize","name":"spawn_agent","arguments":"{\"message\":\"go\"}"}}"#;
+    let created2 =
+        r#"{"type":"response.created","response":{"id":"resp_fixture_2","previous_response_id":"resp_fixture_1"}}"#;
+    let done = r#"{"type":"response.completed","response":{"id":"resp_fixture_2","output":[]}}"#;
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: vec![
+                vec![Bytes::from_static(created.as_bytes())],
+                vec![
+                    Bytes::from_static(created2.as_bytes()),
+                    Bytes::from_static(call.as_bytes()),
+                    Bytes::from_static(done.as_bytes()),
+                ],
+            ],
+            ..Script::default()
+        },
+        "client:\n  codex:\n    optimize-multi-agent-v2: true\ncodex:\n  response-steering: true\n",
+    )
+    .await;
+    let mut socket = wreq::Client::new()
+        .websocket(format!("ws://{}/v1/responses", proxy.addr))
+        .header("authorization", "Bearer client-key")
+        .header("user-agent", CODEX_UA)
+        .header("originator", "codex_cli_rs")
+        .header("x-openai-subagent", "collab_spawn")
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [created]);
+    let append = r#"{"type":"response.append","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"delegate"}]}],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent.","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}]}]}"#;
+    socket.send(Message::text(append)).await.unwrap();
+    let turn = read(&mut socket, &TERMINAL).await;
+    assert_eq!(turn.frames, [created2, call, done], "the upstream frames as sent");
+    let frames = upstream_frames(&proxy, 0);
+    assert!(
+        frames[1].contains("collaboration-optimize"),
+        "the append's legacy shaping renamed the namespace: {}",
+        frames[1]
+    );
+}

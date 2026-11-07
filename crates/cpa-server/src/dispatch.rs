@@ -77,6 +77,10 @@ pub struct NativeRequest {
     /// output is deferred to the attempts that are not native.
     possible: std::sync::atomic::AtomicBool,
     served: std::sync::atomic::AtomicBool,
+    /// The route could not build the request it sends a non-native attempt (a WebSocket
+    /// frame the HTTP fallback cannot convert): every attempt that is not native stops
+    /// with this request error, status and message, before anything is sent.
+    fallback_error: Option<(u16, String)>,
 }
 
 impl NativeRequest {
@@ -87,7 +91,16 @@ impl NativeRequest {
             path,
             possible: std::sync::atomic::AtomicBool::new(false),
             served: std::sync::atomic::AtomicBool::new(false),
+            fallback_error: None,
         })
+    }
+
+    /// See [`NativeRequest::fallback_error`]. Called on a request no attempt has seen.
+    pub fn with_fallback_error(mut self: Arc<Self>, error: Option<(u16, String)>) -> Arc<Self> {
+        if let Some(this) = Arc::get_mut(&mut self) {
+            this.fallback_error = error;
+        }
+        self
     }
 
     /// Whether a native Codex attempt is possible for this request.
@@ -2326,6 +2339,12 @@ async fn attempt(
             }
             None => false,
         };
+        // A frame only the native route can carry ends every other attempt here.
+        if !native && let Some((status, message)) = call.native.as_ref().and_then(|n| n.fallback_error.clone()) {
+            let error = ExecError::local(status, cpa_core::exec::FailureScope::Request, message);
+            lease.complete(Outcome::Neutral(error.clone()));
+            return Attempt::Stop(Fault { error, bootstrap: None });
+        }
         // Before-auth output held back for a possible native attempt reaches every other
         // attempt here, its termination included.
         if !native

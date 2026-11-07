@@ -678,10 +678,14 @@ impl Duplex {
         self.write(body, None);
     }
 
-    /// `restoreMultiAgent` for an event of `prepared`'s request on this socket. A native
-    /// request's events are never restored: nothing renamed them.
+    /// `restoreMultiAgent` for an event of `prepared`'s request on this socket. Nothing on
+    /// a native connection is restored: every upstream frame there reaches the client as
+    /// sent, a legacy-shaped `response.append`'s included (`docs/codex/CONTRACT.md`
+    /// "Native WebSocket route").
     fn restores(&self, prepared: &Prepared) -> bool {
-        !prepared.passthrough && self.turn.conn.restores(prepared.optimized, prepared.conflict)
+        !prepared.passthrough
+            && !self.initial.passthrough
+            && self.turn.conn.restores(prepared.optimized, prepared.conflict)
     }
 
     /// `releaseSteeringSettings`.
