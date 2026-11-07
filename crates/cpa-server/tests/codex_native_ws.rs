@@ -1224,7 +1224,7 @@ async fn a_binary_frame_keeps_its_bytes_until_the_boundary() {
     assert!(refused.frames.iter().any(|f| f.contains(&message)), "{refused:?}");
     assert_eq!(
         upstream_frames(&proxy, 0),
-        [valid.clone()],
+        std::slice::from_ref(&valid),
         "only the valid frame, as sent"
     );
 
