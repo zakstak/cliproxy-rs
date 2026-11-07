@@ -685,9 +685,57 @@ async fn request_shape_errors_keep_the_connection_open() {
     run("previous_not_found_then_create").await;
 }
 
+/// Go answers the prewarm of a Codex credential without `websockets` locally, with a
+/// made-up `resp_prewarm_` response, and merges the warm-up input into the follow-up.
+/// cliproxy-rs refuses that prewarm with an actionable error and sends nothing upstream
+/// (#24 forbids synthesized output; docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket
+/// route"). The connection stays open; the Go follow-up step no longer applies.
 #[tokio::test]
-async fn local_prewarm_then_followup_sends_the_warmup_input() {
-    run("prewarm_then_followup").await;
+async fn a_codex_fallback_prewarm_is_refused_instead_of_answered_locally() {
+    run_with("prewarm_then_followup", |scenario| {
+        let steps = scenario["steps"].as_array_mut().unwrap();
+        steps.truncate(1);
+        steps[0]["read"] = Value::String("one".into());
+        steps[0]["frames"] = serde_json::json!([{ "text": codex_prewarm_refusal() }]);
+        scenario["upstream"] = serde_json::json!([]);
+    })
+    .await;
+}
+
+fn codex_prewarm_refusal() -> String {
+    serde_json::json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "message": "response.create with generate: false (prewarm) is not supported for Codex credentials without websockets: there is no upstream socket to prewarm, and the proxy does not invent a response. Enable websockets on the Codex credential, or send the request without generate: false.",
+            "type": "invalid_request_error",
+        },
+    })
+    .to_string()
+}
+
+/// The native WebSocket route delivers a failure frame as the upstream sent it, where Go
+/// rebuilds it (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route"): the
+/// expected error frame of `step` becomes the last scripted upstream event of that step.
+fn native_failure(scenario: &mut Value, step: usize) {
+    let step = &mut scenario["steps"][step];
+    let raw = step["upstream"][0]["events"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    let frames = step["frames"].as_array_mut().unwrap();
+    let error = frames.iter_mut().find(|f| f["text"].is_string()).unwrap();
+    error["text"] = raw;
+}
+
+/// An account failure (401, 403, 429) on the native WebSocket route never reaches the
+/// client as sent; Go forwards it. A client that is not Codex gets Go's silent close
+/// (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route").
+fn native_account_failure(scenario: &mut Value, step: usize) {
+    let frames = scenario["steps"][step]["frames"].as_array_mut().unwrap();
+    frames.retain(|f| !f["text"].is_string());
 }
 
 #[tokio::test]
@@ -698,7 +746,7 @@ async fn upstream_request_fault_is_shown_then_closed() {
 /// v8.0.35: the error frame's `headers` come back on the error event, canonicalized.
 #[tokio::test]
 async fn upstream_request_fault_keeps_its_frame_headers() {
-    run("ws_request_fault_headers").await;
+    run_with("ws_request_fault_headers", |s| native_failure(s, 0)).await;
 }
 
 #[tokio::test]
@@ -801,7 +849,7 @@ async fn steering_later_error_recovers_with_a_corrected_create() {
 
 #[tokio::test]
 async fn steering_initial_error_stays_terminal() {
-    run("steer_initial_error_terminal").await;
+    run_with("steer_initial_error_terminal", |s| native_failure(s, 0)).await;
 }
 
 #[tokio::test]
@@ -848,12 +896,12 @@ async fn steering_ambiguous_failure_ends_the_socket() {
 /// 401/403/429 after the first response end the stream with the original classification.
 #[tokio::test]
 async fn steering_later_credential_failure_ends_the_socket() {
-    run("steer_later_credential_failure").await;
+    run_with("steer_later_credential_failure", |s| native_account_failure(s, 1)).await;
 }
 
 #[tokio::test]
 async fn steering_later_quota_failure_ends_the_socket() {
-    run("steer_later_quota_failure").await;
+    run_with("steer_later_quota_failure", |s| native_account_failure(s, 1)).await;
 }
 
 /// While a steer waits for tool input, a create must continue that response.
@@ -913,7 +961,7 @@ async fn steering_upstream_idle_upstream_close_closes_an_oauth_client() {
 /// Go `TestResponsesSteeringErrorRecoveryIntegration/disabled_error_remains_terminal`.
 #[tokio::test]
 async fn steering_off_later_error_stays_terminal() {
-    run("steer_disabled_error_terminal").await;
+    run_with("steer_disabled_error_terminal", |s| native_failure(s, 1)).await;
 }
 
 /// Go `TestResponsesSteerInFlightWebSocket`.

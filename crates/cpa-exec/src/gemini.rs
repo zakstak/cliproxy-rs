@@ -82,6 +82,7 @@ pub(crate) fn status_err(status: u16, message: impl Into<Bytes>) -> ExecError {
         retry_after: None,
         direct: false,
         delivered_status: None,
+        delivered_event: None,
         addon: None,
         diagnostic: None,
     }

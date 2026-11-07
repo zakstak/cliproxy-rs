@@ -1097,9 +1097,10 @@ impl Turn {
         let raw_len = payload.len();
         let payload = response::restore(payload, self.restore);
         let payload = payload.as_ref();
-        if let Some(error) = ws_error(payload, self.cooling) {
+        if let Some(mut error) = ws_error(payload, self.cooling) {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
+            self.deliver_as_sent(&mut error, &text);
             return Frame::Failed {
                 error,
                 overload: false,
@@ -1108,18 +1109,16 @@ impl Turn {
                 event: None,
             };
         }
-        if let Some((error, body)) = response::terminal_failure(payload, self.cooling) {
+        if let Some((mut error, body)) = response::terminal_failure(payload, self.cooling) {
             self.replay.clear(payload, self.cooling);
             self.wire.ws_exec_error("upstream_error", &error);
-            // A native turn delivers the upstream's failure event byte for byte, unless it
-            // is the context-window `error` a Codex client gets as `response.failed` (#5),
-            // or an account failure (401, 403, 429). Such an event can carry the pooled
-            // account's identifiers, so it keeps the classified close and the allowlisted
-            // subscription-limit event (#6).
-            let account = matches!(error.status, 401 | 403 | 429);
-            let event = self
-                .preserved_event(payload)
-                .or_else(|| (self.passthrough && !account).then(|| Bytes::from(text.clone())));
+            // The context-window `error` a Codex client gets as `response.failed` (#5) is
+            // delivered ahead of the error; any other failure of a native turn travels on
+            // the error, for delivery once failover is decided.
+            let event = self.preserved_event(payload);
+            if event.is_none() {
+                self.deliver_as_sent(&mut error, &text);
+            }
             return Frame::Failed {
                 error,
                 overload: response::is_overload(&body),
@@ -1265,6 +1264,17 @@ impl Turn {
         }
     }
 
+    /// A native turn's failure reaches the client as the upstream sent it
+    /// ([`ExecError::delivered_event`]), while `error` keeps the scheduler's
+    /// classification. An account failure keeps the classified delivery instead (the
+    /// allowlisted subscription-limit event, #6, or a silent close): its frame can name the
+    /// pooled account or carry its tokens.
+    fn deliver_as_sent(&self, error: &mut ExecError, frame: &str) {
+        if self.passthrough && !account_failure(error.status) {
+            error.delivered_event = Some(Bytes::copy_from_slice(frame.as_bytes()));
+        }
+    }
+
     /// The event a Codex client receives before this turn's error for an upstream
     /// context-window rejection (`cpa_common::codex_client::context_window_failure_event`).
     fn preserved_event(&self, payload: &str) -> Option<Bytes> {
@@ -1335,7 +1345,11 @@ fn rest(turn: Turn) -> ExecStream {
                         turn.invalidate_after_event(&error);
                         return Some((Ok(event), State::Failing(error)));
                     }
-                    if !read {
+                    if error.delivered_event.is_some() {
+                        // The client gets the provider's frame with the error: a loss
+                        // reported first would replace it with a generic close.
+                        turn.invalidate_after_event(&error);
+                    } else if !read {
                         turn.invalidate(&error, true);
                     }
                     // The response already ended; the session reports the loss.
@@ -1348,6 +1362,23 @@ fn rest(turn: Turn) -> ExecStream {
         }
     })
     .boxed()
+}
+
+/// Drops the socket after an upstream failure frame. A failure the client receives as
+/// sent ([`ExecError::delivered_event`]) does not report the session's loss, which would
+/// close the client with a generic error first.
+fn invalidate_failed(turn: &Turn, error: &ExecError) {
+    if error.delivered_event.is_some() {
+        turn.invalidate_after_event(error);
+    } else {
+        turn.invalidate(error, true);
+    }
+}
+
+/// An account failure: 401, 402, 403 or 429 as classified. Its frame can name the pooled
+/// account, so a native route never hands it to the client as sent (#6).
+pub(super) fn account_failure(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403 | 429)
 }
 
 /// Bootstrap buffering over WebSocket messages (codex_websockets_stream.go): every
@@ -1370,7 +1401,7 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 status_frame: true,
                 ..
             } => {
-                turn.invalidate(&error, true);
+                invalidate_failed(&turn, &error);
                 if !timed_out {
                     return Err(error);
                 }
@@ -1384,7 +1415,9 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     // Fail over before anything was shown; the downstream session survives.
                     turn.invalidate(&error, false);
                     let body = String::from_utf8_lossy(&error.body).into_owned();
-                    return Err(response::bootstrap_overload(&body));
+                    let mut overloaded = response::bootstrap_overload(&body);
+                    overloaded.delivered_event = error.delivered_event;
+                    return Err(overloaded);
                 }
                 if let Some(event) = event {
                     turn.invalidate_after_event(&error);
@@ -1392,7 +1425,7 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     held.push(Err(error));
                     return Ok(futures_util::stream::iter(held).boxed());
                 }
-                turn.invalidate(&error, true);
+                invalidate_failed(&turn, &error);
                 held.push(Err(error));
                 return Ok(futures_util::stream::iter(held).boxed());
             }

@@ -505,8 +505,10 @@ async fn a_lost_socket_never_replays_a_continuation() {
 
 /// A Codex credential without `websockets` serves the WebSocket route over HTTP. That is
 /// an explicit conversion, not the native route: the turn goes upstream as an HTTP
-/// Responses request built by the legacy path, and a prewarm is answered locally with a
-/// `resp_prewarm_` response that no provider produced.
+/// Responses request built by the legacy path. It has no upstream socket to prewarm, so a
+/// `generate: false` prewarm is refused with an actionable error instead of a made-up
+/// response (#24 forbids synthesized output), and nothing reaches the upstream. The
+/// connection stays open for the real turn.
 #[tokio::test]
 async fn http_fallback_is_a_separate_explicit_conversion() {
     let proxy = proxy_with(
@@ -525,13 +527,20 @@ async fn http_fallback_is_a_separate_explicit_conversion() {
         .send(Message::text(client_frame("ws-create-prewarm", "gpt-5.5")))
         .await
         .unwrap();
-    let warm = read(&mut socket, &TERMINAL).await;
-    let done = warm.frames.last().unwrap();
+    let refused = read(&mut socket, &["error"]).await;
+    assert_eq!(refused.frames.len(), 1, "{refused:?}");
+    let error: serde_json::Value = serde_json::from_str(&refused.frames[0]).unwrap();
+    assert_eq!(error["status"], 400, "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
     assert!(
-        gjson::get(done, "response.id").str().starts_with("resp_prewarm_"),
-        "a locally fabricated prewarm: {done}"
+        message.contains("generate: false") && message.contains("websockets"),
+        "{message}"
     );
-    assert!(proxy.upstream.http().is_empty(), "the prewarm stays local");
+    assert!(
+        !refused.frames.iter().any(|f| f.contains("resp_prewarm_")),
+        "no fabricated response"
+    );
+    assert!(proxy.upstream.http().is_empty(), "the prewarm sends nothing upstream");
 
     let create = client_frame("ws-create-first", "gpt-5.5");
     socket.send(Message::text(create.clone())).await.unwrap();
@@ -545,6 +554,125 @@ async fn http_fallback_is_a_separate_explicit_conversion() {
     let body = text(sent.body);
     assert_ne!(body, create, "the HTTP conversion, not the client's frame");
     assert!(!body.contains(r#""type":"response.create""#), "{body}");
+}
+
+// Native failure delivery (#25, WebSocket half). Each failure frame is hand-authored to
+// probe preservation: an unknown member, a raw number spelling (`1.50`) and a `null`
+// message must reach the client byte for byte. Their shapes follow the first-party
+// decoders: the wrapped status error of `responses_websocket.rs:712-764` and the
+// `response.failed` of `sse/responses.rs` (`ws-errors-first-party`, `sse-failed-*`).
+
+const STEERING: &str = "codex:\n  response-steering: true\n";
+
+/// A wrapped status error that fails the request (a request fault: no failover).
+const WRAPPED_400: &str = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":null,"param":"input","future_error_field":{"n":1.50}},"future_frame_field":[1e3,-0.0]}"#;
+/// A server failure after the response started.
+const FAILED_500: &str = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fixture_1","status":"failed","error":{"code":"server_error","message":null,"future_error_field":1.50},"usage":null}}"#;
+
+/// A failure before `response.created` reaches the client as the upstream sent it, then
+/// the connection closes; with and without response steering.
+#[tokio::test]
+async fn a_failure_before_the_response_starts_reaches_the_client_as_sent() {
+    for steering in [false, true] {
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: vec![vec![Bytes::from_static(WRAPPED_400.as_bytes())]],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let read = read(&mut socket, &[]).await;
+        assert_eq!(read.frames, [WRAPPED_400], "steering={steering}: the provider's frame");
+        assert!(read.closed.is_some(), "steering={steering}");
+    }
+}
+
+/// A failure after the response started reaches the client as sent. Without response
+/// steering it ends the connection; with it, a failure after the first response is an
+/// event the client may correct, and the connection stays open.
+#[tokio::test]
+async fn a_failure_after_the_response_starts_reaches_the_client_as_sent() {
+    let created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
+    let delta = r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Partial"}"#;
+    for steering in [false, true] {
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: vec![vec![
+                    Bytes::from_static(created.as_bytes()),
+                    Bytes::from_static(delta.as_bytes()),
+                    Bytes::from_static(FAILED_500.as_bytes()),
+                ]],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let read = read(&mut socket, &["response.failed"]).await;
+        assert_eq!(read.frames, [created, delta, FAILED_500], "steering={steering}");
+        let after = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
+        if steering {
+            assert!(after.is_err(), "steering keeps the connection open: {after:?}");
+        } else {
+            assert!(
+                matches!(after, Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None)),
+                "the connection closes: {after:?}"
+            );
+        }
+    }
+}
+
+/// A failure that fails over before anything was delivered: every credential answers a
+/// retryable wrapped status error, and once the attempts run out the client gets the last
+/// provider frame as sent, not a rebuilt error. With and without response steering.
+#[tokio::test]
+async fn the_exhausted_failure_reaches_the_client_as_sent() {
+    let first = r#"{"type":"error","status":503,"error":{"type":"server_error","message":"first","x":1.50}}"#;
+    let last = r#"{"type":"error","status":503,"error":{"type":"server_error","message":null,"x":2.50},"future_frame_field":true}"#;
+    for steering in [false, true] {
+        let proxy = proxy_with(
+            Script {
+                ws: vec![
+                    vec![Bytes::from_static(first.as_bytes())],
+                    vec![Bytes::from_static(last.as_bytes())],
+                ],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+            |url| {
+                let mut second = credential(Profile::Chatgpt, url, true);
+                second.id = "codex-second.json".into();
+                second.metadata.insert("access_token".into(), "at-FAKE-second".into());
+                vec![credential(Profile::Chatgpt, url, true), second]
+            },
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let read = read(&mut socket, &[]).await;
+        assert_eq!(
+            proxy.upstream.sockets().len(),
+            2,
+            "steering={steering}: both credentials tried"
+        );
+        assert_eq!(read.frames, [last], "steering={steering}: the last provider frame");
+        assert!(read.closed.is_some(), "steering={steering}");
+    }
 }
 
 /// Handshake metadata (#3). The downstream socket was upgraded before the first request

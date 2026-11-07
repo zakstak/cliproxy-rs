@@ -79,6 +79,9 @@ const CLOSE_SERVICE_RESTART: u16 = 1012;
 /// Close code 1009 (message too big).
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const TURN_STATE: &str = "x-codex-turn-state";
+
+/// The error a `generate: false` prewarm gets when only the HTTP fallback can serve it.
+const CODEX_PREWARM_UNSUPPORTED: &str = "response.create with generate: false (prewarm) is not supported for Codex credentials without websockets: there is no upstream socket to prewarm, and the proxy does not invent a response. Enable websockets on the Codex credential, or send the request without generate: false.";
 // ponytail: gorilla reads messages of any size; 64 MiB (the HTTP body cap) bounds
 // per-connection memory instead.
 const MAX_MESSAGE: usize = crate::MAX_REQUEST_BYTES;
@@ -243,6 +246,9 @@ struct Failure {
     /// The client-safe subscription-limit event a native Codex client gets
     /// (`websocket_limit`), when the failure is one.
     limit: Option<String>,
+    /// The provider's own failure frame a native Codex turn delivers as sent
+    /// ([`ExecError::delivered_event`]); never set for an account failure.
+    delivered: Option<String>,
 }
 
 impl Failure {
@@ -255,6 +261,7 @@ impl Failure {
             payload: None,
             replay: e.is_replay_required(),
             addon: e.addon.clone(),
+            delivered: delivered(e),
         }
     }
 
@@ -269,6 +276,7 @@ impl Failure {
                     payload: None,
                     replay: e.is_replay_required(),
                     addon: e.addon.clone(),
+                    delivered: delivered(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
@@ -298,6 +306,7 @@ impl Failure {
             replay: false,
             addon: None,
             limit: crate::websocket_limit::from_error_event(payload, unix_now()),
+            delivered: None,
         }
     }
 
@@ -309,8 +318,15 @@ impl Failure {
             replay: false,
             addon: None,
             limit: None,
+            delivered: None,
         }
     }
+}
+
+fn delivered(e: &ExecError) -> Option<String> {
+    e.delivered_event
+        .as_ref()
+        .map(|frame| String::from_utf8_lossy(frame).into_owned())
 }
 
 /// The limit event for an executor error: the frame's headers (addon) first, then the
@@ -925,6 +941,17 @@ impl Connection {
             };
 
         let is_prewarm = !use_upstream_ws && requests::is_local_prewarm(&payload);
+        if is_prewarm && self.codex_may_serve(&request_model) {
+            // Go answers this prewarm locally with a made-up response. A Codex credential
+            // without an upstream socket has no provider prewarm to forward, and a Codex
+            // client must never receive output no provider produced (#24). The request
+            // fails; the connection stays open.
+            let frame = error_payload(400, CODEX_PREWARM_UNSUPPORTED, None);
+            return match send_text(socket, frame).await {
+                true => Flow::Next,
+                false => Flow::End,
+            };
+        }
         let kind = field(&payload, "type");
         let replacement = |payload: &str, last: &str| {
             let input = gjson::get(payload, "input");
@@ -1080,6 +1107,16 @@ impl Connection {
             self.pending_calls = pending;
         }
         Flow::Next
+    }
+
+    /// Whether a Codex credential may serve a turn for `model`: the pinned credential is
+    /// one, or nothing is pinned and the model's pool holds one.
+    fn codex_may_serve(&self, model: &str) -> bool {
+        let codex = |c: &Credential| c.provider.trim().eq_ignore_ascii_case("codex");
+        match self.credential(&self.pinned) {
+            Some(pinned) => codex(&pinned),
+            None => self.available(model).iter().any(|c| codex(c)),
+        }
     }
 
     fn credential(&self, id: &str) -> Option<Arc<Credential>> {
@@ -1458,9 +1495,7 @@ impl Connection {
                 // In duplex mode an error event after `response.created` is recoverable:
                 // the client may correct the request on this socket. Stream errors still
                 // close it.
-                // A native turn's `error` event reaches the client as upstream sent it; the
-                // executor's error follows and ends the connection (below).
-                if kind == "error" && !(response_started && duplex) && !ctx.native_served {
+                if kind == "error" && !(response_started && duplex) {
                     // `responsesWebsocketErrorMessageFromPayload`.
                     let mut status = gjson::get(&payload, "status").i64();
                     if status <= 0 {
@@ -1481,10 +1516,7 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");
                 }
-                // On a native turn every upstream failure event is the client's own terminal
-                // event, as on the HTTP route; the classified error after it only closes.
-                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes())
-                    || (ctx.native_served && matches!(kind.as_str(), "error" | "response.failed"));
+                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
                 // The executor follows such an event with its classified error at once
                 // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
                 // scheduler even when the client interrupts or leaves during the write,
@@ -1507,14 +1539,6 @@ impl Connection {
                     return Forwarded::End;
                 }
                 if let Some(error) = committed {
-                    // A native turn delivered the upstream's own failure event, which the
-                    // client classifies and recovers from (`docs/codex/CONTRACT.md`
-                    // "WebSocket state"). No replay close, limit event or error event
-                    // follows it.
-                    if ctx.native_served {
-                        socket.terminate(CLOSE_SENT);
-                        return Forwarded::End;
-                    }
                     return self.failed(socket, ctx, &error, true).await;
                 }
                 if completed {
@@ -1697,6 +1721,11 @@ async fn close_for_failure(socket: &mut Sink, failure: &Failure, codex_client: b
     } else if let Some(limit) = failure.limit.as_ref().filter(|_| codex_client) {
         socket.event("response", limit.as_bytes());
         let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(limit.clone().into()))).await;
+    } else if let Some(frame) = &failure.delivered {
+        // A native Codex turn: the provider's frame, as sent (docs/codex/CONTRACT.md
+        // "Native WebSocket route").
+        socket.event("response", frame.as_bytes());
+        let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(frame.clone().into()))).await;
     } else if exposed(failure) {
         let payload = failure
             .payload

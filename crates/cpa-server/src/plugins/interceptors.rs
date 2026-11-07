@@ -255,6 +255,7 @@ fn terminated(resp: &RequestInterceptResponse) -> Failure {
         retry_after: None,
         direct: true,
         delivered_status: None,
+        delivered_event: None,
         addon: None,
         diagnostic: None,
     })

@@ -751,6 +751,20 @@ impl Duplex {
         let classify = |payload: &str| {
             ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
         };
+        // An account failure on a native connection never reaches the client as sent,
+        // whichever request it belongs to: its frame can name the pooled account. The
+        // error alone ends the stream, and the server delivers the allowlisted
+        // subscription-limit event (#6) or closes silently.
+        let native = self.initial.passthrough;
+        if native
+            && failure
+            && let Some(error) = classify(payload).filter(|e| super::account_failure(e.status))
+        {
+            self.turn.wire.ws_exec_error("upstream_error", &error);
+            self.outbox.push_back(Err(error));
+            self.done = true;
+            return;
+        }
         if !self.first_response && failure {
             // Account health does not depend on which queued request failed: the stream
             // ends with the original classification and is not replayed elsewhere.
@@ -806,14 +820,23 @@ impl Duplex {
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
         if self.first_response
-            && let Some(error) = terminal
+            && let Some(mut error) = terminal
         {
             // Later failures already reach the client as events (below); an initial
-            // context-window failure does too, so Codex can compact and retry.
-            if self.turn.codex_client
-                && let Some(event) = cpa_common::codex_client::context_window_failure_event(&payload)
+            // context-window failure does too, so Codex can compact and retry (#5). On a
+            // native connection any other initial failure travels on the error as the
+            // upstream sent it, for delivery once failover is decided.
+            match self
+                .turn
+                .codex_client
+                .then(|| cpa_common::codex_client::context_window_failure_event(&payload))
+                .flatten()
             {
-                self.outbox.push_back(Ok(Bytes::from(event.into_owned())));
+                Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),
+                None if passthrough => {
+                    error.delivered_event = Some(Bytes::copy_from_slice(payload.as_bytes()));
+                }
+                None => {}
             }
             self.outbox.push_back(Err(error));
             self.done = true;

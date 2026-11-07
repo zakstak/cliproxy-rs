@@ -254,7 +254,7 @@ them.
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter | #27, coordinated with #15 |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count | #27 |
 | `crates/cpa-exec/src/codex.rs` `open` | `model` of the shaped body, the key of per-model quota snapshots. The native route passes the routed model to `open_for` instead | #27 |
-| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. Both native routes reuse `terminal_failure`, `bufferable`, `meaningful_delta` and `empty_incomplete` to classify a copy of each event; the WebSocket route's `ws_error` still rebuilds a status frame for failover and final delivery | #28, and the remaining WebSocket failure delivery (see [Native WebSocket route](#native-websocket-route)) |
+| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. Both native routes reuse `terminal_failure`, `bufferable`, `meaningful_delta` and `empty_incomplete`, and the WebSocket route `ws_error`, to classify a copy of each event; the client receives the frame itself | #28 |
 | `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. A native frame is checked with `CodexBody` and forwarded; `gjson` still reads frame types, response IDs and model names for routing and bookkeeping | Legacy frames: #28. The bookkeeping reads stay |
 | `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A native attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the fallback frame | xAI and the HTTP fallback keep them; #28 |
 | `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A native attempt gets the client's bytes from `NativeRequest` instead | Other providers keep the rewrite; #28 |
@@ -444,23 +444,31 @@ renames no `response.done`, adds no usage details, restores no namespace and rec
 no tool calls. Usage, capture, quota observation and failure classification read a copy.
 Leading events are held under `stream-bootstrap-buffering`, but they are never changed.
 
-- An upstream `response.failed` or status-less `error` event reaches the client as it
-  arrived. The connection then closes without another frame.
-- An account failure (classified 401, 403 or 429) keeps the classified delivery: the
-  subscription-limit event for an official Codex client (#6), or a silent close. Such an
-  event can carry the pooled account's identifiers and tokens, which the #6 allowlist
-  keeps from the client.
+Every upstream failure frame keeps two readings: the scheduler's classification, which
+drives failover and credential health, and the frame itself, which is what the client
+receives (`ExecError::delivered_event`).
+
+- A failure that is not an account failure reaches the client as the upstream sent it.
+  This covers `response.failed`, a status-less `error` and the wrapped status `error`
+  frame: unknown members, `null` and number spellings included. The proxy builds no
+  error of its own.
+- A failure before anything was delivered fails over when its classification allows it
+  (a retryable status, an overload). Once the attempts run out, the client receives the
+  last attempt's frame.
+- A failure after the response started reaches the client after the events before it.
+  Without `codex.response-steering` the connection then closes. With it, the first
+  response's failure is handled like a failure before anything was delivered, and a later
+  failure is an event that the client may correct on the same socket. That recovery
+  belongs to the Go-defined steering transport; the pinned client does not use it.
+- An account failure (classified 401, 402, 403 or 429) never reaches the client as sent,
+  on any path: an ordinary turn, the first or a later response of a steering connection,
+  or a create still waiting in the duplex queue. Its frame can name the pooled account or
+  carry its tokens. The client gets the allowlisted subscription-limit event when it is an
+  official Codex client (#6), or else a silent close. The scheduler still receives the
+  classification, so the credential cools as before.
 - Two exceptions stay. A Codex client gets the status-less context-window `error` as
   `response.failed` (#5). An empty `response.incomplete` before any content is a
   request-scoped 502 (#7).
-- A wrapped `error` frame with a status (Go's status frame) and an overload failure keep
-  their classification and failover before anything is delivered. The final delivery of
-  such a failure is unchanged: a close code, the subscription-limit event for an official
-  Codex client (#6), a rebuilt request-fault `error` event, or a silent close.
-  Forwarding that frame byte for byte is remaining #25 work, because failover and credential
-  health depend on the rebuilt status.
-- On a `codex.response-steering` connection, a failure after the first response is an
-  event that the client may correct, as before.
 - The interrupt regressions stay. An interrupt acknowledgement that arrives after the
   terminal event is still delivered. A late interrupt does not poison the next turn. An
   interrupted `response.incomplete` passes unchanged.
@@ -488,8 +496,12 @@ A Codex credential without `websockets` serves the WebSocket route over HTTP. Th
 an explicit conversion, separate from the native route, and it keeps the earlier rules.
 The proxy merges the transcript of each turn, repairs tool calls, shapes the body, runs
 payload rules and posts an HTTP Responses request. A prewarm on such a credential is
-answered locally with a `resp_prewarm_` response that no provider produced, and its
-follow-up merges the warm-up input. A `previous_response_id` on such a connection is
+refused with a 400 `invalid_request_error` that names the cause and the fix: there is no
+upstream socket to prewarm, and the proxy does not invent a response. Nothing reaches the
+upstream, and the connection stays open. This applies when the pinned credential is a
+Codex credential, or when nothing is pinned and the model's pool holds one. Go answers such
+a prewarm locally with a made-up `resp_prewarm_` response; other providers keep that
+behaviour. A `previous_response_id` on such a connection is
 answered from the stored transcript, as in Go. A continuation of state held on an upstream
 socket cannot move to this transport, so it closes with 1012.
 
@@ -596,8 +608,8 @@ Passive accounting reads a copy and changes nothing.
   another socket. When the upstream socket is gone, the client sees the failure and
   recovers on its own.
 - The proxy forwards a client's prewarm and never sends its own. It sends no inference
-  keepalive. A prewarm on a credential without `websockets` is the
-  [HTTP fallback's](#websocket-http-fallback) local answer, labelled as such.
+  keepalive. A prewarm that only the [HTTP fallback](#websocket-http-fallback) could
+  serve is refused, never answered locally.
 - The proxy forwards `response.interrupt` and its acknowledgements unchanged.
 - A 426 handshake fails the turn with that status. The only proxy-side HTTP conversion
   is the [WebSocket HTTP fallback](#websocket-http-fallback) for credentials without
