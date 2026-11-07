@@ -7843,6 +7843,12 @@ pub(crate) mod tests {
             "no second attempt before the backoff"
         );
         rt.stop_auto_refresh();
+        // Unload the plugin as the plugin integration tests' `finish` does: its auth
+        // provider is process-global (`set_plugin_auth_providers`), and left loaded it
+        // defers every auth file other tests in this binary scan, so their stores come
+        // back empty.
+        rt.plugins().shutdown_all(None).await;
+        assert!(!cpa_core::config::credentials::plugin_auth_parser_active());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
