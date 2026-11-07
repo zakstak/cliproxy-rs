@@ -500,11 +500,16 @@ fn native_frame(sent: &str, model: &str) -> String {
 }
 
 /// The HTTP body a Codex credential without `websockets` sends for the client's `sent`
-/// create: the frame without `type`, with `model` routed.
+/// create: the frame without `type`, with `model` routed and `stream: true`.
 fn http_body(sent: &str, model: &str) -> String {
+    use cpa_common::codex_body::{CodexBody, Kind};
     let routed = native_frame(sent, model);
-    let body = cpa_common::codex_body::CodexBody::parse(routed.as_bytes()).unwrap();
-    String::from_utf8(body.without_member("type")).unwrap()
+    let untagged = CodexBody::parse(routed.as_bytes()).unwrap().without_member("type");
+    let body = CodexBody::parse(&untagged).unwrap();
+    if body.get("stream").map(|m| m.kind) == Some(Kind::True) {
+        return String::from_utf8(untagged.clone()).unwrap();
+    }
+    String::from_utf8(body.with_member("stream", "true")).unwrap()
 }
 
 /// Runs one scenario and returns its runtime, for checks after the connection. A
