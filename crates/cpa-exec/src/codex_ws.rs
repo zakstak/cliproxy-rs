@@ -1071,8 +1071,16 @@ impl Turn {
 
     /// Reports a loss the reader left to this turn (`Link::deferred`): before the turn
     /// returns the reader's error, or when it ends without the event's own error.
+    ///
+    /// Also stops further deferral under the same lock: a dropped turn can keep its read
+    /// channel until an observation returns (`Drop`), and a reader exiting in that
+    /// window must report its own loss rather than leave it to a turn that is gone.
     fn report_deferred(&self) {
-        let deferred = self.conn.link.lock().expect("link").deferred.take();
+        let deferred = {
+            let mut link = self.conn.link.lock().expect("link");
+            link.preserves = false;
+            link.deferred.take()
+        };
         if let Some(error) = deferred {
             self.session.notify(&error);
         }

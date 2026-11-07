@@ -77,6 +77,8 @@ enum Act {
     SendOwned(String),
     /// Ping `count` times, `every` apart, without any application message.
     Pings(Duration, usize),
+    /// Send, then close the socket with code 1000 once notified.
+    SendCloseOn(Vec<&'static str>, Arc<tokio::sync::Notify>),
 }
 
 #[derive(Default)]
@@ -141,6 +143,13 @@ async fn serve_socket(up: Arc<Upstream>, mut socket: AxSocket) {
                 break;
             }
             Some(Act::SendClose(events, code)) => (events, Some(code)),
+            Some(Act::SendCloseOn(events, close)) => {
+                for event in events {
+                    let _ = socket.send(AxMessage::Text(event.into())).await;
+                }
+                close.notified().await;
+                (Vec::new(), Some(1000))
+            }
             Some(Act::SendOwned(text)) => {
                 let _ = socket.send(AxMessage::Text(text.into())).await;
                 continue;
@@ -1549,6 +1558,79 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
                 "{name}: the loss is the classified error"
             );
         }
+    }
+}
+
+/// A Codex client's turn abandoned while an observer holds the context-window rejection
+/// keeps its read channel until the observation returns. A reader that loses the socket
+/// in that window reports its own loss: the gone turn cannot report a deferred one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_preserving_turn_leaves_no_loss_unreported() {
+    /// Holds every message until `release`.
+    struct Holding {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Credential,
+            _: &'a str,
+            _: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let _ = self.release.acquire().await.unwrap();
+            })
+        }
+    }
+    const FAILED: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+    for rejection in [FAILED, LIVE_CONTEXT_ERROR.trim()] {
+        let close = Arc::new(tokio::sync::Notify::new());
+        let (_up, url) = upstream(vec![Act::SendCloseOn(vec![rejection], close.clone())]).await;
+        let executor = Arc::new(CodexExecutor::new().unwrap());
+        let observer = Arc::new(Holding {
+            calls: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let turn = {
+            let (executor, url, observer) = (executor.clone(), url.clone(), observer.clone());
+            tokio::spawn(async move {
+                let mut req = codex_client_request(BODY);
+                req.usage = cpa_core::exec::UsageSink::default().with_websocket(Some(observer));
+                if let Ok(response) = executor
+                    .execute_in_session(&credential(&url), req, &Config::default(), &session(false))
+                    .await
+                {
+                    collect(response).await;
+                }
+            })
+        };
+        let calls = || observer.calls.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..250 {
+            if calls() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls(), 1, "{rejection}: the rejection was not observed");
+        let conn = executor.ws.session("conn-1").current().expect("socket");
+        turn.abort();
+        let _ = turn.await;
+        assert!(
+            conn.link.lock().expect("link").active.is_some(),
+            "{rejection}: the abandoned turn released its read channel during the observation"
+        );
+        close.notify_one();
+        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1")).await;
+        let deferred = conn.link.lock().expect("link").deferred.is_some();
+        observer.release.add_permits(100);
+        assert!(
+            loss.is_ok(),
+            "{rejection}: the reader's loss was left unreported (deferred: {deferred})"
+        );
+        assert!(!deferred, "{rejection}: a loss was deferred to the abandoned turn");
     }
 }
 
