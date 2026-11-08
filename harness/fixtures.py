@@ -157,17 +157,7 @@ def cases():
         body=encoded({"model": MODEL, "input": "Local question", "stream": True}))
     add("models-anthropic-ua", method="GET", path="/v1/models", body="", no_upstream=True,
         headers=base["headers"][:1] + [["User-Agent", "claude-cli/2.1.280 (external, cli)"]])
-    add("models-gemini", method="GET", path="/v1beta/models", body="", headers=base["headers"][:1], no_upstream=True)
-    add("models-gemini-get", method="GET", path=f"/v1beta/models/{MODEL}", body="", headers=base["headers"][:1],
-        no_upstream=True)
-    add("models-gemini-get-missing", method="GET", path="/v1beta/models/no-such-model", body="",
-        headers=base["headers"][:1], no_upstream=True)
-    add("gemini-unknown-method", path=f"/v1beta/models/{MODEL}:foo", body="{}", headers=openai_headers,
-        no_upstream=True)
-    add("gemini-bad-action", path=f"/v1beta/models/{MODEL}", body="{}", headers=openai_headers, no_upstream=True)
-    add("interactions-invalid", path="/v1beta/interactions", body="{}", headers=openai_headers, no_upstream=True)
-    add("interactions-bad-stream", path="/v1beta/interactions", headers=openai_headers, no_upstream=True,
-        body=encoded({"model": MODEL, "stream": "yes"}))
+    # The Gemini and Interactions routes were removed (issue #49); they answer 410 here.
     add("healthz-head", method="HEAD", path="/healthz", body="", headers=[], no_upstream=True)
     # gin without HandleMethodNotAllowed: wrong methods and unregistered HEADs are NoRoute 404s.
     add("wrong-method-chat", method="GET", path="/v1/chat/completions", body="", headers=openai_headers,

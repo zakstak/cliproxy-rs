@@ -18,15 +18,16 @@ async fn serve(app: axum::Router) -> String {
     url
 }
 
-/// A Gemini model only Go's typed decode reads as intended: nulls in a string list and a
+/// A model only Go's typed decode reads as intended (in the `meta` section; Go's test used
+/// the `gemini` section, removed with issue #49): nulls in a string list and a
 /// header map, HTML characters, the integer `-0` and unknown members.
-const TYPED_GEMINI: &str = r#"{"id":"gemini-typed","inputTokenLimit":123,"supportedInputModalities":[null,"text"],"config":{"override_header":{"X-Test":null,"b":"<v>"}},"thinking":{"min":1,"levels":["low"],"disable_type":"x"},"display_name":"D","created":-0,"native_capabilities":{"web_search":true},"unknown":{"a":[1.5]}}"#;
+const TYPED_MODEL: &str = r#"{"id":"gemini-typed","inputTokenLimit":123,"supportedInputModalities":[null,"text"],"config":{"override_header":{"X-Test":null,"b":"<v>"}},"thinking":{"min":1,"levels":["low"],"disable_type":"x"},"display_name":"D","created":-0,"native_capabilities":{"web_search":true},"unknown":{"a":[1.5]}}"#;
 
-/// Go 1.26.4 `json.Marshal` of [`TYPED_GEMINI`] decoded into `registry.ModelInfo`.
-const TYPED_GEMINI_GO: &str = r#"{"id":"gemini-typed","object":"","created":0,"owned_by":"","type":"","display_name":"D","inputTokenLimit":123,"supportedInputModalities":["","text"],"thinking":{"min":1,"disable_type":"x","levels":["low"]},"config":{"override_header":{"X-Test":"","b":"\u003cv\u003e"}}}"#;
+/// Go 1.26.4 `json.Marshal` of [`TYPED_MODEL`] decoded into `registry.ModelInfo`.
+const TYPED_MODEL_GO: &str = r#"{"id":"gemini-typed","object":"","created":0,"owned_by":"","type":"","display_name":"D","inputTokenLimit":123,"supportedInputModalities":["","text"],"thinking":{"min":1,"disable_type":"x","levels":["low"]},"config":{"override_header":{"X-Test":"","b":"\u003cv\u003e"}}}"#;
 
 /// Catalogs refused whole (docs/DIFFERENCES-FROM-GO.md, remote model catalogs), as raw
-/// text: a parsed `Value` cannot hold repeated members. Each adds one Gemini model (or a
+/// text: a parsed `Value` cannot hold repeated members. Each adds one model (or a
 /// section) to the otherwise acceptable refreshed catalog. Go refuses the integer-field
 /// fractions, `"bad"` then `123` (also as a repeated header name), and the empty decoded
 /// ID; it serves `""` for a null `type` and level and merges the others differently from
@@ -65,11 +66,11 @@ const REFUSED: [(&str, &str); 17] = [
     ("type_null", r#"{"id":"g","type":null}"#),
     ("levels_null", r#"{"id":"g","thinking":{"levels":[null]}}"#),
     ("empty_decoded_id", r#"{"id":"g","ID":""}"#),
-    ("section_in_two_cases", r#"SECTION"GEMINI":[{"id":"b"}]"#),
-    ("section_in_another_case", r#"LONE"GEMINI":[{"id":"b"}]"#),
+    ("section_in_two_cases", r#"SECTION"META":[{"id":"b"}]"#),
+    ("section_in_another_case", r#"LONE"META":[{"id":"b"}]"#),
 ];
 
-/// An accepted Gemini model with `-0` in an integer field (Go's 0, serde's `-0.0`) and a
+/// An accepted model with `-0` in an integer field (Go's 0, serde's `-0.0`) and a
 /// repeated header name (Go keeps the last value).
 const LENIENT: &str = r#"{"id":"g-lenient","type":"gemini","owned_by":"google","context_length":4096,"thinking":{"min":-0,"max":1024},"config":{"override_header":{"X-Test":"a","X-Test":"ok","x-test":null}}}"#;
 
@@ -78,37 +79,36 @@ const LENIENT: &str = r#"{"id":"g-lenient","type":"gemini","owned_by":"google","
 fn refused(modified: &str, name: &str, case: &str) -> String {
     let case = &case.replace(r#"{"id":"g""#, &format!(r#"{{"id":"g-{name}""#));
     if let Some(section) = case.strip_prefix("SECTION") {
-        // After the `gemini` section, so Go decodes this one last.
+        // After the last section, so Go decodes this one last.
         return format!("{},{section}}}", modified.strip_suffix('}').unwrap());
     }
     if let Some(section) = case.strip_prefix("LONE") {
-        // In place of the `gemini` section, which comes right before `vertex`.
-        let gemini = modified.find(r#""gemini":["#).unwrap();
-        let vertex = modified.find(r#""vertex":["#).unwrap();
-        return format!("{}{section},{}", &modified[..gemini], &modified[vertex..]);
+        // In place of the `meta` section, the last one.
+        let meta = modified.find(r#""meta":["#).unwrap();
+        return format!("{}{section}}}", &modified[..meta]);
     }
-    modified.replacen(r#""gemini":["#, &format!(r#""gemini":[{case},"#), 1)
+    modified.replacen(r#""meta":["#, &format!(r#""meta":[{case},"#), 1)
 }
 
 /// The embedded catalog with one extra Claude model and a placeholder for
-/// [`TYPED_GEMINI`], which [`render`] fills in.
+/// [`TYPED_MODEL`], which [`render`] fills in.
 fn with_extra_claude_model() -> serde_json::Map<String, serde_json::Value> {
     let mut root: serde_json::Map<String, serde_json::Value> = serde_json::from_str(EMBEDDED).unwrap();
     let mut extra = root["claude"][0].as_object().unwrap().clone();
     extra.insert("id".into(), "claude-refreshed-1".into());
     root["claude"].as_array_mut().unwrap().push(extra.into());
-    root["gemini"]
+    root["meta"]
         .as_array_mut()
         .unwrap()
-        .push(serde_json::json!({"id": "TYPED_GEMINI"}));
+        .push(serde_json::json!({"id": "TYPED_MODEL"}));
     root
 }
 
-/// `root` as text with [`TYPED_GEMINI`] as written: serde would write its `-0` as `-0.0`.
+/// `root` as text with [`TYPED_MODEL`] as written: serde would write its `-0` as `-0.0`.
 fn render(root: &serde_json::Map<String, serde_json::Value>) -> String {
     serde_json::to_string(root)
         .unwrap()
-        .replacen(r#"{"id":"TYPED_GEMINI"}"#, TYPED_GEMINI, 1)
+        .replacen(r#"{"id":"TYPED_MODEL"}"#, TYPED_MODEL, 1)
 }
 
 #[tokio::test]
@@ -120,10 +120,10 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     // Go's typed decode refuses a fractional token limit.
     let mistyped = {
         let mut root = root.clone();
-        root["gemini"][0]["inputTokenLimit"] = serde_json::json!(1.5);
+        root["meta"][0]["inputTokenLimit"] = serde_json::json!(1.5);
         render(&root)
     };
-    let lenient = modified.replacen(r#""gemini":["#, &format!(r#""gemini":[{LENIENT},"#), 1);
+    let lenient = modified.replacen(r#""meta":["#, &format!(r#""meta":[{LENIENT},"#), 1);
     let refused_cases: Vec<(&str, String)> = REFUSED.iter().map(|(n, c)| (*n, refused(&modified, n, c))).collect();
     let without_meta = {
         let mut root = root.clone();
@@ -174,21 +174,20 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     )
     .unwrap();
     let mut metadata = serde_json::Map::new();
-    metadata.insert("type".into(), "gemini".into());
-    metadata.insert("access_token".into(), "fake-gemini-token".into());
-    let gemini = cpa_core::credential::Credential::from_file(
+    metadata.insert("type".into(), "meta".into());
+    metadata.insert("access_token".into(), "fake-meta-token".into());
+    let meta = cpa_core::credential::Credential::from_file(
         std::path::Path::new("/auth"),
         std::path::Path::new("/auth/g.json"),
         metadata,
     )
     .unwrap();
-    let gemini_id = gemini.id.clone();
+    let meta_id = meta.id.clone();
     let executors = cpa_exec::Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let auth = std::env::temp_dir().join(format!("model-updater-{}", std::process::id()));
     std::fs::create_dir_all(&auth).unwrap();
@@ -201,7 +200,7 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     std::fs::write(&config, yaml).unwrap();
     let rt = Arc::new(cpa_server::testing::runtime(
         cpa_core::config::Config::load(&config).unwrap(),
-        vec![credential, gemini],
+        vec![credential, meta],
         executors,
     ));
     let registered = |rt: &cpa_server::Runtime| rt.registry().ids().any(|id| id == "claude-refreshed-1");
@@ -220,7 +219,7 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     });
     let served = |addr: std::net::SocketAddr| async move {
         wreq::Client::new()
-            .get(format!("http://{addr}/v8/management/routing/model-definitions/gemini"))
+            .get(format!("http://{addr}/v8/management/routing/model-definitions/meta"))
             .bearer_auth("fake-management-only")
             .send()
             .await
@@ -257,7 +256,7 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     assert_eq!(definitions.last().unwrap().id, "claude-refreshed-1");
     // ... and render a refreshed model as Go's typed decode and encode do.
     let body = served(addr).await;
-    assert!(body.ends_with(&format!(",{TYPED_GEMINI_GO}]}}")), "{body}");
+    assert!(body.ends_with(&format!(",{TYPED_MODEL_GO}]}}")), "{body}");
     std::fs::remove_dir_all(&auth).unwrap();
     // Go's refresh callback re-registers the credentials of changed providers.
     assert!(registered(&rt));
@@ -269,9 +268,10 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     // An empty remote `meta` section keeps the current one (Go tryRefreshModels).
     cpa_server::model_updater::refresh(&urls(&["no-meta"])).await;
     assert_eq!(catalog_generation(), generation + 1, "identical once meta is kept");
-    assert_eq!(pinned().channel("meta").len(), meta_before);
+    // The refreshed `meta` section carries the typed model too.
+    assert_eq!(pinned().channel("meta").len(), meta_before + 1);
 
-    // `-0` is Go's 0 in the static catalog, the Gemini credential's registration, the
+    // `-0` is Go's 0 in the static catalog, the Meta credential's registration, the
     // client model list and the management rendering; the last of repeated header names
     // wins.
     cpa_server::model_updater::refresh(&urls(&["lenient"])).await;
@@ -285,7 +285,7 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     };
     let model = pinned().lookup("g-lenient").unwrap();
     assert_eq!(model.thinking, thinking(0, 1024));
-    let spec = rt.registry().client_model(&gemini_id, "g-lenient").expect("registered");
+    let spec = rt.registry().client_model(&meta_id, "g-lenient").expect("registered");
     assert_eq!(
         (spec.owned_by.as_str(), spec.context_length, spec.thinking.clone()),
         ("google", 4096, thinking(0, 1024))

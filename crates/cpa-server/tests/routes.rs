@@ -152,7 +152,6 @@ struct Proxy {
     url: String,
     seen: Arc<Seen>,
     rt: Arc<Runtime>,
-    upstream: String,
 }
 
 async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
@@ -166,18 +165,12 @@ async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     let url = serve(router(rt.clone())).await;
-    Proxy {
-        url,
-        seen,
-        rt,
-        upstream: upstream_url,
-    }
+    Proxy { url, seen, rt }
 }
 
 async fn post(url: &str, path: &str, body: &str) -> (u16, wreq::header::HeaderMap, String) {
@@ -676,10 +669,12 @@ async fn misc_routes_match_go() {
         .await
         .unwrap();
     assert_eq!(cb.headers()["content-type"], "text/html; charset=utf-8");
-    let devin = client.get(format!("{}/devin/callback", p.url)).send().await.unwrap();
-    assert_eq!(devin.status().as_u16(), 400);
-    assert_eq!(devin.headers()["cache-control"], "no-store");
-    assert_eq!(devin.text().await.unwrap(), r#"{"error":"code or error is required"}"#);
+    // The Devin and Antigravity login callbacks were removed (issue #49).
+    for path in ["/devin/callback", "/callback", "/antigravity/callback?code=c&state=s"] {
+        let gone = client.get(format!("{}{path}", p.url)).send().await.unwrap();
+        assert_eq!(gone.status().as_u16(), 410, "{path}");
+        assert!(gone.text().await.unwrap().contains("no longer supported"), "{path}");
+    }
     // A pending login receives the callback.
     let got = Arc::new(Mutex::new(None));
     let sink = got.clone();
@@ -688,23 +683,7 @@ async fn misc_routes_match_go() {
         cpa_server::runtime::OAuthDelivery::Delivered
     })));
     let callback = |path: &'static str| client.get(format!("{}{path}", p.url)).send();
-    let ok = callback("/callback?code=%20c1%20&state=s1").await.unwrap();
-    assert_eq!(ok.status().as_u16(), 200);
-    assert_eq!(
-        *got.lock().unwrap(),
-        Some(("devin", "s1".to_owned(), "c1".to_owned(), String::new()))
-    );
-    // Go's Devin handler trims `error` before falling back to `error_description`, so a
-    // blank error still reports the denial (server_routes.go devinCallbackHandler).
-    let denied = callback("/callback?state=s2&error=%20&error_description=access_denied")
-        .await
-        .unwrap();
-    assert_eq!(denied.status().as_u16(), 200);
-    assert_eq!(
-        *got.lock().unwrap(),
-        Some(("devin", "s2".to_owned(), String::new(), "access_denied".to_owned()))
-    );
-    // The other providers' handlers read `error` untrimmed: a blank one wins.
+    // The provider handlers read `error` untrimmed: a blank one wins.
     let blank = callback("/anthropic/callback?state=s3&error=%20&error_description=access_denied")
         .await
         .unwrap();
@@ -727,26 +706,6 @@ async fn misc_routes_match_go() {
     let other = callback("/anthropic/callback?state=siwc&code=c").await.unwrap();
     assert_eq!(other.status().as_u16(), 200);
     assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
-    // Interactions validation (interactions_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            400,
-            r#"{"error":{"message":"request requires exactly one of model or agent","type":"invalid_request_error"}}"#
-        )
-    );
-    // Gemini action parsing (gemini_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/models/x", "{}").await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            404,
-            r#"{"error":{"message":"/v1beta/models/x not found.","type":"invalid_request_error"}}"#
-        )
-    );
-    let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
-    assert_eq!((status, text.as_str()), (200, ""));
     // Compact through Claude (v8.0.35 2bc236d2): one non-stream summary turn, sealed
     // into a single compaction item.
     let (status, _, text) = post(
@@ -828,9 +787,8 @@ async fn expired_token_is_used_then_refreshed_once_after_401() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
     let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
@@ -883,9 +841,8 @@ async fn a_siwc_map_never_refreshes_a_claude_credential_after_401() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
     let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
@@ -971,9 +928,8 @@ async fn scripted_proxy(config: &str, tokens: &[&str], replies: Vec<Reply>) -> (
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     (serve(router(rt.clone())).await, script, rt)
@@ -1278,51 +1234,68 @@ impl cpa_server::remote::RemoteDispatch for Picks {
     }
 }
 
-/// Go's count_tokens handler runs on `GetContextWithCancel(.., context.Background())`,
-/// which drops the access middleware's usage key, so its Home 401 records carry the key
-/// Home authenticated (gin `userApiKey`), even over a client key the middleware
-/// accepted; a later pick without one keeps it.
+/// Home count-token failures retain Home's authenticated client key across picks,
+/// rather than the access middleware's client key, even when later picks omit it.
 #[tokio::test]
 async fn count_tokens_home_401s_record_the_home_client_key() {
-    let p = proxy("", vec![]).await;
-    let cfg = Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap();
-    p.rt.usage_queue().configure(true, &cfg);
-    // Kimi counts tokens upstream (Go `countTokensUpstream`).
+    let upstream = cpa_exec::test_support::CountTokensUpstream::start().await;
+    let mut cfg = Config::parse("access: {api-keys: [client-key]}\nrequest-retry: 0\nmax-retry-credentials: 3\nusage-statistics-enabled: true\n").unwrap();
+    let dir = std::env::temp_dir().join(format!("routes-home-count-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.auth_dir = dir.clone();
+    let rt = Arc::new(cpa_server::testing::runtime(
+        cfg.clone(),
+        vec![],
+        Executors {
+            claude: upstream.executor(),
+            codex: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
+        },
+    ));
+    rt.usage_queue().configure(true, &cfg);
     let pick = |id: &str, token: &str| {
-        let metadata = serde_json::json!({"type": "kimi", "access_token": token});
-        let mut c = Credential::from_file(
-            Path::new("/fake"),
-            &Path::new("/fake").join(id),
-            metadata.as_object().unwrap().clone(),
-        )
-        .unwrap();
-        for (k, v) in [
-            (cpa_core::config::credentials::HOME_AUTH_INDEX, format!("idx-{id}")),
-            ("base_url", p.upstream.clone()),
-            (cpa_server::remote::UPSTREAM_MODEL, "kimi-up".to_owned()),
-        ] {
-            c.attributes.insert(k.into(), v);
-        }
+        let mut c = cpa_server::testing::local(oauth(id, token, serde_json::json!({})));
+        c.attributes.insert(
+            cpa_core::config::credentials::HOME_AUTH_INDEX.into(),
+            format!("idx-{id}"),
+        );
+        c.attributes
+            .insert(cpa_server::remote::UPSTREAM_MODEL.into(), "claude-up".into());
         c
     };
-    p.rt.set_remote_dispatch(Some(Arc::new(Picks(Mutex::new(vec![
-        (pick("a.json", "fake-unauth"), "home-client"),
-        (pick("b.json", "fake-unauth"), ""),
-        (pick("c.json", "fake-ok"), ""),
+    rt.set_remote_dispatch(Some(Arc::new(Picks(Mutex::new(vec![
+        (pick("a.json", "sk-ant-api03-fake-A"), "home-client"),
+        (pick("b.json", "sk-ant-api03-fake-A"), ""),
+        (pick("c.json", "sk-ant-api03-fake-B"), ""),
     ])))));
-    let body = r#"{"model":"kimi-x","messages":[{"role":"user","content":"hi"}]}"#;
-    let (status, _, text) = post(&p.url, "/v1/messages/count_tokens", body).await;
+    let url = serve(router(rt.clone())).await;
+    let (status, _, text) = post(
+        &url,
+        "/v1/messages/count_tokens",
+        r#"{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
     assert_eq!(status, 200, "{text}");
-    assert_eq!(p.seen.requests.lock().unwrap().len(), 3, "three upstream attempts");
-    let keys: Vec<(String, Value)> =
-        p.rt.usage_queue()
-            .pop_oldest(10)
-            .iter()
-            .map(|r| serde_json::from_slice::<Value>(r).unwrap())
-            .map(|r| (r["api_key"].as_str().unwrap().to_owned(), r["executor_type"].clone()))
-            .collect();
-    let want = ("home-client".to_owned(), Value::from("home-result"));
-    assert_eq!(keys, [want.clone(), want]);
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["input_tokens"], 5);
+    assert_eq!(
+        upstream.calls(),
+        ["sk-ant-api03-fake-A", "sk-ant-api03-fake-A", "sk-ant-api03-fake-B"]
+    );
+    let records: Vec<Value> = rt
+        .usage_queue()
+        .pop_oldest(10)
+        .iter()
+        .map(|r| serde_json::from_slice(r).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "only failed counts produce records: {records:?}");
+    for record in records {
+        assert_eq!(record["api_key"], "home-client");
+        assert_eq!(record["executor_type"], "home-result");
+        assert_eq!(record["fail"]["status_code"], 401);
+        assert_eq!(record["tokens"]["total_tokens"], 0);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Go's Responses handler applies `prepareCodexOrphanDelegation` before dispatch, so the

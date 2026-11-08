@@ -1,7 +1,7 @@
 //! `--working-dir` in the real binary: the directory changes before `.env`, the default
 //! config and relative paths are read, and `--log-file` opens before the runtime starts
-//! and replaces only stdout, so `logging-to-file` still writes `main.log`. Runs a short
-//! import command; no network.
+//! and replaces only stdout, so `logging-to-file` still writes `main.log`. Runs a
+//! `-siwc-bind` that fails on its missing file; no network.
 use std::process::Command;
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -30,7 +30,7 @@ fn working_dir_applies_before_dotenv_config_and_log_paths() {
             "work",
             "--log-file",
             "process.log",
-            "-vertex-import",
+            "-siwc-bind",
             "missing-key.json",
         ])
         .current_dir(&root)
@@ -45,14 +45,14 @@ fn working_dir_applies_before_dotenv_config_and_log_paths() {
     assert!(work.join("process.log").is_file(), "{stderr}");
     assert!(!root.join("process.log").exists());
     // `.env` from the working directory chose the log directory, the default config
-    // there turned on `logging-to-file`, and the import error went to main.log.
+    // there turned on `logging-to-file`, and the bind error went to main.log.
     let main_log = std::fs::read_to_string(work.join("from-dotenv/logs/main.log")).unwrap_or_default();
     assert!(
-        main_log.contains("missing-key.json"),
+        main_log.contains("siwc-bind: failed to resolve credential file"),
         "main.log: {main_log}\nstderr: {stderr}"
     );
     let process_log = std::fs::read_to_string(work.join("process.log")).unwrap();
-    assert!(!process_log.contains("missing-key.json"), "{process_log}");
+    assert!(!process_log.contains("siwc-bind"), "{process_log}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -72,7 +72,7 @@ fn a_warning_before_the_runtime_starts_goes_to_the_log_file() {
             "-local-model",
             "--log-file",
             "process.log",
-            "-vertex-import",
+            "-siwc-bind",
             "missing-key.json",
         ])
         .current_dir(&root)
@@ -95,7 +95,7 @@ fn a_warning_before_the_runtime_starts_goes_to_the_log_file() {
 #[test]
 fn a_missing_working_dir_fails_before_anything_runs() {
     let output = Command::new(env!("CARGO_BIN_EXE_cliproxy"))
-        .args(["-working-dir=/nonexistent/cliproxy-wd", "-vertex-import", "x.json"])
+        .args(["-working-dir=/nonexistent/cliproxy-wd", "-siwc-bind", "x.json"])
         .current_dir(std::env::temp_dir())
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())

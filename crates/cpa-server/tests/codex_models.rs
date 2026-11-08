@@ -17,9 +17,8 @@ async fn get(path: &str, cfg: &str) -> (u16, String, Value) {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,19 +82,75 @@ async fn client_version_selects_the_codex_catalog() {
 #[tokio::test]
 async fn catalog_matches_go_for_config_models() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_models_go.json")).unwrap();
-    let cfg = fixture["config"].as_str().unwrap();
+    // The recorded OpenAI-compatible group and its models went with that provider
+    // (issue #49).
+    let cfg = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
     for version in ["0.150.0", "cpa", "0.143.0"] {
-        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), cfg).await;
+        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), &cfg).await;
         assert_eq!(status, 200);
         let want: Value = serde_json::from_str(fixture[version].as_str().unwrap()).unwrap();
-        let (got, want) = (body["models"].as_array().unwrap(), want["models"].as_array().unwrap());
+        let want: Vec<Value> = want["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| !m["slug"].as_str().unwrap().starts_with("acme-"))
+            .cloned()
+            .collect();
+        let (got, want) = (body["models"].as_array().unwrap(), &want);
         let slugs = |m: &[Value]| {
             m.iter()
                 .map(|e| e["slug"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
         };
         assert_eq!(slugs(got), slugs(want), "{version}: models and order");
+        // A synthesized entry's priority follows its position, which the removed group's
+        // models no longer take; the order of priorities still matches Go's.
+        let priorities = |m: &[Value]| m.iter().map(|e| e["priority"].as_i64()).collect::<Vec<_>>();
+        let order = |p: Vec<Option<i64>>| {
+            let mut idx: Vec<usize> = (0..p.len()).collect();
+            idx.sort_by_key(|&i| p[i]);
+            idx
+        };
+        assert_eq!(
+            order(priorities(got)),
+            order(priorities(want)),
+            "{version}: priority order"
+        );
         for (g, w) in got.iter().zip(want) {
+            let (mut g, mut w) = (g.clone(), w.clone());
+            g.as_object_mut().unwrap().remove("priority");
+            w.as_object_mut().unwrap().remove("priority");
+            let (g, w) = (&g, &w);
+            // Go's `gpt-5.5` entry took the recorded OpenAI-compatible group's config model
+            // (text only, low and xhigh effort, no apply_patch). Codex alone serves it now,
+            // so it is the Codex catalog template.
+            if w["slug"] == "gpt-5.5" {
+                let catalog: Value = serde_json::from_str(cpa_common::codex_client::CLIENT_MODELS_JSON).unwrap();
+                let mut expected = catalog["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["slug"] == "gpt-5.5")
+                    .unwrap()
+                    .clone();
+                expected.as_object_mut().unwrap().remove("priority");
+                // The configured Codex model keeps its pinned template plus the
+                // configured name and explicitly enabled client flag.
+                expected["display_name"] = serde_json::json!("gpt-5.5");
+                expected["multi_agent_version"] = serde_json::json!("v2");
+                if version == "cpa" {
+                    expected["cpa_capabilities"] = serde_json::json!({"web_search":true});
+                }
+                let mut got_keys: Vec<_> = g.as_object().unwrap().keys().collect();
+                let mut want_keys: Vec<_> = expected.as_object().unwrap().keys().collect();
+                got_keys.sort();
+                want_keys.sort();
+                assert_eq!(got_keys, want_keys, "{version}: full template keys");
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(g.get(key), Some(value), "{version}: template field {key}");
+                }
+                continue;
+            }
             assert_eq!(g, w, "{version}: {}", w["slug"]);
         }
     }

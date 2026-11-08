@@ -30,8 +30,8 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::codex_ws::{self, Pool, Read, Session, Target, Upstream};
-use crate::openai_compat::status_err;
-use crate::openai_compat_payload::ensure_responses_usage_details;
+use crate::openai_http::status_err;
+use crate::openai_payload::ensure_responses_usage_details;
 use crate::xai::{XaiExecutor, apply_patch_error, compaction_frames, compaction_item, compaction_response_id, creds};
 use crate::xai_auth::DEFAULT_API_BASE_URL;
 use crate::xai_replay::{self as replay, ReplayScope};
@@ -487,7 +487,7 @@ pub fn websockets_enabled(credential: &Credential) -> bool {
 
 /// A plain Go error (`fmt.Errorf`), as the manager sees it.
 fn plain(message: impl Into<String>) -> ExecError {
-    crate::openai_compat::plain_err(message.into())
+    crate::openai_http::plain_err(message.into())
 }
 
 /// `buildXAIResponsesWebsocketURL`.
@@ -759,7 +759,7 @@ impl WsCapture {
         }
         let (auth_type, auth_value) = cpa_core::registry::dynamic::account_info(credential);
         Self {
-            headers: crate::openai_compat_http::header_pairs(headers),
+            headers: crate::openai_http::header_pairs(headers),
             sink,
             websocket,
             url: url.to_owned(),
@@ -819,7 +819,7 @@ impl WsCapture {
         }
         self.sink
             .record(CaptureEvent::Request(self.log(&url, "GET", &request_headers, &[])));
-        let response_headers = crate::openai_compat_http::header_pairs(headers);
+        let response_headers = crate::openai_http::header_pairs(headers);
         self.sink
             .record(CaptureEvent::ResponseMetadata(status, &response_headers));
         self.sink.record(CaptureEvent::ResponseChunk(body));
@@ -828,7 +828,7 @@ impl WsCapture {
     /// `recordAPIWebsocketHandshake` for a newly dialed socket.
     fn handshake(&self, headers: &HeaderMap) {
         if self.sink.enabled() {
-            let pairs = crate::openai_compat_http::header_pairs(headers);
+            let pairs = crate::openai_http::header_pairs(headers);
             self.sink.record(CaptureEvent::WebsocketHandshake(101, &pairs));
         }
     }
@@ -913,7 +913,7 @@ impl Turn {
     /// (`invalidatePatchAttempt`).
     fn fail_patch(&mut self, events: Vec<Vec<u8>>) {
         let error = apply_patch_error();
-        crate::openai_compat_http::publish_failure(&self.usage, &error);
+        crate::openai_http::publish_failure(&self.usage, &error);
         self.session.invalidate(&self.conn, &error, false);
         self.ready.extend(events.into_iter().map(|e| Ok(Bytes::from(e))));
         self.ready.push_back(Err(error));
@@ -941,7 +941,7 @@ impl Turn {
         // read error: Go logs it at the `read` stage (`unexpected_binary` is its
         // sessionless reader's).
         self.capture.error("read", &error);
-        crate::openai_compat_http::publish_failure(&self.usage, &error);
+        crate::openai_http::publish_failure(&self.usage, &error);
         self.ready.push_back(Err(error));
         self.done = true;
     }
@@ -956,7 +956,7 @@ impl Turn {
         crate::ws_observation::observe(&mut self.observing, self.capture.response(payload)).await;
         if let Some(error) = ws_error(payload) {
             self.capture.error("upstream_error", &error);
-            crate::openai_compat_http::publish_failure(&self.usage, &error);
+            crate::openai_http::publish_failure(&self.usage, &error);
             self.session.invalidate(&self.conn, &error, false);
             self.ready.push_back(Err(error));
             self.done = true;

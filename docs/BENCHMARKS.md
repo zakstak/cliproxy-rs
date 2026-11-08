@@ -635,7 +635,6 @@ Measured on 2026-11-07 for the Codex migration's qualification ([#29](https://gi
   - `codex`: a Responses conversation (18 KB of instructions, 24 function tools, reasoning items with encrypted content, function calls and their large outputs) at about 122 KB, 322 KB, 1.9 MB and 7.7 MB, for a model that needs no routing. Only the number of conversation turns grows with the size.
   - `codex.alias`: the same bodies for an operator alias, so `model` is routed: the native route's one body edit.
   - `codex.claude`: the Claude Messages conversation of the Claude rows above, sent to the Codex model, so the translated route converts it. Only the turns grow.
-  - `codex.gemini`: Gemini requests that start with the same 48 tool schemas of 40 properties each at every size, followed by more or fewer conversation turns. The schema part is fixed, so these rows do not show how preparation grows with schema size.
 
 ```sh
 # Three runs per compiler, each:
@@ -646,7 +645,7 @@ Raw output, with the revision, compiler and command of each run: [`bench/results
 
 ### Results
 
-Six runs, three per compiler. The ranges are over all six; both compilers gave the same values, apart from peaks varying by up to 152 bytes from run to run and the Gemini 1.9 MB count reading 41,392 to 41,394.
+Six runs, three per compiler. The ranges are over all six; both compilers gave the same values, apart from peaks varying by up to 152 bytes from run to run. The run also measured Gemini requests; those rows were dropped with the Gemini client protocol (issue #49).
 
 | Workload | Body (bytes) | Peak live heap (bytes) | Peak / body | Allocations |
 | --- | --- | --- | --- | --- |
@@ -660,9 +659,6 @@ Six runs, three per compiler. The ranges are over all six; both compilers gave t
 | codex.claude, 100k | 118,598 | 522,797 | 4.41 | 2,647 |
 | codex.claude, 1900k | 1,843,817 | 7,441,814 | 4.04 | 10,117 |
 | codex.claude, 7600k | 7,381,557 | 29,649,658 | 4.02 | 34,069 |
-| codex.gemini, 400k | 540,237 | 2,402,207 | 4.45 | 35,524 |
-| codex.gemini, 1900k | 1,985,577 | 7,565,550 | 3.81 | 41,392 to 41,394 |
-| codex.gemini, 7600k | 7,511,877 | 29,806,962 | 3.97 | 63,784 |
 
 ### What the numbers show
 
@@ -673,14 +669,13 @@ These are heap observations for these workloads on this machine:
   - Before #23 the same route was 8.8x the body.
 - **Native with an alias:** the peak is about the body's size plus that fixed part, 1.0x the body at 1.9 MB and 7.7 MB: one copy, the `model` edit.
 - **Translated:**
-  - From Claude Messages, the peak was between 4.0x and 4.4x the body at the three sizes. From Gemini, it was between 3.8x and 4.5x the body.
+  - From Claude Messages, the peak was between 4.0x and 4.4x the body at the three sizes.
   - The allocation count grows with the number of turns.
   - The converted body is now one buffer shared by the upstream send and the response translator; it used to be copied for the send. That removed one held allocation; the peak did not change.
   - What makes up the remaining peak was not attributed by measurement. By reading the code, it includes the strict converter's output and the copy returned by the shared reasoning step (`cpa_common::thinking`, which other providers share and this change leaves alone). The Claude route itself measures 4.0x its body above.
 
 These results do not show:
 - execution time, CPU or bytes rescanned, so nothing about computational complexity;
-- how preparation grows with schema size, since the Gemini schemas are fixed;
 - a release build;
 - the WebSocket routes;
 - concurrency;

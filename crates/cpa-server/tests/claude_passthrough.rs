@@ -114,9 +114,8 @@ async fn proxy(dir: &Path, upstream_url: &str) -> String {
     let executors = Executors {
         claude: ClaudeExecutor::new(upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     // This suite checks wire passthrough, one upstream attempt per request. Scheduler
@@ -333,18 +332,15 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
         res.text().await.unwrap(),
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-opus-5"}}"#
     );
-    // An Antigravity credential without a project or refresh token: Go's
-    // PrepareRequestAuth fails in ensureAccessToken (`missing refresh token`, 401)
-    // before any request leaves, and the conductor answers that last error.
-    let res = post(r#"{"model":"gemini-3-flash"}"#).await.unwrap();
-    assert_eq!(res.status().as_u16(), 401);
-    assert_eq!(
-        res.text().await.unwrap(),
-        r#"{"type":"error","error":{"type":"authentication_error","message":"missing refresh token"}}"#
-    );
-    // Go v8.0.35 (f62d4d28) dropped these Antigravity models from the catalog, so the
-    // credential no longer registers them and they have no provider.
-    for model in ["gemini-pro-agent", "gemini-3.1-pro-low", "gemini-3.7-flash-high"] {
+    // A saved Antigravity login is no longer loaded (issue #49), so its models have no
+    // provider; Go answers 401 `missing refresh token` from the Antigravity executor.
+    // The file itself stays as it was.
+    for model in [
+        "gemini-3-flash",
+        "gemini-pro-agent",
+        "gemini-3.1-pro-low",
+        "gemini-3.7-flash-high",
+    ] {
         let res = post(Box::leak(format!(r#"{{"model":"{model}"}}"#).into_boxed_str()))
             .await
             .unwrap();
@@ -356,6 +352,10 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
             )
         );
     }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("antigravity-a.json")).unwrap(),
+        r#"{"type":"antigravity"}"#
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -387,9 +387,8 @@ async fn request_log_masks_upstream_credentials() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     cpa_server::install_registry(&rt);
@@ -549,9 +548,8 @@ async fn usage_proxy(dir: &Path, upstream_url: &str) -> (Arc<cpa_server::Runtime
     let executors = Executors {
         claude: ClaudeExecutor::new(upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     rt.usage_queue().configure(true, &rt.config());

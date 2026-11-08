@@ -6,9 +6,9 @@
   import Missing from "../Missing.svelte";
   import Bar from "../Bar.svelte";
 
-  const builtIn = ["claude", "codex", "antigravity", "kimi", "kimi-ai", "xai", "devin", "meta"];
+  const builtIn = ["claude", "codex", "xai", "meta"];
   // Go starts a local callback forwarder for these when asked by a web UI.
-  const forwarded = ["claude", "codex", "antigravity", "xai", "devin"];
+  const forwarded = ["claude", "codex", "xai"];
   const providers = builtIn;
   let gone = $state<string[]>([]),
     session = $state<Data | null>(null),
@@ -19,8 +19,7 @@
     // The usage read this sign-in made; null when none was made (the 2-minute wait, or no source).
     got = $state<Data | null>(null),
     now = $state(Date.now()),
-    callback = $state(""),
-    region = $state("");
+    callback = $state("");
   const can = $derived(store.can("GET", "/oauth/auth-url"));
 
   async function start(p: string) {
@@ -137,28 +136,10 @@
   const v = $derived(acct ? accountRow(acct, limits(acct), true, true) : null);
   // The bars come from this tab's own usage read, never from older passive numbers.
   const live = $derived(status === "ok" && !!got?.windows && !got.error);
-  function vertex(input: HTMLInputElement) {
-    const file = input.files?.[0];
-    input.value = "";
-    if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    // The server defaults an empty region to us-central1.
-    if (region.trim()) form.append("location", region.trim());
-    store.act(async () => {
-      const r = await api("/oauth/import?provider=vertex", "POST", form).catch((e) => {
-        if (!(e instanceof ApiError && e.code === "provider_not_found")) throw e;
-        gone = [...gone, "vertex"];
-        throw new Error("Vertex import is not available on this server.");
-      });
-      await store.creds.load(true);
-      store.notify(`Vertex service account for ${r.project_id} imported (${r.location}).`);
-    });
-  }
 </script>
 
 <div class="head"><h1>Connect an account</h1></div>
-<Missing actions={[["GET", "/oauth/auth-url", "provider sign-in"], ["POST", "/oauth/import", "Vertex import"]]} />
+<Missing actions={[["GET", "/oauth/auth-url", "provider sign-in"]]} />
 
 <section class="section">
   <h2>Sign in with a provider</h2>
@@ -280,27 +261,6 @@
 <section class="section">
   <h2>Other ways</h2>
   <ul class="list">
-    <li class="item">
-      <span class="grow">Use a Google Cloud service-account JSON for Vertex AI.</span>
-      <label class="field region"
-        ><span class="sr">Vertex region</span><input
-          bind:value={region}
-          placeholder="us-central1"
-          spellcheck="false"
-          autocomplete="off"
-          disabled={!store.can("POST", "/oauth/import") || gone.includes("vertex")}
-        /></label
-      >
-      <label class="key" aria-disabled={!store.can("POST", "/oauth/import") || gone.includes("vertex")}
-        ><svg class="i" aria-hidden="true"><use href="#i-upload" /></svg>Import service account<input
-          class="file"
-          type="file"
-          accept=".json,application/json"
-          disabled={store.busy || !store.can("POST", "/oauth/import") || gone.includes("vertex")}
-          onchange={(e) => vertex(e.currentTarget)}
-        /></label
-      >
-    </li>
     <li class="item">
       <span class="grow">Use an API key instead of an account.</span>
       <a class="key" href="#providers">Providers</a>

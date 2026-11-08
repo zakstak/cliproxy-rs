@@ -283,10 +283,6 @@ pub struct Policy {
     pub max_trusted_cooldown: Duration,
     /// routing.force-model-prefix: bool, default false.
     pub force_model_prefix: bool,
-    /// Enabled `openai-compatibility` entries in config order with their
-    /// `disable-cooling` (Go `providerCoolingOverrideForAuth`). Filled from the config on
-    /// every publish ([`compat_cooling`]).
-    pub compat_disable_cooling: Vec<(String, Option<bool>)>,
     /// OAuth-only `oauth.request-scoped-errors` channels; API keys must not inherit these.
     pub oauth_request_scoped_errors: HashMap<String, Vec<ErrorRule>>,
 }
@@ -306,7 +302,6 @@ impl Default for Policy {
             save_cooldown_status: false,
             max_trusted_cooldown: DEFAULT_TRUSTED_COOLDOWN,
             force_model_prefix: false,
-            compat_disable_cooling: Vec::new(),
             oauth_request_scoped_errors: HashMap::new(),
         }
     }
@@ -483,33 +478,10 @@ impl Policy {
     }
 
     /// Go `quotaCooldownDisabledForAuthWithConfig`: the credential's `disable_cooling`
-    /// metadata, then its OpenAI-compatibility entry's `disable-cooling`, then global.
+    /// metadata, then global (Go's OpenAI-compatibility entry override went with that
+    /// provider, issue #49).
     pub(crate) fn cooling_disabled(&self, c: &Credential) -> bool {
-        boolean(c, "disable_cooling")
-            .or_else(|| self.provider_cooling(c))
-            .unwrap_or(self.disable_cooling)
-    }
-
-    /// Go `providerCoolingOverrideForAuth` with `resolveOpenAICompatConfig`: the first
-    /// enabled entry (config order) named by the credential's `compat_name`,
-    /// `provider_key` or provider.
-    fn provider_cooling(&self, c: &Credential) -> Option<bool> {
-        let provider = c.provider.trim().go_lower();
-        let attr = |k: &str| c.attributes.get(k).map(|v| v.trim()).unwrap_or_default();
-        let (compat_name, mut provider_key) = (attr("compat_name"), attr("provider_key"));
-        if provider.is_empty()
-            || (provider_key.is_empty() && compat_name.is_empty() && provider != "openai-compatibility")
-        {
-            return None;
-        }
-        if provider_key.is_empty() {
-            provider_key = &provider;
-        }
-        let candidates = [compat_name, provider_key, provider.as_str()];
-        self.compat_disable_cooling
-            .iter()
-            .find(|(name, _)| candidates.iter().any(|c| !c.is_empty() && c.go_eq_fold(name)))
-            .and_then(|(_, disable)| *disable)
+        boolean(c, "disable_cooling").unwrap_or(self.disable_cooling)
     }
 
     pub fn error_action(&self, c: &Credential, error: &ExecError) -> ErrorAction {
@@ -722,34 +694,6 @@ pub(crate) struct Scheduler {
     rejected: HashMap<String, std::sync::Arc<Credential>>,
 }
 
-/// Go `cfg.OpenAICompatibility` for cooling: enabled entries with a base URL (Go
-/// `SanitizeOpenAICompatibility`), in config order, with their `disable-cooling`.
-pub fn compat_cooling(cfg: &cpa_core::config::Config) -> Vec<(String, Option<bool>)> {
-    cfg.document
-        .get("api-keys")
-        .and_then(|k| k.get("openai-compatibility"))
-        .and_then(serde_yaml_ng::Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter(|g| {
-            g.get("base-url")
-                .and_then(serde_yaml_ng::Value::as_str)
-                .is_some_and(|b| !b.trim().is_empty())
-                && g.get("disabled").and_then(serde_yaml_ng::Value::as_bool) != Some(true)
-        })
-        .map(|g| {
-            (
-                g.get("name")
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned(),
-                g.get("disable-cooling").and_then(serde_yaml_ng::Value::as_bool),
-            )
-        })
-        .collect()
-}
-
 /// A selection's affinity keys: the session, and its parent or alias when distinct.
 struct SessionKeys {
     primary: crate::affinity::Key,
@@ -925,16 +869,6 @@ impl Scheduler {
                 }
             }
         }
-    }
-
-    /// The generation of a lease picked outside selection (the Antigravity credits
-    /// fallback, which runs on credentials selection refused): one that every bounded
-    /// window and probe reservation within 2^30 generations of now, before or after, is
-    /// newer than. Such a lease answers none of them: a cancelled or successful credits
-    /// attempt neither frees another request's probe nor ends a window, which stays with
-    /// its own probe.
-    pub fn outside_selection_generation(&self) -> u32 {
-        self.generation.wrapping_sub(1 << 30)
     }
 
     /// Reserves the probe of `c` for `model` when its pick ends a bounded window: until
@@ -2829,37 +2763,6 @@ mod tests {
         }
     }
 
-    /// A lease picked outside selection (the credits fallback) on a credential whose
-    /// ended window has a probe in flight neither frees that probe nor ends the window,
-    /// whatever its outcome; nor does it answer a window opened after it.
-    #[test]
-    fn outside_selection_leases_answer_no_bounded_window() {
-        let c = cred("a", serde_json::json!({}));
-        let p = Policy::default();
-        let start = Instant::now();
-        let mut s = Scheduler::default();
-        s.record(&c, "m", &hinted(FailureScope::Model, secs(6 * 24 * H)), &p, start);
-        let ended = start + secs(H);
-        let probe = s.reserve_probe(&c, "m", ended);
-        let credits = s.outside_selection_generation();
-        for outcome in [Outcome::Cancelled, Outcome::Success] {
-            s.record_picked(&c, "m", &outcome, &p, credits, ended);
-            assert!(s.wait(&c, "m", ended).is_some(), "the reserved probe holds the window");
-        }
-        s.accept_probe_picked(&c, "m", credits, ended);
-        assert!(s.wait(&c, "m", ended).is_some(), "a credits stream accepts nothing");
-        s.record_picked(&c, "m", &Outcome::Success, &p, probe, ended);
-        assert_eq!(s.wait(&c, "m", ended), None, "the probe's own success ends it");
-        // A window opened after the credits lease was picked is newer than it too.
-        let credits = s.outside_selection_generation();
-        let later = ended + secs(MIN);
-        s.record(&c, "m", &hinted(FailureScope::Model, secs(6 * 24 * H)), &p, later);
-        let reopened = later + secs(H);
-        s.reserve_probe(&c, "m", reopened);
-        s.record_picked(&c, "m", &Outcome::Cancelled, &p, credits, reopened);
-        assert!(s.wait(&c, "m", reopened).is_some(), "the later probe still holds");
-    }
-
     /// Generations compare in serial-number order: a window opened just after the counter
     /// wraps is newer than a lease picked just before, and older than one picked after.
     #[test]
@@ -3507,7 +3410,10 @@ mod tests {
                     );
                 }
                 let payload = step["payload"].as_str().unwrap_or_default().as_bytes();
-                let format = cpa_core::format::Format::parse(case["format"].as_str().unwrap_or("openai")).unwrap();
+                // Gemini and Interactions clients were removed (issue #49).
+                let Some(format) = cpa_core::format::Format::parse(case["format"].as_str().unwrap_or("openai")) else {
+                    continue;
+                };
                 let caller = match step["caller"].as_str() {
                     Some(c) => c,
                     None => case["caller"].as_str().unwrap_or_default(),
@@ -3779,32 +3685,6 @@ mod tests {
         );
     }
 
-    /// Go matches openai-compatibility groups by `EqualFold` against the credential's
-    /// compat name, provider key and provider (`resolveOpenAICompatConfig`), where σ and ς
-    /// are equal. Group `ΟΣ` now registers `openai-compatible-οσ` (Go `strings.ToLower`),
-    /// and the earlier group `openai-compatible-ος` still supplies its proxy and its
-    /// disable-cooling setting.
-    #[test]
-    fn compat_groups_match_with_go_equal_fold() {
-        let cfg = cpa_core::config::Config::parse(
-            "openai-compatibility:\n  - name: openai-compatible-ος\n    base-url: http://127.0.0.1:9\n    disable-cooling: true\n    api-key-entries: [{api-key: k, proxy-url: 'http://127.0.0.1:8080'}]\n  - name: ΟΣ\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n",
-        )
-        .unwrap();
-        let creds = cpa_core::config::credentials::from_config(&cfg);
-        let c = creds
-            .iter()
-            .find(|c| c.attributes.get("compat_name").is_some_and(|n| n == "ΟΣ"))
-            .unwrap();
-        assert_eq!(cpa_core::registry::dynamic::provider_key(c), "openai-compatible-οσ");
-        assert_eq!(
-            cpa_core::config::credentials::api_key_config_proxy(&cfg, c),
-            "http://127.0.0.1:8080"
-        );
-        let mut policy = crate::management::policy(&cfg);
-        policy.compat_disable_cooling = compat_cooling(&cfg);
-        assert_eq!(policy.provider_cooling(c), Some(true));
-    }
-
     /// OAuth request-scoped-error channels and the credential provider they are looked up
     /// by are both Go `strings.ToLower` (U+0130 becomes a plain `i`): rules keyed `HİGH`
     /// apply to a `"type":"HİGH"` file credential.
@@ -3900,45 +3780,6 @@ mod tests {
             }
             .retry_limit(&cred("b", serde_json::json!({"request_retry":"-1"}))),
             3
-        );
-        // Go `providerCoolingOverrideForAuth`: the first enabled compat entry named by
-        // compat_name, provider_key or provider; credential metadata still wins.
-        let cfg = cpa_core::config::Config::parse(
-            "openai-compatibility:\n  - {name: skipped, base-url: '', disable-cooling: false}\n  - {name: Router, base-url: http://r.invalid, disable-cooling: true}\n  - {name: plain, base-url: http://p.invalid}\n",
-        )
-        .unwrap();
-        let mut p = Policy {
-            compat_disable_cooling: compat_cooling(&cfg),
-            ..Default::default()
-        };
-        assert_eq!(
-            p.compat_disable_cooling,
-            [("Router".to_owned(), Some(true)), ("plain".to_owned(), None)],
-            "legacy openai-compatibility is read through the v8 document"
-        );
-        let compat = |attrs: &[(&str, &str)], meta: Value| {
-            let mut c = cred("compat", meta);
-            c.provider = "openai-compatibility".into();
-            for (k, v) in attrs {
-                c.attributes.insert((*k).into(), (*v).into());
-            }
-            c
-        };
-        assert!(p.cooling_disabled(&compat(&[("compat_name", "router")], serde_json::json!({}))));
-        assert!(p.cooling_disabled(&compat(&[("provider_key", "ROUTER")], serde_json::json!({}))));
-        assert!(!p.cooling_disabled(&compat(
-            &[("compat_name", "router")],
-            serde_json::json!({"disable_cooling": false})
-        )));
-        p.disable_cooling = true;
-        assert!(
-            p.cooling_disabled(&compat(&[("compat_name", "plain")], serde_json::json!({}))),
-            "an entry without disable-cooling defers to global"
-        );
-        p.disable_cooling = false;
-        assert!(
-            !p.cooling_disabled(&cred("claude-file", serde_json::json!({}))),
-            "credentials outside OpenAI compatibility ignore entries"
         );
         for scope in [FailureScope::Request, FailureScope::Transport] {
             let mut s = Scheduler::default();

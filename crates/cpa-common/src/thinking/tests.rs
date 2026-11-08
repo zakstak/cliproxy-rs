@@ -287,41 +287,6 @@ fn replay_all(lines: impl Iterator<Item = String>) -> std::collections::BTreeMap
     ran
 }
 
-/// The Kimi thread's Go-derived ApplyRequestThinking vectors
-/// (cpa-exec/tests/device_fixtures/kimi/vectors.json), against the pinned catalog.
-#[test]
-fn kimi_thread_request_vectors() {
-    let vectors: Vec<Value> = serde_json::from_str(include_str!(
-        "../../../cpa-exec/tests/device_fixtures/kimi/vectors.json"
-    ))
-    .unwrap();
-    let mut count = 0;
-    for v in vectors.iter().filter(|v| v["fn"] == "thinking") {
-        let input = s(&v["in"]).as_bytes();
-        let (from, to) = (s(&v["from"]), s(&v["to"]));
-        // Go's registry: only the Codex target registers translators from these formats.
-        let has_request_transformer = to == "codex" && matches!(from, "openai" | "openai-response");
-        let got = apply_request_thinking(&RequestThinking {
-            body: input,
-            payload: input,
-            original: input,
-            model: s(&v["model"]),
-            from,
-            to,
-            provider: "kimi",
-            resolved: None,
-            has_request_transformer,
-            updates_changed: false,
-        });
-        match v["err"].as_str() {
-            Some(want) => assert_eq!(got.unwrap_err().message, want, "{v}"),
-            None => assert_eq!(got.unwrap(), s(&v["out"]).as_bytes(), "{v}"),
-        }
-        count += 1;
-    }
-    assert_eq!(count, 16);
-}
-
 #[test]
 fn suffix_and_conversion_edges() {
     assert_eq!(parse_suffix("a(b)(c)").model_name, "a(b)");

@@ -92,18 +92,6 @@ export CLIPROXY_CLIENT_KEY=your-client-key
 codex
 ```
 
-## Gemini CLI
-
-[Gemini CLI's official repository](https://github.com/google-gemini/gemini-cli/issues/1679#issuecomment-3293504913) confirms `GOOGLE_GEMINI_BASE_URL` for a custom Gemini endpoint. `GEMINI_API_KEY` is the documented key variable. The CLI uses Gemini `/v1beta` routes.
-
-```bash
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8317
-export GEMINI_API_KEY=your-client-key
-gemini
-```
-
-Pick `<model-id>` with Gemini CLI's `/model` command. Not verified against official docs: a model environment variable for a custom endpoint.
-
 ## Amp
 
 [Amp Model Routing](https://ampcode.com/docs/customize/model-routing#custom-url-connections) calls Custom URL connections from Amp's servers. Expose the proxy at a public HTTPS address first. In Model Routing, choose Add, then Custom URL. Use one of these configurations and map an Amp model to `<model-id>`.
@@ -314,41 +302,6 @@ const message = await client.messages.create({
   messages: [{ role: "user", content: "Hello" }],
 });
 console.log(message.content[0].text);
-```
-
-### Google Gen AI Python
-
-The [official Python SDK source](https://github.com/googleapis/python-genai/blob/main/google/genai/client.py) accepts `api_key` and `http_options`. It uses Gemini `/v1beta` routes.
-
-```python
-from google import genai
-from google.genai import types
-
-client = genai.Client(
-    api_key="your-client-key",
-    http_options=types.HttpOptions(base_url="http://127.0.0.1:8317"),
-)
-response = client.models.generate_content(model="<model-id>", contents="Hello")
-print(response.text)
-```
-
-The published Python guide describes custom base URLs only for its enterprise mode. The SDK's current source accepts the combination above for the Gemini Developer API too.
-
-### Google Gen AI JavaScript
-
-The [official JavaScript SDK source](https://github.com/googleapis/js-genai/blob/main/src/client.ts) accepts `apiKey` and `httpOptions.baseUrl`.
-
-```javascript
-import { GoogleGenAI } from "@google/genai";
-
-const client = new GoogleGenAI({
-  apiKey: "your-client-key",
-  httpOptions: { baseUrl: "http://127.0.0.1:8317" },
-});
-const response = await client.models.generateContent({
-  model: "<model-id>", contents: "Hello",
-});
-console.log(response.text);
 ```
 
 ## Check it works

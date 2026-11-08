@@ -1,4 +1,4 @@
-//! Go's `bytes.TrimSpace` for the Meta and Kimi executors. The Codex request helpers
+//! Go's `bytes.TrimSpace` for the Meta executor. The Codex request helpers
 //! that used to be adapted here are `cpa_common::codex_client` and `crate::codex_tokens`.
 
 /// Go `bytes.TrimSpace`: leading and trailing runes with `unicode.IsSpace` (the same set as

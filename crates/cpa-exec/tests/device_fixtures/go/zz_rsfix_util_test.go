@@ -1,6 +1,6 @@
 package executor
 
-// Fixture generator for cliproxy-rs device providers (Kimi, Meta, Devin).
+// Fixture generator for cliproxy-rs device providers (Meta; Kimi and Devin were removed).
 // Runs the real Go executors against a raw HTTP/1.1 capture server and records the
 // exact upstream request (ordered header lines, body) and the downstream result.
 // Enable with RSFIX_OUT=<dir>; otherwise every generator test is skipped.

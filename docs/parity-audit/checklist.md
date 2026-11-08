@@ -1,5 +1,7 @@
 # CLIProxyAPI source-derived parity checklist for cliproxy-rs
 
+> **Scope after issue #49.** This fork keeps only the Claude, Codex, Grok (`xai`) and Muse (`meta`) upstreams and the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses client protocols. Items for Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity, the OpenAI-compatible upstreams and their translators are out of scope and kept only as history; their statuses are not maintained. See [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md#removed-providers).
+
 Reference: `router-for-me/CLIProxyAPI`, release **v8.0.35**, commit **`ae3ee3be303fb07fb8173279923413005bf32177`**, committed `2026-10-20T00:55:07+08:00` (19 October UTC). The target is frozen for this porting pass. Citations are immutable commit permalinks. Historical removed declarations are labeled explicitly. The Go checkout is read-only; no runtime implementation or live provider calls are part of this inventory.
 
 Every checkbox is one independently tracked inventory/contract item. Milestone counts include routes, translation registrations, configuration fields, ABI methods, and test-suite files; they are not estimates of engineering effort. An operation with multiple methods has one checkbox per method. Test-suite checkboxes cover all named tests in that file, not one checkbox per assertion. A feature can have separate runtime and configuration checkboxes. Milestones indicate the earliest required delivery phase, not isolation: later phases depend on earlier ones.

@@ -61,20 +61,20 @@ struct Args {
     /// Override OAuth callback port (defaults to provider-specific port)
     #[arg(long, default_value_t = 0)]
     oauth_callback_port: u16,
-    /// Login to Antigravity using OAuth
-    #[arg(long)]
+    /// Removed: Antigravity is no longer supported (exits with migration guidance)
+    #[arg(long, hide = true)]
     antigravity_login: bool,
-    /// Login to Kimi (.com) using OAuth
-    #[arg(long)]
+    /// Removed: Kimi is no longer supported (exits with migration guidance)
+    #[arg(long, hide = true)]
     kimi_login: bool,
-    /// Login to Kimi.ai using OAuth
-    #[arg(long)]
+    /// Removed: Kimi is no longer supported (exits with migration guidance)
+    #[arg(long, hide = true)]
     kimi_ai_login: bool,
     /// Login to xAI using OAuth
     #[arg(long)]
     xai_login: bool,
-    /// Login to Devin using OAuth
-    #[arg(long)]
+    /// Removed: Devin is no longer supported (exits with migration guidance)
+    #[arg(long, hide = true)]
     devin_login: bool,
     /// Login to Meta using OAuth
     #[arg(long)]
@@ -97,11 +97,11 @@ struct Args {
     /// Comma-separated interface names to skip during LAN discovery
     #[arg(long, action = ArgAction::Append)]
     discover_exclude: Vec<String>,
-    /// Import Vertex service account key JSON file
-    #[arg(long, default_value = "")]
+    /// Removed: Vertex AI is no longer supported (exits with migration guidance)
+    #[arg(long, hide = true, default_value = "")]
     vertex_import: String,
-    /// Prefix for Vertex model namespacing (use with -vertex-import)
-    #[arg(long, default_value = "")]
+    /// Removed with -vertex-import
+    #[arg(long, hide = true, default_value = "")]
     vertex_import_prefix: String,
     /// Bind Sign in with ChatGPT (SIWC) credentials to a Codex credential file
     #[arg(long, default_value = "")]
@@ -1039,15 +1039,24 @@ async fn persist_bound(store: &cpa_store::Store, path: &Path) {
     }
 }
 
-/// Go's command modes, in Go's order.
+/// The login or import flag of a removed provider (issue #49), with that provider.
+fn removed_command(args: &Args) -> Option<(&'static str, &'static str)> {
+    [
+        (!args.vertex_import.is_empty(), "vertex", "-vertex-import"),
+        (args.antigravity_login, "antigravity", "-antigravity-login"),
+        (args.kimi_login, "kimi", "-kimi-login"),
+        (args.kimi_ai_login, "kimi-ai", "-kimi-ai-login"),
+        (args.devin_login, "devin", "-devin-login"),
+    ]
+    .into_iter()
+    .find_map(|(set, provider, flag)| set.then_some((provider, flag)))
+}
+
+/// Go's command modes, in Go's order. A removed provider's flag fails with its
+/// migration guidance and changes nothing.
 async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
-    // Go DoVertexImport: failures are logged and the command still exits normally.
-    if !args.vertex_import.is_empty() {
-        match cpa_exec::vertex_auth::import(&config.auth_dir, &args.vertex_import, &args.vertex_import_prefix) {
-            Ok(path) => println!("Vertex credentials imported: {}", path.display()),
-            Err(error) => tracing::error!("{error}"),
-        }
-        return Ok(Ran::Login);
+    if let Some((provider, flag)) = removed_command(args) {
+        anyhow::bail!(cpa_core::removed::operation_error(provider, flag));
     }
     if !args.siwc_bind.is_empty() {
         // Go DoSIWCBind: failures are reported and the command still exits normally,
@@ -1072,24 +1081,6 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
             }
         }
         return Ok(Ran::Bound(None));
-    }
-    if args.antigravity_login {
-        // Go DoAntigravityLogin: a failure is logged and the command still exits normally.
-        let options = cpa_exec::antigravity_auth::LoginOptions {
-            no_browser: args.no_browser,
-            callback_port: args.oauth_callback_port,
-        };
-        match cpa_exec::antigravity_auth::login(&config.auth_dir, config, &options).await {
-            Ok((path, label)) => {
-                println!("Authentication saved to {}", path.display());
-                if !label.is_empty() {
-                    println!("Authenticated as {label}");
-                }
-                println!("Antigravity authentication successful!");
-            }
-            Err(error) => tracing::error!("Antigravity authentication failed: {error}"),
-        }
-        return Ok(Ran::Login);
     }
     if args.codex_login || args.codex_device_login {
         let options = cpa_exec::codex_oauth::LoginOptions {
@@ -1129,21 +1120,11 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
         }
         return Ok(Ran::Login);
     }
-    if args.kimi_login || args.kimi_ai_login {
-        let provider = if args.kimi_login { "kimi" } else { "kimi-ai" };
-        cpa_exec::kimi_auth::login(provider, config, args.no_browser).await?;
-        return Ok(Ran::Login);
-    }
     if args.xai_login {
         // Go DoXAILogin: a failure is logged and the command still exits normally.
         if let Err(error) = cpa_exec::xai_auth::login(config, args.no_browser).await {
             tracing::error!("xAI authentication failed: {}", String::from_utf8_lossy(&error.body));
         }
-        return Ok(Ran::Login);
-    }
-    if args.devin_login {
-        // Go DoDevinLogin: a failure is logged and the command still exits normally.
-        cpa_exec::devin_auth::login(config, args.no_browser, args.oauth_callback_port).await;
         return Ok(Ran::Login);
     }
     if args.meta_login {
@@ -1256,9 +1237,8 @@ async fn serve(
     let executors = Executors {
         claude: ClaudeExecutor::new(DEFAULT_BASE_URL)?,
         codex: cpa_exec::codex::CodexExecutor::new()?,
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(Runtime::new(config, credentials, executors));
     // What each file credential was loaded from, for Go-exact management saves.
@@ -1783,9 +1763,8 @@ mod tests {
             let executors = Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             };
             let rt = Arc::new(cpa_server::testing::runtime(config.clone(), Vec::new(), executors));
             let options = cpa_server::management::Options {

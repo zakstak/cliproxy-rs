@@ -102,11 +102,8 @@ impl Runtime {
     /// The scheduler policy is derived from the config (`routing` plus the OAuth
     /// provider rules), as on every publish.
     pub fn new(config: Config, credentials: Vec<Credential>, executors: Executors) -> Self {
-        let mut policy = crate::management::policy(&config);
-        policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
+        let policy = crate::management::policy(&config);
         let cooldown_dir = cooldown_dir(&config, &policy);
-        let (enabled, strict) = signature_cache_config(&config);
-        cpa_translate::set_antigravity_signature_cache_config(enabled, strict);
         let rt = Self {
             config: RwLock::new(Arc::new(config)),
             store: CredentialStore::new(credentials),
@@ -207,34 +204,22 @@ impl Runtime {
 
     /// Integration should use this when publishing parsed routing settings too. False
     /// when the config was rejected and nothing changed.
-    pub fn publish_config_and_policy(&self, config: Config, mut policy: Policy) -> bool {
+    pub fn publish_config_and_policy(&self, config: Config, policy: Policy) -> bool {
         if !Self::accepts_config(&config) {
             return false;
         }
-        policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
-        let (enabled, strict) = signature_cache_config(&config);
-        cpa_translate::set_antigravity_signature_cache_config(enabled, strict);
         let dir = cooldown_dir(&config, &policy);
-        let ws_auth = crate::relay::ws_auth(&config);
         let config = Arc::new(config);
         // Commits are serialized, so the catalogs are configured in commit order; the
         // config lock itself is released first, as Go releases cfgMu before
         // `UpdateModelCatalogSources`, so readers never wait on a catalog publish.
         let commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
-        let previous = {
-            let mut current = self.config.write().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *current, config.clone())
-        };
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         // Go `UpdateModelCatalogSources`; the reads stay async.
         if let Some(catalogs) = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             catalogs.configure(&config, false);
         }
         drop(commit);
-        // Go's websocket auth change handler: turning ws-auth on ends the relay sessions
-        // that connected without a key.
-        if ws_auth && !crate::relay::ws_auth(&previous) {
-            self.executors.google.aistudio.relay.stop();
-        }
         self.publish_policy(policy);
         self.store.configure_cooldown_store(dir);
         self.config_changed.send_replace(());
@@ -324,8 +309,6 @@ impl Runtime {
         }
         let snapshot = self.store.snapshot();
         let registry = Arc::new(Registry::build(&config, &snapshot));
-        let credentials: Vec<_> = snapshot.iter().map(|c| self.for_executor(c)).collect();
-        self.executors.models_registered(&credentials, &config);
         *cache = Some((config, generation, registry.clone()));
         registry
     }
@@ -391,41 +374,6 @@ impl Runtime {
             }
         }
         Ok(lease)
-    }
-
-    /// A lease on credential `id` outside selection, prepared like [`Self::acquire`]
-    /// (Go's credits fallback, `findAllAntigravityCreditsCandidateAuths` then
-    /// `prepareRequestAuth`). `None` when the credential is gone or preparation fails;
-    /// Go records no result for either.
-    pub(crate) async fn lease_credential(
-        &self,
-        id: &str,
-        selection: Selection,
-        cfg: &Config,
-        prepare: impl FnOnce(&Credential) -> Credential,
-    ) -> Option<Lease> {
-        let mut credential = self.store.get(id).filter(|c| !self.store.tokens_rejected(c))?;
-        if self.executors.readiness(&credential, cfg) == Readiness::PrepareNow {
-            credential = self.prepare_credential(id, cfg, None).await.ok()?;
-        }
-        // Outside selection: the lease answers no bounded window or probe reservation.
-        let (picked, seq) = {
-            let mut scheduler = self.store.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            (scheduler.outside_selection_generation(), scheduler.dispatch())
-        };
-        Some(Lease {
-            store: self.store.clone(),
-            credential: Arc::new(prepare(&credential)),
-            execution_model: selection.model.clone(),
-            selection,
-            attempt: self.store.attempts.fetch_add(1, Ordering::Relaxed),
-            policy: self.policy(),
-            reported: false,
-            picked,
-            seq,
-            remote: None,
-            lcp: None,
-        })
     }
 
     /// The installed remote dispatcher (Go Home mode), if any.
@@ -3732,26 +3680,6 @@ impl Stream for Completing {
     }
 }
 
-/// Go `configuredSignatureCacheEnabled` / `configuredSignatureBypassStrict`
-/// (internal/api/server_reload.go): `oauth.providers.antigravity.signature-cache-enabled`
-/// (default true) and `.signature-bypass-strict` (default false), legacy
-/// `antigravity-signature-*` spellings included. Applied on every publish, as Go
-/// applies them at startup and on each reload.
-fn signature_cache_config(cfg: &Config) -> (bool, bool) {
-    let flag = |key: &str| {
-        cfg.document
-            .get("oauth")
-            .and_then(|o| o.get("providers"))
-            .and_then(|p| p.get("antigravity"))
-            .and_then(|a| a.get(key))
-            .and_then(serde_yaml_ng::Value::as_bool)
-    };
-    (
-        flag("signature-cache-enabled").unwrap_or(true),
-        flag("signature-bypass-strict").unwrap_or(false),
-    )
-}
-
 /// Credentials the background refresh considers: enabled auth files, never API-key
 /// kinds (Go `nextRefreshCheckAt` skips `AuthKind() == apikey` for every provider).
 /// The access token requests send (Go `authAccessToken`): a Sign in with ChatGPT
@@ -3923,24 +3851,6 @@ pub(crate) mod tests {
         assert!(kinds.contains("apikey") && kinds.contains("oauth"), "{kinds:?}");
     }
 
-    #[test]
-    fn signature_cache_config_reads_v8_and_legacy_keys() {
-        let at = |yaml: &str| signature_cache_config(&Config::parse(yaml).unwrap());
-        assert_eq!(at("{}\n"), (true, false));
-        assert_eq!(
-            at("antigravity-signature-cache-enabled: false\nantigravity-signature-bypass-strict: true\n"),
-            (false, true)
-        );
-        assert_eq!(
-            at("oauth: {providers: {antigravity: {signature-cache-enabled: false, signature-bypass-strict: true}}}\n"),
-            (false, true)
-        );
-        assert_eq!(
-            at("oauth: {providers: {antigravity: {signature-cache-enabled: null}}}\n"),
-            (true, false)
-        );
-    }
-
     fn cred(id: &str, provider: &str, disabled: bool) -> Credential {
         let mut metadata = Map::new();
         metadata.insert("type".into(), provider.into());
@@ -3989,9 +3899,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         );
         let with = |prefix: &str, disabled: bool| {
@@ -4709,9 +4618,8 @@ pub(crate) mod tests {
     }
 
     /// Go 35af74f9 (TestManager_Issue6643_InFlightSuccessesKeepFreshQuotaCooldown):
-    /// successes of requests dispatched before a 429 was recorded, whether picked by
-    /// selection or by the credits fallback outside it, leave the cooldown; a lease
-    /// dispatched again after it (a refresh-and-retry) clears it.
+    /// successes of requests dispatched before a 429 was recorded leave the cooldown; a
+    /// lease dispatched again after it (a refresh-and-retry) clears it.
     #[tokio::test]
     async fn successes_dispatched_before_a_cooldown_keep_it() {
         let rt = Arc::new(crate::testing::runtime(
@@ -4720,18 +4628,12 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let selection = Selection::new("claude", "m");
-        let cfg = rt.config();
         let in_flight = rt.store.select(selection.clone()).unwrap();
-        let credits = rt
-            .lease_credential("a.json", selection.clone(), &cfg, Credential::clone)
-            .await
-            .unwrap();
         let mut retried = rt.store.select(selection.clone()).unwrap();
         let mut quota = ExecError::local(429, FailureScope::Model, "rate limited");
         quota.retry_after = Some(Duration::from_secs(3600));
@@ -4742,11 +4644,6 @@ pub(crate) mod tests {
         assert!(rt.store.select(selection.clone()).is_none(), "cooling");
         in_flight.complete(Outcome::Success);
         assert!(rt.store.select(selection.clone()).is_none(), "a stale success keeps it");
-        credits.complete(Outcome::Success);
-        assert!(
-            rt.store.select(selection.clone()).is_none(),
-            "a stale credits success keeps it"
-        );
         retried.redispatch();
         retried.complete(Outcome::Success);
         assert!(rt.store.select(selection).is_some(), "a later dispatch clears it");
@@ -4793,9 +4690,8 @@ pub(crate) mod tests {
         let executors = || Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         // Legacy top-level keys and the canonical routing block both reach the scheduler.
         let rt = crate::testing::runtime(
@@ -4825,9 +4721,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         );
         let offsets: Vec<usize> = (0..4).map(|_| rt.next_pool_offset("a|openai|m", 3)).collect();
@@ -4958,9 +4853,8 @@ pub(crate) mod tests {
         let executors = || Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-            devices: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = crate::testing::runtime(config(), creds(), executors());
         let mut selection = Selection::new("claude", "m1");
@@ -5071,9 +4965,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let lock = rt.store.prepare_lock("a.json");
@@ -5144,9 +5037,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let refresh = tokio::spawn({
@@ -5265,9 +5157,8 @@ pub(crate) mod tests {
                 Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             let refresh = tokio::spawn({
@@ -5405,9 +5296,8 @@ pub(crate) mod tests {
                 Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ))
         }
@@ -6395,9 +6285,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.start_auto_refresh();
@@ -6793,9 +6682,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let logs = Logs::default();
@@ -6950,9 +6838,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         (rt, dir, calls)
@@ -6999,10 +6886,8 @@ pub(crate) mod tests {
         // A refresh that starts after the rejection refuses too.
         assert_eq!(rt.prepare_credential(&id, &cfg, None).await.unwrap_err().status, 401);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // The background loop leaves it alone too, and so does the credits fallback.
+        // The background loop leaves it alone too.
         assert!(rt.store.rejected_ids(&rt.store.snapshot()).contains(&id));
-        let lease = rt.lease_credential(&id, claude(), &cfg, |c| c.clone()).await;
-        assert!(lease.is_none(), "the credits fallback leased a refused credential");
         // Deleted, then imported again with the same tokens: a new credential.
         let reload = |rt: &Runtime| {
             rt.store.reconcile(
@@ -7276,9 +7161,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         (rt, dir)
@@ -7448,9 +7332,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.start_auto_refresh();

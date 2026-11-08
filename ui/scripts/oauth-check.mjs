@@ -2,9 +2,8 @@
 //
 // --mode fake: the server's login endpoints point at scripts/fake-logins.mjs (the
 //   login-harness build of cliproxy-rs). Claude and Codex finish through a pasted callback
-//   URL, Devin through a pasted callback to the server's /callback, Kimi, Meta and xAI
-//   through the device-code flow; each new credential must appear in the
-//   list. Providers the server lacks must turn into an honest "not available" message.
+//   URL, Meta and xAI through the device-code flow; each new credential must appear in
+//   the list.
 // --mode dead: the shipped binary with requests.proxy-url on a dead port. A pasted callback
 //   must end in an honest failure, never "Connected". No request reaches a provider.
 //
@@ -68,38 +67,19 @@ try {
       await page.screenshot({ path: `${out}/oauth-${provider.toLowerCase()}-connected.png` });
       pass(`${provider}: authorize link, pasted callback, code exchange, credential saved (${email})`);
     }
-    // Devin redirects to the server's own /callback route; the pasted URL carries it there.
-    {
-      const { state } = await begin("Devin");
-      assert.ok(state, "Devin: provider link carries a state");
-      await paste(`${new URL(url).origin}/callback?code=fake-devin-code&state=${state}`);
-      await main.getByText("Connected", { exact: true }).waitFor({ timeout: 20_000 });
-      await noProgressToast("Devin connected");
-      pass("Devin: authorize link, pasted callback to the server's /callback, code exchange, credential saved");
-    }
-    for (const [provider, code] of [["Kimi", "KIMI-FAKE"], ["Meta", "META-FAKE"], ["xAI", "XAI-FAKE"]]) {
+    for (const [provider, code] of [["Meta", "META-FAKE"], ["xAI", "XAI-FAKE"]]) {
       await button(provider).click();
       await main.getByText(code).waitFor();
-      if (provider === "Kimi") await page.screenshot({ path: `${out}/oauth-kimi-device-code.png` });
+      if (provider === "Meta") await page.screenshot({ path: `${out}/oauth-meta-device-code.png` });
       await main.getByText("Connected", { exact: true }).waitFor({ timeout: 30_000 });
       pass(`${provider}: device code ${code} shown, polled to completion`);
     }
     await page.evaluate(() => (location.hash = "#accounts"));
     for (const email of ["claude-login@example.invalid", "codex-login@example.invalid", "meta-login@example.invalid", "xai-login@example.invalid"])
       await main.getByText(email).first().waitFor({ timeout: 15_000 });
-    const groups = await main.locator(".group").allTextContents();
-    for (const g of ["Kimi", "Devin"]) assert.ok(groups.some((t) => t.startsWith(g)), `${g} group listed`);
     await page.screenshot({ path: `${out}/oauth-credentials-after.png`, fullPage: true });
-    pass("all six new credentials are listed on Accounts");
+    pass("all four new credentials are listed on Accounts");
 
-    // A built-in provider this server lacks: honest message, button disabled afterwards.
-    await page.evaluate(() => (location.hash = "#connect"));
-    await button("Antigravity").click();
-    const toast = await page.locator(".toast", { hasText: /Antigravity|ok/ }).or(main.getByText("Waiting for approval")).first().textContent();
-    if (toast.includes("not available")) {
-      assert.equal(await button("Antigravity").isDisabled(), true);
-      pass(`unimplemented provider: "${toast.trim()}" and the button is disabled`);
-    } else pass(`Antigravity sign-in is implemented here (${toast.trim()})`);
   } else {
     const { state } = await begin("Codex");
     await paste(`http://localhost:1455/auth/callback?code=fake-code&state=${state}`);

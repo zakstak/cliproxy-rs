@@ -1,7 +1,8 @@
 //! Management-started logins (Go auth_files_provider_oauth.go, oauth_sessions.go,
 //! oauth_callback.go, auth_files_oauth_callback.go, auth_files_v8.go):
 //! `GET /oauth/auth-url`, `GET /oauth/status`, `DELETE /oauth/session`,
-//! `GET|POST /oauth/callback` and `POST /oauth/import` (vertex_import.go).
+//! `GET|POST /oauth/callback` and `POST /oauth/import`, which answers only the removed
+//! Vertex import's migration error (issue #49).
 //!
 //! Go hands callbacks to the waiting login through `.oauth-<provider>-<state>.oauth`
 //! files in auth-dir; cliproxy-rs keeps the callback with the pending session in
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use cpa_core::exec::ExecError;
 use cpa_exec::proxy::Proxy;
 use futures_util::FutureExt;
@@ -286,9 +287,7 @@ pub(super) fn normalize_callback_provider(provider: &str) -> Option<String> {
     let builtin = match p.as_str() {
         "anthropic" | "claude" => Some("anthropic"),
         "codex" | "openai" => Some("codex"),
-        "antigravity" | "anti-gravity" => Some("antigravity"),
         "xai" | "x-ai" | "x.ai" | "grok" => Some("xai"),
-        "devin" | "cognition" => Some("devin"),
         "meta" | "muse" => Some("meta"),
         _ => None,
     };
@@ -371,6 +370,17 @@ pub(super) fn install_callback_sink(state: &Arc<Management>) {
         })));
 }
 
+/// 410 Gone with the migration guidance for an operation on a removed provider.
+pub(super) fn removed(provider: &str, operation: &str) -> Response {
+    respond(
+        StatusCode::GONE,
+        &json!({
+            "code": "removed_provider",
+            "error": cpa_core::removed::operation_error(provider, operation),
+        }),
+    )
+}
+
 fn status_error(status: StatusCode, message: &str) -> Response {
     respond(status, &json!({"status": "error", "error": message}))
 }
@@ -420,22 +430,11 @@ pub(crate) async fn auth_url(State(state): State<Arc<Management>>, RawQuery(raw)
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
         "claude" => start_claude(state, webui).await,
         "codex" => start_codex(state, webui).await,
-        "antigravity" => start_antigravity(state, webui).await,
-        "kimi" => {
-            // Go `RequestKimiToken`: `domain`, else `channel`, else kimi.com.
-            let domain = [q.first("domain"), q.first("channel")]
-                .into_iter()
-                .map(str::trim)
-                .find(|v| !v.is_empty())
-                .unwrap_or(cpa_exec::kimi_auth::DOMAIN_COM)
-                .to_owned();
-            start_kimi(state, domain).await
-        }
-        "kimi-ai" => start_kimi(state, cpa_exec::kimi_auth::DOMAIN_AI.to_owned()).await,
         "meta" => start_meta(state).await,
         "xai" => start_xai(state).await,
-        "devin" => start_devin(state).await,
-        // Go `ServePluginAuthURL` would try a plugin auth provider's login here.
+        // Go `ServePluginAuthURL` would try a plugin auth provider's login here. A
+        // removed provider gets its migration error (issue #49).
+        provider if cpa_core::removed::provider(provider).is_some() => removed(provider, "Login"),
         _ => fail(StatusCode::NOT_FOUND, "provider_not_found"),
     }
 }
@@ -450,95 +449,11 @@ pub(crate) async fn import(
     let query = Query::parse(raw);
     match query.first("provider").trim().go_lower().as_str() {
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
-        "vertex" => import_vertex(state, &query, &headers, read).await,
-        _ => fail(StatusCode::NOT_FOUND, "provider_not_found"),
-    }
-}
-
-/// Go `ImportVertexCredential`: a service-account key uploaded as the `file` form field;
-/// `location` from the form, else the query.
-async fn import_vertex(
-    state: Arc<Management>,
-    query: &Query,
-    headers: &HeaderMap,
-    read: crate::body_limit::Read,
-) -> Response {
-    use super::multipart::Failed;
-    use cpa_exec::vertex_auth::{UploadError, import_upload};
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    // Go `FormFile("file")`: any form error reads as a missing file, with the limit's
-    // status for the limit error.
-    let body = match super::multipart::body(read, content_type) {
-        Ok(body) => body,
-        Err(Failed::Read(rejection)) => return rejection.into_response(),
-        Err(Failed::Form(status, _)) => {
-            return fail(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-                "file required",
-            );
+        provider if cpa_core::removed::provider(provider).is_some() => {
+            let _ = (state, headers, read);
+            removed(provider, "Credential import")
         }
-    };
-    let Ok((mut files, values)) = super::multipart::form(content_type, &body) else {
-        return fail(StatusCode::BAD_REQUEST, "file required");
-    };
-    let Some(file) = files.remove("file").and_then(|parts| parts.into_iter().next()) else {
-        return fail(StatusCode::BAD_REQUEST, "file required");
-    };
-    let mut location = values
-        .get("location")
-        .and_then(|v| v.first())
-        .map(|v| v.trim().to_owned())
-        .unwrap_or_default();
-    if location.is_empty() {
-        location = query.first("location").trim().to_owned();
-    }
-    let auth_dir = state.rt.config().auth_dir.clone();
-    let saved = tokio::task::spawn_blocking(move || {
-        // Under `disk` from the read of an existing file to the write, so a concurrent
-        // management edit (for example `disabled`) is neither lost nor overwritten.
-        let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        let upload = import_upload(&auth_dir, &file.data, &location)?;
-        // Go `saveTokenRecord`: success only once the token store has the file.
-        let mut written = Ok(());
-        let stored = state.store_write(Box::new(|| {
-            written = upload.write();
-            written.as_ref().map_err(|_| anyhow::anyhow!("write failed"))?;
-            Ok(Some(upload.path.clone()))
-        }));
-        written?;
-        stored.map_err(UploadError::Save)?;
-        state.publish((*state.rt.config()).clone(), None);
-        Ok(upload)
-    })
-    .await;
-    let message = |error: &str, message: String| {
-        reply(
-            StatusCode::BAD_REQUEST,
-            [("error", Value::from(error)), ("message", Value::from(message))],
-        )
-    };
-    match saved {
-        Ok(Ok(upload)) => reply(
-            StatusCode::OK,
-            [
-                ("status", "ok".into()),
-                ("auth-file", upload.path.to_string_lossy().into_owned().into()),
-                ("project_id", upload.project.into()),
-                ("email", upload.email.into()),
-                ("location", upload.location.into()),
-            ],
-        ),
-        Ok(Err(UploadError::InvalidJson(e))) => message("invalid json", e),
-        Ok(Err(UploadError::InvalidServiceAccount(e))) => message("invalid service account", e),
-        Ok(Err(UploadError::ProjectMissing)) => fail(StatusCode::BAD_REQUEST, "project_id missing"),
-        Ok(Err(UploadError::Save(e))) => reply(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [("error", Value::from("save_failed")), ("message", Value::from(e))],
-        ),
-        Err(_) => fail(StatusCode::INTERNAL_SERVER_ERROR, "save_failed"),
+        _ => fail(StatusCode::NOT_FOUND, "provider_not_found"),
     }
 }
 
@@ -828,85 +743,6 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     started(url, sid)
 }
 
-/// Go `RequestAntigravityToken`: reuse the CLI exchange and storage, but unlike
-/// `CompleteAntigravityOAuth`, a project discovery failure does not fail the login.
-async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
-    use cpa_exec::antigravity_auth::{DEFAULT_CALLBACK_PORT, OAuth, auth_url, build_auth, redirect_uri, write_login};
-    let Some(sid) = random_state() else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
-    };
-    let redirect = redirect_uri(DEFAULT_CALLBACK_PORT);
-    let url = auth_url(&sid, &redirect);
-    state.oauth.register(&sid, "antigravity");
-    let forwarder = if webui {
-        match start_forwarder(&state, DEFAULT_CALLBACK_PORT, "/antigravity/callback").await {
-            Ok(id) => Some(id),
-            Err(message) => return fail(StatusCode::INTERNAL_SERVER_ERROR, message),
-        }
-    } else {
-        None
-    };
-    let worker = state.clone();
-    let flow = sid.clone();
-    let forwarder = forwarder.map(|id| (DEFAULT_CALLBACK_PORT, id));
-    spawn_login(&state, &sid, "antigravity", forwarder, async move {
-        if let Some(cb) = next_callback(&worker, &flow, "antigravity").await {
-            let outcome = async {
-                if !cb.error.is_empty() {
-                    return Outcome::Failed("Authentication failed".into());
-                }
-                if !cb.state.is_empty() && cb.state != flow {
-                    return Outcome::Failed("Authentication failed: state mismatch".into());
-                }
-                if cb.code.is_empty() {
-                    return Outcome::Failed("Authentication failed: code not found".into());
-                }
-                let client = login_client(&worker);
-                let oauth = match &worker.login_base {
-                    Some(base) => OAuth::with_endpoints(
-                        client,
-                        &format!("{base}/token"),
-                        &format!("{base}/oauth2/v2/userinfo?alt=json"),
-                        base,
-                        base,
-                    ),
-                    None => OAuth::new(client),
-                };
-                let tokens = match oauth.exchange_code(&cb.code, &redirect).await {
-                    Ok(tokens) if !tokens.access_token.trim().is_empty() => tokens,
-                    _ => return Outcome::Failed("Failed to exchange token".into()),
-                };
-                let access = tokens.access_token.trim();
-                let email = match oauth.user_info(access).await {
-                    Ok(email) if !email.trim().is_empty() => email,
-                    _ => return Outcome::Failed("Failed to fetch user info".into()),
-                };
-                let project = oauth.project_id(access).await.unwrap_or_else(|_| {
-                    // Upstream bodies can contain credentials; do not log the cause.
-                    tracing::warn!("antigravity: failed to fetch project ID during management login");
-                    String::new()
-                });
-                let record = build_auth(&tokens, &email, &project, chrono::Utc::now());
-                let write = |dir: PathBuf, (name, metadata): (String, serde_json::Map<String, Value>)| {
-                    write_login(&dir, &name, &metadata)
-                };
-                save_if_pending(
-                    &worker,
-                    &flow,
-                    "antigravity",
-                    record,
-                    write,
-                    "Failed to save token to file",
-                )
-                .await
-            }
-            .await;
-            settle(&worker, &flow, outcome).await;
-        }
-    });
-    started(url, sid)
-}
-
 /// Go's callback wait: every 500 ms for up to five minutes, until the callback
 /// arrives, the session stops being pending, or the deadline passes (recorded as the
 /// session's error).
@@ -917,12 +753,7 @@ async fn next_callback(state: &Management, sid: &str, provider: &str) -> Option<
             return None;
         }
         if Instant::now() > deadline {
-            let message = if provider == "antigravity" {
-                "OAuth flow timed out"
-            } else {
-                "Timeout waiting for OAuth callback"
-            };
-            state.oauth.set_error(sid, message);
+            state.oauth.set_error(sid, "Timeout waiting for OAuth callback");
             return None;
         }
         if let Some(cb) = state.oauth.take_callback(sid) {
@@ -945,85 +776,6 @@ async fn wait_for_callback(state: &Management, sid: &str, provider: &str, bad_re
         return None;
     }
     Some(cb.code)
-}
-
-/// Go `RequestDevinToken`: PKCE login whose callback reaches the main listener's
-/// `/callback` (Devin only accepts `http://127.0.0.1:<port>/callback`).
-async fn start_devin(state: Arc<Management>) -> Response {
-    use cpa_exec::devin_auth::{DevinAuth, generate_pkce, save_record};
-    let port = state.rt.config().port;
-    if port == 0 {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "callback server unavailable");
-    }
-    let redirect = format!("http://127.0.0.1:{port}/callback");
-    let Ok(pkce) = generate_pkce() else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate PKCE codes");
-    };
-    let Some(sid) = random_state() else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
-    };
-    let mut auth = DevinAuth::new(login_client(&state));
-    if let Some(base) = &state.login_base {
-        auth = auth.with_app_base(base).with_api_base(base).with_server_base(base);
-    }
-    let url = auth.build_authorization_url(&redirect, &pkce.challenge, &sid);
-    state.oauth.register(&sid, "devin");
-    let worker = state.clone();
-    let flow = sid.clone();
-    spawn_login(&state, &sid, "devin", None, async move {
-        // Go runs the whole flow under one five-minute context.
-        let deadline = tokio::time::Instant::now() + CALLBACK_WAIT;
-        let Some(cb) = next_callback(&worker, &flow, "devin").await else {
-            return;
-        };
-        let fail = |message: &str| {
-            if worker.oauth.is_pending(&flow, "devin") {
-                fail_session(&worker, &flow, message);
-            }
-        };
-        if cb.state != flow {
-            return fail("State code error");
-        }
-        if !cb.error.is_empty() {
-            return fail("Devin authorization denied");
-        }
-        if cb.code.trim().is_empty() {
-            return fail("Missing authorization code");
-        }
-        // Upstream errors can carry tokens or codes: only Go's fixed messages surface.
-        let exchanged = tokio::select! {
-            r = auth.exchange_code(&cb.code, &pkce.verifier) => r.ok(),
-            () = tokio::time::sleep_until(deadline) => None,
-            () = cancelled(&worker, &flow, "devin") => return,
-        };
-        let token = match exchanged {
-            Some(token) if !token.trim().is_empty() => token,
-            _ => return fail("Failed to exchange authorization code for tokens"),
-        };
-        if !worker.oauth.is_pending(&flow, "devin") {
-            return;
-        }
-        let created = tokio::select! {
-            r = auth.create_auth_record(&token) => r.ok(),
-            () = tokio::time::sleep_until(deadline) => None,
-            () = cancelled(&worker, &flow, "devin") => return,
-        };
-        let Some(record) = created else {
-            return fail("Failed to create Devin authentication record");
-        };
-        let write = |dir: PathBuf, record| save_record(&dir, &record);
-        let outcome = save_if_pending(
-            &worker,
-            &flow,
-            "devin",
-            record,
-            write,
-            "Failed to save authentication tokens",
-        )
-        .await;
-        settle(&worker, &flow, outcome).await;
-    });
-    started(url, sid)
 }
 
 /// Go `watchOAuthSessionCancel`: resolves once the session stops being pending.
@@ -1051,73 +803,6 @@ fn device_started(url: String, sid: String, user_code: &str, expires_in: Option<
         out.push(("expires_in", e.into()));
     }
     reply(StatusCode::OK, out)
-}
-
-/// Go `requestKimiTokenWithDomain`.
-async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
-    use cpa_exec::kimi_auth::{DeviceFlow, is_ai_domain, login_record, write_login};
-    let (provider, prefix) = if is_ai_domain(&domain) {
-        ("kimi-ai", "kmi-ai")
-    } else {
-        ("kimi", "kmi")
-    };
-    let sid = format!("{prefix}-{}", unix_nanos());
-    let mut flow = DeviceFlow::new(login_client(&state), &domain, "");
-    if let Some(base) = &state.login_base {
-        flow = flow.with_oauth_host(base);
-    }
-    let Ok(code) = flow.request_device_code().await else {
-        return fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to generate authorization url",
-        );
-    };
-    let url = if code.verification_uri_complete.is_empty() {
-        code.verification_uri.clone()
-    } else {
-        code.verification_uri_complete.clone()
-    };
-    state.oauth.register(&sid, provider);
-    let response = device_started(
-        url,
-        sid.clone(),
-        &code.user_code,
-        (code.expires_in > 0).then_some(code.expires_in),
-    );
-    let worker = state.clone();
-    let flow_sid = sid.clone();
-    spawn_login(&state, &flow_sid, provider, None, async move {
-        let polled = tokio::select! {
-            t = flow.poll(&code) => t,
-            () = cancelled(&worker, &sid, provider) => return,
-        };
-        let outcome = match polled {
-            Ok(tokens) => {
-                let mut record = login_record(
-                    provider,
-                    &tokens,
-                    flow.device_id(),
-                    chrono::Utc::now().timestamp_millis(),
-                );
-                // Go records the requested domain as given.
-                record.metadata.insert("domain".into(), domain.clone().into());
-                let write = |dir: PathBuf, record| write_login(&dir, &record).map_err(|e| exec_text(&e));
-                save_if_pending(
-                    &worker,
-                    &sid,
-                    provider,
-                    record,
-                    write,
-                    "Failed to save authentication tokens",
-                )
-                .await
-            }
-            Err(_) if !worker.oauth.is_pending(&sid, provider) => Outcome::Cancelled,
-            Err(e) => Outcome::Failed(with_cause("Authentication failed", &exec_text(&e))),
-        };
-        settle(&worker, &sid, outcome).await;
-    });
-    response
 }
 
 /// Go `RequestMetaToken`.

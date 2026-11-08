@@ -70,6 +70,7 @@ pub(crate) fn builder(hosts: &[String]) -> (Vec<u8>, btls::ssl::SslAcceptorBuild
 /// A local TLS upstream for `host` that counts the TCP connections it accepts and answers
 /// every request `200 ok`: over HTTP/2 when `alpn` selects `h2`, otherwise over HTTP/1.1
 /// with keep-alive. Returns (CA PEM, address, accepted connections).
+#[cfg(test)]
 pub(crate) async fn counting_upstream(
     host: &str,
     alpn: &'static [u8],
@@ -115,6 +116,7 @@ pub(crate) async fn counting_upstream(
 
 /// HTTP/1.1 keep-alive: every request (any body announced by Content-Length is read)
 /// gets `200 ok` on the same connection until the client closes it.
+#[cfg(test)]
 async fn serve_h1<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut io: S) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::new();

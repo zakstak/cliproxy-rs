@@ -3,17 +3,14 @@
 [![CI](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/vayungodara/cliproxy-rs/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/vayungodara/cliproxy-rs)](https://github.com/vayungodara/cliproxy-rs/stargazers)
 
-Use DeepSeek, GLM, Kimi, OpenRouter and more in Codex CLI and Claude Code: one local endpoint, API translation, failover. Single Rust binary, CLIProxyAPI-compatible.
+Use your Claude, Codex (ChatGPT), Grok and Muse accounts and API keys from Claude Code, Codex CLI and other OpenAI or Anthropic clients: one local endpoint, API translation, failover. Single Rust binary, CLIProxyAPI-compatible for the providers it keeps.
 
-- **API translation.** Codex CLI sends Responses requests, and the proxy sends Chat Completions to providers that only offer those, tool calls included. Claude Code's Messages requests are translated to the selected provider's format the same way.
+- **Four upstreams.** Claude, Codex, Grok (xAI) and Muse (Meta), by account sign-in or API key. Kimi, Devin, Gemini, Vertex AI, AI Studio, Antigravity and generic OpenAI-compatible upstreams were removed from this fork; [Removed providers](docs/DIFFERENCES-FROM-GO.md#removed-providers) lists what that changes.
+- **API translation.** Anthropic Messages, OpenAI Chat Completions and OpenAI Responses clients reach every upstream, tool calls and streaming included.
 - **Several keys and providers behind one model name.** By default, a 429 cools that key for the model and the request moves to another ready key or provider with the same alias.
 - **One binary with the dashboard built in.** It reads CLIProxyAPI's `config.yaml` and credential files. Parity with CLIProxyAPI v8.0.35 is partial; [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) has the counts.
 
 This fork ([zakstak/cliproxy-rs](https://github.com/zakstak/cliproxy-rs)) runs on Linux only, natively or in the Linux container, and uses local builds without release publishing or package distribution. Build it from source on Linux, or build and run the container on any host; see [Quick start](#quick-start).
-
-<p align="center">
-  <a href="docs/INSTALL.md"><img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/hero.gif" alt="cliproxy-rs on 127.0.0.1:8317 translates a Codex CLI Responses request to Chat Completions for DeepSeek and moves it to a second key when the first answers 429. Claude Code's Messages requests reach GLM the same way. Kimi and OpenRouter are the other providers shown." width="880"></a>
-</p>
 
 0.4.0 changes how some configs load. Read [Before you upgrade](https://github.com/vayungodara/cliproxy-rs/releases/tag/v0.4.0#:~:text=Before%20you%20upgrade) in the [release notes](https://github.com/vayungodara/cliproxy-rs/releases/tag/v0.4.0) first.
 
@@ -38,13 +35,6 @@ To upgrade, pull and rebuild; the config and credentials stay where they are. [I
 ## What is this?
 
 cliproxy-rs is a Rust rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It reads the same `config.yaml` and credential formats and implements the client routes and v8 Management API. The dashboard shows provider keys and their traffic, request history and tool settings.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/overview-dark.png">
-    <img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/overview-light.png" alt="The dashboard's Provider keys page with demo data: DeepSeek, GLM, Kimi and OpenRouter API keys and their requests over the last 200 minutes. Red dots mark the 429s from one DeepSeek key; the second key took those requests." width="880">
-  </picture>
-</p>
 
 The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,140 covered, 794 partial and 17 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
 
@@ -73,53 +63,28 @@ Where the others are stronger:
 
 ## Use it with your tools
 
-The local OpenAI base URL is `http://127.0.0.1:8317/v1`. Claude Code and Gemini clients use `http://127.0.0.1:8317` without `/v1`. Use your installation's port and client key.
+The local OpenAI base URL is `http://127.0.0.1:8317/v1`. Claude Code uses `http://127.0.0.1:8317` without `/v1`. Use your installation's port and client key.
 
 [CLIENTS.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/CLIENTS.md) has client settings, including [GPT in Claude Code](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/CLIENTS.md#gpt-in-claude-code). Not every model and tool combination has been tested.
 
-## API keys: Codex CLI and mixed providers
+## API keys
 
-Codex CLI only speaks the Responses API now. A provider entry with `wire_api = "chat"` stops Codex with "`wire_api = "chat"` is no longer supported".
-
-If you only use one provider and it serves the Responses API, Codex can talk to it directly. DeepSeek's API, Z.ai's GLM Coding Plan and Kimi Code do, and each publishes its own Codex setup: [DeepSeek](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/), [GLM Coding Plan](https://docs.z.ai/devpack/tool/codex), [Kimi Code](https://www.kimi.com/code/docs/en/third-party-tools/codex.html).
-
-The proxy is for the rest: an endpoint that only offers Chat Completions, such as OpenCode Go's models, or several providers and keys behind one endpoint, with failover when one returns 429. It accepts Responses requests from Codex and sends Chat Completions upstream, tool calls included.
-
-You do not need a subscription login. Merge this provider block into `~/.cliproxy-rs/config.yaml`, or the `config.yaml` in your container's `/data` volume. Keep `access.api-keys`, `management.secret-key` and the rest of your config. The proxy reloads the configuration on save. The upstream keys below are separate from your proxy's client key. Replace the key and upstream model placeholders with values from each provider.
+Provider API keys go under `api-keys` in `config.yaml`, grouped by provider: `claude`, `codex`, `xai` and `meta`. Keep `access.api-keys`, `management.secret-key` and the rest of your config; the proxy reloads the configuration on save. The upstream keys are separate from your proxy's client key.
 
 ```yaml
 api-keys:
-  openai-compatibility:
-    - name: deepseek
-      base-url: "https://api.deepseek.com"
+  claude:
+    - keys:
+        - api-key: "<anthropic-api-key>"
+  xai:
+    - base-url: "https://api.x.ai/v1"
       keys:
-        - api-key: "<deepseek-api-key>"
-      models:
-        - name: "<deepseek-model-id>"
-          alias: "deepseek"
-    - name: openrouter
-      base-url: "https://openrouter.ai/api/v1"
-      keys:
-        - api-key: "<openrouter-api-key>"
-      models:
-        - name: "<openrouter-model-id>"
-          alias: "router"
+        - api-key: "<xai-api-key>"
 ```
 
-Use the same structure for any of these metered APIs. The base URL excludes `/chat/completions`; the proxy adds it.
-
-| Provider | Base URL | Model IDs and API access |
-| --- | --- | --- |
-| DeepSeek | `https://api.deepseek.com` | [DeepSeek API docs](https://api-docs.deepseek.com/) |
-| GLM (Z.ai) | `https://api.z.ai/api/paas/v4` | [Z.ai API docs](https://docs.z.ai/api-reference/introduction) |
-| Kimi (Moonshot) | `https://api.moonshot.ai/v1` | [Moonshot API docs](https://platform.moonshot.ai/docs) |
-| OpenRouter | `https://openrouter.ai/api/v1` | [OpenRouter API docs](https://openrouter.ai/docs/quickstart) |
-| OpenCode Go | `https://opencode.ai/zen/go/v1` | [OpenCode Go docs](https://opencode.ai/docs/go/); use its Chat Completions models, and add `headers: {x-opencode-session: $CPA-SESSION-ID}` to the entry, which sends each conversation's session ID; OpenCode Go rejects requests without one |
-
-Put this in `~/.codex/config.toml`:
+Put this in `~/.codex/config.toml` to use the proxy from Codex CLI:
 
 ```toml
-model = "deepseek"
 model_provider = "cliproxy"
 
 [model_providers.cliproxy]
@@ -129,18 +94,9 @@ env_key = "CLIPROXY_CLIENT_KEY"
 wire_api = "responses"
 ```
 
-```sh
-export CLIPROXY_CLIENT_KEY=your-client-key
-codex
-```
+For failover, add another key to a provider's `keys` list or connect several accounts. By default, a 429 cools that credential for the failing model, and the proxy tries another eligible credential, within the configured attempt limits and error rules. [MULTI-ACCOUNT.md](docs/MULTI-ACCOUNT.md#cooldowns-and-limits) explains retries when none are ready.
 
-Use the port and `CLIPROXY_CLIENT_KEY` from your installation's `keys.env`. Codex CLI sends Responses requests to the proxy; the proxy translates them to Chat Completions for these upstreams. Set `model = "router"` to use the second provider. Other clients can use either alias at the same endpoint, alongside any connected subscription accounts.
-
-For failover, give two provider entries the same model alias, or add another key to a provider's `keys` list. By default, a 429 cools that credential for the failing model, and the proxy tries another eligible credential for the alias, within the configured attempt limits and error rules. [MULTI-ACCOUNT.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MULTI-ACCOUNT.md#cooldowns-and-limits) explains retries when none are ready.
-
-<p align="center"><img src="https://github.com/vayungodara/cliproxy-rs/raw/master/docs/img/codex-deepseek.gif" alt="Codex CLI fixing a bug and running a check with DeepSeek V4.1 Flash through cliproxy-rs" width="880"></p>
-
-On 7 October 2026, Codex CLI 0.160 finished a task with a file edit and a shell command through cliproxy-rs 0.2.2, using DeepSeek V4.1 Flash on OpenCode Go's Chat Completions endpoint (above). The DeepSeek, GLM, Kimi and OpenRouter endpoints in the table haven't been run live.
+A config that still configures a removed provider (`openai-compatibility`, `gemini`, `vertex`, ...) does not load; the error names the setting to remove.
 
 ## Accounts and provider terms
 

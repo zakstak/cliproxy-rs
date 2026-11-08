@@ -4,30 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cpa_common::json::{self as gj, Kind, Res};
+use cpa_common::json::{self as gj, Res};
 use sha2::{Digest, Sha256};
 
 use crate::claude_responses::{qualify_namespace_name, tool_name};
 use crate::common::{sanitize_function_name, trim_space};
 
-/// util.ResponsesToolIdentity: the client-side identity behind an upstream function name.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Identity {
-    pub name: Vec<u8>,
-    pub namespace: Vec<u8>,
-    pub custom: bool,
-    /// From the winning original declaration, never from the upstream name.
-    pub apply_patch: bool,
-    /// The function shim standing in for a client-executed `tool_search` declaration.
-    pub tool_search: bool,
-}
-
 /// util.ResponsesToolSearchFunctionName: the function exposed for a client tool_search.
 pub(crate) const TOOL_SEARCH_NAME: &[u8] = b"tool_search";
-/// util.ResponsesClientToolSearchKey: the forward-map key of the client tool_search shim.
-/// The NUL byte cannot appear in a declared tool name.
-pub(crate) const CLIENT_TOOL_SEARCH_KEY: &[u8] = b"\x00client_tool_search";
-const TOOL_SEARCH_DEFAULT_PARAMETERS: &[u8] = br#"{"type":"object","properties":{"query":{"type":"string","description":"Search query for deferred tools."},"limit":{"type":"number","description":"Maximum number of tools to return."}},"required":["query"],"additionalProperties":false}"#;
 /// util.ResponsesDiscoveredToolPriority: tools loaded by a tool_search_output.
 const DISCOVERED_PRIORITY: u8 = 2;
 
@@ -42,7 +26,6 @@ pub(crate) struct Descriptor<'a> {
     pub name: Vec<u8>,
     pub local_name: Vec<u8>,
     pub namespace: Vec<u8>,
-    pub custom: bool,
     pub tool: Res<'a>,
     priority: u8,
     direct: bool,
@@ -117,7 +100,6 @@ fn descriptors_with<'a>(root: &Res<'a>, client_search: bool) -> Vec<Descriptor<'
                    name: Vec<u8>,
                    local: Vec<u8>,
                    namespace: Vec<u8>,
-                   custom: bool,
                    priority: u8,
                    direct: bool,
                    search: bool| {
@@ -129,7 +111,6 @@ fn descriptors_with<'a>(root: &Res<'a>, client_search: bool) -> Vec<Descriptor<'
             name,
             local_name: local,
             namespace,
-            custom,
             tool: tool.clone(),
             priority,
             direct,
@@ -140,18 +121,9 @@ fn descriptors_with<'a>(root: &Res<'a>, client_search: bool) -> Vec<Descriptor<'
     for (tools, priority) in sources {
         tools.each(|_, tool| {
             match trim_space(&tool.get("type").bytes()) {
-                kind @ (b"" | b"function" | b"custom") => {
+                b"" | b"function" | b"custom" => {
                     let name = tool_name(&tool);
-                    add(
-                        &tool,
-                        name.clone(),
-                        name,
-                        vec![],
-                        kind == b"custom",
-                        priority,
-                        true,
-                        false,
-                    );
+                    add(&tool, name.clone(), name, vec![], priority, true, false);
                 }
                 b"namespace" => {
                     let namespace = trim_space(&tool.get("name").bytes()).to_vec();
@@ -166,17 +138,8 @@ fn descriptors_with<'a>(root: &Res<'a>, client_search: bool) -> Vec<Descriptor<'
                                 return true;
                             }
                             let qualified = qualify_namespace_name(&namespace, &child_name);
-                            if let kind @ (b"" | b"function" | b"custom") = trim_space(&child.get("type").bytes()) {
-                                add(
-                                    &child,
-                                    qualified,
-                                    child_name,
-                                    namespace.clone(),
-                                    kind == b"custom",
-                                    priority,
-                                    false,
-                                    false,
-                                );
+                            if let b"" | b"function" | b"custom" = trim_space(&child.get("type").bytes()) {
+                                add(&child, qualified, child_name, namespace.clone(), priority, false, false);
                             }
                             true
                         });
@@ -188,7 +151,7 @@ fn descriptors_with<'a>(root: &Res<'a>, client_search: bool) -> Vec<Descriptor<'
                         && trim_space(&tool.get("execution").bytes()) == b"client" =>
                 {
                     let name = TOOL_SEARCH_NAME.to_vec();
-                    add(&tool, name.clone(), name, vec![], false, priority, true, true);
+                    add(&tool, name.clone(), name, vec![], priority, true, true);
                 }
                 _ => {}
             }
@@ -324,15 +287,6 @@ pub(crate) fn map_sanitized_function_name(map: &HashMap<Vec<u8>, Vec<u8>>, name:
     }
 }
 
-/// util.DisambiguatedToolNameMap: sanitized name -> declared name, for names that changed.
-pub(crate) fn disambiguated_tool_name_map(raw: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
-    sanitized_function_name_map(raw)
-        .into_iter()
-        .filter(|(original, sanitized)| original != sanitized)
-        .map(|(original, sanitized)| (sanitized, original))
-        .collect()
-}
-
 fn disambiguate(base: &[u8], original: &[u8], used: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
     for attempt in 0u64.. {
         let mut hasher = Sha256::new();
@@ -347,281 +301,6 @@ fn disambiguate(base: &[u8], original: &[u8], used: &HashMap<Vec<u8>, Vec<u8>>) 
         }
     }
     unreachable!("an unused suffix always exists")
-}
-
-/// util.BuildGeminiFunctionDeclarations: Gemini `functionDeclarations`, the forward map
-/// (Responses name to Gemini name) and the reverse identity map.
-pub(crate) type Declarations = (Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>, HashMap<Vec<u8>, Identity>);
-
-pub(crate) fn gemini_function_declarations(root: &Res<'_>) -> Declarations {
-    let descriptors = descriptors_with(root, true);
-    // Winners per name, kept apart for the client tool_search shim and a user tool of the
-    // same name.
-    let mut winners: HashMap<(&[u8], bool), usize> = HashMap::new();
-    for d in &descriptors {
-        let key = (d.name.as_slice(), d.client_search);
-        let better = winners.get(&key).is_none_or(|&w| {
-            let c = &descriptors[w];
-            if d.priority != c.priority {
-                d.priority < c.priority
-            } else if d.direct != c.direct {
-                d.direct
-            } else {
-                d.order < c.order
-            }
-        });
-        if better {
-            winners.insert(key, d.order);
-        }
-    }
-    let winning: Vec<&Descriptor<'_>> = descriptors
-        .iter()
-        .filter(|d| winners[&(d.name.as_slice(), d.client_search)] == d.order)
-        .collect();
-    let input = root.get("input");
-    let mut search_history = false;
-    if input.is_array() {
-        input.each(|_, item| {
-            let kind = item.get("type").bytes();
-            search_history = matches!(kind.as_ref(), b"tool_search_call" | b"tool_search_output")
-                && is_client_tool_search_item(&item);
-            !search_history
-        });
-    }
-    let mut declarations = vec![];
-    let mut forward: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut reverse: HashMap<Vec<u8>, Identity> = HashMap::new();
-    let shim = |name: &[u8]| Identity {
-        name: name.to_vec(),
-        tool_search: true,
-        ..Default::default()
-    };
-    if winning.is_empty() {
-        if search_history {
-            forward.insert(CLIENT_TOOL_SEARCH_KEY.to_vec(), TOOL_SEARCH_NAME.to_vec());
-            forward.insert(TOOL_SEARCH_NAME.to_vec(), TOOL_SEARCH_NAME.to_vec());
-            reverse.insert(TOOL_SEARCH_NAME.to_vec(), shim(TOOL_SEARCH_NAME));
-        }
-        return (declarations, forward, reverse);
-    }
-    let client_search = winning.iter().any(|d| d.client_search);
-    let names: Vec<&[u8]> = winning
-        .iter()
-        .filter(|d| !d.client_search)
-        .map(|d| d.name.as_slice())
-        .collect();
-    let user_owns_tool_search = names.contains(&TOOL_SEARCH_NAME);
-    let mut sanitized = sanitize_names(&names);
-    let mut search_name = vec![];
-    if client_search || search_history {
-        let mut used: HashMap<Vec<u8>, Vec<u8>> = sanitized
-            .iter()
-            .map(|(original, mapped)| (mapped.clone(), original.clone()))
-            .collect();
-        if user_owns_tool_search {
-            search_name = disambiguate(TOOL_SEARCH_NAME, CLIENT_TOOL_SEARCH_KEY, &used);
-        } else {
-            // Reserve "tool_search" for the shim; a tool that sanitized to it (say
-            // "tool.search") moves to a suffixed name.
-            let colliding = used.insert(TOOL_SEARCH_NAME.to_vec(), CLIENT_TOOL_SEARCH_KEY.to_vec());
-            if let Some(original) = colliding.filter(|o| o != TOOL_SEARCH_NAME) {
-                let moved = disambiguate(TOOL_SEARCH_NAME, &original, &used);
-                used.insert(moved.clone(), original.clone());
-                sanitized.insert(original, moved);
-            }
-            search_name = TOOL_SEARCH_NAME.to_vec();
-        }
-        forward.insert(CLIENT_TOOL_SEARCH_KEY.to_vec(), search_name.clone());
-        forward.insert(search_name.clone(), search_name.clone());
-        if !user_owns_tool_search {
-            forward.insert(TOOL_SEARCH_NAME.to_vec(), search_name.clone());
-        }
-        reverse.insert(search_name.clone(), shim(TOOL_SEARCH_NAME));
-    }
-    for d in &winning {
-        let gemini_name = if d.client_search {
-            search_name.clone()
-        } else {
-            match sanitized.get(&d.name) {
-                Some(mapped) if !mapped.is_empty() => mapped.clone(),
-                _ => sanitize_function_name(&d.name),
-            }
-        };
-        if !d.client_search {
-            forward.insert(d.name.clone(), gemini_name.clone());
-        }
-        forward.insert(gemini_name.clone(), gemini_name.clone());
-        let apply_patch = crate::apply_patch::is_custom_tool(&d.tool);
-        let identity = Identity {
-            name: d.local_name.clone(),
-            namespace: d.namespace.clone(),
-            custom: d.custom,
-            apply_patch,
-            tool_search: d.client_search,
-        };
-        if !d.client_search && d.name != gemini_name {
-            reverse.insert(d.name.clone(), identity.clone());
-        }
-        reverse.insert(gemini_name.clone(), identity);
-
-        let mut decl = br#"{"name":"","description":"","parametersJsonSchema":{}}"#.to_vec();
-        gj::set_str(&mut decl, "name", &gemini_name);
-        let description = tool_description(&d.tool);
-        if !description.is_empty() {
-            gj::set_str(&mut decl, "description", &description);
-        }
-        if apply_patch {
-            gj::set_str(&mut decl, "description", crate::apply_patch::description(&d.tool));
-            gj::set_raw(&mut decl, "parametersJsonSchema", crate::apply_patch::PARAMETERS);
-        } else if d.custom {
-            gj::set_raw(
-                &mut decl,
-                "parametersJsonSchema",
-                br#"{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}"#,
-            );
-        } else if d.client_search {
-            gj::set_raw(&mut decl, "parametersJsonSchema", tool_search_parameters(&d.tool));
-        } else if let Some(params) = tool_parameters(&d.tool) {
-            gj::set_raw(
-                &mut decl,
-                "parametersJsonSchema",
-                cpa_common::gemini_schema::for_gemini_json_schema(&params.raw),
-            );
-        }
-        declarations.push(decl);
-    }
-    // Local-name aliases come last, so a namespace child's local name never shadows a
-    // direct tool or the search shim.
-    for d in &winning {
-        if !d.client_search
-            && !d.local_name.is_empty()
-            && d.local_name != d.name
-            && !forward.contains_key(&d.local_name)
-        {
-            let mapped = forward[&d.name].clone();
-            forward.insert(d.local_name.clone(), mapped);
-        }
-    }
-    (declarations, forward, reverse)
-}
-
-/// buildGeminiToolSearchParametersSchema: the declared schema when it cleans to an object.
-fn tool_search_parameters(tool: &Res<'_>) -> Vec<u8> {
-    if let Some(params) = tool_parameters(tool).filter(Res::is_object) {
-        let cleaned = cpa_common::gemini_schema::for_gemini_json_schema(&params.raw);
-        if gj::valid(&cleaned) && gj::parse(&cleaned).is_object() {
-            return cleaned;
-        }
-    }
-    TOOL_SEARCH_DEFAULT_PARAMETERS.to_vec()
-}
-
-/// util.ResponsesToolReverseIdentityMap over a raw Responses request (or a `request`
-/// wrapper holding one).
-pub(crate) fn reverse_identity_map(raw: &[u8]) -> HashMap<Vec<u8>, Identity> {
-    if raw.is_empty() || !gj::valid(raw) {
-        return HashMap::new();
-    }
-    let mut root = gj::parse(raw);
-    let req = root.get("request");
-    if req.exists() && (req.get("model").exists() || req.get("input").exists() || req.get("tools").exists()) {
-        root = req;
-    }
-    gemini_function_declarations(&root).2
-}
-
-/// util.MapResponsesClientToolSearchName: the Gemini name of the client tool_search shim.
-pub(crate) fn client_tool_search_name(forward: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
-    match forward.get(CLIENT_TOOL_SEARCH_KEY) {
-        Some(mapped) if !mapped.is_empty() => mapped.clone(),
-        _ => TOOL_SEARCH_NAME.to_vec(),
-    }
-}
-
-/// util.MapResponsesToolName.
-pub(crate) fn map_tool_name(forward: &HashMap<Vec<u8>, Vec<u8>>, name: &[u8]) -> Vec<u8> {
-    match forward.get(name) {
-        Some(mapped) if !mapped.is_empty() => mapped.clone(),
-        _ => sanitize_function_name(name),
-    }
-}
-
-/// util.ConvertResponsesToolChoiceToGemini: the `functionCallingConfig` object.
-pub(crate) fn tool_choice_to_gemini(choice: &Res<'_>, forward: &HashMap<Vec<u8>, Vec<u8>>) -> Option<Vec<u8>> {
-    if !choice.exists() {
-        return None;
-    }
-    let mode_of = |s: &[u8]| -> Option<&'static str> {
-        match crate::common::go_lower(trim_space(s)).as_slice() {
-            b"none" => Some("NONE"),
-            b"auto" => Some("AUTO"),
-            b"required" | b"any" => Some("ANY"),
-            _ => None,
-        }
-    };
-    let mut mode = None;
-    let mut allowed: Vec<Vec<u8>> = vec![];
-    if choice.kind == Kind::String {
-        mode = mode_of(&choice.s);
-    } else if choice.is_object() {
-        let kind = crate::common::go_lower(trim_space(&choice.get("type").bytes()));
-        match kind.as_slice() {
-            b"tool_search" => {
-                mode = Some("ANY");
-                allowed.push(client_tool_search_name(forward));
-            }
-            b"function" | b"custom" | b"tool" | b"" => {
-                mode = Some("ANY");
-                let first = |paths: [&str; 3]| -> Vec<u8> {
-                    paths
-                        .iter()
-                        .map(|p| trim_space(&choice.get(*p).bytes()).to_vec())
-                        .find(|v| !v.is_empty())
-                        .unwrap_or_default()
-                };
-                let mut name = first(["name", "function.name", "custom.name"]);
-                let namespace = first(["namespace", "function.namespace", "custom.namespace"]);
-                if !namespace.is_empty() {
-                    name = qualify_namespace_name(&namespace, &name);
-                }
-                if !name.is_empty() {
-                    allowed.push(map_tool_name(forward, &name));
-                }
-            }
-            other => mode = mode_of(other),
-        }
-    }
-    let mode = mode?;
-    let mut cfg = br#"{"mode":""}"#.to_vec();
-    gj::set_str(&mut cfg, "mode", mode);
-    if !allowed.is_empty() {
-        gj::set_strs(&mut cfg, "allowedFunctionNames", &allowed);
-    }
-    Some(cfg)
-}
-
-/// util.UnwrapResponsesCustomToolInput: the `input` of `{"input": ...}` arguments, a bare
-/// JSON string's value, or the trimmed arguments.
-pub(crate) fn unwrap_custom_tool_input(arguments: &[u8]) -> Vec<u8> {
-    let arguments = trim_space(arguments);
-    if arguments.is_empty() || arguments == b"{}" {
-        return vec![];
-    }
-    if gj::valid(arguments) {
-        let parsed = gj::parse(arguments);
-        let v = parsed.get("input");
-        if v.exists() {
-            return if v.kind == Kind::String {
-                v.s.to_vec()
-            } else {
-                v.raw.to_vec()
-            };
-        }
-        if parsed.kind == Kind::String {
-            return parsed.s.to_vec();
-        }
-    }
-    arguments.to_vec()
 }
 
 #[cfg(test)]
@@ -642,52 +321,5 @@ mod tests {
         assert_eq!(out[&b"a b".to_vec()], expect(b"a b"));
         assert_eq!(out[&b"a_b".to_vec()], expect(b"a_b"));
         assert_ne!(out[&b"a b".to_vec()], out[&b"a_b".to_vec()]);
-    }
-
-    #[test]
-    fn namespace_children_fall_back_to_children_key() {
-        let raw = br#"{"tools":[{"type":"namespace","name":"ns","children":[{"type":"function","name":"run"}]}]}"#;
-        let (decls, forward, reverse) = gemini_function_declarations(&gj::parse(raw));
-        assert_eq!(decls.len(), 1);
-        assert_eq!(forward[&b"run".to_vec()], b"ns__run");
-        assert_eq!(reverse[&b"ns__run".to_vec()].namespace, b"ns");
-    }
-
-    // Go internal/util/responses_tools_test.go cases the translator goldens cannot
-    // harvest (they only see the translated request); expectations were checked against
-    // Go's BuildGeminiFunctionDeclarations at ae3ee3be.
-
-    #[test]
-    fn dotted_user_tool_keeps_its_name_beside_the_tool_search_shim() {
-        let raw = br#"{"tools":[{"type":"function","name":"tool.search","description":"dotted user tool"},{"type":"tool_search","execution":"client","description":"client search"}]}"#;
-        let (decls, forward, reverse) = gemini_function_declarations(&gj::parse(raw));
-        let names: Vec<_> = decls.iter().map(|d| gj::get(d, "name").bytes().to_vec()).collect();
-        assert_eq!(names, [b"tool.search".to_vec(), b"tool_search".to_vec()]);
-        assert_eq!(client_tool_search_name(&forward), b"tool_search");
-        assert_eq!(forward[&b"tool.search".to_vec()], b"tool.search");
-        let dotted = &reverse[&b"tool.search".to_vec()];
-        assert!(!dotted.tool_search && dotted.name == b"tool.search");
-        assert!(reverse[&b"tool_search".to_vec()].tool_search);
-    }
-
-    #[test]
-    fn tool_search_shim_parameters_fall_back_only_for_a_non_object() {
-        let schema = |params: &str| {
-            let raw = format!(r#"{{"tools":[{{"type":"tool_search","execution":"client","parameters":{params}}}]}}"#);
-            let (decls, _, _) = gemini_function_declarations(&gj::parse(raw.as_bytes()));
-            assert_eq!(decls.len(), 1);
-            gj::get(&decls[0], "parametersJsonSchema").raw().to_vec()
-        };
-        // Not an object: the default schema.
-        assert_eq!(schema("[1]"), TOOL_SEARCH_DEFAULT_PARAMETERS);
-        // An object that cleans to an empty object keeps it (no default).
-        assert_eq!(schema(r##"{"$ref":"#/$defs/A","$defs":{"A":true}}"##), b"{}");
-    }
-
-    #[test]
-    fn server_executed_tool_search_is_dropped() {
-        let raw = br#"{"tools":[{"type":"tool_search"},{"type":"tool_search","execution":"server"}]}"#;
-        let (decls, forward, reverse) = gemini_function_declarations(&gj::parse(raw));
-        assert!(decls.is_empty() && forward.is_empty() && reverse.is_empty());
     }
 }

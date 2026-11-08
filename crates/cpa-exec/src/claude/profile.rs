@@ -661,7 +661,7 @@ mod tests {
         assert!(mask != 0 && mask.count_ones() as usize == logged, "{mask:b} {logged}");
         // A newer release without its Stainless versions is refused, and the line names
         // exactly the headers missing or malformed, and where they were lost.
-        let capture = crate::kimi_fixture::LogCapture::default();
+        let capture = crate::device_fixture::LogCapture::default();
         let guard = capture.install();
         let line = |id: &str, headers: &HeaderMap| {
             capture.0.lock().unwrap().clear();

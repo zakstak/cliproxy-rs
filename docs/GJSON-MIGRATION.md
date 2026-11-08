@@ -12,6 +12,18 @@ rg -n 'gjson::' crates --glob '*.rs'
 rg -n gjson Cargo.toml Cargo.lock crates/*/Cargo.toml harness/rust/Cargo.toml harness/rust/Cargo.lock .github/workflows/ci.yml
 ```
 
+## Inventory after the provider cutdown
+
+Regenerated after issue #49 kept only the Claude, Codex, Grok (`xai`) and Muse (`meta`)
+upstreams. None of the removed providers' modules (Kimi, Devin, Gemini, Vertex, AI
+Studio, Antigravity, OpenAI-compatible) used the third-party crate: they read JSON
+through `cpa_common::json`, so their deletion removed no consumer and none was
+migrated. The command above lists 24 files, all Codex, xAI or shared WebSocket code:
+11 source files (7 in `cpa-exec`, 4 in `cpa-server`) and 13 test files (`*_tests.rs` and
+`tests/`). Issue #47 removed one more consumer, `cpa-server`'s `management/quota_probe.rs`.
+The removal of the external dependency, the vendor copy, the manifest patches, the lockfile entries
+and the vendor-only CI steps still waits on those consumers.
+
 ## Contract boundaries
 
 Codex requests follow [codex/CONTRACT.md](codex/CONTRACT.md). Use `CodexBody` for
@@ -19,7 +31,9 @@ native request routing and its permitted transport edits. Borrow raw values when
 parser needs only a few fields. Forward the original bytes after inspection.
 Unknown members, numeric spelling and escapes must survive.
 
-Other providers follow Go v8.0.35. `cpa_common::json` is an independent Rust port of
+The other retained providers (Claude, xAI, Meta) follow the provider-first policy in
+[DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#compatibility-policy), with Go v8.0.35
+as the default where no provider source decides. `cpa_common::json` is an independent Rust port of
 Go's byte-oriented gjson/sjson behavior, not a dependency on the Rust `gjson` crate.
 The translators already use that port. Replacing a Go-compatible reader with
 `serde_json::Value` would change duplicate-key lookup, coercions, invalid UTF-8,
@@ -59,8 +73,8 @@ Paths in this table are relative to `crates/`.
 | `cpa-exec/src/codex_images.rs` | Images input parsing, tool settings and output aggregation. The adapter performs a cross-API conversion; direct Images bodies must retain passthrough behavior. |
 | `cpa-exec/src/codex_json.rs` | Go-compatible object remarshal for Alpha Search, plus byte-edit helpers used by translated requests, Images, token records and response normalization. The conditional model/stream setters remain live. |
 | `cpa-exec/src/codex.rs` | Quota model inspection in the shared send helper and Alpha Search response IDs. Alpha Search is outside the Codex Responses contract and retains Go behavior. |
-| `cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs` | Shared WebSocket transcript, prewarm, request and tool handling for other providers. Native Codex attempts use the preserved client frame instead. |
-| `cpa-server/src/codex_alpha.rs`, `management/quota_probe.rs` | Alpha Search and management quota probes, outside the Codex Responses contract. Preserve their Go behavior. |
+| `cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs` | Shared WebSocket transcript, prewarm, request and tool handling for xAI, the only other provider with a Responses WebSocket. Native Codex attempts use the preserved client frame instead. |
+| `cpa-server/src/codex_alpha.rs` | Alpha Search, outside the Codex Responses contract. Preserve its Go behavior. |
 | Executor and server unit/integration tests returned by the inventory command | Assertions and helpers still use gjson. They also must migrate before deleting the dependency. Keep historical Go fixtures labelled with their recorded versions. |
 
 The translated and Images tool bodies can retain raw source schemas. Applying the

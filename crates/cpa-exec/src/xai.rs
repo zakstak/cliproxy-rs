@@ -22,10 +22,10 @@ use cpa_translate::{ResponseCtx, StreamTranslator};
 use futures_util::StreamExt;
 use http::HeaderMap;
 
-use crate::gemini_stream::ClaudeInputTokens;
-use crate::openai_compat::status_err;
-use crate::openai_compat_http::{self as wire, Clients, GoHeaders};
-use crate::openai_compat_payload::{self as compat, ensure_responses_usage_details};
+use crate::claude_input_tokens::ClaudeInputTokens;
+use crate::openai_http::status_err;
+use crate::openai_http::{self as wire, Clients, GoHeaders};
+use crate::openai_payload::{self as compat, ensure_responses_usage_details};
 use crate::xai_auth::{self, CLI_CHAT_PROXY_BASE_URL, DEFAULT_API_BASE_URL, metadata_string};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::{self as request, Prepared};

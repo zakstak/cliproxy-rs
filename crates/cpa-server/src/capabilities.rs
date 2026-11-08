@@ -15,7 +15,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::thinking::parse_suffix;
 use cpa_core::config::Config;
 use cpa_core::config::credentials;
-use cpa_core::credential::{Credential, Source};
+use cpa_core::credential::Credential;
 use cpa_core::exec::{ResolvedModel, ResolvedSource};
 use cpa_core::registry::dynamic::{self, ConfigModel};
 use cpa_core::registry::{ModelInfo, ThinkingSupport, pinned};
@@ -159,9 +159,10 @@ fn attr<'a>(c: &'a Credential, key: &str) -> &'a str {
     c.attributes.get(key).map_or("", |v| v.trim())
 }
 
-/// `isConfiguredModelRoutingAuth`: API keys, or config-sourced OpenAI-compatible entries.
+/// `isConfiguredModelRoutingAuth`: API keys (Go also counts config-sourced
+/// OpenAI-compatible entries, removed with that provider, issue #49).
 fn configured_routing(c: &Credential) -> bool {
-    dynamic::is_api_key(c) || (matches!(c.source, Source::Config { .. }) && !attr(c, "compat_name").is_empty())
+    dynamic::is_api_key(c)
 }
 
 /// One configured model as Go compiles it (`addConfiguredModelCapability` inputs).
@@ -179,14 +180,11 @@ struct Configured {
 fn entry_models(cfg: &Config, c: &Credential) -> Option<(Vec<Configured>, &'static str)> {
     let provider = c.provider.trim().go_lower();
     let (family, kind) = match provider.as_str() {
-        "gemini" => ("gemini", "gemini"),
-        "gemini-interactions" => ("interactions", "interactions"),
         "claude" => ("claude", "claude"),
         "codex" => ("codex", "codex"),
         "xai" => ("xai", "xai"),
-        "vertex" => ("vertex", "gemini"),
         "meta" => ("meta", "meta"),
-        _ => return Some((compat_models(cfg, c)?, "openai-compatibility")),
+        _ => return None,
     };
     let entry = credentials::resolve_api_key_entry(cfg, family, c)?;
     let models = entry
@@ -197,67 +195,11 @@ fn entry_models(cfg: &Config, c: &Credential) -> Option<(Vec<Configured>, &'stat
             name: m.name,
             alias: m.alias,
             thinking: m.thinking,
-            // VertexCompatModel has no is-compat (Go's GetIsCompat is absent).
-            is_compat: m.is_compat && family != "vertex",
+            is_compat: m.is_compat,
             support_configuration_update: (family == "codex").then_some(m.support_configuration_update),
         })
         .collect();
     Some((models, kind))
-}
-
-/// `resolveOpenAICompatConfigForAuth` then `compileOpenAICompatibleModelCapabilities`:
-/// the entry at `config_index` among entries with a base URL when enabled, else the
-/// first enabled entry named by `compat_name`, `provider_key` or the provider. Models
-/// without configured thinking get low/medium/high unless they are image models.
-fn compat_models(cfg: &Config, c: &Credential) -> Option<Vec<Configured>> {
-    let text = |v: Option<&serde_yaml_ng::Value>| match v {
-        Some(serde_yaml_ng::Value::String(s)) => s.trim().to_owned(),
-        Some(serde_yaml_ng::Value::Number(n)) => n.to_string(),
-        Some(serde_yaml_ng::Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    };
-    let entries: Vec<&serde_yaml_ng::Value> = cfg
-        .document
-        .get("api-keys")
-        .and_then(|k| k.get("openai-compatibility"))
-        .and_then(serde_yaml_ng::Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter(|g| !text(g.get("base-url")).is_empty())
-        .collect();
-    let disabled = |g: &serde_yaml_ng::Value| g.get("disabled").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
-    let by_index = matches!(c.source, Source::Config { .. })
-        .then(|| attr(c, "config_index").parse::<usize>().ok())
-        .flatten()
-        .and_then(|i| entries.get(i).copied())
-        .filter(|g| !disabled(g));
-    let entry = by_index.or_else(|| {
-        let candidates = [attr(c, "compat_name"), attr(c, "provider_key"), c.provider.trim()];
-        entries.iter().copied().find(|g| {
-            let name = text(g.get("name"));
-            !disabled(g) && candidates.iter().any(|cand| !cand.is_empty() && cand.go_eq_fold(&name))
-        })
-    })?;
-    let models = entry
-        .get("models")
-        .and_then(serde_yaml_ng::Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter_map(|m| serde_yaml_ng::from_value::<ConfigModel>(m.clone()).ok())
-        .map(|m| Configured {
-            thinking: m.thinking.or_else(|| {
-                (!m.image).then(|| ThinkingSupport {
-                    levels: vec!["low".into(), "medium".into(), "high".into()],
-                    ..ThinkingSupport::default()
-                })
-            }),
-            name: m.name,
-            alias: m.alias,
-            is_compat: m.is_compat,
-            support_configuration_update: None,
-        })
-        .collect();
-    Some(models)
 }
 
 /// `modelAliasLookupCandidates`: the model, then its suffix-free base when different.
@@ -456,7 +398,9 @@ mod tests {
         let config = fixture["resolved_config"].as_str().unwrap();
         let codex_compat = "          alias: sol\n          is-compat: true\n";
         assert_eq!(config.matches(codex_compat).count(), 1);
-        let cfg = Config::parse(&config.replace(codex_compat, "          alias: sol\n")).unwrap();
+        // The removed providers' sections (issue #49) and their cases go.
+        let config = cpa_core::removed::strip_settings(&config.replace(codex_compat, "          alias: sol\n"));
+        let cfg = Config::parse(&config).unwrap();
         let synthesized = credentials::from_config(&cfg);
         let cases = fixture["resolved"].as_array().unwrap();
         assert_eq!(cases.len(), 32);
@@ -464,6 +408,9 @@ mod tests {
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let id = case["auth_id"].as_str().unwrap();
+            if id.starts_with("openai-compatibility:") || id.starts_with("vertex:") {
+                continue;
+            }
             let attributes: std::collections::BTreeMap<String, String> = case["attributes"]
                 .as_object()
                 .map(|a| {
@@ -567,7 +514,8 @@ mod tests {
                 "{name}: typed thinking"
             );
         }
-        assert_eq!((bound, codex_oauth), (25, 4));
+        // 25 in Go; the OpenAI-compatible and Vertex cases went with those providers.
+        assert_eq!((bound, codex_oauth), (21, 4));
     }
 
     /// Go `TestResolveModelInfoConfiguredThinkingKeepsCatalogDisableType`: configured levels

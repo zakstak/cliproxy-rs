@@ -30,7 +30,7 @@ reviews:
         - Check that a Rust value never silently differs from Go's for the same input. Refusing an input Go accepts is acceptable only with a DIFFERENCES-FROM-GO.md entry.
         - Check that request preparation and config loading stay linear in input size: flag code that rescans a JSON body or YAML document for each element.
         - Check that tests use local mock upstreams and a private auth-dir, and cannot reach the network or ~/.cli-proxy-api.
-    - path: "{crates/cpa-exec/src/claude.rs,crates/cpa-exec/src/claude/**,crates/cpa-translate/src/*claude*.rs,crates/cpa-server/src/claude.rs,crates/cpa-common/src/cache.rs,crates/cpa-common/src/signature/claude*.rs}"
+    - path: "{crates/cpa-exec/src/claude.rs,crates/cpa-exec/src/claude/**,crates/cpa-translate/src/*claude*.rs,crates/cpa-server/src/claude.rs,crates/cpa-common/src/signature/claude*.rs}"
       instructions: |
         - Check every change to the bytes sent to Claude upstream: system blocks, tool order and definitions, message content, cache_control placement, headers and beta flags, field order and whitespace. Any change before the last cache breakpoint invalidates prompt caching for existing sessions; flag it unless the PR description states it.
         - Check that bodies that pass through are forwarded byte for byte and not re-serialized.

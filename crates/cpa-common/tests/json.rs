@@ -154,11 +154,11 @@ fn encoding_matches_encoding_json() {
     }
 }
 
-/// The sjson/gjson vectors the Kimi thread generated from Go (cpa-exec device fixtures).
+/// sjson/gjson vectors generated from Go (moved from the removed Kimi device fixtures,
+/// tests/device_fixtures/go/zz_rsfix_vectors_test.go).
 #[test]
-fn kimi_device_vectors_match() {
-    let vectors: Vec<Value> =
-        serde_json::from_str(include_str!("../../cpa-exec/tests/device_fixtures/kimi/vectors.json")).unwrap();
+fn sjson_go_vectors_match() {
+    let vectors: Vec<Value> = serde_json::from_str(include_str!("fixtures/sjson_go_vectors.json")).unwrap();
     let mut seen = 0;
     for v in vectors {
         let input = v["in"].as_str().unwrap_or_default().as_bytes();

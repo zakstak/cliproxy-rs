@@ -190,15 +190,8 @@ alloc.codex.claude.7600k.allocations       34_069  3
 
 # Each 2026-11-07 value is the largest of the six runs in
 # bench/results/2026-11-07-codex-alloc.txt.
-# 2026-11-07: Gemini requests for the Codex model whose size starts with 48 large tool
-# schemas (upper-case types converted at schema positions only, #27), then turns of
-# function calls and large responses. 3.8x to 4.5x the body.
-alloc.codex.gemini.400k.peak_bytes      2_402_207  2
-alloc.codex.gemini.400k.allocations        35_524  3
-alloc.codex.gemini.1900k.peak_bytes     7_565_550  2
-alloc.codex.gemini.1900k.allocations       41_394  3
-alloc.codex.gemini.7600k.peak_bytes    29_806_962  2
-alloc.codex.gemini.7600k.allocations       63_784  3
+# The 2026-11-07 Gemini-to-Codex rows were dropped with the Gemini client protocol
+# (issue #49).
 
 # count_tokens with the same Claude bodies, counted locally as for an OAuth login: the
 # body as a JSON tree, its text joined, then the shared o200k_base encoder (built by the

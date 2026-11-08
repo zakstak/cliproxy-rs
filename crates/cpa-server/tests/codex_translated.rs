@@ -1,13 +1,12 @@
-//! The Codex translated route through the real router (#27): Claude Messages, Chat
-//! Completions, Gemini and Interactions requests served by a Codex credential on a
-//! native profile (`docs/codex/CONTRACT.md` "Translated route").
+//! The Codex translated route through the real router (#27): Claude Messages and Chat
+//! Completions requests served by a Codex credential on a native profile
+//! (`docs/codex/CONTRACT.md` "Translated route"). The Gemini and Interactions sources
+//! went with those client protocols (issue #49).
 //!
 //! Each source request is hand-authored from its provider's documented request shape:
 //! Anthropic Messages (`system`, `thinking`, `tools`, `tool_use`/`tool_result` blocks),
-//! OpenAI Chat Completions (`messages` with `tool_calls` and `tool` messages, `tools`,
-//! `parallel_tool_calls`), Gemini `generateContent` (`systemInstruction`, `contents` with
-//! `functionCall`/`functionResponse` parts, `functionDeclarations`, `thinkingConfig`) and
-//! Gemini Interactions (`input`). The upstream answer is the #21 first-party fixture
+//! and OpenAI Chat Completions (`messages` with `tool_calls` and `tool` messages, `tools`,
+//! `parallel_tool_calls`). The upstream answer is the #21 first-party fixture
 //! `sse-completed` (encrypted reasoning, a message, full usage). The tests check meaning,
 //! not Go's bytes: what the caller said reaches the upstream in Responses form, nothing
 //! the caller did not say is added, and what Codex cannot express is refused before any
@@ -80,9 +79,8 @@ fn executors() -> Executors {
     Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     }
 }
 
@@ -355,7 +353,7 @@ async fn claude_without_thinking_gets_no_reasoning_default() {
 
 /// Content Codex cannot express is refused before any upstream request, with a message
 /// that names the part: Claude `redacted_thinking`, a non-PDF document, a Chat `refusal`
-/// part, an empty audio part, and Gemini code execution.
+/// part and an empty audio part.
 #[tokio::test]
 async fn unexpressible_content_is_refused_before_the_send() {
     let mut redacted = claude_request(false);
@@ -375,16 +373,11 @@ async fn unexpressible_content_is_refused_before_the_send() {
     let audio = json!({"model": "gpt-5.5", "messages": [
         {"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}, {"type": "text", "text": "hi"}]}
     ]});
-    let code = json!({"contents": [{"role": "user", "parts": [
-        {"text": "run it"},
-        {"executableCode": {"language": "PYTHON", "code": "print(1)"}}
-    ]}]});
     let cases = [
         ("/v1/messages", redacted, "redacted_thinking"),
         ("/v1/messages", document, "document"),
         ("/v1/chat/completions", refusal, "refusal"),
         ("/v1/chat/completions", audio, "input_audio"),
-        ("/v1beta/models/gpt-5.5:generateContent", code, "executableCode"),
     ];
     for (path, body, part) in cases {
         let proxy = proxy(vec![completed()], "").await;
@@ -440,58 +433,6 @@ async fn chat_round_trips_keep_meaning() {
             assert_eq!(completion["usage"]["completion_tokens"], 40, "{completion}");
         }
     }
-}
-
-/// Gemini `generateContent`: the system instruction as a developer item, the function
-/// call and response paired under one ID, the caller's thinking budget as an effort, and
-/// the answer back as candidate text with the provider's usage.
-#[tokio::test]
-async fn gemini_round_trip_keeps_meaning() {
-    let proxy = proxy(vec![completed()], "").await;
-    let request = json!({
-        "systemInstruction": {"parts": [{"text": "Be brief."}]},
-        "generationConfig": {"thinkingConfig": {"thinkingBudget": 1024}},
-        "tools": [{"functionDeclarations": [{
-            "name": "get_weather",
-            "description": "Weather for a city.",
-            "parameters": {"type": "OBJECT", "properties": {"city": {"type": "STRING"}}}
-        }]}],
-        "contents": [
-            {"role": "user", "parts": [{"text": "Weather in Paris?"}]},
-            {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}]},
-            {"role": "user", "parts": [{"functionResponse": {"name": "get_weather", "response": {"result": "18C"}}}]}
-        ]
-    });
-    let (status, answer) = post(&proxy.url, "/v1beta/models/gpt-5.5:generateContent", &request).await;
-    assert_eq!(status, 200, "{answer}");
-    let body = sent(&proxy);
-    assert_nothing_added(&body, &["get_weather"]);
-    assert_eq!(body["input"][0]["role"], "developer");
-    let call = items(&body, "function_call")[0].clone();
-    let output = items(&body, "function_call_output")[0].clone();
-    assert_eq!(call["call_id"], output["call_id"], "{body}");
-    assert_eq!(output["output"], "18C");
-    assert!(body["reasoning"]["effort"].is_string(), "{body}");
-    let response: Value = serde_json::from_str(&answer).unwrap();
-    assert!(answer.contains("Done."), "{answer}");
-    assert_eq!(response["usageMetadata"]["candidatesTokenCount"], 40, "{response}");
-}
-
-/// Gemini Interactions: a plain input gets no default instructions or reasoning.
-#[tokio::test]
-async fn interactions_conversion_adds_nothing() {
-    let proxy = proxy(vec![completed()], "").await;
-    let (status, answer) = post(
-        &proxy.url,
-        "/v1beta/interactions",
-        &json!({"model": "gpt-5.5", "input": "Hello"}),
-    )
-    .await;
-    assert_eq!(status, 200, "{answer}");
-    let body = sent(&proxy);
-    assert_nothing_added(&body, &[]);
-    assert!(body["reasoning"].get("effort").is_none(), "{body}");
-    assert!(answer.contains("Done."), "{answer}");
 }
 
 /// Payload rules and the Codex-client rewrites cannot reach a translated body.
@@ -627,12 +568,6 @@ async fn generation_controls_map_or_are_refused() {
     chat["max_completion_tokens"] = json!(7);
     chat["temperature"] = json!(0.25);
     chat["prompt_cache_key"] = json!("client-key-for-caching");
-    let gemini = json!({
-        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-        "generationConfig": {"maxOutputTokens": 9, "temperature": 0.25, "topP": 0.5}
-    });
-    let interactions =
-        json!({"model": "gpt-5.5", "input": "hi", "generation_config": {"max_output_tokens": 11, "temperature": 0.25}});
     let mapped = [
         (
             "/v1/messages",
@@ -643,16 +578,6 @@ async fn generation_controls_map_or_are_refused() {
             "/v1/chat/completions",
             chat,
             json!({"max_output_tokens": 7, "temperature": 0.25, "prompt_cache_key": "client-key-for-caching"}),
-        ),
-        (
-            "/v1beta/models/gpt-5.5:generateContent",
-            gemini,
-            json!({"max_output_tokens": 9, "temperature": 0.25, "top_p": 0.5}),
-        ),
-        (
-            "/v1beta/interactions",
-            interactions,
-            json!({"max_output_tokens": 11, "temperature": 0.25}),
         ),
     ];
     for (path, request, want) in mapped {
@@ -676,12 +601,6 @@ async fn generation_controls_map_or_are_refused() {
     chat_penalty["presence_penalty"] = json!(0.5);
     let mut chat_seed = chat_request(false);
     chat_seed["seed"] = json!(42);
-    let gemini_top_k =
-        json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"topK": 4}});
-    let gemini_json = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"responseMimeType": "application/json"}});
-    let gemini_safety = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "safetySettings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}]});
-    let interactions_penalty =
-        json!({"model": "gpt-5.5", "input": "hi", "generation_config": {"presence_penalty": 0.5}});
     let refused = [
         ("/v1/messages", top_k, "top_k"),
         ("/v1/messages", stop, "stop_sequences"),
@@ -689,18 +608,6 @@ async fn generation_controls_map_or_are_refused() {
         ("/v1/chat/completions", chat_n, "`n`"),
         ("/v1/chat/completions", chat_penalty, "presence_penalty"),
         ("/v1/chat/completions", chat_seed, "seed"),
-        ("/v1beta/models/gpt-5.5:generateContent", gemini_top_k, "topK"),
-        (
-            "/v1beta/models/gpt-5.5:generateContent",
-            gemini_json,
-            "responseMimeType",
-        ),
-        (
-            "/v1beta/models/gpt-5.5:generateContent",
-            gemini_safety,
-            "safetySettings",
-        ),
-        ("/v1beta/interactions", interactions_penalty, "presence_penalty"),
     ];
     for (path, request, field) in refused {
         let proxy = make(vec![completed()], "").await;
@@ -717,8 +624,8 @@ async fn generation_controls_map_or_are_refused() {
 /// Nested and handled content is kept or refused, never partly sent: a tool result with
 /// text and an image URL keeps both; a tool result with text and an unsupported block, a
 /// thinking block with reasoning text but no Codex signature, a non-text system block, a
-/// Gemini thought, an Interactions thought step, a Chat result without its call and a
-/// Chat call of an unknown type are refused before the send.
+/// Chat result without its call and a Chat call of an unknown type are refused before the
+/// send.
 #[tokio::test]
 async fn nested_content_is_kept_or_refused() {
     let mut kept = claude_request(false);
@@ -744,16 +651,6 @@ async fn nested_content_is_kept_or_refused() {
         json!({"type": "thinking", "thinking": "I should call the tool.", "signature": "EqQBCkgIBxABGAIqQKlaude"});
     let mut system = claude_request(false);
     system["system"] = json!([{"type": "text", "text": "Be brief."}, {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}]);
-    let gemini_thought = json!({"contents": [
-        {"role": "user", "parts": [{"text": "hi"}]},
-        {"role": "model", "parts": [{"text": "Let me think.", "thought": true}, {"text": "Hello"}]},
-        {"role": "user", "parts": [{"text": "again"}]}
-    ]});
-    let interactions_thought = json!({"model": "gpt-5.5", "input": [
-        {"type": "user_input", "content": "hi"},
-        {"type": "thought", "content": "private reasoning"},
-        {"type": "user_input", "content": "again"}
-    ]});
     let orphan_result = json!({"model": "gpt-5.5", "messages": [
         {"role": "user", "content": "hi"},
         {"role": "tool", "tool_call_id": "call_missing", "content": "18C"}
@@ -767,8 +664,6 @@ async fn nested_content_is_kept_or_refused() {
         ("/v1/messages", mixed, "search_result"),
         ("/v1/messages", foreign, "thinking"),
         ("/v1/messages", system, "system block"),
-        ("/v1beta/models/gpt-5.5:generateContent", gemini_thought, "thought"),
-        ("/v1beta/interactions", interactions_thought, "thought"),
         (
             "/v1/chat/completions",
             orphan_result,
@@ -789,8 +684,7 @@ async fn nested_content_is_kept_or_refused() {
 }
 
 /// A caller's tool schema reaches the upstream as sent: `$schema`, a nested `pattern`
-/// with a `\p{...}` escape, `patternProperties` and an unknown keyword stay. Gemini's
-/// upper-case type names become JSON Schema's, the one documented dialect change, and no
+/// with a `\p{...}` escape, `patternProperties` and an unknown keyword stay, and no
 /// `additionalProperties` is added.
 #[tokio::test]
 async fn tool_schemas_keep_their_constraints() {
@@ -810,23 +704,6 @@ async fn tool_schemas_keep_their_constraints() {
     let (status, answer) = post(&proxy.url, "/v1/messages", &claude).await;
     assert_eq!(status, 200, "{answer}");
     assert_eq!(sent(&proxy)["tools"][0]["parameters"], schema, "the caller's schema");
-
-    let gemini = json!({
-        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-        "tools": [{"functionDeclarations": [{"name": "lookup", "parameters": {
-            "type": "OBJECT",
-            "properties": {"name": {"type": "STRING", "pattern": "^\\p{Lu}"}},
-            "required": ["name"]
-        }}]}]
-    });
-    let proxy = make(vec![completed()], "").await;
-    let (status, answer) = post(&proxy.url, "/v1beta/models/gpt-5.5:generateContent", &gemini).await;
-    assert_eq!(status, 200, "{answer}");
-    assert_eq!(
-        sent(&proxy)["tools"][0]["parameters"],
-        json!({"type": "object", "properties": {"name": {"type": "string", "pattern": "^\\p{Lu}"}}, "required": ["name"]}),
-        "only the type names change"
-    );
 }
 
 /// A call ID longer than 64 bytes reaches the upstream unchanged on both the call and
@@ -903,112 +780,7 @@ async fn direct_images_are_not_rewritten() {
     );
 }
 
-// Review 5812490964: Gemini tool selection and schema literals, value-level controls,
-// failed tool results.
-
-fn gemini_tools(config_key: &str, config: Value) -> Value {
-    json!({
-        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-        "tools": [{"functionDeclarations": [
-            {"name": "alpha", "parameters": {"type": "OBJECT", "properties": {}}},
-            {"name": "beta", "parameters": {"type": "OBJECT", "properties": {}}},
-            {"name": "gamma", "parameters": {"type": "OBJECT", "properties": {}}}
-        ]}],
-        config_key: config
-    })
-}
-
-/// A Gemini `ANY` restriction to a proper subset of the declared tools stays a
-/// restriction (the Responses `allowed_tools` choice), in both spellings; one allowed name
-/// becomes that function; a mode with no Responses form is refused.
-#[tokio::test]
-async fn gemini_tool_restrictions_are_not_widened() {
-    let path = "/v1beta/models/gpt-5.5:generateContent";
-    let subset = [
-        gemini_tools(
-            "toolConfig",
-            json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["alpha", "beta"]}}),
-        ),
-        gemini_tools(
-            "tool_config",
-            json!({"function_calling_config": {"mode": "ANY", "allowed_function_names": ["alpha", "beta"]}}),
-        ),
-    ];
-    for request in subset {
-        let proxy = make(vec![completed()], "").await;
-        let (status, answer) = post(&proxy.url, path, &request).await;
-        assert_eq!(status, 200, "{answer}");
-        assert_eq!(
-            sent(&proxy)["tool_choice"],
-            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "alpha"}, {"type": "function", "name": "beta"}]})
-        );
-    }
-    let proxy = make(vec![completed()], "").await;
-    let one = gemini_tools(
-        "tool_config",
-        json!({"function_calling_config": {"mode": "ANY", "allowed_function_names": ["gamma"]}}),
-    );
-    post(&proxy.url, path, &one).await;
-    assert_eq!(
-        sent(&proxy)["tool_choice"],
-        json!({"type": "function", "name": "gamma"})
-    );
-    let proxy = make(vec![completed()], "").await;
-    let none = gemini_tools("tool_config", json!({"function_calling_config": {"mode": "NONE"}}));
-    post(&proxy.url, path, &none).await;
-    assert_eq!(sent(&proxy)["tool_choice"], "none");
-    let proxy = make(vec![completed()], "").await;
-    let validated = gemini_tools("toolConfig", json!({"functionCallingConfig": {"mode": "VALIDATED"}}));
-    let (status, answer) = post(&proxy.url, path, &validated).await;
-    assert_eq!(status, 400, "{answer}");
-    assert!(
-        answer.contains("unsupported conversion") && answer.contains("validated"),
-        "{answer}"
-    );
-    assert!(proxy.upstream.http().is_empty());
-}
-
-/// Only Gemini schema `type` names become JSON Schema's: literal values (`enum`,
-/// `default`), a property named `type`, unknown extensions and `parametersJsonSchema`
-/// keep their data.
-#[tokio::test]
-async fn gemini_schema_literals_are_not_rewritten() {
-    let request = json!({
-        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-        "tools": [{"functionDeclarations": [
-            {"name": "tiered", "parameters": {
-                "type": "OBJECT",
-                "x-meta": {"type": "VIP", "const": {"type": "VIP"}},
-                "properties": {
-                    "tier": {"type": "STRING", "enum": ["VIP"], "default": "VIP"},
-                    "type": {"type": "STRING", "example": {"type": "VIP"}},
-                    "list": {"type": "ARRAY", "items": {"type": "INTEGER"}}
-                }
-            }},
-            {"name": "json_schema", "parametersJsonSchema": {"type": "object", "properties": {"k": {"const": {"type": "VIP"}}}}}
-        ]}]
-    });
-    let proxy = make(vec![completed()], "").await;
-    let (status, answer) = post(&proxy.url, "/v1beta/models/gpt-5.5:generateContent", &request).await;
-    assert_eq!(status, 200, "{answer}");
-    let body = sent(&proxy);
-    assert_eq!(
-        body["tools"][0]["parameters"],
-        json!({
-            "type": "object",
-            "x-meta": {"type": "VIP", "const": {"type": "VIP"}},
-            "properties": {
-                "tier": {"type": "string", "enum": ["VIP"], "default": "VIP"},
-                "type": {"type": "string", "example": {"type": "VIP"}},
-                "list": {"type": "array", "items": {"type": "integer"}}
-            }
-        })
-    );
-    assert_eq!(
-        body["tools"][1]["parameters"],
-        json!({"type": "object", "properties": {"k": {"const": {"type": "VIP"}}}})
-    );
-}
+// Review 5812490964: value-level controls, failed tool results.
 
 /// Controls the converter handles are checked by value: Chat JSON mode becomes the
 /// Responses JSON format and any Chat tier is kept; a Claude tier, tool choice or
@@ -1068,63 +840,4 @@ async fn failed_tool_results_are_refused() {
         let (status, answer) = post(&proxy.url, "/v1/messages", &request).await;
         assert_eq!(status, 200, "{content}: an ordinary result: {answer}");
     }
-}
-
-/// Gemini tool restrictions over many functions (codex review r4502075020): every
-/// declared name allowed is unrestricted `required`; all but one is an `allowed_tools`
-/// subset in the client's order; every declared name plus one undeclared name is refused,
-/// not widened to `required`.
-#[tokio::test]
-async fn wide_gemini_tool_restrictions_keep_their_meaning() {
-    let n = 2_000;
-    let names: Vec<String> = (0..n).map(|i| format!("tool_{i}")).collect();
-    let request = |allowed: &[String]| {
-        let declarations: Vec<Value> = names
-            .iter()
-            .map(|name| json!({"name": name, "parameters": {"type": "OBJECT", "properties": {}}}))
-            .collect();
-        json!({
-            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-            "tools": [{"functionDeclarations": declarations}],
-            "tool_config": {"function_calling_config": {"mode": "ANY", "allowed_function_names": allowed}}
-        })
-    };
-    let path = "/v1beta/models/gpt-5.5:generateContent";
-
-    let proxy = make(vec![completed()], "").await;
-    let (status, answer) = post(&proxy.url, path, &request(&names)).await;
-    assert_eq!(status, 200, "{answer}");
-    assert_eq!(
-        sent(&proxy)["tool_choice"],
-        "required",
-        "every declared function allowed"
-    );
-
-    let mut subset: Vec<String> = names[1..].to_vec();
-    subset.reverse();
-    let proxy = make(vec![completed()], "").await;
-    let (status, answer) = post(&proxy.url, path, &request(&subset)).await;
-    assert_eq!(status, 200, "{answer}");
-    let choice = sent(&proxy)["tool_choice"].clone();
-    assert_eq!(choice["type"], "allowed_tools");
-    assert_eq!(choice["mode"], "required");
-    let listed: Vec<&str> = choice["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        listed,
-        subset.iter().map(String::as_str).collect::<Vec<_>>(),
-        "the client's order"
-    );
-
-    let mut unknown = names.clone();
-    unknown.push("not_declared".into());
-    let proxy = make(vec![completed()], "").await;
-    let (status, answer) = post(&proxy.url, path, &request(&unknown)).await;
-    assert_eq!(status, 400, "{answer}");
-    assert!(answer.contains("naming no declared function"), "{answer}");
-    assert!(proxy.upstream.http().is_empty(), "nothing was sent");
 }

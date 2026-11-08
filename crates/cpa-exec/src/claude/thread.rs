@@ -23,9 +23,7 @@ const LIMIT: usize = 1024;
 /// `claudeThreadNotFoundErrorMessage`.
 pub const NOT_FOUND: &str = "No thread state was found for the requested previous_message_id. Replay the full conversation with thread create to start a new Thread.";
 
-/// `claudeOAuthToolAliasStore`: one per executor, shared by every request it serves
-/// (the Claude executor keeps a second one for Kimi, which Go runs as an executor of
-/// its own).
+/// `claudeOAuthToolAliasStore`: one per executor, shared by every request it serves.
 ///
 /// Bounded at [`LIMIT`] keys with no expiry, as in Go. A turn's alias map (one entry
 /// per declared tool) is built once, when its request's tools are remapped; the turn

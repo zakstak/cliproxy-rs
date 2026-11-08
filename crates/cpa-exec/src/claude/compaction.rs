@@ -4,7 +4,7 @@
 
 use cpa_common::json as gj;
 
-use crate::antigravity_compaction as capsule;
+use crate::compaction_capsule as capsule;
 
 /// `prepareClaudeCompactionSummaryPayload`: Antigravity's summary request, keeping the
 /// tool definitions Claude needs to accept `tool_use` history.

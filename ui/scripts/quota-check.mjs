@@ -211,7 +211,7 @@ try {
   await evaluate(`window.quotaFixture.files.push(
     {name:'multi.json', auth_index:'multi-a', type:'gemini-cli', email:'one@example.com', status:'active'},
     {name:'multi.json', auth_index:'multi-b', type:'gemini-cli', email:'two@example.com', status:'active'},
-    {name:'kimi.json', auth_index:'kimi-test', type:'kimi', status:'active'})`);
+    {name:'xai.json', auth_index:'xai-test', type:'xai', status:'active'})`);
   await main.getByLabel("Select one@example.com").waitFor({ timeout: 15_000 });
   await main.getByLabel("Select one@example.com").check();
   assert.match(await main.locator(".batch").textContent(), /1 selected\..*Actions also reach two@example\.com, in the same files/);
@@ -242,12 +242,12 @@ try {
   assert.equal(await evaluate("document.querySelector('input[aria-label=\"Select all shown\"]').indeterminate"), false);
   await main.locator(".batch").getByRole("button", { name: "Refresh tokens for 5" }).click();
   await page.getByText("Tokens refreshed for 3 files. 1 failed: codex.json (refresh refused)").waitFor();
-  assert.deepEqual((await evaluate("window.quotaFixture.refreshed")).sort(), ["claude-test", "codex-test", "kimi-test", "multi-a"]);
+  assert.deepEqual((await evaluate("window.quotaFixture.refreshed")).sort(), ["claude-test", "codex-test", "multi-a", "xai-test"]);
   console.log("PASS a batch refresh goes on past a failure, once per file, and names what failed");
 
   await main.locator(".batch").getByRole("button", { name: "Delete 5…" }).click();
   await page.getByText("3 files deleted. 1 failed: codex.json (file is busy)").waitFor();
-  assert.deepEqual((await evaluate("window.quotaFixture.deleted")).sort(), ["claude-setup.json", "codex.json", "kimi.json", "multi.json"]);
+  assert.deepEqual((await evaluate("window.quotaFixture.deleted")).sort(), ["claude-setup.json", "codex.json", "multi.json", "xai.json"]);
   assert.match(await main.locator(".batch").textContent(), /^\s*1 selected\./);
   assert.equal(await main.getByLabel("Select codex.json").isChecked(), true);
   console.log("PASS a batch delete removes each file once, goes on past a failure and keeps the failed account selected");

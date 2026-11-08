@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::*;
-use crate::openai_compat_usage::{HttpAttempt, Logged, http_capture_problems, published};
+use crate::usage_testkit::{HttpAttempt, Logged, http_capture_problems, published};
 
 const FIXTURE: &str = include_str!("../tests/fixtures/xai_go.json");
 /// The scenarios the payload barrier changed, recorded at v8.0.35; they replace their
@@ -239,7 +239,7 @@ async fn go_reference_scenarios() {
         *chosen.lock().unwrap() = None;
         let cfg = Config::parse(&s["config"].as_str().unwrap_or_default().replace("UPSTREAM", &addr)).unwrap();
         let cred = credential(s, &cfg);
-        let (recorder, capture, sink) = crate::openai_compat_usage::sinks();
+        let (recorder, capture, sink) = crate::usage_testkit::sinks();
         let req = request(s, sink);
         let op = s["op"].as_str().unwrap();
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
@@ -286,7 +286,7 @@ async fn go_reference_scenarios() {
             }
         }
         if op != "count"
-            && let Some(problem) = crate::openai_compat_usage::ttft_problem(
+            && let Some(problem) = crate::usage_testkit::ttft_problem(
                 &recorder.0.lock().unwrap(),
                 raw.is_some(),
                 raw.is_some() && !s["upstream"]["body"].as_str().unwrap_or_default().is_empty(),
@@ -415,7 +415,7 @@ async fn empty_error_body_starts_ttft_without_first_byte() {
     let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
     let cfg = Config::default();
     let cred = credential(s, &cfg);
-    let (recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+    let (recorder, _capture, sink) = crate::usage_testkit::sinks();
     let error = executor
         .execute(&cred, request(s, sink), &cfg, false)
         .await
@@ -423,7 +423,7 @@ async fn empty_error_body_starts_ttft_without_first_byte() {
         .expect("the 500");
     assert_eq!(error.status, 500);
     let reports = recorder.0.lock().unwrap();
-    assert_eq!(crate::openai_compat_usage::ttft_problem(&reports, true, false), None);
+    assert_eq!(crate::usage_testkit::ttft_problem(&reports, true, false), None);
 }
 
 /// Go's TestXAISpeechRequestURLStaysOnOfficialAPI and
@@ -500,7 +500,7 @@ async fn speech_errors_keep_go_scope() {
             *seen.lock().unwrap() = url.to_owned();
             redirect(url, &addr)
         });
-        let (_recorder, _capture, sink) = crate::openai_compat_usage::sinks();
+        let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
         let error = executor
             .speech(&credential(&s, &cfg), request(&s, sink), &cfg)
             .await

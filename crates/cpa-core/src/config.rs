@@ -472,10 +472,10 @@ impl PartialEq for Derived {
 impl Eq for Derived {}
 
 impl Config {
-    /// `models.catalog`, `models.codex-catalog` and `models.devin-catalog` (Go
-    /// `CatalogSources`); empty when unset.
-    pub fn catalog_sources(&self) -> [String; 3] {
-        ["catalog", "codex-catalog", "devin-catalog"].map(|name| {
+    /// `models.catalog` and `models.codex-catalog` (Go `CatalogSources` without the
+    /// removed Devin catalog); empty when unset.
+    pub fn catalog_sources(&self) -> [String; 2] {
+        ["catalog", "codex-catalog"].map(|name| {
             self.document
                 .get("models")
                 .and_then(|models| models.get(name))
@@ -933,6 +933,8 @@ fn decode(text: &str, mode: Decode) -> anyhow::Result<(Mapping, ConfigDocument)>
     }
     let mut document = ConfigDocument::from_mapping(root.clone())?;
     document.coerce_typed_scalars();
+    // Before the field checks, so a removed provider's setting reads as a migration.
+    crate::removed::config(document.value())?;
     schema::validate(document.value(), false)
         .and_then(|()| validate::decoded(document.value()))
         .map_err(|e| {
@@ -1963,10 +1965,13 @@ oauth-excluded-models: {{c: [{numbers}]}}
                 .collect::<String>()
         };
         for case in go["cases"].as_array().unwrap() {
-            let cfg = Config::parse(&without_plugins(case["yaml"].as_str().unwrap())).unwrap();
+            // The removed providers' settings (issue #49) and their checks go too.
+            let yaml = crate::removed::strip_settings(&without_plugins(case["yaml"].as_str().unwrap()));
+            let cfg = Config::parse(&yaml).unwrap();
             for check in case["checks"].as_array().unwrap() {
                 let path = check["rust"].as_str().unwrap();
-                if path.starts_with("plugins.") {
+                if path.starts_with("plugins.") || path.contains("openai-compatibility") || path.contains("antigravity")
+                {
                     continue;
                 }
                 let mut node = &cfg.document;
@@ -1981,7 +1986,10 @@ oauth-excluded-models: {{c: [{numbers}]}}
         }
         // A model with a display name written as a number registers under its prefix,
         // both as Go reads them.
-        let cfg = Config::parse(&without_plugins(go["cases"][0]["yaml"].as_str().unwrap())).unwrap();
+        let cfg = Config::parse(&crate::removed::strip_settings(&without_plugins(
+            go["cases"][0]["yaml"].as_str().unwrap(),
+        )))
+        .unwrap();
         let aliases = crate::registry::dynamic::global_aliases(&cfg);
         let models: Vec<(String, String)> = credentials::from_config(&cfg)
             .iter()

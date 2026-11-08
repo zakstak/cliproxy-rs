@@ -1,8 +1,11 @@
-# Device-provider fixtures (Kimi, Meta, Devin)
+# Device-provider fixtures (Meta)
+
+The Kimi and Devin fixtures were deleted with those executors (issue #49); the
+recording notes below still describe how the remaining Meta fixtures were made.
 
 Every JSON file here was produced by the unmodified Go executors and auth code of
 CLIProxyAPI at `6fecc6e`, run against a local raw HTTP/1.1 capture server. The Rust
-tests (`src/kimi_tests.rs` and siblings) replay the same scripted upstream responses and
+tests (`src/meta_tests.rs`) replay the same scripted upstream responses and
 compare what the Rust executors send and return. Expected values are never derived from
 the Rust code.
 

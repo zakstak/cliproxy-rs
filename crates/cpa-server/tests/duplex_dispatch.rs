@@ -165,9 +165,8 @@ impl Conductor {
         let executors = Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
         let (input, rx) = tokio::sync::mpsc::channel(1);

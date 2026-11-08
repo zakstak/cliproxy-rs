@@ -634,7 +634,7 @@ impl XaiAuth {
         if status != 200 {
             // ponytail: Go appends the response body; it is withheld because token
             // endpoints may echo credentials and the message reaches management clients
-            // (same choice as the Kimi refresh).
+            // (Go's choice for device-login refreshes).
             return Err(auth_error(
                 status,
                 format!("xai token request failed with status {status}"),
@@ -916,7 +916,7 @@ pub fn refresh_patch(
 /// SDK lead (`RefreshSoon`; requests keep the current token).
 pub fn needs_refresh(credential: &Credential, now: DateTime<Utc>) -> bool {
     !metadata_string(credential, "refresh_token").is_empty()
-        && crate::kimi_http::refresh_due(
+        && crate::helpers::refresh_due(
             credential,
             Some(chrono::Duration::from_std(REFRESH_LEAD).expect("lead fits")),
             now,
@@ -963,7 +963,7 @@ pub(crate) async fn login_with(auth: XaiAuth, auth_dir: &Path, no_browser: bool)
     if !code.user_code.is_empty() {
         print!("Then enter this code: {}\n\n", code.user_code);
     }
-    if !no_browser && crate::kimi_auth::open_browser(url) {
+    if !no_browser && crate::login::open_browser(url) {
         println!("Browser opened automatically.");
     }
     println!("Waiting for authorization...");
@@ -990,7 +990,7 @@ pub(crate) async fn login_with(auth: XaiAuth, auth_dir: &Path, no_browser: bool)
     tokio::task::spawn_blocking(move || {
         let existing = std::fs::read(&target).ok().filter(|raw| !raw.is_empty());
         let document = GoValue::Object(saved_document(metadata, existing.as_deref()).map_err(|e| auth_error(500, e))?);
-        crate::kimi_auth::write_private(&target, &document.encode_indented())
+        crate::login::write_private(&target, &document.encode_indented())
             .map_err(|_| auth_error(500, "xai: cannot write credential file"))
     })
     .await

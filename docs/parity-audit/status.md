@@ -1,5 +1,7 @@
 # Parity status, item by item
 
+> **Scope after issue #49.** This fork keeps only the Claude, Codex, Grok (`xai`) and Muse (`meta`) upstreams and the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses client protocols. Items for Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity, the OpenAI-compatible upstreams and their translators are out of scope and kept only as history; their statuses are not maintained. See [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md#removed-providers).
+
 Audit of 2026-10-20 (v0.2.6, d1261f2) against CLIProxyAPI v8.0.35 (`ae3ee3be`). Milestones audited: M1, M2, M3, M4, M5, M6 (every item in [checklist.md](checklist.md)). [docs/PARITY.md](../PARITY.md) explains the milestones and sums them up.
 
 Statuses:

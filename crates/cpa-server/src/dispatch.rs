@@ -516,22 +516,7 @@ fn route(rt: &Runtime, registry: &Registry, call: &Call) -> Result<(Vec<String>,
     if providers.is_empty() {
         return Err(Failure::UnknownModel(call.model.clone()).into());
     }
-    adjust_for_entry(call.entry, &mut providers);
     Ok((providers, resolved))
-}
-
-/// Go `adjustExecutionProvidersForEntryProtocol`.
-fn adjust_for_entry(entry: Format, providers: &mut Vec<String>) {
-    match entry {
-        Format::Interactions => {
-            if let Some(i) = providers.iter().position(|p| p == "gemini-interactions") {
-                let p = providers.remove(i);
-                providers.insert(0, p);
-            }
-        }
-        Format::OpenAI | Format::OpenAIResponse | Format::Claude | Format::Gemini => {}
-        _ => providers.retain(|p| p != "gemini-interactions"),
-    }
 }
 
 /// `thinking.ParseSuffix(model).ModelName` without trimming.
@@ -1196,43 +1181,15 @@ async fn run_routed(
             _ => (0, false),
         };
         let terminal = |round_error: RunError| upstream.clone().map(Fault::into_run_error).unwrap_or(round_error);
-        let pinned = call.pinned();
-        let credits = Credits {
-            providers: &providers,
-            model: &model,
-            aliases: &aliases,
-            pinned: pinned.as_deref(),
-            compact,
-        };
         if !retry_round {
-            return credits
-                .fallback(
-                    rt,
-                    &cfg,
-                    &policy,
-                    &call,
-                    &request,
-                    usage.as_ref(),
-                    terminal(round_error),
-                )
-                .await;
+            return Err(terminal(round_error));
         }
         let wait = {
             let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors);
             rt.store().retry_wait(&selection, &policy, status, &attempted, &admit)
         };
         let Some(wait) = wait else {
-            return credits
-                .fallback(
-                    rt,
-                    &cfg,
-                    &policy,
-                    &call,
-                    &request,
-                    usage.as_ref(),
-                    terminal(round_error),
-                )
-                .await;
+            return Err(terminal(round_error));
         };
         if !wait.is_zero() {
             tokio::time::sleep(jitter(wait, policy.max_retry_interval)).await;
@@ -1946,90 +1903,6 @@ pub fn jitter(wait: Duration, max: Duration) -> Duration {
     wait + Duration::from_nanos(hasher.finish() % range.as_nanos().max(1) as u64)
 }
 
-/// Go's Antigravity credits fallback (`shouldAttemptAntigravityCreditsFallback`,
-/// `tryAntigravityCreditsExecute` and its stream variant): after the last round, a
-/// Claude-model request that ended on quota or with nothing selectable is tried once
-/// more per Antigravity credential, in credits-hint order, with credits enabled.
-struct Credits<'a> {
-    providers: &'a [String],
-    model: &'a str,
-    aliases: &'a std::collections::HashMap<String, Vec<cpa_core::registry::dynamic::OAuthAlias>>,
-    pinned: Option<&'a str>,
-    compact: bool,
-}
-
-impl Credits<'_> {
-    /// Whether `error` qualifies: credits on, an Antigravity provider, and a 429/503 or
-    /// a selection that found every credential cooling or unavailable.
-    fn wanted(&self, cfg: &Config, error: &RunError) -> bool {
-        self.providers
-            .iter()
-            .any(|p| p.trim().eq_ignore_ascii_case("antigravity"))
-            && cpa_exec::antigravity_credits::enabled(cfg)
-            && match &error.failure {
-                Failure::Exec(e) => matches!(classify::go_status(e), 429 | 503),
-                Failure::Cooldown { .. } => true,
-                Failure::Unavailable { code, .. } => matches!(*code, "auth_not_found" | "auth_unavailable"),
-                _ => false,
-            }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn fallback(
-        &self,
-        rt: &Arc<Runtime>,
-        cfg: &Config,
-        policy: &Policy,
-        call: &Call,
-        request: &ExecRequest,
-        usage: Option<&Arc<crate::usage_record::Facts>>,
-        error: RunError,
-    ) -> Result<Done, RunError> {
-        // Go's ExecuteCount has no credits fallback; Execute and ExecuteStream do.
-        if request.operation == Operation::CountTokens
-            || !self.wanted(cfg, &error)
-            || !self.model.go_lower().contains("claude")
-        {
-            return Err(error);
-        }
-        let snapshot = rt.store().snapshot();
-        let ids = snapshot
-            .iter()
-            .filter(|c| !c.disabled && c.provider.trim().eq_ignore_ascii_case("antigravity"))
-            .filter(|c| self.pinned.is_none_or(|p| p.is_empty() || c.id == p))
-            .map(|c| c.id.as_str());
-        for id in cpa_exec::antigravity_credits::order_candidates(ids) {
-            let selection = Selection::new("antigravity", self.model);
-            let Some(lease) = rt
-                .lease_credential(&id, selection, cfg, cpa_exec::antigravity_credits::request_on)
-                .await
-            else {
-                continue;
-            };
-            let (models, alias) = registry::execution_models(self.aliases, &lease.credential, self.model);
-            if models.is_empty() {
-                continue;
-            }
-            let selection_model = registry::selection_model(self.aliases, &lease.credential, self.model);
-            let target = Target {
-                models: &models,
-                selection_model: &selection_model,
-                pooled: models.len() > 1,
-                alias: &alias,
-                compact: self.compact,
-                keep_model: call.selection_model.is_some(),
-                unauthorized: None,
-            };
-            // ponytail: a 401 inside a credits attempt retries with the refreshed
-            // credential, which no longer carries the credits flag.
-            if let Attempt::Done(done) = attempt(rt, cfg, policy, call, request, usage, lease, target).await {
-                return Ok(done);
-            }
-        }
-        Err(error)
-    }
-}
-
 enum Attempt {
     Done(Done),
     /// Terminal for the whole request.
@@ -2656,9 +2529,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = Arc::new(crate::testing::runtime(cfg.clone(), Vec::new(), executors));
         rt.usage_queue().configure(true, &cfg);

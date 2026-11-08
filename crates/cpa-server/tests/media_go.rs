@@ -266,8 +266,10 @@ async fn media_routes_match_go() {
     // (docs/DIFFERENCES-FROM-GO.md).
     let mut failures = replay("media", &media, |s| {
         if s.name.starts_with("models_grok_shell") {
-            s.response
-                .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
+            without_compat_models(
+                &s.response
+                    .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}")),
+            )
         } else {
             forward_port::gpt_image_26::error_message(&s.response)
         }
@@ -283,6 +285,20 @@ async fn media_routes_match_go() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+/// Go's model list without the recorded OpenAI-compatible group's models (`chat`,
+/// `img`), which went with that provider (issue #49). Other bytes stay as recorded.
+fn without_compat_models(body: &str) -> String {
+    let mut out = body.as_bytes().to_vec();
+    loop {
+        let ids = cpa_common::json::get(&out, "data.#.id");
+        let Some(i) = ids.array().iter().position(|id| matches!(&*id.str(), "chat" | "img")) else {
+            break;
+        };
+        assert!(cpa_common::json::delete(&mut out, &format!("data.{i}")));
+    }
+    String::from_utf8(out).unwrap()
 }
 
 /// Replays `fixture` on a fresh runtime; `expected` is the response a scenario must give.
@@ -302,15 +318,16 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     // soonest-reset, whose one probe per key reorders the two xAI keys across models
     // (docs/DIFFERENCES-FROM-GO.md "Default routing strategy"), so Go's is set.
     assert!(!config.contains("strategy:"), "the fixture leaves the strategy unset");
+    // The recorded OpenAI-compatible group went with that provider (issue #49).
+    let config = cpa_core::removed::strip_settings(&config);
     let config = format!("{config}\nrouting:\n  strategy: round-robin\n");
     let config = Config::parse(&config).expect("config parses");
     let credentials = cpa_core::config::credentials::load(&config);
     let executors = Executors {
         claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     cpa_server::install_registry(&rt);
@@ -329,6 +346,10 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     let client = wreq::Client::new();
     let mut failures = Vec::new();
     for s in &fixture.scenarios {
+        // Scenarios served by the removed OpenAI-compatible upstream (issue #49).
+        if s.name.contains("compat") || s.name == "gen_chat_model_rejected" {
+            continue;
+        }
         *upstream.replies.lock().unwrap() = s.upstreams.iter().cloned().collect();
         upstream.requests.lock().unwrap().clear();
         let method = wreq::Method::from_bytes(s.method.as_bytes()).unwrap();

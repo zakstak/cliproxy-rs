@@ -45,8 +45,6 @@ fn codex_target(executor: &str) -> bool {
 fn compat_translator(from: Format, to: Format) -> Option<cpa_translate::RequestFn> {
     Some(match (from, to) {
         (Format::Claude, Format::Codex) => cpa_translate::claude_to_codex_with_compat,
-        (Format::Claude, Format::Gemini) => cpa_translate::claude_to_gemini_with_compat,
-        (Format::Claude, Format::Interactions) => cpa_translate::claude_to_interactions_with_compat,
         (Format::Claude, Format::OpenAI) => cpa_translate::claude_to_openai_with_compat,
         (Format::OpenAI, Format::Claude) => cpa_translate::openai_to_claude_with_compat,
         (Format::OpenAIResponse, Format::Claude) => cpa_translate::responses_to_claude_with_compat,
@@ -94,27 +92,6 @@ pub(crate) fn translate_request(
         ctx.model,
         summary,
     ))
-}
-
-/// `TranslateRequestEnvelopeWithCodexMultiAgentV2`: the Responses orphan-delegation and
-/// multi-agent v2 rewrites (no integer tool-type normalization), then
-/// `cpa_translate::translate_request_envelope` with the attempt's model info.
-pub(crate) fn translate_request_envelope(
-    from: Format,
-    to: Format,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-    client: &Client<'_>,
-    model_info: Option<&cpa_core::registry::ModelInfo>,
-) -> Result<Vec<u8>, cpa_translate::Error> {
-    let mut payload = body.to_vec();
-    if from == Format::OpenAIResponse {
-        payload = cc::rewrite_orphan_delegation_input(client.headers, &payload, client.settings.orphan_delegation);
-        if !matches!(to, Format::Codex | Format::OpenAIResponse) {
-            payload = cc::rewrite_multi_agent_v2_input(client.headers, &payload, &client.settings, client.is_compat);
-        }
-    }
-    cpa_translate::translate_request_envelope(from, to, ctx, &payload, model_info)
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Model catalog updaters (Go internal/registry/catalog_sources.go): one updater each
-//! for models.json, the Codex client catalog and the Devin catalog. Each reads its
+//! for models.json and the Codex client catalog (Go's Devin catalog updater went with
+//! the Devin provider, issue #49). Each reads its
 //! effective source ([`effective_sources`]) now and every three hours, validates what it
 //! read, and publishes it only while that source is still the configured one. A failed
 //! read or an invalid catalog keeps the last valid one. A config reload that changes a
@@ -12,10 +13,9 @@
 //! rules (environment proxy, Go's redirects) and are bounded to 30 seconds; Go sets no
 //! timeout.
 //!
-//! The empty source of the Codex client and Devin catalogs starts lazily outside Home
-//! mode: with the first Codex or Devin credential, or (Codex) the first request from a
-//! Codex client that needs the catalog. Go starts them at launch. The Antigravity client
-//! version updater likewise starts with the first Antigravity credential.
+//! The empty source of the Codex client catalog starts lazily outside Home mode: with the
+//! first Codex credential or the first request from a Codex client that needs the
+//! catalog. Go starts it at launch.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -36,11 +36,6 @@ pub const MODELS_URLS: [&str; 2] = [
 const CODEX_URLS: [&str; 2] = [
     "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json",
     "https://models.router-for.me/codex_client_models.json",
-];
-/// Go `devinModelsURLs`.
-const DEVIN_URLS: [&str; 2] = [
-    "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/devin_models.json",
-    "https://models.router-for.me/devin_models.json",
 ];
 
 /// Go `ModelsRefreshInterval`.
@@ -296,8 +291,8 @@ fn publish_general(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The process-wide updaters: models.json, the Codex client catalog, the Devin catalog.
-static CATALOGS: LazyLock<[Arc<Updater>; 3]> = LazyLock::new(|| {
+/// The process-wide updaters: models.json and the Codex client catalog.
+static CATALOGS: LazyLock<[Arc<Updater>; 2]> = LazyLock::new(|| {
     [
         Updater::new(general_fetcher(owned(&MODELS_URLS)), Box::new(publish_general)),
         Updater::new(
@@ -308,25 +303,17 @@ static CATALOGS: LazyLock<[Arc<Updater>; 3]> = LazyLock::new(|| {
             ),
             Box::new(|data| cpa_common::codex_catalog::load(data).map(drop)),
         ),
-        Updater::new(
-            fetcher(cpa_core::registry::devin::EMBEDDED, owned(&DEVIN_URLS), |data| {
-                cpa_core::registry::devin::validate(data).map(drop)
-            }),
-            Box::new(|data| cpa_core::registry::devin::global().load(data, "catalog").map(drop)),
-        ),
     ]
 });
 
-/// Go `effectiveCatalogSources` over `[catalog, codex-catalog, devin-catalog]`: an
-/// empty source is `embed` under `--local-model`, and Home mode disables models.json and
-/// the Devin catalog whatever their source.
-pub(crate) fn effective_sources(sources: &[String; 3], local: bool, home: bool) -> [String; 3] {
+/// Go `effectiveCatalogSources` over `[catalog, codex-catalog]`: an empty source is
+/// `embed` under `--local-model`, and Home mode disables models.json whatever its source.
+pub(crate) fn effective_sources(sources: &[String; 2], local: bool, home: bool) -> [String; 2] {
     let mut effective = sources
         .clone()
         .map(|s| if s.is_empty() && local { EMBED.to_owned() } else { s });
     if home {
         effective[0] = DISABLED.to_owned();
-        effective[2] = DISABLED.to_owned();
     }
     effective
 }
@@ -340,8 +327,8 @@ struct Policy {
 }
 
 /// Go `configureCatalogs` for sources the config load already validated. At startup the
-/// empty Codex and Devin sources wait outside Home mode.
-fn configure(updaters: &[Arc<Updater>; 3], lifetime: &Lifetime, sources: &[String; 3], policy: Policy, startup: bool) {
+/// empty Codex source waits outside Home mode.
+fn configure(updaters: &[Arc<Updater>; 2], lifetime: &Lifetime, sources: &[String; 2], policy: Policy, startup: bool) {
     // Go `UpdateModelCatalogSources`: nothing after shutdown.
     if lifetime.token.is_cancelled() {
         return;
@@ -385,10 +372,10 @@ impl Session {
     }
 }
 
-/// Go `startModelCatalogUpdaters` and `misc.StartAntigravityVersionUpdater`, for the
-/// lifetime of `rt`: configures the catalogs from the current config, and every later
-/// config commit configures them again ([`Runtime::publish_config_and_policy`]). Call
-/// once per runtime. Cost while no Codex, Devin or Antigravity credential exists: one
+/// Go `startModelCatalogUpdaters`, for the lifetime of `rt`: configures the catalogs
+/// from the current config, and every later config commit configures them again
+/// ([`Runtime::publish_config_and_policy`]). Call once per runtime. Cost while no Codex
+/// credential exists: one
 /// parked task that looks at the credentials' providers after each change to the set.
 /// In Home mode the local store stays empty, so every updater starts at once, as in Go.
 pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
@@ -403,20 +390,13 @@ pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
         policy,
     });
     if home_enabled {
-        tracing::info!(
-            "Home mode: models.json and Devin catalog updates disabled; Codex client model list follows Home model IDs"
-        );
+        tracing::info!("Home mode: models.json updates disabled; Codex client model list follows Home model IDs");
     }
     if deny_default {
         return;
     }
     // Updaters that serve one provider, each started by that provider's first credential.
-    let mut wanted: Vec<(&'static str, fn())> = vec![
-        ("codex", || CATALOGS[1].wake()),
-        (cpa_exec::devin::PROVIDER, || CATALOGS[2].wake()),
-        // The client version Antigravity requests carry; Go refreshes it whatever the plan.
-        (cpa_exec::antigravity::PROVIDER, cpa_exec::antigravity_version::start),
-    ];
+    let mut wanted: Vec<(&'static str, fn())> = vec![("codex", || CATALOGS[1].wake())];
     if home_enabled {
         for (_, start) in wanted {
             start();
@@ -510,8 +490,8 @@ mod tests {
         let url = "https://example.com/catalog.json";
         for local in [false, true] {
             for home in [false, true] {
-                for mask in 0..8 {
-                    let sources: [String; 3] = std::array::from_fn(|i| {
+                for mask in 0..4 {
+                    let sources: [String; 2] = std::array::from_fn(|i| {
                         if mask & (1 << i) != 0 {
                             url.to_owned()
                         } else {
@@ -525,7 +505,7 @@ mod tests {
                         } else {
                             given.as_str()
                         };
-                        if home && index != 1 {
+                        if home && index == 0 {
                             want = DISABLED;
                         }
                         assert_eq!(
@@ -625,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn fetcher_reads_each_kind_of_source() {
         use axum::routing::get;
-        let catalogs: [(&str, &'static [u8], Validate); 3] = [
+        let catalogs: [(&str, &'static [u8], Validate); 2] = [
             ("general", cpa_core::registry::MODELS_JSON.as_bytes(), |d| {
                 cpa_core::registry::validate_catalog_json(&String::from_utf8_lossy(d))
             }),
@@ -634,9 +614,6 @@ mod tests {
                 cpa_common::codex_client::CLIENT_MODELS_JSON.as_bytes(),
                 cpa_common::codex_catalog::validate,
             ),
-            ("devin", cpa_core::registry::devin::EMBEDDED, |d| {
-                cpa_core::registry::devin::validate(d).map(drop)
-            }),
         ];
         let dir = std::env::temp_dir().join(format!("cpa-catalog-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -716,7 +693,7 @@ mod tests {
                     "/dots" => "/x/%2E%2e/catalog.json",
                     "/backslash" => "/a\\..\\catalog.json",
                     "/tab" => "/a/\t../catalog.json",
-                    _ => return cpa_core::registry::devin::EMBEDDED.into_response(),
+                    _ => return cpa_common::codex_client::CLIENT_MODELS_JSON.into_response(),
                 };
                 (
                     axum::http::StatusCode::FOUND,
@@ -726,9 +703,11 @@ mod tests {
             }
         });
         let addr = serve(app).await;
-        let fetch = fetcher(cpa_core::registry::devin::EMBEDDED, Vec::new(), |d| {
-            cpa_core::registry::devin::validate(d).map(drop)
-        });
+        let fetch = fetcher(
+            cpa_common::codex_client::CLIENT_MODELS_JSON.as_bytes(),
+            Vec::new(),
+            cpa_common::codex_catalog::validate,
+        );
         for path in [
             "/a/../catalog.json",
             "/my catalogs/../catalog.json",
@@ -822,15 +801,13 @@ mod tests {
     }
 
     /// Go TestCatalogPolicyHotReload, then the lazy default: at startup outside Home the
-    /// empty Codex and Devin sources wait for a wake, and a reload that changes one starts
-    /// it at once.
+    /// empty Codex source waits for a wake, and a reload that changes it starts it at once.
     #[tokio::test]
     async fn policy_follows_reloads_and_lifetimes() {
         let (general, mut general_rx) = echo();
         let (codex, mut codex_rx) = echo();
-        let (devin, mut devin_rx) = echo();
-        let updaters = [general.clone(), codex.clone(), devin.clone()];
-        let sources = |g: &str, c: &str, d: &str| [g.to_owned(), c.to_owned(), d.to_owned()];
+        let updaters = [general.clone(), codex.clone()];
+        let sources = |g: &str, c: &str| [g.to_owned(), c.to_owned()];
         let policy = |local, home| Policy {
             local,
             home,
@@ -838,32 +815,24 @@ mod tests {
         };
         let lifetime = Lifetime::new();
         let (url, codex_url) = ("https://example.com/general", "https://example.com/codex");
-        configure(&updaters, &lifetime, &sources(url, "", ""), policy(true, false), true);
+        configure(&updaters, &lifetime, &sources(url, ""), policy(true, false), true);
         assert_eq!(next(&mut general_rx).await, url);
         assert_eq!(next(&mut codex_rx).await, EMBED);
-        assert_eq!(next(&mut devin_rx).await, EMBED);
         configure(
             &updaters,
             &lifetime,
-            &sources("", codex_url, ""),
+            &sources("", codex_url),
             policy(true, false),
             false,
         );
         assert_eq!(next(&mut general_rx).await, EMBED);
         assert_eq!(next(&mut codex_rx).await, codex_url);
         let ignored = "https://example.com/ignored";
-        configure(
-            &updaters,
-            &lifetime,
-            &sources(ignored, "", ""),
-            policy(true, true),
-            false,
-        );
+        configure(&updaters, &lifetime, &sources(ignored, ""), policy(true, true), false);
         assert_eq!(next(&mut codex_rx).await, EMBED);
-        assert_eq!((source(&general), source(&devin)), (DISABLED.into(), DISABLED.into()));
-        configure(&updaters, &lifetime, &sources("", "", ""), policy(true, false), false);
+        assert_eq!(source(&general), DISABLED);
+        configure(&updaters, &lifetime, &sources("", ""), policy(true, false), false);
         assert_eq!(next(&mut general_rx).await, EMBED);
-        assert_eq!(next(&mut devin_rx).await, EMBED);
 
         // Shutdown fences reloads; a new lifetime restarts the same sources.
         lifetime.token.cancel();
@@ -871,43 +840,28 @@ mod tests {
         configure(
             &updaters,
             &lifetime,
-            &sources("", "https://example.com/stopped", ""),
+            &sources("", "https://example.com/stopped"),
             policy(true, false),
             false,
         );
         assert_eq!(generation(&codex), stopped, "reload after shutdown restarted a reader");
         let lifetime = Lifetime::new();
-        configure(
-            &updaters,
-            &lifetime,
-            &sources(ignored, "", ""),
-            policy(true, true),
-            true,
-        );
+        configure(&updaters, &lifetime, &sources(ignored, ""), policy(true, true), true);
         assert_eq!(next(&mut codex_rx).await, EMBED);
         assert_eq!(source(&general), DISABLED);
 
-        // The default source: models.json starts, Codex and Devin wait.
+        // The default source: models.json starts, Codex waits.
         let lifetime = Lifetime::new();
-        configure(&updaters, &lifetime, &sources("", "", ""), policy(false, false), true);
+        configure(&updaters, &lifetime, &sources("", ""), policy(false, false), true);
         assert_eq!(next(&mut general_rx).await, "");
-        configure(&updaters, &lifetime, &sources("", "", ""), policy(false, false), false);
+        configure(&updaters, &lifetime, &sources("", ""), policy(false, false), false);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(codex_rx.try_recv().is_err() && devin_rx.try_recv().is_err());
+        assert!(codex_rx.try_recv().is_err());
         codex.wake();
         assert_eq!(next(&mut codex_rx).await, "");
-        let devin_url = "https://example.com/devin";
-        configure(
-            &updaters,
-            &lifetime,
-            &sources("", "", devin_url),
-            policy(false, false),
-            false,
-        );
-        assert_eq!(next(&mut devin_rx).await, devin_url);
         // In Home mode the Codex default starts at launch.
         let lifetime = Lifetime::new();
-        configure(&updaters, &lifetime, &sources("", "", ""), policy(false, true), true);
+        configure(&updaters, &lifetime, &sources("", ""), policy(false, true), true);
         assert_eq!(next(&mut codex_rx).await, "");
     }
 
@@ -919,9 +873,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let dir = std::env::temp_dir().join(format!("cpa-updater-{}", uuid::Uuid::new_v4()));
         let cfg = cpa_core::config::Config::parse(&format!("auth-dir: {}\n", dir.display())).unwrap();

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 mod forward_port;
 mod plugins_removed;
+mod removed_settings;
 
 fn fixture() -> &'static Value {
     static FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
@@ -268,6 +269,17 @@ fn trusted_proxy_validation_errors_match_go_text() {
         // Errors Go finds while decoding carry LoadConfig's wrapper; yaml.v3's own
         // decode messages (line numbers, Go type names) are not ported, only the refusal.
         let want = case["error"].as_str().unwrap();
+        // A removed provider's setting fails with its migration guidance (issue #49).
+        let removed = [
+            "devin-catalog",
+            "antigravity",
+            "vertex",
+            "gemini-api-key",
+            "openai-compatibility",
+        ];
+        if removed.iter().any(|r| yaml.contains(r)) && got.contains("which is no longer supported") {
+            continue;
+        }
         match want.strip_prefix("failed to parse config file: ") {
             Some(yaml_error) if yaml_error.starts_with("yaml: ") => assert!(!got.is_empty(), "{yaml}"),
             Some(decoded) => assert_eq!(got, decoded, "{yaml}"),
@@ -342,7 +354,16 @@ fn oauth_only_presence_matches_go() {
             .filter(|f| *f != CODEX_UA_FIELD)
             .map(to_v8)
             .collect();
-        assert_eq!(Config::parse(&yaml).unwrap().oauth_only, want, "{yaml}");
+        // A removed provider's setting refuses the config (issue #49).
+        let yaml = cpa_core::removed::strip_settings(&yaml);
+        let want: std::collections::BTreeSet<String> = want.into_iter().filter(|f| !removed_path(f)).collect();
+        let got: std::collections::BTreeSet<String> = Config::parse(&yaml)
+            .unwrap()
+            .oauth_only
+            .into_iter()
+            .filter(|f| !removed_path(f))
+            .collect();
+        assert_eq!(got, want, "{yaml}");
     }
     // Go `ForAPIKey`: those fields read as zero for API-key credentials; the shared
     // `upstream.codex` value written at its historical path stays.
@@ -359,7 +380,7 @@ fn oauth_only_presence_matches_go() {
         serde_yaml_ng::Value::Bool(false)
     );
     assert!(view.oauth_only.is_empty());
-    let legacy = Config::parse(cases[0]["yaml"].as_str().unwrap()).unwrap();
+    let legacy = Config::parse(&cpa_core::removed::strip_settings(cases[0]["yaml"].as_str().unwrap())).unwrap();
     assert!(matches!(legacy.for_api_key(), std::borrow::Cow::Borrowed(_)));
 }
 
@@ -413,7 +434,8 @@ fn config_and_file_credentials_match_go_synthesizers() {
         let root = dir.join("fixture-root");
         std::fs::create_dir_all(root.join("auth")).unwrap();
         let path = root.join("config.yaml");
-        std::fs::write(&path, case["yaml"].as_str().unwrap()).unwrap();
+        // The removed providers' settings go (issue #49); their auth files stay unread.
+        std::fs::write(&path, cpa_core::removed::strip_settings(case["yaml"].as_str().unwrap())).unwrap();
         for (file, body) in case["files"].as_object().into_iter().flatten() {
             std::fs::write(root.join("auth").join(file), body.as_str().unwrap()).unwrap();
         }
@@ -428,19 +450,55 @@ fn config_and_file_credentials_match_go_synthesizers() {
             .iter()
             .map(|c| go_shape(c, &root))
             .collect();
-        let want: Vec<Value> = case["config"].as_array().unwrap().iter().map(go_expected).collect();
+        let want: Vec<Value> = case["config"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(go_expected)
+            .filter(|c| !removed_provider(c))
+            .collect();
         assert_eq!(got, want, "{name}: config credentials");
         compared += got.len();
         let got: Vec<Value> = credentials::from_auth_dir(&cfg)
             .iter()
             .map(|c| go_shape(c, &root))
             .collect();
-        let want: Vec<Value> = case["file"].as_array().unwrap().iter().map(go_expected).collect();
+        let want: Vec<Value> = case["file"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(go_expected)
+            .filter(|c| !removed_provider(c))
+            .collect();
         assert_eq!(got, want, "{name}: file credentials");
         compared += got.len();
         let _ = std::fs::remove_dir_all(&dir);
     }
-    assert_eq!(compared, 32, "every recorded Go credential was compared");
+    // 32 recorded; the rest are the removed providers' (issue #49).
+    assert_eq!(compared, 11, "every retained Go credential was compared");
+}
+
+/// A recorded Go credential of a provider this fork removed (issue #49).
+fn removed_provider(c: &Value) -> bool {
+    ["provider", "type"]
+        .iter()
+        .filter_map(|k| c[k].as_str())
+        .any(|p| cpa_core::removed::provider(p).is_some())
+}
+
+/// A recorded v8 path that configures a removed provider (issue #49).
+fn removed_path(path: &str) -> bool {
+    [
+        "antigravity",
+        "aistudio",
+        "devin",
+        "gemini",
+        "vertex",
+        "openai-compatibility",
+        "kimi",
+    ]
+    .iter()
+    .any(|p| path.contains(p))
 }
 
 mod access {
@@ -487,9 +545,8 @@ mod access {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let options = Options {
@@ -573,7 +630,15 @@ mod routes {
             write(scenario["yaml"].as_str().unwrap());
             // The fixtures set no auth-dir; never fall back to the real ~/.cli-proxy-api.
             let auth = dir.join("auth");
-            let mut cfg = Config::load(&path).unwrap();
+            // A scenario that starts from a removed provider's setting is refused at
+            // load (issue #49).
+            let mut cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains("which is no longer supported") => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+                loaded => loaded.unwrap(),
+            };
             cfg.auth_dir = auth.clone();
             let rt = Arc::new(cpa_server::testing::runtime(
                 cfg,
@@ -581,9 +646,8 @@ mod routes {
                 Executors {
                     claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: Default::default(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             let state = Management::with_options(
@@ -743,6 +807,25 @@ mod config_writes {
         }
     }
 
+    /// Recorded writes that set a removed provider's setting (issue #49), with this build's
+    /// refusal status. The file stays as it was; where Go accepted the write and it also
+    /// changed retained settings, those are written again and compared.
+    const REFUSED_WRITES: &[(&str, u16)] = &[
+        // PUT /config/oauth/excluded-models/gemini, then PATCH /config with a Gemini
+        // model alias: Go 200.
+        ("malformed_oauth_maps_are_rejected_before_sanitizing[4]", 422),
+        ("malformed_oauth_maps_are_rejected_before_sanitizing[5]", 422),
+        // PUT /config with Gemini keys, one with an invalid weight: Go 400 for the weight.
+        ("rejected_writes_leave_the_file[23]", 422),
+        // PUT /config/models/devin-catalog with an invalid URL: Go 422 for the URL.
+        ("model_catalog_sources[9]", 422),
+        // PUT /config/models with all three catalogs: Go 200; replayed without
+        // devin-catalog.
+        ("model_catalog_sources[23]", 422),
+        // v0 PUT /config.yaml with an invalid devin-catalog URL: Go 400 for the URL.
+        ("model_catalog_sources[28]", 422),
+    ];
+
     /// Scenarios whose file cliproxy-rs refuses to load where Go loads it
     /// (docs/DIFFERENCES-FROM-GO.md), with the refusal.
     /// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
@@ -815,6 +898,125 @@ mod config_writes {
         serde_json::to_value(v).unwrap()
     }
 
+    struct AnswerCtx<'a> {
+        name: &'a str,
+        i: usize,
+        at: &'a str,
+        status: u16,
+    }
+
+    /// A Go document (response or file) and this build's without the removed providers'
+    /// settings (issue #49). Where this build's is a config document, a file or a read,
+    /// it must hold none with a value; a write's answer rooted at its path
+    /// (`{"status":"ok"}` under `oauth.providers.aistudio.ws-auth`) is not one.
+    fn retained(go: &Value, rust: &Value, at: &str, failures: &mut Vec<String>) -> (Value, Value) {
+        retained_as(go, rust, true, at, failures)
+    }
+
+    fn retained_as(go: &Value, rust: &Value, document: bool, at: &str, failures: &mut Vec<String>) -> (Value, Value) {
+        let leaks = removed_settings::leaks(rust, None);
+        if document && !leaks.is_empty() {
+            failures.push(format!("{at}: removed settings: {leaks:?}"));
+        }
+        (removed_settings::without(go), removed_settings::without(rust))
+    }
+
+    /// A refused write's body without the removed settings, when it also writes retained
+    /// ones: a config upload as YAML, a JSON value written at `route`. `None` when only
+    /// removed settings were written.
+    fn retained_write(route: &str, body: &str) -> Option<String> {
+        if route.ends_with("/config.yaml") {
+            let kept = removed_settings::without_yaml(body);
+            return (kept != body).then_some(kept);
+        }
+        let parts: Vec<&str> = route
+            .strip_prefix("/config")?
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        let value: Value = serde_json::from_str(body).ok()?;
+        let kept = removed_settings::without(&rooted(route, &value));
+        let kept = parts.iter().try_fold(&kept, |node, part| node.get(*part))?;
+        // Only mappings left: the write set nothing else.
+        fn sets(v: &Value) -> bool {
+            v.as_object().is_none_or(|m| m.values().any(sets))
+        }
+        (*kept != value && sets(kept)).then(|| kept.to_string())
+    }
+
+    fn compare_answer(
+        ctx: &AnswerCtx,
+        step: &Value,
+        body: &str,
+        bytes_compared: &mut usize,
+        failures: &mut Vec<String>,
+    ) {
+        let AnswerCtx { name, i, at, status } = *ctx;
+        let want = &plugins_removed::without_plugins_value(&step["response"]);
+        if step["path"] == "/config.yaml" && step["method"] == "GET" && status == 200 {
+            let (want, got) = retained(want, &rust_yaml_value(body), at, failures);
+            if let Err(e) = same(&normalize(&want, true), &normalize(&got, false), "yaml view") {
+                failures.push(format!("{at}: {e}"));
+            }
+            let go_archived = step["raw_response"].as_str().unwrap().contains("# mystery-section");
+            assert_eq!(body.contains("# mystery-section"), go_archived, "{at}: archive in view");
+        } else if want.is_null() {
+            assert!(body.is_empty(), "{at}: {body}");
+        } else {
+            let got: Value = serde_json::from_str(body).unwrap();
+            // gin's exact bytes wherever the values agree exactly; key order always.
+            if let Some(raw) = step["raw_json"].as_str() {
+                let raw = &plugins_removed::without_plugins_json(raw);
+                if got == *want {
+                    *bytes_compared += 1;
+                    if body != *raw {
+                        failures.push(format!("{at}: bytes differ\n go: {raw}\n rs: {body}"));
+                    }
+                }
+                let go_raw: Value = serde_json::from_str(raw).unwrap();
+                if let Err(e) = same_key_order(&go_raw, &got, at) {
+                    failures.push(e);
+                }
+            }
+            if let Some(code) = want.get("error") {
+                assert_eq!(got["error"], *code, "{at}");
+                assert_eq!(got.get("field"), want.get("field"), "{at}");
+                assert_eq!(
+                    got.get("message").is_some(),
+                    want.get("message").is_some(),
+                    "{at}: {got}"
+                );
+                // Go's text, except where it is yaml.v3's typed-decode error, which
+                // cliproxy-rs words by setting (docs/DIFFERENCES-FROM-GO.md).
+                if let Some(go) = want.get("message").and_then(Value::as_str) {
+                    let step = format!("{name}[{i}]");
+                    let rust = match DECODE_MESSAGES.iter().find(|(s, _)| *s == step) {
+                        Some((_, rust)) => {
+                            assert!(go.contains("yaml: unmarshal errors:\n"), "{at}: {go}");
+                            *rust
+                        }
+                        None => go,
+                    };
+                    if got["message"] != rust {
+                        failures.push(format!("{at}: message {}, expected {rust:?}", got["message"]));
+                    }
+                }
+            } else {
+                // Values as written: `"on"` stays a string, as in Go's file.
+                let path = step["path"].as_str().unwrap();
+                let (want, got) = if path == "/config" || path.starts_with("/config/") {
+                    let read = step["method"] == "GET";
+                    retained_as(&rooted(path, want), &rooted(path, &got), read, at, failures)
+                } else {
+                    (want.clone(), got)
+                };
+                if let Err(e) = same(&normalize(&want, true), &normalize(&got, false), "response") {
+                    failures.push(format!("{at}: {e}"));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn go_config_v8_writes_replay_value_for_value() {
         let hash = bcrypt::hash("fake-secret", 4).unwrap();
@@ -824,6 +1026,11 @@ mod config_writes {
         let mut retired = 0;
         let mut failures: Vec<String> = Vec::new();
         let mut verified = HashSet::new();
+        let mut reseeded: Vec<String> = Vec::new();
+        let mut refused: Vec<(String, u16)> = Vec::new();
+        let mut replayed = 0;
+        let mut refused_only = 0;
+        let mut steps = 0;
         for scenario in fixture()["config_writes"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
             let dir = std::env::temp_dir().join(format!("cpa-config-{name}-{}", std::process::id()));
@@ -836,6 +1043,13 @@ mod config_writes {
                 let e = Config::load(&path).err().map(|e| format!("{e:#}"));
                 assert_eq!(e.as_deref(), Some(*refusal), "{name}");
                 if name != "plugin_entries_and_float_ints" {
+                    for i in 0..scenario["steps"].as_array().unwrap().len() {
+                        removed_settings::inventory(
+                            "manage_go.config_writes",
+                            &format!("{name}[{i}]"),
+                            "plugin_load_retired",
+                        );
+                    }
                     let _ = std::fs::remove_dir_all(&dir);
                     continue;
                 }
@@ -844,7 +1058,20 @@ mod config_writes {
                 let yaml = plugins_removed::without_plugins_yaml(scenario["yaml"].as_str().unwrap());
                 std::fs::write(&path, yaml.replace("$HASH", &hash)).unwrap();
             }
-            let mut cfg = Config::load(&path).unwrap();
+            // A scenario that starts from a removed provider's setting (issue #49) is
+            // refused at load; it replays from the same file without that setting.
+            let mut cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains(cpa_core::removed::GUIDANCE) => {
+                    let seed = std::fs::read_to_string(&path).unwrap();
+                    let retained = removed_settings::without_yaml(&seed);
+                    assert_ne!(retained, seed, "{name}: {e:#}");
+                    std::fs::write(&path, retained).unwrap();
+                    reseeded.push(name.to_owned());
+                    removed_settings::inventory("manage_go.config_writes", name, "seed_refused_then_retained");
+                    Config::load(&path).unwrap()
+                }
+                loaded => loaded.unwrap(),
+            };
             cfg.auth_dir = auth.clone();
             let rt = Arc::new(cpa_server::testing::runtime(
                 cfg,
@@ -852,9 +1079,8 @@ mod config_writes {
                 Executors {
                     claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: Default::default(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             let options = Options {
@@ -864,6 +1090,7 @@ mod config_writes {
             };
             let (base, server) = super::access::serve(Management::with_options(rt, path.clone(), options)).await;
             for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
+                steps += 1;
                 let method: wreq::Method = step["method"].as_str().unwrap().parse().unwrap();
                 // Paths are v8 management routes unless they name their API version.
                 let route = step["path"].as_str().unwrap();
@@ -873,16 +1100,18 @@ mod config_writes {
                 } else {
                     format!("{base}/v8/management{route}")
                 };
-                let res = client
-                    .request(method, url)
-                    .header("X-Test-Peer", "127.0.0.1:1")
-                    .bearer_auth("fake-secret")
-                    .body(step["body"].as_str().unwrap_or_default().to_owned())
-                    .send()
-                    .await
-                    .unwrap();
-                let status = res.status().as_u16();
-                let body = res.text().await.unwrap();
+                let request = |body: String| {
+                    client
+                        .request(method.clone(), &url)
+                        .header("X-Test-Peer", "127.0.0.1:1")
+                        .bearer_auth("fake-secret")
+                        .body(body)
+                        .send()
+                };
+                let sent = step["body"].as_str().unwrap_or_default();
+                let res = request(sent.to_owned()).await.unwrap();
+                let mut status = res.status().as_u16();
+                let mut body = res.text().await.unwrap();
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
                 // Go's plugin section reads and writes (other than the read-only
                 // `plugins.auth-revision`, refused alike) are refused here and change
@@ -896,75 +1125,55 @@ mod config_writes {
                         "{at}: file changed"
                     );
                     retired += 1;
+                    removed_settings::inventory("manage_go.config_writes", &format!("{name}[{i}]"), "plugin_retired");
                     continue;
                 }
-                assert_eq!(status, step["status"], "{at}: {body}");
-                let want = &plugins_removed::without_plugins_value(&step["response"]);
-                if step["path"] == "/config.yaml" && step["method"] == "GET" && status == 200 {
-                    let got = normalize(&rust_yaml_value(&body), false);
-                    if let Err(e) = same(&normalize(want, true), &got, "yaml view") {
-                        failures.push(format!("{at}: {e}"));
+                // A write that configures a removed provider is refused with its
+                // migration guidance and changes nothing (issue #49). Where Go accepted it
+                // with retained settings too, those are written again without the removed
+                // ones and compared; otherwise only the file is, with Go's.
+                let mut answered = true;
+                if removed_settings::is_refusal(status, &body) {
+                    refused.push((format!("{name}[{i}]"), status));
+                    assert_eq!(
+                        std::fs::read_to_string(&path).unwrap(),
+                        file_before,
+                        "{at}: file changed"
+                    );
+                    match retained_write(route, sent).filter(|_| step["status"] == 200) {
+                        Some(retained) => {
+                            let res = request(retained).await.unwrap();
+                            status = res.status().as_u16();
+                            body = res.text().await.unwrap();
+                            replayed += 1;
+                        }
+                        None => answered = false,
                     }
-                    let go_archived = step["raw_response"].as_str().unwrap().contains("# mystery-section");
-                    assert_eq!(body.contains("# mystery-section"), go_archived, "{at}: archive in view");
-                } else if want.is_null() {
-                    assert!(body.is_empty(), "{at}: {body}");
-                } else {
-                    let got: Value = serde_json::from_str(&body).unwrap();
-                    // gin's exact bytes wherever the values agree exactly; key order always.
-                    if let Some(raw) = step["raw_json"].as_str() {
-                        let raw = &plugins_removed::without_plugins_json(raw);
-                        if got == *want {
-                            bytes_compared += 1;
-                            if body != *raw {
-                                failures.push(format!("{at}: bytes differ\n go: {raw}\n rs: {body}"));
-                            }
-                        }
-                        let go_raw: Value = serde_json::from_str(raw).unwrap();
-                        if let Err(e) = same_key_order(&go_raw, &got, &at) {
-                            failures.push(e);
-                        }
-                    }
-                    if let Some(code) = want.get("error") {
-                        assert_eq!(got["error"], *code, "{at}");
-                        assert_eq!(got.get("field"), want.get("field"), "{at}");
-                        assert_eq!(
-                            got.get("message").is_some(),
-                            want.get("message").is_some(),
-                            "{at}: {got}"
-                        );
-                        // Go's text, except where it is yaml.v3's typed-decode error, which
-                        // cliproxy-rs words by setting (docs/DIFFERENCES-FROM-GO.md).
-                        if let Some(go) = want.get("message").and_then(Value::as_str) {
-                            let step = format!("{name}[{i}]");
-                            let rust = match DECODE_MESSAGES.iter().find(|(s, _)| *s == step) {
-                                Some((_, rust)) => {
-                                    assert!(go.contains("yaml: unmarshal errors:\n"), "{at}: {go}");
-                                    *rust
-                                }
-                                None => go,
-                            };
-                            if got["message"] != rust {
-                                failures.push(format!("{at}: message {}, expected {rust:?}", got["message"]));
-                            }
-                        }
-                    } else {
-                        // Values as written: `"on"` stays a string, as in Go's file.
-                        let path = step["path"].as_str().unwrap();
-                        let (want, got) = if path == "/config" || path.starts_with("/config/") {
-                            (rooted(path, want), rooted(path, &got))
-                        } else {
-                            (want.clone(), got)
-                        };
-                        if let Err(e) = same(&normalize(&want, true), &normalize(&got, false), "response") {
-                            failures.push(format!("{at}: {e}"));
-                        }
-                    }
+                }
+                if answered {
+                    assert_eq!(status, step["status"], "{at}: {body}");
+                    compare_answer(
+                        &AnswerCtx {
+                            name,
+                            i,
+                            at: &at,
+                            status,
+                        },
+                        step,
+                        &body,
+                        &mut bytes_compared,
+                        &mut failures,
+                    );
                 }
                 let file = std::fs::read_to_string(&path).unwrap();
                 let rust_file = rust_yaml_value(&file);
-                let go_file = plugins_removed::without_plugins_value(&step["file"]);
-                if let Err(e) = same(&normalize(&go_file, true), &normalize(&rust_file, false), "file")
+                let (go_file, rust_retained) = retained(
+                    &plugins_removed::without_plugins_value(&step["file"]),
+                    &rust_file,
+                    &at,
+                    &mut failures,
+                );
+                if let Err(e) = same(&normalize(&go_file, true), &normalize(&rust_retained, false), "file")
                     .and_then(|()| same_key(&step["file"], &rust_file, &mut verified))
                 {
                     failures.push(format!("{at}: {e}"));
@@ -978,17 +1187,49 @@ mod config_writes {
                 {
                     failures.push(format!("{at}: archive is not at the end\n{file}"));
                 }
-                compared += 1;
+                let class = match (
+                    answered,
+                    refused.last().is_some_and(|(at, _)| *at == format!("{name}[{i}]")),
+                ) {
+                    (true, true) => "refused_write_replayed",
+                    (true, false) => "compared",
+                    (false, _) => "refused_write",
+                };
+                removed_settings::inventory("manage_go.config_writes", &format!("{name}[{i}]"), class);
+                if answered {
+                    compared += 1;
+                } else {
+                    refused_only += 1;
+                }
             }
             server.abort();
             let _ = std::fs::remove_dir_all(&dir);
         }
+        eprintln!(
+            "config writes: {steps} steps run, {compared} compared ({bytes_compared} byte for byte, {replayed} \
+             replayed without removed settings), {refused_only} refused with the file compared, {retired} \
+             retired; reseeded {reseeded:?}; refused {refused:?}"
+        );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-        // 186 recorded steps: 4 in binary_plugin_pin refused at load, 10 plugin
-        // section reads/writes refused here, and 172 retained comparisons.
-        assert_eq!((compared, retired), (172, 10));
-        eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 136, "steps compared byte for byte");
+        // Scenarios whose seed configures a removed provider (issue #49): the original is
+        // refused, the rest of the file replays.
+        assert_eq!(
+            reseeded,
+            [
+                "null_writes_take_go_defaults",
+                "malformed_oauth_maps_are_rejected_before_sanitizing",
+                "model_catalog_sources"
+            ]
+        );
+        let want: Vec<(String, u16)> = REFUSED_WRITES.iter().map(|(s, c)| ((*s).to_owned(), *c)).collect();
+        assert_eq!(refused, want, "refused removed-provider writes");
+        // 186 recorded steps: 4 in binary_plugin_pin refused at load (plugins), 10 plugin
+        // section reads/writes retired here, the removed-provider writes refused, and every
+        // other step compared with Go.
+        assert_eq!(steps + 4, 186);
+        assert_eq!(compared + refused_only + retired, steps);
+        assert_eq!((compared, refused_only, replayed, retired), (167, 5, 1, 10));
+        assert_eq!(bytes_compared, 129, "steps compared byte for byte");
     }
 }
 
@@ -1052,7 +1293,46 @@ mod creds {
     }
 
     fn config_credentials(config: &Value) -> Vec<Value> {
-        let yaml = serde_yaml_ng::to_string(config).unwrap();
+        // The removed providers' settings go (issue #49).
+        let mut config = config.clone();
+        for (parent, keys) in [
+            (
+                &[][..],
+                &[
+                    "ws-auth",
+                    "gemini-api-key",
+                    "interactions-api-key",
+                    "vertex-api-key",
+                    "openai-compatibility",
+                    "antigravity",
+                    "devin",
+                ][..],
+            ),
+            (
+                &["api-keys"][..],
+                &["gemini", "interactions", "vertex", "openai-compatibility"][..],
+            ),
+            (
+                &["oauth", "providers"][..],
+                &[
+                    "aistudio",
+                    "antigravity",
+                    "devin",
+                    "kimi",
+                    "gemini",
+                    "gemini-cli",
+                    "vertex",
+                ][..],
+            ),
+        ] {
+            let node = parent.iter().try_fold(&mut config, |node, key| node.get_mut(*key));
+            if let Some(Value::Object(map)) = node {
+                for key in keys {
+                    map.remove(*key);
+                }
+            }
+        }
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
         let cfg = Config::parse(&yaml).unwrap();
         credentials::from_config(&cfg)
             .iter()
@@ -1066,9 +1346,24 @@ mod creds {
         let client = wreq::Client::new();
         let mut compared = 0;
         let mut bytes_compared = 0;
+        let mut adapted = 0;
+        let (mut refused, mut after_refusal, mut removed_only, mut recorded) = (0, 0, 0, 0);
         for scenario in fixture()["credentials"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
+            // dashboard_probes_are_rejected_without_side_effects replays this one.
             if name == "dashboard_probes" {
+                continue;
+            }
+            recorded += scenario["steps"].as_array().unwrap().len();
+            // Its credential is the runtime-only AI Studio `/v1/ws` relay session, the one
+            // kind of runtime credential Go registers (`Credential::relay_session`), and
+            // its steps read that provider's models: removed with it (issue #49).
+            if name == "runtime_credentials" {
+                assert_eq!(scenario["runtime_auths"], json!(["aistudio-0123456789abcdef"]));
+                removed_only += scenario["steps"].as_array().unwrap().len();
+                for i in 0..scenario["steps"].as_array().unwrap().len() {
+                    removed_settings::inventory("manage_go.credentials", &format!("{name}[{i}]"), "removed_only");
+                }
                 continue;
             }
             let log_files = scenario["log_files"].as_array();
@@ -1090,8 +1385,20 @@ mod creds {
                 .unwrap()
                 .replace("$HASH", &hash)
                 .replace("$AUTH", &auth.display().to_string());
-            std::fs::write(&path, yaml).unwrap();
-            let cfg = Config::load(&path).unwrap();
+            std::fs::write(&path, &yaml).unwrap();
+            // A seed with a removed provider's group (issue #49) is refused at load; it
+            // replays with that group as a retained provider's (see `RETAINED_GROUP`).
+            let cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains(cpa_core::removed::GUIDANCE) => {
+                    assert_eq!(name, "api_call_and_usage", "{e:#}");
+                    let (removed, retained) = RETAINED_GROUP;
+                    assert_eq!(yaml.matches(removed).count(), 1, "{name}");
+                    std::fs::write(&path, yaml.replace(removed, retained)).unwrap();
+                    adapted += 1;
+                    Config::load(&path).unwrap()
+                }
+                loaded => loaded.unwrap(),
+            };
             let scan = credentials::scan_auth_dir(&cfg);
             let mut loaded = scan.credentials;
             loaded.extend(credentials::from_config(&cfg));
@@ -1101,9 +1408,8 @@ mod creds {
                 Executors {
                     claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: Default::default(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             // As the binary records what it loaded.
@@ -1171,7 +1477,11 @@ mod creds {
             let mut last_cursor = "no-cursor".to_owned();
             for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
-                let step = &forward_ports(pin_pending_steps(step.clone(), name, i, &at));
+                let mut step = forward_ports(pin_pending_steps(step.clone(), name, i, &at));
+                if adapted > 0 && name == "api_call_and_usage" {
+                    step = retained_group_step(step);
+                }
+                let step = &step;
                 if let Some(ms) = step["sleep_ms"].as_u64() {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
@@ -1204,6 +1514,25 @@ mod creds {
                     .unwrap()
                     .replace(&root.display().to_string(), "/fixture-root")
                     .replace(&echo_url, "$ECHO");
+                // A removed provider's login is refused instead of stored (issue #49), and
+                // Go's later read of it matches nothing here: Go's own answer for a name
+                // without a credential (auth_files.go ListAuthFiles: 200, no files).
+                if step["path"].as_str().unwrap().contains("gem.json") {
+                    assert!(!auth.join("gem.json").exists(), "{at}: the refused login was stored");
+                    if step["method"] == "POST" {
+                        assert_eq!(status, 400, "{at}: {body}");
+                        assert!(removed_settings::is_refusal(status, &body), "{at}: {body}");
+                        refused += 1;
+                        removed_settings::inventory("manage_go.credentials", &format!("{name}[{i}]"), "refused_upload");
+                    } else {
+                        assert_eq!((step["method"].as_str(), status), (Some("GET"), 200), "{at}: {body}");
+                        let got: Value = serde_json::from_str(&body).unwrap();
+                        assert_eq!(got["files"], json!([]), "{at}");
+                        after_refusal += 1;
+                        removed_settings::inventory("manage_go.credentials", &format!("{name}[{i}]"), "after_refusal");
+                    }
+                    continue;
+                }
                 assert_eq!(status, step["status"], "{at}: {body}");
                 // New credentials (uploads) get indexes on both sides.
                 for c in rt.store().snapshot().iter() {
@@ -1289,6 +1618,10 @@ mod creds {
                         );
                         want["error"] = got["error"].clone();
                     }
+                    // Go also deletes the Gemini login this fork refused (issue #49).
+                    if name == "credential_inventory_and_edits" && step["path"] == "/credentials?all=true" {
+                        want["deleted"] = json!(want["deleted"].as_i64().unwrap() - 1);
+                    }
                     assert_eq!(got, want, "{at}");
                 }
                 // Auth dir contents, as JSON values read the way Go's snapshot reads them
@@ -1302,9 +1635,14 @@ mod creds {
                         .unwrap_or_else(|| json!(format!("raw:{}", String::from_utf8_lossy(&data))));
                     files.insert(entry.file_name().to_string_lossy().into_owned(), v);
                 }
+                // Without the refused Gemini upload (issue #49).
+                let mut want_files = step["files"].clone();
+                if let Some(map) = want_files.as_object_mut() {
+                    map.remove("gem.json");
+                }
                 assert_eq!(
                     go_numbers(&Value::Object(files)),
-                    go_numbers(&step["files"]),
+                    go_numbers(&want_files),
                     "{at}: auth dir"
                 );
                 if let Some(want) = step.get("log_dir") {
@@ -1330,6 +1668,12 @@ mod creds {
                     "{at}: config API keys"
                 );
                 compared += 1;
+                let class = if adapted > 0 && name == "api_call_and_usage" {
+                    "compared_retained_group"
+                } else {
+                    "compared"
+                };
+                removed_settings::inventory("manage_go.credentials", &format!("{name}[{i}]"), class);
             }
             server.abort();
             if let Some(echo) = echo_server {
@@ -1337,9 +1681,47 @@ mod creds {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
-        assert_eq!(compared, 222);
         eprintln!("credentials: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 174, "steps compared byte for byte");
+        assert_eq!(adapted, 1, "api_call_and_usage replays with a retained group");
+        // Every recorded step is classified: compared, the refused Gemini upload and the
+        // read after it, and the AI Studio relay scenario.
+        assert_eq!((recorded, refused, after_refusal, removed_only), (222, 1, 1, 15));
+        assert_eq!(compared + refused + after_refusal + removed_only, recorded);
+        assert_eq!(compared, 205);
+        assert_eq!(bytes_compared, 165, "steps compared byte for byte");
+    }
+
+    /// `api_call_and_usage` seeds an OpenAI-compatible group (issue #49) as its last
+    /// config credential. Its steps test shared api-call behaviour (token substitution
+    /// for the credential an `AuthIndex` names) and the usage view, not that provider, so
+    /// the group replays as a Codex API-key group with the same base URL and key: the
+    /// last config credential still substitutes `fake-compat`.
+    const RETAINED_GROUP: (&str, &str) = (
+        "  openai-compatibility:\n    - name: Compat-One\n      base-url: https://compat.example.invalid/v1\n      keys:\n        - api-key: fake-compat\n",
+        "  codex:\n    - base-url: https://compat.example.invalid/v1\n      keys:\n        - api-key: fake-compat\n",
+    );
+
+    /// Go's recording for that group, as the Codex group answers: the config's group
+    /// under `api-keys.codex` without its name, and the usage view's group, which Go
+    /// names after the OpenAI-compatible provider, under `codex`. Nothing else changes.
+    fn retained_group_step(mut step: Value) -> Value {
+        if let Some(keys) = step["config"]["api-keys"].as_object_mut()
+            && let Some(Value::Array(mut groups)) = keys.remove("openai-compatibility")
+        {
+            for group in &mut groups {
+                group.as_object_mut().unwrap().remove("name");
+            }
+            keys.insert("codex".into(), Value::Array(groups));
+        }
+        if step["path"] == "/observability/usage/api-keys" {
+            let usage = step["response"].as_object_mut().unwrap();
+            let group = usage.shift_remove("compat-one").expect("the group's usage");
+            usage.insert("codex".into(), group);
+            let raw = step["raw_json"].as_str().unwrap();
+            assert_eq!(raw.matches(r#""compat-one":"#).count(), 1);
+            step["raw_json"] = raw.replace(r#""compat-one":"#, r#""codex":"#).into();
+        }
+        step
     }
 
     /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model
@@ -1494,9 +1876,8 @@ mod creds {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let options = Options {

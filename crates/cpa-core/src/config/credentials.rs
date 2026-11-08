@@ -134,8 +134,6 @@ struct Key {
     rebuild_mid_system_message: bool,
     native_tool_search: bool,
     fingerprint_profile: String,
-    /// `vertex-api-key` `interactions` (Go 2d5351b3): native Interactions routing.
-    interactions: bool,
 }
 
 const SHARED: &[&str] = &[
@@ -220,7 +218,6 @@ fn decode(item: &serde_yaml_ng::Mapping) -> Key {
         alpha_search: boolean(get("alpha-search")).unwrap_or(false),
         disable_codex_cloaking: boolean(get("disable-codex-cloaking")),
         rebuild_mid_system_message: boolean(get("rebuild-mid-system-message")).unwrap_or(false),
-        interactions: boolean(get("interactions")).unwrap_or(false),
         native_tool_search: boolean(get("native-tool-search")).unwrap_or(false),
         fingerprint_profile: text(get("fingerprint-profile")),
     }
@@ -235,50 +232,7 @@ fn sanitized(cfg: &Config, family: &str) -> Vec<Key> {
             ..decode(item)
         })
         .collect();
-    let mut seen = HashSet::new();
     keys.retain_mut(|k| match family {
-        "gemini" | "interactions" => {
-            k.api_key = k.api_key.trim().to_owned();
-            k.base_url = k.base_url.trim().to_owned();
-            if k.api_key.is_empty() && k.base_url.is_empty() {
-                return false;
-            }
-            k.prefix = normalize_prefix(&k.prefix);
-            k.proxy_url = k.proxy_url.trim().to_owned();
-            k.excluded = normalize_excluded(&k.excluded);
-            let id = [
-                k.api_key.as_str(),
-                &k.base_url,
-                &k.proxy_url,
-                &k.prefix,
-                &sorted_headers(&k.headers),
-            ]
-            .join("\0");
-            seen.insert(id)
-        }
-        "vertex" => {
-            k.api_key = k.api_key.trim().to_owned();
-            if k.api_key.is_empty() {
-                return false;
-            }
-            k.prefix = normalize_prefix(&k.prefix);
-            k.base_url = k.base_url.trim().to_owned();
-            k.proxy_url = k.proxy_url.trim().to_owned();
-            k.excluded = normalize_excluded(&k.excluded);
-            // SanitizeVertexCompatKeys drops models without a name; since v8.0.35
-            // (d9451cb6) a model without an alias stays and registers under its name.
-            k.models = std::mem::take(&mut k.models)
-                .into_iter()
-                .map(|(n, a)| (n.trim().to_owned(), a.trim().to_owned()))
-                .filter(|(n, _)| !n.is_empty())
-                .collect();
-            k.raw_models.retain(|m| {
-                m.get("name")
-                    .and_then(Json::as_str)
-                    .is_some_and(|v| !v.trim().is_empty())
-            });
-            seen.insert(format!("{}|{}", k.api_key, k.base_url))
-        }
         "codex" | "xai" => {
             k.prefix = normalize_prefix(&k.prefix);
             k.base_url = k.base_url.trim().to_owned();
@@ -505,18 +459,6 @@ fn base_draft(ids: &mut Ids, kind: &str, source: &str, k: &Key, parts: &[&str]) 
     }
 }
 
-/// Go `util.OpenAICompatibleProviderKey`.
-pub fn openai_compat_provider(name: &str) -> String {
-    let name = name.trim().go_lower();
-    if name.is_empty() {
-        "openai-compatibility".into()
-    } else if name == "openai-compatibility" || name.starts_with("openai-compatible-") {
-        name
-    } else {
-        format!("openai-compatible-{name}")
-    }
-}
-
 /// Config-backed API-key credentials in Go's synthesis order. Weight bounds are
 /// already enforced by config validation.
 pub fn from_config(cfg: &Config) -> Vec<Credential> {
@@ -524,8 +466,7 @@ pub fn from_config(cfg: &Config) -> Vec<Credential> {
 }
 
 /// Where a config-backed credential's key lives in the v8 document:
-/// `api-keys.<family>[group].keys[key]`. `None` for OpenAI-compatibility entries
-/// (Go cannot toggle them per key either) and unknown IDs.
+/// `api-keys.<family>[group].keys[key]`. `None` for unknown IDs.
 pub fn config_key_location(cfg: &Config, id: &str) -> Option<KeyLocation> {
     synthesize(cfg)
         .into_iter()
@@ -544,43 +485,6 @@ pub struct KeyLocation {
 fn synthesize(cfg: &Config) -> Vec<(Credential, Option<KeyLocation>)> {
     let mut ids = Ids::default();
     let mut out: Vec<(Credential, Option<KeyLocation>)> = Vec::new();
-    for (family, kind, source, label, provider, section) in [
-        (
-            "gemini",
-            "gemini:apikey",
-            "gemini",
-            "gemini-apikey",
-            "gemini",
-            "gemini-api-key",
-        ),
-        (
-            "interactions",
-            "gemini-interactions:apikey",
-            "interactions",
-            "interactions-apikey",
-            "gemini-interactions",
-            "interactions-api-key",
-        ),
-    ] {
-        for k in sanitized(cfg, family) {
-            let headers = sorted_headers(&k.headers);
-            let parts = [&*k.api_key, &k.base_url, &k.proxy_url, &k.prefix, &headers];
-            let mut d = base_draft(&mut ids, kind, source, &k, &parts);
-            if !k.api_key.trim().is_empty() {
-                d.attrs.insert("api_key".into(), k.api_key.trim().into());
-            }
-            if !k.base_url.trim().is_empty() {
-                d.attrs.insert("base_url".into(), k.base_url.trim().into());
-            }
-            (d.provider, d.label, d.section) = (provider.into(), label.into(), section);
-            let origin = Some(KeyLocation {
-                family,
-                group: d.origin.0,
-                key: d.origin.1,
-            });
-            out.push((d.finish(Some(&k.excluded), &k.models, &k.raw_models), origin));
-        }
-    }
     for k in sanitized(cfg, "claude") {
         let (key, base) = (k.api_key.trim(), k.base_url.trim());
         if key.is_empty() && base.is_empty() {
@@ -662,158 +566,10 @@ fn synthesize(cfg: &Config) -> Vec<(Credential, Option<KeyLocation>)> {
             out.push((d.finish(Some(&k.excluded), &k.models, &k.raw_models), origin));
         }
     }
-    out.extend(openai_compat(cfg, &mut ids).into_iter().map(|c| (c, None)));
-    for k in sanitized(cfg, "vertex") {
-        let (key, base) = (k.api_key.trim(), k.base_url.trim());
-        let (id, token) = ids.next("vertex:apikey", &[key, base, &k.proxy_url]);
-        let mut attrs = BTreeMap::new();
-        attrs.insert("source".into(), format!("config:vertex-apikey[{token}]"));
-        attrs.insert("base_url".into(), base.into());
-        attrs.insert("provider_key".into(), "vertex".into());
-        attrs.insert("config_index".into(), k.index.to_string());
-        if k.priority != 0 {
-            attrs.insert("priority".into(), k.priority.to_string());
-        }
-        if let Some(w) = k.weight {
-            attrs.insert("weight".into(), w.max(0).to_string());
-        }
-        if !key.is_empty() {
-            attrs.insert("api_key".into(), key.into());
-        }
-        if k.interactions {
-            attrs.insert("interactions".into(), "true".into());
-        }
-        for (name, value) in &k.headers {
-            attrs.insert(format!("header:{name}"), value.clone());
-        }
-        let mut meta = Map::new();
-        if let Some(v) = k.disable_cooling {
-            meta.insert("disable_cooling".into(), v.into());
-        }
-        if let Some(v) = k.request_retry.filter(|v| *v >= 0) {
-            meta.insert("request_retry".into(), v.into());
-        }
-        let d = Draft {
-            origin: k.origin,
-            id,
-            provider: "vertex".into(),
-            label: "vertex-apikey".into(),
-            section: "vertex-api-key",
-            index: k.index,
-            prefix: k.prefix.trim().into(),
-            proxy_url: k.proxy_url.trim().into(),
-            attrs,
-            meta,
-        };
-        let origin = Some(KeyLocation {
-            family: "vertex",
-            group: d.origin.0,
-            key: d.origin.1,
-        });
-        out.push((d.finish(Some(&k.excluded), &k.models, &k.raw_models), origin));
-    }
     out
 }
 
-/// Lowercased names of the enabled `openai-compatibility` entries that
-/// `SanitizeOpenAICompatibility` keeps (a base URL is required).
-pub fn openai_compat_names(cfg: &Config) -> Vec<String> {
-    groups(cfg, "openai-compatibility")
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter(|g| !text(g.get("base-url")).trim().is_empty() && !boolean(g.get("disabled")).unwrap_or(false))
-        .map(|g| text(g.get("name")).trim().go_lower())
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
-fn openai_compat(cfg: &Config, ids: &mut Ids) -> Vec<Credential> {
-    let mut out = Vec::new();
-    let mut index = 0;
-    for group in groups(cfg, "openai-compatibility") {
-        let Some(g) = group.as_mapping() else { continue };
-        let base = text(g.get("base-url")).trim().to_owned();
-        if base.is_empty() {
-            continue; // SanitizeOpenAICompatibility
-        }
-        let i = index;
-        index += 1;
-        if boolean(g.get("disabled")).unwrap_or(false) {
-            continue;
-        }
-        let name = text(g.get("name")).trim().to_owned();
-        let provider_name = if name.is_empty() {
-            "openai-compatibility".to_owned()
-        } else {
-            name.go_lower()
-        };
-        let provider = openai_compat_provider(&provider_name);
-        let group_key = Key {
-            index: i,
-            priority: int(g.get("priority")).unwrap_or(0),
-            prefix: normalize_prefix(&text(g.get("prefix"))),
-            headers: headers(g.get("headers")),
-            disable_cooling: boolean(g.get("disable-cooling")),
-            request_retry: int(g.get("request-retry")),
-            rules: g
-                .get("request-scoped-errors")
-                .and_then(Value::as_sequence)
-                .cloned()
-                .unwrap_or_default(),
-            ..Key::default()
-        };
-        let models: Vec<(String, String)> = g
-            .get("models")
-            .and_then(Value::as_sequence)
-            .into_iter()
-            .flatten()
-            .map(|m| (text(m.get("name")), text(m.get("alias"))))
-            .collect();
-        let group_raw_models = raw_models(g.get("models"));
-        let kind = format!("openai-compatibility:{provider_name}");
-        let entries: Vec<&Value> = g
-            .get("keys")
-            .and_then(Value::as_sequence)
-            .into_iter()
-            .flatten()
-            .collect();
-        let mut push = |entry: Option<&Value>| {
-            let key = entry.map(|e| text(e.get("api-key"))).unwrap_or_default();
-            let key = key.trim();
-            let proxy = entry.map(|e| text(e.get("proxy-url"))).unwrap_or_default();
-            let proxy = proxy.trim();
-            let parts: Vec<&str> = if entry.is_some() {
-                vec![key, &base, proxy]
-            } else {
-                vec![&base]
-            };
-            let mut k = Key {
-                proxy_url: proxy.to_owned(),
-                weight: entry.and_then(|e| int(e.get("weight"))),
-                ..group_key.clone()
-            };
-            k.headers = group_key.headers.clone();
-            let mut d = base_draft(ids, &kind, &provider_name, &k, &parts);
-            d.attrs.insert("base_url".into(), base.clone());
-            d.attrs.insert("compat_name".into(), name.clone());
-            d.attrs.insert("provider_key".into(), provider.clone());
-            if !key.is_empty() {
-                d.attrs.insert("api_key".into(), key.into());
-            }
-            (d.provider, d.label, d.section) = (provider.clone(), name.clone(), "openai-compatibility");
-            out.push(d.finish(None, &models, &group_raw_models));
-        };
-        if entries.is_empty() {
-            push(None);
-        }
-        for entry in entries {
-            push(Some(entry));
-        }
-    }
-    out
-}
-
-/// One sanitized `api-keys.<family>` entry (Go `cfg.GeminiKey[i]`, `cfg.CodexKey[i]`,
+/// One sanitized `api-keys.<family>` entry (Go `cfg.ClaudeKey[i]`, `cfg.CodexKey[i]`,
 /// ...), as `LoadConfig` leaves it. `index` is its position, which config-backed
 /// credentials carry as the `config_index` attribute.
 #[derive(Debug, Clone, PartialEq)]
@@ -830,13 +586,9 @@ pub struct ApiKeyEntry {
 }
 
 /// The sanitized entries of one family, index-aligned with `config_index`.
-/// `family` is the section under `api-keys`: `gemini`, `interactions`, `vertex`,
-/// `claude`, `codex`, `xai` or `meta` (OpenAI compatibility has its own shape).
+/// `family` is the section under `api-keys`: `claude`, `codex`, `xai` or `meta`.
 pub fn api_key_entries(cfg: &Config, family: &str) -> Vec<ApiKeyEntry> {
-    if !matches!(
-        family,
-        "gemini" | "interactions" | "vertex" | "claude" | "codex" | "xai" | "meta"
-    ) {
+    if !matches!(family, "claude" | "codex" | "xai" | "meta") {
         return Vec::new();
     }
     sanitized(cfg, family)
@@ -910,39 +662,7 @@ pub fn api_key_config_proxy(cfg: &Config, c: &Credential) -> String {
     let attr = |k: &str| c.attributes.get(k).map(|v| v.trim()).unwrap_or_default();
     let fold = |a: &str, b: &str| a.go_eq_fold(b);
     let (key, base) = (attr("api_key"), attr("base_url"));
-    let compat = attr("compat_name");
-    if !compat.is_empty() || fold(c.provider.trim(), "openai-compatibility") {
-        if key.is_empty() {
-            return String::new();
-        }
-        let candidates: Vec<&str> = [compat, attr("provider_key"), c.provider.trim()]
-            .into_iter()
-            .filter(|v| !v.is_empty())
-            .collect();
-        for group in groups(cfg, "openai-compatibility") {
-            let Some(g) = group.as_mapping() else { continue };
-            // SanitizeOpenAICompatibility drops entries without a base URL.
-            if text(g.get("base-url")).trim().is_empty() || boolean(g.get("disabled")).unwrap_or(false) {
-                continue;
-            }
-            let name = text(g.get("name")).trim().to_owned();
-            if !candidates.iter().any(|cand| fold(cand, &name)) {
-                continue;
-            }
-            return g
-                .get("keys")
-                .and_then(Value::as_sequence)
-                .into_iter()
-                .flatten()
-                .find(|e| fold(text(e.get("api-key")).trim(), key))
-                .map(|e| text(e.get("proxy-url")).trim().to_owned())
-                .unwrap_or_default();
-        }
-        return String::new();
-    }
     let family = match c.provider.trim().go_lower().as_str() {
-        "gemini" => "gemini",
-        "gemini-interactions" => "interactions",
         "claude" => "claude",
         "codex" => "codex",
         "xai" => "xai",
@@ -1086,8 +806,12 @@ fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<C
         .unwrap_or_default()
         .trim()
         .go_lower();
-    if provider.is_empty() || provider == "gemini" || provider == "gemini-cli" {
+    if provider.is_empty() {
         return Ok(None);
+    }
+    // A saved login of a removed provider stays on disk, unread (issue #49).
+    if crate::removed::provider(&provider).is_some() {
+        return Err(crate::removed::credential_error(&provider));
     }
     let full = path.display().to_string();
     let mut attrs = BTreeMap::new();
@@ -1128,9 +852,6 @@ fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<C
     if let Some(aliases) = oauth_aliases(&meta) {
         attrs.insert("model_aliases".into(), aliases);
     }
-    if let Some(names) = openapi_models(&meta) {
-        attrs.insert("openapi_models".into(), names);
-    }
     // Invalid rules must not drop the credential: keep the valid entries and warn (Go
     // 1a28c61e). Only the credential's own rules are stored; the global
     // `oauth-excluded-models` apply at registration when there are none (Go b015f208).
@@ -1151,9 +872,6 @@ fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<C
         && !p.is_empty()
     {
         attrs.insert("fingerprint_profile".into(), p);
-    }
-    if matches!(provider.as_str(), "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com") {
-        kimi_attributes(&provider, &meta, &mut attrs);
     }
     if provider == "codex" {
         let plan = meta
@@ -1321,80 +1039,7 @@ fn go_alias_entries(raw: &Json) -> Option<Vec<Map<String, Json>>> {
     Some(out)
 }
 
-/// Go `applyOpenAPIModelsAttribute` (d9451cb6): the `openapi_models` and `models`
-/// names (a comma list, strings, or entries' `name`), first spelling of each kept.
-fn openapi_models(meta: &Map<String, Json>) -> Option<String> {
-    let mut seen = HashSet::new();
-    let mut names = Vec::new();
-    for raw in ["openapi_models", "models"].into_iter().filter_map(|key| meta.get(key)) {
-        crate::registry::dynamic::for_each_model_name(raw, |name| {
-            let name = name.trim();
-            if !name.is_empty() && seen.insert(name.go_lower()) {
-                names.push(name.to_owned());
-            }
-        });
-    }
-    (!names.is_empty()).then(|| names.join(","))
-}
-
 /// Go `codex.ParseJWTToken(...).GetPlanType()`, defaulting to "free".
-const KIMI_COM: &str = "kimi.com";
-const KIMI_AI: &str = "kimi.ai";
-
-/// Go `FileSynthesizer`'s Kimi branch: keep `domain` and `base_url`, canonicalize
-/// the domain and default the API base URL from the resolved domain.
-fn kimi_attributes(provider: &str, meta: &Map<String, Json>, attrs: &mut BTreeMap<String, String>) {
-    let text = |key: &str| {
-        meta.get(key)
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    };
-    let (domain, base_url) = (text("domain"), text("base_url"));
-    // Go `ResolveKimiDomainFromAuth`. Its metadata steps repeat the attribute
-    // steps, `type` equals the provider, and every provider that reaches this
-    // branch classifies, so the file-name fallback is unreachable.
-    let resolved = domain
-        .and_then(kimi_domain)
-        .or_else(|| base_url.and_then(kimi_url_domain))
-        .or_else(|| kimi_domain(provider))
-        .unwrap_or(KIMI_COM);
-    let normalized = domain.map_or(resolved, |d| {
-        kimi_domain(d).filter(|d| *d == KIMI_AI).unwrap_or(KIMI_COM)
-    });
-    attrs.insert("domain".into(), normalized.into());
-    let default_base = if resolved == KIMI_AI {
-        "https://api.kimi.ai/coding"
-    } else {
-        "https://api.kimi.com/coding"
-    };
-    attrs.insert("base_url".into(), base_url.unwrap_or(default_base).into());
-}
-
-/// Go `IsKimiAIDomain` / `IsKimiComDomain`.
-fn kimi_domain(s: &str) -> Option<&'static str> {
-    let d = s.trim().go_lower();
-    if matches!(d.as_str(), "kimi.ai" | "ai" | "kimi-ai") || d.ends_with(".kimi.ai") {
-        Some(KIMI_AI)
-    } else if matches!(d.as_str(), "kimi.com" | "com" | "kimi") || d.ends_with(".kimi.com") {
-        Some(KIMI_COM)
-    } else {
-        None
-    }
-}
-
-/// Go `isKimiAIHost` / `isKimiComHost`: a URL Go cannot parse classifies as neither.
-fn kimi_url_domain(raw: &str) -> Option<&'static str> {
-    let host = super::go_url::parse(raw.trim())?.hostname().trim().go_lower();
-    if host == KIMI_AI || host.ends_with(".kimi.ai") {
-        Some(KIMI_AI)
-    } else if host == KIMI_COM || host.ends_with(".kimi.com") {
-        Some(KIMI_COM)
-    } else {
-        None
-    }
-}
-
 fn codex_plan(token: &str) -> String {
     use base64::Engine;
     let payload = token.split('.').collect::<Vec<_>>();
@@ -1595,12 +1240,8 @@ pub fn auth_index(c: &Credential) -> String {
             let (key, base) = (attr("api_key"), attr("base_url"));
             let prefix = if key.is_empty() {
                 ""
-            } else if !attr("compat_name").is_empty() || provider == "openai-compatibility" {
-                "openai-compatibility"
             } else {
                 match provider.as_str() {
-                    "gemini" => "gemini-api-key",
-                    "gemini-interactions" => "interactions-api-key",
                     "codex" => "codex-api-key",
                     "xai" => "xai-api-key",
                     "claude" => "claude-api-key",
@@ -1665,137 +1306,6 @@ mod tests {
         );
     }
 
-    /// Go d9451cb6 (tests/reference/vertex_openapi_models): an auth file's
-    /// `model_aliases` attribute (now also from `models`, a list Go drops whole when an
-    /// entry does not decode) and `openapi_models` attribute, the models it registers
-    /// (a Vertex file adds the partner models it names and the OAuth alias targets),
-    /// the upstream model of each request, and AuthKind / AccountInfo for service
-    /// accounts and Sign in with ChatGPT sections.
-    #[test]
-    fn vertex_openapi_models_follow_go() {
-        use crate::registry::dynamic;
-        let go: Json =
-            serde_json::from_str(include_str!("../../tests/fixtures/vertex_openapi_models_go.json")).unwrap();
-        let cfg = Config::parse(go["yaml"].as_str().unwrap()).unwrap();
-        let aliases = dynamic::global_aliases(&cfg);
-        let dir = Path::new("/auths");
-        for f in go["files"].as_array().unwrap() {
-            let name = f["name"].as_str().unwrap();
-            let path = dir.join(format!("{name}.json"));
-            let c = from_file(&cfg, dir, &path, f["body"].as_str().unwrap().as_bytes())
-                .unwrap()
-                .unwrap();
-            let attrs: BTreeMap<&str, &str> = ["model_aliases", "openapi_models", "auth_kind", "excluded_models"]
-                .into_iter()
-                .filter_map(|k| Some((k, c.attributes.get(k)?.as_str())))
-                .collect();
-            assert_eq!(
-                serde_json::to_value(&attrs).unwrap(),
-                f["attributes"],
-                "{name}: attributes"
-            );
-            let mut models: Vec<Json> = dynamic::models_for(&cfg, &aliases, &c, 0)
-                .into_iter()
-                .map(|m| {
-                    let mut out = serde_json::json!({"id": m.id, "metadata_model_id": m.metadata_model_id,
-                        "display_name": m.display_name, "owned_by": m.owned_by, "type": m.kind,
-                        "user_defined": m.user_defined, "thinking": m.thinking.is_some()});
-                    if let Some(t) = &m.thinking {
-                        for (k, v) in [
-                            ("levels", Json::from(t.levels.clone())),
-                            ("min", Json::from(t.min)),
-                            ("max", Json::from(t.max)),
-                            ("zero", Json::from(t.zero_allowed)),
-                            ("dynamic", Json::from(t.dynamic_allowed)),
-                        ] {
-                            if !(v == 0 || v == false || v.as_array().is_some_and(Vec::is_empty)) {
-                                out[k] = v;
-                            }
-                        }
-                    }
-                    out
-                })
-                .collect();
-            models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-            assert_eq!(Json::Array(models.clone()), f["models"], "{name}: models");
-            for e in f["exec"].as_array().unwrap() {
-                let request = e["request"].as_str().unwrap();
-                let (upstream, _) = dynamic::execution_models(&aliases, &c, request);
-                let upstream = upstream.first().map_or(request, String::as_str);
-                assert_eq!(upstream, e["upstream"], "{name}: {request}");
-                let supports = models
-                    .iter()
-                    .any(|m| m["id"].as_str().unwrap().go_eq_fold(request.trim()));
-                assert_eq!(supports, e["supports"], "{name}: supports {request}");
-            }
-        }
-        for a in go["accounts"].as_array().unwrap() {
-            let meta: Map<String, Json> = serde_json::from_str(a["metadata"].as_str().unwrap()).unwrap();
-            let c = Credential {
-                id: "x".into(),
-                provider: "vertex".into(),
-                source: Source::File(dir.join("x.json")),
-                disabled: false,
-                label: String::new(),
-                attributes: BTreeMap::new(),
-                metadata: meta,
-                revision: 0,
-            };
-            let (kind, value) = dynamic::account_info(&c);
-            assert_eq!(
-                dynamic::auth_kind(&c).unwrap_or_default(),
-                a["kind"],
-                "{}",
-                a["metadata"]
-            );
-            assert_eq!(
-                (kind, value.as_str()),
-                (a["type"].as_str().unwrap(), a["value"].as_str().unwrap()),
-                "{}",
-                a["metadata"]
-            );
-        }
-    }
-
-    /// Go v8.0.35 `buildVertexCompatConfigModels` after the config load's sanitizer
-    /// (tests/reference/vertex_models): a model without an alias registers under its
-    /// trimmed name, one without a name is dropped, and the first ID wins case-blind.
-    /// The entry is not OpenAI-compatible although it carries a `provider_key`.
-    #[test]
-    fn vertex_config_models_follow_go() {
-        let go: Json = serde_json::from_str(include_str!("../../tests/fixtures/vertex_models_go.json")).unwrap();
-        let cfg = Config::parse(go["yaml"].as_str().unwrap()).unwrap();
-        let creds = from_config(&cfg);
-        let aliases = crate::registry::dynamic::global_aliases(&cfg);
-        let vertex = creds.iter().find(|c| c.provider == "vertex").unwrap();
-        let got: Vec<Json> = crate::registry::dynamic::models_for(&cfg, &aliases, vertex, 0)
-            .into_iter()
-            .map(|m| {
-                serde_json::json!({"id": m.id, "metadata_model_id": m.metadata_model_id,
-                    "display_name": m.display_name, "owned_by": m.owned_by, "type": m.kind})
-            })
-            .collect();
-        assert_eq!(Json::Array(got), go["models"]);
-
-        // Go `executionModelCandidatesWithAlias`: the upstream model each request
-        // executes as. `v-only` runs as `v3` (whose alias it is) although it registers
-        // as the alias-less `v-only`.
-        let exec = &go["execution"];
-        let cfg = Config::parse(exec["yaml"].as_str().unwrap()).unwrap();
-        let creds = from_config(&cfg);
-        let aliases = crate::registry::dynamic::global_aliases(&cfg);
-        for case in exec["cases"].as_array().unwrap() {
-            let key = case["api_key"].as_str().unwrap();
-            let c = creds
-                .iter()
-                .find(|c| c.attributes.get("api_key").map(String::as_str) == Some(key))
-                .unwrap();
-            let request = case["request"].as_str().unwrap();
-            let (got, _) = crate::registry::dynamic::execution_models(&aliases, c, request);
-            assert_eq!(Json::from(got), case["upstream"], "{key} {request:?}");
-        }
-    }
-
     /// yaml.v3 reads a plain scalar into a string field as its text, so a model name or
     /// alias written as a number or boolean (`0x1F`, `1.50`, `007`, `true`, aliased or
     /// merged in too) registers and executes as written, and so do exclusions and OAuth
@@ -1804,7 +1314,9 @@ mod tests {
     fn scalar_model_names_keep_their_yaml_text() {
         let go: Json = serde_json::from_str(include_str!("../../tests/fixtures/scalar_model_names_go.json")).unwrap();
         for section in ["yaml", "legacy", "lists", "legacy-lists"] {
-            let cfg = Config::parse(go[section]["yaml"].as_str().unwrap()).unwrap();
+            // The removed providers' sections (issue #49) and their keys' models go.
+            let yaml = crate::removed::strip_settings(go[section]["yaml"].as_str().unwrap());
+            let cfg = Config::parse(&yaml).unwrap();
             let aliases = crate::registry::dynamic::global_aliases(&cfg);
             // Exclusions and OAuth model aliases, where Go has them.
             if let Some(want) = go[section].get("oauth-excluded-models") {
@@ -1830,7 +1342,11 @@ mod tests {
                     .collect();
                 got.insert(c.attributes["api_key"].clone(), models.into());
             }
-            assert_eq!(Json::Object(got), go[section]["models"], "{section}");
+            let mut want = go[section]["models"].clone();
+            for removed in ["vk", "ok"] {
+                want.as_object_mut().unwrap().remove(removed);
+            }
+            assert_eq!(Json::Object(got), want, "{section}");
         }
         // A payload rule's model name is a Go string too, but its params are untyped:
         // a `models` list nested in them keeps its YAML types.
@@ -1853,29 +1369,32 @@ mod tests {
     #[test]
     fn resolve_api_key_entry_prefers_the_matching_config_index() {
         let cfg = Config::parse(
-            "api-keys:\n  gemini:\n    - base-url: https://g.example.invalid\n      headers: {X-A: one}\n      models: [{name: first}]\n      keys: [{api-key: same}]\n    - base-url: https://g.example.invalid\n      headers: {X-A: two}\n      models: [{name: second}]\n      keys: [{api-key: same}]\n",
+            "api-keys:\n  claude:\n    - base-url: https://g.example.invalid\n      headers: {X-A: one}\n      models: [{name: first}]\n      keys: [{api-key: same}]\n    - base-url: https://g.example.invalid\n      headers: {X-A: two}\n      models: [{name: second}]\n      keys: [{api-key: same}]\n",
         )
         .unwrap();
-        let entries = api_key_entries(&cfg, "gemini");
+        let entries = api_key_entries(&cfg, "claude");
         assert_eq!(entries.iter().map(|e| e.index).collect::<Vec<_>>(), [0, 1]);
         let creds = from_config(&cfg);
         assert_eq!(creds.len(), 2);
         let second = &creds[1];
         assert_eq!(second.attributes["config_index"], "1");
-        let bound = resolve_api_key_entry(&cfg, "gemini", second).unwrap();
+        let bound = resolve_api_key_entry(&cfg, "claude", second).unwrap();
         assert_eq!((bound.index, bound.models[0]["name"].as_str()), (1, Some("second")));
         let mut stale = second.clone();
         stale.attributes.insert("config_index".into(), "9".into());
-        assert_eq!(resolve_api_key_entry(&cfg, "gemini", &stale).unwrap().index, 0);
-        assert!(api_key_entries(&cfg, "openai-compatibility").is_empty());
+        assert_eq!(resolve_api_key_entry(&cfg, "claude", &stale).unwrap().index, 0);
+        assert!(
+            api_key_entries(&cfg, "gemini").is_empty(),
+            "a removed family has no entries"
+        );
     }
 
     /// Go `proxyURLFromAPIKeyConfig`: the first matching entry wins, so a repeated key
-    /// takes the earlier entry's `direct`, and compat keys match by name then key.
+    /// takes the earlier entry's `direct`.
     #[test]
     fn api_key_config_proxy_takes_the_first_matching_entry() {
         let cfg = Config::parse(
-            "api-keys:\n  claude:\n    - base-url: https://c.example.invalid\n      proxy-url: direct\n      keys: [{api-key: dup}]\n    - base-url: https://c.example.invalid\n      keys: [{api-key: dup, prefix: second}]\n  openai-compatibility:\n    - name: Off\n      disabled: true\n      base-url: https://o.example.invalid\n      keys: [{api-key: k, proxy-url: socks5://off.example.invalid:1}]\n    - name: One\n      base-url: https://o.example.invalid\n      keys: [{api-key: k, proxy-url: http://one.example.invalid:1}]\n",
+            "api-keys:\n  claude:\n    - base-url: https://c.example.invalid\n      proxy-url: direct\n      keys: [{api-key: dup}]\n    - base-url: https://c.example.invalid\n      keys: [{api-key: dup, prefix: second}]\n",
         )
         .unwrap();
         let creds = from_config(&cfg);
@@ -1885,8 +1404,6 @@ mod tests {
             .unwrap();
         assert_eq!(second.attributes.get("proxy_url"), None);
         assert_eq!(api_key_config_proxy(&cfg, second), "direct");
-        let compat = creds.iter().find(|c| c.attributes.contains_key("compat_name")).unwrap();
-        assert_eq!(api_key_config_proxy(&cfg, compat), "http://one.example.invalid:1");
     }
 
     /// Go `TestExtractExcludedModelsFromMetadata`.

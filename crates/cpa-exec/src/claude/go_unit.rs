@@ -108,7 +108,7 @@ fn reverse(value: &Value) -> alias::Reverse {
 async fn replay(test: &str, record: &Value) -> Result<Verdict, String> {
     let field = |name: &str| &record[name];
     let checked = match field("fn").as_str().unwrap() {
-        "execute" | "execute_stream" | "count_tokens" | "count_tokens_upstream" => {
+        "execute" | "execute_stream" | "count_tokens" => {
             return super::go_exec::replay(test, record).await;
         }
         "remap" => {
@@ -187,6 +187,21 @@ async fn replay_file(fixture: &Value, file: &str) {
             continue;
         }
         for (i, record) in records.as_array().unwrap().iter().enumerate() {
+            // Go's direct `countTokensUpstream` calls serve Kimi's embedded executor,
+            // which this fork removed (issue #49); the Claude executor counts as before.
+            if record["fn"] == "count_tokens_upstream" {
+                continue;
+            }
+            // Calls whose client speaks a format this fork removed (Gemini, Interactions;
+            // issue #49) have no route here.
+            let removed = |key: &str| {
+                record["options"][key]
+                    .as_str()
+                    .is_some_and(|f| !f.is_empty() && cpa_core::format::Format::parse(f).is_none())
+            };
+            if removed("source_format") || removed("response_format") {
+                continue;
+            }
             count += 1;
             match replay(test, record).await {
                 Ok(Verdict::Matched) => {}

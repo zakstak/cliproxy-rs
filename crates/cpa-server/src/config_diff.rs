@@ -685,6 +685,53 @@ fn provider_changes(out: &mut Vec<String>, old: &Value, new: &Value, family: &st
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A Go change line for a removed provider's setting (issue #49): this build refuses
+    /// the setting, so it never reports a change to it. Exact setting prefixes, and the
+    /// provider-keyed OAuth map lines whose channel is a removed provider.
+    fn removed_line(line: &str) -> bool {
+        const PREFIXES: [&str; 11] = [
+            "ws-auth: ",
+            "quota-exceeded.antigravity-credits: ",
+            "antigravity.",
+            "devin.",
+            "gemini-api-key count: ",
+            "interactions-api-key count: ",
+            "vertex-api-key count: ",
+            "gemini[",
+            "interactions[",
+            "vertex[",
+            "openai-compatibility:",
+        ];
+        PREFIXES.iter().any(|p| line.starts_with(p))
+            || ["oauth-excluded-models[", "oauth-model-alias["].iter().any(|map| {
+                line.strip_prefix(map)
+                    .and_then(|rest| rest.split_once(']'))
+                    .is_some_and(|(channel, _)| cpa_core::removed::provider(channel).is_some())
+            })
+    }
+
+    #[test]
+    fn removed_lines_are_exact() {
+        for line in [
+            "ws-auth: true -> false",
+            "antigravity.sensitive-words: 0 -> 2",
+            "gemini[0].models: updated (1 -> 1 entries)",
+            "oauth-excluded-models[gemini]: added (1 entries)",
+            "openai-compatibility:\n  provider updated: same (models 0 -> 1)",
+        ] {
+            assert!(removed_line(line), "{line}");
+        }
+        for line in [
+            "quota-exceeded.switch-project: false -> true",
+            "codex[0].models: updated (1 -> 1 entries)",
+            "oauth-excluded-models[claude]: removed",
+            "claude-api-key count: 0 -> 1",
+            "payload.override: updated (0 -> 0 rules)",
+        ] {
+            assert!(!removed_line(line), "{line}");
+        }
+    }
     #[test]
     fn real_go_reload_summaries_and_redaction() {
         let dir = std::env::temp_dir().join(format!("cpa-config-diff-{}", uuid::Uuid::new_v4()));
@@ -696,27 +743,78 @@ mod tests {
         };
         let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/config_diff_go.json")).unwrap();
         let mut refused = 0;
+        let mut normalized = Vec::new();
+        let mut retired_lines = 0;
         for (i, case) in list(&cases).iter().enumerate() {
-            let old = Config::parse(&private_paths(text(&case["old"]))).unwrap();
+            // A case that sets a removed provider's settings is refused at load (issue #49).
+            // It replays without any removed setting, inert ones too, and Go's lines for
+            // them retire. A case with inert ones only loads and compares as recorded.
+            let (old, new) = (private_paths(text(&case["old"])), private_paths(text(&case["new"])));
+            let mut refused_case = false;
+            for side in [&old, &new] {
+                if cpa_core::removed::strip_settings(side) != *side {
+                    let error = Config::parse(side).map(drop).unwrap_err().to_string();
+                    assert!(error.contains(cpa_core::removed::GUIDANCE), "case {i}: {error}");
+                    refused_case = true;
+                }
+            }
+            let (old, new) = if refused_case {
+                normalized.push(i);
+                (
+                    cpa_core::removed::strip_every_setting(&old),
+                    cpa_core::removed::strip_every_setting(&new),
+                )
+            } else {
+                (old, new)
+            };
+            let old = Config::parse(&old).unwrap();
             // A `codex-api-key` model marked `is-compat` makes the reload invalid (#28); the
             // running config stays, so there is no summary. Other providers keep the flag.
-            let new = match Config::parse(&private_paths(text(&case["new"]))) {
+            let new = match Config::parse(&new) {
                 Err(error) if error.to_string().contains("is-compat is no longer supported") => {
                     assert!(text(&case["new"]).contains("codex-api-key"), "case {i}: {error}");
+                    if std::env::var_os("CPA_COVERAGE_INVENTORY").is_some() {
+                        eprintln!("coverage\tconfig_diff\tcase {i}\tcodex_is_compat_refusal");
+                    }
                     refused += 1;
                     continue;
                 }
                 parsed => parsed.unwrap(),
             };
             let actual = details(&old, &new);
-            let expected: Vec<_> = list(&case["changes"])
-                .iter()
-                .map(|value| private_paths(text(value)))
-                .collect();
+            if refused_case {
+                assert!(!actual.iter().any(|l| removed_line(l)), "case {i}: {actual:?}");
+            }
+            let mut expected = Vec::new();
+            // The OpenAI-compatible summary continues on indented lines under its header.
+            let mut in_removed_block = false;
+            for line in list(&case["changes"]).iter().map(|value| private_paths(text(value))) {
+                in_removed_block = line == "openai-compatibility:" || (in_removed_block && line.starts_with("  "));
+                if refused_case && (removed_line(&line) || in_removed_block) {
+                    retired_lines += 1;
+                } else {
+                    expected.push(line);
+                }
+            }
             assert_eq!(json!(actual), json!(expected), "case {i}");
+            if std::env::var_os("CPA_COVERAGE_INVENTORY").is_some() {
+                let class = if refused_case {
+                    "refused_then_retained"
+                } else {
+                    "compared"
+                };
+                eprintln!("coverage\tconfig_diff\tcase {i}\t{class}");
+            }
             assert!(!actual.join("\n").contains("fixture-secret"));
         }
+        assert_eq!(list(&cases).len(), 62);
         assert_eq!(refused, 1, "the one Codex is-compat case");
+        assert_eq!(
+            normalized,
+            [1, 5, 6, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 38, 39, 40, 41, 48],
+            "cases refused, then replayed without removed-provider settings"
+        );
+        assert_eq!(retired_lines, 35, "Go's lines for removed-provider settings");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

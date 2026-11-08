@@ -129,7 +129,6 @@ fn render(case: &Map<String, Value>) -> Vec<String> {
             tab.data(Ok(keys::Data {
                 api_keys: strings(&input["keys"]),
                 providers,
-                openai: objects(&input.get("openai-compatibility").cloned().unwrap_or_default()),
             }));
             for _ in 0..presses(input.get("down")) {
                 tab.key("down");
@@ -209,6 +208,50 @@ fn render(case: &Map<String, Value>) -> Vec<String> {
     }
 }
 
+/// Go's lines without the providers this fork removed (issue #49): their API key sections
+/// on the keys tab, and their rows on the OAuth tab, where the cursor keeps its index.
+fn without_removed_providers(tab: &str, want: Vec<String>) -> Vec<String> {
+    const SECTIONS: [&str; 5] = [
+        "Gemini API Keys",
+        "Interactions API Keys",
+        "Vertex API Keys",
+        "OpenAI Compatibility",
+        "Gemini Interactions",
+    ];
+    const ROWS: [&str; 4] = ["Antigravity", "Kimi", "Devin", "Vertex"];
+    match tab {
+        "keys" => {
+            // Sections follow the header and are separated by blank lines.
+            let mut sections: Vec<Vec<String>> = vec![Vec::new()];
+            for line in want {
+                if line.is_empty() {
+                    sections.push(Vec::new());
+                } else {
+                    sections.last_mut().unwrap().push(line);
+                }
+            }
+            sections.retain(|s| !s.first().is_some_and(|h| SECTIONS.iter().any(|r| h.contains(r))));
+            sections.join(&String::new())
+        }
+        "oauth" => {
+            let row = |l: &String| l.starts_with("   ") || l.starts_with("▸  ");
+            let cursor = want.iter().filter(|l| row(l)).position(|l| l.starts_with('▸'));
+            let mut out: Vec<String> = want
+                .into_iter()
+                .filter(|l| !(row(l) && ROWS.iter().any(|r| l.contains(r))))
+                .map(|l| l.replacen("▸  ", "   ", 1))
+                .collect();
+            if let Some(i) = cursor
+                && let Some(line) = out.iter_mut().filter(|l| row(l)).nth(i)
+            {
+                *line = line.replacen("   ", "▸  ", 1);
+            }
+            out
+        }
+        _ => want,
+    }
+}
+
 #[test]
 fn tabs_render_like_go() {
     let _locale = i18n::LOCALE_LOCK
@@ -230,7 +273,7 @@ fn tabs_render_like_go() {
                 continue;
             }
         };
-        let mut want = strings(&case["lines"]);
+        let mut want = without_removed_providers(case["tab"].as_str().unwrap_or_default(), strings(&case["lines"]));
         if case["tab"] == "bars" && want[0].contains('\n') {
             // Go's lipgloss wraps a tab bar wider than the screen; this port cuts it.
             want[0] = got[0].clone();

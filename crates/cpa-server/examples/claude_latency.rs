@@ -669,9 +669,8 @@ fn main() {
     let executors = cpa_exec::Executors {
         claude: cpa_exec::claude::ClaudeExecutor::with_hooks(hooks, cpa_exec::claude::DEFAULT_BASE_URL),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let (proxy_addr, runtime) = proxy_rt.block_on(async {
         let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));

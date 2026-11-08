@@ -14,7 +14,6 @@ pub mod dispatch;
 mod error_events;
 mod errors;
 mod fs_events;
-mod gemini;
 mod gojson;
 mod home_models;
 pub mod home_session;
@@ -34,7 +33,6 @@ mod realtime;
 mod refresh;
 mod registrations;
 pub mod registry;
-mod relay;
 pub mod remote;
 pub mod request_logging;
 mod resp;
@@ -117,9 +115,6 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/v1/responses/compact", post(openai::compact))
         .route("/backend-api/codex/responses", post(openai::responses))
         .route("/backend-api/codex/responses/compact", post(openai::compact))
-        .route("/v1beta/models", get(models::gemini_list))
-        .route("/v1beta/interactions", post(gemini::interactions))
-        .route("/v1beta/models/{*action}", post(gemini::action).get(models::gemini_get))
         .merge(codex_alpha::routes())
         .merge(websocket::routes())
         // Only matched routes: gin's NoRoute runs no group middleware.
@@ -129,12 +124,9 @@ fn api(rt: Arc<Runtime>) -> Router {
         .route("/", get(root))
         .route("/anthropic/callback", get(callback))
         .route("/codex/callback", get(callback))
-        .route("/antigravity/callback", get(callback))
-        .route("/callback", get(devin_callback))
-        .route("/devin/callback", get(devin_callback))
+        .merge(removed_routes())
         .merge(v1)
         .merge(realtime::routes(&rt))
-        .merge(relay::routes(&rt))
         // Matched API routes only: management answers its own HEADs (plugin routes).
         .route_layer(middleware::from_fn(head_only_healthz))
         .method_not_allowed_fallback(|| async { StatusCode::NOT_FOUND })
@@ -142,6 +134,32 @@ fn api(rt: Arc<Runtime>) -> Router {
         .layer(middleware::from_fn(go_framing))
         .layer(middleware::from_fn(request_logging::response))
         .with_state(rt)
+}
+
+/// The client routes and OAuth callbacks of the providers this fork removed (issue #49):
+/// the Gemini and Gemini Interactions protocols, the AI Studio WebSocket relay and the
+/// Antigravity and Devin login callbacks. Each answers 410 Gone with migration guidance
+/// instead of the bare 404 of an unknown path, so a client still configured for them
+/// learns why.
+fn removed_routes() -> Router<Arc<Runtime>> {
+    use axum::routing::any;
+    let gone = |what: &'static str| {
+        any(move || async move {
+            let message = format!("{what} is no longer supported: {}", cpa_core::removed::GUIDANCE);
+            let body = serde_json::json!({
+                "error": {"message": message, "type": "invalid_request_error", "code": "removed_provider"}
+            });
+            respond::gin_json(410, body.to_string())
+        })
+    };
+    Router::new()
+        .route("/v1beta/models", gone("The Gemini API"))
+        .route("/v1beta/models/{*action}", gone("The Gemini API"))
+        .route("/v1beta/interactions", gone("The Gemini Interactions API"))
+        .route("/v1/ws", gone("The AI Studio relay"))
+        .route("/antigravity/callback", gone("Antigravity login"))
+        .route("/callback", gone("Devin login"))
+        .route("/devin/callback", gone("Devin login"))
 }
 
 /// gin registers HEAD for `/healthz` only, so a HEAD never falls back to a GET handler;
@@ -243,8 +261,7 @@ fn callback_query(query: &str, trim: bool) -> (String, String, String) {
 async fn callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri) -> Response {
     let provider = match uri.path() {
         "/anthropic/callback" => "anthropic",
-        "/codex/callback" => "codex",
-        _ => "antigravity",
+        _ => "codex",
     };
     let (code, state, error) = callback_query(uri.query().unwrap_or_default(), false);
     if !state.is_empty() {
@@ -263,32 +280,4 @@ async fn callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri)
         }
     }
     html()
-}
-
-async fn devin_callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri) -> Response {
-    let (code, state, error) = callback_query(uri.query().unwrap_or_default(), true);
-    let no_store = |mut res: Response| {
-        res.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        res
-    };
-    if code.is_empty() && error.is_empty() {
-        return no_store(respond::gin_json(
-            400,
-            r#"{"error":"code or error is required"}"#.into(),
-        ));
-    }
-    let delivered = rt.deliver_oauth_callback(&runtime::OAuthCallback {
-        provider: "devin",
-        state,
-        code,
-        error,
-    });
-    if delivered != runtime::OAuthDelivery::Delivered {
-        return no_store(respond::gin_json(
-            400,
-            r#"{"error":"invalid or expired OAuth callback"}"#.into(),
-        ));
-    }
-    no_store(html())
 }

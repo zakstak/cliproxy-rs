@@ -22,8 +22,6 @@ pub(crate) struct Snapshot {
 
 /// The replay payload of Go's envelope struct.
 pub(crate) enum Payload<'a> {
-    /// `Content json.RawMessage \`json:"content,omitempty"\`` (Kimi).
-    Content(&'a [u8]),
     /// `Contents []json.RawMessage \`json:"contents,omitempty"\`` (Claude).
     Contents(&'a [Vec<u8>]),
 }
@@ -99,10 +97,6 @@ pub(crate) fn envelope(generation: &str, payload: Option<Payload<'_>>) -> Vec<u8
     cpa_common::json::marshal_str(&mut out, generation.as_bytes(), true);
     match payload {
         None => out.extend_from_slice(b",\"deleted\":true"),
-        Some(Payload::Content(content)) if !content.is_empty() => {
-            out.extend_from_slice(b",\"content\":");
-            out.extend_from_slice(&cpa_common::json::compact(content, true));
-        }
         Some(Payload::Contents(contents)) if !contents.is_empty() => {
             out.extend_from_slice(b",\"contents\":[");
             for (i, content) in contents.iter().enumerate() {
@@ -199,10 +193,6 @@ mod tests {
     #[test]
     fn envelopes_marshal_like_go() {
         assert_eq!(envelope("g", None), br#"{"generation":"g","deleted":true}"#);
-        assert_eq!(
-            envelope("g", Some(Payload::Content(br#"[ {"a":"<&>"} ]"#))),
-            br#"{"generation":"g","content":[{"a":"\u003c\u0026\u003e"}]}"#
-        );
         assert_eq!(
             envelope("g", Some(Payload::Contents(&[b"[1]".to_vec(), b"[ 2 ]".to_vec()]))),
             br#"{"generation":"g","contents":[[1],[2]]}"#

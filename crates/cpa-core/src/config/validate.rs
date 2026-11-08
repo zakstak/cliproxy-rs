@@ -58,7 +58,7 @@ pub(super) fn codex_compat(cfg: &super::Config) -> Result<()> {
 /// with a host. Go walks a map, so with several invalid sources it names any one of
 /// them; this names the first in field order.
 pub fn catalog_sources(section: Option<&Value>) -> Result<()> {
-    for name in ["catalog", "codex-catalog", "devin-catalog"] {
+    for name in ["catalog", "codex-catalog"] {
         let source = text(section, name, "");
         if source.is_empty() || go_is_abs(&source) {
             continue;
@@ -359,7 +359,6 @@ mod tests {
             "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, is-compat: false}]}]\n",
             "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a}]}]\n",
             "claude-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, alias: b, is-compat: true}]}]\n",
-            "gemini-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
             "xai-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
         ] {
             assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");

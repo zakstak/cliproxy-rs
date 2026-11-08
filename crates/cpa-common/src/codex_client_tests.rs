@@ -53,15 +53,23 @@ fn replays_every_go_vector() {
                 assert_eq!(String::from_utf8(got).unwrap(), want, "{ctx}");
             }
             "spawn_models" => {
+                // A Gemini model's description came from the removed Gemini catalog
+                // section (issue #49); the recorded list without it is compared.
+                let gemini = |id: &str| id.starts_with("gemini-");
                 let available: Vec<AvailableModel> = v["models"]
                     .as_array()
                     .unwrap()
                     .iter()
+                    .filter(|m| !gemini(s(m, "id")))
                     .map(|m| AvailableModel {
                         id: s(m, "id").to_owned(),
                         display_name: s(m, "display_name").to_owned(),
                         description: s(m, "description").to_owned(),
                     })
+                    .collect();
+                let want: String = want
+                    .split_inclusive('\n')
+                    .filter(|line| !line.starts_with("- `gemini-"))
                     .collect();
                 assert_eq!(spawn_agent_models(&available, &registry_facts), want, "{ctx}");
             }

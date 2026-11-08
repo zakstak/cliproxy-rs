@@ -17,23 +17,19 @@
 //!   shared by every executor that serves Codex clients; owner: Codex).
 //! - `codex_catalog`: the Codex client model catalog and store (client/codex/models,
 //!   registry/codex_client_models.go; owner: Codex).
-//! - `gemini_schema`: util/gemini_schema.go (JSON Schema cleaning for Gemini and Antigravity
-//!   tool and response schemas; owner: translators).
+//! - `schema_refs`: util/gemini_schema.go `InlineLocalRefs` (local `$ref` inlining for tool
+//!   schemas; owner: xAI).
 //! - `session`: sdk/cliproxy/session (session identity, parent/child relationships and the
 //!   derived identity executors key provider sessions on; owner: server).
-//! - `cache`: internal/cache's Antigravity reasoning replay and thinking signature
-//!   caches, shared by the Antigravity translators and executor.
 //! - `gostr`: Go's `strings.ToLower`, `strings.EqualFold`, `strings.TrimSpace` and
 //!   `strconv.Quote` on Go's own Unicode tables (owner: Google).
 //!
 //! The proxy-aware HTTP client (executor/helps/proxy_helpers.go) touches the network and
 //! lives in cpa-exec instead.
 
-pub mod cache;
 pub mod codex_body;
 pub mod codex_catalog;
 pub mod codex_client;
-pub mod gemini_schema;
 pub mod gostr;
 pub mod headers;
 pub mod idle;
@@ -42,6 +38,7 @@ pub mod json;
 mod json_go_vectors;
 pub mod payload;
 pub mod schema;
+pub mod schema_refs;
 pub mod session;
 pub mod signature;
 pub mod thinking;

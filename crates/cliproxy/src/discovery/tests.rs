@@ -47,7 +47,6 @@ fn txt_records_match_go() {
             features: list(&o["Features"]),
             api_path_openai: s(&o["APIPathOpenAI"]),
             api_path_anthropic: s(&o["APIPathAnthropic"]),
-            api_path_gemini: s(&o["APIPathGemini"]),
             tls: o["TLS"].as_bool().unwrap(),
             auth_required: o["AuthRequired"].as_bool().unwrap(),
             auth_methods: list(&o["AuthMethods"]),
@@ -55,7 +54,25 @@ fn txt_records_match_go() {
             node_role: s(&o["NodeRole"]),
             advertise_management: o["AdvertiseManagement"].as_bool().unwrap(),
         };
-        assert_eq!(build_txt_records(&opts), list(&case["records"]), "{o}");
+        // No `api_gemini` record: this fork serves no Gemini API (issue #49). Its space can
+        // then hold a later record Go dropped at the size limit, which can in turn leave
+        // out one Go kept; the records before it and the limit still match.
+        let recorded = list(&case["records"]);
+        let gemini = recorded.iter().position(|r| r.starts_with("api_gemini="));
+        let want: Vec<String> = recorded
+            .iter()
+            .filter(|r| !r.starts_with("api_gemini="))
+            .cloned()
+            .collect();
+        let got = build_txt_records(&opts);
+        match gemini {
+            Some(cut) if got != want => {
+                assert_eq!(got[..cut], recorded[..cut], "{o}");
+                let size: usize = got.iter().map(|r| r.len() + 1).sum();
+                assert!(size <= MAX_TXT_BYTES, "{o}: {size} bytes");
+            }
+            _ => assert_eq!(got, want, "{o}"),
+        }
     }
 }
 
@@ -257,7 +274,7 @@ fn service_spec_follows_config_bind_host_and_tls() {
     let legacy = cpa_core::config::Config::parse("discovery:\n  enabled: true\n  service-type: ''\n").unwrap();
     let d = DiscoveryConfig::from_document(&legacy.document);
     assert!(d.enabled && d.auth_required.is_none());
-    assert_eq!((d.service_type.as_str(), d.subtypes.len()), (DEFAULT_SERVICE_TYPE, 5));
+    assert_eq!((d.service_type.as_str(), d.subtypes.len()), (DEFAULT_SERVICE_TYPE, 3));
 }
 
 #[test]

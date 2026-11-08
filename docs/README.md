@@ -5,7 +5,7 @@ New here? Start with [Getting started](GETTING-STARTED.md).
 | Page | For |
 |---|---|
 | [Getting started](GETTING-STARTED.md) | Installing, a first config, connecting an account and a tool, running it safely |
-| [Use it with your tools](CLIENTS.md) | Claude Code, Codex CLI, Gemini CLI, Amp, OpenCode, Cursor, Cline, Zed and more, plus the SDKs |
+| [Use it with your tools](CLIENTS.md) | Claude Code, Codex CLI, Amp, OpenCode, Cursor, Cline, Zed and more, plus the SDKs |
 | [Several accounts](MULTI-ACCOUNT.md) | Routing strategies, session affinity, cooldowns, the quota view, per-account proxies, remote access |
 | [Configuration](CONFIGURATION.md) | The `config.yaml` settings you are most likely to change |
 | [Install](INSTALL.md) | Supported hosts (Linux and the Linux container), building from source, Docker, manual configuration, starting at login |

@@ -8,26 +8,12 @@ pub enum Format {
     OpenAIResponse,
     /// Anthropic Messages.
     Claude,
-    /// Gemini generateContent.
-    Gemini,
     /// Codex flavour of the Responses API.
     Codex,
-    /// Antigravity envelope around Gemini.
-    Antigravity,
-    /// Gemini Interactions.
-    Interactions,
 }
 
 impl Format {
-    pub const ALL: [Format; 7] = [
-        Format::OpenAI,
-        Format::OpenAIResponse,
-        Format::Claude,
-        Format::Gemini,
-        Format::Codex,
-        Format::Antigravity,
-        Format::Interactions,
-    ];
+    pub const ALL: [Format; 4] = [Format::OpenAI, Format::OpenAIResponse, Format::Claude, Format::Codex];
 
     /// Identifier used by CLIProxyAPI in config and payload rules.
     pub fn as_str(self) -> &'static str {
@@ -35,10 +21,7 @@ impl Format {
             Format::OpenAI => "openai",
             Format::OpenAIResponse => "openai-response",
             Format::Claude => "claude",
-            Format::Gemini => "gemini",
             Format::Codex => "codex",
-            Format::Antigravity => "antigravity",
-            Format::Interactions => "interactions",
         }
     }
 

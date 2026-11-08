@@ -1,13 +1,13 @@
-//! Signed-thinking replay shared by Kimi and Claude API-key compat models
-//! (kimi_thinking_replay.go helpers that claude_thinking_replay.go reuses).
+//! Signed-thinking replay for Claude API-key compat models (the kimi_thinking_replay.go
+//! helpers that claude_thinking_replay.go reuses).
 //!
 //! Claude Code drops signed `thinking` blocks from history; some upstreams reject tool
 //! turns without them. A provider caches the complete assistant content of a response
 //! (signed thinking plus a tool call) per (model family, session) and restores it into
 //! the matching assistant turn of the next request. This module has the provider-neutral
 //! parts: the session key, the replayable check, turn restoration, the SSE accumulator and
-//! the stream wrapper. Each provider owns its cache and family (kimi_replay for Kimi; Go's
-//! Claude cache keeps up to 64 turns per session and restores each in order).
+//! the stream wrapper. The Claude executor owns its cache and family (Go's Claude cache
+//! keeps up to 64 turns per session and restores each in order).
 
 use std::collections::BTreeMap;
 
@@ -512,7 +512,7 @@ mod tests {
         // codexReasoningReplaySessionKey: Claude Code session, then the execution session
         // (not isolated per caller key), then payload and header keys.
         let fx = serde_json::json!({"request": {"body": "{}", "source": "claude", "model": "kimi-k3"}});
-        let mut req = crate::kimi_fixture::request(&fx, "");
+        let mut req = crate::device_fixture::request(&fx, "");
         req.headers.insert("session_id", "s1".parse().unwrap());
         assert_eq!(session_key(&req, b"{}"), "", "header sessions need a caller key");
         req.execution_session = Some(" e1 ".into());

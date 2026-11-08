@@ -543,9 +543,8 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
     // Like main.rs (and Go's global registry): translators and the Codex client rewrites

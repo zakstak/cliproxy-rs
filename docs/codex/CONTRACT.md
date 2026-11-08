@@ -141,7 +141,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Hand a WebSocket client each event's `data` payload as one text frame | A WebSocket turn served over HTTP | Transport framing. A WebSocket text frame carries one event; the bytes of each payload are unchanged. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
-| Convert Chat Completions, Claude Messages, Gemini or Interactions requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
+| Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
@@ -253,7 +253,7 @@ manifest dependencies, including consumers outside Codex Responses.
 | `crates/cpa-exec/src/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes |
 | `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request, OAuth and SIWC token files | Retained for those callers; the native boundary is not applied to raw schemas in generated bodies |
 | `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. No Codex route calls it; the registered Responses-to-Codex pair keeps it for the providers that share it | Other providers |
-| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs`, `codex_gemini.rs`, `codex_interactions.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; [Translated route](#translated-route) |
+| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; [Translated route](#translated-route) |
 | `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | Retained; #33 owns image model IDs |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | Retained |
@@ -538,8 +538,10 @@ upgrade, and the proxy's downstream upgrade has already succeeded.
 [#27](https://github.com/zakstak/cliproxy-rs/issues/27) puts this route in place. A
 request takes it when all of these hold:
 
-- its client format is Claude Messages, Chat Completions, Gemini or Gemini Interactions;
-  each has a registered built-in pair into Codex;
+- its client format is Claude Messages or Chat Completions; each has a registered
+  built-in pair into Codex. The Gemini and Gemini Interactions sources went with those
+  client protocols (issue #49): their routes answer 410, and the rows and refusals
+  below that name them are historical;
 - the selected credential is a built-in Codex credential, on any profile;
 - it is a generation (not compact or a token count).
 

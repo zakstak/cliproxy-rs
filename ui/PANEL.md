@@ -6,7 +6,7 @@ Tested against unmodified CLIProxyAPI at commit `6fecc6e` (v8.0.10), both the re
 
 ## What you get
 
-- Every screen: overview, credentials and account sign-in (OAuth, device codes, callback paste, Vertex import), provider API keys, client keys, models, payload rules, quotas, configuration (JSON and YAML with a reviewed diff), logs, usage and system.
+- Every screen: overview, credentials and account sign-in (OAuth, device codes, callback paste), provider API keys, client keys, models, payload rules, quotas, configuration (JSON and YAML with a reviewed diff), logs, usage and system.
 - It talks only to the server that serves it: the v8 Management API (`/v8/management/...`), plus `GET /v1/models` with a client key when the Use with tools page tests that key. JavaScript, CSS, the font and the icons are inside the file. It makes no other requests: no CDN, no web fonts, no analytics, no update checks of its own.
 - The management key is kept in the tab's memory only, never in browser storage. Reloading the page signs you out. The theme choice is the only thing stored.
 - It recognises the server from its `X-CPA-VERSION`, `X-CPA-COMMIT` and `X-CPA-BUILD-DATE` headers. On Go it assumes the full v8 API and sends no capability probes; every request it makes is one you triggered or a read for the screen you are on.
@@ -41,7 +41,7 @@ Place the file before the first visit to `/management.html`: if the file is miss
 
 SHA-256 of the `dist-panel/management.html` built from this commit:
 
-<!-- sha256 -->`d3aaf18a3788b0e699ed9d9521fb1d44361ccfec3897bc1c8260b9072230d0db`<!-- /sha256 -->
+<!-- sha256 -->`d32d1c1c023dc7334b38d2cc5111cef19d3894e17b601e95f3a09d3a4a0a0705`<!-- /sha256 -->
 
 ```sh
 sha256sum static/management.html

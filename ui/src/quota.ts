@@ -9,8 +9,6 @@ import { provider, quotaWindows, signalWindows, type Data, type Window } from ".
 const usageURL: Record<string, string> = {
   claude: "https://api.anthropic.com/api/oauth/usage",
   codex: "https://chatgpt.com/backend-api/wham/usage",
-  kimi: "https://api.kimi.com/coding/v1/usages",
-  "kimi-ai": "https://api.kimi.ai/coding/v1/usages",
 };
 export const quotaKey = (a: Data) => a.auth_index || a.name;
 /** The provider has a usage endpoint this server can call. */

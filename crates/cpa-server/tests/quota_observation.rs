@@ -95,8 +95,7 @@ async fn proxy(name: &str) -> Proxy {
             json!({"type":"claude"}),
             &[("api_key", "sk-fake-claude"), ("base_url", &upstream_url)],
         ),
-        credential("kimi-k.json", json!({"type":"kimi"}), &[]),
-        credential("devin-d.json", json!({"type":"devin"}), &[]),
+        credential("xai-x.json", json!({"type":"xai"}), &[]),
     ];
     let yaml = "api-keys:\n  - client-key\n";
     let rt = Arc::new(cpa_server::testing::runtime(
@@ -105,9 +104,8 @@ async fn proxy(name: &str) -> Proxy {
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let dir = std::env::temp_dir().join(format!("cpa-quota-{name}-{}", std::process::id()));
@@ -260,18 +258,13 @@ async fn restoring_a_cooldown_keeps_the_live_observation() {
 }
 
 /// TestProviderSupportsQuotaObservation and
-/// TestQuotaStateObserveResponseHeadersDropsKimiGrokAndAntigravitySignals: Claude,
-/// Codex and Devin report observations; every other provider reports empty signals.
+/// TestQuotaStateObserveResponseHeadersDropsKimiGrokAndAntigravitySignals: Claude and
+/// Codex report observations (Go's Devin did too, before its removal); every other
+/// provider, Grok included, reports empty signals.
 #[tokio::test]
 async fn only_observing_providers_report_snapshots() {
     let p = proxy("providers").await;
-    let mut signals = std::collections::BTreeMap::new();
-    signals.insert("plan".to_owned(), "pro".to_owned());
-    p.rt.executors.devices.devin.observe_quota("devin-d.json", signals);
-    let devin = p.entry("devin-d.json").await;
-    assert_eq!(devin["quota"]["signals"], json!({"plan": "pro"}));
-    assert!(devin["quota"]["observed_at"].is_string(), "{devin}");
-    let kimi = p.entry("kimi-k.json").await;
-    assert_eq!(kimi["quota"], json!({"signals": {}}));
-    assert!(kimi.get("model_quotas").is_none());
+    let xai = p.entry("xai-x.json").await;
+    assert_eq!(xai["quota"], json!({"signals": {}}));
+    assert!(xai.get("model_quotas").is_none());
 }

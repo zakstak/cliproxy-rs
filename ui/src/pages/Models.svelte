@@ -4,7 +4,7 @@
   import { readPath, label, type Data } from "../core";
   import Load from "../Load.svelte";
 
-  const channels = ["claude", "codex", "antigravity", "kimi", "xai", "meta", "vertex", "aistudio"];
+  const channels = ["claude", "codex", "xai", "meta"];
   let channel = $state("claude");
   let alias = $state({ name: "", alias: "", fork: false }),
     pattern = $state("");

@@ -67,9 +67,8 @@ fn app(dir: &std::path::Path, yaml: &str) -> (axum::Router, Arc<cpa_server::Runt
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let state = Management::with_options(rt.clone(), path, management::Options::default());
@@ -175,7 +174,8 @@ async fn body_limit_answers_match_go() {
         // failure is a plain-text 400 where gin's handlers write their own JSON 400
         // (docs/DIFFERENCES-FROM-GO.md).
         let status_only = STATUS_ONLY.contains(&name);
-        if retired(case["path"].as_str().unwrap()) {
+        let path = case["path"].as_str().unwrap();
+        if retired(path) {
             // A retired plugin route (docs/DIFFERENCES-FROM-GO.md "Native plugins"): a
             // declared length over the limit is still refused before routing, as Go
             // does; any other request gets the removal answer without its body read.
@@ -183,6 +183,24 @@ async fn body_limit_answers_match_go() {
             let removed = got.0 == 410 && got.2.contains("plugins_removed");
             if !(refused_early && got.0 == 413 || !refused_early && removed) {
                 failures.push(format!("{name}: got {got:?} on a retired plugin route"));
+            }
+        } else if path.starts_with("/v1beta/")
+            || [
+                "vertex",
+                "gemini-api-key",
+                "interactions-api-key",
+                "openai-compatibility",
+                "antigravity",
+                "kimi",
+                "devin",
+            ]
+            .iter()
+            .any(|p| path.contains(p))
+        {
+            // The removed providers' routes (issue #49) answer 410 with migration
+            // guidance before reading the body.
+            if got.0 != 410 || !got.2.contains("is no longer supported") {
+                failures.push(format!("{name}: got {got:?}, want a removed-provider 410"));
             }
         } else if status_only && got.0 != want.0 || !status_only && got != want {
             failures.push(format!("{name}: got {got:?}, want {want:?}"));

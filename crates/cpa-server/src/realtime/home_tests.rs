@@ -228,9 +228,8 @@ async fn start_rt(
         cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     rt.set_remote_dispatch(Some(home as Arc<dyn RemoteDispatch>));

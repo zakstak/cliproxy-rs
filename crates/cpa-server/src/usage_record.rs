@@ -221,18 +221,6 @@ fn unclassified(total: i64) -> Breakdown {
     }
 }
 
-/// Go `invalidUsageTokenBreakdown`.
-fn invalid(total: i64) -> Breakdown {
-    let total = total.max(0);
-    Breakdown {
-        quality: Quality::Inconsistent,
-        total,
-        input: [0; 4],
-        output: [0; 3],
-        unclassified: total,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Semantics {
     Unknown,
@@ -593,194 +581,6 @@ fn parse_claude_stream(line: &[u8]) -> Option<Detail> {
     node.exists().then(|| parse_claude_node(&node))
 }
 
-/// Go `safeUsageTokenSum`.
-fn safe_sum(values: &[i64]) -> Option<i64> {
-    sum(values)
-}
-
-/// Go `parseGeminiFamilyUsageDetail`.
-fn parse_gemini_node(node: &Res<'_>) -> Detail {
-    let cached = node.get("cachedContentTokenCount").int();
-    let tool_use = first(node, &["toolUsePromptTokenCount", "tool_use_prompt_token_count"]).int();
-    let input = safe_sum(&[node.get("promptTokenCount").int(), tool_use]);
-    let mut d = Detail {
-        input: input.unwrap_or(0),
-        output: node.get("candidatesTokenCount").int(),
-        reasoning: node.get("thoughtsTokenCount").int(),
-        total: node.get("totalTokenCount").int(),
-        cached,
-        cache_read: cached,
-        ..Detail::default()
-    };
-    if input.is_none() {
-        d.breakdown = Some(invalid(d.total));
-        return d;
-    }
-    if d.total == 0 {
-        match safe_sum(&[d.input, d.output, d.reasoning]) {
-            Some(total) => d.total = total,
-            None => {
-                d.total = 0;
-                d.breakdown = Some(invalid(0));
-                return d;
-            }
-        }
-    }
-    d.breakdown = Some(separate_reasoning(
-        d.input,
-        d.cache_read,
-        d.cache_creation,
-        d.output,
-        d.reasoning,
-        d.total,
-    ));
-    d
-}
-
-/// Go `ParseGeminiUsage`.
-pub fn parse_gemini(body: &[u8]) -> Detail {
-    let node = first(&gj::parse(body), &["usageMetadata", "usage_metadata"]);
-    if !node.exists() {
-        return Detail::default();
-    }
-    parse_gemini_node(&node)
-}
-
-/// Go `ParseGeminiStreamUsage`. The Gemini-family executors report the line Go parses
-/// (the Gemini executor's `FilterSSEUsageMetadata` payload, Vertex's raw line), so a
-/// non-terminal chunk's usage counts when it is reported.
-fn parse_gemini_stream(line: &[u8]) -> Option<Detail> {
-    let payload = json_payload(line).filter(|p| gj::valid(p))?;
-    let node = first(&gj::parse(payload), &["usageMetadata", "usage_metadata"]);
-    if !node.exists() {
-        return None;
-    }
-    let d = parse_gemini_node(&node);
-    has_tokens(&d).then_some(d)
-}
-
-/// Go `ParseAntigravityStreamUsage`: the wrapped `response.usageMetadata` first, and
-/// zero usage still counts.
-fn parse_antigravity_stream(line: &[u8]) -> Option<Detail> {
-    let payload = json_payload(line).filter(|p| gj::valid(p))?;
-    let node = first(
-        &gj::parse(payload),
-        &["response.usageMetadata", "usageMetadata", "usage_metadata"],
-    );
-    node.exists().then(|| parse_gemini_node(&node))
-}
-
-/// Go `parseInteractionsUsageDetail`.
-fn parse_interactions_node(node: &Res<'_>) -> Detail {
-    let cache_read = first(node, &["cache_read_tokens", "cacheReadTokens"]);
-    let tool_use = first(
-        node,
-        &[
-            "tool_use_tokens",
-            "total_tool_use_tokens",
-            "toolUseTokens",
-            "totalToolUseTokens",
-        ],
-    )
-    .int();
-    let input = safe_sum(&[
-        first(node, &["input_tokens", "prompt_tokens", "total_input_tokens"]).int(),
-        tool_use,
-    ]);
-    let mut d = Detail {
-        input: input.unwrap_or(0),
-        output: first(node, &["output_tokens", "completion_tokens", "total_output_tokens"]).int(),
-        reasoning: first(
-            node,
-            &["reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens"],
-        )
-        .int(),
-        total: first(node, &["total_tokens", "totalTokenCount"]).int(),
-        cached: first(
-            node,
-            &["cached_tokens", "cachedContentTokenCount", "total_cached_tokens"],
-        )
-        .int(),
-        cache_read: cache_read.int(),
-        cache_creation: first(
-            node,
-            &[
-                "cache_creation_tokens",
-                "cacheCreationTokens",
-                "cache_write_tokens",
-                "cacheWriteTokens",
-            ],
-        )
-        .int(),
-        ..Detail::default()
-    };
-    if input.is_none() {
-        d.breakdown = Some(invalid(d.total));
-        return d;
-    }
-    if !cache_read.exists() && d.cached > 0 {
-        d.cache_read = d.cached;
-    }
-    if d.total == 0 {
-        match safe_sum(&[d.input, d.output, d.reasoning]) {
-            Some(total) => d.total = total,
-            None => {
-                d.total = 0;
-                d.breakdown = Some(invalid(0));
-                return d;
-            }
-        }
-    }
-    d.breakdown = Some(separate_reasoning(
-        d.input,
-        d.cache_read,
-        d.cache_creation,
-        d.output,
-        d.reasoning,
-        d.total,
-    ));
-    d
-}
-
-/// Go `ParseInteractionsUsage`.
-pub fn parse_interactions(body: &[u8]) -> Detail {
-    let root = gj::parse(body);
-    let node = first(
-        &root,
-        &[
-            "usage",
-            "total_usage",
-            "metadata.total_usage",
-            "metadata.usage",
-            "usageMetadata",
-            "usage_metadata",
-            "interaction.usage",
-            "interaction.total_usage",
-            "interaction.metadata.total_usage",
-        ],
-    );
-    if !node.exists() {
-        return Detail::default();
-    }
-    let mut d = if node.get("promptTokenCount").exists() || node.get("candidatesTokenCount").exists() {
-        parse_gemini_node(&node)
-    } else {
-        parse_interactions_node(&node)
-    };
-    d.response_service_tier = service_tier(body);
-    d
-}
-
-/// Go `ParseInteractionsStreamUsage`.
-fn parse_interactions_stream(line: &[u8]) -> Option<Detail> {
-    let payload = json_payload(line).unwrap_or(line);
-    if payload.is_empty() || !gj::valid(payload) {
-        return None;
-    }
-    let d = parse_interactions(payload);
-    has_tokens(&d).then_some(d)
-}
-
 /// The buffered-response parser for a format (Go's executor for that format).
 pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     match format {
@@ -788,19 +588,6 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
         // A buffered Responses body is the completed response object: usage and
         // service_tier are top-level, as `ParseOpenAIUsage` reads them.
         Format::OpenAI | Format::OpenAIResponse | Format::Codex => parse_openai(body),
-        Format::Gemini => parse_gemini(body),
-        Format::Antigravity => {
-            let node = first(
-                &gj::parse(body),
-                &["response.usageMetadata", "usageMetadata", "usage_metadata"],
-            );
-            if node.exists() {
-                parse_gemini_node(&node)
-            } else {
-                Detail::default()
-            }
-        }
-        Format::Interactions => parse_interactions(body),
     }
 }
 
@@ -922,21 +709,6 @@ impl StreamUsage {
                     return;
                 }
                 if let Some(d) = parse_codex(payload) {
-                    self.observe(d);
-                }
-            }
-            Format::Gemini => {
-                if let Some(d) = parse_gemini_stream(line) {
-                    self.observe(d);
-                }
-            }
-            Format::Antigravity => {
-                if let Some(d) = parse_antigravity_stream(line) {
-                    self.observe(d);
-                }
-            }
-            Format::Interactions => {
-                if let Some(d) = parse_interactions_stream(line) {
                     self.observe(d);
                 }
             }
@@ -1658,7 +1430,7 @@ impl Facts {
 /// Cost: one walk over the body's top-level members (large values are skipped by
 /// bracket matching; nothing is decoded or copied), SHA-256 over the two values, and
 /// one 16-byte string.
-// ponytail: Chat Completions, Antigravity and Interactions bodies get none (their system
+// ponytail: Chat Completions bodies get none (their system
 // prompt is a message or sits in an envelope); add a lookup when a client of theirs
 // needs one.
 pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
@@ -1666,7 +1438,6 @@ pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
     let system: &[&[u8]] = match format {
         Format::Claude => &[b"system"],
         Format::OpenAIResponse | Format::Codex => &[b"instructions"],
-        Format::Gemini => &[b"systemInstruction", b"system_instruction"],
         _ => return String::new(),
     };
     let (mut tools, mut instructions) = (None, None);
@@ -2644,7 +2415,14 @@ mod tests {
         for (index, case) in cases.iter().enumerate() {
             let name = case["name"].as_str().unwrap();
             let s = |k: &str| case[k].as_str().unwrap_or_default().to_owned();
-            let format = Format::parse(&s("format")).unwrap();
+            // Gemini, Vertex, Interactions and OpenAI-compatible credentials were removed
+            // (issue #49).
+            let Some(format) = Format::parse(&s("format")) else {
+                continue;
+            };
+            if name.contains("compat") || name.starts_with("vertex ") {
+                continue;
+            }
             let lines: Vec<&str> = case["lines"]
                 .as_array()
                 .unwrap()
@@ -2810,9 +2588,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = std::sync::Arc::new(crate::testing::runtime(cfg.clone(), Vec::new(), executors));
         rt.usage_queue().configure(true, &cfg);
@@ -2857,21 +2634,22 @@ mod tests {
         use cpa_core::exec::{ExecError, FailureScope};
         let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
         let cases = fixture["reporter"].as_array().unwrap();
-        let gemini = [
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}}"#,
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}}"#,
-        ];
         let claude = [
             r#"data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":9,"output_tokens":1}}}"#,
             r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}"#,
         ];
         let kimi_chunk = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[{"index":0,"delta":{"content":"x"}}]}"#;
         let kimi_usage = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
-        let gemini_body = br#"{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":2,"totalTokenCount":4}}"#;
+        // Go's sequence published a Gemini body; the same counts as a Chat Completions body.
+        let usage_body = br#"{"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}"#;
         let error = |status: u16, text: &str| ExecError::local(status, FailureScope::Request, text);
         let rt = usage_runtime();
         for case in cases {
             let name = case["name"].as_str().unwrap();
+            // Gemini stream parsing went with the Gemini provider (issue #49).
+            if name.starts_with("gemini stream") {
+                continue;
+            }
             let (provider, model) = match name.split(' ').next().unwrap() {
                 "gemini" | "publish" | "failure" => ("gemini", "gemini-2.5-pro"),
                 "claude" => ("claude", "claude-sonnet-4-6"),
@@ -2896,14 +2674,6 @@ mod tests {
                 }
             };
             match name {
-                "gemini stream usage then scan error" => {
-                    lines(Format::Gemini, &gemini);
-                    tracker.fail(&error(0, "read: connection reset"));
-                }
-                "gemini stream usage" => {
-                    lines(Format::Gemini, &gemini);
-                    tracker.succeed();
-                }
                 "claude stream usage then scan error" => {
                     lines(Format::Claude, &claude);
                     tracker.fail(&error(502, "stream broke"));
@@ -2947,13 +2717,13 @@ mod tests {
                     tracker.fail(&error(403, "devin trailer: permission_denied"));
                 }
                 "publish then failure" => {
-                    sink.response_body(Format::Gemini, gemini_body);
+                    sink.response_body(Format::OpenAI, usage_body);
                     sink.publish();
                     tracker.fail(&error(500, "late"));
                 }
                 "failure then publish" => {
                     sink.publish_failure(429, "slow down");
-                    sink.response_body(Format::Gemini, gemini_body);
+                    sink.response_body(Format::OpenAI, usage_body);
                     sink.publish();
                     tracker.succeed();
                 }

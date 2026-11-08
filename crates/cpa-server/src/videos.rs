@@ -365,7 +365,7 @@ fn create_request_from_form(
     body: &[u8],
     limit: Option<u64>,
 ) -> Result<Vec<u8>, String> {
-    use cpa_exec::openai_compat_multipart::{MediaType, parse_media_type};
+    use cpa_exec::multipart::{MediaType, parse_media_type};
     let raw_type = headers
         .get(header::CONTENT_TYPE)
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
@@ -846,7 +846,7 @@ pub async fn create(
     client_request: axum::extract::Request,
 ) -> Response {
     use axum::extract::FromRequest as _;
-    use cpa_exec::openai_compat_multipart::{MediaType, parse_media_type};
+    use cpa_exec::multipart::{MediaType, parse_media_type};
     // Go answers these form types without reading the body: `parsePostForm` an unusable
     // urlencoded media type, `ParseMultipartForm` a multipart type or boundary it refuses.
     let raw_type = headers

@@ -68,7 +68,7 @@
             <label class="field">Model pattern<input required bind:value={form.model} /></label>
             <label class="field"
               >Protocol<select value={form.protocol} onchange={(e) => (form.protocol = e.currentTarget.value)}
-                ><option value="">Any</option>{#each ["openai", "claude", "gemini", "codex", "antigravity"] as p}<option>{p}</option>{/each}</select
+                ><option value="">Any</option>{#each ["openai", "claude", "codex"] as p}<option>{p}</option>{/each}</select
               ></label
             >
           </div>

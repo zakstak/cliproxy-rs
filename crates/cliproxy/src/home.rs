@@ -96,11 +96,6 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
         &["routing", "cooldown", "save-cooldown-status"],
         Some(Yaml::Bool(false)),
     );
-    set(
-        &mut doc,
-        &["oauth", "providers", "aistudio", "ws-auth"],
-        Some(Yaml::Bool(false)),
-    );
     set(&mut doc, &["management", "allow-remote"], Some(Yaml::Bool(false)));
     set(
         &mut doc,
@@ -423,16 +418,8 @@ impl Dispatcher {
             );
         }
         let supports = |provider: &str| self.rt.upgrade().is_some_and(|rt| rt.executors.supports(provider));
-        // Go: an unregistered provider with a base URL runs on the generic
-        // OpenAI-compatible executor.
-        if !supports(&credential.provider)
-            && credential
-                .attributes
-                .get("base_url")
-                .is_some_and(|u| !u.trim().is_empty())
-        {
-            credential.provider = "openai-compatibility".into();
-        }
+        // Go runs an unregistered provider with a base URL on its generic
+        // OpenAI-compatible executor, which this fork removed (issue #49).
         if !supports(&credential.provider) {
             end_scope(&scope);
             return Err(reject(502, "executor_not_found", "executor not registered"));
@@ -527,25 +514,11 @@ impl RemoteDispatch for Dispatcher {
     }
 }
 
-/// Go `executorKeyFromAuth`: the provider key executors are registered under.
-fn executor_key(provider: &str, label: &str, attributes: &BTreeMap<String, String>) -> String {
-    let attr = |key: &str| attributes.get(key).map(|v| v.trim()).unwrap_or_default();
-    if !attr("compat_name").is_empty() {
-        let key = if attr("provider_key").is_empty() {
-            attr("compat_name")
-        } else {
-            attr("provider_key")
-        };
-        return cpa_core::config::credentials::openai_compat_provider(key);
-    }
-    if provider.trim().eq_ignore_ascii_case("openai-compatibility") {
-        return cpa_core::config::credentials::openai_compat_provider(label.trim());
-    }
-    match provider.trim().go_lower().as_str() {
-        "kimi.com" => "kimi".into(),
-        "kimi.ai" => "kimi-ai".into(),
-        other => other.to_owned(),
-    }
+/// Go `executorKeyFromAuth`: the provider key executors are registered under, for the
+/// retained providers (its OpenAI-compatible and Kimi branches went with those
+/// providers, issue #49).
+fn executor_key(provider: &str) -> String {
+    provider.trim().go_lower()
 }
 
 /// Go's typed decoding of the dispatched auth's runtime state, on the reply as written:
@@ -622,7 +595,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
     cpa_core::config::credentials::validate_metadata(&metadata).map_err(|e| reject(502, "invalid_auth", e))?;
     let provider = text("provider").go_lower();
     let label = text("label");
-    let key = executor_key(&provider, &label, &attributes);
+    let key = executor_key(&provider);
     if provider.is_empty() || key.is_empty() {
         return Err(reject(502, "invalid_auth", "home returned auth without provider"));
     }
@@ -1074,16 +1047,6 @@ mod tests {
                 }
             }),
         );
-        let app = app.route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                axum::Json(serde_json::json!({
-                    "id": "c1", "object": "chat.completion", "created": 1, "model": "compat-up",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                }))
-            }),
-        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1091,14 +1054,14 @@ mod tests {
     }
 
     /// A Home whose RPOP replies come from `replies` in order (nil once empty).
-    async fn scripted(config: &'static str, replies: Vec<String>) -> FakeHome {
+    async fn scripted(config: &str, replies: Vec<String>) -> FakeHome {
         scripted_with_kv(config, replies, Default::default()).await
     }
 
     /// A Home serving `config`, the dispatch `replies` in order, and an in-memory KV
     /// seeded with `kv`.
     async fn scripted_with_kv(
-        config: &'static str,
+        config: &str,
         replies: Vec<String>,
         kv: std::collections::HashMap<String, String>,
     ) -> FakeHome {
@@ -1106,14 +1069,11 @@ mod tests {
     }
 
     /// [`scripted_with_kv`] with raw RPOP replies (errors as well as payloads).
-    async fn sequenced(
-        config: &'static str,
-        replies: Vec<Reply>,
-        kv: std::collections::HashMap<String, String>,
-    ) -> FakeHome {
+    async fn sequenced(config: &str, replies: Vec<Reply>, kv: std::collections::HashMap<String, String>) -> FakeHome {
+        let config = config.to_owned();
         let replies = Mutex::new(std::collections::VecDeque::from(replies));
         fake_home(with_kv(kv, move |args| match args[0].go_lower().as_str() {
-            "get" => fake::bulk(config),
+            "get" => fake::bulk(&config),
             "subscribe" => fake::raw(ACK),
             "ping" => fake::raw("+PONG\r\n"),
             "rpop" => replies
@@ -1212,9 +1172,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         node_full(home, executors, vec![]).await
     }
@@ -1380,21 +1339,20 @@ mod tests {
 
     #[test]
     fn dispatched_auths_become_runtime_credentials() {
-        let raw = br#"{"model":"gpt-up","auth_index":"i1","force_mapping":true,"original_alias":"pretty","auth":{"id":"c1","provider":"openai-compatibility","label":"Acme","prefix":"team","proxy_url":"socks5://p","attributes":{"api_key":"k","base_url":"http://127.0.0.1:1","compat_name":"acme"},"metadata":{"x":1}}}"#;
+        let raw = br#"{"model":"gpt-up","auth_index":"i1","force_mapping":true,"original_alias":"pretty","auth":{"id":"c1","provider":"Codex","label":"Acme","prefix":"team","proxy_url":"socks5://p","attributes":{"api_key":"k","base_url":"http://127.0.0.1:1"},"metadata":{"x":1}}}"#;
         let response = DispatchResponse::parse(raw).unwrap();
         let c = credential(&response, "team/pretty(high)").unwrap();
-        assert_eq!(c.provider, "openai-compatible-acme", "Go executorKeyFromAuth");
+        assert_eq!(c.provider, "codex", "Go executorKeyFromAuth");
         assert_eq!(c.attributes["prefix"], "team");
         assert_eq!(c.attributes["proxy_url"], "socks5://p");
         assert_eq!(c.attributes[cpa_server::remote::UPSTREAM_MODEL], "gpt-up");
         assert_eq!(c.attributes[cpa_server::remote::ORIGINAL_ALIAS], "pretty");
-        assert_eq!(c.attributes[cpa_server::remote::PROVIDER], "openai-compatibility");
+        assert_eq!(c.attributes[cpa_server::remote::PROVIDER], "Codex");
         assert!(matches!(c.source, Source::Config { .. }));
         assert_eq!(c.label, "Acme");
         // Go `homeForceMappingAliasResult`: only recognized suffixes are ignored.
         let c = credential(&response, "pretty(custom)").unwrap();
         assert!(!c.attributes.contains_key(cpa_server::remote::FORCE_MAPPING));
-        assert_eq!(executor_key("kimi.com", "", &BTreeMap::new()), "kimi");
         let oauth =
             DispatchResponse::parse(br#"{"id":"a.json","provider":"Claude","metadata":{"email":"e@x"}}"#).unwrap();
         let c = credential(&oauth, "m").unwrap();
@@ -1735,10 +1693,11 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// Go: an unregistered provider with a base URL runs on the OpenAI-compatible
-    /// executor.
+    /// Go runs an unregistered provider with a base URL on its OpenAI-compatible
+    /// executor; that executor was removed (issue #49), so the pick fails without
+    /// reaching the upstream.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unknown_providers_with_a_base_url_run_openai_compatible() {
+    async fn unknown_providers_with_a_base_url_are_refused() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let upstream = upstream(seen.clone()).await;
         let reply = format!(
@@ -1752,13 +1711,16 @@ mod tests {
         .await;
         let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
         let (status, _, text) = ask_with_headers(&base, "/v1/chat/completions", body).await;
-        assert_eq!(status, 200, "{text}");
+        assert_eq!(status, 502, "{text}");
+        assert!(text.contains("executor not registered"), "{text}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the upstream");
         shutdown.cancel();
         task.await.unwrap();
     }
 
-    /// Go `handleHomeModels`, `handleGrokModels` and `handleHomeGeminiModels`: every
-    /// catalog route, model details included, serves what Home answers for this client.
+    /// Go `handleHomeModels` and `handleGrokModels`: every catalog route, model details
+    /// included, serves what Home answers for this client. The Gemini routes answer 410
+    /// (issue #49).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn model_routes_serve_the_home_catalog() {
         let catalog = r#"{"xai":[{"id":"grok-4","display_name":"Grok 4","context_length":256000,"owned_by":"xai"}],"claude":[{"id":"claude-x","owned_by":"anthropic","created":1700000000}]}"#;
@@ -1824,15 +1786,11 @@ mod tests {
         );
         let (status, _) = get("/v1/models/gpt-5", &[]).await;
         assert_eq!(status, 404);
-        let (status, body) = get("/v1beta/models/grok-4", &[]).await;
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(
-            body,
-            r#"{"description":"Grok 4","displayName":"Grok 4","name":"models/grok-4","supportedGenerationMethods":["generateContent"]}"#
-        );
-        let (status, body) = get("/v1beta/models", &[]).await;
-        assert_eq!(status, 200);
-        assert!(body.contains("models/claude-x"), "{body}");
+        for path in ["/v1beta/models/grok-4", "/v1beta/models"] {
+            let (status, body) = get(path, &[]).await;
+            assert_eq!(status, 410, "{path}: {body}");
+            assert!(body.contains("removed_provider"), "{path}: {body}");
+        }
         let (status, body) = get("/v1/models", &[("x-bad", "1")]).await;
         assert_eq!(
             (status, body.as_str()),
@@ -2079,9 +2037,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.usage_queue().configure(true, &config);
@@ -2223,9 +2180,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let dispatcher = Dispatcher::new(&rt);
@@ -2291,9 +2247,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ))
     }
@@ -2598,45 +2553,47 @@ mod tests {
             .collect()
     }
 
+    /// A retained Claude first-party count path, using a private TLS mock and
+    /// injected transport, retains the original Home failure-accounting assertions.
     /// Go `reportHomeUnauthorized`: a Home count-tokens attempt the upstream answers 401
     /// becomes a zero-token `home-result` failure (no executor reporter records count
     /// tokens) under the selection's provider, Home's upstream model and Home's session;
     /// the next credential's success records nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn count_tokens_401s_reach_home_as_home_results() {
-        use axum::response::IntoResponse;
-        const DENIED: &str = r#"{"type":"error","error":{"type":"authentication_error","message":"bad token"}}"#;
-        let app = axum::Router::new().route(
-            "/v1/messages/count_tokens",
-            axum::routing::post(|headers: axum::http::HeaderMap| async move {
-                let auth = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default();
-                if auth.ends_with("fake-A") {
-                    (axum::http::StatusCode::UNAUTHORIZED, DENIED).into_response()
-                } else {
-                    axum::Json(serde_json::json!({"input_tokens": 5})).into_response()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        // Kimi counts tokens upstream through the Claude executor (Go
-        // `countTokensUpstream`); its auth's provider differs from its executor key.
+        use cpa_exec::test_support::{COUNT_DENIED as DENIED, CountTokensUpstream};
+        let upstream = CountTokensUpstream::start().await;
+        let dir = std::env::temp_dir().join(format!("home-count-tokens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let pick = |id: &str, token: &str| {
-            format!(
-                r#"{{"model":"kimi-up","auth_index":"idx-{id}","user_api_key":"home-client","auth":{{"id":"{id}","provider":"Kimi.com","attributes":{{"base_url":"{upstream}"}},"metadata":{{"type":"kimi","access_token":"{token}"}}}}}}"#
-            )
+            let metadata = serde_json::json!({"type":"claude", "access_token":token});
+            let c = cpa_server::testing::local(
+                Credential::from_file(&dir, &dir.join(id), metadata.as_object().unwrap().clone()).unwrap(),
+            );
+            serde_json::json!({"model":"claude-up", "auth_index":format!("idx-{id}"), "user_api_key":"home-client",
+                "auth":{"id":id,"provider":"claude","attributes":c.attributes,"metadata":metadata}})
+            .to_string()
         };
         let home = scripted_with_kv(
-            "port: 0\n",
-            vec![pick("cred-a", "kimi-oat-fake-A"), pick("cred-b", "kimi-oat-fake-B")],
+            &format!("port: 0\nauth-dir: {}\n", dir.display()),
+            vec![
+                pick("cred-a", "sk-ant-api03-fake-A"),
+                pick("cred-b", "sk-ant-api03-fake-B"),
+            ],
             Default::default(),
         )
         .await;
-        let (base, rt, shutdown, task) = node(&home).await;
+        let (base, rt, shutdown, task) = node_full(
+            &home,
+            cpa_exec::Executors {
+                claude: upstream.executor(),
+                codex: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
+            },
+            vec![],
+        )
+        .await;
         eventually("dispatch published", || {
             rt.remote_dispatch().is_some_and(|d| d.available())
         })
@@ -2645,7 +2602,7 @@ mod tests {
             .post(format!("{base}/v1/messages/count_tokens"))
             .header("authorization", "Bearer client-key")
             .header("x-session-id", "conv-count-1")
-            .json(&serde_json::json!({"model": "kimi-x", "messages": [{"role": "user", "content": "hi"}]}))
+            .json(&serde_json::json!({"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]}))
             .send()
             .await
             .unwrap();
@@ -2665,13 +2622,13 @@ mod tests {
         assert_eq!(sent_session, "header:conv-count-1");
         let expect = [
             ("executor_type", "home-result"),
-            ("provider", "kimi.com"),
-            ("model", "kimi-up"),
-            ("alias", "kimi-x"),
+            ("provider", "claude"),
+            ("model", "claude-up"),
+            ("alias", "claude-x"),
             ("auth_index", "idx-cred-a"),
             (
                 "access_token_sha256",
-                "893a8052149a5afa166437049902edae776705705842626aefff0a5fea14041d",
+                "29e7ccf7c3096c86da26ce751aca3e0842446e940d66c84a82903c71bfaec081",
             ),
             ("auth_type", "oauth"),
             ("source", ""),
@@ -2692,8 +2649,10 @@ mod tests {
         assert_eq!(record["generate"], false);
         assert_eq!(record["fail"], serde_json::json!({"status_code": 401, "body": DENIED}));
         assert_eq!(record["tokens"]["total_tokens"], 0);
+        assert_eq!(upstream.calls(), ["sk-ant-api03-fake-A", "sk-ant-api03-fake-B"]);
         shutdown.cancel();
         task.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Go's Alpha Search reports an upstream 401 on a Home pick (`ReportHomeUnauthorized`
@@ -2782,12 +2741,12 @@ mod tests {
             Answer::Fail(400, None, r#"{"error":{"message":"invalid request"}}"#),
         )])
         .await;
-        let bad = accounted_compat("cred-3", &upstream.base).replace("sk-home-fake", "sk-bad");
+        let bad = accounted_pick("cred-3", &upstream.base).replace("sk-home-fake", "sk-bad");
         let home = scripted(
             "port: 0\nrequest-retry: 0\n",
             vec![
-                accounted_compat("cred-1", &upstream.base),
-                accounted_compat("cred-2", &upstream.base),
+                accounted_pick("cred-1", &upstream.base),
+                accounted_pick("cred-2", &upstream.base),
                 bad,
             ],
         )
@@ -2841,12 +2800,11 @@ mod tests {
     async fn home_user_api_key_is_the_attempt_caller() {
         let upstream = ContractUpstream::start(vec![("sk-bad", bad_gateway())]).await;
         let mut first: Value =
-            serde_json::from_str(&accounted_compat("cred-1", &upstream.base).replace("sk-home-fake", "sk-bad"))
-                .unwrap();
+            serde_json::from_str(&accounted_pick("cred-1", &upstream.base).replace("sk-home-fake", "sk-bad")).unwrap();
         first["user_api_key"] = " client-key-home ".into();
         let home = scripted(
             "port: 0\n",
-            vec![first.to_string(), accounted_compat("cred-2", &upstream.base)],
+            vec![first.to_string(), accounted_pick("cred-2", &upstream.base)],
         )
         .await;
         let (base, _rt, shutdown, task) = contract_node(&home).await;
@@ -3085,9 +3043,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let (base, rt, shutdown, task) = node_full(home, executors, Vec::new()).await;
         eventually("dispatch published", || {
@@ -3197,7 +3154,7 @@ mod tests {
     }
 
     /// Go `registerConfigAPIKeyAuths` on each applied Home config: its API keys register
-    /// their models (a keyless OpenAI-compatibility entry is not an API key). A later
+    /// their models. A later
     /// config without the key drops the model from the local registry (unlike Go, which
     /// keeps it). The same socket's next continuation still keeps its pin: a Home pin is
     /// validated by the pick Home granted, not by the local registry (#38,
@@ -3208,13 +3165,12 @@ mod tests {
         let (upstream, _) = responses_ws_upstream().await;
         let pick = || codex_ws_pick("cred-ws", &upstream, "");
         let home = scripted(
-            "port: 0\ncodex-api-key:\n  - api-key: sk-local\n    base-url: http://127.0.0.1:9\n    models:\n      - name: gpt-5-codex\nopenai-compatibility:\n  - name: keyless\n    base-url: http://127.0.0.1:9\n    models:\n      - name: compat-model\n",
+            "port: 0\ncodex-api-key:\n  - api-key: sk-local\n    base-url: http://127.0.0.1:9\n    models:\n      - name: gpt-5-codex\n",
             vec![pick(), pick()],
         )
         .await;
         let (base, rt, shutdown, task) = codex_ws_node(&home).await;
         assert_eq!(rt.registry().providers("gpt-5-codex"), ["codex"]);
-        assert!(rt.registry().providers("compat-model").is_empty());
         let mut socket = ws_connect(&base).await;
         ws_turn(&mut socket, CODEX_TURN).await.unwrap();
         ws_turn(&mut socket, CODEX_CONTINUATION).await.unwrap();
@@ -3498,9 +3454,11 @@ mod tests {
     // ---- Go home_retry_contract_test.go ---------------------------------------------
     //
     // `ContractHome` answers like Go's `retryContractHomeDispatcher` and the upstream
-    // like `retryContractHomeExecutor` (by credential: an OpenAI-compatible key named
-    // after the credential). Go's 1 ms retry waits become Home's `retry_after_ms` or
-    // whole-second upstream `Retry-After` values.
+    // like `retryContractHomeExecutor` (by credential: a key named after the credential).
+    // Go's contract runs on an OpenAI-compatible credential; that executor was removed
+    // (issue #49), so the credentials are Claude API keys on a Claude Messages upstream.
+    // Go's 1 ms retry waits become Home's `retry_after_ms` or whole-second upstream
+    // `Retry-After` values.
 
     /// How the contract upstream answers one credential.
     #[derive(Clone)]
@@ -3519,8 +3477,8 @@ mod tests {
         Answer::Fail(502, None, r#"{"error":{"message":"upstream unavailable"}}"#)
     }
 
-    /// An OpenAI-compatible upstream answering each credential (its bearer key) from
-    /// `answers`; any other succeeds with its own ID as the content.
+    /// A Claude Messages upstream answering each credential (its key) from `answers`; any
+    /// other succeeds with its own ID as the content.
     struct ContractUpstream {
         base: String,
         calls: Arc<Mutex<Vec<String>>>,
@@ -3532,18 +3490,19 @@ mod tests {
             let calls: Arc<Mutex<Vec<String>>> = Arc::default();
             let answers: std::collections::HashMap<&'static str, Answer> = answers.into_iter().collect();
             let app = axum::Router::new().route(
-                "/chat/completions",
+                "/v1/messages",
                 axum::routing::post({
                     let calls = calls.clone();
                     move |headers: axum::http::HeaderMap, body: String| {
                         let (calls, answers) = (calls.clone(), answers.clone());
                         async move {
-                            let key = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or_default()
-                                .trim_start_matches("Bearer ")
-                                .to_owned();
+                            // Off Anthropic's host the key goes as a bearer token.
+                            let header =
+                                |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
+                            let key = match header("x-api-key") {
+                                "" => header("authorization").trim_start_matches("Bearer ").to_owned(),
+                                key => key.to_owned(),
+                            };
                             calls.lock().unwrap().push(key.clone());
                             let stream = serde_json::from_str::<Value>(&body).unwrap()["stream"] == true;
                             match answers.get(key.as_str()).cloned().unwrap_or(Answer::Ok) {
@@ -3561,19 +3520,30 @@ mod tests {
                                     }
                                     response
                                 }
-                                Answer::Ok if stream => (
-                                    [("content-type", "text/event-stream")],
-                                    format!(
-                                        "data: {}\n\ndata: [DONE]\n\n",
-                                        serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt",
-                                            "choices": [{"index": 0, "delta": {"content": key}, "finish_reason": "stop"}]})
-                                    ),
-                                )
-                                    .into_response(),
+                                Answer::Ok if stream => {
+                                    let events = [
+                                        serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                                            "role": "assistant", "model": "gpt", "content": [], "stop_reason": null,
+                                            "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+                                        serde_json::json!({"type": "content_block_start", "index": 0,
+                                            "content_block": {"type": "text", "text": ""}}),
+                                        serde_json::json!({"type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": key}}),
+                                        serde_json::json!({"type": "content_block_stop", "index": 0}),
+                                        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                                            "usage": {"output_tokens": 1}}),
+                                        serde_json::json!({"type": "message_stop"}),
+                                    ];
+                                    let body: String = events
+                                        .iter()
+                                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                                        .collect();
+                                    ([("content-type", "text/event-stream")], body).into_response()
+                                }
                                 Answer::Ok => axum::Json(serde_json::json!({
-                                    "id": "c1", "object": "chat.completion", "created": 1, "model": "gpt",
-                                    "choices": [{"index": 0, "message": {"role": "assistant", "content": key}, "finish_reason": "stop"}],
-                                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                                    "id": "msg_1", "type": "message", "role": "assistant", "model": "gpt",
+                                    "content": [{"type": "text", "text": key}],
+                                    "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
                                 }))
                                 .into_response(),
                             }
@@ -3592,11 +3562,11 @@ mod tests {
         }
     }
 
-    /// One dispatched `home-retry-contract` credential on the contract upstream.
+    /// One dispatched Claude API key credential on the contract upstream.
     fn contract_pick(id: &str, upstream: &str, request_retry: Option<i64>, metadata: &Value) -> String {
         let mut reply = serde_json::json!({
             "model": "gpt",
-            "auth": {"id": id, "provider": "home-retry-contract",
+            "auth": {"id": id, "provider": "claude",
                      "attributes": {"api_key": id, "base_url": upstream}, "metadata": metadata},
         });
         if let Some(retry) = request_retry {
@@ -3847,13 +3817,14 @@ mod tests {
     /// Go `TestHomeRetryRoundUsesEarliestCredentialRetryAfter` and
     /// `TestHomeStreamBootstrapErrorPreservesAggregatedRetryAfter`: a round whose
     /// credentials all rate-limited ends with the earliest retry-after, not the last
-    /// upstream's, streamed or not.
+    /// upstream's, streamed or not. The Claude executor adds Go's 1–30 s fuzz to a 429's
+    /// `Retry-After`, so the two deadlines are far enough apart to stay ordered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_round_takes_the_earliest_credential_retry_after() {
         for stream in [false, true] {
             let upstream = ContractUpstream::start(vec![
                 ("home-retry-a", rate_limited(2)),
-                ("home-retry-b", rate_limited(5)),
+                ("home-retry-b", rate_limited(600)),
             ])
             .await;
             let home = contract_home(
@@ -3868,7 +3839,8 @@ mod tests {
             let (base, _rt, shutdown, task) = contract_node(&home).await;
             let (status, retry_after, body) = chat(&base, stream).await;
             assert_eq!(status, 429, "{body}");
-            assert_eq!(retry_after.as_deref(), Some("2"), "stream {stream}: {body}");
+            let seconds: u64 = retry_after.as_deref().unwrap_or_default().parse().unwrap();
+            assert!((3..=32).contains(&seconds), "stream {stream}: {seconds} s: {body}");
             shutdown.cancel();
             task.await.unwrap();
         }
@@ -3938,29 +3910,70 @@ mod tests {
         }
     }
 
-    /// Go `TestHomePreferredErrorIgnoresLaterInternalExecutorFailure`: a later credential
-    /// that failed locally (no base URL: nothing reached upstream) does not replace the
-    /// earlier upstream failure.
+    /// Go `TestHomePreferredErrorIgnoresLaterInternalExecutorFailure`: Meta's local
+    /// preparation failure must not replace an earlier Claude upstream response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_later_local_failure_keeps_the_upstream_error() {
+        let dir = std::env::temp_dir().join(format!("home-preferred-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let upstream = ContractUpstream::start(vec![("home-retry-a", bad_gateway())]).await;
-        let local = serde_json::json!({
-            "model": "gpt",
-            "auth": {"id": "home-retry-b", "provider": "openai-compatibility", "label": "contract",
-                     "attributes": {"api_key": "home-retry-b", "compat_name": "contract"}},
-        })
+        let local = serde_json::json!({"model":"gpt", "auth_index":"idx-preferred-meta",
+            "auth":{"id":"home-retry-b", "provider":"meta", "attributes":{"base_url":upstream.base},
+            "metadata":{"type":"meta", "dca_token":"dca:home-preferred-fake"}}})
         .to_string();
-        let home = scripted(
-            "port: 0\nrequest-retry: 0\nmax-retry-credentials: 2\n",
-            vec![contract_pick("home-retry-a", &upstream.base, None, &Value::Null), local],
-        )
+        let replies = Mutex::new(std::collections::VecDeque::from([
+            contract_pick("home-retry-a", &upstream.base, None, &Value::Null),
+            local,
+        ]));
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = refreshes.clone();
+        let config = format!(
+            "port: 0\nrequest-retry: 0\nmax-retry-credentials: 2\nauth-dir: {}\n",
+            dir.display()
+        );
+        let home = fake_home(with_kv(Default::default(), move |args| {
+            match args[0].go_lower().as_str() {
+                "get" if args[1].starts_with('{') => {
+                    let request: Value = serde_json::from_str(&args[1]).unwrap();
+                    assert_eq!(request["type"], "refresh");
+                    assert_eq!(request["auth_index"], "idx-preferred-meta");
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // A dispatched Meta auth prepares via Home, never a local mint.
+                    fake::bulk(r#"{"error":{"type":"internal_error","message":"fake preparation failure"}}"#)
+                }
+                "get" => fake::bulk(&config),
+                "subscribe" => fake::raw(ACK),
+                "ping" => fake::raw("+PONG\r\n"),
+                "rpop" => replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map_or_else(|| fake::raw("$-1\r\n"), fake::bulk),
+                "lpush" => fake::raw(":1\r\n"),
+                _ => fake::raw("-ERR unexpected\r\n"),
+            }
+        }))
         .await;
-        let (base, _rt, shutdown, task) = contract_node(&home).await;
+        let executors = cpa_exec::Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new(&upstream.base).unwrap(),
+            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url("http://127.0.0.1:9/must-not-mint"),
+            codex: Default::default(),
+            xai: Default::default(),
+        };
+        let (base, rt, shutdown, task) = node_full(&home, executors, vec![]).await;
+        eventually("dispatch published", || {
+            rt.remote_dispatch().is_some_and(|d| d.available())
+        })
+        .await;
         let (status, _, body) = chat(&base, false).await;
         assert_eq!(status, 502, "{body}");
         assert!(body.contains("upstream unavailable"), "{body}");
+        assert_eq!(upstream.calls(), strings(&["home-retry-a"]));
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(exclusions(&home)[1], strings(&["home-retry-a"]));
         shutdown.cancel();
         task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Go `TestHomeSelectionFailureIsNotHiddenByEarlierUpstreamAttempt`: a pick that fails
@@ -3973,7 +3986,7 @@ mod tests {
             (fake::bulk("{}"), "invalid_auth"),
             (
                 fake::bulk(
-                    r#"{"concurrency":{"accounted":true,"credential_id":"home-retry-a","model":"gpt"},"error":"busy","auth":{"id":"home-retry-a","provider":"home-retry-contract"}}"#,
+                    r#"{"concurrency":{"accounted":true,"credential_id":"home-retry-a","model":"gpt"},"error":"busy","auth":{"id":"home-retry-a","provider":"claude"}}"#,
                 ),
                 "invalid_home_concurrency",
             ),
@@ -4495,9 +4508,8 @@ mod tests {
                 .unwrap()
                 .with_oauth(oauth),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         // A local credential that shares the Home pick's ID and can refresh.
         let dir = std::env::temp_dir().join(format!("cpa-home-401-{}", std::process::id()));
@@ -4566,12 +4578,8 @@ mod tests {
         let executors = |upstream: &str| cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex: Default::default(),
-            devices: cpa_exec::DeviceExecutors {
-                meta: cpa_exec::meta::MetaExecutor::default().with_mint_url(&format!("{upstream}/mint")),
-                ..Default::default()
-            },
-            openai: Default::default(),
-            google: Default::default(),
+            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url(&format!("{upstream}/mint")),
+            xai: Default::default(),
         };
         let pick = serde_json::json!({"model": "muse-up", "auth_index": "idx-meta",
             "auth": {"id": "meta-1", "provider": "meta", "attributes": {"base_url": upstream},
@@ -4908,7 +4916,7 @@ mod tests {
     /// models leave it false even when the local binding says compat.
     #[test]
     fn home_is_compat_ignores_the_local_binding_on_every_provider() {
-        for provider in ["codex", "claude", "gemini", "custom-compat"] {
+        for provider in ["codex", "claude", "xai", "meta"] {
             for enabled in [true, false] {
                 let options = serde_json::json!({"models": [
                     {"name": "upstream", "alias": "other", "is-compat": !enabled},
@@ -4951,58 +4959,6 @@ mod tests {
         }
     }
 
-    /// End to end through a fake Home: the `credential_options` entry Home mode selects
-    /// for the dispatched model reaches the OpenAI-compatible executor (Go
-    /// `ResolvedHomeModelOptions` in `resolveCompatConfig`), whose
-    /// `use-max-completion-tokens` rewrites the upstream body, and Home's model
-    /// definition binds the attempt; another alias's entry does not leak in.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn credential_options_reach_the_executor_through_a_home_pick() {
-        let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
-        let app = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post({
-                let bodies = bodies.clone();
-                move |body: String| {
-                    let bodies = bodies.clone();
-                    async move {
-                        bodies.lock().unwrap().push(serde_json::from_str(&body).unwrap());
-                        axum::Json(serde_json::json!({
-                            "id": "c1", "object": "chat.completion", "created": 1, "model": "upstream",
-                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                        }))
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        for (route, want) in [("alias", true), ("other", false)] {
-            let reply = serde_json::json!({
-                "model": "upstream", "model_info": {"id": "upstream", "user_defined": true},
-                "auth": {"id": "c1", "provider": "openai-compatibility", "label": "contract",
-                    "attributes": {"api_key": "sk-home-fake", "base_url": upstream, "compat_name": "contract"},
-                    "metadata": {"credential_options": {"models": [
-                        {"name": "upstream", "alias": "other", "use-max-completion-tokens": false},
-                        {"name": "upstream", "alias": "alias", "use-max-completion-tokens": true}
-                    ]}}},
-            });
-            let home = scripted("port: 0\nrequest-retry: 0\n", vec![reply.to_string()]).await;
-            let (base, _rt, shutdown, task) = contract_node(&home).await;
-            let body =
-                serde_json::json!({"model": route, "max_tokens": 7, "messages": [{"role": "user", "content": "hi"}]});
-            let (status, _, text) = ask_with_headers(&base, "/v1/chat/completions", body).await;
-            assert_eq!(status, 200, "{text}");
-            let sent = bodies.lock().unwrap().pop().unwrap();
-            assert_eq!(sent.get("max_completion_tokens").is_some(), want, "{route}: {sent}");
-            assert_eq!(sent.get("max_tokens").is_none(), want, "{route}: {sent}");
-            shutdown.cancel();
-            task.await.unwrap();
-        }
-    }
-
     // ---- Go home_concurrency_test.go: single picks against a fixture Home ----------
 
     /// Go `newHomeSelectionTestManager`: a dispatcher with its own Home client and
@@ -5021,9 +4977,8 @@ mod tests {
             let executors = cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             };
             let config = overlay(b"port: 0\n", None).unwrap();
             let rt = Arc::new(cpa_server::testing::runtime(config, vec![], executors));
@@ -5372,11 +5327,11 @@ mod tests {
 
     // ---- Go home_execution_paths_test.go: lease lifetimes on the execution paths ------
 
-    /// An OpenAI-compatible upstream whose streams send one chunk and then wait for
+    /// A Claude Messages upstream whose streams send one chunk and then wait for
     /// `close` (a `Notify` permit per stream); buffered requests answer at once.
     async fn held_stream_upstream(close: Arc<tokio::sync::Notify>) -> String {
         let app = axum::Router::new().route(
-            "/chat/completions",
+            "/v1/messages",
             axum::routing::post(move |body: String| {
                 let close = close.clone();
                 async move {
@@ -5385,27 +5340,44 @@ mod tests {
                     let stream = serde_json::from_str::<Value>(&body).unwrap()["stream"] == true;
                     if !stream {
                         return axum::Json(serde_json::json!({
-                            "id": "c1", "object": "chat.completion", "created": 1, "model": "m",
-                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                            "content": [{"type": "text", "text": "hi"}],
+                            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
                         }))
                         .into_response();
                     }
-                    let chunk = |content: &str| {
-                        format!(
-                            "data: {}\n\n",
-                            serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "m",
-                                "choices": [{"index": 0, "delta": {"content": content}}]})
-                        )
+                    let events = |events: &[Value]| -> String {
+                        events
+                            .iter()
+                            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                            .collect()
                     };
-                    let first = chunk("initial");
+                    let first = events(&[
+                        serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                            "role": "assistant", "model": "m", "content": [], "stop_reason": null,
+                            "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+                        serde_json::json!({"type": "content_block_start", "index": 0,
+                            "content_block": {"type": "text", "text": ""}}),
+                        serde_json::json!({"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta", "text": "initial"}}),
+                    ]);
+                    let last = events(&[
+                        serde_json::json!({"type": "content_block_stop", "index": 0}),
+                        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                            "usage": {"output_tokens": 1}}),
+                        serde_json::json!({"type": "message_stop"}),
+                    ]);
                     let body = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) }).chain(
                         futures_util::stream::once(async move {
                             close.notified().await;
-                            Ok("data: [DONE]\n\n".to_owned())
+                            Ok(last)
                         }),
                     );
-                    ([("content-type", "text/event-stream")], axum::body::Body::from_stream(body)).into_response()
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(body),
+                    )
+                        .into_response()
                 }
             }),
         );
@@ -5415,13 +5387,13 @@ mod tests {
         base
     }
 
-    /// An accounted pick of `id` on an OpenAI-compatible credential at `upstream`.
-    fn accounted_compat(id: &str, upstream: &str) -> String {
+    /// An accounted pick of `id` on a Claude API key credential at `upstream`.
+    fn accounted_pick(id: &str, upstream: &str) -> String {
         serde_json::json!({
             "model": "m", "auth_index": id,
             "concurrency": {"accounted": true, "credential_id": id, "model": "m"},
-            "auth": {"id": id, "provider": "openai-compatibility", "label": "pool",
-                     "attributes": {"api_key": "sk-home-fake", "base_url": upstream, "compat_name": "pool"}},
+            "auth": {"id": id, "provider": "claude", "label": "pool",
+                     "attributes": {"api_key": "sk-home-fake", "base_url": upstream}},
         })
         .to_string()
     }
@@ -5438,11 +5410,7 @@ mod tests {
         for client_leaves in [false, true] {
             let close = Arc::new(tokio::sync::Notify::new());
             let upstream = held_stream_upstream(close.clone()).await;
-            let home = scripted(
-                "port: 0\nrequest-retry: 0\n",
-                vec![accounted_compat("cred-1", &upstream)],
-            )
-            .await;
+            let home = scripted("port: 0\nrequest-retry: 0\n", vec![accounted_pick("cred-1", &upstream)]).await;
             let (base, _rt, shutdown, task) = contract_node(&home).await;
             let response = wreq::Client::new()
                 .post(format!("{base}/v1/chat/completions"))
@@ -5455,8 +5423,11 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status().as_u16(), 200);
             let mut body = response.bytes_stream();
-            let first = body.next().await.unwrap().unwrap();
-            assert!(String::from_utf8_lossy(&first).contains("initial"));
+            // The first upstream event batch can reach the client as several chunks.
+            let mut seen = String::new();
+            while !seen.contains("initial") {
+                seen += &String::from_utf8_lossy(&body.next().await.unwrap().unwrap());
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(releases(&home).is_empty(), "no release while the stream is open");
             if client_leaves {
@@ -5494,10 +5465,10 @@ mod tests {
 
         let upstream = ContractUpstream::start(vec![("sk-bad", bad_gateway())]).await;
         // The first credential's key fails upstream; the second one's succeeds.
-        let first = accounted_compat("cred-1", &upstream.base).replace("sk-home-fake", "sk-bad");
+        let first = accounted_pick("cred-1", &upstream.base).replace("sk-home-fake", "sk-bad");
         let home = scripted(
             "port: 0\nrequest-retry: 0\nmax-retry-credentials: 2\n",
-            vec![first, accounted_compat("cred-2", &upstream.base)],
+            vec![first, accounted_pick("cred-2", &upstream.base)],
         )
         .await;
         let (base, _rt, shutdown, task) = contract_node(&home).await;

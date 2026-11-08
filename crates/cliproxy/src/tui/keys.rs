@@ -12,14 +12,14 @@ use super::style::{self as s, Doc, span};
 use super::widgets::{TextInput, Viewport};
 use super::{Cmd, Msg, cmd};
 
-/// Go's provider sections, in its order (no Meta list, as in Go).
-pub(super) const PROVIDERS: [(&str, &str); 6] = [
-    ("Gemini API Keys", "gemini-api-key"),
-    ("Interactions API Keys", "interactions-api-key"),
+/// The provider sections: Go's, in its order, for the four retained providers (issue
+/// #49). Go shows no Meta list; it is shown here so the TUI lists every key family the
+/// Management API serves.
+pub(super) const PROVIDERS: [(&str, &str); 4] = [
     ("Claude API Keys", "claude-api-key"),
     ("Codex API Keys", "codex-api-key"),
     ("xAI API Keys", "xai-api-key"),
-    ("Vertex API Keys", "vertex-api-key"),
+    ("Meta API Keys", "meta-api-key"),
 ];
 
 /// Go's `keysDataMsg`.
@@ -27,7 +27,6 @@ pub struct Data {
     pub(super) api_keys: Vec<String>,
     /// One list per [`PROVIDERS`] entry, in order.
     pub(super) providers: Vec<Vec<Object>>,
-    pub(super) openai: Vec<Object>,
 }
 
 pub struct KeysTab {
@@ -35,7 +34,6 @@ pub struct KeysTab {
     pub vp: Viewport,
     pub keys: Vec<String>,
     providers: Vec<Vec<Object>>,
-    openai: Vec<Object>,
     err: Option<String>,
     width: usize,
     pub cursor: usize,
@@ -59,7 +57,6 @@ impl KeysTab {
             vp: Viewport::default(),
             keys: Vec::new(),
             providers: Vec::new(),
-            openai: Vec::new(),
             err: None,
             width: 0,
             cursor: 0,
@@ -85,12 +82,7 @@ impl KeysTab {
             for (_, route) in PROVIDERS {
                 providers.push(client.get_key_list(route).await.unwrap_or_default());
             }
-            let openai = client.get_key_list("openai-compatibility").await.unwrap_or_default();
-            Msg::KeysData(Ok(Data {
-                api_keys,
-                providers,
-                openai,
-            }))
+            Msg::KeysData(Ok(Data { api_keys, providers }))
         })
     }
 
@@ -115,7 +107,6 @@ impl KeysTab {
                 self.err = None;
                 self.keys = data.api_keys;
                 self.providers = data.providers;
-                self.openai = data.openai;
                 if self.cursor >= self.keys.len() {
                     self.cursor = self.keys.len().saturating_sub(1);
                 }
@@ -322,15 +313,6 @@ impl KeysTab {
             }
             doc.blank();
         }
-        if !self.openai.is_empty() {
-            doc.table_header(format!("  OpenAI Compatibility ({})", self.openai.len()));
-            for (i, entry) in self.openai.iter().enumerate() {
-                let mut info = s::get_string(entry, "name");
-                append_details(&mut info, entry);
-                doc.text(format!("  {}. {info}", i + 1), Style::new());
-            }
-            doc.blank();
-        }
         if let Some((status, style)) = &self.status {
             doc.text(status.clone(), *style);
         }
@@ -358,7 +340,6 @@ mod tests {
         Ok(Data {
             api_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
             providers: Vec::new(),
-            openai: Vec::new(),
         })
     }
 

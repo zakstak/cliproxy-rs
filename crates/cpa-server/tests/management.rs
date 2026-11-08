@@ -124,9 +124,8 @@ impl Fixture {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let state = Management::new(rt.clone(), path);
@@ -157,9 +156,8 @@ impl Fixture {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex,
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         // As the binary records what it loaded.
@@ -890,7 +888,7 @@ async fn unreadable_auth_dir_never_blocks_secret_rotation_or_removal() {
 async fn writes_normalize_only_what_they_touch() {
     let f = Fixture::new("scoped");
     let path = f.dir.join("config.yaml");
-    let dirty = "  excluded-models:\n    Claude: [' Opus-X ', opus-x] # dirty\n    gemini: [a]\n  model-alias:\n    claude:\n      - {name: a, alias: a} # self alias\n";
+    let dirty = "  excluded-models:\n    Claude: [' Opus-X ', opus-x] # dirty\n    xai: [a]\n  model-alias:\n    claude:\n      - {name: a, alias: a} # self alias\n";
     let text = f.file().replacen("oauth:\n", &format!("oauth:\n{dirty}"), 1)
         + "observability:\n  pprof:\n    addr: null # keep\n";
     std::fs::write(&path, &text).unwrap();
@@ -905,7 +903,7 @@ async fn writes_normalize_only_what_they_touch() {
     };
     let r = send(
         wreq::Method::PUT,
-        "/config/oauth/excluded-models/gemini",
+        "/config/oauth/excluded-models/xai",
         r#"[" B ", "b", "c"]"#,
     )
     .await
@@ -921,7 +919,7 @@ async fn writes_normalize_only_what_they_touch() {
         .json()
         .await
         .unwrap();
-    assert_eq!(config["oauth"]["excluded-models"]["gemini"], json!([" B ", "b", "c"]));
+    assert_eq!(config["oauth"]["excluded-models"]["xai"], json!([" B ", "b", "c"]));
     let r = send(
         wreq::Method::PATCH,
         "/config",
@@ -1241,75 +1239,6 @@ async fn config_key_field_patch_is_not_found() {
     server.abort();
 }
 
-/// Go d9451cb6: the fields patch writes `openapi-location` and `openapi-models` under
-/// their canonical names, and a Vertex file then registers the partner models it lists.
-#[tokio::test]
-async fn openapi_field_aliases_patch_their_canonical_keys() {
-    let f = Fixture::from_yaml("openapi-fields", |auth, hash| {
-        std::fs::write(auth.join("vertex.json"), r#"{"type":"vertex","project_id":"p"}"#).unwrap();
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        )
-    });
-    let id = f.rt.store().snapshot()[0].id.clone();
-    let (base, server) = f.server().await;
-    assert!(!f.rt.registry().client_supports(&id, "meta/llama-4"));
-    let r = wreq::Client::new()
-        .patch(format!("{base}/v8/management/credentials/fields"))
-        .bearer_auth("fake-management-only")
-        .json(&json!({"name": "vertex.json", "openapi-location": "us-east5", "openapi-models": ["meta/llama-4"]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
-    let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("auth").join("vertex.json")).unwrap()).unwrap();
-    assert_eq!(saved["openapi_location"], "us-east5", "{saved}");
-    assert_eq!(saved["openapi_models"], json!(["meta/llama-4"]), "{saved}");
-    assert!(
-        saved.get("openapi-location").is_none() && saved.get("openapi-models").is_none(),
-        "{saved}"
-    );
-    assert!(f.rt.registry().client_supports(&id, "meta/llama-4"));
-    server.abort();
-}
-
-/// Go d9451cb6 `AccountInfo`: a service-account file without a top-level `email` is an
-/// OAuth account named by the service account's trimmed `client_email`, in both the v0
-/// and v8 auth-file lists; no `email` key is listed (Go `buildAuthFileEntryLocked`).
-#[tokio::test]
-async fn a_service_account_file_lists_its_client_email_as_the_account() {
-    let f = Fixture::from_yaml("sa-account", |auth, hash| {
-        std::fs::write(
-            auth.join("vertex-sa.json"),
-            r#"{"type":"vertex","project_id":"p","service_account":{"client_email":" sa@p.iam.gserviceaccount.com ","private_key":"unused"}}"#,
-        )
-        .unwrap();
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        )
-    });
-    let (base, server) = f.server().await;
-    for path in ["/v8/management/credentials", "/v0/management/auth-files"] {
-        let listed: Value = wreq::Client::new()
-            .get(format!("{base}{path}"))
-            .bearer_auth("fake-management-only")
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let entry = &listed["files"][0];
-        assert_eq!(entry["account"], "sa@p.iam.gserviceaccount.com", "{path}: {entry}");
-        assert_eq!(entry["account_type"], "oauth", "{path}: {entry}");
-        assert_eq!(entry["project_id"], "p", "{path}: {entry}");
-        assert!(entry.get("email").is_none(), "{path}: {entry}");
-    }
-    server.abort();
-}
-
 /// Go `TestCodexExcludedModelsCredentialPriorityAfterPatchAndReload` (b015f208,
 /// 94d1a9a0): a credential's own excluded models replace the global
 /// `oauth.excluded-models`; with none, the current global list applies, so a later
@@ -1456,7 +1385,7 @@ async fn excluded_models_writes_are_validated() {
     }
     for content in [
         r#"{"type":"codex","excluded_models":123}"#,
-        r#"{"type":"gemini-cli","excluded_models":123}"#,
+        r#"{"type":"claude","excluded_models":123}"#,
         r#"{"type":"codex","excluded_models":["codex-new",1]}"#,
     ] {
         let r = client
@@ -1636,68 +1565,8 @@ async fn credential_models_come_from_registrations() {
     server.abort();
 }
 
-/// Go v8.0.35 `GetStaticModelDefinitions` (`50cfd238`): a channel without a built-in
-/// catalog lists the models its credentials registered, sorted by ID, as Go's
-/// `registry.ModelInfo` encodes them; a channel with neither is still unknown
-/// (`TestGetStaticModelDefinitions_FallsBackToRegistryModelsForPerAuthPlugin`,
-/// `TestGetStaticModelDefinitions_BuiltInChannel`,
-/// `TestGetStaticModelDefinitions_RejectsUnknownChannel`).
-#[tokio::test]
-async fn model_definitions_fall_back_to_registered_models_by_channel() {
-    let f = Fixture::from_yaml("definitions", |auth, hash| {
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: http://127.0.0.1:9/v1\n      models: [{{name: up-z, alias: zeta}}, {{name: up-a, alias: alpha}}]\n      keys: [{{api-key: fake-acme}}]\n",
-            auth.display()
-        )
-    });
-    let (base, server) = f.server().await;
-    let get = |channel: &str| {
-        wreq::Client::new()
-            .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
-            .bearer_auth("fake-management-only")
-            .send()
-    };
-    let r = get("OpenAI-Compatible-Acme").await.unwrap();
-    assert_eq!(r.status(), 200);
-    let v: Value = r.json().await.unwrap();
-    assert_eq!(v["channel"], "openai-compatible-acme");
-    let models = v["models"].as_array().unwrap();
-    let ids: Vec<_> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["alpha", "zeta"]);
-    for internal in [
-        "user_defined",
-        "is_compat",
-        "max_context_length",
-        "support_configuration_update",
-    ] {
-        assert!(
-            models.iter().all(|m| m.get(internal).is_none()),
-            "{internal}: {models:?}"
-        );
-    }
-    let v0: Value = wreq::Client::new()
-        .get(format!("{base}/v0/management/model-definitions/openai-compatible-acme"))
-        .bearer_auth("fake-management-only")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(v0, v, "v0 serves the same handler");
-    let r = get("claude").await.unwrap();
-    assert_eq!(r.status(), 200, "the built-in catalog still wins");
-    let r = get("nobody").await.unwrap();
-    assert_eq!(r.status(), 400);
-    assert_eq!(
-        r.json::<Value>().await.unwrap(),
-        json!({"channel": "nobody", "error": "unknown channel"})
-    );
-    server.abort();
-}
-
 /// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
-/// the Codex, xAI and Devin built-ins. Every channel answers Go's bytes, recorded by
+/// the Codex and xAI built-ins. Every channel answers Go's bytes, recorded by
 /// `reference/manage` (its second output), with the GPT Image 2.6 forward port in the
 /// Codex built-ins (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
@@ -1705,6 +1574,13 @@ async fn model_definitions_match_go_by_channel() {
     let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
     forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
+    // The removed providers' channels (issue #49) are unknown here.
+    let removed: Vec<String> = go
+        .keys()
+        .filter(|c| !matches!(c.as_str(), "claude" | "codex" | "xai" | "meta"))
+        .cloned()
+        .collect();
+    go.retain(|c, _| !removed.contains(c));
     let f = Fixture::from_yaml("definitions-go", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
@@ -1719,14 +1595,7 @@ async fn model_definitions_match_go_by_channel() {
             .send()
     };
     // Aliases answer their canonical section under the requested (lowercased) name.
-    let aliases = [
-        ("kimi-ai", "kimi"),
-        ("Kimi.AI", "kimi"),
-        ("kimi.com", "kimi"),
-        ("x-ai", "xai"),
-        ("GROK", "xai"),
-        ("muse", "meta"),
-    ];
+    let aliases = [("x-ai", "xai"), ("GROK", "xai"), ("muse", "meta")];
     let requests = go.keys().map(|c| (c.as_str(), c.as_str())).chain(aliases);
     let mut compared = 0;
     for (channel, section) in requests {
@@ -1740,7 +1609,11 @@ async fn model_definitions_match_go_by_channel() {
         assert_eq!(r.text().await.unwrap(), want, "{channel}");
         compared += 1;
     }
-    assert_eq!(compared, 17);
+    assert_eq!(compared, 7);
+    for channel in removed {
+        let r = get(channel.clone()).await.unwrap();
+        assert_eq!(r.status(), 400, "{channel}");
+    }
     server.abort();
 }
 
@@ -1749,9 +1622,14 @@ async fn model_definitions_match_go_by_channel() {
 /// echoed `auth_index`/`auth-index` fields instead of saving them.
 #[tokio::test]
 async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
+    let mut fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
+    // The removed providers' groups go (issue #49).
+    for family in ["gemini", "interactions", "vertex", "openai-compatibility"] {
+        fixture["response"].as_object_mut().unwrap().remove(family);
+    }
+    let config = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
     let f = Fixture::from_yaml("authindex", |auth, hash| {
-        fixture["config"].as_str().unwrap().replace(
+        config.replace(
             "config-version: 8\n",
             &format!(
                 "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
@@ -1796,11 +1674,11 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
         .text()
         .await
         .unwrap();
-    assert!(yaml.contains("fake-o2") && !yaml.contains("896fb130477af684"), "{yaml}");
+    assert!(yaml.contains("fake-c2") && !yaml.contains("auth-index"), "{yaml}");
 
     // Echo the read back, at the provider list and at the root.
-    let acme = read["openai-compatibility"].clone();
-    let r = send(wreq::Method::PUT, "/api-keys/openai-compatibility", acme.to_string())
+    let codex = read["codex"].clone();
+    let r = send(wreq::Method::PUT, "/api-keys/codex", codex.to_string())
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
@@ -2091,7 +1969,7 @@ async fn github_token_stays_out_of_the_v0_config_json() {
 /// `/abs/models.json` is not absolute on Windows.
 #[tokio::test]
 async fn model_catalog_sources_survive_a_legacy_save() {
-    let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n  devin-catalog: 'http://localhost/devin.json'\n";
+    let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n";
     let f = Fixture::from_yaml("catalog-legacy", |auth, hash| private_config(raw, auth, hash, true));
     let (base, server) = f.server().await;
     let (status, text) = call(
@@ -2107,7 +1985,7 @@ async fn model_catalog_sources_survive_a_legacy_save() {
     let models = Config::parse(&file).unwrap().document["models"].clone();
     assert_eq!(
         serde_json::to_value(models).unwrap(),
-        json!({"catalog": "/abs/models.json", "codex-catalog": "https://codex.example.invalid/codex.json", "devin-catalog": "http://localhost/devin.json"}),
+        json!({"catalog": "/abs/models.json", "codex-catalog": "https://codex.example.invalid/codex.json"}),
         "{file}"
     );
     server.abort();
@@ -2781,7 +2659,7 @@ async fn api_call_head_does_not_negotiate_gzip() {
     up.abort();
 }
 
-/// Fake provider login endpoints (Claude, Codex, Kimi) on one local server; records
+/// Fake provider login endpoints (Claude, Codex, xAI) on one local server; records
 /// the form or JSON bodies it receives.
 async fn fake_logins() -> (
     String,
@@ -2820,12 +2698,6 @@ async fn fake_logins() -> (
                     "organization": {"uuid": "org-1", "name": "Org"}}),
                 "/api/oauth/profile" => json!({"account": {"uuid": "acct-1", "email": "a@example.invalid"},
                     "organization": {"uuid": "org-1", "name": "Org"}}),
-                "/api/oauth/device_authorization" => json!({"device_code": "dc", "user_code": "UC-1",
-                    "verification_uri": "https://kimi.example.invalid/device",
-                    "verification_uri_complete": "https://kimi.example.invalid/device?code=UC-1",
-                    "expires_in": 600, "interval": 1}),
-                "/api/oauth/token" => json!({"access_token": "fake-kimi-at", "refresh_token": "fake-kimi-rt",
-                    "token_type": "Bearer", "expires_in": 3600, "scope": "s"}),
                 // xAI: discovery names auth.x.ai endpoints, which the test seam redirects here.
                 "/.well-known/openid-configuration" => json!({
                     "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
@@ -2836,10 +2708,6 @@ async fn fake_logins() -> (
                     "expires_in": 600, "interval": 1}),
                 "/oauth2/token" => json!({"access_token": "fake-xai-at", "refresh_token": "fake-xai-rt",
                     "id_token": xai_id_token, "token_type": "Bearer", "expires_in": 3600}),
-                // Devin: code exchange and profile (the user-status RPC gets `{}` and fails,
-                // which the login tolerates).
-                "/auth/cli/token" => json!({"token": "fake-devin-session"}),
-                "/v3/self" => json!({"user_name": "dev-user", "user_id": "u-1", "org_id": "o-1"}),
                 _ => json!({}),
             };
             axum::Json(v)
@@ -2999,97 +2867,6 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     fake_server.abort();
 }
 
-/// Devin: Go `RequestDevinToken` needs the listener port for its fixed loopback
-/// redirect; the main listener's `/callback` completes the login.
-#[tokio::test]
-async fn devin_login_completes_through_the_main_listener_callback() {
-    let (fake, seen, fake_server) = fake_logins().await;
-    // Port 0: no redirect URI can be built.
-    let f = Fixture::new("devinlogin-noport");
-    let (base, _state, server) = login_server(&f, &fake).await;
-    let r = oauth_get(&base, "/oauth/auth-url?provider=devin").await;
-    assert_eq!(r, json!({"error": "callback server unavailable"}));
-    server.abort();
-
-    let f = Fixture::from_yaml("devinlogin", |auth, hash| {
-        format!(
-            "config-version: 8\nserver:\n  port: 18999\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        )
-    });
-    let (base, _state, server) = login_server(&f, &fake).await;
-    let deliver = |state: &str, code: &str, error: &str| {
-        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-            provider: "devin",
-            state: state.to_owned(),
-            code: code.to_owned(),
-            error: error.to_owned(),
-        }) == cpa_server::runtime::OAuthDelivery::Delivered
-    };
-    // A denied authorization ends the session with Go's message.
-    let started = oauth_get(&base, "/oauth/auth-url?provider=devin").await;
-    let denied = started["state"].as_str().unwrap().to_owned();
-    assert!(deliver(&denied, "", "access_denied"));
-    assert_eq!(
-        final_status(&base, &denied, 5).await,
-        json!({"status": "error", "error": "Devin authorization denied"})
-    );
-    // A callback for another provider or an unknown state is not delivered.
-    let started = oauth_get(&base, "/oauth/auth-url?provider=devin").await;
-    assert_eq!(started["status"], "ok");
-    let state = started["state"].as_str().unwrap().to_owned();
-    assert_eq!(state.len(), 32, "Go misc.GenerateRandomState");
-    let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
-    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
-    assert_eq!(query["redirect_uri"], "http://127.0.0.1:18999/callback");
-    assert_eq!(query["state"], state);
-    assert!(!deliver("unknown-state", "c", ""));
-    assert_ne!(
-        f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
-            provider: "codex",
-            state: state.clone(),
-            code: "c".into(),
-            error: String::new(),
-        }),
-        cpa_server::runtime::OAuthDelivery::Delivered
-    );
-    assert!(deliver(&state, "fake-devin-code", ""));
-    assert_eq!(final_status(&base, &state, 10).await, json!({"status": "ok"}));
-    let path = f.dir.join("auth/devin-dev-user.json");
-    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for (key, want) in [
-        ("type", "devin"),
-        ("api_key", "fake-devin-session"),
-        ("session_token", "fake-devin-session"),
-        ("user_name", "dev-user"),
-        ("user_id", "u-1"),
-        ("org_id", "o-1"),
-        ("auth_kind", "oauth"),
-    ] {
-        assert_eq!(saved[key], want, "{key}");
-    }
-    assert_eq!(saved["disabled"], false);
-    let exchange = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(p, _)| p == "/auth/cli/token")
-        .unwrap()
-        .1
-        .clone();
-    let exchange: Value = serde_json::from_str(&exchange).unwrap();
-    assert_eq!(exchange["code"], "fake-devin-code");
-    let verifier = exchange["code_verifier"].as_str().unwrap();
-    // The challenge sent to the browser is S256(verifier).
-    use base64::Engine;
-    use sha2::Digest;
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    assert_eq!(query["code_challenge"], challenge);
-    assert!(f.rt.store().get("devin-dev-user.json").is_some(), "published");
-    server.abort();
-    fake_server.abort();
-}
-
 /// A login worker that panics fails its session at once, with a fixed message,
 /// instead of leaving the dashboard waiting until the session expires: here the panic
 /// is on the blocking task that saves the credential, which the worker passes on.
@@ -3174,368 +2951,6 @@ async fn codex_login_completes_through_the_main_listener_callback() {
     );
     server.abort();
     fake_server.abort();
-}
-
-/// Antigravity management login permits a missing project (unlike CLI completion),
-/// validates the token/email, and never saves a cancelled exchange.
-#[tokio::test]
-async fn antigravity_management_login_flows() {
-    use axum::response::IntoResponse;
-    let exchanging = Arc::new(tokio::sync::Notify::new());
-    let resume = Arc::new(tokio::sync::Semaphore::new(0));
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (notice, gate, record) = (exchanging.clone(), resume.clone(), seen.clone());
-    let app = axum::Router::new().fallback(move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
-        let (notice, gate, record) = (notice.clone(), gate.clone(), record.clone());
-        async move {
-            assert_ne!(headers.get("authorization").and_then(|v| v.to_str().ok()), Some("Bearer fake-management-only"));
-            let access = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").trim_start_matches("Bearer ");
-            let value = match uri.path() {
-                "/token" => {
-                    let form: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-                    record.lock().unwrap().push(form.clone());
-                    let code = form.get("code").map(String::as_str).unwrap_or("");
-                    if code == "denied" {
-                        return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
-                    }
-                    if code == "cancelled" {
-                        notice.notify_one();
-                        let _ = gate.acquire().await.unwrap();
-                    }
-                    json!({"access_token": if code == "empty-token" { "" } else { code }, "refresh_token": "fake-ag-rt", "expires_in": 3600})
-                }
-                "/oauth2/v2/userinfo" => {
-                    if access == "bad-user" {
-                        return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
-                    }
-                    json!({"email": if access == "empty-email" { "".into() } else { format!("{access}@example.invalid") }})
-                }
-                "/v1internal:loadCodeAssist" if access == "no-project" => {
-                    return (axum::http::StatusCode::FORBIDDEN, "secret-sentinel").into_response();
-                }
-                "/v1internal:loadCodeAssist" => json!({"cloudaicompanionProject": "fake-project"}),
-                _ => panic!("unexpected login request: {uri}"),
-            };
-            axum::Json(value).into_response()
-        }
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let fake = format!("http://{}", listener.local_addr().unwrap());
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let f = Fixture::new("antigravitylogin");
-    let (settled_tx, mut settled) = tokio::sync::mpsc::unbounded_channel();
-    let options = management::Options {
-        login_base: Some(fake.clone()),
-        login_settled: Some(settled_tx),
-        ..Default::default()
-    };
-    let (base, _management, server) = serve_with(&f, options).await;
-    for (code, error) in [
-        ("success", ""),
-        ("no-project", ""),
-        ("denied", "Failed to exchange token"),
-        ("empty-token", "Failed to exchange token"),
-        ("bad-user", "Failed to fetch user info"),
-        ("empty-email", "Failed to fetch user info"),
-        ("cancelled", "unknown or expired state"),
-    ] {
-        let started = if code == "success" {
-            wreq::Client::new()
-                .get(format!("{base}/v0/management/antigravity-auth-url"))
-                .bearer_auth("fake-management-only")
-                .send()
-                .await
-                .unwrap()
-                .json::<Value>()
-                .await
-                .unwrap()
-        } else {
-            oauth_get(&base, "/oauth/auth-url?provider=antigravity").await
-        };
-        assert_eq!(started["status"], "ok", "{started}");
-        let sid = started["state"].as_str().unwrap();
-        assert_eq!(sid.len(), 32);
-        let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
-        assert_eq!(url.origin().ascii_serialization(), "https://accounts.google.com");
-        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(query["state"], sid);
-        assert_eq!(query["redirect_uri"], "http://localhost:51121/oauth-callback");
-        assert_eq!(query["access_type"], "offline");
-        let callback: Value = wreq::Client::new().post(format!("{base}/v8/management/oauth/callback"))
-            .json(&json!({"provider":"anti-gravity", "redirect_url":format!("http://localhost:51121/oauth-callback?state={sid}&code={code}")}))
-            .send().await.unwrap().json().await.unwrap();
-        assert_eq!(callback, json!({"status":"ok"}));
-        if code == "cancelled" {
-            tokio::time::timeout(std::time::Duration::from_secs(5), exchanging.notified())
-                .await
-                .unwrap();
-            let cancelled: Value = wreq::Client::new()
-                .delete(format!("{base}/v8/management/oauth/session?state={sid}"))
-                .bearer_auth("fake-management-only")
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(cancelled["cancelled"], true);
-            resume.add_permits(1);
-        }
-        // Barrier: the login worker has finished, including a cancelled exchange.
-        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), settled.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(finished, sid);
-        let status = final_status(&base, sid, 5).await;
-        if error.is_empty() {
-            assert_eq!(status, json!({"status":"ok"}));
-            let name = format!("antigravity-{code}@example.invalid.json");
-            let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("auth").join(&name)).unwrap()).unwrap();
-            assert_eq!(saved["type"], "antigravity");
-            assert_eq!(saved["access_token"], code);
-            assert_eq!(saved["refresh_token"], "fake-ag-rt");
-            assert_eq!(
-                saved["project_id"],
-                if code == "no-project" {
-                    Value::Null
-                } else {
-                    json!("fake-project")
-                }
-            );
-            assert!(f.rt.store().get(&name).is_some(), "published");
-        } else {
-            assert_eq!(status, json!({"status":"error", "error":error}));
-            assert!(
-                !f.dir
-                    .join(format!("auth/antigravity-{code}@example.invalid.json"))
-                    .exists()
-            );
-        }
-    }
-    for form in seen.lock().unwrap().iter() {
-        assert_eq!(form["redirect_uri"], "http://localhost:51121/oauth-callback");
-        assert_eq!(form["grant_type"], "authorization_code");
-    }
-    assert_eq!(
-        f.rt.store()
-            .snapshot()
-            .iter()
-            .filter(|c| c.provider == "antigravity")
-            .count(),
-        2
-    );
-    server.abort();
-    // Go `saveTokenRecord`: with a remote store that is down, the login fails.
-    let down = Fixture::new("antigravitystore");
-    let store = Arc::new(FakeStore {
-        dir: down.dir.join("auth"),
-        down: true,
-        ..Default::default()
-    });
-    let options = management::Options {
-        login_base: Some(fake.clone()),
-        store: Some(store.clone()),
-        ..Default::default()
-    };
-    let (base, _management, server) = serve_with(&down, options).await;
-    let started = oauth_get(&base, "/oauth/auth-url?provider=antigravity").await;
-    let sid = started["state"].as_str().unwrap();
-    wreq::Client::new()
-        .post(format!("{base}/v8/management/oauth/callback"))
-        .json(&json!({"provider": "antigravity", "redirect_url": format!("http://localhost:51121/oauth-callback?state={sid}&code=stored")}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        final_status(&base, sid, 5).await,
-        json!({"status": "error", "error": "Failed to save token to file"})
-    );
-    assert_eq!(
-        *store.pushed.lock().unwrap(),
-        ["Update auth antigravity-stored@example.invalid.json"]
-    );
-    server.abort();
-    upstream.abort();
-}
-
-/// Vertex service-account upload (Go `ImportVertexCredential`) through v8
-/// `/oauth/import?provider=vertex` and v0 `/vertex/import`: Go's error answers, the
-/// form location winning over the query, Go's file bytes, and settings of an existing
-/// file kept.
-#[tokio::test]
-async fn vertex_service_account_import() {
-    let fixture: Value = serde_json::from_str(include_str!("../../cpa-exec/tests/fixtures/vertex_go.json")).unwrap();
-    let basic = &fixture["import"][0];
-    assert_eq!(basic["name"], "basic");
-    let key = basic["input"].as_str().unwrap();
-    let f = Fixture::new("verteximport");
-    let (base, server) = f.server().await;
-    let upload = |path: &str, body: Vec<u8>, content_type: &str| {
-        let request = wreq::Client::new()
-            .post(format!("{base}{path}"))
-            .bearer_auth("fake-management-only")
-            .header("content-type", content_type)
-            .body(body);
-        async move {
-            let response = request.send().await.unwrap();
-            (response.status().as_u16(), response.json::<Value>().await.unwrap())
-        }
-    };
-    let form = |file: &str, location: Option<&str>| {
-        let mut body = String::new();
-        if let Some(location) = location {
-            body.push_str(&format!(
-                "--b\r\nContent-Disposition: form-data; name=\"location\"\r\n\r\n{location}\r\n"
-            ));
-        }
-        body.push_str(&format!(
-            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"key.json\"\r\nContent-Type: application/json\r\n\r\n{file}\r\n--b--\r\n"
-        ));
-        body.into_bytes()
-    };
-    const FORM: &str = "multipart/form-data; boundary=b";
-    let v8 = "/v8/management/oauth/import?provider=vertex";
-    let no_project = {
-        let mut sa: Value = serde_json::from_str(key).unwrap();
-        sa.as_object_mut().unwrap().remove("project_id");
-        sa.to_string()
-    };
-    for (body, content_type, want) in [
-        (b"{}".to_vec(), "application/json", json!({"error": "file required"})),
-        (
-            b"--b\r\nContent-Disposition: form-data; name=\"location\"\r\n\r\nx\r\n--b--\r\n".to_vec(),
-            FORM,
-            json!({"error": "file required"}),
-        ),
-        (
-            form("[1]", None),
-            FORM,
-            json!({"error": "invalid json", "message": "json: cannot unmarshal array into Go value of type map[string]interface {}"}),
-        ),
-        (
-            form("null", None),
-            FORM,
-            json!({"error": "invalid service account", "message": "service account payload is empty"}),
-        ),
-        (
-            form("{}", None),
-            FORM,
-            json!({"error": "invalid service account", "message": "service account missing private_key"}),
-        ),
-        (form(&no_project, None), FORM, json!({"error": "project_id missing"})),
-    ] {
-        assert_eq!(upload(v8, body, content_type).await, (400, want));
-    }
-    let auth = f.dir.join("auth");
-    assert_eq!(std::fs::read_dir(&auth).unwrap().count(), 0);
-
-    // A fresh import writes Go's bytes: the CLI golden without its empty prefix.
-    let (status, body) = upload(
-        "/v8/management/oauth/import?provider=VERTEX&location=us-east1",
-        form(key, None),
-        FORM,
-    )
-    .await;
-    let path = auth.join("vertex-proj-1.json");
-    assert_eq!(
-        (status, body),
-        (
-            200,
-            json!({"status": "ok", "auth-file": path.to_str().unwrap(), "project_id": "proj-1",
-                "email": "svc@proj-1.iam.gserviceaccount.com", "location": "us-east1"})
-        )
-    );
-    let golden = basic["files"]["vertex-proj-1.json"]
-        .as_str()
-        .unwrap()
-        .replace("  \"prefix\": \"\",\n", "")
-        .replace("us-central1", "us-east1");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), golden);
-    // The service account holds a private key: never world-readable.
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-    let published = f.rt.store().get("vertex-proj-1.json").expect("published");
-    assert_eq!(published.provider, "vertex");
-
-    // Importing again keeps the user's settings and disabled flag, not token payload;
-    // the form location wins over the query.
-    std::fs::write(
-        &path,
-        r#"{"type":"vertex","prefix":"team","disabled":true,"access_token":"fake-stale"}"#,
-    )
-    .unwrap();
-    let (status, body) = upload(
-        "/v0/management/vertex/import?location=us-east1",
-        form(key, Some(" europe-west4 ")),
-        FORM,
-    )
-    .await;
-    assert_eq!((status, &body["location"]), (200, &json!("europe-west4")));
-    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(
-        (
-            &saved["prefix"],
-            &saved["disabled"],
-            saved.get("access_token"),
-            &saved["location"]
-        ),
-        (&json!("team"), &json!(true), None, &json!("europe-west4"))
-    );
-
-    // Non-string project IDs name the file as Go's fmt.Sprint prints the float64 and
-    // composite values json.Unmarshal decodes (names from Go v8.0.35 with these literals).
-    for (project, file) in [
-        ("1000000", "vertex-1e+06.json"),
-        ("51.248178375505404", "vertex-51.248178375505404.json"),
-        ("12345678901234567890", "vertex-1.2345678901234567e+19.json"),
-        ("9007199254740993", "vertex-9.007199254740992e+15.json"),
-        ("0.000001", "vertex-1e-06.json"),
-        (r#"["a", "b"]"#, "vertex-[a-b].json"),
-        (
-            r#"{"b":[1.5,2e-7,true,null],"a":{"c":100000}}"#,
-            "vertex-map[a_map[c_100000]-b_[1.5-2e-07-true-<nil>]].json",
-        ),
-    ] {
-        let mut sa: Value = serde_json::from_str(key).unwrap();
-        sa["project_id"] = json!("@project@");
-        let sa = sa.to_string().replace(r#""@project@""#, project);
-        let (status, body) = upload(v8, form(&sa, None), FORM).await;
-        assert_eq!(status, 200, "{body}");
-        assert!(auth.join(file).exists(), "{file}: {body}");
-    }
-    server.abort();
-
-    // Go `saveTokenRecord`: with a remote store that is down, the import fails.
-    let down = Fixture::new("vertexstore");
-    let store = Arc::new(FakeStore {
-        dir: down.dir.join("auth"),
-        down: true,
-        ..Default::default()
-    });
-    let options = management::Options {
-        store: Some(store.clone()),
-        ..Default::default()
-    };
-    let (base, _management, server) = serve_with(&down, options).await;
-    let response = wreq::Client::new()
-        .post(format!("{base}{v8}"))
-        .bearer_auth("fake-management-only")
-        .header("content-type", FORM)
-        .body(form(key, None))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 500);
-    assert_eq!(
-        response.json::<Value>().await.unwrap(),
-        json!({"error": "save_failed", "message": "fake store unavailable"})
-    );
-    assert_eq!(*store.pushed.lock().unwrap(), ["Update auth vertex-proj-1.json"]);
-    assert!(down.rt.store().get("vertex-proj-1.json").is_none(), "not published");
-    server.abort();
 }
 
 /// Claude: a pasted callback URL posted to `/oauth/callback` finishes the login.
@@ -3625,8 +3040,8 @@ async fn claude_login_removes_the_legacy_file_only_after_the_store_has_the_new_o
 }
 
 /// A store whose pushes are really pending on the runtime's timers. When the Claude
-/// push arrives (its save holds the disk lock), it starts a Vertex import, whose save
-/// takes the lock next and waits on its own push.
+/// push arrives (its save holds the disk lock), it starts a credential upload, whose
+/// save takes the lock next and waits on its own push.
 #[derive(Default)]
 struct SlowStore {
     dir: PathBuf,
@@ -3684,9 +3099,7 @@ fn a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker() {
         .unwrap();
     let (done, finished) = std::sync::mpsc::channel();
     rt.spawn(async move {
-        let fixture: Value =
-            serde_json::from_str(include_str!("../../cpa-exec/tests/fixtures/vertex_go.json")).unwrap();
-        let key = fixture["import"][0]["input"].as_str().unwrap().to_owned();
+        let key = r#"{"type":"codex","access_token":"fake-access"}"#;
         let (fake, _seen, fake_server) = fake_logins().await;
         let f = Fixture::new("slowstore");
         let store = Arc::new(SlowStore {
@@ -3700,10 +3113,10 @@ fn a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker() {
         };
         let (base, _state, server) = serve_with(&f, options).await;
         let body = format!(
-            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"key.json\"\r\nContent-Type: application/json\r\n\r\n{key}\r\n--b--\r\n"
+            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"codex-upload.json\"\r\nContent-Type: application/json\r\n\r\n{key}\r\n--b--\r\n"
         );
         *store.upload.lock().unwrap() = Some((
-            format!("{base}/v8/management/oauth/import?provider=vertex"),
+            format!("{base}/v8/management/credentials"),
             body.into_bytes(),
         ));
         let started = oauth_get(&base, "/oauth/auth-url?provider=claude").await;
@@ -3730,66 +3143,97 @@ fn a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker() {
     assert_eq!((status, imported), (json!({"status": "ok"}), 200));
 }
 
-/// Kimi device login saves after authorization; a cancelled one saves nothing.
 #[tokio::test]
-async fn kimi_device_login_saves_and_a_cancelled_one_does_not() {
-    let (fake, _seen, fake_server) = fake_logins().await;
-    let f = Fixture::new("kimilogin");
-    let (base, _state, server) = login_server(&f, &fake).await;
-    let started = oauth_get(&base, "/oauth/auth-url?provider=kimi").await;
-    assert_eq!(started["flow"], "device");
-    assert_eq!(started["user_code"], "UC-1");
-    assert_eq!(started["expires_in"], 600);
-    assert_eq!(started["url"], "https://kimi.example.invalid/device?code=UC-1");
-    let state = started["state"].as_str().unwrap().to_owned();
-    assert!(state.starts_with("kmi-"));
-    let cancelled = oauth_get(&base, "/oauth/auth-url?provider=kimi-ai").await;
-    let other = cancelled["state"].as_str().unwrap().to_owned();
-    let r: Value = wreq::Client::new()
-        .delete(format!("{base}/v8/management/oauth/session?state={other}"))
-        .bearer_auth("fake-management-only")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(r, json!({"status": "ok", "cancelled": true}));
-    assert_eq!(final_status(&base, &state, 15).await, json!({"status": "ok"}));
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let names: Vec<String> = std::fs::read_dir(f.dir.join("auth"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        names
-            .iter()
-            .filter(|n| n.starts_with("kimi-") && !n.starts_with("kimi-ai"))
-            .count(),
-        1,
-        "{names:?}"
-    );
-    assert!(!names.iter().any(|n| n.starts_with("kimi-ai")), "{names:?}");
+async fn removed_oauth_maps_refuse_writes_and_keep_the_running_config_on_reload() {
+    let f = Fixture::new("removed-oauth-maps");
+    let (base, server) = f.server().await;
+    let before = f.file();
+    let running = f.rt.config().document.clone();
+    let client = wreq::Client::new();
+    for (field, entries) in [
+        ("settings", json!([{"name":"model", "max-context-length":42}])),
+        (
+            "request-scoped-errors",
+            json!([{"status":401, "match":["denied"], "action":"stop"}]),
+        ),
+    ] {
+        let response = client
+            .put(format!("{base}/v8/management/config/oauth/{field}"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({" Gemini-CLI ": entries}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_config");
+        assert!(body["message"].as_str().unwrap().contains(&format!("oauth.{field}")));
+        assert_eq!(f.file(), before);
+        assert_eq!(f.rt.config().document, running);
+
+        let legacy = format!(
+            "{before}\noauth-{field}:\n  gemini: {}\n",
+            serde_json::to_string(&entries).unwrap()
+        );
+        std::fs::write(f.dir.join("config.yaml"), legacy).unwrap();
+        let error = watching::reload(&f.state).unwrap_err().to_string();
+        assert!(error.contains(&format!("oauth.{field}")), "{error}");
+        assert_eq!(f.rt.config().document, running);
+        std::fs::write(f.dir.join("config.yaml"), &before).unwrap();
+        watching::reload(&f.state).unwrap();
+    }
     server.abort();
-    fake_server.abort();
 }
 
-/// `provider=kimi` honours Go's `domain`/`channel` selectors, and a failed Codex
+/// The removed providers' logins, imports and key lists answer 410, and a failed Codex
 /// exchange reports Go's "token exchange failed" text in the session.
 #[tokio::test]
-async fn kimi_channel_selects_kimi_ai_and_codex_exchange_errors_read_like_go() {
+async fn removed_provider_operations_fail_and_codex_exchange_errors_read_like_go() {
     let (fake, _seen, fake_server) = fake_logins().await;
     let f = Fixture::new("loginselect");
     let (base, _state, server) = login_server(&f, &fake).await;
-    let started = oauth_get(&base, "/oauth/auth-url?provider=kimi&channel=ai").await;
-    let state = started["state"].as_str().unwrap().to_owned();
-    assert!(state.starts_with("kmi-ai-"), "{state}");
-    let _ = wreq::Client::new()
-        .delete(format!("{base}/v8/management/oauth/session?state={state}"))
+    // Logins, imports and key lists of the removed providers answer 410 with migration
+    // guidance (issue #49), on both API generations.
+    let client = wreq::Client::new();
+    for (method, path) in [
+        ("GET", "/v8/management/oauth/auth-url?provider=kimi&channel=ai"),
+        ("GET", "/v8/management/oauth/auth-url?provider=antigravity"),
+        ("GET", "/v8/management/oauth/auth-url?provider=devin"),
+        ("POST", "/v8/management/oauth/import?provider=vertex"),
+        ("GET", "/v0/management/kimi-auth-url"),
+        ("GET", "/v0/management/kimi-ai-auth-url"),
+        ("GET", "/v0/management/antigravity-auth-url"),
+        ("GET", "/v0/management/devin-auth-url"),
+        ("POST", "/v0/management/vertex/import"),
+        ("GET", "/v0/management/gemini-api-key"),
+        ("PUT", "/v0/management/openai-compatibility"),
+        ("PATCH", "/v0/management/vertex-api-key"),
+        ("DELETE", "/v0/management/interactions-api-key"),
+    ] {
+        let response = client
+            .request(method.parse().unwrap(), format!("{base}{path}"))
+            .bearer_auth("fake-management-only")
+            .body("[]")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 410, "{method} {path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "removed_provider", "{method} {path}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("is no longer supported") && error.contains("Claude, Codex, Grok (xai) and Muse (meta)"),
+            "{method} {path}: {body}"
+        );
+    }
+    // An unknown provider still reads as not found.
+    let unknown = client
+        .get(format!("{base}/v8/management/oauth/auth-url?provider=nonesuch"))
         .bearer_auth("fake-management-only")
         .send()
         .await
         .unwrap();
+    assert_eq!(unknown.status().as_u16(), 404);
     server.abort();
 
     // A token endpoint that rejects the code.
@@ -3842,14 +3286,14 @@ async fn config_writes_render_json_values_as_block_yaml() {
             r#"[{{"name":"compat-{n}","base-url":"https://api.example.com","headers":{{"User-Agent":"$User-Agent"}},"models":[{{"alias":"coding","name":"gpt-4o"}}],"keys":[{{"api-key":"fake-compat-{n}"}}]}}]"#
         )
     };
-    let block = "api-keys:\n  openai-compatibility:\n    - name: compat-N\n      base-url: https://api.example.com\n      headers:\n        User-Agent: $User-Agent\n      models:\n        - alias: coding\n          name: gpt-4o\n      keys:\n        - api-key: fake-compat-N\n";
-    let r = send(wreq::Method::PUT, "/config/api-keys/openai-compatibility", &compat("1"))
+    let block = "api-keys:\n  claude:\n    - name: compat-N\n      base-url: https://api.example.com\n      headers:\n        User-Agent: $User-Agent\n      models:\n        - alias: coding\n          name: gpt-4o\n      keys:\n        - api-key: fake-compat-N\n";
+    let r = send(wreq::Method::PUT, "/config/api-keys/claude", &compat("1"))
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(f.file().ends_with(&block.replace('N', "1")), "{}", f.file());
     let patch = format!(
-        r#"{{"api-keys":{{"openai-compatibility":{}}},"server":{{"trusted-proxies":[]}}}}"#,
+        r#"{{"api-keys":{{"claude":{}}},"server":{{"trusted-proxies":[]}}}}"#,
         compat("2")
     );
     let r = send(wreq::Method::PATCH, "/config", &patch).await.unwrap();
@@ -3864,7 +3308,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
     // A whole-config PUT is all JSON: block collections and plain keys throughout, and
     // the saved file loads.
     let root = format!(
-        r#"{{"config-version":8,"management":{{"secret-key":"fake-management-only"}},"server":{{"port":8317}},"api-keys":{{"openai-compatibility":{}}}}}"#,
+        r#"{{"config-version":8,"management":{{"secret-key":"fake-management-only"}},"server":{{"port":8317}},"api-keys":{{"claude":{}}}}}"#,
         compat("3")
     );
     let r = send(wreq::Method::PUT, "/config", &root).await.unwrap();
@@ -3875,7 +3319,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
         assert!(!file.contains(quoted), "{quoted} in {file}");
     }
     let loaded = cpa_core::config::Config::parse(&file).unwrap();
-    let compat = &loaded.document["api-keys"]["openai-compatibility"][0];
+    let compat = &loaded.document["api-keys"]["claude"][0];
     assert_eq!(compat["headers"]["User-Agent"].as_str(), Some("$User-Agent"));
     server.abort();
 }

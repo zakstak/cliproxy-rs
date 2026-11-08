@@ -41,7 +41,7 @@ priority = 90
 filter = '''
     binary_id(cpa-translate::golden) | binary_id(cpa-server::legacy_go)
     | binary_id(cpa-server::media_go) | binary_id(cpa-server::quota_trust)
-    | binary_id(cpa-server::manage_go) | binary_id(cpa-common::gemini_schema)
+    | binary_id(cpa-server::manage_go) | binary_id(cpa-common::schema_refs)
     | binary_id(cpa-server::body_limit_go)
 '''
 priority = 40

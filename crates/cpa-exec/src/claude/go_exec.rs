@@ -648,12 +648,7 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
     let chat = req.response_format == Format::OpenAI && kind == "execute_stream";
     // Go's tests swap the executor's clock; the recorded date is what it read.
     let pins = super::tests::pin_today(record["date"].as_str());
-    // A direct countTokensUpstream call counts upstream whatever the origin.
-    let delegation = super::Delegation {
-        count_upstream: kind == "count_tokens_upstream",
-        ..Default::default()
-    };
-    let result = executor.execute_delegated(&credential, req, &cfg, delegation).await;
+    let result = executor.execute(&credential, req, &cfg).await;
     drop(pins);
     let recorded = &record["result"];
     let go = if kind == "execute_stream" && recorded["error"].is_null() {
