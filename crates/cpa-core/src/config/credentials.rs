@@ -1379,7 +1379,9 @@ mod tests {
     fn scalar_model_names_keep_their_yaml_text() {
         let go: Json = serde_json::from_str(include_str!("../../tests/fixtures/scalar_model_names_go.json")).unwrap();
         for section in ["yaml", "legacy", "lists", "legacy-lists"] {
-            let cfg = Config::parse(go[section]["yaml"].as_str().unwrap()).unwrap();
+            // The removed providers' sections (issue #49) and their keys' models go.
+            let yaml = crate::removed::strip_settings(go[section]["yaml"].as_str().unwrap());
+            let cfg = Config::parse(&yaml).unwrap();
             let aliases = crate::registry::dynamic::global_aliases(&cfg);
             // Exclusions and OAuth model aliases, where Go has them.
             if let Some(want) = go[section].get("oauth-excluded-models") {
@@ -1405,7 +1407,11 @@ mod tests {
                     .collect();
                 got.insert(c.attributes["api_key"].clone(), models.into());
             }
-            assert_eq!(Json::Object(got), go[section]["models"], "{section}");
+            let mut want = go[section]["models"].clone();
+            for removed in ["vk", "ok"] {
+                want.as_object_mut().unwrap().remove(removed);
+            }
+            assert_eq!(Json::Object(got), want, "{section}");
         }
         // A payload rule's model name is a Go string too, but its params are untyped:
         // a `models` list nested in them keeps its YAML types.

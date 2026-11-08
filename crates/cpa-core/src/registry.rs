@@ -783,19 +783,14 @@ mod tests {
         assert_eq!(changed_providers(&old, &new), ["codex"]);
     }
 
-    /// Go TestDetectChangedProviders_KimiAliases: a Kimi change reports every Kimi alias.
+    /// Go TestDetectChangedProviders for the retained sections: a change reports its
+    /// provider once, unchanged sections report nothing, and the removed providers'
+    /// sections (issue #49) report nothing.
     #[test]
-    fn detect_changed_providers_kimi_aliases() {
-        let old = catalog(r#"{"kimi":[{"id":"kimi-k2"}]}"#);
-        let new = catalog(r#"{"kimi":[{"id":"kimi-k2"},{"id":"kimi-k3"}]}"#);
-        assert_eq!(
-            changed_providers(&old, &new),
-            ["kimi", "kimi-ai", "kimi.ai", "kimi.com"]
-        );
-        // Gemini changes cover both Gemini protocols; unchanged sections report nothing.
-        let old = catalog(r#"{"gemini":[{"id":"g"}],"claude":[{"id":"c"}]}"#);
-        let new = catalog(r#"{"gemini":[{"id":"g","display_name":"G"}],"claude":[{"id":"c"}]}"#);
-        assert_eq!(changed_providers(&old, &new), ["gemini", "gemini-interactions"]);
+    fn detect_changed_providers_reports_retained_providers() {
+        let old = catalog(r#"{"xai":[{"id":"g"}],"claude":[{"id":"c"}],"kimi":[{"id":"k"}]}"#);
+        let new = catalog(r#"{"xai":[{"id":"g","display_name":"G"}],"claude":[{"id":"c"}],"kimi":[]}"#);
+        assert_eq!(changed_providers(&old, &new), ["xai"]);
     }
 
     /// Go validateModelsCatalog: null entries, empty ids and duplicates in required
@@ -866,16 +861,10 @@ mod tests {
             sizes,
             [
                 ("claude", 19),
-                ("gemini", 14),
-                ("vertex", 21),
-                ("gemini-cli", 7),
-                ("aistudio", 15),
                 ("codex-free", 5),
                 ("codex-team", 9),
                 ("codex-plus", 9),
                 ("codex-pro", 9),
-                ("kimi", 10),
-                ("antigravity", 11),
                 ("xai", 12),
                 ("meta", 9),
             ]
@@ -885,14 +874,10 @@ mod tests {
     #[test]
     fn lookup_follows_go_search_order_across_providers() {
         let catalog = pinned();
-        // Present in claude and antigravity: the claude definition wins.
         assert_eq!(catalog.lookup("claude-sonnet-4-6").unwrap().kind, "claude");
-        // Only in vertex and antigravity: vertex is searched first.
-        assert_eq!(catalog.lookup("gemini-3-flash").unwrap().kind, "gemini");
-        // Non-Claude capabilities are visible to Claude-bound translation (Go does the same).
-        let kimi = catalog.lookup("kimi-k2.5").unwrap().thinking.as_ref().unwrap();
-        assert_eq!(kimi.levels, ["low", "high"]);
-        assert!(kimi.zero_allowed);
+        // The removed providers' sections are gone (issue #49).
+        assert!(catalog.lookup("gemini-3-flash").is_none());
+        assert!(catalog.lookup("kimi-k2.5").is_none());
         assert!(catalog.lookup("").is_none());
         assert!(catalog.lookup("no-such-model").is_none());
     }

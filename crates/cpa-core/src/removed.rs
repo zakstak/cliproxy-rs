@@ -106,7 +106,7 @@ fn set(value: &Value) -> bool {
         Value::Bool(b) => *b,
         Value::String(s) => !s.trim().is_empty(),
         Value::Sequence(s) => !s.is_empty(),
-        Value::Mapping(m) => !m.is_empty(),
+        Value::Mapping(m) => m.values().any(set),
         Value::Tagged(t) => set(&t.value),
         Value::Number(_) => true,
     }
@@ -155,6 +155,43 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test support for Go goldens recorded with settings of the removed providers: `yaml`
+/// without the block (or flow line) of each removed setting, so the rest of the recorded
+/// document still loads. Indentation decides a block's extent.
+#[cfg(test)]
+pub(crate) fn strip_settings(yaml: &str) -> String {
+    const KEYS: [&str; 7] = [
+        "vertex:",
+        "openai-compatibility:",
+        "gemini:",
+        "interactions:",
+        "vertex-api-key:",
+        "gemini-api-key:",
+        "antigravity:",
+    ];
+    let mut out = String::new();
+    let mut skip: Option<usize> = None;
+    for line in yaml.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start().len();
+        let text = line.trim_start().trim_start_matches("- ");
+        if let Some(level) = skip {
+            if line.trim().is_empty() || indent > level {
+                continue;
+            }
+            skip = None;
+        }
+        if KEYS.iter().any(|k| text.starts_with(k)) {
+            skip = Some(indent);
+            continue;
+        }
+        if line.contains("{antigravity:") {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +218,7 @@ mod tests {
             .to_string();
         assert!(err.starts_with("api-keys.gemini (legacy `gemini-api-key`) configures Gemini"), "{err}");
         assert!(err.contains("Claude, Codex, Grok (xai) and Muse (meta)"), "{err}");
+        assert!(strip_settings("a: 1\napi-keys:\n  vertex:\n    - k: v\n  claude: []\n").contains("claude"));
         let err = config(&doc("oauth:\n  excluded-models:\n    antigravity: [a]\n"))
             .unwrap_err()
             .to_string();

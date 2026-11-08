@@ -1999,9 +1999,13 @@ oauth-excluded-models: {{c: [{numbers}]}}
         let go: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/scalar_settings_go.json")).unwrap();
         for case in go["cases"].as_array().unwrap() {
-            let cfg = Config::parse(case["yaml"].as_str().unwrap()).unwrap();
+            // The removed providers' settings (issue #49) and their checks go.
+            let cfg = Config::parse(&crate::removed::strip_settings(case["yaml"].as_str().unwrap())).unwrap();
             for check in case["checks"].as_array().unwrap() {
                 let path = check["rust"].as_str().unwrap();
+                if path.contains("openai-compatibility") || path.contains("antigravity") {
+                    continue;
+                }
                 let mut node = &cfg.document;
                 for part in path.split('.') {
                     node = match part.parse::<usize>() {
@@ -2014,7 +2018,7 @@ oauth-excluded-models: {{c: [{numbers}]}}
         }
         // A model with a display name written as a number registers under its prefix,
         // both as Go reads them.
-        let cfg = Config::parse(go["cases"][0]["yaml"].as_str().unwrap()).unwrap();
+        let cfg = Config::parse(&crate::removed::strip_settings(go["cases"][0]["yaml"].as_str().unwrap())).unwrap();
         let aliases = crate::registry::dynamic::global_aliases(&cfg);
         let models: Vec<(String, String)> = credentials::from_config(&cfg)
             .iter()

@@ -359,7 +359,6 @@ mod tests {
             "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, is-compat: false}]}]\n",
             "codex-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a}]}]\n",
             "claude-api-key: [{api-key: k, base-url: https://x.test, models: [{name: a, alias: b, is-compat: true}]}]\n",
-            "gemini-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
             "xai-api-key: [{api-key: k, models: [{name: a, alias: b, is-compat: true}]}]\n",
         ] {
             assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");

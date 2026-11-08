@@ -1748,64 +1748,6 @@ mod tests {
         }
     }
 
-    /// Go `registerModelsForAuth` (tests/reference/provider_key): the key an
-    /// OpenAI-compatible credential that config synthesis did not build (a Home-dispatched
-    /// or plugin auth) registers under. Without a `provider_key`, the compat name or else
-    /// the label gets Go's `openai-compatible-` prefix.
-    #[test]
-    fn compat_provider_key_follows_go() {
-        // DIFFERENCES-FROM-GO.md "Plugins, models of credentials with another provider":
-        // Go registers these under the `provider_key` (or nothing without a plugin model),
-        // cliproxy-rs under the provider.
-        const OTHER_PROVIDER: [&str; 2] = ["unnamed-provider-provider-key", "unmatched-provider-provider-key"];
-        let go: Value = serde_json::from_str(include_str!("../../tests/fixtures/provider_key_go.json")).unwrap();
-        for case in go["cases"].as_array().unwrap() {
-            let attrs: Vec<(&str, &str)> = case["attributes"]
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str().unwrap()))
-                .collect();
-            let mut c = (*config(case["provider"].as_str().unwrap(), "zz", serde_json::json!({}), &attrs)).clone();
-            c.label = case["label"].as_str().unwrap().into();
-            if OTHER_PROVIDER.contains(&case["name"].as_str().unwrap()) {
-                assert_eq!(provider_key(&c), case["provider"].as_str().unwrap().go_lower());
-                continue;
-            }
-            assert_eq!(
-                Value::from(vec![provider_key(&c)]),
-                case["registered"],
-                "{}",
-                case["name"]
-            );
-        }
-    }
-
-    /// An openai-compatibility group named `HİGH` registers under Go's lowercased key,
-    /// and asking for it by its configured name finds its models (Go
-    /// `GetAvailableModelsByProvider` lowercases with `strings.ToLower`).
-    #[test]
-    fn compat_provider_lookup_lowercases_like_go() {
-        let cfg = Config::parse(
-            "openai-compatibility:\n  - name: HİGH\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: m1}]\n",
-        )
-        .unwrap();
-        let creds: Vec<_> = crate::config::credentials::from_config(&cfg)
-            .into_iter()
-            .map(Arc::new)
-            .collect();
-        assert_eq!(provider_key(&creds[0]), "openai-compatible-high");
-        let r = Registry::build(&cfg, &creds);
-        for asked in ["openai-compatible-HİGH", "openai-compatible-high"] {
-            let ids: Vec<String> = r
-                .available_by_provider(asked, |_, _| Suspension::None)
-                .iter()
-                .map(|m| m.id.clone())
-                .collect();
-            assert_eq!(ids, ["m1"], "{asked}");
-        }
-    }
-
     /// Go `applyAPIKeyModelAliasWithRouting`: an API key resolves through its
     /// `strings.ToLower`-keyed alias table before the `EqualFold` scan, so aliases σ and ς
     /// stay distinct; `Σ` lowercases to σ.
@@ -1826,31 +1768,6 @@ mod tests {
         let c = crate::config::credentials::from_config(&cfg).remove(0);
         assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["one(high)"]);
 
-        // An OpenAI-compatible API key falls back to the table when the EqualFold pool is
-        // empty.
-        let cfg = Config::parse(
-            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: one, alias: i}]\n",
-        )
-        .unwrap();
-        let c = crate::config::credentials::from_config(&cfg).remove(0);
-        assert!(is_api_key(&c));
-        assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["one(high)"]);
-        // A single-entry EqualFold pool still wins over the table, which maps σ to the
-        // name σ here.
-        let cfg = Config::parse(
-            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    api-key-entries: [{api-key: k}]\n    models: [{name: σ, alias: x}, {name: one, alias: ς}]\n",
-        )
-        .unwrap();
-        let c = crate::config::credentials::from_config(&cfg).remove(0);
-        assert_eq!(execution_models(&HashMap::new(), &c, "σ").0, ["one"]);
-        // A keyless compatible credential has no API-key table.
-        let cfg = Config::parse(
-            "openai-compatibility:\n  - name: g\n    base-url: http://127.0.0.1:9\n    models: [{name: one, alias: i}]\n",
-        )
-        .unwrap();
-        let c = crate::config::credentials::from_config(&cfg).remove(0);
-        assert!(!is_api_key(&c));
-        assert_eq!(execution_models(&HashMap::new(), &c, "İ(high)").0, ["İ(high)"]);
     }
 
     /// Go `resolveOAuthModelAliasWithResult`: the credential's own aliases match with
@@ -1930,23 +1847,6 @@ mod tests {
         );
         // Unknown models pass through unchanged.
         assert_eq!(execution_models(&HashMap::new(), &c, "other").0, ["other"]);
-    }
-
-    #[test]
-    fn compat_pools_rotate_through_every_name() {
-        let c = config(
-            "openai-compatible-pool",
-            "openai-compatibility:pool:1",
-            serde_json::json!({"model_aliases":[{"name":"a-1","alias":"fast"},{"name":"a-2","alias":"fast"}]}),
-            &[("compat_name", "pool"), ("provider_key", "openai-compatible-pool")],
-        );
-        let r = Registry::build(&Config::default(), std::slice::from_ref(&c));
-        assert_eq!(r.providers("fast"), ["openai-compatible-pool"]);
-        assert_eq!(
-            r.info("fast", None).unwrap().thinking.as_ref().unwrap().levels,
-            ["low", "medium", "high"]
-        );
-        assert_eq!(execution_models(&HashMap::new(), &c, "fast").0, ["a-1", "a-2"]);
     }
 
     #[test]
