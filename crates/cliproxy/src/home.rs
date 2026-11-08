@@ -619,6 +619,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    cpa_core::config::credentials::validate_metadata(&metadata).map_err(|e| reject(502, "invalid_auth", e))?;
     let provider = text("provider").go_lower();
     let label = text("label");
     let key = executor_key(&provider, &label, &attributes);
@@ -1402,6 +1403,19 @@ mod tests {
             ("a.json", "claude", "e@x")
         );
         assert!(credential(&DispatchResponse::parse(br#"{"id":"x"}"#).unwrap(), "m").is_err());
+    }
+
+    #[test]
+    fn dispatched_auths_refuse_retired_quota_probe() {
+        let response = DispatchResponse::parse(
+            br#"{"id":"fake-home-auth","provider":"codex","metadata":{"quota_probe":{"kind":"fake"}}}"#,
+        )
+        .unwrap();
+        let error = credential(&response, "fake-model").unwrap_err();
+        assert_eq!(error.error.status, 502);
+        let body = String::from_utf8_lossy(&error.error.body);
+        assert!(body.contains("quota_probe"));
+        assert!(body.contains("requests/api-call"));
     }
 
     /// Go `TestHomeForceMappingAliasResult`,

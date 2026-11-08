@@ -75,7 +75,8 @@ This fork does not load Go CLIProxyAPI native plugins and has no plugin hooks, p
 
 1. Delete the whole `plugins` section from `config.yaml`, and from the config Home serves when you run with `-home-jwt`. Any `plugins` key, even `plugins: {enabled: false}`, stops the load with `the plugins section is not supported: cliproxy-rs removed native plugin support ...`. A reload with the section keeps the running config, and a Management API write that adds it answers `422 invalid_config`.
 2. Remove command-line flags that a plugin added. They are unknown flags here, and the binary exits with a usage error.
-3. Move each plugin's job to a built-in feature, or keep running Go for it:
+3. Remove the top-level `quota_probe` field from credential JSON files and from credentials served by Home. Any value, including `null` or `false`, is refused. Local scans skip the credential with a migration warning; uploads and field edits return `400` without changing the file, and Home dispatch refuses the credential. Use `POST /v8/management/requests/api-call` with `$TOKEN$` for provider usage requests. Existing files are never modified automatically.
+4. Move each plugin's job to a built-in feature, or keep running Go for it:
 
 | What a plugin did | In cliproxy-rs |
 | --- | --- |
@@ -85,7 +86,7 @@ This fork does not load Go CLIProxyAPI native plugins and has no plugin hooks, p
 | Request and response rewriting (interceptors, normalizers, translators, thinking appliers) | Payload rules under `requests.payload` for non-Codex providers, and the built-in translation. Codex requests take no operator rewrites ([codex/CONTRACT.md](codex/CONTRACT.md#settings)). |
 | Usage and request lifecycle plugins | The usage queue (`observability.usage.usage-statistics-enabled`, `GET /v8/management/observability/usage/queue`, the RESP `usage` channel) and request logs. |
 | Auth providers (`auth.parse`, plugin refresh, sign-in) | The built-in credential files and OAuth sign-in. A file of a type only a plugin read stays in the auth directory untouched, loads as an unknown provider and serves no requests; nothing is deleted. |
-| Quota providers and the `quota/*` routes | Passive quota signals in the credentials listing, and `POST /v8/management/requests/api-call` with `$TOKEN$` to call a provider's usage endpoint, as the dashboard's "Check quota" does. A credential's `quota_probe` metadata is no longer run. |
+| Quota providers and the `quota/*` routes | Passive quota signals in the credentials listing, and `POST /v8/management/requests/api-call` with `$TOKEN$` to call a provider's usage endpoint, as the dashboard's "Check quota" does. A credential's top-level `quota_probe` metadata is refused; remove it before loading or uploading the credential. |
 | Plugin store, plugin routes and resources | None. `/v8/management/plugins...`, `/v0/management/plugins...`, `/v0/management/plugin-store...`, `/v0/management/quota/...` and `/v0/resource/plugins/...` answer `410 {"error":"plugins_removed"}`. |
 | Home-managed plugin sync, tasks and status | None. Home mode otherwise works as before. |
 

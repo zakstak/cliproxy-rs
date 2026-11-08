@@ -5825,6 +5825,60 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
     upstream.abort();
 }
 
+#[tokio::test]
+async fn retired_quota_probe_refuses_load_upload_and_field_edits() {
+    let legacy = br#"{"type":"codex","quota_probe":{"kind":"fake"},"unknown":{"keep":true}}"#;
+    let f = Fixture::from_yaml("quota-probe-removed", |auth, hash| {
+        std::fs::write(auth.join("legacy.json"), legacy).unwrap();
+        std::fs::write(
+            auth.join("active.json"),
+            br#"{"type":"codex","unknown":{"quota_probe":"keep"}}"#,
+        )
+        .unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        )
+    });
+    assert!(f.rt.store().get("legacy.json").is_none());
+    let before = f.rt.store().get("active.json").unwrap();
+    let auth = f.dir.join("auth");
+    let unchanged = std::fs::read(auth.join("active.json")).unwrap();
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    for value in [json!({"kind":"fake"}), Value::Null, json!(false)] {
+        let response = client
+            .post(format!("{base}/v8/management/credentials?name=uploaded.json"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({"type":"codex", "quota_probe":value}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("quota_probe"));
+        assert!(body["error"].as_str().unwrap().contains("requests/api-call"));
+        assert!(!auth.join("uploaded.json").exists());
+    }
+    for field in ["quota_probe", "quota_probe.url", " quota_probe . url "] {
+        let response = client
+            .patch(format!("{base}/v8/management/credentials/fields"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({"name":"active.json", field:"fake-value"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("quota_probe"));
+        assert_eq!(std::fs::read(auth.join("active.json")).unwrap(), unchanged);
+        assert_eq!(f.rt.store().get("active.json").unwrap().revision, before.revision);
+    }
+    assert_eq!(std::fs::read(auth.join("legacy.json")).unwrap(), legacy);
+    assert_eq!(before.metadata["unknown"]["quota_probe"], "keep");
+    server.abort();
+}
+
 /// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): every
 /// plugin, plugin store and plugin quota route answers `410 plugins_removed` behind the
 /// management guard, plugin resources answer it without one, the API reports no plugin

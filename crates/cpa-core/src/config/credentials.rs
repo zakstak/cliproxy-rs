@@ -1055,6 +1055,18 @@ pub fn from_file(_cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Re
     file_credential(auth_dir, path, data)
 }
 
+/// Migration error for the retired declarative quota probe, including disabled or
+/// null values. Unknown credential metadata remains supported.
+pub const QUOTA_PROBE_REMOVED: &str = "credential metadata quota_probe is removed; remove quota_probe and use POST /v8/management/requests/api-call with $TOKEN$ for provider usage requests; see docs/MIGRATING-FROM-GO.md#native-plugins";
+
+/// Validate known retired credential settings before publishing or saving them.
+pub fn validate_metadata(meta: &Map<String, Json>) -> Result<(), &'static str> {
+    if meta.contains_key("quota_probe") {
+        return Err(QUOTA_PROBE_REMOVED);
+    }
+    Ok(())
+}
+
 fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<Credential>, String> {
     if data.is_empty() {
         return Ok(None);
@@ -1062,6 +1074,7 @@ fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<C
     let Ok(mut meta) = serde_json::from_slice::<Map<String, Json>>(data) else {
         return Ok(None);
     };
+    validate_metadata(&meta)?;
     normalize_metadata(&mut meta);
     let weight = match meta.get("weight") {
         Some(w) => Some(parse_weight(w).map_err(|e| format!("invalid metadata weight: {e}"))?),
@@ -1191,6 +1204,7 @@ fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<C
 /// restart; the caller decides how long it lives. `None` for invalid JSON.
 pub fn upload_fallback(auth_dir: &Path, path: &Path, data: &[u8]) -> Option<Credential> {
     let mut meta = serde_json::from_slice::<Map<String, Json>>(data).ok()?;
+    validate_metadata(&meta).ok()?;
     normalize_metadata(&mut meta);
     let provider = match meta.get("type").and_then(Json::as_str) {
         Some(t) if !t.is_empty() => t.to_owned(),
@@ -1929,6 +1943,21 @@ mod tests {
             let want: Vec<String> = want.iter().map(|s: &&str| s.to_string()).collect();
             assert_eq!(read(json), (want, Some(error.to_owned())), "{json}");
         }
+    }
+
+    #[test]
+    fn retired_quota_probe_is_refused_without_dropping_unknown_metadata() {
+        let cfg = Config::default();
+        let dir = Path::new("/private-fake-auth");
+        let path = dir.join("a.json");
+        for value in [serde_json::json!({"kind": "fake"}), Json::Null, Json::Bool(false)] {
+            let raw = serde_json::to_vec(&serde_json::json!({"type":"codex", "quota_probe":value})).unwrap();
+            assert_eq!(from_file(&cfg, dir, &path, &raw).unwrap_err(), QUOTA_PROBE_REMOVED);
+            assert!(upload_fallback(dir, &path, &raw).is_none());
+        }
+        let raw = br#"{"type":"codex","unknown":{"quota_probe":{"keep":true}}}"#;
+        let credential = from_file(&cfg, dir, &path, raw).unwrap().unwrap();
+        assert_eq!(credential.metadata["unknown"]["quota_probe"]["keep"], true);
     }
 
     /// Go's synthesizer lowercases with `strings.ToLower`, which maps U+0130 (İ) to a

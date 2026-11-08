@@ -13,7 +13,37 @@ mod plugins_removed;
 
 fn fixture() -> &'static Value {
     static FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("fixtures/manage_go.json")).expect("fixture JSON")
+        let mut fixture: Value = serde_json::from_str(include_str!("fixtures/manage_go.json")).expect("fixture JSON");
+        // Native plugins removal: migrate only the three seeded Claude files and
+        // their recorded disk snapshots. The original Go recording stays unchanged;
+        // every request and response still replays, including unknown metadata.
+        let mut migrated = 0;
+        let mut snapshots = 0;
+        for scenario in fixture["credentials"].as_array_mut().unwrap() {
+            if !matches!(
+                scenario["name"].as_str(),
+                Some("credential_inventory_and_edits" | "api_call_and_usage" | "dashboard_probes")
+            ) {
+                continue;
+            }
+            let raw = scenario["auth_files"]["claude-a.json"].as_str().unwrap();
+            assert!(raw.contains(r#""quota_probe":{"kind":"fake"},"#));
+            scenario["auth_files"]["claude-a.json"] = raw.replacen(r#""quota_probe":{"kind":"fake"},"#, "", 1).into();
+            migrated += 1;
+            for step in scenario["steps"].as_array_mut().unwrap() {
+                if let Some(file) = step
+                    .get_mut("files")
+                    .and_then(|f| f.get_mut("claude-a.json"))
+                    .and_then(Value::as_object_mut)
+                {
+                    assert_eq!(file.remove("quota_probe"), Some(json!({"kind":"fake"})));
+                    snapshots += 1;
+                }
+            }
+        }
+        assert_eq!(migrated, 3);
+        assert_eq!(snapshots, 129);
+        fixture
     });
     &FIXTURE
 }

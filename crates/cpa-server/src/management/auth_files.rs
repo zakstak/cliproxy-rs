@@ -846,6 +846,7 @@ fn prepare_upload(state: &Management, name: &str, data: &[u8]) -> Result<Upload,
         Ok(m) => m,
         Err(e) => return Err((true, format!("invalid auth file: {e}"))),
     };
+    credentials::validate_metadata(&meta).map_err(|e| (true, e.to_owned()))?;
     // Loading tolerates invalid exclusion rules, so they are rejected here (Go 1a28c61e),
     // after Go's `NormalizeCredentialMetadata`, so an error names the canonical key.
     let mut canonical = meta.clone();
@@ -1796,6 +1797,9 @@ fn apply_fields(
     }
     if !changed {
         return Ok(Some(fail(StatusCode::BAD_REQUEST, "no fields to update")));
+    }
+    if let Err(error) = credentials::validate_metadata(&meta) {
+        return Ok(Some(fail(StatusCode::BAD_REQUEST, error)));
     }
     let mut roots: Vec<String> = fields.iter().map(|f| root(&f.path)).collect();
     if retry.is_some() {
