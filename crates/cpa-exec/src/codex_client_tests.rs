@@ -39,9 +39,14 @@ fn replays_go_translation_and_optimization() {
         let h = headers(v);
         match v["fn"].as_str().unwrap() {
             "translate" => {
+                // Pairs with a format this fork removed (issue #49) are not translated.
+                let (Some(from), Some(to)) = (
+                    Format::parse(v["from"].as_str().unwrap()),
+                    Format::parse(v["to"].as_str().unwrap()),
+                ) else {
+                    continue;
+                };
                 translated += 1;
-                let from = Format::parse(v["from"].as_str().unwrap()).unwrap();
-                let to = Format::parse(v["to"].as_str().unwrap()).unwrap();
                 let client = Client {
                     headers: &h,
                     settings: settings(v),
@@ -72,7 +77,8 @@ fn replays_go_translation_and_optimization() {
             other => panic!("unknown vector fn {other}"),
         }
     }
-    assert_eq!((translated, optimized), (80, 8));
+    // Go records 80 translations; 24 involve a removed format.
+    assert_eq!((translated, optimized), (56, 8));
 }
 
 /// Orphan delegation is a shared `upstream.codex` setting (Go 52d5507d): API keys

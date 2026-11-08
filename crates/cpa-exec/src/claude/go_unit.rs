@@ -192,6 +192,16 @@ async fn replay_file(fixture: &Value, file: &str) {
             if record["fn"] == "count_tokens_upstream" {
                 continue;
             }
+            // Calls whose client speaks a format this fork removed (Gemini, Interactions;
+            // issue #49) have no route here.
+            let removed = |key: &str| {
+                record["options"][key]
+                    .as_str()
+                    .is_some_and(|f| !f.is_empty() && cpa_core::format::Format::parse(f).is_none())
+            };
+            if removed("source_format") || removed("response_format") {
+                continue;
+            }
             count += 1;
             match replay(test, record).await {
                 Ok(Verdict::Matched) => {}
