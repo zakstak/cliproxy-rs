@@ -2778,9 +2778,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = Arc::new(crate::testing::runtime(cfg.clone(), Vec::new(), executors));
         rt.usage_queue().configure(true, &cfg);

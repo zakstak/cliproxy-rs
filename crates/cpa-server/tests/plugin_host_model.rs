@@ -170,9 +170,8 @@ async fn callbacks_execute_pin_and_stream_without_recursing_into_the_caller() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
     cpa_server::plugins::start(&rt).await;
@@ -477,9 +476,8 @@ async fn callback_streams_preserve_executor_bytes_across_interceptor_unload() {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new(&url).unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         cpa_server::plugins::start(&rt).await;
@@ -601,9 +599,8 @@ async fn nested_callbacks_inherit_pin_session_and_path_but_not_proxy() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     cpa_server::plugins::start(&rt).await;
@@ -777,9 +774,8 @@ async fn nested_callbacks_record_the_parent_usage_identity() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     rt.usage_queue().configure(true, &cfg);
@@ -924,9 +920,8 @@ async fn responses_bootstrap_flushes_a_pending_payload() {
                 Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             cpa_server::plugins::start(&rt).await;

@@ -186,9 +186,8 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     let executors = cpa_exec::Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let auth = std::env::temp_dir().join(format!("model-updater-{}", std::process::id()));
     std::fs::create_dir_all(&auth).unwrap();

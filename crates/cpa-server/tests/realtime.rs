@@ -119,9 +119,8 @@ async fn proxy(credentials: Vec<Credential>, mock: Shared) -> String {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     serve(router(rt)).await
@@ -538,9 +537,8 @@ async fn realtime_websockets_match_go() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let proxy = serve(router(rt)).await;
@@ -814,9 +812,8 @@ async fn sideband_claims_and_hangup_teardown() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let proxy = serve(router(rt.clone())).await;
@@ -900,9 +897,8 @@ async fn raw_handshakes_match_gorilla() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let proxy = serve(router(rt)).await;
@@ -989,9 +985,8 @@ async fn relay_end_close_codes_match_gorilla() {
         Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let proxy = serve(router(rt)).await;

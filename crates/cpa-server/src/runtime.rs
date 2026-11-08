@@ -4198,9 +4198,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         );
         let with = |prefix: &str, disabled: bool| {
@@ -4918,9 +4917,8 @@ pub(crate) mod tests {
     }
 
     /// Go 35af74f9 (TestManager_Issue6643_InFlightSuccessesKeepFreshQuotaCooldown):
-    /// successes of requests dispatched before a 429 was recorded, whether picked by
-    /// selection or by the credits fallback outside it, leave the cooldown; a lease
-    /// dispatched again after it (a refresh-and-retry) clears it.
+    /// successes of requests dispatched before a 429 was recorded leave the cooldown; a
+    /// lease dispatched again after it (a refresh-and-retry) clears it.
     #[tokio::test]
     async fn successes_dispatched_before_a_cooldown_keep_it() {
         let rt = Arc::new(crate::testing::runtime(
@@ -4929,18 +4927,12 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let selection = Selection::new("claude", "m");
-        let cfg = rt.config();
         let in_flight = rt.store.select(selection.clone()).unwrap();
-        let credits = rt
-            .lease_credential("a.json", selection.clone(), &cfg, Credential::clone)
-            .await
-            .unwrap();
         let mut retried = rt.store.select(selection.clone()).unwrap();
         let mut quota = ExecError::local(429, FailureScope::Model, "rate limited");
         quota.retry_after = Some(Duration::from_secs(3600));
@@ -4951,11 +4943,6 @@ pub(crate) mod tests {
         assert!(rt.store.select(selection.clone()).is_none(), "cooling");
         in_flight.complete(Outcome::Success);
         assert!(rt.store.select(selection.clone()).is_none(), "a stale success keeps it");
-        credits.complete(Outcome::Success);
-        assert!(
-            rt.store.select(selection.clone()).is_none(),
-            "a stale credits success keeps it"
-        );
         retried.redispatch();
         retried.complete(Outcome::Success);
         assert!(rt.store.select(selection).is_some(), "a later dispatch clears it");
@@ -5002,9 +4989,8 @@ pub(crate) mod tests {
         let executors = || Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         // Legacy top-level keys and the canonical routing block both reach the scheduler.
         let rt = crate::testing::runtime(
@@ -5034,9 +5020,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         );
         let offsets: Vec<usize> = (0..4).map(|_| rt.next_pool_offset("a|openai|m", 3)).collect();
@@ -5193,9 +5178,8 @@ pub(crate) mod tests {
         let executors = || Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-            devices: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = crate::testing::runtime(config(), creds(), executors());
         let mut selection = Selection::new("claude", "m1");
@@ -5306,9 +5290,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let lock = rt.store.prepare_lock("a.json");
@@ -5379,9 +5362,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let refresh = tokio::spawn({
@@ -5500,9 +5482,8 @@ pub(crate) mod tests {
                 Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ));
             let refresh = tokio::spawn({
@@ -5640,9 +5621,8 @@ pub(crate) mod tests {
                 Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                     codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             ))
         }
@@ -6630,9 +6610,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: cpa_exec::codex::CodexExecutor::with_client(client, oauth),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.start_auto_refresh();
@@ -7028,9 +7007,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let logs = Logs::default();
@@ -7185,9 +7163,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         (rt, dir, calls)
@@ -7234,10 +7211,8 @@ pub(crate) mod tests {
         // A refresh that starts after the rejection refuses too.
         assert_eq!(rt.prepare_credential(&id, &cfg, None).await.unwrap_err().status, 401);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // The background loop leaves it alone too, and so does the credits fallback.
+        // The background loop leaves it alone too.
         assert!(rt.store.rejected_ids(&rt.store.snapshot()).contains(&id));
-        let lease = rt.lease_credential(&id, claude(), &cfg, |c| c.clone()).await;
-        assert!(lease.is_none(), "the credits fallback leased a refused credential");
         // Deleted, then imported again with the same tokens: a new credential.
         let reload = |rt: &Runtime| {
             rt.store.reconcile(
@@ -7511,9 +7486,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         (rt, dir)
@@ -7751,9 +7725,8 @@ pub(crate) mod tests {
             Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         crate::plugins::start(&rt).await;
@@ -7848,9 +7821,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .with_oauth(oauth),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.start_auto_refresh();

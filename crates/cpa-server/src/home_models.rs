@@ -371,8 +371,6 @@ mod tests {
             grok(&entries),
             r#"{"object":"list","data":[{"id":"g2","model":"g2","name":"g2","api_backend":"responses","supported_in_api":true},{"id":"grok-4","model":"grok-4","name":"Grok 4","context_window":256000,"api_backend":"responses","supported_in_api":true}]}"#
         );
-        assert_eq!(gemini(&entries[1])["name"], "models/grok-4");
-        assert!(gemini_matches(&entries[1], "models/grok-4") && !gemini_matches(&entries[1], "grok"));
         assert_eq!(
             error_envelope(br#"{"error":{"type":"no_credentials"}}"#),
             Some((401, "home models request failed".into()))

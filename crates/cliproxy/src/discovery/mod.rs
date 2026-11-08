@@ -19,13 +19,8 @@ pub mod mdns;
 pub const DEFAULT_SERVICE_TYPE: &str = "_ai-gateway._tcp";
 pub const DEFAULT_DOMAIN: &str = "local.";
 pub const PRODUCT_CPA: &str = "cliproxyapi";
-const DEFAULT_SUBTYPES: [&str; 5] = [
-    "_chat-completions",
-    "_responses",
-    "_messages",
-    "_generate-content",
-    "_interactions",
-];
+/// Go's default subtypes without the Gemini protocols this fork removed (issue #49).
+const DEFAULT_SUBTYPES: [&str; 3] = ["_chat-completions", "_responses", "_messages"];
 const DEFAULT_INSTANCE_PREFIX: &str = "CPA-";
 const MAX_TXT_RECORD_BYTES: usize = 255;
 const MAX_TXT_BYTES: usize = 400;
@@ -44,7 +39,6 @@ pub struct TxtOptions {
     pub features: Vec<String>,
     pub api_path_openai: String,
     pub api_path_anthropic: String,
-    pub api_path_gemini: String,
     pub tls: bool,
     pub auth_required: bool,
     pub auth_methods: Vec<String>,
@@ -62,17 +56,10 @@ impl Default for TxtOptions {
         Self {
             version: "1".into(),
             product: PRODUCT_CPA.into(),
-            protocols: strings(&[
-                "chat-completions",
-                "responses",
-                "messages",
-                "generate-content",
-                "interactions",
-            ]),
-            features: strings(&["chat", "responses", "messages", "generate_content", "interactions"]),
+            protocols: strings(&["chat-completions", "responses", "messages"]),
+            features: strings(&["chat", "responses", "messages"]),
             api_path_openai: "/v1".into(),
             api_path_anthropic: "/v1".into(),
-            api_path_gemini: "/v1beta".into(),
             tls: false,
             auth_required: true,
             auth_methods: strings(&["api_key"]),
@@ -84,7 +71,8 @@ impl Default for TxtOptions {
 }
 
 /// Go `BuildTXTRecords`: printable-ASCII values in priority order, each record at most
-/// 255 bytes and the set at most 400 (one length byte per record counted).
+/// 255 bytes and the set at most 400 (one length byte per record counted). No
+/// `api_gemini` record: this fork serves no Gemini API (issue #49).
 pub fn build_txt_records(opts: &TxtOptions) -> Vec<String> {
     let or = |v: &str, d: &str| if v.is_empty() { d.to_owned() } else { v.to_owned() };
     let bool_text = |b: bool, t: &'static str, f: &'static str| if b { t } else { f };
@@ -96,7 +84,6 @@ pub fn build_txt_records(opts: &TxtOptions) -> Vec<String> {
         ("auth_required", bool_text(opts.auth_required, "true", "false").into()),
         ("api_openai", or(&opts.api_path_openai, "/v1")),
         ("api_anthropic", or(&opts.api_path_anthropic, "/v1")),
-        ("api_gemini", or(&opts.api_path_gemini, "/v1beta")),
         (
             "management",
             bool_text(opts.advertise_management, "true", "false").into(),

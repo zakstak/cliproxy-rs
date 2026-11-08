@@ -136,9 +136,8 @@ async fn serve(path: &std::path::Path) -> (String, tokio::task::JoinHandle<()>) 
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let state = Management::with_options(

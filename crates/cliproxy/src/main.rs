@@ -1885,9 +1885,8 @@ mod tests {
             let executors = Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             };
             let rt = Arc::new(cpa_server::testing::runtime(config.clone(), Vec::new(), executors));
             let options = cpa_server::management::Options {

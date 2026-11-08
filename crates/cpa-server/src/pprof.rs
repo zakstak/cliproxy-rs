@@ -581,9 +581,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = occupied.local_addr().unwrap().to_string();

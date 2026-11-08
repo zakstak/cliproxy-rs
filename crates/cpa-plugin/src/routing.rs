@@ -248,13 +248,13 @@ mod tests {
                 .target,
             "claude"
         );
-        // A provider target names the key core registers: Go lowercases both with
-        // strings.ToLower, so U+0130 becomes a plain `i` on each side.
+        // A provider target names the key core registers: Go lowercases it with
+        // strings.ToLower, so U+0130 becomes a plain `i`.
         assert_eq!(
-            normalize_route_response("r", resp("provider", "openai-compatible-HİGH"))
+            normalize_route_response("r", resp("provider", "plugin-HİGH"))
                 .unwrap()
                 .target,
-            cpa_core::config::credentials::openai_compat_provider("HİGH")
+            "plugin-high"
         );
         assert!(normalize_route_response("r", resp("executor", " ")).is_none());
         assert!(normalize_route_response("r", resp("other", "x")).is_none());

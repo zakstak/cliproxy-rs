@@ -63,9 +63,8 @@ async fn upstream_loss_while_the_client_stalls_releases_the_session() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
 
@@ -144,9 +143,8 @@ async fn steering_reader_cancels_the_turn_when_the_client_leaves() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
 
@@ -215,9 +213,8 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let management = crate::management::Management::with_options(
@@ -349,9 +346,8 @@ async fn a_client_close_cancels_a_stalled_steering_turn() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
     let mut socket = wreq::Client::new()
@@ -442,9 +438,8 @@ async fn the_socket_closes_before_the_request_log_is_delivered() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -511,9 +506,8 @@ async fn logged_failure(status: u16, body: &'static str) -> (Vec<String>, String
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let management = crate::management::Management::with_options(
@@ -651,9 +645,8 @@ async fn interrupt_diagnostics_are_sanitized() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let management = crate::management::Management::with_options(
@@ -810,9 +803,8 @@ async fn uninterrupted_claude_turns_send_masters_bytes() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new(format!("http://{upstream}")).unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let proxy = serve(router(rt)).await;
@@ -921,9 +913,8 @@ async fn interrupt_accepts_the_sessions_home_credential() {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let mut home = cpa_core::credential::Credential::from_file(
@@ -1040,9 +1031,8 @@ async fn pinned_continuation_failure(shown: &'static [&'static str], failure: &'
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
     let mut socket = wreq::Client::new()
@@ -1166,9 +1156,8 @@ async fn an_upstream_error_that_loses_the_socket_still_cools_the_credential() {
         let executors = Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
         let proxy = serve(router(rt.clone())).await;
@@ -1277,9 +1266,8 @@ async fn removal_closes_only_its_sockets(section: &str) {
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
     let proxy = serve(router(rt.clone())).await;
@@ -1420,9 +1408,8 @@ async fn handshake_run(
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
     let mut request = wreq::Client::new().websocket(format!("ws://{proxy}/v1/responses"));
@@ -1749,9 +1736,8 @@ mod committed_context_failure {
         let executors = Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
         let proxy = serve(router(rt.clone())).await;

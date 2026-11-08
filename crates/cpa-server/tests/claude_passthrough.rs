@@ -114,9 +114,8 @@ async fn proxy(dir: &Path, upstream_url: &str) -> String {
     let executors = Executors {
         claude: ClaudeExecutor::new(upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     // This suite checks wire passthrough, one upstream attempt per request. Scheduler
@@ -387,9 +386,8 @@ async fn request_log_masks_upstream_credentials() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     cpa_server::install_registry(&rt);
@@ -549,9 +547,8 @@ async fn usage_proxy(dir: &Path, upstream_url: &str) -> (Arc<cpa_server::Runtime
     let executors = Executors {
         claude: ClaudeExecutor::new(upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     rt.usage_queue().configure(true, &rt.config());

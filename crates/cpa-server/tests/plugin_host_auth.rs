@@ -59,9 +59,8 @@ async fn plugin_auth_callbacks_read_and_save_the_credential_store() {
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let _state = Management::with_options(rt.clone(), config_path, Options::default());

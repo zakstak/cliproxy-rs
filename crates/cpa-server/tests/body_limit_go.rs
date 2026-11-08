@@ -67,9 +67,8 @@ fn app(dir: &std::path::Path, yaml: &str, plugin_auth: bool) -> (axum::Router, A
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     if plugin_auth {

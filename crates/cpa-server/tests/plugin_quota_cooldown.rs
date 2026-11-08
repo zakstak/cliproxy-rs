@@ -89,9 +89,8 @@ async fn plugin_quota_reset_persists_cleared_cooldowns_to_the_backend() {
         Executors {
             claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let backend = Arc::new(FakeBackend {

@@ -166,9 +166,8 @@ async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     let url = serve(router(rt.clone())).await;
@@ -830,9 +829,8 @@ async fn expired_token_is_used_then_refreshed_once_after_401() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
     let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
@@ -885,9 +883,8 @@ async fn a_siwc_map_never_refreshes_a_claude_credential_after_401() {
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
     let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
@@ -973,9 +970,8 @@ async fn scripted_proxy(config: &str, tokens: &[&str], replies: Vec<Reply>) -> (
     let executors = Executors {
         claude: ClaudeExecutor::new(&upstream_url).unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     (serve(router(rt.clone())).await, script, rt)

@@ -36,9 +36,8 @@ async fn server_with(management_password: Option<&str>, credentials: Vec<cpa_cor
     let executors = Executors {
         claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
         codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(
         Config::parse(yaml).unwrap(),

@@ -77,9 +77,8 @@ async fn start(dir: &Path, upstream_url: &str) -> String {
         cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: executor,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         },
     ));
     let management = crate::management::Management::with_options(

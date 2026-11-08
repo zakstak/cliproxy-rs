@@ -129,7 +129,6 @@ fn render(case: &Map<String, Value>) -> Vec<String> {
             tab.data(Ok(keys::Data {
                 api_keys: strings(&input["keys"]),
                 providers,
-                openai: objects(&input.get("openai-compatibility").cloned().unwrap_or_default()),
             }));
             for _ in 0..presses(input.get("down")) {
                 tab.key("down");

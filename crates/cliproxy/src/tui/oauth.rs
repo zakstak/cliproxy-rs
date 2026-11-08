@@ -16,12 +16,10 @@ use super::widgets::{TextInput, Viewport};
 use super::{Cmd, Msg, cmd};
 
 /// Go's `oauthProviders`: name, v0 route, emoji, device flow, callback provider key.
-pub const PROVIDERS: [(&str, &str, &str, bool, &str); 7] = [
+/// The removed providers' logins are gone (issue #49).
+pub const PROVIDERS: [(&str, &str, &str, bool, &str); 4] = [
     ("Claude (Anthropic)", "anthropic-auth-url", "🟧", false, "anthropic"),
     ("Codex (OpenAI)", "codex-auth-url", "🟩", false, "codex"),
-    ("Antigravity", "antigravity-auth-url", "🟪", false, "antigravity"),
-    ("Kimi (kimi.com)", "kimi-auth-url", "🟫", true, "kimi"),
-    ("Kimi (kimi.ai)", "kimi-ai-auth-url", "🟫", true, "kimi-ai"),
     ("xAI", "xai-auth-url", "⬛", true, "xai"),
     ("Meta", "meta-auth-url", "🔵", true, "meta"),
 ];

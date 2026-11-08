@@ -3058,9 +3058,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let rt = std::sync::Arc::new(crate::testing::runtime(cfg.clone(), Vec::new(), executors));
         rt.usage_queue().configure(true, &cfg);
@@ -3105,21 +3104,22 @@ mod tests {
         use cpa_core::exec::{ExecError, FailureScope};
         let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
         let cases = fixture["reporter"].as_array().unwrap();
-        let gemini = [
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}}"#,
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}}"#,
-        ];
         let claude = [
             r#"data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":9,"output_tokens":1}}}"#,
             r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}"#,
         ];
         let kimi_chunk = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[{"index":0,"delta":{"content":"x"}}]}"#;
         let kimi_usage = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
-        let gemini_body = br#"{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":2,"totalTokenCount":4}}"#;
+        // Go's sequence published a Gemini body; the same counts as a Chat Completions body.
+        let usage_body = br#"{"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}"#;
         let error = |status: u16, text: &str| ExecError::local(status, FailureScope::Request, text);
         let rt = usage_runtime();
         for case in cases {
             let name = case["name"].as_str().unwrap();
+            // Gemini stream parsing went with the Gemini provider (issue #49).
+            if name.starts_with("gemini stream") {
+                continue;
+            }
             let (provider, model) = match name.split(' ').next().unwrap() {
                 "gemini" | "publish" | "failure" => ("gemini", "gemini-2.5-pro"),
                 "claude" => ("claude", "claude-sonnet-4-6"),
@@ -3144,14 +3144,6 @@ mod tests {
                 }
             };
             match name {
-                "gemini stream usage then scan error" => {
-                    lines(Format::Gemini, &gemini);
-                    tracker.fail(&error(0, "read: connection reset"));
-                }
-                "gemini stream usage" => {
-                    lines(Format::Gemini, &gemini);
-                    tracker.succeed();
-                }
                 "claude stream usage then scan error" => {
                     lines(Format::Claude, &claude);
                     tracker.fail(&error(502, "stream broke"));
@@ -3195,13 +3187,13 @@ mod tests {
                     tracker.fail(&error(403, "devin trailer: permission_denied"));
                 }
                 "publish then failure" => {
-                    sink.response_body(Format::Gemini, gemini_body);
+                    sink.response_body(Format::OpenAI, usage_body);
                     sink.publish();
                     tracker.fail(&error(500, "late"));
                 }
                 "failure then publish" => {
                     sink.publish_failure(429, "slow down");
-                    sink.response_body(Format::Gemini, gemini_body);
+                    sink.response_body(Format::OpenAI, usage_body);
                     sink.publish();
                     tracker.succeed();
                 }

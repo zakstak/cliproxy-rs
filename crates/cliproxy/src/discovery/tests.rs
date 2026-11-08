@@ -47,7 +47,6 @@ fn txt_records_match_go() {
             features: list(&o["Features"]),
             api_path_openai: s(&o["APIPathOpenAI"]),
             api_path_anthropic: s(&o["APIPathAnthropic"]),
-            api_path_gemini: s(&o["APIPathGemini"]),
             tls: o["TLS"].as_bool().unwrap(),
             auth_required: o["AuthRequired"].as_bool().unwrap(),
             auth_methods: list(&o["AuthMethods"]),
@@ -55,7 +54,12 @@ fn txt_records_match_go() {
             node_role: s(&o["NodeRole"]),
             advertise_management: o["AdvertiseManagement"].as_bool().unwrap(),
         };
-        assert_eq!(build_txt_records(&opts), list(&case["records"]), "{o}");
+        // No `api_gemini` record: this fork serves no Gemini API (issue #49).
+        let want: Vec<String> = list(&case["records"])
+            .into_iter()
+            .filter(|r| !r.starts_with("api_gemini="))
+            .collect();
+        assert_eq!(build_txt_records(&opts), want, "{o}");
     }
 }
 

@@ -1248,9 +1248,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex,
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         node_full(home, executors, vec![]).await
     }
@@ -1420,21 +1419,20 @@ mod tests {
 
     #[test]
     fn dispatched_auths_become_runtime_credentials() {
-        let raw = br#"{"model":"gpt-up","auth_index":"i1","force_mapping":true,"original_alias":"pretty","auth":{"id":"c1","provider":"openai-compatibility","label":"Acme","prefix":"team","proxy_url":"socks5://p","attributes":{"api_key":"k","base_url":"http://127.0.0.1:1","compat_name":"acme"},"metadata":{"x":1}}}"#;
+        let raw = br#"{"model":"gpt-up","auth_index":"i1","force_mapping":true,"original_alias":"pretty","auth":{"id":"c1","provider":"Codex","label":"Acme","prefix":"team","proxy_url":"socks5://p","attributes":{"api_key":"k","base_url":"http://127.0.0.1:1"},"metadata":{"x":1}}}"#;
         let response = DispatchResponse::parse(raw).unwrap();
         let c = credential(&response, "team/pretty(high)").unwrap();
-        assert_eq!(c.provider, "openai-compatible-acme", "Go executorKeyFromAuth");
+        assert_eq!(c.provider, "codex", "Go executorKeyFromAuth");
         assert_eq!(c.attributes["prefix"], "team");
         assert_eq!(c.attributes["proxy_url"], "socks5://p");
         assert_eq!(c.attributes[cpa_server::remote::UPSTREAM_MODEL], "gpt-up");
         assert_eq!(c.attributes[cpa_server::remote::ORIGINAL_ALIAS], "pretty");
-        assert_eq!(c.attributes[cpa_server::remote::PROVIDER], "openai-compatibility");
+        assert_eq!(c.attributes[cpa_server::remote::PROVIDER], "Codex");
         assert!(matches!(c.source, Source::Config { .. }));
         assert_eq!(c.label, "Acme");
         // Go `homeForceMappingAliasResult`: only recognized suffixes are ignored.
         let c = credential(&response, "pretty(custom)").unwrap();
         assert!(!c.attributes.contains_key(cpa_server::remote::FORCE_MAPPING));
-        assert_eq!(executor_key("kimi.com", "", &BTreeMap::new()), "kimi");
         let oauth =
             DispatchResponse::parse(br#"{"id":"a.json","provider":"Claude","metadata":{"email":"e@x"}}"#).unwrap();
         let c = credential(&oauth, "m").unwrap();
@@ -2106,9 +2104,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.usage_queue().configure(true, &config);
@@ -2250,9 +2247,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let dispatcher = Dispatcher::new(&rt);
@@ -2318,9 +2314,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ))
     }
@@ -3112,9 +3107,8 @@ mod tests {
         let executors = cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let (base, rt, shutdown, task) = node_full(home, executors, Vec::new()).await;
         eventually("dispatch published", || {
@@ -3300,9 +3294,8 @@ mod tests {
             cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         )
         .with_plugin_host(host.clone());
@@ -4581,9 +4574,8 @@ mod tests {
                 .unwrap()
                 .with_oauth(oauth),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         // A local credential that shares the Home pick's ID and can refresh.
         let dir = std::env::temp_dir().join(format!("cpa-home-401-{}", std::process::id()));
@@ -4652,12 +4644,8 @@ mod tests {
         let executors = |upstream: &str| cpa_exec::Executors {
             claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex: Default::default(),
-            devices: cpa_exec::DeviceExecutors {
-                meta: cpa_exec::meta::MetaExecutor::default().with_mint_url(&format!("{upstream}/mint")),
-                ..Default::default()
-            },
-            openai: Default::default(),
-            google: Default::default(),
+            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url(&format!("{upstream}/mint")),
+            xai: Default::default(),
         };
         let pick = serde_json::json!({"model": "muse-up", "auth_index": "idx-meta",
             "auth": {"id": "meta-1", "provider": "meta", "attributes": {"base_url": upstream},
@@ -5107,9 +5095,8 @@ mod tests {
             let executors = cpa_exec::Executors {
                 claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             };
             let config = overlay(b"port: 0\n", None).unwrap();
             let rt = Arc::new(cpa_server::testing::runtime(config, vec![], executors));
@@ -5994,9 +5981,8 @@ mod tests {
                 cpa_exec::Executors {
                     claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                     codex: Default::default(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
+                    meta: Default::default(),
+                    xai: Default::default(),
                 },
             )
             .with_plugin_host(host.clone()),

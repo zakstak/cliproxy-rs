@@ -134,9 +134,8 @@ impl Fixture {
             Executors {
                 claude: ClaudeExecutor::new(upstream_url).unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         rt.publish_policy(policy);
@@ -422,9 +421,8 @@ async fn stopped_bootstrap_failure_skips_bootstrap_retries() {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let (url, proxy) = serve(router(rt)).await;
@@ -541,9 +539,8 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
             Executors {
                 claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
                 codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
             },
         ));
         let (url, proxy) = serve(router(rt.clone())).await;
