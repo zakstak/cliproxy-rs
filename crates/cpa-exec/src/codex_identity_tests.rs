@@ -73,7 +73,6 @@ fn request(native: bool, headers: &[(&str, &str)]) -> ExecRequest {
         operation: Operation::Generate,
         source_format: format,
         response_format: format,
-        stream_payloads: false,
         requested_model: "gpt-5.4".into(),
         model: "gpt-5.4".into(),
         original_body: body.clone(),

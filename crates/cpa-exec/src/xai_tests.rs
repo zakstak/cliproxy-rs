@@ -163,7 +163,6 @@ fn request(s: &Value, usage: cpa_core::exec::UsageSink) -> ExecRequest {
         },
         source_format: source,
         response_format: response_format(s),
-        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,

@@ -886,7 +886,6 @@ mod tests {
             attributes: Default::default(),
             metadata: metadata.as_object().cloned().unwrap_or_default(),
             revision: 0,
-            next_refresh_after: None,
         };
         c.attributes
             .insert(cpa_core::config::credentials::HOME_PROVIDER.into(), "contract".into());

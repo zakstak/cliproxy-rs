@@ -141,13 +141,6 @@ fn log_auth_changes(before: &Snapshot, after: &Snapshot) {
 
 pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
     let first = targets(state);
-    // A plugin auth provider loaded, unloaded or fused changes what auth files load to
-    // with no file changing: the change wakes this task, which reloads the auth folder.
-    let plugin_auth = Arc::new(tokio::sync::Notify::new());
-    credentials::on_plugin_auth_change(Some(Arc::new({
-        let plugin_auth = plugin_auth.clone();
-        move || plugin_auth.notify_one()
-    })));
     let weak = Arc::downgrade(state);
     let state = state.clone();
     tokio::spawn(async move {
@@ -178,15 +171,10 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
         let mut applied: Option<Snapshot> = None;
         let mut observed: Option<Snapshot> = None;
         let mut since = Instant::now();
-        // `credentials::plugin_auth_epoch` when the last reload started.
-        let mut applied_epoch = credentials::plugin_auth_epoch();
         loop {
-            let woke = applied.is_some() && applied == observed && applied_epoch == credentials::plugin_auth_epoch();
+            let woke = applied.is_some() && applied == observed;
             if woke {
-                tokio::select! {
-                    () = events.changed() => {}
-                    () = plugin_auth.notified() => {}
-                }
+                events.changed().await;
             } else {
                 tokio::time::sleep(TICK).await;
             }
@@ -238,8 +226,7 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 continue;
             }
             let Some(current) = observed.clone() else { continue };
-            let epoch = credentials::plugin_auth_epoch();
-            if applied.as_ref() == Some(&current) && applied_epoch == epoch {
+            if applied.as_ref() == Some(&current) {
                 continue;
             }
             let config_changed = applied.as_ref().map_or(initial_hash, |a| a.config) != current.config;
@@ -259,7 +246,6 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
             // The reload may move auth-dir, and new auth files need their own watches on
             // macOS: retarget after it, on the same blocking thread. A change that lands
             // before a new watch exists is caught by the extra look `Events` then makes.
-            applied_epoch = epoch;
             let reloaded = tokio::task::spawn_blocking({
                 let state = state.clone();
                 let current = current.clone();
@@ -443,13 +429,6 @@ fn reload_config(
     read_config: bool,
     observed: &Snapshot,
 ) -> (Result<Option<Config>, ReloadError>, Snapshot) {
-    // Plugin auth providers parse before the lock is taken, so one can save an auth or
-    // wait on its own locks meanwhile; the scan under the lock takes their answers for
-    // the bytes it reads and defers a file changed since (Go's synthesizer holds no
-    // lock). One atomic load while no plugin offers an auth provider.
-    if credentials::plugin_auth_parser_active() {
-        credentials::preparse_auth_dir(&state.rt.config());
-    }
     let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
     let mut read = Snapshot {
         config: observed.config,
@@ -487,9 +466,6 @@ fn reload_config(
     let mut scan = credentials::scan_auth_dir(&config);
     keep_incomplete(state, &mut scan.credentials, &scan.incomplete);
     read.auth = scan.read.clone();
-    for path in &scan.unapplied {
-        read.auth.remove(path);
-    }
     // A file neither could read stays as observed; recording it as missing would
     // reload it on every tick.
     for (path, hash) in &observed.auth {
@@ -592,6 +568,31 @@ mod tests {
             let running = state.rt.config();
             assert_eq!(running.port, 9101, "the last good config keeps running");
             assert!(running.document["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"].is_null());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #47: a reload whose config has a `plugins` section, enabled or not, is refused
+    /// with the migration error: the running config stays.
+    #[tokio::test]
+    async fn a_reload_with_a_plugins_section_keeps_the_running_config() {
+        let (state, dir) = state();
+        let auth = dir.display();
+        std::fs::write(&state.path, format!("port: 9301\noauth: {{auth-dir: {auth}}}\n")).unwrap();
+        reload(&state).unwrap();
+        for section in ["plugins: {enabled: true, dir: plugins}", "plugins: {enabled: false}"] {
+            std::fs::write(
+                &state.path,
+                format!("port: 9302\noauth: {{auth-dir: {auth}}}\n{section}\n"),
+            )
+            .unwrap();
+            let error = reload(&state).expect_err("refused");
+            assert!(matches!(error, ReloadError::Invalid(_)), "{error}");
+            assert!(
+                format!("{error:#}").contains(cpa_core::config::PLUGINS_REMOVED),
+                "{error:#}"
+            );
+            assert_eq!(state.rt.config().port, 9301, "the last good config keeps running");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1234,105 +1235,5 @@ mod tests {
             Some(Sha256::digest(b"thr!").into())
         );
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// A file whose bytes no plugin auth provider has parsed yet keeps the credential
-    /// the store holds when the scan is published, not when it was read: a refresh that
-    /// commits in between survives (the kept credential is taken under the store's
-    /// reconciliation gate).
-    #[tokio::test]
-    async fn a_deferred_file_keeps_a_refresh_committed_before_publication() {
-        use cpa_core::config::credentials::{ParseRequest, Parsed, ParsedAuth, PluginAuthParser};
-        struct Acme;
-        impl PluginAuthParser for Acme {
-            fn parse_auths(&self, _: &ParseRequest<'_>) -> Parsed {
-                Parsed::Handled(vec![ParsedAuth {
-                    provider: "acme".into(),
-                    id: "acme-a".into(),
-                    metadata: serde_json::json!({"type": "acme", "token": "old"})
-                        .as_object()
-                        .cloned()
-                        .unwrap(),
-                    ..Default::default()
-                }])
-            }
-        }
-        // This thread only: tests sharing the process never see the parser.
-        credentials::with_thread_plugin_auth_parser(Arc::new(Acme), || {
-            let (state, dir) = state();
-            let file = dir.join("acme.json");
-            std::fs::write(&file, r#"{"type":"acme","v":1}"#).unwrap();
-            reload(&state).unwrap();
-            let store = state.rt.store().clone();
-            assert_eq!(store.get("acme-a").unwrap().metadata["token"], "old");
-            // Changed after the parse: the locked scan defers it.
-            std::fs::write(&file, r#"{"type":"acme","v":2}"#).unwrap();
-            let config = (*state.rt.config()).clone();
-            let scan = credentials::scan_auth_dir(&config);
-            assert!(scan.deferred.contains(&file));
-            let refreshed = store.clone();
-            crate::management::BEFORE_RECONCILE.lock().unwrap().push((
-                config.auth_dir.clone(),
-                Box::new(move || {
-                    let current = refreshed.get("acme-a").unwrap();
-                    let mut patch = cpa_core::credential::MetadataPatch::default();
-                    patch.set.insert("token".into(), "refreshed".into());
-                    refreshed.apply_patch("acme-a", current.revision, &patch).unwrap();
-                }),
-            ));
-            state.publish(config, Some(scan));
-            assert_eq!(store.get("acme-a").unwrap().metadata["token"], "refreshed");
-            std::fs::remove_dir_all(dir).unwrap();
-        });
-    }
-
-    /// A new auth-dir whose files plugins have not parsed yet publishes nothing for
-    /// them, never the built-in reading: Go's watcher asks the plugin first. Here a
-    /// Claude multi-auth bundle a plugin parses into two credentials; the reload that
-    /// switches to its folder preparsed the old one, and the next reload parses it.
-    #[tokio::test]
-    async fn a_new_auth_dir_publishes_a_plugin_bundle_only_once_parsed() {
-        use cpa_core::config::credentials::{ParseRequest, Parsed, ParsedAuth, PluginAuthParser};
-        struct Bundles;
-        impl PluginAuthParser for Bundles {
-            fn parse_auths(&self, req: &ParseRequest<'_>) -> Parsed {
-                if req.file_name != "bundle.json" {
-                    return Parsed::NotHandled;
-                }
-                let auth = |id: &str| ParsedAuth {
-                    provider: "claude".into(),
-                    id: id.into(),
-                    metadata: serde_json::json!({"type": "claude", "access_token": id})
-                        .as_object()
-                        .cloned()
-                        .unwrap(),
-                    ..Default::default()
-                };
-                Parsed::Handled(vec![auth("claude-a"), auth("claude-b")])
-            }
-        }
-        // This thread only: tests sharing the process never see the parser.
-        credentials::with_thread_plugin_auth_parser(Arc::new(Bundles), || {
-            let (state, dir) = state();
-            reload(&state).unwrap();
-            let other = dir.join("other");
-            std::fs::create_dir_all(&other).unwrap();
-            std::fs::write(
-                other.join("bundle.json"),
-                r#"{"type":"claude","accounts":[{"access_token":"a"},{"access_token":"b"}]}"#,
-            )
-            .unwrap();
-            std::fs::write(&state.path, format!("oauth: {{auth-dir: {}}}\n", other.display())).unwrap();
-            reload(&state).unwrap();
-            let ids = || -> Vec<String> {
-                let mut ids: Vec<String> = state.rt.store().snapshot().iter().map(|c| c.id.clone()).collect();
-                ids.sort();
-                ids
-            };
-            assert!(ids().is_empty(), "published before it was parsed: {:?}", ids());
-            reload(&state).unwrap();
-            assert_eq!(ids(), ["claude-a", "claude-b"]);
-            std::fs::remove_dir_all(dir).unwrap();
-        });
     }
 }

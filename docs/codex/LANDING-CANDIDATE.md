@@ -6,7 +6,7 @@ The branch `opus/codex-integration-landing` is an optional landing candidate. It
 - Every component keeps its own branch, head, commits and PR.
 - Landing this branch is one option; landing the components in the order in [QUALIFICATION.md](QUALIFICATION.md#landing-order) is another.
 
-[QUALIFICATION.md](QUALIFICATION.md#4-delivery-state-and-landing-order-20-reconciliation) section 4 is the delivery state recorded at #42 (`5eda74e7`). It stays a snapshot of that head.
+[QUALIFICATION.md](QUALIFICATION.md#4-delivery-state-and-landing-order-20-reconciliation) section 4 is the delivery state recorded at #42 (`5eda74e7`). It stays a snapshot of that head. The plugin tests and modules it names were deleted later with native plugin support (#47).
 
 ## Components
 

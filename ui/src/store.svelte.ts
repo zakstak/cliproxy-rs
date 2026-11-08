@@ -14,7 +14,6 @@ export const pages = [
   ["logs", "Logs"],
   ["", ""],
   ["config", "Configuration"],
-  ["plugins", "Plugins"],
   ["system", "System"],
 ] as const;
 const routes = new Set<string>([...pages.map((p) => p[0]).filter(Boolean), "connect"]);
@@ -77,7 +76,6 @@ class Store {
   creds: Res<Data[]> = new Res(async (): Promise<Data[]> =>
     reconcile(this.creds.data || [], (await api("/credentials")).files || [], (a) => `${a.name}\u0000${a.auth_index}`),
   );
-  plugins = new Res<Data[]>(async () => (await api("/plugins")).plugins || []);
   /** Live quota checks made in this tab, by auth index. */
   quota = $state<Record<string, { at: number; windows: Window[]; error?: string; code?: number } | { error: string; code?: number }>>({});
   /** Quota checks waiting in line or on their way, by auth index: "Queued" or "Checking…". */
@@ -116,7 +114,7 @@ class Store {
     this.logged = false;
     this.caps = {};
     this.#probed.clear();
-    this.config.data = this.creds.data = this.plugins.data = undefined;
+    this.config.data = this.creds.data = undefined;
     this.quota = {};
     this.dirty = false;
   }

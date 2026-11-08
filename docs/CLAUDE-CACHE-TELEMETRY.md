@@ -14,8 +14,7 @@ observability:
 Management must also be enabled for the usage queue to accept records.
 This is observation only: it
 does not change request bytes, cache markers, TTLs, routing, or responses. It never
-sends maintenance requests or token-count requests. Usage plugins retain the Go
-record format.
+sends maintenance requests or token-count requests.
 
 ## Record fields
 
@@ -31,8 +30,7 @@ An additional queue observation marked `usage_observed: false` is emitted on
   collection to be enabled.
 - The usage queue accepts records (management and usage statistics are enabled).
 
-These additional observations do not reach Go plugins. Failed attempts do not
-receive the marker. A native non-streaming Claude JSON response without usage
+Failed attempts do not receive the marker. A native non-streaming Claude JSON response without usage
 still calls `UsageSink::publish()` without `usage_required()`: its pre-set outcome
 produces an ordinary record without this marker. Absence of the marker therefore
 does not prove that usage was observed. The additional records' zero tokens mean

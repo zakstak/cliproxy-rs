@@ -71,8 +71,8 @@ try {
         body = {status:'ok'};
       } else if (path.endsWith('/credentials/status')) {
         f.patched.push(sent.auth_index);
-        // multi.json behaves like a plugin source: one request switches the whole file. Its
-        // first request fails without changing anything.
+        // multi.json is one file shared by several accounts: one request switches the whole
+        // file. Its first request fails without changing anything.
         if (sent.auth_index === 'multi-a' && !f.failedOnce) return (f.failedOnce = true), json({error:'source busy'}, 500);
         f.files.filter((x) => (sent.name === 'multi.json' ? x.name === sent.name : x.auth_index === sent.auth_index)).forEach((x) => (x.disabled = sent.disabled));
         // The change lands, then the account list stops answering.
@@ -86,7 +86,6 @@ try {
         if (f.listDown) return json({error:'list unavailable'}, 500);
         body = {files:f.files};
       }
-      else if (path.endsWith('/plugins')) body = {plugins:[]};
       else if (path.endsWith('/requests/api-call')) {
         f.calls++;
         // A held request answers only once the test releases it.

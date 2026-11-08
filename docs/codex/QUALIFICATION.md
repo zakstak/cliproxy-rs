@@ -9,6 +9,8 @@ This page is the receipt for the Codex migration ([#20](https://github.com/zakst
 
 No result here comes from a real account, and none was sent to a provider.
 
+Native plugin removal ([#47](https://github.com/zakstak/cliproxy-rs/issues/47)) later deleted the plugin hooks this page checks against, with `codex_native_plugins.rs` and the Go plugin modules. The plugin rows below are a snapshot of the migration; [CONTRACT.md](CONTRACT.md#settings) now refuses a `plugins` section.
+
 ## 1. Source evidence
 
 [CONTRACT.md](CONTRACT.md) is the authority. It pins the first-party client (`openai/codex` at `44ccf394573c`) and the OpenAI API documentation, and per endpoint profile and transport it records:

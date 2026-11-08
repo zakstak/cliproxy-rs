@@ -1,7 +1,7 @@
 //! `server.max-request-body-bytes`, Go v8.0.35 `maxRequestBodyBytesMiddleware`
 //! (dd7b4334). Off by default. When set, a declared `Content-Length` over the limit is
 //! refused before anything is read, and every other body ends in [`TooLarge`] as soon
-//! as it passes the limit, so whoever reads it (request capture, client auth plugins,
+//! as it passes the limit, so whoever reads it (request capture,
 //! handlers) answers Go's 413 for its route.
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -162,24 +162,6 @@ impl<S: Send + Sync> FromRequest<S> for Read {
             _ => Bytes::new(),
         };
         Ok(Read { body, prefix })
-    }
-}
-
-/// [`Read::first_json`] over `axum::body::to_bytes(body, usize::MAX)`.
-pub(crate) async fn first_json_body(request: Request) -> Result<Bytes, axum::Error> {
-    if request.extensions().get::<Limit>().is_none_or(|l| l.0.is_none()) {
-        return axum::body::to_bytes(request.into_body(), usize::MAX).await;
-    }
-    let (body, seen) = Tee::wrap(request.into_body());
-    match axum::body::to_bytes(body, usize::MAX).await {
-        Err(error) if is_too_large(&error) => {
-            let prefix = seen.prefix();
-            match first_value(&prefix) {
-                Some(value) => Ok(prefix.slice_ref(value)),
-                None => Err(error),
-            }
-        }
-        body => body,
     }
 }
 

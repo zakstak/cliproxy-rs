@@ -9,6 +9,7 @@ use cpa_core::credential::{Credential, Source};
 use serde_json::{Value, json};
 
 mod forward_port;
+mod plugins_removed;
 
 fn fixture() -> &'static Value {
     static FIXTURE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
@@ -87,6 +88,13 @@ fn yaml_bool_spellings_and_durations_load_like_go() {
         let (field, spelling) = (case["field"].as_str().unwrap(), case["spelling"].as_str().unwrap());
         let at = format!("{field}: {spelling}");
         let parsed = Config::parse(&scalar_case_yaml(field, spelling));
+        // Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
+        // plugin entry spellings are refused for their section.
+        if field.starts_with("plugins.") {
+            let error = parsed.err().map(|e| e.to_string());
+            assert_eq!(error.as_deref(), Some(cpa_core::config::PLUGINS_REMOVED), "{at}");
+            continue;
+        }
         assert_eq!(
             parsed.is_err(),
             case["error"] == true,
@@ -102,16 +110,6 @@ fn yaml_bool_spellings_and_durations_load_like_go() {
         };
         let got = match field {
             "observability.logs.debug" => json!(flag(&["observability", "logs", "debug"])),
-            // Plugin entries stay raw (Go `PluginInstanceConfig.Raw`); Go's typed
-            // `Enabled` decodes the YAML 1.1 spellings from them.
-            "plugins.configs.x.enabled" => {
-                let raw = cfg.document["plugins"]["configs"]["x"]["enabled"].clone();
-                json!(match &raw {
-                    serde_yaml_ng::Value::Bool(b) => *b,
-                    serde_yaml_ng::Value::String(s) => cpa_core::config::go_bool(s).unwrap_or(false),
-                    _ => false,
-                })
-            }
             "server.host" => json!(cfg.host),
             // Durations: load acceptance only (nothing consumes them without Home).
             _ => continue,
@@ -120,17 +118,23 @@ fn yaml_bool_spellings_and_durations_load_like_go() {
     }
 }
 
-/// Go's typed decoding and raw plugin views (`typed_scalars` in the fixture): load
-/// errors match; int fields truncate floats; plugin entries keep their raw scalars in
-/// the live document, from which `go_bool`/`go_int` give Go's typed values.
+/// Go's typed decoding (`typed_scalars` in the fixture): load errors match and int
+/// fields truncate floats. Go's plugin entry cases are refused for their `plugins`
+/// section: native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
 #[test]
-fn typed_scalars_and_raw_plugin_entries_load_like_go() {
+fn typed_scalars_load_like_go() {
     let hash = bcrypt::hash("fake-secret", 4).unwrap();
     let cases = fixture()["typed_scalars"].as_array().unwrap();
     assert_eq!(cases.len(), 12);
     for case in cases {
         let name = case["name"].as_str().unwrap();
-        let parsed = Config::parse(&case["yaml"].as_str().unwrap().replace("$HASH", &hash));
+        let yaml = case["yaml"].as_str().unwrap();
+        let parsed = Config::parse(&yaml.replace("$HASH", &hash));
+        if yaml.contains("\nplugins:") {
+            let error = parsed.err().map(|e| e.to_string());
+            assert_eq!(error.as_deref(), Some(cpa_core::config::PLUGINS_REMOVED), "{name}");
+            continue;
+        }
         assert_eq!(
             parsed.is_err(),
             case["error"] == true,
@@ -139,26 +143,6 @@ fn typed_scalars_and_raw_plugin_entries_load_like_go() {
         );
         let Ok(cfg) = parsed else { continue };
         assert_eq!(json!(cfg.routing.retry.request_retry), case["request_retry"], "{name}");
-        let Some(raw_view) = case.get("raw_view") else { continue };
-        let entry = cfg.document["plugins"]["configs"].get("x").cloned().unwrap();
-        // Go's raw view of a null entry is `{}`.
-        let raw: Value = match &entry {
-            serde_yaml_ng::Value::Null => json!({}),
-            other => serde_json::to_value(other).unwrap(),
-        };
-        assert_eq!(raw, raw_view["body"], "{name}: raw view");
-        let enabled = entry.get("enabled").and_then(|v| match v {
-            serde_yaml_ng::Value::Bool(b) => Some(*b),
-            serde_yaml_ng::Value::String(s) => cpa_core::config::go_bool(s),
-            _ => None,
-        });
-        let priority = entry.get("priority").and_then(cpa_core::config::go_int);
-        assert_eq!(
-            json!(enabled.unwrap_or(false)),
-            case["enabled"],
-            "{name}: typed enabled"
-        );
-        assert_eq!(json!(priority.unwrap_or(0)), case["priority"], "{name}: typed priority");
     }
 }
 
@@ -629,9 +613,10 @@ mod routes {
                 }
                 let mut want = step["resp_headers"].as_object().unwrap().clone();
                 // The goldens come from Go's cgo build, which loads native plugins; this
-                // binary does too, except on Windows.
+                // build has none and reports "0", as Go's non-cgo builds do
+                // (docs/DIFFERENCES-FROM-GO.md "Native plugins").
                 if want.contains_key("X-CPA-SUPPORT-PLUGIN") {
-                    want.insert("X-CPA-SUPPORT-PLUGIN".into(), cpa_plugin::SUPPORT_PLUGIN.into());
+                    want.insert("X-CPA-SUPPORT-PLUGIN".into(), "0".into());
                 }
                 assert_eq!(Value::Object(headers), Value::Object(want), "{name}[{i}] headers");
                 compared += 1;
@@ -730,10 +715,12 @@ mod config_writes {
 
     /// Scenarios whose file cliproxy-rs refuses to load where Go loads it
     /// (docs/DIFFERENCES-FROM-GO.md), with the refusal.
-    const REFUSED_LOADS: &[(&str, &str)] = &[(
-        "binary_plugin_pin",
-        "a plugin's store.version or store.release-tag in the config file is a !!binary value, which is not supported",
-    )];
+    /// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
+    /// scenarios that start from a `plugins` section are refused at load.
+    const REFUSED_LOADS: &[(&str, &str)] = &[
+        ("binary_plugin_pin", cpa_core::config::PLUGINS_REMOVED),
+        ("plugin_entries_and_float_ints", cpa_core::config::PLUGINS_REMOVED),
+    ];
 
     /// Steps where Go reports yaml.v3's typed-decode error (`line N: cannot unmarshal ...`
     /// or `field X not found in type ...`), with the message cliproxy-rs gives instead.
@@ -803,6 +790,7 @@ mod config_writes {
         let client = wreq::Client::new();
         let mut compared = 0;
         let mut bytes_compared = 0;
+        let mut retired = 0;
         let mut failures: Vec<String> = Vec::new();
         let mut verified = HashSet::new();
         for scenario in fixture()["config_writes"].as_array().unwrap() {
@@ -842,6 +830,7 @@ mod config_writes {
                 let method: wreq::Method = step["method"].as_str().unwrap().parse().unwrap();
                 // Paths are v8 management routes unless they name their API version.
                 let route = step["path"].as_str().unwrap();
+                let file_before = std::fs::read_to_string(&path).unwrap();
                 let url = if route.starts_with("/v0/") {
                     format!("{base}{route}")
                 } else {
@@ -858,8 +847,22 @@ mod config_writes {
                 let status = res.status().as_u16();
                 let body = res.text().await.unwrap();
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
+                // Go's plugin section reads and writes (other than the read-only
+                // `plugins.auth-revision`, refused alike) are refused here and change
+                // nothing; the rest of the scenario compares against Go with its
+                // `plugins` section dropped.
+                if route.starts_with("/config/plugins") && route != "/config/plugins/auth-revision" {
+                    assert!((400..500).contains(&status), "{at}: {status} {body}");
+                    assert_eq!(
+                        std::fs::read_to_string(&path).unwrap(),
+                        file_before,
+                        "{at}: file changed"
+                    );
+                    retired += 1;
+                    continue;
+                }
                 assert_eq!(status, step["status"], "{at}: {body}");
-                let want = &step["response"];
+                let want = &plugins_removed::without_plugins_value(&step["response"]);
                 if step["path"] == "/config.yaml" && step["method"] == "GET" && status == 200 {
                     let got = normalize(&rust_yaml_value(&body), false);
                     if let Err(e) = same(&normalize(want, true), &got, "yaml view") {
@@ -873,9 +876,10 @@ mod config_writes {
                     let got: Value = serde_json::from_str(&body).unwrap();
                     // gin's exact bytes wherever the values agree exactly; key order always.
                     if let Some(raw) = step["raw_json"].as_str() {
+                        let raw = &plugins_removed::without_plugins_json(raw);
                         if got == *want {
                             bytes_compared += 1;
-                            if body != raw {
+                            if body != *raw {
                                 failures.push(format!("{at}: bytes differ\n go: {raw}\n rs: {body}"));
                             }
                         }
@@ -922,7 +926,8 @@ mod config_writes {
                 }
                 let file = std::fs::read_to_string(&path).unwrap();
                 let rust_file = rust_yaml_value(&file);
-                if let Err(e) = same(&normalize(&step["file"], true), &normalize(&rust_file, false), "file")
+                let go_file = plugins_removed::without_plugins_value(&step["file"]);
+                if let Err(e) = same(&normalize(&go_file, true), &normalize(&rust_file, false), "file")
                     .and_then(|()| same_key(&step["file"], &rust_file, &mut verified))
                 {
                     failures.push(format!("{at}: {e}"));
@@ -942,9 +947,11 @@ mod config_writes {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-        assert_eq!(compared, 182);
+        // 186 recorded steps: 9 in the two scenarios refused at load, and 6 plugin
+        // section reads and writes refused here.
+        assert_eq!((compared, retired), (171, 6));
         eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 146, "steps compared byte for byte");
+        assert_eq!(bytes_compared, 135, "steps compared byte for byte");
     }
 }
 

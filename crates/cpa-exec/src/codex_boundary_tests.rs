@@ -36,7 +36,6 @@ fn request(source: Format, body: impl Into<Bytes>, stream: bool, alt: Option<&st
         operation: Operation::Generate,
         source_format: source,
         response_format: source,
-        stream_payloads: false,
         requested_model: "gpt-test".into(),
         model: "gpt-test".into(),
         original_body: body.clone(),

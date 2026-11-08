@@ -23,7 +23,6 @@ fn request(v: &Value) -> ExecRequest {
         operation: Operation::CountTokens,
         source_format: source,
         response_format: Format::parse(v["response"].as_str().unwrap()).unwrap(),
-        stream_payloads: false,
         requested_model: v["model"].as_str().unwrap().into(),
         model: v["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -59,7 +58,6 @@ async fn count_tokens_matches_go() {
         attributes: [("base_url".to_owned(), "http://127.0.0.1:1".to_owned())].into(),
         metadata: Default::default(),
         revision: 0,
-        next_refresh_after: None,
     };
     let executor = crate::codex::CodexExecutor::new().unwrap();
     let cfg = Config::default();

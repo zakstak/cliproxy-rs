@@ -8,29 +8,15 @@ use super::{
 use super::{is_empty_object, with_bool, with_int, with_str, without};
 use crate::gostr::GoStr;
 use crate::json;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 pub(crate) type ApplyFn = fn(&[u8], &Config, Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
 
-/// Go `ProviderApplier` for a plugin-owned provider (pluginhost `thinkingAdapter`).
-pub trait PluginApplier: Send + Sync {
-    fn apply(&self, body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error>;
-}
-
-/// A provider's applier: built in, or registered by a plugin.
-pub(crate) enum Applier {
-    Native(ApplyFn),
-    Plugin(Arc<dyn PluginApplier>),
-}
+/// A provider's built-in applier.
+pub(crate) struct Applier(ApplyFn);
 
 impl Applier {
     pub(crate) fn apply(&self, body: &[u8], config: &Config, info: Option<&ModelCaps>) -> Result<Vec<u8>, Error> {
-        match self {
-            Applier::Native(f) => f(body, config, info),
-            Applier::Plugin(p) => p.apply(body, config, info),
-        }
+        (self.0)(body, config, info)
     }
 }
 
@@ -47,75 +33,10 @@ fn native(provider: &str) -> Option<ApplyFn> {
     })
 }
 
-struct PluginProvider {
-    owner: String,
-    priority: i64,
-    applier: Arc<dyn PluginApplier>,
-}
-
-/// Go `pluginProviderAppliers`; `PLUGINS_SET` lets lookups skip the lock while empty.
-static PLUGINS: RwLock<BTreeMap<String, PluginProvider>> = RwLock::new(BTreeMap::new());
-static PLUGINS_SET: AtomicBool = AtomicBool::new(false);
-
-fn plugins() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, PluginProvider>> {
-    PLUGINS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Go `RegisterPluginProvider`: `false` for an empty owner or name, a built-in
-/// provider, or a provider already held at a higher priority (or the same priority by
-/// a lower owner ID).
-pub fn register_plugin_provider(owner: &str, name: &str, priority: i64, applier: Arc<dyn PluginApplier>) -> bool {
-    let (owner, name) = (owner.trim(), name.trim().go_lower());
-    if owner.is_empty() || name.is_empty() || native(&name).is_some() {
-        return false;
-    }
-    let mut map = plugins();
-    if let Some(current) = map.get(&name)
-        && (current.priority > priority || (current.priority == priority && current.owner.as_str() <= owner))
-    {
-        return false;
-    }
-    map.insert(
-        name,
-        PluginProvider {
-            owner: owner.to_owned(),
-            priority,
-            applier,
-        },
-    );
-    PLUGINS_SET.store(true, Ordering::Release);
-    true
-}
-
-/// Go `UnregisterPluginProviders`: drops every provider `owner` holds.
-pub fn unregister_plugin_providers(owner: &str) {
-    let owner = owner.trim();
-    if owner.is_empty() {
-        return;
-    }
-    let mut map = plugins();
-    map.retain(|_, p| p.owner != owner);
-    PLUGINS_SET.store(!map.is_empty(), Ordering::Release);
-}
-
-/// Go `ClearPluginProviders`.
-pub fn clear_plugin_providers() {
-    let mut map = plugins();
-    map.clear();
-    PLUGINS_SET.store(false, Ordering::Release);
-}
-
-/// Go `GetProviderApplier`: the built-in applier, else a plugin's.
+/// Go `GetProviderApplier`: the built-in applier. Go also consults plugin-registered
+/// appliers; native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
 pub(crate) fn applier(provider: &str) -> Option<Applier> {
-    let provider = provider.trim().go_lower();
-    if let Some(f) = native(&provider) {
-        return Some(Applier::Native(f));
-    }
-    if !PLUGINS_SET.load(Ordering::Acquire) {
-        return None;
-    }
-    let map = PLUGINS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.get(&provider).map(|p| Applier::Plugin(p.applier.clone()))
+    native(&provider.trim().go_lower()).map(Applier)
 }
 
 /// Public entry for callers that need one applier directly (Go `GetProviderApplier`).

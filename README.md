@@ -46,7 +46,7 @@ cliproxy-rs is a Rust rewrite of [CLIProxyAPI](https://github.com/router-for-me/
   </picture>
 </p>
 
-The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,053 covered, 872 partial and 26 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
+The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,140 covered, 794 partial and 17 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
 
 ## How it compares
 
@@ -171,7 +171,6 @@ Before switching, read [MIGRATING-FROM-GO.md](https://github.com/vayungodara/cli
 
 Not in cliproxy-rs yet:
 
-- Three plugin pieces: model discovery for each credential, response hooks on a buffered Claude answer, and sending your GitHub token on plugin store requests.
 - The remaining parity gaps and Go test cases, listed in [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md).
 
 ## Performance

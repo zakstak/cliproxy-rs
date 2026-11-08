@@ -24,7 +24,6 @@ fn credential(case: &Value, base_url: &str) -> Credential {
         attributes: Default::default(),
         metadata: Default::default(),
         revision: 0,
-        next_refresh_after: None,
     });
     credential.provider = "codex".into();
     credential.attributes.insert("base_url".into(), base_url.into());
@@ -68,7 +67,6 @@ fn request(case: &Value) -> ExecRequest {
         operation: Operation::Generate,
         source_format: source,
         response_format: response,
-        stream_payloads: false,
         requested_model: case["model"].as_str().unwrap().into(),
         model: case["model"].as_str().unwrap().into(),
         original_body: body.clone(),
@@ -707,7 +705,6 @@ fn plain_request(stream: bool, alt: Option<&str>) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::Codex,
         response_format: Format::Codex,
-        stream_payloads: false,
         requested_model: "gpt-5.4".into(),
         model: "gpt-5.4".into(),
         original_body: body.clone(),
@@ -1092,7 +1089,6 @@ async fn direct_images_send_the_configured_upstream_model() {
                 operation: Operation::Generate,
                 source_format: Format::OpenAI,
                 response_format: Format::OpenAI,
-                stream_payloads: false,
                 requested_model: requested.into(),
                 model: resolved.into(),
                 original_body: body.clone(),
@@ -1162,7 +1158,6 @@ async fn images_match_go_on_every_fixture_case() {
             operation: Operation::Generate,
             source_format: Format::OpenAI,
             response_format: Format::OpenAI,
-            stream_payloads: false,
             requested_model: model.into(),
             model: model.into(),
             original_body: body.clone(),

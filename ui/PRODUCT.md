@@ -22,6 +22,6 @@ They come with these questions, in this order: is traffic flowing, which credent
 
 ## Scope
 
-Overview, accounts (credentials with their quotas) and connecting accounts (OAuth, device codes, callback paste, Vertex import), provider API keys, client keys, models (aliases, exclusions, catalog), payload rules, configuration (JSON and YAML with a reviewed diff and a stale-write check), logs, usage, plugins and system.
+Overview, accounts (credentials with their quotas) and connecting accounts (OAuth, device codes, callback paste, Vertex import), provider API keys, client keys, models (aliases, exclusions, catalog), payload rules, configuration (JSON and YAML with a reviewed diff and a stale-write check), logs, usage and system.
 
 Out of scope: accounts or billing, a historical telemetry database, Rust-only endpoints other than the live usage feed (which keeps the live view from consuming the usage queue), and process metrics the API does not expose.

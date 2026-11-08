@@ -28,7 +28,7 @@ Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checke
 | Path | Role |
 | --- | --- |
 | `src/api.ts` | Fetch wrapper. Holds the management key in memory and reports unimplemented routes (Go-style empty 404, 501, 405). |
-| `src/store.svelte.ts` | Shared state: session, server kind from version headers, config, credentials, plugins, capabilities, toasts, writes with stale checks. |
+| `src/store.svelte.ts` | Shared state: session, server kind from version headers, config, credentials, capabilities, toasts, writes with stale checks. |
 | `src/core.ts` | Pure helpers: credential state, traffic buckets, usage records, quota windows, diffs. Tested in `src/core.test.ts`. |
 | `src/Load.svelte` | Loading, error, not-available and data states for one read. |
 | `src/Missing.svelte` | One line naming actions this server does not implement. |
@@ -51,8 +51,8 @@ All paths are under `/v8/management`. Every screen also uses `GET /config` and `
 | Screen | Endpoints |
 | --- | --- |
 | Overview | `GET /credentials` every 10 s while visible |
-| Accounts | `GET /credentials` every 10 s while visible, `POST /credentials` (upload), `DELETE /credentials`, `GET /credentials/download`, `GET /credentials/models`, `PATCH /credentials/status`, `PATCH /credentials/fields`, `POST /credentials/refresh`, `POST /routing/cooldown/reset`; quota checks by button only, one at a time and at most once per account every 2 minutes: `POST /requests/api-call` (Claude, Codex, Kimi usage), `POST /plugins/<id>/quota`. Batch actions send one request per account, except one `DELETE /credentials` for all. |
-| Connect | `GET /oauth/auth-url`, `GET /oauth/status` every 2 s while waiting, `POST /oauth/callback`, `DELETE /oauth/session`, `POST /oauth/import?provider=vertex`, `GET /plugins` |
+| Accounts | `GET /credentials` every 10 s while visible, `POST /credentials` (upload), `DELETE /credentials`, `GET /credentials/download`, `GET /credentials/models`, `PATCH /credentials/status`, `PATCH /credentials/fields`, `POST /credentials/refresh`, `POST /routing/cooldown/reset`; quota checks by button only, one at a time and at most once per account every 2 minutes: `POST /requests/api-call` (Claude, Codex, Kimi usage). Batch actions send one request per account, except one `DELETE /credentials` for all. |
+| Connect | `GET /oauth/auth-url`, `GET /oauth/status` every 2 s while waiting, `POST /oauth/callback`, `DELETE /oauth/session`, `POST /oauth/import?provider=vertex` |
 | Providers | `GET /observability/usage/api-keys`; `PUT /config/api-keys/<family>` |
 | Client keys | `PUT /config/access/api-keys` |
 | Models | `GET /routing/model-definitions/<channel>`; `PUT /config/oauth/model-alias/<channel>`, `PUT /config/oauth/excluded-models/<channel>` |
@@ -60,7 +60,6 @@ All paths are under `/v8/management`. Every screen also uses `GET /config` and `
 | Usage | `GET /observability/usage/api-keys`; while the live view is on, `GET /observability/usage/live?after=<cursor>` every 3 s while visible |
 | Logs | `GET /observability/logs` (cursor, every 3 s), `DELETE /observability/logs`, `GET /observability/logs/errors`, `GET /observability/logs/errors/<name>`, `GET /observability/logs/requests/<id>` |
 | Configuration | `GET, PUT /config/<section>`, `GET, PUT /config.yaml` |
-| Plugins | `GET /plugins`, `GET /plugins/store`, `POST /plugins/store/<id>/install`, `DELETE /plugins/<id>`, `PUT /config/plugins/enabled`, `GET, PUT /config/plugins/configs/<id>` |
 | System | `GET /server/latest-version` on request |
 
 Config list writes reread the target first and refuse to write if it changed since it was shown. The API has no revision precondition, so this narrows the race window rather than closing it.
@@ -70,11 +69,11 @@ Config list writes reread the target first and refuse to write if it changed sin
 Both scripts are for disposable servers with fake credentials only: they edit configuration and credential files. Fixture requirements: management key `orb-dashboard-test-only`, a disabled fake Claude credential with email `operator@example.invalid`, routing strategy `round-robin`, and an empty `requests.payload.default`.
 
 - `node scripts/browser-check-rust.mjs [url] [capture-dir]` drives the dashboard with agent-browser against the Rust binary (or Go): nine screens in both themes, unsupported actions disabled on Rust, a payload rule written and removed, a YAML diff discarded, 390 px layout, and no key in storage.
-- `CHROME_PATH=... node scripts/panel-check-go.mjs [url] [capture-dir]` drives the single-file panel with Playwright against Go: all 13 screens in both themes, credential edits, a Codex OAuth start and cancel, config list writes, the section editor, request logs, the live usage view, phone layouts, and asserts that no request leaves the serving origin, Go is never probed, there are no console errors, and the key is not stored. `playwright-core` is a dev dependency for this script only; it downloads no browser.
+- `CHROME_PATH=... node scripts/panel-check-go.mjs [url] [capture-dir]` drives the single-file panel with Playwright against Go: all 12 screens in both themes, credential edits, a Codex OAuth start and cancel, config list writes, the section editor, request logs, the live usage view, phone layouts, and asserts that no request leaves the serving origin, Go is never probed, there are no console errors, and the key is not stored. `playwright-core` is a dev dependency for this script only; it downloads no browser.
 - `node scripts/fake-logins.mjs [port]` serves fake provider login endpoints (Claude, Codex, Kimi, Meta token, profile, device-code and key-mint routes) and a Claude usage endpoint that echoes its `Authorization` header. Fake tokens and `@example.invalid` emails only.
 - `scripts/login-harness/` is a test build of cliproxy-rs whose only change is `Options.login_base`, which points every provider login endpoint at the fake. It is never shipped. Build it with `cp ../../../Cargo.lock . && CARGO_TARGET_DIR=../../../target cargo build` inside that directory.
 - `CHROME_PATH=... node scripts/oauth-check.mjs <url> --mode fake` drives Claude and Codex sign-in through a pasted callback URL and Kimi and Meta through the device code against the harness, and checks each new credential appears and that a provider the server lacks gets an honest message. `--mode dead` runs against the shipped binary with a dead `requests.proxy-url` and checks that a pasted callback ends in an honest failure.
-- The same script's `--mode plugin` uses fake management responses to check relative plugin login URLs, absolute HTTP(S) links, Copy link, guide navigation, cancellation, unsafe-scheme rejection, and a sign-in the server forgot while the tab was hidden (Go and servers before 0.4.2 keep a finished sign-in for a minute). It checks that the status is read as soon as the tab is visible again, that only one new credential name of exactly that built-in provider, between two successful reads, counts as connected, and that a rewritten file, a failed read, a kimi credential for a kimi-ai sign-in, or a plugin provider gives "Result unavailable". It also checks that a status reply delayed past a cancel and a new start leaves the new sign-in alone. Run it against both `/management.html` and a prefixed path such as `/proxy/team/management.html`; it makes no provider calls.
+- The script's former `--mode plugin`, which drove plugin sign-in with fake management responses, went with native plugin support (docs/DIFFERENCES-FROM-GO.md "Native plugins").
 - `node scripts/api-call-check.mjs <base> [<base> ...]` sends the Accounts screen's `POST /requests/api-call` to the fake usage endpoint through each server, checks `$TOKEN$` substitution and that the quota parser reads the windows, and compares the response shape between servers.
 - `CHROME_PATH=... node scripts/quota-check.mjs [dashboard-url] [capture-dir]` drives Overview and Accounts with fake management responses (Playwright, like `oauth-check.mjs`): failed checks retain live or passive limits and their timestamps, Claude 403 advice explains setup-token permissions, a successful retry clears errors, a second check within 2 minutes sends nothing, the drawer's Check quota re-enables by itself after its 2 minutes, and a partial batch delete keeps the failed account selected and names it. It makes no provider calls.
 - The checks that sign in or send through a real server (`oauth-check.mjs` fake and dead modes, `first-run-check.mjs`, `api-call-check.mjs`) refuse to start unless the server reports an auth-dir whose real path, symlinks resolved, is strictly inside the system temp dir's real path (`scripts/private-auth-dir.mjs`; a path that doesn't resolve is refused too, and `npm test` covers it with disposable symlinks). The key is `oauth.auth-dir` (or the legacy root `auth-dir`). Anything else, such as `management.auth-dir`, falls back to `~/.cli-proxy-api`, where real logins live, and `isolated.sh` isolates the network, not the filesystem. Set `HOME` to a temp dir as well.
@@ -82,7 +81,7 @@ Both scripts are for disposable servers with fake credentials only: they edit co
 
 ## Security
 
-The management key lives in `src/api.ts` module memory and is cleared on sign-out; reloading signs out. Only the theme is stored. Plugin store descriptions are decoded as text, never inserted as HTML. Downloaded credential files and configuration previews contain secrets; treat them accordingly. Do not use the dashboard over plain HTTP across a network.
+The management key lives in `src/api.ts` module memory and is cleared on sign-out; reloading signs out. Only the theme is stored. Downloaded credential files and configuration previews contain secrets; treat them accordingly. Do not use the dashboard over plain HTTP across a network.
 
 ## Fonts
 

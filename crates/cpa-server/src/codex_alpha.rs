@@ -144,17 +144,9 @@ async fn alpha_search(
         session_parent: bound(parent),
         session_fork: fork,
         exclude,
-        scheduler: crate::plugins::provider_scheduler_context(
-            &rt,
-            "codex",
-            &selection_headers,
-            if policy.session_affinity { &model } else { "" },
-            &[],
-        ),
         ..Selection::default()
     };
-    // ponytail: one selection, no failover or outcome recording, as in Go; plugin model
-    // routing is not ported.
+    // ponytail: one selection, no failover or outcome recording, as in Go.
     if let Some(remote) = rt.remote_dispatch() {
         let (lease, home_key) = match home_lease(&rt, remote.as_ref(), selection, &headers).await {
             Ok(picked) => picked,
@@ -217,15 +209,6 @@ async fn alpha_search(
         }
         Err(AcquireError::Prepare { error: e, .. }) => {
             return error(e.status, &String::from_utf8_lossy(&e.body));
-        }
-        // A plugin scheduler's answer: Go returns the error as is, and a statusless one
-        // answers 503 (`HTTPStatusFromErrorOr`).
-        Err(AcquireError::Rejected { code, message }) => {
-            return error(503, &format!("{code}: {message}"));
-        }
-        Err(AcquireError::Scheduler(e)) => {
-            let status = if e.status > 0 { e.status } else { 503 };
-            return error(status, &crate::classify::error_text(&e));
         }
     };
     search(&rt, lease, &body, &headers, &model, &cfg, &capture, None).await

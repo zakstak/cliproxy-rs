@@ -16,25 +16,42 @@ use cpa_core::exec::Caller;
 
 use crate::runtime::Runtime;
 
-/// Go `AuthMiddleware`: client keys, then plugin frontend auth providers.
-pub async fn require_client_key(State(rt): State<Arc<Runtime>>, req: Request, next: Next) -> Response {
-    let (mut req, access) = crate::plugins::authenticate(&rt, req).await;
-    let caller = match access {
-        Ok(crate::plugins::Access::Open) => Caller {
+/// The access provider identifier Go reports for a configured client key.
+pub(crate) const CONFIG_PROVIDER: &str = "config-inline";
+
+/// Go `sdkaccess.Manager.Authenticate` with the config access provider, the only one:
+/// `Ok(None)` when no client keys are configured (Go's manager returns no result and
+/// sets nothing), else the accepted caller or Go's 401 message.
+pub(crate) fn check(rt: &Runtime, headers: &HeaderMap, query: &str) -> Result<Option<Caller>, &'static str> {
+    let config = rt.config();
+    if config.api_keys.is_empty() {
+        return Ok(None);
+    }
+    authenticate(&config.api_keys, headers, query).map(|caller| {
+        Some(Caller {
+            provider: CONFIG_PROVIDER.to_owned(),
+            ..caller
+        })
+    })
+}
+
+/// Go `AuthMiddleware` over the configured client keys.
+pub async fn require_client_key(State(rt): State<Arc<Runtime>>, mut req: Request, next: Next) -> Response {
+    let caller = match check(&rt, req.headers(), req.uri().query().unwrap_or_default()) {
+        Ok(Some(caller)) => caller,
+        Ok(None) => Caller {
             principal: String::new(),
             source: "",
             provider: String::new(),
         },
-        Ok(crate::plugins::Access::Granted(caller)) => caller,
         // gin `AbortWithStatusJSON(status, gin.H{"error": msg})`.
-        Err(denied) => {
-            let body = crate::gojson::Obj::new().str("error", denied.message).finish();
-            return crate::respond::gin_json(denied.status, body);
+        Err(message) => {
+            let body = crate::gojson::Obj::new().str("error", message).finish();
+            return crate::respond::gin_json(401, body);
         }
     };
     req.extensions_mut().insert(caller);
-    let query = req.uri().query().unwrap_or_default().to_owned();
-    crate::plugins::execution::with_query(&query, next.run(req)).await
+    next.run(req).await
 }
 
 pub(crate) fn authenticate(keys: &[String], headers: &HeaderMap, query: &str) -> Result<Caller, &'static str> {

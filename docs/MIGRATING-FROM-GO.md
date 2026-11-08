@@ -4,7 +4,7 @@ cliproxy-rs follows CLIProxyAPI at commit `6fecc6e` (v8.0.10). It reads the same
 
 ## What carries over
 
-- `config.yaml`. The v8 layout and the older flat layout (top-level `port`, `auth-dir`, an `api-keys` list, `remote-management`) are both read. Every v8 setting is accepted, including settings for features cliproxy-rs does not have yet (listed below); those are kept in the file but have no effect.
+- `config.yaml`. The v8 layout and the older flat layout (top-level `port`, `auth-dir`, an `api-keys` list, `remote-management`) are both read. Every v8 setting is accepted except `plugins`, including settings for features cliproxy-rs does not have yet (listed below); those are kept in the file but have no effect. A config with a `plugins` section fails to load: see [Native plugins](#native-plugins).
 - Credential files in `oauth.auth-dir` (default `~/.cli-proxy-api`). Claude, Codex, Antigravity, Kimi, Meta, xAI, Devin, Vertex and AI Studio files are used as they are.
 - The hashed management key. Go and cliproxy-rs both hash a plaintext `management.secret-key` with bcrypt on start and write the hash back, and each accepts the other's hash.
 - Client keys in `access.api-keys`, provider keys under `api-keys`, OpenAI-compatible upstreams, model aliases and exclusions, payload rules, proxies, routing strategy, retries and cooldowns.
@@ -19,7 +19,7 @@ The way back works too. In our tests against fake sign-in servers, Go 6fecc6e li
 
 1. Stop the Go server.
 2. Back up `config.yaml` and the credential directory. They hold OAuth refresh tokens, so keep the backup private.
-3. Check your command line against the flag list below. A few Go modes are not available yet, and cliproxy-rs exits with an error instead of starting without them.
+3. Check your command line against the flag list below. A few Go modes are not available yet, and cliproxy-rs exits with an error instead of starting without them. Remove any `plugins` section from `config.yaml` ([Native plugins](#native-plugins)).
 4. Start cliproxy-rs with the same config: `cliproxy --config /path/to/config.yaml`.
 5. Open `/management.html` and check that your credentials are listed and healthy, then send a test request with one of your client keys.
 
@@ -40,8 +40,6 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 | Go setting or feature | In cliproxy-rs |
 | --- | --- |
 | `pprof` | No profiling endpoint. |
-| Plugins on the request path | Frontend auth, model routers, plugin catalogs and executors (with or without a router), plugin schedulers, request and response translators and normalizers, thinking appliers, request, response and stream-chunk interceptors, the WebSocket response observer, the request lifecycle and usage plugins run as in Go, and so do the `host.http.*`, `host.auth.*`, `host.model.*` and `host.affinity.lookup` callbacks. Auth files go to the plugin auth provider owning their type before the built-in loader (`auth.parse`), as in Go; plugins are trusted code, and an auth provider sees every auth file with no `type`. Not called yet: per-credential model discovery (`model.for_auth`), and the plugin response hooks on a Claude client's buffered Claude answer. |
-| Home-managed plugins | With `-home-jwt`, bootstrap, config updates, dispatch, usage, process and request logs, in-flight reporting and shared KV state work. Plugin binaries must already be installed locally; Home-supplied configuration can configure them, but Home-managed plugin sync, tasks and status reports are unavailable. |
 | `management.panel-github-repository`, `management.disable-auto-update-panel`, `MANAGEMENT_STATIC_PATH` | The dashboard is built into the binary and never downloaded or read from disk. `management.disable-control-panel` is honoured. |
 | Config reload log summaries | The config is reloaded, but the changes are not summarised in the log. |
 
@@ -49,11 +47,12 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 
 ## Management API differences
 
-The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs, model definitions and plugins behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Antigravity, Kimi, Meta, xAI and Devin, and `oauth/import?provider=vertex` (or `/v0/management/vertex/import`) imports a Vertex service account as in Go.
+The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs and model definitions behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Antigravity, Kimi, Meta, xAI and Devin, and `oauth/import?provider=vertex` (or `/v0/management/vertex/import`) imports a Vertex service account as in Go.
 
 Not available on cliproxy-rs:
 
 - `server/latest-version` answers `502` with "no release repository is configured" because cliproxy-rs doesn't check for its own releases yet. Go asks GitHub for the latest CLIProxyAPI release.
+- The plugin, plugin store and plugin quota routes answer `410` ([Native plugins](#native-plugins)).
 
 The bundled dashboard checks which server it is talking to and marks these features as not available instead of failing.
 
@@ -69,6 +68,28 @@ Features Go does not have. Reset-first routing is the default; the others are op
 - Codex connection reuse: `oauth.providers.codex.chatgpt-keep-alive: true` keeps up to 2 idle connections to `chatgpt.com` per proxy for 90 seconds instead of opening one per request. Off by default.
 
 Before switching, remove `oauth.providers.codex.header-defaults.user-agent` (or `codex-header-defaults.user-agent`) and any `is-compat: true` on a `codex-api-key` model from `config.yaml`: cliproxy-rs refuses a config that sets either. Payload rules, `optimize-multi-agent-v2` and `orphan-delegation-compatibility` stay valid but no longer change requests served by Codex credentials, and a Codex WebSocket client that sends `response.append` gets an error ([codex/CONTRACT.md](codex/CONTRACT.md#settings)). Codex requests no longer claim to come from `codex-tui` on macOS; they send the client's own identity or cliproxy-rs's ([codex/IDENTITY.md](codex/IDENTITY.md)).
+
+## Native plugins
+
+This fork does not load Go CLIProxyAPI native plugins and has no plugin hooks, plugin store or Home plugin sync ([#47](https://github.com/zakstak/cliproxy-rs/issues/47)). Before switching:
+
+1. Delete the whole `plugins` section from `config.yaml`, and from the config Home serves when you run with `-home-jwt`. Any `plugins` key, even `plugins: {enabled: false}`, stops the load with `the plugins section is not supported: cliproxy-rs removed native plugin support ...`. A reload with the section keeps the running config, and a Management API write that adds it answers `422 invalid_config`.
+2. Remove command-line flags that a plugin added. They are unknown flags here, and the binary exits with a usage error.
+3. Move each plugin's job to a built-in feature, or keep running Go for it:
+
+| What a plugin did | In cliproxy-rs |
+| --- | --- |
+| Client authentication (frontend auth providers) | Client keys in `access.api-keys`. |
+| Extra upstream providers (executors, model catalogs, model routers) | The built-in providers, provider API keys under `api-keys` and `oauth.model-alias` / `oauth.excluded-models`. No replacement for a provider only a plugin offered. |
+| Credential selection (schedulers) | `routing.strategy` (`soonest-reset`, `round-robin`, `fill-first`), priorities, weights and session affinity. |
+| Request and response rewriting (interceptors, normalizers, translators, thinking appliers) | Payload rules under `requests.payload` for non-Codex providers, and the built-in translation. Codex requests take no operator rewrites ([codex/CONTRACT.md](codex/CONTRACT.md#settings)). |
+| Usage and request lifecycle plugins | The usage queue (`observability.usage.usage-statistics-enabled`, `GET /v8/management/observability/usage/queue`, the RESP `usage` channel) and request logs. |
+| Auth providers (`auth.parse`, plugin refresh, sign-in) | The built-in credential files and OAuth sign-in. A file of a type only a plugin read stays in the auth directory untouched, loads as an unknown provider and serves no requests; nothing is deleted. |
+| Quota providers and the `quota/*` routes | Passive quota signals in the credentials listing, and `POST /v8/management/requests/api-call` with `$TOKEN$` to call a provider's usage endpoint, as the dashboard's "Check quota" does. A credential's `quota_probe` metadata is no longer run. |
+| Plugin store, plugin routes and resources | None. `/v8/management/plugins...`, `/v0/management/plugins...`, `/v0/management/plugin-store...`, `/v0/management/quota/...` and `/v0/resource/plugins/...` answer `410 {"error":"plugins_removed"}`. |
+| Home-managed plugin sync, tasks and status | None. Home mode otherwise works as before. |
+
+Management responses carry `X-CPA-SUPPORT-PLUGIN: 0`, so dashboards built for Go hide their plugin pages. Switching back to Go needs no change: put the `plugins` section back in the config Go reads.
 
 ## Switching back
 

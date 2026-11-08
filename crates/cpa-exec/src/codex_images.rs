@@ -1059,7 +1059,6 @@ mod tests {
             operation: cpa_core::exec::Operation::Generate,
             source_format: Format::OpenAI,
             response_format: Format::OpenAI,
-            stream_payloads: false,
             requested_model: requested.into(),
             model: resolved.into(),
             original_body: Bytes::from_static(body),

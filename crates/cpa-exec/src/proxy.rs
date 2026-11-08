@@ -727,9 +727,9 @@ fn ended_early(error: &std::io::Error) -> bool {
     false
 }
 
-/// [`send_request`] without error sanitising, for callers that report Go's own error
-/// text (the plugin host's `host.http.*`).
-pub async fn send_request_raw(
+/// [`send_request`] without error sanitising: the exchange's own errors, for tests.
+#[cfg(test)]
+async fn send_request_raw(
     route: &(dyn Fn(&url::Url) -> Result<Route, ExecError> + Sync),
     method: wreq::Method,
     url: &str,

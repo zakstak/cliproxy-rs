@@ -160,7 +160,6 @@ fn translate_body(
         body,
         &client,
     )
-    .map(|t| t.body)
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
 
@@ -480,7 +479,6 @@ pub(crate) async fn chat_with(
                     translated_request: &body,
                     tool_search: false,
                 },
-                &req,
             ),
             None => Box::new(Identity),
         };
@@ -528,11 +526,7 @@ pub(crate) async fn chat_with(
     let mut out = match response_pair {
         Some(pair) => (pair.non_stream)(&ctx, &raw)
             .map_err(|_| ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION))?,
-        // Go's TranslateNonStream still runs the plugin response hooks.
-        None => {
-            cpa_translate::hooks::unregistered_non_stream(target.as_str(), req.response_format.as_str(), &ctx, &raw)
-                .unwrap_or_else(|| raw.to_vec())
-        }
+        None => raw.to_vec(),
     };
     if out.is_empty() {
         return Err(ExecError::local(502, FailureScope::Request, EMPTY_TRANSLATION));
@@ -808,7 +802,7 @@ impl Frames {
     }
 
     /// One Go `TranslateStream` call per frame's joined `data:` line: no blank line
-    /// follows it, so plugin stream hooks run once per line, as in Go.
+    /// follows it, as in Go.
     fn translate(&mut self, line: &[u8]) -> bool {
         match self.translator.event(line) {
             Ok(mut out) => {

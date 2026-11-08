@@ -807,7 +807,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), lock.lock_owned())
                 .await
                 .expect("the commit returns");
-            let (_, status, _, _, completed) = state.oauth.details(&sid).unwrap();
+            let (_, status, completed) = state.oauth.details(&sid).unwrap();
             assert_eq!(
                 (status.as_str(), completed),
                 ("SIWC binding target changed; start a new binding", false),
