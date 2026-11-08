@@ -181,6 +181,9 @@ struct Pending {
 /// A started response whose record has not settled.
 struct Open {
     id: String,
+    /// This record belongs to the latest start, even when multiple starts reuse an ID.
+    /// Settling it must never promote an older record to the latest one.
+    latest_start: bool,
     accounting: Accounting,
 }
 
@@ -671,7 +674,7 @@ impl Duplex {
             }
             return Owner::Started {
                 ends_latest: true,
-                open: self.open.iter().rposition(|open| open.id == self.response_id),
+                open: self.open.iter().rposition(|open| open.latest_start),
             };
         }
         let open = self.open.iter().rposition(|open| open.id == failed);
@@ -689,7 +692,7 @@ impl Duplex {
             // Go's reading of a failure no create can own: the running response ended.
             Owner::Started {
                 ends_latest: true,
-                open: self.open.iter().rposition(|open| open.id == self.response_id),
+                open: self.open.iter().rposition(|open| open.latest_start),
             }
         } else {
             Owner::Rejected
@@ -719,7 +722,11 @@ impl Duplex {
                 .accounting
                 .fail(&local("response superseded without a terminal event"));
         }
-        self.open.push_back(Open { id, accounting });
+        self.open.push_back(Open {
+            id,
+            latest_start: true,
+            accounting,
+        });
     }
 
     fn enabled(&self) -> bool {
@@ -1102,6 +1109,9 @@ impl Duplex {
                 Accounting::new(self.current.usage.clone())
             }),
         };
+        for open in &mut self.open {
+            open.latest_start = false;
+        }
         self.response_id = rawjson::get(payload, "response.id").str().to_owned();
         if let Some(accounting) = accounting {
             self.track(self.response_id.clone(), accounting);
