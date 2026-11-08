@@ -1109,8 +1109,10 @@ impl Duplex {
         self.response_settings
             .insert(self.response_id.clone(), self.current.retained());
         self.response_order.push_back(self.response_id.clone());
+        // The queue counts starts; an ID's newer occurrence still owns its settings.
         if self.response_order.len() > RETAINED_RESPONSES
             && let Some(oldest) = self.response_order.pop_front()
+            && !self.response_order.contains(&oldest)
         {
             self.response_settings.remove(&oldest);
             self.response_history_evicted = true;

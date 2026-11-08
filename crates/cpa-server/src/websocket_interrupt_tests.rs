@@ -1163,6 +1163,70 @@ mod steering_usage {
         }
     }
 
+    /// Evicting an earlier occurrence of an ID must keep a newer retained occurrence's
+    /// settings. Its late failure is still a known settled response's, and cannot close
+    /// the socket or abort the unrelated pending request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reused_response_keeps_its_settings_when_the_older_start_is_evicted() {
+        const PRIORITY: &str = r#"{"type":"response.create","model":"gpt-fixture","service_tier":"priority","reasoning":{"effort":"high"},"input":[]}"#;
+        const LATE_ERROR: &str =
+            r#"{"type":"error","status":400,"response_id":"r0","error":{"message":"late failure"}}"#;
+        let up = upstream(vec![], Then::Hold).await;
+        let (mut client, rt, credential) = proxy_with(&up.url, true, STEERING).await;
+        let mut ids = (0..16).map(|i| format!("r{i}")).collect::<Vec<_>>();
+        ids.extend(["r0".to_owned(), "r17".to_owned()]);
+        for (index, id) in ids.iter().enumerate() {
+            client.send(CREATE).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while up.frames().len() <= index {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the create reached upstream");
+            let created = format!(
+                r#"{{"type":"response.created","response":{{"id":"{id}","status":"in_progress","output":[]}}}}"#
+            );
+            let terminal = END1.replacen("r1", id, 1);
+            up.push
+                .send(vec![created.clone(), terminal.clone(), BARRIER.to_owned()])
+                .unwrap();
+            expect(&mut client, &[&created, &terminal, BARRIER], id).await;
+        }
+        let completed = pop(&rt);
+        assert_eq!(completed.len(), 18, "{completed:?}");
+        same_connection(&completed, "reused ID");
+        for record in &completed {
+            success(record, [5, 3, 8], "reused ID");
+        }
+        client.send(PRIORITY).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while up.frames().len() < 19 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pending create reached upstream");
+        up.push.send([LATE_ERROR, BARRIER].map(str::to_owned).to_vec()).unwrap();
+        expect(&mut client, &[LATE_ERROR, BARRIER], "late retained error").await;
+        assert!(pop(&rt).is_empty(), "a known settled response adds no record");
+        up.push
+            .send([CREATED_R2, END2, BARRIER].map(str::to_owned).to_vec())
+            .unwrap();
+        expect(&mut client, &[CREATED_R2, END2, BARRIER], "pending create").await;
+        let got = records(&rt, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        success(&got[0], [11, 7, 18], "pending create");
+        assert_eq!(got[0]["service_tier"], "priority");
+        assert_eq!(got[0]["reasoning_effort"], "high");
+        end(client, End::Graceful, &up).await;
+        assert!(records(&rt, 0).await.is_empty());
+        assert_eq!(up.frames().len(), 19);
+        assert_eq!(up.frames().last().unwrap(), PRIORITY);
+        assert_eq!(*up.dials.lock().unwrap(), 1);
+        assert!(rt.store().cooldowns(&credential).is_empty());
+    }
+
     /// Frames the proxy answers itself never go upstream and get no record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frames_refused_locally_get_no_record() {
