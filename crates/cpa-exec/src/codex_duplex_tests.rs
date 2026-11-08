@@ -2014,3 +2014,83 @@ async fn outstanding_and_held_creates_stay_bounded() {
         );
     }
 }
+
+/// #24, `docs/codex/CONTRACT.md` "Socket and account ownership": the duplex reads client
+/// frames only while its write queue has room, so an upstream that stops reading
+/// backpressures the client. The frames wait in the client's own bounded queue; the duplex
+/// neither fails with a full write queue nor buffers them without bound. Once upstream reads
+/// again, every frame arrives, in order and unchanged, and the stream reports no error.
+/// The 64 steers of 256 KiB (16 MiB) exceed the 16-frame write queue plus the loopback
+/// socket buffers, so the client must block before it has sent them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_upstream_backpressures_client_frames() {
+    const STEERS: usize = 64;
+    let pad = "x".repeat(256 * 1024);
+    let steer =
+        move |n: usize| format!(r#"{{"type":"response.steer","previous_response_id":"r1","input":"{n:03} {pad}"}}"#);
+    let received: Arc<Mutex<Vec<String>>> = Arc::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let all_read = Arc::new(tokio::sync::Notify::new());
+    let (log, resume, done) = (received.clone(), release.clone(), all_read.clone());
+    let up = Scripted::start(move |mut c: Peer| {
+        let (log, resume, done) = (log.clone(), resume.clone(), done.clone());
+        async move {
+            c.read().await;
+            c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                .await;
+            // Stop reading: the proxy's writes fill the socket buffers, then its queue.
+            resume.notified().await;
+            for _ in 0..STEERS {
+                let frame = c.read().await;
+                log.lock().unwrap().push(frame);
+            }
+            done.notify_one();
+            c.idle().await;
+        }
+    })
+    .await;
+    let client = Client::new("duplex-backpressure");
+    let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+    let created = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&created, "type"), "response.created");
+
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (input, counter, frames) = (client.input.clone(), sent.clone(), steer.clone());
+    let sender = tokio::spawn(async move {
+        for n in 0..STEERS {
+            input.send(Bytes::from(frames(n))).await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    // The client blocks while upstream does not read: its progress stops short of the end.
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = sent.load(Ordering::SeqCst);
+        assert!(now < STEERS, "the duplex took every frame while upstream was stalled");
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), all_read.notified())
+        .await
+        .expect("upstream read again");
+    let want: Vec<String> = (0..STEERS).map(steer).collect();
+    assert!(
+        *received.lock().unwrap() == want,
+        "the client's steers, in order and unchanged"
+    );
+    tokio::time::timeout(Duration::from_secs(10), sender)
+        .await
+        .expect("the client's blocked sends complete")
+        .unwrap();
+    // Nothing failed meanwhile: no full write queue, no local error waits on the stream.
+    assert!(
+        futures_util::FutureExt::now_or_never(stream.next()).is_none(),
+        "the stream stays open with nothing to deliver"
+    );
+    drop(stream);
+    up.finish().await;
+}
