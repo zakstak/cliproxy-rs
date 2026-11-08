@@ -791,6 +791,76 @@ mod steering_usage {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_records_keep_the_client_alias_before_model_routing() {
+        let up = upstream(
+            vec![vec![CREATED_R1, END1], vec![CREATED_R2, END2, BARRIER]],
+            Then::Hold,
+        )
+        .await;
+        let config = format!("        alias: gpt-alias\n{STEERING}");
+        let (mut client, rt, credential) = proxy_with(&up.url, true, &config).await;
+        let first = CREATE.replacen("gpt-fixture", "gpt-alias", 1);
+        let second = CREATE_R2.replacen(
+            r#""model":"gpt-fixture""#,
+            r#""model":"gpt-alias","service_tier":"flex","reasoning":{"effort":"high"}"#,
+            1,
+        );
+        client.send(&first).await;
+        expect(&mut client, &[CREATED_R1, END1], "alias first").await;
+        client.send(&second).await;
+        expect(&mut client, &[CREATED_R2, END2, BARRIER], "alias successor").await;
+        let open = records(&rt, 2).await;
+        assert_eq!(open.len(), 2, "{open:?}");
+        same_connection(&open, "alias");
+        for record in &open {
+            assert_eq!(record["alias"], "gpt-alias", "{record}");
+        }
+        assert_eq!(open[1]["reasoning_effort"], "high");
+        assert_eq!(open[1]["service_tier"], "flex");
+        assert_eq!(
+            up.frames(),
+            [CREATE.to_owned(), second.replacen("gpt-alias", "gpt-fixture", 1)],
+            "only the model value is routed"
+        );
+        end(client, End::Graceful, &up).await;
+        assert!(records(&rt, 0).await.is_empty());
+        assert_eq!(*up.dials.lock().unwrap(), 1);
+        assert!(rt.store().cooldowns(&credential).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settled_steering_records_keep_the_time_of_the_first_payload() {
+        let up = upstream(vec![vec![], vec![]], Then::Hold).await;
+        let (mut client, rt, _) = proxy_with(&up.url, true, STEERING).await;
+        for (index, create, created, terminal) in [(1, CREATE, CREATED_R1, END1), (2, CREATE_R2, CREATED_R2, END2)] {
+            client.send(create).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while up.frames().len() < index {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the request reached upstream");
+            // Delay both the first payload and the terminal separately. TTFT must
+            // include the first wait, without becoming the terminal's latency.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            up.push.send(vec![created.to_owned()]).unwrap();
+            expect(&mut client, &[created], "first payload").await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            up.push.send(vec![terminal.to_owned(), BARRIER.to_owned()]).unwrap();
+            expect(&mut client, &[terminal, BARRIER], "terminal").await;
+            let got = records(&rt, 1).await;
+            assert_eq!(got.len(), 1, "{got:?}");
+            let ttft = got[0]["ttft_ms"].as_i64().unwrap();
+            let latency = got[0]["latency_ms"].as_i64().unwrap();
+            assert!(ttft >= 35, "response {index}: {got:?}");
+            assert!(latency - ttft >= 35, "response {index}: {got:?}");
+        }
+        end(client, End::Graceful, &up).await;
+        assert!(records(&rt, 0).await.is_empty());
+    }
+
     /// An interrupted zero-output response and its successor, acknowledged before or
     /// after the terminal event: the provider's interrupted end is its own success with
     /// its reported usage, not a cancellation, and the successor has its own record.

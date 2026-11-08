@@ -1764,7 +1764,11 @@ impl Observer {
                 detail,
                 model: r.model.get().to_owned(),
                 latency: self.started.elapsed(),
-                ttft: r.ttft.get(),
+                ttft: if self.own.is_some() && !r.ttft.tracked {
+                    r.first.unwrap_or_default()
+                } else {
+                    r.ttft.get()
+                },
             });
         }
         self.publish_own();
@@ -2615,6 +2619,60 @@ mod tests {
         tracker.succeed();
         assert_eq!(queue.pop_oldest(10).len(), 1);
         assert!(sink.detach().is_none());
+    }
+
+    #[test]
+    fn owned_outcomes_preserve_payload_ttft_and_explicit_marks() {
+        use cpa_core::exec::UsageObserver;
+        use std::time::Duration;
+
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAIResponse,
+            Format::OpenAIResponse,
+            "gpt-fixture",
+            b"{}",
+            true,
+            &crate::dispatch::Trace::default(),
+        ));
+        // The saved first payload must survive success, failure, and drop. An
+        // executor's explicit marks retain precedence, including a marked zero.
+        for detached in [false, true] {
+            for marked in [None, Some(0), Some(7)] {
+                for ending in ["success", "failure", "failure_with_usage", "drop"] {
+                    let tracker = Tracker::start(&rt, &facts, &credential_for("codex"), "gpt-fixture");
+                    let reported = Reported {
+                        first: Some(Duration::from_millis(43)),
+                        ttft: Ttft {
+                            tracked: marked.is_some(),
+                            ttft: marked.map(Duration::from_millis),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let own = tracker.observer.record(facts.clone(), reported, detached);
+                    match ending {
+                        "success" => own.publish(),
+                        "failure" => own.publish_failure(502, "failed"),
+                        "failure_with_usage" => own.publish_failure_with_usage(502, "failed"),
+                        "drop" => {}
+                        _ => unreachable!(),
+                    }
+                    drop(own);
+                    let got = rt.usage_queue().pop_oldest(10);
+                    assert_eq!(got.len(), 1, "{ending}, detached={detached}, marked={marked:?}");
+                    let record: Value = serde_json::from_slice(&got[0]).unwrap();
+                    assert_eq!(
+                        record["ttft_ms"],
+                        marked.unwrap_or(43),
+                        "{ending}, detached={detached}, marked={marked:?}: {record}"
+                    );
+                    tracker.sink().discard();
+                    drop(tracker);
+                }
+            }
+        }
     }
 
     /// Claude's executor-published outcomes through the queue: an apply_patch

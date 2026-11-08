@@ -751,17 +751,17 @@ impl Duplex {
         } else {
             self.req.model.trim().to_owned()
         };
-        let frame = match body.routed(&upstream, false) {
-            std::borrow::Cow::Borrowed(_) => payload,
-            std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
-        };
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
         }
-        // The create goes upstream: a record of its own, with this frame's facts and
-        // the reasoning effort it sends (as `report_request` reports the bootstrap's).
-        let usage = self.current.usage.successor(Some(frame.as_bytes()));
+        // Client facts must precede routing: the alias names what the client selected.
+        // Report the reasoning effort from the routed frame, as for the bootstrap.
+        let usage = self.current.usage.successor(Some(payload.as_bytes()));
+        let frame = match body.routed(&upstream, false) {
+            std::borrow::Cow::Borrowed(_) => payload,
+            std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
+        };
         if usage.enabled() {
             usage.request(Format::Codex, frame.as_bytes());
         }
