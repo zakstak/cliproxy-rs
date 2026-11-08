@@ -25,7 +25,8 @@
 //! observed, while the connection stays open: its terminal event (with the usage that
 //! event reported, or none), its own failure, or a rejection before it started. A failure
 //! naming a response the socket saw start is that response's, however many others run or
-//! wait; one naming a response it never saw start rejects the oldest pending create.
+//! wait. With complete response history, an unmatched ID rejects the oldest pending
+//! create as inherited proxy policy. After history eviction it is ambiguous instead.
 //! Settled records are never revisited. A message whose observation was running when the
 //! consumer left still settles what it carries, undelivered. When the connection ends,
 //! only records still open settle: as the connection's failure, or as the proxy's
@@ -202,10 +203,10 @@ fn response_terminal(kind: &str) -> bool {
 /// belongs to. A failure names its response in `response.id`, or in `response_id` on an
 /// `error` event.
 enum Owner {
-    /// It names no response, and the running response or a pending create could own it.
+    /// No request can be identified safely.
     Ambiguous,
     /// The oldest pending create, which upstream rejected before it started: the failure
-    /// names no response while none runs, or a response this socket never saw start.
+    /// names no response while none runs, or an unmatched ID before history eviction.
     Rejected,
     /// A response this socket started. `ends_latest`: the failure ends the latest
     /// response, which no longer runs. `open`: the response's unsettled record.
@@ -270,6 +271,9 @@ pub(super) struct Duplex {
     response_id: String,
     response_settings: HashMap<String, Prepared>,
     response_order: VecDeque<String>,
+    /// A started response has left the retained history. An unmatched failure ID may
+    /// now name that response instead of rejecting a pending create.
+    response_history_evicted: bool,
     /// Settings pinned by in-flight steering, independent of the retention window.
     steering_settings: HashMap<String, Prepared>,
     /// The response waiting for required input (`response.steer.pending`).
@@ -400,6 +404,7 @@ impl Duplex {
             response_id: String::new(),
             response_settings: HashMap::new(),
             response_order: VecDeque::new(),
+            response_history_evicted: false,
             steering_settings: HashMap::new(),
             waiting_parent: String::new(),
             automatic_active: false,
@@ -647,9 +652,11 @@ impl Duplex {
     /// never owns a pending create, so a failure naming one, still open or settled, the
     /// latest or an older one, leaves the queue alone; only a failure of the latest
     /// response stops it running.
-    // ponytail: "saw start" means an open record or one of the last RETAINED_RESPONSES
-    // started; a settled response older than that counts as never seen, and a create
-    // whose new response reuses a settled ID cannot be told from that response.
+    // ponytail: retain settings for RETAINED_RESPONSES starts. Once history is evicted,
+    // unmatched failure IDs are ambiguous and end the socket instead of consuming a
+    // pending create. Stronger attribution needs provider-supported request correlation.
+    // A failure reusing a retained settled ID cannot be told from that old response;
+    // only a new response.created binds a fresh record to that ID.
     fn failure_owner(&self, payload: &str) -> Owner {
         let mut failed = rawjson::get(payload, "response.id").str().to_owned();
         if failed.is_empty() {
@@ -674,6 +681,9 @@ impl Duplex {
                 ends_latest: latest,
                 open,
             };
+        }
+        if self.response_history_evicted {
+            return Owner::Ambiguous;
         }
         if self.pending.is_empty() {
             // Go's reading of a failure no create can own: the running response ended.
@@ -1103,6 +1113,7 @@ impl Duplex {
             && let Some(oldest) = self.response_order.pop_front()
         {
             self.response_settings.remove(&oldest);
+            self.response_history_evicted = true;
         }
         self.release_steering_settings(&parent);
         self.first_response = false;

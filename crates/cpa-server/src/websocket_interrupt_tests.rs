@@ -992,7 +992,8 @@ mod steering_usage {
     /// waiting create's, and `r2` runs on; the waiting create later starts as the
     /// explicit request it is, with its own facts. A failure naming a response that
     /// already settled adds no record and takes nothing from the waiting create. One
-    /// naming a response the socket never saw start is still that create's rejection.
+    /// naming a response the socket never saw start is still that create's rejection
+    /// while its started-response history is complete.
     /// Every event reaches the client as sent; nothing more settles at the close.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failure_is_the_record_of_the_response_it_names() {
@@ -1071,6 +1072,94 @@ mod steering_usage {
             assert!(after.is_empty(), "{case}: {after:?}");
             assert_eq!(*up.dials.lock().unwrap(), 1, "{case}");
             assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+        }
+    }
+
+    /// Once history has expired, an unmatched failure ID cannot prove that the pending
+    /// create was rejected. Preserve the frame and fail the socket as ambiguous, instead
+    /// of charging that create the old response's outcome. A retained settled ID still
+    /// leaves the pending create and its facts intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_history_cannot_charge_a_pending_create_an_old_failure() {
+        const PRIORITY: &str =
+            r#"{"type":"response.create","model":"gpt-fixture","service_tier":"priority","input":[]}"#;
+        const CREATED_PENDING: &str =
+            r#"{"type":"response.created","response":{"id":"pending","status":"in_progress","output":[]}}"#;
+        const END_PENDING: &str = r#"{"type":"response.completed","response":{"id":"pending","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}}"#;
+        for (failed_id, ambiguous) in [("r0", true), ("never-seen", true), ("r16", false)] {
+            let up = upstream(vec![], Then::Hold).await;
+            let (mut client, rt, credential) = proxy_with(&up.url, true, STEERING).await;
+            for index in 0..17 {
+                client.send(CREATE).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while up.frames().len() <= index {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the create reached upstream");
+                let created = format!(
+                    r#"{{"type":"response.created","response":{{"id":"r{index}","status":"in_progress","output":[]}}}}"#
+                );
+                let terminal = END1.replacen("r1", &format!("r{index}"), 1);
+                up.push
+                    .send(vec![created.clone(), terminal.clone(), BARRIER.to_owned()])
+                    .unwrap();
+                expect(&mut client, &[&created, &terminal, BARRIER], failed_id).await;
+            }
+            let completed = pop(&rt);
+            assert_eq!(completed.len(), 17, "{failed_id}: {completed:?}");
+            for record in &completed {
+                success(record, [5, 3, 8], failed_id);
+            }
+            client.send(PRIORITY).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while up.frames().len() < 18 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the pending create reached upstream");
+            let failed = format!(
+                r#"{{"type":"error","status":400,"response_id":"{failed_id}","error":{{"message":"late failure"}}}}"#
+            );
+            let mut events = vec![failed.clone()];
+            if !ambiguous {
+                events.push(BARRIER.to_owned());
+            }
+            up.push.send(events).unwrap();
+            assert_eq!(client.read().await, failed, "upstream bytes are preserved");
+            if ambiguous {
+                let got = records(&rt, 1).await;
+                assert_eq!(got.len(), 1, "{failed_id}: {got:?}");
+                failure(&got[0], 502, failed_id);
+                assert_eq!(got[0]["service_tier"], "priority");
+                assert!(
+                    got[0]["fail"]["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cannot associate websocket failure"),
+                    "{got:?}"
+                );
+                closed(&mut client).await;
+            } else {
+                assert_eq!(client.read().await, BARRIER);
+                assert!(pop(&rt).is_empty(), "a settled response produces no new record");
+                up.push
+                    .send([CREATED_PENDING, END_PENDING, BARRIER].map(str::to_owned).to_vec())
+                    .unwrap();
+                expect(&mut client, &[CREATED_PENDING, END_PENDING, BARRIER], failed_id).await;
+                let got = records(&rt, 1).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                success(&got[0], [11, 7, 18], failed_id);
+                assert_eq!(got[0]["service_tier"], "priority");
+                end(client, End::Graceful, &up).await;
+            }
+            assert!(records(&rt, 0).await.is_empty(), "no extra settlement");
+            assert_eq!(up.frames().len(), 18);
+            assert_eq!(up.frames().last().unwrap(), PRIORITY);
+            assert_eq!(*up.dials.lock().unwrap(), 1);
+            assert!(rt.store().cooldowns(&credential).is_empty());
         }
     }
 
