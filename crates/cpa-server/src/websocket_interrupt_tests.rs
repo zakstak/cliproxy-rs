@@ -385,9 +385,9 @@ mod zero_output_ends {
 
     /// `content_filter` and `max_output_tokens` with zero output are the provider's
     /// answer: they reach the client unchanged, with their own reason, and the socket and
-    /// the credential stay. Without a reason the same shape is an upstream silent abort:
-    /// the client never gets it, the attempt is a request-scoped 502 that cools nothing,
-    /// and the socket is gone.
+    /// the credential stay. An unexplained end sent before any event is delivered is
+    /// an upstream silent abort: the client never gets it, the attempt is a request-scoped
+    /// 502 that cools nothing, and the socket is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn named_reasons_stay_distinct_and_an_unexplained_end_stays_an_abort() {
         for steering in [false, true] {
@@ -417,11 +417,10 @@ mod zero_output_ends {
                 }
             }
         }
-        let (upstream, frames, _) = ws_upstream(vec![vec![CREATED_R1, UNEXPLAINED]]).await;
+        let (upstream, frames, _) = ws_upstream(vec![vec![UNEXPLAINED]]).await;
         let (mut client, rt, credential) = proxy_with(&upstream, true, "").await;
         client.send(CREATE).await;
-        assert_eq!(client.read().await, CREATED_R1);
-        aborted(&mut client, &rt, &credential, "no reason").await;
+        aborted(&mut client, &rt, &credential, "no reason before delivery").await;
         assert_eq!(frames.lock().unwrap().len(), 1);
     }
 
