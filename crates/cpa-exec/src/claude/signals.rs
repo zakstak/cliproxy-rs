@@ -21,7 +21,7 @@ fn probe(body: &str) -> bool {
         return false;
     }
     let messages = rawjson::get(body, "messages");
-    if messages.kind() != gjson::Kind::Array || messages.array().is_empty() {
+    if messages.kind() != rawjson::Kind::Array || messages.array().is_empty() {
         return true;
     }
     let messages = messages.array();
@@ -31,8 +31,8 @@ fn probe(body: &str) -> bool {
     let content = messages[0].get("content");
     let probe_text = |t: &str| matches!(t, "quota" | "test" | "." | "probe");
     match content.kind() {
-        gjson::Kind::String => probe_text(content.str().trim()),
-        gjson::Kind::Array => {
+        rawjson::Kind::String => probe_text(content.str().trim()),
+        rawjson::Kind::Array => {
             let (mut count, mut matched) = (0, false);
             for part in content.array() {
                 let t = part.get("text");
@@ -52,7 +52,7 @@ fn probe(body: &str) -> bool {
 }
 
 fn any_text(value: &rawjson::Value, matches: impl Fn(&str) -> bool) -> bool {
-    if value.kind() == gjson::Kind::Array {
+    if value.kind() == rawjson::Kind::Array {
         value.array().iter().any(|p| matches(p.get("text").str()))
     } else {
         matches(value.str())
@@ -147,11 +147,11 @@ pub(crate) fn subagent(headers: &HeaderMap, body: &str) -> bool {
     }
     let system = rawjson::get(body, "system");
     match system.kind() {
-        gjson::Kind::Array => system
+        rawjson::Kind::Array => system
             .array()
             .first()
             .is_some_and(|b| b.get("text").str().contains("cc_is_subagent=true")),
-        gjson::Kind::String => system.str().contains("cc_is_subagent=true"),
+        rawjson::Kind::String => system.str().contains("cc_is_subagent=true"),
         _ => false,
     }
 }
@@ -168,7 +168,7 @@ pub(crate) fn blocks(body: &str) -> Vec<(String, Cow<'_, str>)> {
     let mut out = Vec::new();
     for section in ["tools", "system"] {
         let v = rawjson::get(body, section);
-        if v.kind() == gjson::Kind::Array {
+        if v.kind() == rawjson::Kind::Array {
             out.extend(
                 v.array()
                     .iter()
@@ -178,10 +178,10 @@ pub(crate) fn blocks(body: &str) -> Vec<(String, Cow<'_, str>)> {
         }
     }
     let messages = rawjson::get(body, "messages");
-    if messages.kind() == gjson::Kind::Array {
+    if messages.kind() == rawjson::Kind::Array {
         for (m, message) in messages.array().iter().enumerate() {
             let content = message.get("content");
-            if content.kind() == gjson::Kind::Array {
+            if content.kind() == rawjson::Kind::Array {
                 out.extend(
                     content
                         .array()
@@ -203,7 +203,7 @@ pub(crate) fn has_1h_ttl(body: &str) -> bool {
         && rawjson::valid(body)
         && blocks(body).iter().any(|(_, block)| {
             let cc = rawjson::get(block, "cache_control");
-            cc.kind() == gjson::Kind::Object && cc.get("ttl").str() == "1h"
+            cc.kind() == rawjson::Kind::Object && cc.get("ttl").str() == "1h"
         })
 }
 
@@ -221,7 +221,7 @@ pub(crate) fn new_prompt_turn(body: &str) -> bool {
         return false;
     }
     let messages = rawjson::get(body, "messages");
-    if messages.kind() != gjson::Kind::Array {
+    if messages.kind() != rawjson::Kind::Array {
         return true;
     }
     let messages = messages.array();
@@ -230,7 +230,7 @@ pub(crate) fn new_prompt_turn(body: &str) -> bool {
         return false;
     }
     let content = last.get("content");
-    !(content.kind() == gjson::Kind::Array && content.array().iter().any(|p| p.get("type").str() == "tool_result"))
+    !(content.kind() == rawjson::Kind::Array && content.array().iter().any(|p| p.get("type").str() == "tool_result"))
 }
 
 const BILLING: &str = "x-anthropic-billing-header:";
@@ -238,8 +238,8 @@ const BILLING: &str = "x-anthropic-billing-header:";
 fn billing_text(body: &str) -> Option<String> {
     let system = rawjson::get(body, "system");
     let text = match system.kind() {
-        gjson::Kind::Array => system.array().first()?.get("text").str().to_owned(),
-        gjson::Kind::String => system.str().to_owned(),
+        rawjson::Kind::Array => system.array().first()?.get("text").str().to_owned(),
+        rawjson::Kind::String => system.str().to_owned(),
         _ => return None,
     };
     text.starts_with(BILLING).then_some(text)

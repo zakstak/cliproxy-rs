@@ -191,6 +191,64 @@ impl<'a> CodexBody<'a> {
         self.members.iter().find(|m| m.key == key)
     }
 
+    /// Apply the permitted model and streaming transport edits in one copy. An
+    /// unchanged body stays borrowed, including an equivalent escaped model string.
+    /// Missing members are inserted first, as in [`Self::with_member`].
+    pub fn routed(&self, model: &str, force_stream: bool) -> Cow<'a, [u8]> {
+        let model_member = self.get("model");
+        let model_value = (model_member.and_then(Member::text).as_deref() != Some(model))
+            .then(|| serde_json::to_string(model).expect("serialize a string"));
+        let stream_member = self.get("stream");
+        let stream_value = (force_stream && stream_member.map(|m| m.kind) != Some(Kind::True)).then_some("true");
+        if model_value.is_none() && stream_value.is_none() {
+            return Cow::Borrowed(self.raw);
+        }
+
+        let mut replacements = Vec::with_capacity(2);
+        let mut missing = Vec::with_capacity(2);
+        for (key, member, value) in [
+            ("model", model_member, model_value.as_deref()),
+            ("stream", stream_member, stream_value),
+        ] {
+            let Some(value) = value else { continue };
+            match member {
+                Some(member) => {
+                    let start = member.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
+                    replacements.push((start, start + member.raw.len(), value));
+                }
+                None => missing.push((key, value)),
+            }
+        }
+        replacements.sort_unstable_by_key(|(start, _, _)| *start);
+        let mut out = Vec::with_capacity(self.raw.len() + model_value.as_ref().map_or(0, String::len) + 32);
+        let mut copied = 0;
+        if !missing.is_empty() {
+            let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
+            out.extend_from_slice(&self.raw[..open]);
+            // Same order as routing model, then inserting stream with with_member.
+            for (i, (key, value)) in missing.iter().rev().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.push(b'"');
+                out.extend_from_slice(key.as_bytes());
+                out.extend_from_slice(b"\":");
+                out.extend_from_slice(value.as_bytes());
+            }
+            if !self.members.is_empty() {
+                out.push(b',');
+            }
+            copied = open;
+        }
+        for (start, end, value) in replacements {
+            out.extend_from_slice(&self.raw[copied..start]);
+            out.extend_from_slice(value.as_bytes());
+            copied = end;
+        }
+        out.extend_from_slice(&self.raw[copied..]);
+        Cow::Owned(out)
+    }
+
     /// The body with top-level `key` set to `value`, a JSON value the caller wrote. An
     /// existing member keeps its position and only its value bytes change; a missing one
     /// is added as the first member. Every other byte is copied unchanged, once. This is

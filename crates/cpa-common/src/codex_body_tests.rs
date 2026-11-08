@@ -251,3 +251,51 @@ fn without_member_removes_one_member_and_its_comma() {
     let raw = br#"{"model":"m"}"#;
     assert_eq!(CodexBody::parse(raw).unwrap().without_member("type"), raw);
 }
+
+/// Contract probe: routing changes only model/stream, including when both need edits.
+/// Unknown values remain raw JSON rather than passing through a serde value tree.
+#[test]
+fn routing_preserves_unknown_bytes_and_handles_both_member_orders() {
+    for (raw, expected) in [
+        (
+            r#" {"model" : "alias", "stream" : false, "future":{"n":1e400,"s":"\u0061"}} "#,
+            r#" {"model" : "upstream", "stream" : true, "future":{"n":1e400,"s":"\u0061"}} "#,
+        ),
+        (
+            r#"{"stream":false,"mod\u0065l":"alias","future":[-0,1E-9]}"#,
+            r#"{"stream":true,"mod\u0065l":"upstream","future":[-0,1E-9]}"#,
+        ),
+        (
+            r#" {"future":123456789012345678901234567890} "#,
+            r#" {"stream":true,"model":"upstream","future":123456789012345678901234567890} "#,
+        ),
+        (" { }\n", " {\"stream\":true,\"model\":\"upstream\" }\n"),
+        (
+            r#"{"stream":false,"future":null}"#,
+            r#"{"model":"upstream","stream":true,"future":null}"#,
+        ),
+        (
+            r#"{"model":"alias","future":false}"#,
+            r#"{"stream":true,"model":"upstream","future":false}"#,
+        ),
+    ] {
+        let body = CodexBody::parse(raw.as_bytes()).unwrap();
+        assert_eq!(body.routed("upstream", true).as_ref(), expected.as_bytes(), "{raw}");
+    }
+}
+
+#[test]
+fn routing_borrows_unchanged_bodies_and_quotes_only_a_changed_model() {
+    let raw = br#"{"model":"up\u0073tream","stream":true,"future":1e400}"#;
+    let body = CodexBody::parse(raw).unwrap();
+    let out = body.routed("upstream", true);
+    assert!(matches!(out, Cow::Borrowed(_)));
+    assert_eq!(out.as_ptr(), raw.as_ptr());
+    let raw = br#"{"model":"upstream","stream":false}"#;
+    let body = CodexBody::parse(raw).unwrap();
+    assert!(matches!(body.routed("upstream", false), Cow::Borrowed(_)));
+    assert_eq!(
+        body.routed("a\"b\\c\n", false).as_ref(),
+        br#"{"model":"a\"b\\c\n","stream":false}"#
+    );
+}
