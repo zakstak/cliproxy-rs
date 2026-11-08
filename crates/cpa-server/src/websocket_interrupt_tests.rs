@@ -987,6 +987,93 @@ mod steering_usage {
         assert!(after.is_empty(), "{case}: {after:?}");
     }
 
+    /// `r1` and `r2` run and a third create waits upstream when a failure arrives. One
+    /// that names `r1` (as `response.id` or as `response_id`) is `r1`'s record, not the
+    /// waiting create's, and `r2` runs on; the waiting create later starts as the
+    /// explicit request it is, with its own facts. A failure naming a response that
+    /// already settled adds no record and takes nothing from the waiting create. One
+    /// naming a response the socket never saw start is still that create's rejection.
+    /// Every event reaches the client as sent; nothing more settles at the close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failure_is_the_record_of_the_response_it_names() {
+        const CREATE_AUTO: &str =
+            r#"{"type":"response.create","model":"gpt-fixture","service_tier":"auto","input":[]}"#;
+        const CREATE_FLEX: &str =
+            r#"{"type":"response.create","model":"gpt-fixture","service_tier":"flex","input":[]}"#;
+        const CREATE_PRIORITY: &str =
+            r#"{"type":"response.create","model":"gpt-fixture","service_tier":"priority","input":[]}"#;
+        const FAILED_R1: &str = r#"{"type":"response.failed","response":{"id":"r1","status":"failed","output":[],"error":{"type":"invalid_request_error","message":"r1 failed"}}}"#;
+        const ERROR_R1: &str = r#"{"type":"error","status":400,"response_id":"r1","error":{"type":"invalid_request_error","message":"r1 rejected"}}"#;
+        const UNSTARTED: &str = r#"{"type":"error","status":400,"response_id":"never-started","error":{"type":"invalid_request_error","message":"rejected before it started"}}"#;
+        const CREATED_R3: &str =
+            r#"{"type":"response.created","response":{"id":"r3","status":"in_progress","output":[]}}"#;
+        const END3: &str = r#"{"type":"response.completed","response":{"id":"r3","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}"#;
+        for (case, settled_first, failed) in [
+            ("older open response.id", false, FAILED_R1),
+            ("older open response_id", false, ERROR_R1),
+            ("settled", true, FAILED_R1),
+            ("never started", false, UNSTARTED),
+        ] {
+            let first: Vec<&'static str> = if settled_first {
+                vec![CREATED_R1, END1]
+            } else {
+                vec![CREATED_R1]
+            };
+            let up = upstream(vec![first.clone(), vec![CREATED_R2], vec![failed, BARRIER]], Then::Hold).await;
+            let (mut client, rt, credential) = proxy_with(&up.url, true, STEERING).await;
+            client.send(CREATE_AUTO).await;
+            expect(&mut client, &first, case).await;
+            client.send(CREATE_FLEX).await;
+            expect(&mut client, &[CREATED_R2], case).await;
+            client.send(CREATE_PRIORITY).await;
+            expect(&mut client, &[failed, BARRIER], case).await;
+            let tier = |r: &Value| r["service_tier"].as_str().unwrap().to_owned();
+            let open = records(&rt, 1).await;
+            assert_eq!(open.len(), 1, "{case}: {open:?}");
+            match case {
+                "settled" => success(&open[0], [5, 3, 8], case),
+                _ => failure(&open[0], 400, case),
+            }
+            let failed_tier = if case == "never started" { "priority" } else { "auto" };
+            assert_eq!(
+                tier(&open[0]),
+                if settled_first { "auto" } else { failed_tier },
+                "{case}"
+            );
+            // The rest of the conversation: r2 ends, then r3 starts and ends unless the
+            // failure rejected its create; then r1 ends if it still runs.
+            let mut rest = vec![END2];
+            if case != "never started" {
+                rest.extend([CREATED_R3, END3]);
+            } else {
+                rest.push(END1);
+            }
+            rest.push(BARRIER);
+            up.push.send(rest.iter().map(|s| (*s).to_owned()).collect()).unwrap();
+            expect(&mut client, &rest, case).await;
+            let later = records(&rt, 2).await;
+            assert_eq!(later.len(), 2, "{case}: {later:?}");
+            success(&later[0], [11, 7, 18], case);
+            assert_eq!(tier(&later[0]), "flex", "{case}");
+            if case == "never started" {
+                success(&later[1], [5, 3, 8], case);
+                assert_eq!(tier(&later[1]), "auto", "{case}");
+            } else {
+                success(&later[1], [2, 1, 3], case);
+                assert_eq!(tier(&later[1]), "priority", "{case}: r3 keeps its create's facts");
+            }
+            let mut all = open.clone();
+            all.extend(later);
+            same_connection(&all, case);
+            assert_eq!(up.frames(), [CREATE_AUTO, CREATE_FLEX, CREATE_PRIORITY], "{case}");
+            end(client, End::Graceful, &up).await;
+            let after = records(&rt, 0).await;
+            assert!(after.is_empty(), "{case}: {after:?}");
+            assert_eq!(*up.dials.lock().unwrap(), 1, "{case}");
+            assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+        }
+    }
+
     /// Frames the proxy answers itself never go upstream and get no record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frames_refused_locally_get_no_record() {
