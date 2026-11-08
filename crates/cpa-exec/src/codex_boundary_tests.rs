@@ -382,6 +382,9 @@ async fn images_forms_are_read_without_loss() {
     assert!(mock.take().is_empty(), "a refused form reached the upstream");
 }
 
+/// Form text fields, in order: name and raw value.
+type Fields<'a> = Vec<(&'a str, &'a [u8])>;
+
 /// A present form control is read or refused, never dropped (#22). On both paths the
 /// routing fields `model` and `stream` are read once, as UTF-8, and `stream` as a
 /// boolean, though the routed values replace them. The tool path refuses a count that is
@@ -396,7 +399,7 @@ async fn images_form_controls_are_refused_not_dropped() {
     let path = "/v1/images/edits";
     let content_type = "multipart/form-data; boundary=B";
     let prompt: (&str, &[u8]) = ("prompt", b"p");
-    let mut cases: Vec<(&str, Vec<(&str, &[u8])>, &str)> = Vec::new();
+    let mut cases: Vec<(&str, Fields, &str)> = Vec::new();
     for model in ["gpt-5.4", "gpt-image-2"] {
         for (fields, message) in [
             (
