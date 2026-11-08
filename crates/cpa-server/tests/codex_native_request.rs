@@ -534,3 +534,262 @@ async fn the_final_failure_keeps_the_upstream_status_and_body() {
     assert_eq!(status, 429);
     assert_eq!(proxy.upstream.http().len(), 1);
 }
+
+/// Codex's own client paths (`/backend-api/codex/responses` and its `/compact` form) are
+/// the same native routes: the client path maps to the profile's `/responses` or
+/// `/responses/compact` (the routing row of docs/codex/CONTRACT.md "Permitted
+/// transformations"), and the body and answer pass unchanged.
+#[tokio::test]
+async fn codex_client_paths_take_the_same_native_routes() {
+    let compacted = r#"{"id":"cmp_2","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"ENC"}],"future":null}"#;
+    for api_key in [false, true] {
+        let proxy = native(
+            api_key,
+            Script {
+                http: vec![
+                    Reply::sse(fixture("sse-completed").bytes()),
+                    Reply::json(200, compacted),
+                ],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let body = routed("http-request-full");
+        let (status, _, answer) = post(
+            &proxy.url,
+            "/backend-api/codex/responses",
+            &[("user-agent", CODEX_UA)],
+            body.clone(),
+        )
+        .await;
+        assert_eq!((status, answer.as_str()), (200, text_of("sse-completed").as_str()));
+        let sent = proxy.upstream.http().pop().unwrap();
+        assert_eq!(sent.uri.path(), "/responses", "api_key={api_key}");
+        assert_eq!(String::from_utf8_lossy(&sent.body), body, "api_key={api_key}");
+
+        let body = routed("http-request-compaction").replacen(r#""stream":true"#, r#""stream":false"#, 1);
+        let (status, _, answer) = post(&proxy.url, "/backend-api/codex/responses/compact", &[], body.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, compacted), "api_key={api_key}");
+        let sent = proxy.upstream.http().pop().unwrap();
+        assert_eq!(sent.uri.path(), "/responses/compact", "api_key={api_key}");
+        assert_eq!(String::from_utf8_lossy(&sent.body), body, "api_key={api_key}");
+    }
+}
+
+/// A `zstd` request body (the pinned client compresses requests to the Codex backend,
+/// core/src/client.rs:1932-1940): the server decodes it to read the routing fields, and
+/// the upstream gets the decoded bytes unchanged, without the client's `Content-Encoding`
+/// (docs/codex/CONTRACT.md "Permitted transformations", the decoding row). Nothing is
+/// re-serialized: the probe's escape and raw number spellings survive.
+#[tokio::test]
+async fn a_zstd_body_reaches_the_upstream_decoded_and_unchanged() {
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let body = routed("probe-request-unknown-fields");
+    let compressed = zstd::encode_all(body.as_bytes(), 3).unwrap();
+    let response = wreq::Client::new()
+        .post(format!("{}/v1/responses", proxy.url))
+        .header("authorization", "Bearer client-key")
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .header("user-agent", CODEX_UA)
+        .body(compressed)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let answer = response.text().await.unwrap();
+    assert_eq!((status, answer.as_str()), (200, text_of("sse-completed").as_str()));
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), body, "the decoded client bytes");
+    assert!(
+        sent.headers.get("content-encoding").is_none(),
+        "decoded bytes never travel with the client's encoding: {:?}",
+        sent.headers.get("content-encoding")
+    );
+}
+
+/// Responses Lite from the official client: the Lite body (tools in a leading
+/// `additional_tools` item, no top-level `tools`, `parallel_tool_calls: false`) with its
+/// marker header reaches the upstream unchanged, and so does the marker. No top-level
+/// tools, instructions or reasoning are manufactured.
+#[tokio::test]
+async fn responses_lite_keeps_its_body_and_marker() {
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let body = routed("http-request-lite");
+    let (status, _, answer) = post(
+        &proxy.url,
+        "/v1/responses",
+        &[
+            ("user-agent", CODEX_UA),
+            ("originator", "codex_cli_rs"),
+            ("x-openai-internal-codex-responses-lite", "true"),
+        ],
+        body.clone(),
+    )
+    .await;
+    assert_eq!((status, answer.as_str()), (200, text_of("sse-completed").as_str()));
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), body);
+    assert_eq!(sent.headers["x-openai-internal-codex-responses-lite"], "true");
+}
+
+/// Explicit routing on the `chatgpt` profile composes with the buffered adaptation: an
+/// OAuth model alias changes only the `model` value, a buffered client's request also gets
+/// `stream: true`, and nothing else changes. The client gets the terminal `response`
+/// object byte for byte, with the upstream's model name (no `force-mapping` rewrite).
+#[tokio::test]
+async fn an_oauth_alias_and_the_buffered_adaptation_change_only_their_fields() {
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "oauth-model-alias:\n  codex:\n    - name: gpt-5.5\n      alias: team-model\n      fork: false\n",
+    )
+    .await;
+    let client = text_of("probe-request-unknown-fields")
+        .replacen(r#""model":"gpt-test""#, r#""model":"team-model""#, 1)
+        .replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    assert!(client.contains(r#""stream":false"#), "{client}");
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], client.clone()).await;
+    let terminal = String::from_utf8(fixture("sse-completed").frames().pop().unwrap().to_vec()).unwrap();
+    let object = &terminal[terminal.find(r#""response":"#).unwrap() + 11..terminal.len() - 1];
+    assert_eq!((status, answer.as_str()), (200, object));
+    let sent = proxy.upstream.http().pop().unwrap();
+    let want = client
+        .replacen(r#""model":"team-model""#, r#""model":"gpt-5.5""#, 1)
+        .replacen(r#""stream":false"#, r#""stream":true"#, 1);
+    assert_eq!(String::from_utf8_lossy(&sent.body), want, "only `model` and `stream`");
+}
+
+/// Inputs the native route cannot carry without a body change are refused through the
+/// real routes with an actionable 400, before any upstream request: a thinking suffix on
+/// the model, a streamed compaction, and an `image_generation` tool or tool choice while
+/// `multimedia.disable-image-generation` strips it (Go stripped it from the body). The
+/// same proxy still forwards a body without the tool unchanged.
+#[tokio::test]
+async fn unsupported_native_inputs_are_refused_before_the_send() {
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        "multimedia:\n  disable-image-generation: true\n",
+    )
+    .await;
+    let full = routed("http-request-full");
+    let with_tool = full.replacen(r#""tools":["#, r#""tools":[{"type":"image_generation"},"#, 1);
+    let with_choice = full.replacen(
+        r#""tool_choice":"auto""#,
+        r#""tool_choice":{"type":"image_generation"}"#,
+        1,
+    );
+    assert_ne!(with_tool, full);
+    assert_ne!(with_choice, full);
+    let cases = [
+        (
+            "/v1/responses",
+            full.replacen(r#""model":"gpt-5.5""#, r#""model":"gpt-5.5(high)""#, 1),
+            "model suffix `(high)` is not supported on native Codex Responses requests; set `reasoning` in the request body",
+        ),
+        (
+            "/v1/responses/compact",
+            routed("http-request-compaction"),
+            "Streaming not supported for compact responses",
+        ),
+        ("/v1/responses", with_tool, "multimedia.disable-image-generation"),
+        ("/v1/responses", with_choice, "multimedia.disable-image-generation"),
+    ];
+    for (path, body, message) in cases {
+        for headers in [&[("user-agent", CODEX_UA)][..], &[]] {
+            let (status, _, answer) = post(&proxy.url, path, headers, body.clone()).await;
+            assert_eq!(status, 400, "{path} {message}: {answer}");
+            assert!(answer.contains(message), "{path}: {answer}");
+            assert!(proxy.upstream.http().is_empty(), "{path} {message}: nothing upstream");
+        }
+    }
+    let (status, _, _) = post(&proxy.url, "/v1/responses", &[("user-agent", CODEX_UA)], full.clone()).await;
+    assert_eq!(status, 200);
+    let sent = proxy.upstream.http().pop().unwrap();
+    assert_eq!(String::from_utf8_lossy(&sent.body), full);
+}
+
+/// #2, kept and broadened to the native contract. #2 kept an official Codex client's
+/// `parallel_tool_calls` (false, true or omitted) and output-replay `include`; Go forced
+/// `parallel_tool_calls: true` and dropped the replay for other Responses clients, forced
+/// `false` under Responses Lite and dropped `prompt_cache_options`. Those Go-parity
+/// assertions are replaced by the contract's: every client's body reaches the upstream
+/// byte for byte (docs/codex/CONTRACT.md "Field preservation"), on the `chatgpt`,
+/// `api-key` and Sign in with ChatGPT profiles, whichever headers identify the client.
+#[tokio::test]
+async fn issue2_parallelism_and_output_replay_pass_unchanged_for_every_client() {
+    let clients: [&[(&str, &str)]; 5] = [
+        &[("user-agent", CODEX_UA), ("originator", "codex_cli_rs")],
+        &[("originator", "codex_cli_rs")],
+        &[
+            ("user-agent", CODEX_UA),
+            ("x-openai-internal-codex-responses-lite", "true"),
+        ],
+        &[("user-agent", "OpenAI/Python 2.1.0")],
+        &[],
+    ];
+    let includes = [REPLAY, r#"["reasoning.encrypted_content"]"#, "[]"];
+    let cases = clients.len() * 3 * includes.len();
+    for api_key in [false, true] {
+        let replies = (0..cases)
+            .map(|_| Reply::sse(fixture("sse-completed").bytes()))
+            .collect();
+        let proxy = native(
+            api_key,
+            Script {
+                http: replies,
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        for headers in clients {
+            for parallel in [Some(false), Some(true), None] {
+                for include in includes {
+                    let client = body(parallel, include);
+                    let (status, _, answer) = post(&proxy.url, "/v1/responses", headers, client.clone()).await;
+                    assert_eq!(status, 200, "{answer}");
+                    let sent = proxy.upstream.http().pop().unwrap();
+                    assert_eq!(
+                        String::from_utf8_lossy(&sent.body),
+                        client,
+                        "api_key={api_key} {headers:?} {parallel:?} {include}"
+                    );
+                }
+            }
+        }
+    }
+    let siwc = proxy(true).await;
+    for headers in clients {
+        for parallel in [Some(false), Some(true), None] {
+            let client = body(parallel, REPLAY);
+            let (auth, sent) = send(&siwc, headers, client.clone()).await;
+            assert_eq!(auth["authorization"], "Bearer siwc-at-FAKE");
+            assert_eq!(sent, client, "siwc {headers:?} {parallel:?}");
+        }
+    }
+}
