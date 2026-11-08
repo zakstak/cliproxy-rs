@@ -1620,6 +1620,123 @@ async fn handshake_metadata_precedes_a_preserved_context_window_failure() {
     );
 }
 
+/// #3: a turn whose first socket fails before anything reached the client fails over to
+/// a fresh socket, and the client gets that socket's handshake metadata once, ahead of
+/// its first event. The failed socket's handshake belongs to an attempt the client never
+/// saw, so its turn state never travels. With and without response steering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_over_turn_reports_only_the_serving_sockets_handshake() {
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wreq::ws::message::Message as WsMessage;
+    /// Retryable before anything was delivered: the attempt fails over.
+    const UNAVAILABLE: &str =
+        r#"{"type":"error","status":503,"error":{"type":"server_error","message":"try another"}}"#;
+    for steering in [false, true] {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let upstream = {
+            let dials = dials.clone();
+            serve(axum::Router::new().fallback(move |ws: WebSocketUpgrade| {
+                let dial = dials.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let (turn_state, events): (&'static str, &'static [&'static str]) = if dial == 0 {
+                        ("ts-failed", &[UNAVAILABLE])
+                    } else {
+                        ("ts-serving", &[CREATED, COMPLETED])
+                    };
+                    let mut response = ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if matches!(message, AxMessage::Text(_)) {
+                                for event in events {
+                                    let _ = socket.send(AxMessage::Text((*event).into())).await;
+                                }
+                            }
+                        }
+                    });
+                    for (name, value) in [("x-codex-turn-state", turn_state), ("openai-model", "gpt-fixture")] {
+                        response.headers_mut().insert(
+                            axum::http::HeaderName::from_static(name),
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                    }
+                    response
+                }
+            }))
+            .await
+        };
+        let dir = std::env::temp_dir().join(format!("cpa-ws-failover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let steering_line = if steering {
+            "codex:\n  response-steering: true\n"
+        } else {
+            ""
+        };
+        let key = |n: u8| {
+            format!(
+                "  - api-key: sk-FAKE-{n}\n    base-url: http://{upstream}\n    websockets: true\n    models:\n      - name: gpt-fixture\n"
+            )
+        };
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\n{steering_line}codex-api-key:\n{}{}",
+            dir.display(),
+            key(1),
+            key(2)
+        ))
+        .unwrap();
+        let credentials = cpa_core::config::credentials::from_config(&cfg);
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
+        let mut socket = wreq::Client::new()
+            .websocket(format!("ws://{proxy}/v1/responses"))
+            .send()
+            .await
+            .unwrap()
+            .into_websocket()
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+            ))
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let frame = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+                Ok(Some(Ok(WsMessage::Text(text)))) => text.as_str().to_owned(),
+                Ok(Some(Ok(_))) => continue,
+                other => panic!("steering={steering}: no text frame after {frames:?}: {other:?}"),
+            };
+            let done = cpa_common::rawjson::get(&frame, "type").str() == "response.completed";
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+        drop(socket);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "steering={steering}: a fresh socket served"
+        );
+        assert_eq!(
+            frames,
+            [
+                r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-serving","openai-model":"gpt-fixture"}}"#,
+                CREATED,
+                COMPLETED
+            ],
+            "steering={steering}"
+        );
+    }
+}
+
 /// zakstak/cliproxy-rs#5: once a Codex client's context-window failure is committed (the
 /// upstream sent it and the executor classified it), a `response.interrupt` or a client
 /// that leaves while the proxy writes the event does not replace it. The client gets one
