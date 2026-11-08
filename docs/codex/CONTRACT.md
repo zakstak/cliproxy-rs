@@ -147,7 +147,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
-| Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or when the socket was opened for another upstream model. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
+| Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
@@ -540,7 +540,7 @@ delivers them differently.
 | Header | Pinned client | Proxy |
 | --- | --- | --- |
 | `x-codex-turn-state` | Set from the upgrade (`responses_websocket.rs:623-630`) or from a `response.metadata` event's top-level `headers` (`sse/responses.rs:214-222`, `responses_websocket.rs:934-938`). The turn's `OnceLock` keeps the first value; a new logical turn starts with a new lock (`core/src/client.rs:323-343`). | Delivered once, to the request that opened the socket. It is never repeated on a reused socket: in a later turn's new lock it would be a stale first value. |
-| `openai-model` | Read from the upgrade (lines 618-622) and re-emitted as `ServerModel` at the start of every request on that socket (lines 302-303). Any event can also carry it, in `response.headers` first and top-level `headers` second (`sse/responses.rs:193-212`); each response stream reports each distinct value once (`responses_websocket.rs:948-963`). | Delivered to the request that opened the socket, and alone to each later request on it. |
+| `openai-model` | Read from the upgrade (lines 618-622) and re-emitted as `ServerModel` at the start of every request on that socket (lines 302-303). Any event can also carry it, in `response.headers` first and top-level `headers` second (`sse/responses.rs:193-212`); each response stream suppresses consecutive equal values, so A -> B -> A reports A again (`responses_websocket.rs:948-963`). | Delivered to the request that opened the socket, and alone to each eligible later request on it under the omission rules below. |
 | `x-reasoning-included` | Read from the upgrade (`responses_websocket.rs:617`) or HTTP response headers by presence only, and re-emitted on every request (lines 304-308). No event sets it. | Not delivered. |
 
 The rules for the proxy's event:
@@ -548,7 +548,7 @@ The rules for the proxy's event:
 - The opening event carries `x-codex-turn-state` and `openai-model`, each only when
   present and not empty after trimming. It comes before the first delivered event of the
   request that opened the socket, including a send retried on a fresh socket.
-- Each later request on the same socket gets `{"type":"response.metadata","headers":{"openai-model":...}}`
+- Each eligible later request on the same socket gets `{"type":"response.metadata","headers":{"openai-model":...}}`
   before its first delivered event. "Later" counts requests, not user turns: the first
   real request after a prewarm, each continuation and each new logical turn. The pinned
   client's startup prewarm drains its own notifications and keeps only completion
@@ -564,10 +564,19 @@ The rules for the proxy's event:
   proxy sent upstream differs from the model that request named, comparing ASCII case
   only as the pinned client does (`core/src/session/mod.rs:4650-4688`), so that an alias
   or a payload rule never looks like a cyber-safety reroute. A native thinking suffix is
-  refused before this point. `openai-model` is also left out when the socket was opened
-  for another upstream model: the header answered that request. A genuine difference
-  between the requested model and the upgrade's model, with no proxy rewrite, stays
-  visible on every request.
+  refused before this point. When the current upstream model matches the socket's
+  opening request model and the proxy did not rewrite it, a differing upgrade model
+  stays visible.
+- Additional proxy policy: omit the synthesized model on a later request whose upstream
+  model differs from the socket's opening request model, comparing ASCII case only.
+  The pinned client instead repeats its stored upgrade model unconditionally
+  (`responses_websocket.rs:277,302-303`). It can send a changed model on the same socket
+  (`core/tests/suite/client_websockets.rs:2478-2555`). This fork chooses omission to
+  avoid treating an earlier model's announcement as a reroute for the new model.
+  Whether the backend's upgrade model still applies after a switch is unknown.
+  Omission can therefore hide a still-applicable reroute notice. This policy does not
+  establish which model served the request. Upstream event metadata still passes
+  unchanged.
 - On a response-steering connection, an explicit later `response.create` gets the event
   right before the `response.created` that starts it. A create rejected before it
   starts gets none, and neither does an automatic successor, which upstream starts on

@@ -288,8 +288,11 @@ impl Upstream {
     /// (`responses_websocket.rs:934-938`).
     ///
     /// Empty when this request's model was changed by the proxy (`model_kept`), when
-    /// the socket was opened for another upstream model (the upgrade answered that
-    /// request, not this one), or when the upgrade returned no model.
+    /// the socket was opened for another upstream model, or when the upgrade returned
+    /// no model. The model-switch omission is an additional proxy policy: the pinned
+    /// client repeats unconditionally. Backend applicability after a switch is unknown,
+    /// so omission can hide a still-applicable reroute notice. See CONTRACT.md's
+    /// "Handshake metadata" policy and tradeoff.
     pub(crate) fn later_metadata(&self, model: &str, model_kept: bool) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let Some(upgrade) = self.upgrade_model.get() else {
