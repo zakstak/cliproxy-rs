@@ -162,82 +162,144 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The legacy root spellings the loader moves to a [`SETTINGS`] path
+/// (`config::document` `PATHS` and `FAMILIES`).
+const LEGACY_SETTINGS: &[&[&str]] = &[
+    &["gemini-api-key"],
+    &["interactions-api-key"],
+    &["vertex-api-key"],
+    &["openai-compatibility"],
+    &["antigravity"],
+    &["antigravity-signature-cache-enabled"],
+    &["antigravity-signature-bypass-strict"],
+    &["quota-exceeded", "antigravity-credits"],
+    &["devin"],
+    &["ws-auth"],
+];
+
+/// The provider-keyed OAuth maps, canonical and legacy; an entry whose key selects a
+/// removed provider (folded as Go folds channel names) is that provider's setting.
+const KEYED_MAPS: &[&[&str]] = &[
+    &["oauth", "model-alias"],
+    &["oauth", "excluded-models"],
+    &["oauth", "request-scoped-errors"],
+    &["oauth", "settings"],
+    &["oauth-model-alias"],
+    &["oauth-excluded-models"],
+    &["oauth-request-scoped-errors"],
+    &["oauth-settings"],
+];
+
+/// Whether `path`, mapping keys from the document root, names a removed provider's
+/// setting: a canonical v8 path, a legacy spelling the loader moves there, or a removed
+/// channel's entry in a provider-keyed OAuth map. The match is exact: the same key
+/// anywhere else (`requests.payload.override[0].params.metadata.gemini`, a `metadata`
+/// map) is user data.
+pub fn is_setting_path<S: AsRef<str>>(path: &[S]) -> bool {
+    let parts: Vec<&str> = path.iter().map(AsRef::as_ref).collect();
+    SETTINGS.iter().any(|(setting, _)| *setting == parts.as_slice())
+        || LEGACY_SETTINGS.contains(&parts.as_slice())
+        || parts
+            .split_last()
+            .is_some_and(|(key, map)| KEYED_MAPS.contains(&map) && provider(key).is_some())
+}
+
+/// The removed providers' settings in `doc`, as exact key paths in document order. With
+/// `active_only`, only those holding a value that would do something (what [`config`]
+/// refuses); otherwise empty and `false` ones too. Only root mappings down to the
+/// deepest setting path are walked, so the cost does not grow with nested user data.
+#[doc(hidden)]
+pub fn setting_paths(doc: &Value, active_only: bool) -> Vec<Vec<String>> {
+    const DEPTH: usize = 3;
+    fn walk(node: &Value, at: &mut Vec<String>, active_only: bool, out: &mut Vec<Vec<String>>) {
+        let Value::Mapping(map) = node else { return };
+        for (key, value) in map {
+            let Some(key) = key.as_str() else { continue };
+            at.push(key.to_owned());
+            if is_setting_path(at) {
+                if !active_only || set(value) {
+                    out.push(at.clone());
+                }
+            } else if at.len() < DEPTH {
+                walk(value, at, active_only, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, &mut Vec::new(), active_only, &mut out);
+    out
+}
+
 /// Test support for Go goldens recorded with settings of the removed providers: `yaml`
-/// without the block (or flow line) of each removed setting, so the rest of the recorded
-/// document still loads. Indentation decides a block's extent; a key matches quoted, padded
-/// or in any case (`" Gemini-CLI ":`), as Go folds channel names.
+/// without each removed setting that holds a value ([`setting_paths`] with
+/// `active_only`), so the rest of the recorded document still loads. Removed settings
+/// left empty or `false` stay, as the loader accepts them.
+///
+/// Each setting goes at its exact path through the syntax tree, block or flow, so every
+/// other byte stays: comments, quoting, the same key names under other parents, and
+/// string values that only look like settings. A mapping left empty reads as `{}`, not
+/// null, as its Go source would have it. Panics when the edited text does not read as
+/// the original document without exactly those settings.
 #[doc(hidden)]
 pub fn strip_settings(yaml: &str) -> String {
-    const KEYS: [&str; 16] = [
-        "vertex",
-        "openai-compatibility",
-        "gemini",
-        "gemini-cli",
-        "interactions",
-        "vertex-api-key",
-        "gemini-api-key",
-        "interactions-api-key",
-        "antigravity",
-        "antigravity-signature-cache-enabled",
-        "antigravity-signature-bypass-strict",
-        "aistudio",
-        "ws-auth",
-        "devin",
-        "devin-catalog",
-        "kimi",
-    ];
-    // The mapping key a block line starts with, unquoted, trimmed and folded.
-    let key = |text: &str| -> Option<String> {
-        let key = match text.as_bytes().first() {
-            Some(&q @ (b'"' | b'\'')) => {
-                let end = text[1..].find(q as char)? + 1;
-                text[end + 1..].trim_start().strip_prefix(':')?;
-                &text[1..end]
-            }
-            _ => text.split_once(':')?.0,
-        };
-        Some(key.trim().go_lower())
+    strip(yaml, true)
+}
+
+/// [`strip_settings`] for every removed setting, empty and `false` ones too: for a
+/// comparison of what the retained settings do, where an accepted inert one still
+/// shows (a reload summary's `ws-auth: true -> false`).
+#[doc(hidden)]
+pub fn strip_every_setting(yaml: &str) -> String {
+    strip(yaml, false)
+}
+
+fn strip(yaml: &str, active_only: bool) -> String {
+    let Ok(doc) = crate::config::yaml_value(yaml) else {
+        return yaml.to_owned();
     };
-    const FLOW: [&str; 5] = ["{antigravity:", "{aistudio:", "{devin:", "{gemini:", "{vertex:"];
-    let mut kept: Vec<String> = Vec::new();
-    // Output lines that lost a child block to the strip.
-    let mut emptied: Vec<usize> = Vec::new();
-    let mut skip: Option<usize> = None;
-    for line in yaml.split_inclusive('\n') {
-        let indent = line.len() - line.trim_start().len();
-        let text = line.trim_start().trim_start_matches("- ");
-        if let Some(level) = skip {
-            if line.trim().is_empty() || indent > level {
-                continue;
-            }
-            skip = None;
-        }
-        if key(text).is_some_and(|k| KEYS.contains(&k.as_str())) {
-            skip = Some(indent);
-            if let Some(last) = kept.len().checked_sub(1) {
-                emptied.push(last);
-            }
-            continue;
-        }
-        if FLOW.iter().any(|k| line.contains(k)) {
-            continue;
-        }
-        kept.push(line.to_owned());
+    let paths = setting_paths(&doc, active_only);
+    if paths.is_empty() {
+        return yaml.to_owned();
     }
-    // A mapping key whose only children were stripped reads as an empty mapping, not
-    // null, as its Go source would have it.
-    for &i in &emptied {
-        let indent = kept[i].len() - kept[i].trim_start().len();
-        let body = kept[i].trim_end().to_owned();
-        let has_child = kept[i + 1..]
+    let file: yaml_edit::YamlFile = yaml.parse().expect("the syntax tree reads what serde reads");
+    let root = file
+        .document()
+        .and_then(|d| d.as_mapping())
+        .expect("a document holding settings is a mapping");
+    let mut want = doc;
+    for path in &paths {
+        let (last, parents) = path.split_last().expect("setting paths are not empty");
+        let parent = parents
             .iter()
-            .find(|l| !l.trim().is_empty())
-            .is_some_and(|l| l.len() - l.trim_start().len() > indent);
-        if body.ends_with(':') && !has_child {
-            kept[i] = format!("{body} {{}}\n");
-        }
+            .try_fold(root.clone(), |node, key| node.get_mapping(key.as_str()))
+            .unwrap_or_else(|| panic!("{}: not a plain mapping path in the text", path.join(".")));
+        assert!(
+            parent.remove(last.as_str()).is_some(),
+            "{}: not removed from the text",
+            path.join(".")
+        );
+        let parent = parents
+            .iter()
+            .try_fold(&mut want, |node, key| node.get_mut(key.as_str()))
+            .and_then(Value::as_mapping_mut)
+            .expect("the path was found in the document");
+        parent.remove(last.as_str());
     }
-    kept.concat()
+    let out = file.to_string();
+    // A document of removed settings only is left empty, which reads as null.
+    let got = crate::config::yaml_value(&out).ok().map(|v| {
+        if v.is_null() {
+            Value::Mapping(Default::default())
+        } else {
+            v
+        }
+    });
+    assert!(
+        got.as_ref() == Some(&want),
+        "stripping {paths:?} changed more than those settings:\n{yaml}\n->\n{out}"
+    );
+    out
 }
 
 #[cfg(test)]
@@ -316,6 +378,126 @@ mod tests {
             )))
             .unwrap();
         }
+    }
+
+    /// Every legacy spelling in the table is one the loader moves to a refused path, and
+    /// every canonical and legacy path is stripped exactly, so the stripped text loads.
+    #[test]
+    fn stripping_follows_the_loader_paths() {
+        let cases: &[(&str, &str)] = &[
+            ("api-keys:\n  gemini:\n    - api-key: k\n", "api-keys.gemini"),
+            (
+                "api-keys:\n  interactions:\n    - api-key: k\n",
+                "api-keys.interactions",
+            ),
+            ("api-keys:\n  vertex:\n    - api-key: k\n", "api-keys.vertex"),
+            (
+                "api-keys:\n  openai-compatibility:\n    - name: o\n      base-url: http://127.0.0.1:9\n",
+                "api-keys.openai-compatibility",
+            ),
+            ("gemini-api-key:\n  - api-key: k\n", "api-keys.gemini"),
+            ("interactions-api-key:\n  - api-key: k\n", "api-keys.interactions"),
+            ("vertex-api-key:\n  - api-key: k\n", "api-keys.vertex"),
+            (
+                "openai-compatibility:\n  - name: o\n    base-url: http://127.0.0.1:9\n",
+                "api-keys.openai-compatibility",
+            ),
+            ("antigravity:\n  sensitive-words: [x]\n", "oauth.providers.antigravity"),
+            (
+                "antigravity-signature-cache-enabled: true\n",
+                "oauth.providers.antigravity",
+            ),
+            (
+                "antigravity-signature-bypass-strict: true\n",
+                "oauth.providers.antigravity",
+            ),
+            (
+                "quota-exceeded:\n  antigravity-credits: true\n",
+                "oauth.providers.antigravity",
+            ),
+            ("devin:\n  sensitive-words: [x]\n", "oauth.providers.devin"),
+            ("ws-auth: true\n", "oauth.providers.aistudio"),
+            (
+                "oauth:\n  providers:\n    aistudio:\n      ws-auth: true\n",
+                "oauth.providers.aistudio",
+            ),
+            (
+                "models:\n  devin-catalog: https://d.example.invalid/m.json\n",
+                "models.devin-catalog",
+            ),
+            (
+                "oauth-excluded-models:\n  ' Gemini ': [x]\n",
+                "oauth.excluded-models. Gemini ",
+            ),
+            (
+                "oauth:\n  settings:\n    KIMI.com: [{name: m}]\n",
+                "oauth.settings.KIMI.com",
+            ),
+        ];
+        for (yaml, refused) in cases {
+            let yaml = format!("config-version: 8\n# head\n{yaml}routing:\n  strategy: fill-first # kept\n");
+            let error = crate::config::Config::parse(&yaml).unwrap_err().to_string();
+            assert!(error.starts_with(refused), "{yaml}: {error}");
+            let stripped = strip_settings(&yaml);
+            crate::config::Config::parse(&stripped).unwrap_or_else(|e| panic!("{stripped}: {e}"));
+            assert!(stripped.starts_with("config-version: 8\n# head\n"), "{stripped}");
+            assert!(
+                stripped.ends_with("routing:\n  strategy: fill-first # kept\n"),
+                "{stripped}"
+            );
+        }
+    }
+
+    /// The same key names anywhere but a setting path, and text that only looks like a
+    /// setting, are user data: they stay byte for byte, next to a stripped setting too.
+    #[test]
+    fn stripping_keeps_unrelated_user_data() {
+        let user = "config-version: 8\n\
+            note: 'keep {gemini: user-data}'\n\
+            quoted: \"{antigravity: x}\\u00e9\"\n\
+            metadata:\n  gemini: user-value\n  kimi: [a]\n\
+            requests:\n  payload:\n    override:\n      - models: [{name: m}]\n        params:\n          metadata:\n            kimi: keep\n            gemini: {devin: 1}\n\
+            upstream:\n  claude:\n    header-defaults: {}\n\
+            oauth:\n  providers:\n    codex: {gemini: 1}\n  model-alias:\n    claude: [{name: gemini, alias: ws-auth}]\n\
+            api-keys:\n  claude:\n    - api-key: k\n      models: [{name: devin-catalog, alias: vertex}]\n";
+        assert_eq!(strip_settings(user), user);
+        let with_removed = format!("{user}  gemini:\n    - api-key: k\nws-auth: true\n");
+        assert_eq!(strip_settings(&with_removed), user);
+        // Flow form: only the removed entry goes; empty removed settings stay.
+        assert_eq!(
+            strip_settings("oauth: {providers: {antigravity: {antigravity-credits: true}, xai: {}, devin: {}}}\n"),
+            "oauth: {providers: {xai: {}, devin: {}}}\n"
+        );
+        for (kept, every) in [
+            ("ws-auth: false\na: 1\n", "a: 1\n"),
+            ("api-keys: {gemini: [], claude: []}\n", "api-keys: {claude: []}\n"),
+            (
+                "oauth:\n  providers:\n    antigravity: {}\n",
+                "oauth:\n  providers: {}\n",
+            ),
+        ] {
+            assert_eq!(strip_settings(kept), kept);
+            assert_eq!(strip_every_setting(kept), every);
+        }
+        // A document of removed settings only is left empty.
+        assert_eq!(
+            strip_settings("gemini-api-key:\n  - api-key: k\nws-auth: true\n").trim(),
+            ""
+        );
+        // Invalid YAML is not a document to edit.
+        assert_eq!(strip_settings("a: [\n"), "a: [\n");
+        for path in [
+            &["metadata", "gemini"][..],
+            &["requests", "payload", "override"],
+            &["oauth", "providers", "codex"],
+            &["oauth", "model-alias", "claude"],
+            &["upstream", "gemini"],
+            &["gemini"],
+            &["api-keys", "claude"],
+        ] {
+            assert!(!is_setting_path(path), "{path:?}");
+        }
+        assert!(is_setting_path(&["oauth-request-scoped-errors", "openai-compatible-x"]));
     }
 
     #[test]

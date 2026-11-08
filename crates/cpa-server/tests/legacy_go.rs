@@ -13,6 +13,7 @@ use serde_json::Value;
 
 mod plugins_removed;
 use plugins_removed::{without_plugins_json, without_plugins_yaml};
+mod removed_settings;
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/legacy_go.json")).expect("fixture JSON")
@@ -182,21 +183,92 @@ fn yaml_strategy(yaml: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Go's v0 config view defaults, which show the removed providers' settings too
+/// (`ws-auth: true`): a value equal to these is not a removed setting leaking back.
+fn view_defaults() -> Value {
+    serde_json::from_str(include_str!("../src/management/legacy/defaults.json")).unwrap()
+}
+
+/// Recorded writes that set a removed provider's setting (issue #49). This build refuses
+/// each with the migration guidance and leaves the file as it was; the scenario then
+/// goes on from that state. A refused `config.yaml` upload Go accepted is sent again
+/// without the removed settings, so later steps start where Go's did.
+const REFUSED_WRITES: &[(&str, usize, u16)] = &[
+    // PUT /ws-auth {"value":true}
+    ("scalars-v8", 10, 422),
+    ("scalars-legacy", 10, 422),
+    // PATCH /oauth-excluded-models for " GEMINI ", then /oauth-model-alias for Gemini-CLI
+    ("map-writes", 5, 422),
+    ("map-writes", 18, 422),
+    // PUT /config.yaml with an OpenAI-compatible group
+    ("config-yaml-put", 21, 422),
+    ("legacy-writes", 21, 422),
+    ("legacy-writes", 34, 422),
+];
+
+/// Recorded steps that delete what a refused write would have added. Go deletes it; here
+/// nothing was added, and the answer is Go's own for a missing entry
+/// (internal/api/handlers/management/config_lists.go, PatchOAuthExcludedModels and
+/// PatchOAuthModelAlias with an empty list). The file stays, and the config compares
+/// with Go's after its delete.
+const AFTER_REFUSAL: &[(&str, usize, &str)] = &[
+    ("map-writes", 6, r#"{"error":"provider not found"}"#),
+    ("map-writes", 20, r#"{"error":"channel not found"}"#),
+    ("legacy-writes", 22, r#"{"error":"provider not found"}"#),
+    ("legacy-writes", 36, r#"{"error":"channel not found"}"#),
+];
+
+/// This build's v0 config view without the removed settings, and the removed settings
+/// it held with a value other than Go's default: those leak back, which normalization
+/// must not hide.
+async fn config_view(client: &wreq::Client, base: &str, defaults: &Value) -> (String, Vec<String>) {
+    let res = client
+        .get(format!("{base}/v0/management/config"))
+        .bearer_auth("fake-secret")
+        .send()
+        .await
+        .unwrap();
+    let text = res.text().await.unwrap();
+    let leaks = removed_settings::leaks(&serde_json::from_str(&text).unwrap(), Some(defaults));
+    (without_removed(&text), leaks)
+}
+
+#[derive(Default, Debug, PartialEq)]
+struct Counts {
+    /// Status and body compared with Go, and the config and groups after a write.
+    compared: usize,
+    /// A removed provider's v0 route: 410 with `removed_provider`, file unchanged.
+    removed_routes: usize,
+    /// A write of a removed setting: refused, file unchanged, config compared.
+    refused_writes: usize,
+    /// Of those, uploads replayed without the removed settings and compared.
+    replayed: usize,
+    /// Deletes of what a refused write would have added: Go's missing-entry answer.
+    after_refusal: usize,
+}
+
 #[tokio::test]
 async fn go_v0_routes_replay_byte_for_byte() {
     let hash = bcrypt::hash("fake-secret", 4).unwrap();
     let client = wreq::Client::new();
+    let defaults = view_defaults();
     let mut failures: Vec<String> = Vec::new();
-    let (mut compared, mut skipped) = (0, 0);
+    let mut counts = Counts::default();
+    let mut refused_at: Vec<(String, usize, u16)> = Vec::new();
+    let mut steps = 0;
     for scenario in fixture()["scenarios"].as_array().unwrap() {
         let name = scenario["name"].as_str().unwrap();
         let dir = std::env::temp_dir().join(format!("cpa-legacy-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        // The removed providers' settings go (issue #49).
-        let yaml = cpa_core::removed::strip_settings(&without_plugins_yaml(
-            &scenario["yaml"].as_str().unwrap().replace("$HASH", &hash),
-        ));
+        // The removed providers' active settings go (issue #49); the original seed is
+        // refused at load.
+        let seed = without_plugins_yaml(&scenario["yaml"].as_str().unwrap().replace("$HASH", &hash));
+        let yaml = removed_settings::without_yaml(&seed);
+        if yaml != seed {
+            let error = Config::parse(&seed).map(drop).unwrap_err().to_string();
+            assert!(error.contains(cpa_core::removed::GUIDANCE), "{name}: {error}");
+        }
         std::fs::write(&path, with_auth_dir(&yaml, &dir)).unwrap();
         // routing.strategy in Go's state, from the fixture alone.
         let mut go_strategy = yaml_strategy(&yaml);
@@ -209,49 +281,131 @@ async fn go_v0_routes_replay_byte_for_byte() {
                 .body(body)
                 .send()
         };
+        // Go's config after the last write, without the removed settings.
+        let go_config = |step: &Value| {
+            step["config"]
+                .as_str()
+                .map(|c| without_removed(&without_plugins_json(c)))
+        };
         for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
+            steps += 1;
             let (method, route) = (step["method"].as_str().unwrap(), step["path"].as_str().unwrap());
-            // The removed providers' v0 routes answer 410 (issue #49).
-            if removed_route(route) {
-                skipped += 1;
-                continue;
-            }
             let at = format!(
                 "{name}[{i}] {method} {route} {}",
                 step["body"].as_str().unwrap_or_default()
             );
+            let file_before = std::fs::read(&path).unwrap();
+            // The removed providers' v0 routes answer 410 with migration guidance and
+            // change nothing (issue #49), whatever Go answered.
+            if removed_route(route) {
+                let res = send(method, route, step["body"].as_str().unwrap_or_default().to_owned())
+                    .await
+                    .unwrap();
+                let status = res.status().as_u16();
+                let body = res.text().await.unwrap();
+                if status != 410 || !removed_settings::is_refusal(status, &body) {
+                    failures.push(format!("{at}: not refused: {status} {body}"));
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), file_before, "{at}: file changed");
+                counts.removed_routes += 1;
+                removed_settings::inventory("legacy_go", &format!("{name}[{i}]"), "removed_route_refusal");
+                continue;
+            }
             // An accepted config.yaml upload replaces the whole file and is reloaded, so it
             // keeps the private auth directory too.
             let mut sent = step["body"].as_str().unwrap_or_default().to_owned();
-            if method == "PUT" && route == "/config.yaml" && step["status"] == 200 && !sent.is_empty() {
+            let upload = method == "PUT" && route == "/config.yaml" && step["status"] == 200 && !sent.is_empty();
+            if upload {
                 sent = with_auth_dir(&sent, &dir);
             }
             let unset = go_strategy.trim().is_empty();
             if let Some(cfg) = step["config"].as_str() {
                 let cfg: Value = serde_json::from_str(cfg).unwrap();
                 go_strategy = cfg["routing"]["strategy"].as_str().unwrap_or_default().to_owned();
-            } else if method == "PUT" && route == "/config.yaml" && step["status"] == 200 {
+            } else if upload {
                 go_strategy = yaml_strategy(step["body"].as_str().unwrap_or_default());
             }
             let strategy_read = method == "GET" && route == "/routing/strategy";
-            let file_before = strategy_read.then(|| std::fs::read(&path).unwrap());
-            let res = send(method, route, sent).await.unwrap();
-            let status = res.status().as_u16();
-            let body = res.text().await.unwrap();
-            // A write that configures a removed provider is refused (issue #49); the rest
-            // of the scenario builds on it.
-            if body.contains("is no longer supported") {
-                break;
+            let res = send(method, route, sent.clone()).await.unwrap();
+            let mut status = res.status().as_u16();
+            let mut body = res.text().await.unwrap();
+            if let Some((.., want)) = AFTER_REFUSAL.iter().find(|(n, s, _)| *n == name && *s == i) {
+                assert_eq!(step["status"], 200, "{at}: Go deleted the entry");
+                if (status, body.as_str()) != (404, *want) {
+                    failures.push(format!("{at}: {status} {body}, expected 404 {want}"));
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), file_before, "{at}: file changed");
+                if let Some(go) = go_config(step) {
+                    let (got, leaks) = config_view(&client, &base, &defaults).await;
+                    if !leaks.is_empty() {
+                        failures.push(format!("{at}: removed settings in the config: {leaks:?}"));
+                    }
+                    if let Some(d) = first_difference(&got, &go) {
+                        failures.push(format!("{at}: config after the delete: {d}"));
+                    }
+                }
+                counts.after_refusal += 1;
+                removed_settings::inventory("legacy_go", &format!("{name}[{i}]"), "after_refusal");
+                continue;
             }
-            compared += 1;
-            if let Some(before) = file_before {
-                assert_eq!(std::fs::read(&path).unwrap(), before, "{at}: the read wrote the config");
+            if removed_settings::is_refusal(status, &body) {
+                refused_at.push((name.to_owned(), i, status));
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    file_before,
+                    "{at}: refused write changed the file"
+                );
+                counts.refused_writes += 1;
+                if !upload {
+                    // Go's state after its write differs from the unchanged one here only
+                    // by the removed setting.
+                    if let Some(go) = go_config(step) {
+                        let (got, leaks) = config_view(&client, &base, &defaults).await;
+                        if !leaks.is_empty() {
+                            failures.push(format!("{at}: removed settings in the config: {leaks:?}"));
+                        }
+                        if let Some(d) = first_difference(&got, &go) {
+                            failures.push(format!("{at}: config after the refused write: {d}"));
+                        }
+                    }
+                    removed_settings::inventory("legacy_go", &format!("{name}[{i}]"), "refused_write");
+                    continue;
+                }
+                // The upload without the removed settings: Go's accepted write, replayed.
+                let res = send(method, route, removed_settings::without_yaml(&sent))
+                    .await
+                    .unwrap();
+                status = res.status().as_u16();
+                body = res.text().await.unwrap();
+                counts.replayed += 1;
+                removed_settings::inventory("legacy_go", &format!("{name}[{i}]"), "refused_write_replayed");
+            } else {
+                counts.compared += 1;
+                removed_settings::inventory("legacy_go", &format!("{name}[{i}]"), "compared");
+            }
+            if strategy_read {
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    file_before,
+                    "{at}: the read wrote the config"
+                );
             }
             if status != step["status"].as_u64().unwrap() as u16 {
                 failures.push(format!("{at}: status {status}, Go {}: {body}", step["status"]));
                 continue;
             }
             let recorded = without_removed(&without_plugins_json(step["raw_response"].as_str().unwrap()));
+            if let Ok(rust) = serde_json::from_str::<Value>(&body) {
+                let leaks = removed_settings::leaks(&rust, Some(&defaults));
+                if !leaks.is_empty() {
+                    failures.push(format!("{at}: removed settings in the answer: {leaks:?}"));
+                }
+            } else if let Ok(rust) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&body) {
+                let leaks = cpa_core::removed::setting_paths(&rust, true);
+                if !leaks.is_empty() {
+                    failures.push(format!("{at}: removed settings in the answer: {leaks:?}"));
+                }
+            }
             let body = without_removed(&body);
             let mut want = recorded.as_str();
             // docs/DIFFERENCES-FROM-GO.md "Default routing strategy": for an unset strategy
@@ -274,10 +428,12 @@ async fn go_v0_routes_replay_byte_for_byte() {
             } else if let Some(d) = first_difference(&body, want) {
                 failures.push(format!("{at}: {d}"));
             }
-            if let Some(go_cfg) = step["config"].as_str() {
-                let res = send("GET", "/config", String::new()).await.unwrap();
-                let got = without_removed(&res.text().await.unwrap());
-                if let Some(d) = first_difference(&got, &without_removed(&without_plugins_json(go_cfg))) {
+            if let Some(go) = go_config(step) {
+                let (got, leaks) = config_view(&client, &base, &defaults).await;
+                if !leaks.is_empty() {
+                    failures.push(format!("{at}: removed settings in the config: {leaks:?}"));
+                }
+                if let Some(d) = first_difference(&got, &go) {
                     failures.push(format!("{at}: config after write: {d}"));
                 }
             }
@@ -297,15 +453,33 @@ async fn go_v0_routes_replay_byte_for_byte() {
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
-    eprintln!("v0 replay: {compared} steps compared, {skipped} removed-provider steps skipped");
-    // The scenarios that set or read a removed provider's settings (issue #49) are
-    // skipped step by step; the rest still compare byte for byte.
-    assert_eq!((compared, skipped), (463, 223));
+    eprintln!("v0 replay of {steps} recorded steps: {counts:?}, refused {refused_at:?}");
     assert!(
         failures.is_empty(),
-        "{} of {compared} steps differ:\n{}",
+        "{} of {steps} steps differ:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+    let expected: Vec<(String, usize, u16)> = REFUSED_WRITES
+        .iter()
+        .map(|(n, i, s)| ((*n).to_owned(), *i, *s))
+        .collect();
+    assert_eq!(refused_at, expected, "refused writes");
+    // Every recorded step runs: the removed providers' routes and writes (issue #49) are
+    // asserted as refusals, every other step compares with Go.
+    assert_eq!(
+        counts,
+        Counts {
+            compared: 581,
+            removed_routes: 224,
+            refused_writes: 7,
+            replayed: 1,
+            after_refusal: 4,
+        }
+    );
+    assert_eq!(
+        counts.compared + counts.removed_routes + counts.refused_writes + counts.after_refusal,
+        steps
     );
 }
 
@@ -326,43 +500,33 @@ fn removed_route(route: &str) -> bool {
     .contains(&route)
 }
 
-/// A management answer without the removed providers' keys (issue #49): their v0 key
-/// lists and their entries in the per-channel OAuth maps. Other bytes stay as they were.
+/// Go's default discovery subtypes, with the removed Gemini protocols, and this build's
+/// (docs/DIFFERENCES-FROM-GO.md: discovery advertises chat-completions, responses and
+/// messages).
+const GO_SUBTYPES: &str = r#"["_chat-completions","_responses","_messages","_generate-content","_interactions"]"#;
+const SUBTYPES: &str = r#"["_chat-completions","_responses","_messages"]"#;
+
+/// A management answer without the removed providers' settings at their exact paths
+/// (issue #49), every other byte as it was. Go's default `discovery.subtypes`, and only
+/// that field, reads as this build's default.
 fn without_removed(text: &str) -> String {
     if !text.trim_start().starts_with('{') {
-        return cpa_core::removed::strip_settings(text);
+        return removed_settings::without_yaml(text);
     }
-    // Go's default discovery subtypes include the removed Gemini protocols.
-    let text = text.replace(r#","_generate-content","_interactions""#, "");
-    let mut out = text.as_bytes().to_vec();
-    for key in [
-        "gemini-api-key",
-        "interactions-api-key",
-        "vertex-api-key",
-        "openai-compatibility",
-        "ws-auth",
-    ] {
-        cpa_common::json::delete(&mut out, key);
+    let mut out = removed_settings::without_json(text).into_bytes();
+    if cpa_common::json::get(&out, "discovery.subtypes").raw.as_ref() == GO_SUBTYPES.as_bytes() {
+        assert!(cpa_common::json::set_raw(&mut out, "discovery.subtypes", SUBTYPES));
     }
+    let before: Value = serde_json::from_str(text).unwrap_or_default();
     for map in [
         "oauth-excluded-models",
         "oauth-model-alias",
         "oauth-request-scoped-errors",
     ] {
-        for channel in [
-            "gemini",
-            "gemini-cli",
-            "vertex",
-            "aistudio",
-            "antigravity",
-            "kimi",
-            "devin",
-        ] {
-            cpa_common::json::delete(&mut out, &format!("{map}.{channel}"));
-        }
         // A map that only held removed channels is absent here: Rust keeps no empty map,
         // and its own route answers null.
-        if cpa_common::json::get(&out, map).raw.as_ref() == b"{}" {
+        let emptied = before[map].as_object().is_some_and(|m| !m.is_empty());
+        if emptied && cpa_common::json::get(&out, map).raw.as_ref() == b"{}" {
             let only = serde_json::from_slice::<serde_json::Map<String, Value>>(&out).is_ok_and(|o| o.len() == 1);
             if only {
                 out = format!("{{\"{map}\":null}}").into_bytes();
