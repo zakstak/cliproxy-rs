@@ -10,8 +10,8 @@ Docker `COPY vendor` step are deleted.
 Run these commands from the repository root. Both print nothing:
 
 ```sh
-rg -n '\bgjson::|use gjson|extern crate gjson' crates harness --glob '*.rs'
-rg -n gjson Cargo.toml Cargo.lock crates/*/Cargo.toml harness/rust/Cargo.toml harness/rust/Cargo.lock .github Dockerfile
+rg -n '\bgjson::|^\s*use gjson\b|extern crate gjson' crates harness --glob '*.rs'
+rg -nw gjson Cargo.toml Cargo.lock crates/*/Cargo.toml harness/rust/Cargo.toml harness/rust/Cargo.lock .github Dockerfile
 ```
 
 Other matches for `gjson` in the tree name Go's tidwall/gjson: Go reference programs,
