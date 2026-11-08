@@ -374,7 +374,7 @@ pub(super) fn install_callback_sink(state: &Arc<Management>) {
 pub(super) fn removed(provider: &str, operation: &str) -> Response {
     fail(
         StatusCode::GONE,
-        &cpa_core::removed::operation_error(provider, operation),
+        cpa_core::removed::operation_error(provider, operation),
     )
 }
 
