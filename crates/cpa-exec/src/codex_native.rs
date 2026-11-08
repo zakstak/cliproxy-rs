@@ -230,8 +230,9 @@ impl CodexExecutor {
         };
         let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
-        self.native_send(view, settings, req, profile, call, model, body, None)
-            .await
+        let usage = req.usage.clone();
+        let send = self.native_send(view, settings, req, profile, call, model, body, None);
+        crate::cancel::fail_if_canceled(&usage, send).await
     }
 
     /// A WebSocket turn on a credential without `websockets`: the client's
@@ -247,10 +248,15 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let model = upstream_model(&req)?;
         let body = ws_http_body(&req.body, &model)?;
-        self.native_send(view, settings, req, profile, Call::Stream, model, body, Some(session))
-            .await
+        let usage = req.usage.clone();
+        let send = self.native_send(view, settings, req, profile, Call::Stream, model, body, Some(session));
+        crate::cancel::fail_if_canceled(&usage, send).await
     }
 
+    /// The exchange up to the response: the upstream send, then either the stream, or the
+    /// whole body for a buffered client. The callers record the attempt as canceled when
+    /// the client leaves before this returns ([`crate::cancel`]); a stream settles its own
+    /// outcome ([`passthrough`]).
     #[allow(clippy::too_many_arguments)]
     async fn native_send(
         &self,
@@ -757,6 +763,9 @@ struct Passthrough {
     websocket: bool,
     out: VecDeque<Result<Bytes, ExecError>>,
     done: bool,
+    /// The attempt's record if the consumer drops the stream: canceled until the
+    /// upstream completes or the consumer takes the failure that ends it.
+    outcome: crate::cancel::StreamOutcome,
 }
 
 impl Passthrough {
@@ -901,6 +910,7 @@ fn passthrough(
     hold: Option<Option<Duration>>,
     websocket: bool,
 ) -> ExecStream {
+    let outcome = crate::cancel::StreamOutcome::new(observer.usage.clone());
     let state = Passthrough {
         upstream,
         observer,
@@ -912,10 +922,15 @@ fn passthrough(
         websocket,
         out: VecDeque::new(),
         done: false,
+        outcome,
     };
     futures_util::stream::unfold(state, |mut st| async move {
         loop {
             if let Some(item) = st.out.pop_front() {
+                if item.is_err() {
+                    // The consumer settles the failure it takes (always the last item).
+                    st.outcome.settled();
+                }
                 return Some((item, st));
             }
             if st.done {
@@ -936,6 +951,14 @@ fn passthrough(
                 Some(Err(error)) => st.end(error),
                 // A clean end without a terminal event: a truncated response.
                 None => st.end(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+            }
+            if st.done {
+                // The upstream response ended: a terminal event (its usage is observed),
+                // or a failure queued behind any event delivered with it.
+                match st.out.back() {
+                    Some(Err(error)) => st.outcome.failed(error),
+                    _ => st.outcome.settled(),
+                }
             }
         }
     })

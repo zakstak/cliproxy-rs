@@ -582,7 +582,7 @@ fn framed(lines: &[String]) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
-/// What one upstream event means for the stream.
+/// What one upstream event, or the end of the upstream body, means for the stream.
 pub(crate) enum Step {
     /// Forward this (normalised) event.
     Event(Bytes),
@@ -810,16 +810,20 @@ impl Processor {
     }
 }
 
-/// Upstream events → processed client events. Stops after a terminal event or the first
-/// error; a clean EOF before any terminal event is Go's request-scoped 408.
-pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usize) -> ExecStream {
+/// Processed upstream steps, in order: events, then at most one [`Step::Terminal`] or
+/// [`Step::Fail`], which ends them. The consumer sees how the upstream ended in the step
+/// that ends it, before it delivers that step's lines.
+pub(crate) type Steps = futures_util::stream::BoxStream<'static, Step>;
+
+/// Upstream events → processed steps. Stops after a terminal event or the first error; a
+/// read error ends in that error, and a clean EOF before any terminal event in Go's
+/// request-scoped 408.
+pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usize) -> Steps {
     struct State {
         upstream: ExecStream,
         processor: Processor,
         emitted: usize,
         done: bool,
-        /// A failure to deliver after the lines that preceded it in its event.
-        failed: Option<ExecError>,
     }
     futures_util::stream::unfold(
         State {
@@ -827,46 +831,22 @@ pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usi
             processor,
             emitted,
             done: false,
-            failed: None,
         },
         |mut st| async move {
-            if let Some(error) = st.failed.take() {
-                st.done = true;
-                return Some((Err(error), st));
-            }
             if st.done {
                 return None;
             }
-            let item = match st.upstream.next().await {
-                Some(Ok(event)) => match st.processor.event(&event) {
-                    Step::Event(out) => {
-                        st.emitted += 1;
-                        Ok(out)
-                    }
-                    Step::Terminal(out) => {
-                        st.done = true;
-                        Ok(out)
-                    }
-                    Step::Fail {
-                        error,
-                        before: Some(before),
-                        ..
-                    } => {
-                        st.emitted += 1;
-                        st.failed = Some(error);
-                        Ok(before)
-                    }
-                    Step::Fail { error, .. } => {
-                        st.done = true;
-                        Err(error)
-                    }
-                },
+            let step = match st.upstream.next().await {
+                Some(Ok(event)) => st.processor.event(&event),
                 Some(Err(error)) => {
-                    st.done = true;
                     // Go records the scan error, then how the stream ended.
                     st.processor.record(&error);
                     st.processor.record(&ended(st.emitted));
-                    Err(error)
+                    Step::Fail {
+                        error,
+                        body: None,
+                        before: None,
+                    }
                 }
                 None => {
                     st.done = true;
@@ -876,10 +856,18 @@ pub(crate) fn processed(upstream: ExecStream, processor: Processor, emitted: usi
                     if st.emitted == 0 {
                         return None;
                     }
-                    Err(end)
+                    Step::Fail {
+                        error: end,
+                        body: None,
+                        before: None,
+                    }
                 }
             };
-            Some((item, st))
+            match step {
+                Step::Event(_) => st.emitted += 1,
+                Step::Terminal(_) | Step::Fail { .. } => st.done = true,
+            }
+            Some((step, st))
         },
     )
     .boxed()
@@ -899,8 +887,10 @@ fn ended(emitted: usize) -> ExecError {
 pub(crate) enum Bootstrap {
     /// Failed before anything was shown: the attempt may fail over.
     Reject(ExecError),
-    /// The stream to deliver: held frames first, then the rest.
-    Stream(ExecStream),
+    /// The steps to deliver: the held ones first, then `rest`, the upstream after them.
+    /// `rest` is `None` when the upstream already ended: in the last held step (a
+    /// terminal event or a failure), or with no event at all.
+    Stream { held: VecDeque<Step>, rest: Option<Steps> },
 }
 
 /// Go's bootstrap budgets (codex_executor_stream.go): the lines held so far, their raw
@@ -972,7 +962,7 @@ pub(crate) async fn bootstrap(
     timeout: Option<Duration>,
     started: Instant,
 ) -> Bootstrap {
-    let mut held: VecDeque<Result<Bytes, ExecError>> = VecDeque::new();
+    let mut held = VecDeque::new();
     let mut gate = Gate::new(timeout, started);
     loop {
         let event = match upstream.next().await {
@@ -984,7 +974,7 @@ pub(crate) async fn bootstrap(
             None if held.is_empty() => {
                 // "upstream stream closed before first payload": an empty stream.
                 processor.record(&ended(0));
-                return Bootstrap::Stream(futures_util::stream::empty().boxed());
+                return Bootstrap::Stream { held, rest: None };
             }
             None => {
                 let error = request_scoped(408, INCOMPLETE_MESSAGE);
@@ -993,25 +983,22 @@ pub(crate) async fn bootstrap(
             }
         };
         match processor.event_with(&event, Some(&mut gate)) {
-            Step::Fail { error, body, before } => {
-                // Once a line has released the stream, the overload is delivered in-stream.
-                if !gate.released && !gate.timed_out() && body.as_deref().is_some_and(is_overload) {
-                    return Bootstrap::Reject(bootstrap_overload(body.as_deref().unwrap_or_default()));
-                }
-                held.extend(before.map(Ok));
-                held.push_back(Err(error));
-                return Bootstrap::Stream(futures_util::stream::iter(held).boxed());
+            // Once a line has released the stream, the overload is delivered in-stream.
+            Step::Fail { body, .. }
+                if !gate.released && !gate.timed_out() && body.as_deref().is_some_and(is_overload) =>
+            {
+                return Bootstrap::Reject(bootstrap_overload(body.as_deref().unwrap_or_default()));
             }
-            Step::Terminal(out) => {
-                held.push_back(Ok(out));
-                return Bootstrap::Stream(futures_util::stream::iter(held).boxed());
+            ended @ (Step::Fail { .. } | Step::Terminal(_)) => {
+                held.push_back(ended);
+                return Bootstrap::Stream { held, rest: None };
             }
-            Step::Event(out) => {
-                held.push_back(Ok(out));
+            event @ Step::Event(_) => {
+                held.push_back(event);
                 if gate.released {
                     let emitted = held.len();
                     let rest = processed(upstream, processor, emitted);
-                    return Bootstrap::Stream(futures_util::stream::iter(held).chain(rest).boxed());
+                    return Bootstrap::Stream { held, rest: Some(rest) };
                 }
             }
         }

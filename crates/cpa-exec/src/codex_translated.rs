@@ -13,7 +13,10 @@
 //! namespace restoration or a local token estimate in place of
 //! provider usage. A buffered client receives the aggregate of the upstream's events.
 
+use std::collections::VecDeque;
+
 use super::*;
+use crate::codex_response::{Step, Steps};
 
 /// The source formats the route converts. Each has a registered built-in pair to Codex.
 const SOURCES: [Format; 2] = [Format::Claude, Format::OpenAI];
@@ -74,8 +77,21 @@ pub(crate) fn upstream_body(req: &ExecRequest, model: &str) -> Result<String, Ex
 }
 
 impl CodexExecutor {
-    /// One translated request (see the module documentation).
+    /// One translated request (see the module documentation). The attempt is recorded as
+    /// canceled when the client leaves before the response is ready: during the upstream
+    /// send, the stream bootstrap or a buffered client's body read ([`crate::cancel`]).
+    /// A stream settles its own outcome ([`client_stream`]).
     pub(crate) async fn translated(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        req: ExecRequest,
+    ) -> Result<ExecResponse, ExecError> {
+        let usage = req.usage.clone();
+        crate::cancel::fail_if_canceled(&usage, self.translated_exchange(view, settings, req)).await
+    }
+
+    async fn translated_exchange(
         &self,
         view: &View<'_>,
         settings: &Settings,
@@ -123,18 +139,18 @@ impl CodexExecutor {
         let processor = Processor::new(false, settings.model_level_cooling).reporting(req.usage.clone());
         if req.stream {
             let processor = processor.capturing(wire);
-            let stream = if settings.bootstrap_buffering {
+            let (held, rest) = if settings.bootstrap_buffering {
                 match response::bootstrap(events, processor, settings.bootstrap_timeout, started).await {
                     Bootstrap::Reject(error) => return Err(error),
-                    Bootstrap::Stream(stream) => stream,
+                    Bootstrap::Stream { held, rest } => (held, rest),
                 }
             } else {
-                response::processed(events, processor, 0)
+                (VecDeque::new(), Some(response::processed(events, processor, 0)))
             };
             return Ok(ExecResponse {
                 status,
                 headers,
-                body: ResponseBody::Stream(client_stream(&req, body, stream)),
+                body: ResponseBody::Stream(client_stream(&req, body, held, rest)),
             });
         }
         let completed = aggregate(events, processor, &wire).await?;
@@ -195,29 +211,57 @@ fn client_body(req: &ExecRequest, translated: &str, completed: &str) -> Result<B
     Ok(Bytes::from(out))
 }
 
-/// The client's stream: the built-in stream translation, its events as the translator
-/// renders them. A Claude client's `message_start` carries what the translator knows; no
-/// local token estimate stands in for provider usage.
-fn client_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
+/// The client's stream: the built-in stream translation of the `held` steps, then of
+/// `rest` ([`Bootstrap`]), its events as the translator renders them. A Claude client's
+/// `message_start` carries what the translator knows; no local token estimate stands in
+/// for provider usage.
+///
+/// The stream owns the attempt's outcome if the consumer drops it ([`crate::cancel`]):
+/// canceled until the upstream ends. The upstream ends when the stream observes its
+/// terminal event (its usage is observed) or its clean end; or when it observes a
+/// failure, which is the record until the consumer takes it. A step counts as observed
+/// once it reaches this stream, so a held step, and client events still queued for the
+/// consumer, keep the outcome of the step they came from.
+fn client_stream(req: &ExecRequest, translated: &str, held: VecDeque<Step>, rest: Option<Steps>) -> ExecStream {
     let ctx = response_ctx(req, translated);
     let Some(pair) = cpa_translate::pair(req.response_format, Format::Codex) else {
         return futures_util::stream::once(async { Err(unregistered_response()) }).boxed();
     };
     let translator = (pair.stream)(&ctx);
+    let mut outcome = crate::cancel::StreamOutcome::new(req.usage.clone());
+    match held.back() {
+        Some(Step::Fail { error, .. }) => outcome.failed(error),
+        // A held terminal event, or an upstream that ended with no event.
+        _ if rest.is_none() => outcome.settled(),
+        _ => {}
+    }
     struct State {
-        upstream: ExecStream,
+        held: VecDeque<Step>,
+        rest: Option<Steps>,
         translator: Box<dyn cpa_translate::StreamTranslator>,
-        ready: std::collections::VecDeque<Bytes>,
+        ready: VecDeque<Bytes>,
         failed: Option<ExecError>,
         done: bool,
+        outcome: crate::cancel::StreamOutcome,
+    }
+    impl State {
+        /// Ends the stream with `error`: the pending client frame, then the error.
+        fn fail(&mut self, error: ExecError) {
+            self.ready.extend(self.translator.flush_frames());
+            self.outcome.failed(&error);
+            self.failed = Some(error);
+            self.done = true;
+        }
     }
     futures_util::stream::unfold(
         State {
-            upstream,
+            held,
+            rest,
             translator,
-            ready: Default::default(),
+            ready: VecDeque::new(),
             failed: None,
             done: false,
+            outcome,
         },
         |mut st| async move {
             loop {
@@ -225,27 +269,47 @@ fn client_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> E
                     return Some((Ok(event), st));
                 }
                 if let Some(error) = st.failed.take() {
+                    // The consumer settles the failure it takes (always the last item).
+                    st.outcome.settled();
                     return Some((Err(error), st));
                 }
                 if st.done {
                     return None;
                 }
-                let result = match st.upstream.next().await {
-                    Some(Ok(event)) => st.translator.event(&event).map_err(translate_error),
-                    Some(Err(error)) => Err(error),
+                let step = match st.held.pop_front() {
+                    Some(step) => Some(step),
+                    None => match st.rest.as_mut() {
+                        Some(rest) => rest.next().await,
+                        None => None,
+                    },
+                };
+                let (events, upstream_failure) = match step {
+                    Some(Step::Event(event)) => (st.translator.event(&event), None),
+                    Some(Step::Terminal(event)) => {
+                        st.outcome.settled();
+                        (st.translator.event(&event), None)
+                    }
+                    Some(Step::Fail { error, before, .. }) => {
+                        // The lines that preceded the failure in its event go first; the
+                        // failure then ends the stream (`State::fail`).
+                        let events = before.map_or_else(|| Ok(Vec::new()), |before| st.translator.event(&before));
+                        (events, Some(error))
+                    }
                     None => {
                         st.done = true;
-                        st.translator.finish().map_err(translate_error)
+                        st.outcome.settled();
+                        (st.translator.finish(), None)
                     }
                 };
-                match result {
+                match events {
                     Ok(events) => st.ready.extend(events),
                     Err(error) => {
-                        // The pending client frame goes before the terminal error.
-                        st.ready.extend(st.translator.flush_frames());
-                        st.failed = Some(error);
-                        st.done = true;
+                        st.fail(translate_error(error));
+                        continue;
                     }
+                }
+                if let Some(error) = upstream_failure {
+                    st.fail(error);
                 }
             }
         },
@@ -260,3 +324,7 @@ fn unregistered_response() -> ExecError {
         "codex response translation is not registered",
     )
 }
+
+#[cfg(test)]
+#[path = "codex_translated_tests.rs"]
+mod tests;

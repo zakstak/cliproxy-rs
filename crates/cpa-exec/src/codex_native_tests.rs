@@ -1043,3 +1043,114 @@ async fn initial_bom_is_framing_for_http_delivery_and_aggregation() {
         }
     }
 }
+
+/// The failures a native stream settled in the attempt's record when its consumer
+/// dropped it (#54), as (status, text).
+#[derive(Default)]
+struct Settled(std::sync::Mutex<Vec<(u16, String)>>);
+
+impl cpa_core::exec::UsageObserver for Settled {
+    fn response_body(&self, _: Format, _: &[u8]) {}
+    fn response_line(&self, _: Format, _: &[u8]) {}
+    fn request(&self, _: Format, _: &[u8]) {}
+    fn publish_failure(&self, status: u16, body: &str) {
+        self.0.lock().unwrap().push((status, body.to_owned()));
+    }
+    fn publish_failure_with_usage(&self, status: u16, body: &str) {
+        self.0.lock().unwrap().push((status, format!("with usage: {body}")));
+    }
+    fn publish(&self) {
+        self.0.lock().unwrap().push((0, "publish".into()));
+    }
+}
+
+/// A native stream over `events` whose upstream then stays open, reporting to the
+/// returned record.
+fn open_stream(events: &[&str]) -> (ExecStream, std::sync::Arc<Settled>) {
+    let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    let upstream = futures_util::stream::iter([Ok::<_, ExecError>(Bytes::from(body))])
+        .chain(futures_util::stream::pending())
+        .boxed();
+    let settled = std::sync::Arc::new(Settled::default());
+    let observer = Observer {
+        usage: cpa_core::exec::UsageSink::new(settled.clone()),
+        ..observer()
+    };
+    (
+        passthrough(crate::upstream::framed(upstream), observer, None, false),
+        settled,
+    )
+}
+
+fn settled(record: &Settled) -> Vec<(u16, String)> {
+    record.0.lock().unwrap().clone()
+}
+
+const DELTA: &str =
+    r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"hi"}"#;
+const FAILED: &str = r#"{"type":"response.failed","response":{"id":"r","status":"failed","error":{"code":"server_error","message":"boom"}}}"#;
+
+/// A consumer that leaves before the upstream ended the response cancels it, once,
+/// whether it left while the stream waited for the upstream or between two polls (a
+/// client that went away while the server wrote an earlier event).
+#[tokio::test]
+async fn a_dropped_unfinished_stream_records_one_cancellation() {
+    use futures_util::FutureExt;
+    for awaiting in [true, false] {
+        let (mut stream, record) = open_stream(&[CREATED, DELTA]);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        if awaiting {
+            assert!(stream.next().now_or_never().is_none(), "the upstream is still open");
+        }
+        assert!(settled(&record).is_empty());
+        drop(stream);
+        assert_eq!(
+            settled(&record),
+            [(499, "context canceled".to_owned())],
+            "awaiting={awaiting}"
+        );
+    }
+}
+
+/// The upstream completed: a consumer that takes the terminal event and leaves before the
+/// stream's end leaves the record to the tracker, which has the observed usage.
+#[tokio::test]
+async fn a_completed_stream_dropped_before_its_end_records_no_cancellation() {
+    let (mut stream, record) = open_stream(&[CREATED, COMPLETED]);
+    assert!(stream.next().await.unwrap().is_ok());
+    let terminal = stream.next().await.unwrap().unwrap();
+    assert!(text(&terminal).contains("response.completed"));
+    drop(stream);
+    assert!(settled(&record).is_empty(), "{:?}", settled(&record));
+}
+
+/// An upstream failure queued behind its delivered event is recorded as that failure if
+/// the consumer leaves before taking it, and left to the consumer once taken.
+#[tokio::test]
+async fn an_upstream_failure_is_never_recorded_as_a_cancellation() {
+    let events = [CREATED, DELTA, FAILED];
+    let (mut stream, record) = open_stream(&events);
+    let mut error = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            error = Some(e);
+            break;
+        }
+    }
+    let error = error.expect("the stream ends with the upstream failure");
+    drop(stream);
+    assert!(settled(&record).is_empty(), "the consumer settles what it took");
+
+    let (mut stream, record) = open_stream(&events);
+    loop {
+        let event = stream.next().await.unwrap().unwrap();
+        if text(&event).contains("response.failed") {
+            break;
+        }
+    }
+    drop(stream);
+    let expected = (error.status, String::from_utf8_lossy(&error.body).into_owned());
+    assert_ne!(expected.0, 499);
+    assert_eq!(settled(&record), [expected]);
+}
