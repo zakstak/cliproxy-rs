@@ -254,6 +254,12 @@ fn trusted_proxy_validation_errors_match_go_text() {
         // Errors Go finds while decoding carry LoadConfig's wrapper; yaml.v3's own
         // decode messages (line numbers, Go type names) are not ported, only the refusal.
         let want = case["error"].as_str().unwrap();
+        // A removed provider's setting fails with its migration guidance (issue #49).
+        if yaml.contains("devin-catalog") || yaml.contains("antigravity") || yaml.contains("vertex") || yaml.contains("gemini-api-key") || yaml.contains("openai-compatibility") {
+            if got.contains("which is no longer supported") {
+                continue;
+            }
+        }
         match want.strip_prefix("failed to parse config file: ") {
             Some(yaml_error) if yaml_error.starts_with("yaml: ") => assert!(!got.is_empty(), "{yaml}"),
             Some(decoded) => assert_eq!(got, decoded, "{yaml}"),
@@ -328,7 +334,17 @@ fn oauth_only_presence_matches_go() {
             .filter(|f| *f != CODEX_UA_FIELD)
             .map(to_v8)
             .collect();
-        assert_eq!(Config::parse(&yaml).unwrap().oauth_only, want, "{yaml}");
+        // A removed provider's setting refuses the config (issue #49).
+        let yaml = cpa_core::removed::strip_settings(&yaml);
+        let want: std::collections::BTreeSet<String> =
+            want.into_iter().filter(|f| !removed_path(f)).collect();
+        let got: std::collections::BTreeSet<String> = Config::parse(&yaml)
+            .unwrap()
+            .oauth_only
+            .into_iter()
+            .filter(|f| !removed_path(f))
+            .collect();
+        assert_eq!(got, want, "{yaml}");
     }
     // Go `ForAPIKey`: those fields read as zero for API-key credentials; the shared
     // `upstream.codex` value written at its historical path stays.
@@ -345,7 +361,7 @@ fn oauth_only_presence_matches_go() {
         serde_yaml_ng::Value::Bool(false)
     );
     assert!(view.oauth_only.is_empty());
-    let legacy = Config::parse(cases[0]["yaml"].as_str().unwrap()).unwrap();
+    let legacy = Config::parse(&cpa_core::removed::strip_settings(cases[0]["yaml"].as_str().unwrap())).unwrap();
     assert!(matches!(legacy.for_api_key(), std::borrow::Cow::Borrowed(_)));
 }
 
@@ -399,7 +415,8 @@ fn config_and_file_credentials_match_go_synthesizers() {
         let root = dir.join("fixture-root");
         std::fs::create_dir_all(root.join("auth")).unwrap();
         let path = root.join("config.yaml");
-        std::fs::write(&path, case["yaml"].as_str().unwrap()).unwrap();
+        // The removed providers' settings go (issue #49); their auth files stay unread.
+        std::fs::write(&path, cpa_core::removed::strip_settings(case["yaml"].as_str().unwrap())).unwrap();
         for (file, body) in case["files"].as_object().into_iter().flatten() {
             std::fs::write(root.join("auth").join(file), body.as_str().unwrap()).unwrap();
         }
@@ -414,19 +431,47 @@ fn config_and_file_credentials_match_go_synthesizers() {
             .iter()
             .map(|c| go_shape(c, &root))
             .collect();
-        let want: Vec<Value> = case["config"].as_array().unwrap().iter().map(go_expected).collect();
+        let want: Vec<Value> = case["config"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(go_expected)
+            .filter(|c| !removed_provider(c))
+            .collect();
         assert_eq!(got, want, "{name}: config credentials");
         compared += got.len();
         let got: Vec<Value> = credentials::from_auth_dir(&cfg)
             .iter()
             .map(|c| go_shape(c, &root))
             .collect();
-        let want: Vec<Value> = case["file"].as_array().unwrap().iter().map(go_expected).collect();
+        let want: Vec<Value> = case["file"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(go_expected)
+            .filter(|c| !removed_provider(c))
+            .collect();
         assert_eq!(got, want, "{name}: file credentials");
         compared += got.len();
         let _ = std::fs::remove_dir_all(&dir);
     }
-    assert_eq!(compared, 32, "every recorded Go credential was compared");
+    // 32 recorded; the rest are the removed providers' (issue #49).
+    assert_eq!(compared, 11, "every retained Go credential was compared");
+}
+
+/// A recorded Go credential of a provider this fork removed (issue #49).
+fn removed_provider(c: &Value) -> bool {
+    ["provider", "type"]
+        .iter()
+        .filter_map(|k| c[k].as_str())
+        .any(|p| cpa_core::removed::provider(p).is_some())
+}
+
+/// A recorded v8 path that configures a removed provider (issue #49).
+fn removed_path(path: &str) -> bool {
+    ["antigravity", "aistudio", "devin", "gemini", "vertex", "openai-compatibility", "kimi"]
+        .iter()
+        .any(|p| path.contains(p))
 }
 
 mod access {
@@ -558,7 +603,15 @@ mod routes {
             write(scenario["yaml"].as_str().unwrap());
             // The fixtures set no auth-dir; never fall back to the real ~/.cli-proxy-api.
             let auth = dir.join("auth");
-            let mut cfg = Config::load(&path).unwrap();
+            // A scenario that starts from a removed provider's setting is refused at
+            // load (issue #49).
+            let mut cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains("which is no longer supported") => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+                loaded => loaded.unwrap(),
+            };
             cfg.auth_dir = auth.clone();
             let rt = Arc::new(cpa_server::testing::runtime(
                 cfg,
@@ -817,7 +870,15 @@ mod config_writes {
                 let _ = std::fs::remove_dir_all(&dir);
                 continue;
             }
-            let mut cfg = Config::load(&path).unwrap();
+            // A scenario that starts from a removed provider's setting is refused at
+            // load (issue #49).
+            let mut cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains("which is no longer supported") => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+                loaded => loaded.unwrap(),
+            };
             cfg.auth_dir = auth.clone();
             let rt = Arc::new(cpa_server::testing::runtime(
                 cfg,
@@ -855,6 +916,11 @@ mod config_writes {
                 let status = res.status().as_u16();
                 let body = res.text().await.unwrap();
                 let at = format!("{name}[{i}] {} {}", step["method"], step["path"]);
+                // A write that configures a removed provider is refused with its
+                // migration guidance (issue #49); the rest of the scenario builds on it.
+                if body.contains("which is no longer supported") {
+                    break;
+                }
                 assert_eq!(status, step["status"], "{at}: {body}");
                 let want = &step["response"];
                 if step["path"] == "/config.yaml" && step["method"] == "GET" && status == 200 {
@@ -939,9 +1005,11 @@ mod config_writes {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-        assert_eq!(compared, 182);
+        // 182 recorded steps; the scenarios that start from or write a removed provider's
+        // setting (issue #49) stop at its refusal.
         eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 146, "steps compared byte for byte");
+        assert_eq!(compared, 115);
+        assert_eq!(bytes_compared, 89, "steps compared byte for byte");
     }
 }
 
@@ -1005,7 +1073,21 @@ mod creds {
     }
 
     fn config_credentials(config: &Value) -> Vec<Value> {
-        let yaml = serde_yaml_ng::to_string(config).unwrap();
+        // The removed providers' settings go (issue #49).
+        let mut config = config.clone();
+        for (parent, keys) in [
+            (&[][..], &["ws-auth", "gemini-api-key", "interactions-api-key", "vertex-api-key", "openai-compatibility", "antigravity", "devin"][..]),
+            (&["api-keys"][..], &["gemini", "interactions", "vertex", "openai-compatibility"][..]),
+            (&["oauth", "providers"][..], &["aistudio", "antigravity", "devin", "kimi", "gemini", "gemini-cli", "vertex"][..]),
+        ] {
+            let node = parent.iter().try_fold(&mut config, |node, key| node.get_mut(*key));
+            if let Some(Value::Object(map)) = node {
+                for key in keys {
+                    map.remove(*key);
+                }
+            }
+        }
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
         let cfg = Config::parse(&yaml).unwrap();
         credentials::from_config(&cfg)
             .iter()
@@ -1021,6 +1103,10 @@ mod creds {
         let mut bytes_compared = 0;
         for scenario in fixture()["credentials"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
+            // AI Studio relay credentials went with that provider (issue #49).
+            if name == "runtime_credentials" {
+                continue;
+            }
             if name == "dashboard_probes" {
                 continue;
             }
@@ -1044,7 +1130,11 @@ mod creds {
                 .replace("$HASH", &hash)
                 .replace("$AUTH", &auth.display().to_string());
             std::fs::write(&path, yaml).unwrap();
-            let cfg = Config::load(&path).unwrap();
+            // A scenario that configures a removed provider is refused at load (issue #49).
+            let cfg = match Config::load(&path) {
+                Err(e) if format!("{e:#}").contains("which is no longer supported") => continue,
+                loaded => loaded.unwrap(),
+            };
             let scan = credentials::scan_auth_dir(&cfg);
             let mut loaded = scan.credentials;
             loaded.extend(credentials::from_config(&cfg));
@@ -1156,6 +1246,15 @@ mod creds {
                     .unwrap()
                     .replace(&root.display().to_string(), "/fixture-root")
                     .replace(&echo_url, "$ECHO");
+                // A removed provider's login is refused instead of stored (issue #49);
+                // Go's later reads of it have nothing to read here.
+                if step["path"].as_str().unwrap().contains("gem.json") {
+                    if step["method"] == "POST" {
+                        assert_eq!(status, 400, "{at}: {body}");
+                        assert!(body.contains("is no longer supported"), "{at}: {body}");
+                    }
+                    continue;
+                }
                 assert_eq!(status, step["status"], "{at}: {body}");
                 // New credentials (uploads) get indexes on both sides.
                 for c in rt.store().snapshot().iter() {
@@ -1241,6 +1340,10 @@ mod creds {
                         );
                         want["error"] = got["error"].clone();
                     }
+                    // Go also deletes the Gemini login this fork refused (issue #49).
+                    if name == "credential_inventory_and_edits" && step["path"] == "/credentials?all=true" {
+                        want["deleted"] = json!(want["deleted"].as_i64().unwrap() - 1);
+                    }
                     assert_eq!(got, want, "{at}");
                 }
                 // Auth dir contents, as JSON values read the way Go's snapshot reads them
@@ -1254,9 +1357,14 @@ mod creds {
                         .unwrap_or_else(|| json!(format!("raw:{}", String::from_utf8_lossy(&data))));
                     files.insert(entry.file_name().to_string_lossy().into_owned(), v);
                 }
+                // Without the refused Gemini upload (issue #49).
+                let mut want_files = step["files"].clone();
+                if let Some(map) = want_files.as_object_mut() {
+                    map.remove("gem.json");
+                }
                 assert_eq!(
                     go_numbers(&Value::Object(files)),
-                    go_numbers(&step["files"]),
+                    go_numbers(&want_files),
                     "{at}: auth dir"
                 );
                 if let Some(want) = step.get("log_dir") {
@@ -1289,9 +1397,11 @@ mod creds {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
-        assert_eq!(compared, 222);
+        // 222 recorded steps; the AI Studio relay and OpenAI-compatible api-call
+        // scenarios and the Gemini upload's steps went with those providers (issue #49).
         eprintln!("credentials: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 174, "steps compared byte for byte");
+        assert_eq!(compared, 172);
+        assert_eq!(bytes_compared, 145, "steps compared byte for byte");
     }
 
     /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model

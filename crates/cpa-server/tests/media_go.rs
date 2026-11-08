@@ -302,6 +302,8 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     // soonest-reset, whose one probe per key reorders the two xAI keys across models
     // (docs/DIFFERENCES-FROM-GO.md "Default routing strategy"), so Go's is set.
     assert!(!config.contains("strategy:"), "the fixture leaves the strategy unset");
+    // The recorded OpenAI-compatible group went with that provider (issue #49).
+    let config = cpa_core::removed::strip_settings(&config);
     let config = format!("{config}\nrouting:\n  strategy: round-robin\n");
     let config = Config::parse(&config).expect("config parses");
     let credentials = cpa_core::config::credentials::load(&config);
@@ -328,6 +330,10 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
     let client = wreq::Client::new();
     let mut failures = Vec::new();
     for s in &fixture.scenarios {
+        // Scenarios served by the removed OpenAI-compatible upstream (issue #49).
+        if s.name.contains("compat") || s.name == "gen_chat_model_rejected" {
+            continue;
+        }
         *upstream.replies.lock().unwrap() = s.upstreams.iter().cloned().collect();
         upstream.requests.lock().unwrap().clear();
         let method = wreq::Method::from_bytes(s.method.as_bytes()).unwrap();

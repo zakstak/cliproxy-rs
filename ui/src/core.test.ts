@@ -153,7 +153,7 @@ test("quota is percent used, not remaining; unknown payloads stay empty", () => 
   );
   assert.equal(quotaWindows("codex", { rate_limit: { secondary_window: { used_percent: 3 } } })[0].label, "Secondary limit");
   assert.equal(quotaWindows("x", { groups: [{ displayName: "Pro", buckets: [{ remainingFraction: 0.25 }] }] })[0].used, 75);
-  assert.deepEqual(quotaWindows("gemini", {}), []);
+  assert.deepEqual(quotaWindows("xai", {}), []);
 });
 
 test("Claude usage: the limits list, as Claude Code titles it", () => {
@@ -255,7 +255,7 @@ test("durations round to the unit a reader needs", () => {
   assert.equal(ago(now - 120_000, now), "2m ago");
 });
 
-test("passive limits from Codex headers and Devin quota", () => {
+test("passive limits from Codex and Claude headers", () => {
   const observed = "2026-10-02T12:00:00Z";
   const codex = signalWindows("codex", {
     observed_at: observed,
@@ -275,13 +275,8 @@ test("passive limits from Codex headers and Devin quota", () => {
     { label: "Weekly limit", used: 7, reset: "2026-10-02T13:00:00.000Z", source: "x-codex-secondary-" },
   ]);
   assert.deepEqual(signalWindows("codex", { signals: { "x-codex-primary-window-minutes": "300" } }), []);
-  assert.deepEqual(
-    signalWindows("devin", { signals: { daily_quota_remaining_percent: "87%", weekly_quota_remaining_percent: "100%", daily_quota_reset_at: "2026-10-03T00:00:00Z" } }),
-    [
-      { label: "Daily", used: 13, reset: "2026-10-03T00:00:00Z", source: "daily_quota_" },
-      { label: "Weekly", used: 0, reset: "", source: "weekly_quota_" },
-    ],
-  );
+  // Devin's daily and weekly quota went with the Devin provider (issue #49).
+  assert.deepEqual(signalWindows("devin", { signals: { daily_quota_remaining_percent: "87%" } }), []);
   assert.deepEqual(signalWindows("claude", { signals: { "x-codex-primary-used-percent": "5" } }), []);
   // Claude's unified headers, as recorded: fractions of 1 and Unix-second resets.
   const claude = {

@@ -82,12 +82,21 @@ async fn client_version_selects_the_codex_catalog() {
 #[tokio::test]
 async fn catalog_matches_go_for_config_models() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_models_go.json")).unwrap();
-    let cfg = fixture["config"].as_str().unwrap();
+    // The recorded OpenAI-compatible group and its models went with that provider
+    // (issue #49).
+    let cfg = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
     for version in ["0.150.0", "cpa", "0.143.0"] {
-        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), cfg).await;
+        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), &cfg).await;
         assert_eq!(status, 200);
         let want: Value = serde_json::from_str(fixture[version].as_str().unwrap()).unwrap();
-        let (got, want) = (body["models"].as_array().unwrap(), want["models"].as_array().unwrap());
+        let want: Vec<Value> = want["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| !m["slug"].as_str().unwrap().starts_with("acme-"))
+            .cloned()
+            .collect();
+        let (got, want) = (body["models"].as_array().unwrap(), &want);
         let slugs = |m: &[Value]| {
             m.iter()
                 .map(|e| e["slug"].as_str().unwrap().to_owned())

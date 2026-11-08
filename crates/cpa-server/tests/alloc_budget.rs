@@ -275,49 +275,6 @@ fn claude_to_codex_conversation(target: usize) -> Bytes {
     Bytes::from(body.replacen(r#""model":"claude-opus-5-5""#, r#""model":"gpt-5.5""#, 1))
 }
 
-/// A Gemini request for the Codex model, its size from large tool schemas: 48 function
-/// declarations whose `parameters` schemas hold 40 properties each, with Gemini's
-/// upper-case `type` names, which the translated route converts at schema positions only
-/// (#27), then turns of text, function calls and their large responses.
-fn gemini_conversation(target: usize) -> Bytes {
-    use serde_json::json;
-    let filler = |n: usize| "Explain the change in this diff and list any risks. ".repeat(n / 52 + 1);
-    let properties = |i: usize| {
-        let mut map = serde_json::Map::new();
-        for p in 0..40 {
-            map.insert(
-                format!("field_{i}_{p}"),
-                json!({"type": "STRING", "description": filler(120), "enum": ["TYPE", "type", "OBJECT"]}),
-            );
-        }
-        map.insert(
-            "nested".into(),
-            json!({"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"type": {"type": "STRING"}}}}),
-        );
-        serde_json::Value::Object(map)
-    };
-    let declarations: Vec<_> = (0..48)
-        .map(|i| json!({"name": format!("tool_{i}"), "description": filler(300), "parameters": {"type": "OBJECT", "properties": properties(i)}}))
-        .collect();
-    let mut contents = vec![json!({"role": "user", "parts": [{"text": filler(2000)}]})];
-    let mut size = 360_000;
-    let mut turn = 0;
-    while size < target {
-        contents.push(json!({"role": "model", "parts": [{"text": filler(1000)}, {"functionCall": {"name": "tool_1", "args": {"path": "src/main.rs"}}}]}));
-        contents.push(json!({"role": "user", "parts": [{"functionResponse": {"name": "tool_1", "response": {"content": filler(20_000)}}}]}));
-        size += 22_000;
-        turn += 1;
-    }
-    let _ = turn;
-    let body = json!({
-        "systemInstruction": {"parts": [{"text": filler(18_000)}]},
-        "contents": contents,
-        "tools": [{"functionDeclarations": declarations}],
-        "generationConfig": {"maxOutputTokens": 1024},
-    });
-    Bytes::from(serde_json::to_vec(&body).unwrap())
-}
-
 /// The ceiling for `key` in bench/budgets.txt: `<key> <value> <tolerance %>`, read the way
 /// bench/gate.sh reads it. None when the file has no line for it: the value is reported,
 /// not gated.
@@ -420,10 +377,6 @@ async fn large_requests_stay_within_their_heap_budget() {
         let (path, done): (_, &'static [u8]) = match route {
             "claude" | "cloak" | "codex-claude" => ("/v1/messages", b"message_stop"),
             "count" => ("/v1/messages/count_tokens", b"\"input_tokens\""),
-            "codex-gemini" => (
-                "/v1beta/models/gpt-5.5:streamGenerateContent?alt=sse",
-                b"totalTokenCount",
-            ),
             _ => ("/v1/responses", b"response.completed"),
         };
         let request = axum::http::Request::post(path)
@@ -465,9 +418,6 @@ async fn large_requests_stay_within_their_heap_budget() {
         ("codex-claude", "codex.claude.100k", 100_000),
         ("codex-claude", "codex.claude.1900k", 1_900_000),
         ("codex-claude", "codex.claude.7600k", 7_600_000),
-        ("codex-gemini", "codex.gemini.400k", 400_000),
-        ("codex-gemini", "codex.gemini.1900k", 1_900_000),
-        ("codex-gemini", "codex.gemini.7600k", 7_600_000),
         ("cloak", "cloak.306k", 306_000),
         ("cloak", "cloak.1900k", 1_900_000),
     ] {
@@ -475,7 +425,6 @@ async fn large_requests_stay_within_their_heap_budget() {
             "codex" => responses_conversation(target),
             "codex-alias" => responses_alias_conversation(target),
             "codex-claude" => claude_to_codex_conversation(target),
-            "codex-gemini" => gemini_conversation(target),
             "cloak" => cloak_conversation(target),
             _ => conversation(target),
         };

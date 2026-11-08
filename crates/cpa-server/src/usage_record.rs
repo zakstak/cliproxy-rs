@@ -2862,7 +2862,14 @@ mod tests {
         for (index, case) in cases.iter().enumerate() {
             let name = case["name"].as_str().unwrap();
             let s = |k: &str| case[k].as_str().unwrap_or_default().to_owned();
-            let format = Format::parse(&s("format")).unwrap();
+            // Gemini, Vertex, Interactions and OpenAI-compatible credentials were removed
+            // (issue #49).
+            let Some(format) = Format::parse(&s("format")) else {
+                continue;
+            };
+            if name.contains("compat") || name.starts_with("vertex ") {
+                continue;
+            }
             let lines: Vec<&str> = case["lines"]
                 .as_array()
                 .unwrap()

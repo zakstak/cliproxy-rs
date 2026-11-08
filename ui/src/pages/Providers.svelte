@@ -5,7 +5,7 @@
   import Grille from "../Grille.svelte";
   import Load from "../Load.svelte";
 
-  const families = ["claude", "codex", "gemini", "vertex", "openai-compatibility", "interactions", "xai", "meta"];
+  const families = ["claude", "codex", "xai", "meta"];
   let family = $state("claude"),
     reveal = $state(false);
   let form = $state({ name: "", url: "", key: "" });
@@ -13,10 +13,9 @@
   usage.load();
   $effect(() => every(15_000, () => usage.load(true)));
   const groups = $derived(readPath(store.config.data || {}, `api-keys/${family}`, []) as Data[]);
-  const compat = $derived(family === "openai-compatibility");
-  /** Usage is keyed by provider (or compat group name) and "base-url|api-key". */
+  /** Usage is keyed by provider and "base-url|api-key". */
   function traffic(group: Data, k: Data): Buckets | null {
-    const byKey = usage.data?.[compat ? String(group.name || "").toLowerCase() : family];
+    const byKey = usage.data?.[family];
     const hit = byKey?.[`${group["base-url"] || ""}|${k["api-key"]}`];
     if (!hit) return null;
     const rows: Data[] = hit.recent_requests || [];
@@ -57,9 +56,6 @@
               <div class="section-head">
                 <h2>{g.name || `Group ${i + 1}`}</h2>
                 {#if g.disabled}<span class="row legend"><span class="lamp off"></span>Disabled</span>{/if}
-                {#if compat}<button class="key small" disabled={store.busy} onclick={() => write(groups.map((x, n) => (n === i ? { ...x, disabled: !x.disabled } : x)), g.disabled ? "Group enabled." : "Group disabled.")}
-                    >{g.disabled ? "Enable" : "Disable"}</button
-                  >{/if}
                 <button
                   class="key small quiet danger"
                   disabled={store.busy}
@@ -95,7 +91,7 @@
       <form class="form" onsubmit={add}>
         <label class="field">Group name<input required bind:value={form.name} /></label>
         <label class="field"
-          >Base URL<input type="url" required={compat} bind:value={form.url} placeholder={compat ? "https://…/v1" : "Provider default"} /></label
+          >Base URL<input type="url" bind:value={form.url} placeholder="Provider default" /></label
         >
         <label class="field">API key<input type="password" autocomplete="off" required bind:value={form.key} /></label>
         <button class="key primary" disabled={store.busy}><svg class="i" aria-hidden="true"><use href="#i-plus" /></svg>Add group</button>

@@ -60,17 +60,8 @@ const names: Record<string, string> = {
   claude: "Claude",
   anthropic: "Claude",
   codex: "Codex",
-  gemini: "Gemini",
-  vertex: "Vertex",
-  aistudio: "AI Studio",
-  antigravity: "Antigravity",
-  kimi: "Kimi",
-  "kimi-ai": "Kimi (kimi.ai)",
   xai: "xAI",
   meta: "Meta",
-  devin: "Devin",
-  "openai-compatibility": "OpenAI-compatible",
-  interactions: "Interactions",
 };
 export const label = (id: string) => names[id] || id;
 export const provider = (a: Data) => String(a.provider || a.type || "unknown").replace("anthropic", "claude");
@@ -265,7 +256,7 @@ export function usageStats(events: Event[]) {
  */
 export type Window = { label: string; used: number | null; reset: string; source?: string; detail?: string };
 const clamp = (n: number) => Math.round(Math.max(0, Math.min(100, n)) * 10) / 10;
-/** Normalised plugin groups first; then the built-in Claude, Codex and Kimi usage payloads. */
+/** Normalised plugin groups first; then the built-in Claude and Codex usage payloads. */
 export function quotaWindows(p: string, payload: Data): Window[] {
   const out: Window[] = [];
   if (Array.isArray(payload.groups)) {
@@ -294,10 +285,6 @@ export function quotaWindows(p: string, payload: Data): Window[] {
               ? new Date(Date.now() + Number(v.reset_after_seconds) * 1000).toISOString()
               : "",
         });
-  } else if (p === "kimi" || p === "kimi-ai") {
-    for (const [k, v] of Object.entries<Data>(payload.usages || {}))
-      if (v?.limit > 0)
-        out.push({ label: k.replaceAll("_", " "), used: clamp((Number(v.used) / Number(v.limit)) * 100), reset: String(v.reset_time || "") });
   }
   return out;
 }
@@ -373,8 +360,8 @@ const codexWindow = (seconds: number, fallback: string) =>
 
 /**
  * Limits the server observed passively, without asking the provider: Codex rate-limit
- * headers (x-codex-primary-*, x-codex-secondary-*), Claude's anthropic-ratelimit-unified-*
- * headers and Devin's daily and weekly quota.
+ * headers (x-codex-primary-*, x-codex-secondary-*) and Claude's
+ * anthropic-ratelimit-unified-* headers.
  */
 export function signalWindows(p: string, quota: Data | undefined): Window[] {
   const sig: Data = {};
@@ -411,12 +398,6 @@ export function signalWindows(p: string, quota: Data | undefined): Window[] {
         reset = new Date(num("reset") * 1000);
       if (!Number.isFinite(used) || sig[source + "disabled-reason"]) continue;
       out.push({ label, used: clamp(used * 100), reset: reset.getTime() > 0 ? reset.toISOString() : "", source });
-    }
-  else if (p === "devin")
-    for (const w of ["daily", "weekly"]) {
-      const left = parseFloat(sig[`${w}_quota_remaining_percent`]);
-      if (!Number.isNaN(left))
-        out.push({ label: w === "daily" ? "Daily" : "Weekly", used: clamp(100 - left), reset: sig[`${w}_quota_reset_at`] || "", source: `${w}_quota_` });
     }
   return out;
 }

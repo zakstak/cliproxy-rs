@@ -906,6 +906,14 @@ fn prepare_upload(state: &Management, name: &str, data: &[u8]) -> Result<Upload,
     if let (_, Some(e)) = credentials::excluded_models_from_metadata(&canonical) {
         return Err((true, format!("invalid auth file: {e}")));
     }
+    // A removed provider's login is refused, not stored unread (issue #49).
+    let kind = canonical.get("type").and_then(Value::as_str).unwrap_or_default();
+    if cpa_core::removed::provider(kind).is_some() {
+        return Err((
+            true,
+            format!("invalid auth file: {base}: {}", cpa_core::removed::operation_error(kind, "Uploading credentials")),
+        ));
+    }
     let synthesized = credentials::from_file(&cfg, &cfg.auth_dir, &dst, data)
         .map_err(|e| (true, format!("invalid auth file: invalid weight in {base}: {e}")))?;
     // Go writes the upload as sent, then its file store rewrites it unless it is

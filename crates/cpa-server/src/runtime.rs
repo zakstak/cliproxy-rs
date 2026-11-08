@@ -105,7 +105,6 @@ impl Runtime {
     /// provider rules), as on every publish.
     pub fn new(config: Config, credentials: Vec<Credential>, executors: Executors) -> Self {
         let mut policy = crate::management::policy(&config);
-        policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
         let cooldown_dir = cooldown_dir(&config, &policy);
         let rt = Self {
             config: RwLock::new(Arc::new(config)),
@@ -230,7 +229,6 @@ impl Runtime {
         if !Self::accepts_config(&config) {
             return false;
         }
-        policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
         let dir = cooldown_dir(&config, &policy);
         let config = Arc::new(config);
         // Commits are serialized, so the catalogs are configured in commit order; the

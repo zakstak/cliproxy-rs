@@ -9,8 +9,6 @@ import { provider, quotaWindows, signalWindows, type Data, type Window } from ".
 const usageURL: Record<string, string> = {
   claude: "https://api.anthropic.com/api/oauth/usage",
   codex: "https://chatgpt.com/backend-api/wham/usage",
-  kimi: "https://api.kimi.com/coding/v1/usages",
-  "kimi-ai": "https://api.kimi.ai/coding/v1/usages",
 };
 const plugin = (p: string) =>
   (store.plugins.data || []).find((x) => x.supports_quota && (x.quota_provider || x.id) === p);

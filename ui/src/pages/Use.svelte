@@ -53,7 +53,7 @@
 
 <div class="head"><h1>Use with tools</h1></div>
 <p class="muted">
-  Point a coding tool or an SDK at this proxy. It speaks the OpenAI, Anthropic and Gemini APIs and answers with the accounts you
+  Point a coding tool or an SDK at this proxy. It speaks the OpenAI and Anthropic APIs and answers with the accounts you
   connected.
 </p>
 

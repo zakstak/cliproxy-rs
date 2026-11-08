@@ -158,16 +158,25 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
 /// Test support for Go goldens recorded with settings of the removed providers: `yaml`
 /// without the block (or flow line) of each removed setting, so the rest of the recorded
 /// document still loads. Indentation decides a block's extent.
-#[cfg(test)]
-pub(crate) fn strip_settings(yaml: &str) -> String {
-    const KEYS: [&str; 7] = [
+#[doc(hidden)]
+pub fn strip_settings(yaml: &str) -> String {
+    const KEYS: [&str; 16] = [
         "vertex:",
         "openai-compatibility:",
         "gemini:",
+        "gemini-cli:",
         "interactions:",
         "vertex-api-key:",
         "gemini-api-key:",
+        "interactions-api-key:",
         "antigravity:",
+        "antigravity-signature-cache-enabled:",
+        "antigravity-signature-bypass-strict:",
+        "aistudio:",
+        "ws-auth:",
+        "devin:",
+        "devin-catalog:",
+        "kimi:",
     ];
     let mut out = String::new();
     let mut skip: Option<usize> = None;
@@ -184,7 +193,10 @@ pub(crate) fn strip_settings(yaml: &str) -> String {
             skip = Some(indent);
             continue;
         }
-        if line.contains("{antigravity:") {
+        if ["{antigravity:", "{aistudio:", "{devin:", "{gemini:", "{vertex:"]
+            .iter()
+            .any(|k| line.contains(k))
+        {
             continue;
         }
         out.push_str(line);

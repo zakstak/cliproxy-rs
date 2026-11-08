@@ -90,15 +90,17 @@ async fn home_empty_model_catalog_responses() {
             &[("anthropic-version", "2023-06-01")][..],
             "data",
         ),
-        ("gemini", "/v1beta/models", &[][..], "models"),
         ("grok", "/v1/models", &[("user-agent", "grok-shell")][..], "data"),
     ] {
         let (status, body) = get(&base, path, headers).await;
         assert_eq!(status, 200, "{name}: {body}");
         assert_eq!(body[field], Value::Array(Vec::new()), "{name}: {body}");
     }
+    // The Gemini model routes were removed (issue #49).
+    let (status, body) = get(&base, "/v1beta/models", &[]).await;
+    assert_eq!(status, 410, "{body}");
     let (status, body) = get(&base, "/v1beta/models/inaccessible-model", &[]).await;
-    assert_eq!(status, 404, "{body}");
+    assert_eq!(status, 410, "{body}");
 }
 
 /// Go `TestHomeModelCatalogErrorsRemainErrors`: error envelopes, with any shape, and

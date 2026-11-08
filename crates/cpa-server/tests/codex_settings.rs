@@ -283,17 +283,18 @@ async fn websocket_turns_ignore_every_rewrite_control() {
     }
 }
 
-/// The control: an OpenAI-compatible provider under the same config still gets the
+/// The control: another provider (Grok) under the same config still gets the
 /// shared payload rules, so they are scoped to other providers, not silently dead.
 #[tokio::test]
 async fn other_providers_keep_the_shared_payload_rules() {
-    let chat = r#"{"id":"c1","object":"chat.completion","created":1,"model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    // Grok stands in for the other providers (Go's test used an OpenAI-compatible
+    // upstream, removed with issue #49).
     let proxy = proxy(
         Script {
-            http: vec![Reply::json(200, chat)],
+            http: vec![Reply::sse(SSE)],
             ..Script::default()
         },
-        "openai-compatibility:\n  - name: Acme\n    base-url: {upstream}/v1\n    models: [{name: up-model, alias: control-model}]\n    api-key-entries: [{api-key: key-FAKE-acme}]\n",
+        "xai-api-key:\n  - api-key: key-FAKE-xai\n    base-url: {upstream}/v1\n    models: [{name: up-model, alias: control-model}]\n",
         |_| Vec::new(),
     )
     .await;

@@ -83,7 +83,10 @@ mod tests {
             }
             let payload = case["payload"].as_str().unwrap().as_bytes();
             let execution = case["execution"].as_str().filter(|s| !s.is_empty());
-            let format = Format::parse(case["format"].as_str().unwrap()).unwrap();
+            // Gemini and Interactions clients were removed (issue #49).
+            let Some(format) = Format::parse(case["format"].as_str().unwrap()) else {
+                continue;
+            };
             let scope = identity::caller_scope(case["client_key"].as_str().unwrap());
             assert_eq!(scope, case["caller_scope"].as_str().unwrap(), "{name} caller scope");
 
