@@ -693,7 +693,7 @@ fn json_str(s: &str) -> Vec<u8> {
 
 /// `util.InlineLocalRefs` with `$defs` and `definitions` dropped, as a string.
 fn inlined_parameters(raw: &str) -> String {
-    let inlined = cpa_common::gemini_schema::inline_local_refs(raw.as_bytes());
+    let inlined = cpa_common::schema_refs::inline_local_refs(raw.as_bytes());
     if !gj::valid(&inlined) {
         return String::from_utf8_lossy(&inlined).into_owned();
     }
@@ -959,7 +959,7 @@ fn normalize_tool(tool: &Res<'_>, namespace: &str, keep_image: bool) -> Option<(
     if tool_type == FUNCTION || tool_type == CUSTOM {
         let params = tool.get("parameters");
         if params.exists() {
-            let inlined = cpa_common::gemini_schema::inline_local_refs(params.raw());
+            let inlined = cpa_common::schema_refs::inline_local_refs(params.raw());
             if inlined != params.raw()
                 && let Ok(mut updated) = gj::try_set_raw(&raw, "parameters", &inlined)
             {

@@ -66,9 +66,9 @@ Each acceptance item is owned by the PR and tests listed. This PR adds the cross
 
 The translated route converts Claude Messages and Chat Completions requests into Responses (the Gemini and Interactions sources were removed with issue #49; the evidence below that names them is historical), and their answers back ([#27](https://github.com/zakstak/cliproxy-rs/issues/27)). It is not byte transparency, so the matrix above does not cover it. It keeps meaning or refuses: [CONTRACT.md](CONTRACT.md#translated-route) lists each retained conversion with its evidence, and each refusal. [`crates/cpa-server/tests/codex_translated.rs`](../../crates/cpa-server/tests/codex_translated.rs) tests it through the router:
 
-- round trips for each source (`claude_round_trips_keep_meaning`, `chat_round_trips_keep_meaning`, `gemini_round_trip_keeps_meaning`, `interactions_conversion_adds_nothing`);
+- round trips for each source (`claude_round_trips_keep_meaning`, `chat_round_trips_keep_meaning`);
 - refusals before the send (`unexpressible_content_is_refused_before_the_send`, `generation_controls_map_or_are_refused`, `failed_tool_results_are_refused`);
-- schema and tool-choice fidelity (`tool_schemas_keep_their_constraints`, `gemini_schema_literals_are_not_rewritten`, `gemini_tool_restrictions_are_not_widened`, `wide_gemini_tool_restrictions_keep_their_meaning`);
+- schema and tool-choice fidelity (`tool_schemas_keep_their_constraints`);
 - bypass checks (`operator_rules_cannot_rewrite_translated_bodies`, and `codex_native_plugins.rs` `plugin_translators_cannot_rewrite_codex_translated_traffic`).
 
 The meta and xAI executors, which share the registered translators, keep Go's conversion.

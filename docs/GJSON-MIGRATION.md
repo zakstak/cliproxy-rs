@@ -18,9 +18,10 @@ Regenerated after issue #49 kept only the Claude, Codex, Grok (`xai`) and Muse (
 upstreams. None of the removed providers' modules (Kimi, Devin, Gemini, Vertex, AI
 Studio, Antigravity, OpenAI-compatible) used the third-party crate: they read JSON
 through `cpa_common::json`, so their deletion removed no consumer and none was
-migrated. The command above lists 25 files, all Codex, xAI or shared WebSocket code:
-13 source files (8 in `cpa-exec`, 5 in `cpa-server`) and 12 test files. The removal of
-the external dependency, the vendor copy, the manifest patches, the lockfile entries
+migrated. The command above lists 24 files, all Codex, xAI or shared WebSocket code:
+11 source files (7 in `cpa-exec`, 4 in `cpa-server`) and 13 test files (`*_tests.rs` and
+`tests/`). Issue #47 removed one more consumer, `cpa-server`'s `management/quota_probe.rs`.
+The removal of the external dependency, the vendor copy, the manifest patches, the lockfile entries
 and the vendor-only CI steps still waits on those consumers.
 
 ## Contract boundaries

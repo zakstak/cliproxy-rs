@@ -1,9 +1,9 @@
-//! Differential test for cpa_common::gemini_schema against the pinned Go cleaners
-//! (fixtures from tests/reference/gemini_schema/main.go, recorded at v8.0.35). One test per
-//! cleaner, so nextest runs them in parallel: Go's own reference-budget inputs make the
-//! cleaners quadratic for seconds per call, in Go as here.
+//! Differential test for cpa_common::schema_refs against Go's `InlineLocalRefs` (fixtures
+//! from tests/reference/gemini_schema/main.go, recorded at v8.0.35). The fixture also holds
+//! Go's Gemini and Antigravity cleaners, which went with those providers (issue #49); their
+//! cases are not read.
 
-use cpa_common::gemini_schema as gs;
+use cpa_common::schema_refs as gs;
 use serde_json::Value;
 
 fn bytes(v: &Value) -> Vec<u8> {
@@ -43,43 +43,13 @@ fn matches_go(name: &str, clean: fn(&[u8]) -> Vec<u8>) {
 }
 
 #[test]
-fn gemini_matches_go() {
-    matches_go("gemini", gs::for_gemini);
-}
-
-#[test]
-fn gemini_json_schema_matches_go() {
-    matches_go("gemini_json_schema", gs::for_gemini_json_schema);
-}
-
-#[test]
-fn antigravity_matches_go() {
-    matches_go("antigravity", gs::for_antigravity);
-}
-
-#[test]
-fn antigravity_tool_matches_go() {
-    matches_go("antigravity_tool", |s| gs::for_antigravity_tool(s, false));
-}
-
-#[test]
-fn antigravity_claude_tool_matches_go() {
-    matches_go("antigravity_claude_tool", |s| gs::for_antigravity_claude_tool(s, false));
-}
-
-#[test]
-fn antigravity_response_matches_go() {
-    matches_go("antigravity_response", gs::for_antigravity_response);
-}
-
-#[test]
 fn inline_local_refs_matches_go() {
     matches_go("inline_local_refs", gs::inline_local_refs);
 }
 
 /// A chain of 1,000 definitions in a 5-deep schema expands to about 2,000 nesting levels
-/// within the inlining budget. Inlining and cleaning run on their own deep stack, so a
-/// caller on a 2 MiB worker stack completes instead of aborting.
+/// within the inlining budget. Inlining runs on its own deep stack, so a caller on a 2 MiB
+/// worker stack completes instead of aborting.
 #[test]
 fn a_definition_chain_expands_on_a_small_stack() {
     const N: usize = 1000;
@@ -94,19 +64,12 @@ fn a_definition_chain_expands_on_a_small_stack() {
     let schema = format!(
         r##"{{"type":"object","properties":{{"x":{{"type":"object","properties":{{"y":{{"$ref":"#/$defs/D0"}}}}}}}},"$defs":{{{defs}}}}}"##
     );
-    let (cleaned, inlined) = std::thread::Builder::new()
+    let inlined = std::thread::Builder::new()
         .stack_size(2 << 20)
-        .spawn(move || {
-            (
-                gs::for_gemini(schema.as_bytes()),
-                gs::inline_local_refs(schema.as_bytes()),
-            )
-        })
+        .spawn(move || gs::inline_local_refs(schema.as_bytes()))
         .unwrap()
         .join()
         .unwrap();
-    for out in [&cleaned, &inlined] {
-        let expanded = out.windows(5).filter(|w| w == br#""a":{"#).count();
-        assert!(expanded >= N, "{expanded} of {N} references expanded");
-    }
+    let expanded = inlined.windows(5).filter(|w| w == br#""a":{"#).count();
+    assert!(expanded >= N, "{expanded} of {N} references expanded");
 }
