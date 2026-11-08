@@ -74,6 +74,9 @@ impl Mock {
                 match reply {
                     Some(reply) => {
                         let mut response = (StatusCode::from_u16(reply.status).unwrap(), reply.body).into_response();
+                        // Reply headers are explicit: String::into_response adds text/plain,
+                        // which would prevent exercising a genuinely absent MIME header.
+                        response.headers_mut().remove(axum::http::header::CONTENT_TYPE);
                         for (k, v) in reply.headers {
                             response
                                 .headers_mut()

@@ -821,3 +821,140 @@ async fn a_home_is_compat_model_is_refused_for_the_credential() {
         assert_eq!(mock.take().len(), if compat { 0 } else { 2 }, "compat={compat}");
     }
 }
+
+#[tokio::test]
+async fn missing_mime_classifies_framing_and_preserves_original_chunks() {
+    for (body, want) in [
+        ("data: {\"type\":\"response.created\"}\n\n", true),
+        ("\r\nevent: response.created\ndata: {}\n\n", true),
+        ("\u{feff}data: {}\n\n", true),
+        (": comment\n\ndata: {}\n\n", true),
+        ("{\"object\":\"response\"}", false),
+        ("", false),
+        ("dat", false),
+    ] {
+        // One-byte chunks exercise every boundary, including BOM and field names.
+        let chunks: Vec<_> = body.as_bytes().chunks(1).map(Bytes::copy_from_slice).collect();
+        let upstream = crate::proxy::Upstream {
+            status: 200,
+            headers: HeaderMap::new(),
+            body: futures_util::stream::iter(chunks.clone().into_iter().map(Ok)).boxed(),
+        };
+        let (sse, mut upstream) = classify_response(upstream, true, &Wire::default()).await.unwrap();
+        assert_eq!(sse, want, "{body:?}");
+        let mut replay = Vec::new();
+        while let Some(chunk) = upstream.body.next().await {
+            replay.push(chunk.unwrap());
+        }
+        assert_eq!(replay, chunks, "original chunk boundaries and bytes survive");
+    }
+}
+
+#[tokio::test]
+async fn missing_mime_does_not_buffer_a_whole_stream_or_override_explicit_json() {
+    let first = Bytes::from_static(b"data: {}\n\n");
+    let upstream = crate::proxy::Upstream {
+        status: 200,
+        headers: HeaderMap::new(),
+        body: futures_util::stream::once(futures_util::future::ready(Ok(first.clone())))
+            .chain(futures_util::stream::pending())
+            .boxed(),
+    };
+    let (sse, mut replay) = tokio::time::timeout(
+        Duration::from_secs(1),
+        classify_response(upstream, true, &Wire::default()),
+    )
+    .await
+    .expect("framing detection must not wait for EOF")
+    .unwrap();
+    assert!(sse);
+    assert_eq!(replay.body.next().await.unwrap().unwrap(), first);
+    for (mime, expected, want) in [
+        (Some("application/json"), true, false),
+        (None, false, false),
+        (Some("Text/Event-Stream; charset=utf-8"), true, true),
+    ] {
+        let mut headers = HeaderMap::new();
+        if let Some(mime) = mime {
+            headers.insert(http::header::CONTENT_TYPE, mime.parse().unwrap());
+        }
+        let upstream = crate::proxy::Upstream {
+            status: 200,
+            headers,
+            body: futures_util::stream::pending().boxed(),
+        };
+        let (sse, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            classify_response(upstream, expected, &Wire::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(sse, want);
+    }
+}
+
+#[tokio::test]
+async fn missing_mime_preserves_body_errors_and_bounds_inspection() {
+    let upstream = crate::proxy::Upstream {
+        status: 200,
+        headers: HeaderMap::new(),
+        body: futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"da")),
+            Err(ExecError::local(502, FailureScope::Transport, "fixture read error")),
+        ])
+        .boxed(),
+    };
+    let Err(error) = classify_response(upstream, true, &Wire::default()).await else {
+        panic!("read error must survive");
+    };
+    assert_eq!(error.scope, FailureScope::Transport);
+    let upstream = crate::proxy::Upstream {
+        status: 200,
+        headers: HeaderMap::new(),
+        body: futures_util::stream::once(futures_util::future::ready(Ok(Bytes::from(vec![b'\n'; 65536]))))
+            .chain(futures_util::stream::pending())
+            .boxed(),
+    };
+    let (sse, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        classify_response(upstream, true, &Wire::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!sse);
+}
+
+#[tokio::test]
+async fn missing_mime_keeps_native_http_streaming_and_chatgpt_buffered_aggregation() {
+    let mock = Mock::start().await;
+    for stream in [true, false] {
+        let mut reply = sse("sse-completed");
+        reply.headers.clear();
+        mock.script("/responses", vec![reply]);
+        let body = text(&fixture("http-request-full").bytes());
+        let body = if stream {
+            body
+        } else {
+            body.replace("\"stream\":true", "\"stream\":false")
+        };
+        let response = executor()
+            .execute(
+                &credential(Kind::OAuth, &mock.url),
+                request(body, "gpt-test", stream, None),
+                &Config::default(),
+            )
+            .await
+            .unwrap();
+        if stream {
+            let (bytes, error) = drain(response).await;
+            assert!(error.is_none());
+            assert_eq!(bytes, fixture("sse-completed").bytes());
+        } else {
+            let terminal = text(&fixture("sse-completed").frames().pop().unwrap());
+            let object = &terminal[terminal.find(r#""response":"#).unwrap() + 11..terminal.len() - 1];
+            assert_eq!(text(&buffered(response)), object);
+        }
+    }
+}

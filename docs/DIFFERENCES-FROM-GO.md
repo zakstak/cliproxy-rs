@@ -210,3 +210,5 @@ The Antigravity implementation was recorded from `6fecc6e`, plus these v8.0.27 c
 - Reasoning replay branch IDs come from a counter, not random bytes; they are only compared inside one process.
 - Not ported from v8.0.27 yet: per-account model entitlements and their probe scheduling (Go 7e857c37, 9521fe29, ad381435, 091ff27f), Interactions session continuation (cbc4cd55), and replay logging and batch retry changes (17dc1b81, 40f4df07, 611ebba4).
 - Further changes through v8.0.35 still need porting or assertion-level verification: SDK user-agent helpers (acaab599) and expired AI-credits negative-hint recovery (904ec710).
+
+- Codex responses without MIME: when a request asks for an HTTP event stream and the upstream omits Content-Type, inspect a bounded initial SSE framing prefix and replay it unchanged. This keeps native HTTP streaming, ChatGPT buffered aggregation and WebSocket HTTP fallback working with the observed ChatGPT backend. Explicit media types remain authoritative; a JSON aggregate still does not become a fabricated WebSocket event. See the Codex contract’s WebSocket HTTP fallback section.
