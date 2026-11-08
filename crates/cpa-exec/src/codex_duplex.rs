@@ -671,7 +671,7 @@ impl Duplex {
             }
             return Owner::Started {
                 ends_latest: true,
-                open: self.open.len().checked_sub(1),
+                open: self.open.iter().rposition(|open| open.id == self.response_id),
             };
         }
         let open = self.open.iter().rposition(|open| open.id == failed);
@@ -689,7 +689,7 @@ impl Duplex {
             // Go's reading of a failure no create can own: the running response ended.
             Owner::Started {
                 ends_latest: true,
-                open: None,
+                open: self.open.iter().rposition(|open| open.id == self.response_id),
             }
         } else {
             Owner::Rejected

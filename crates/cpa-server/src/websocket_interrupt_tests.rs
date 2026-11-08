@@ -1227,6 +1227,57 @@ mod steering_usage {
         assert!(rt.store().cooldowns(&credential).is_empty());
     }
 
+    /// With no pending create, the proxy's inherited fallback ends the latest response.
+    /// Its accounting must end with it. If that latest response already settled, the
+    /// fallback must not fail a different, older response whose record remains open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fallback_failure_settles_only_the_latest_responses_record() {
+        const FLEX: &str = r#"{"type":"response.create","model":"gpt-fixture","service_tier":"flex","input":[]}"#;
+        const UNKNOWN_ERROR: &str =
+            r#"{"type":"error","status":400,"response_id":"unmatched","error":{"message":"failed"}}"#;
+        const UNKNOWN_FAILED: &str = r#"{"type":"response.failed","response":{"id":"unmatched","error":{"type":"invalid_request_error","message":"failed"}}}"#;
+        const NO_ID: &str = r#"{"type":"error","status":400,"error":{"message":"failed"}}"#;
+        for failed in [UNKNOWN_ERROR, UNKNOWN_FAILED, NO_ID] {
+            for latest_settled in [false, true] {
+                let up = upstream(vec![vec![CREATED_R1], vec![CREATED_R2]], Then::Hold).await;
+                let (mut client, rt, credential) = proxy_with(&up.url, true, STEERING).await;
+                client.send(CREATE).await;
+                expect(&mut client, &[CREATED_R1], "older open").await;
+                client.send(FLEX).await;
+                expect(&mut client, &[CREATED_R2], "latest open").await;
+                if latest_settled {
+                    up.push.send([END2, BARRIER].map(str::to_owned).to_vec()).unwrap();
+                    expect(&mut client, &[END2, BARRIER], "latest success").await;
+                    let got = pop(&rt);
+                    assert_eq!(got.len(), 1, "{got:?}");
+                    success(&got[0], [11, 7, 18], "latest success");
+                    assert_eq!(got[0]["service_tier"], "flex");
+                }
+                up.push.send([failed, BARRIER].map(str::to_owned).to_vec()).unwrap();
+                expect(&mut client, &[failed, BARRIER], "fallback failure").await;
+                let got = records(&rt, usize::from(!latest_settled)).await;
+                if latest_settled {
+                    assert!(got.is_empty(), "do not fail the older open response: {got:?}");
+                } else {
+                    assert_eq!(got.len(), 1, "the latest outcome must publish while open: {got:?}");
+                    failure(&got[0], 400, "latest failure");
+                    assert_eq!(got[0]["service_tier"], "flex");
+                }
+                up.push.send([END1, BARRIER].map(str::to_owned).to_vec()).unwrap();
+                expect(&mut client, &[END1, BARRIER], "older success").await;
+                let got = records(&rt, 1).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                success(&got[0], [5, 3, 8], "older success");
+                assert_eq!(got[0]["service_tier"], "auto");
+                end(client, End::Graceful, &up).await;
+                assert!(records(&rt, 0).await.is_empty(), "no late cancellation or duplicate");
+                assert_eq!(up.frames(), [CREATE, FLEX]);
+                assert_eq!(*up.dials.lock().unwrap(), 1);
+                assert!(rt.store().cooldowns(&credential).is_empty());
+            }
+        }
+    }
+
     /// Frames the proxy answers itself never go upstream and get no record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frames_refused_locally_get_no_record() {
