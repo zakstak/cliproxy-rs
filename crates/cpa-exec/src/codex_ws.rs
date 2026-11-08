@@ -1142,16 +1142,22 @@ impl Turn {
 
     /// Quota headers and usage from one upstream event.
     fn observe(&mut self, payload: &str) {
+        self.signals(payload);
+        if self.usage.enabled() {
+            self.usage
+                .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
+        }
+    }
+
+    /// Interrupt acknowledgements and quota headers from one upstream event; a duplex
+    /// stream reports its usage per response itself.
+    fn signals(&mut self, payload: &str) {
         if let Some(id) = acknowledged_id(payload) {
             self.conn.acknowledged(&id);
         }
         if let Some(headers) = codex_quota::event_headers(payload) {
             codex_quota::merge(&mut self.observed, &headers);
             self.quota.observe(&self.credential, &self.model, &self.observed);
-        }
-        if self.usage.enabled() {
-            self.usage
-                .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
         }
     }
 

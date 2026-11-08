@@ -515,6 +515,13 @@ receives (`ExecError::delivered_event`).
   response's failure is handled like a failure before anything was delivered, and a later
   failure is an event that the client may correct on the same socket. That recovery
   belongs to the Go-defined steering transport; the pinned client does not use it.
+  The proxy ends the socket after delivering a failure it cannot safely associate with
+  a running response or pending create. Started-response settings retain 16 starts.
+  After any eviction, an unmatched failure ID is ambiguous because it might name a
+  forgotten settled response. Open and retained IDs still identify their own responses.
+  Before eviction, assigning an unmatched ID to the oldest pending create is inherited
+  proxy policy from Go, with unknown provider applicability. The pinned client supplies
+  no FIFO ownership rule for steering failures.
 - An account failure (classified 401, 402, 403 or 429) never reaches the client as sent,
   on any path: an ordinary turn, the first or a later response of a steering connection,
   or a create still waiting in the duplex queue. Its frame can name the pooled account or

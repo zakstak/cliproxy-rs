@@ -26,7 +26,8 @@
 //! WebSocket mode runs full duplex. The executor keeps the upstream socket for the rest of
 //! the connection and, after the first `response.created`, takes the client's later frames
 //! (`response.steer`, more creates) from the connection's frame queue. That turn ends only
-//! with the connection.
+//! with the connection; its usage is recorded per upstream response as each one settles
+//! (the executor detaches the turn's record), not when the turn ends.
 //!
 //! Handshake metadata: this 101 precedes the first request, which chooses the credential
 //! and the model, so the upstream socket's handshake comes later. A turn that opens a

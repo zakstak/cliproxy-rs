@@ -1609,3 +1609,306 @@ async fn later_creates_get_the_sockets_model_before_they_start() {
         "the client's frames only, as sent"
     );
 }
+
+// ------------------------------------------------------------------ usage records (#25)
+
+/// Usage records as a steering connection makes them: every settlement in order, as the
+/// record's label and status (200 for a publish). A record that settles twice shows
+/// twice. The detached bootstrap record is `bootstrap`, a create's record its
+/// `service_tier`, and an automatic successor's its parent's label plus `+auto`.
+#[derive(Clone)]
+struct Ledger {
+    label: String,
+    settled: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl Ledger {
+    fn attempt() -> Self {
+        Self {
+            label: "attempt".into(),
+            settled: Arc::default(),
+        }
+    }
+
+    fn record(&self, label: String) -> Option<Arc<dyn cpa_core::exec::UsageObserver>> {
+        Some(Arc::new(Self {
+            label,
+            settled: self.settled.clone(),
+        }))
+    }
+
+    fn settle(&self, status: u16) {
+        self.settled.lock().unwrap().push((self.label.clone(), status));
+    }
+
+    /// The settlements so far, sorted: which record settles first when the connection
+    /// drops several is not the point.
+    fn sorted(&self) -> Vec<(String, u16)> {
+        let mut settled = self.settled.lock().unwrap().clone();
+        settled.sort();
+        settled
+    }
+}
+
+impl cpa_core::exec::UsageObserver for Ledger {
+    fn response_body(&self, _: Format, _: &[u8]) {}
+    fn response_line(&self, _: Format, _: &[u8]) {}
+    fn request(&self, _: Format, _: &[u8]) {}
+    fn publish(&self) {
+        self.settle(200);
+    }
+    fn publish_failure(&self, status: u16, _: &str) {
+        self.settle(status);
+    }
+    fn detach(&self) -> Option<Arc<dyn cpa_core::exec::UsageObserver>> {
+        self.record("bootstrap".into())
+    }
+    fn successor(&self, request: Option<&[u8]>) -> Option<Arc<dyn cpa_core::exec::UsageObserver>> {
+        self.record(match request {
+            Some(frame) => get(&String::from_utf8_lossy(frame), "service_tier"),
+            None => format!("{}+auto", self.label),
+        })
+    }
+}
+
+fn tiered(tier: &str) -> String {
+    format!(r#"{{"type":"response.create","model":"gpt-6-astra","service_tier":"{tier}","input":[]}}"#)
+}
+
+fn event(kind: &str, id: &str) -> String {
+    format!(r#"{{"type":"{kind}","response":{{"id":"{id}","output":[]}}}}"#)
+}
+
+/// The steering stream has ended and its records settled: the duplex released the
+/// client queue, which it holds until it is gone (on this single-threaded runtime, its
+/// drop has then finished).
+async fn duplex_gone(client: &Client) {
+    tokio::time::timeout(Duration::from_secs(5), client.frames.clone().lock_owned())
+        .await
+        .expect("the duplex released the client queue");
+}
+
+/// A failure that names a response the socket saw start settles that response's record,
+/// even while a later response runs and a create waits: the waiting create keeps its
+/// own record and stays an explicit request (its metadata precedes its
+/// `response.created`). A failure naming a settled response settles nothing more. One
+/// naming a response the socket never saw start is still the rejection of the oldest
+/// waiting create, and the responses running keep running. Every event reaches the
+/// client as sent.
+#[tokio::test]
+async fn a_failure_settles_the_response_it_names() {
+    const LATER: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-6-astra-served"}}"#;
+    const FAILED_R1: &str = r#"{"type":"response.failed","response":{"id":"r1","output":[],"error":{"type":"invalid_request_error","message":"r1 failed"}}}"#;
+    const ERROR_R1: &str = r#"{"type":"error","status":400,"response_id":"r1","error":{"type":"invalid_request_error","message":"r1 rejected"}}"#;
+    const UNSTARTED: &str = r#"{"type":"error","status":400,"response_id":"never-started","error":{"type":"invalid_request_error","message":"rejected before it started"}}"#;
+    // (case, r1 completes before r2 starts, failure, the create waiting is rejected)
+    for (name, settled_first, failure, rejects) in [
+        ("older open, response.id", false, FAILED_R1, false),
+        ("older open, response_id", false, ERROR_R1, false),
+        ("settled", true, FAILED_R1, false),
+        ("never started", false, UNSTARTED, true),
+    ] {
+        let up = Scripted::start_with_handshake(
+            &[("openai-model", "gpt-6-astra-served")],
+            move |mut c: Peer| async move {
+                c.read().await;
+                c.write(&event("response.created", "r1")).await;
+                if settled_first {
+                    c.write(&event("response.completed", "r1")).await;
+                }
+                c.read().await;
+                c.write(&event("response.created", "r2")).await;
+                // The third create is upstream, not started: only then does the failure come.
+                c.read().await;
+                c.write(failure).await;
+                c.write(&event("response.completed", "r2")).await;
+                if rejects {
+                    c.write(&event("response.completed", "r1")).await;
+                } else {
+                    c.write(&event("response.created", "r3")).await;
+                    c.write(&event("response.completed", "r3")).await;
+                }
+                c.idle().await;
+            },
+        )
+        .await;
+        let client = Client::new(&format!("named-failure-{name}"));
+        let ledger = Ledger::attempt();
+        let usage = cpa_core::exec::UsageSink::new(Arc::new(ledger.clone()));
+        let mut stream = client
+            .start_with(&up.url, &tiered("auto"), Format::OpenAIResponse, usage)
+            .await;
+        let last = if rejects {
+            ("response.completed", "r1")
+        } else {
+            ("response.completed", "r3")
+        };
+        let mut delivered = Vec::new();
+        while let Some(chunk) = next(&mut stream).await {
+            let chunk = chunk.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (kind, id) = (get(&chunk, "type"), get(&chunk, "response.id"));
+            delivered.push(chunk);
+            match (kind.as_str(), id.as_str()) {
+                ("response.created", "r1") => client.send(&tiered("flex")).await,
+                ("response.created", "r2") => client.send(&tiered("priority")).await,
+                _ => {}
+            }
+            if (kind.as_str(), id.as_str()) == last {
+                break;
+            }
+        }
+        let mut want = vec![event("response.created", "r1")];
+        if settled_first {
+            want.push(event("response.completed", "r1"));
+        }
+        want.extend([LATER.to_owned(), event("response.created", "r2"), failure.to_owned()]);
+        want.push(event("response.completed", "r2"));
+        if rejects {
+            want.push(event("response.completed", "r1"));
+        } else {
+            want.extend([
+                LATER.to_owned(),
+                event("response.created", "r3"),
+                event("response.completed", "r3"),
+            ]);
+        }
+        assert_eq!(
+            delivered, want,
+            "{name}: every event as sent, metadata before explicit creates"
+        );
+        drop(stream);
+        duplex_gone(&client).await;
+        let want: Vec<(String, u16)> = match name {
+            "settled" => vec![("bootstrap", 200), ("flex", 200), ("priority", 200)],
+            "never started" => vec![("bootstrap", 200), ("flex", 200), ("priority", 400)],
+            _ => vec![("bootstrap", 400), ("flex", 200), ("priority", 200)],
+        }
+        .into_iter()
+        .map(|(label, status)| (label.to_owned(), status))
+        .collect();
+        assert_eq!(ledger.sorted(), want, "{name}: one settlement per record, its own");
+        up.finish().await;
+    }
+}
+
+/// An upstream outcome whose observation already started when the consumer left still
+/// settles its own record, once, as it would have with the consumer there: a terminal
+/// as a success, a failure or a rejection as that failure, an account failure every
+/// record. Only what it does not settle is the client's cancellation (499), as is a
+/// failure no request can be assigned. Nothing is delivered after the consumer left.
+#[tokio::test]
+async fn an_outcome_observed_when_the_consumer_leaves_still_settles() {
+    /// Holds every observation but `response.created`'s until `release`, telling `held`
+    /// when it starts, and `repolled` when polled again after `left` was set.
+    struct Holding {
+        held: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        left: std::sync::atomic::AtomicBool,
+        repolled: tokio::sync::Notify,
+    }
+    impl cpa_core::exec::WebSocketObserver for Holding {
+        fn response<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a cpa_core::credential::Credential,
+            _: &'a str,
+            payload: &'a [u8],
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if crate::rawjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.created" {
+                    return;
+                }
+                self.held.notify_one();
+                let mut acquire = std::pin::pin!(self.release.acquire());
+                std::future::poll_fn(|cx| {
+                    if self.left.load(Ordering::SeqCst) {
+                        self.repolled.notify_one();
+                    }
+                    acquire.as_mut().poll(cx).map(|permit| permit.unwrap().forget())
+                })
+                .await;
+            })
+        }
+    }
+    let statuses = |pairs: &[(&str, u16)]| -> Vec<(String, u16)> {
+        let mut v: Vec<(String, u16)> = pairs.iter().map(|(l, s)| ((*l).to_owned(), *s)).collect();
+        v.sort();
+        v
+    };
+    // r1 runs (the detached bootstrap record) and a `flex` create waits upstream when the
+    // held message arrives.
+    for (name, held, want) in [
+        (
+            "completed",
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}"#,
+            statuses(&[("bootstrap", 200), ("flex", 499)]),
+        ),
+        (
+            "failed",
+            r#"{"type":"response.failed","response":{"id":"r1","output":[],"error":{"type":"invalid_request_error","message":"failed"}}}"#,
+            statuses(&[("bootstrap", 400), ("flex", 499)]),
+        ),
+        (
+            "error naming r1",
+            r#"{"type":"error","status":400,"response_id":"r1","error":{"type":"invalid_request_error","message":"rejected"}}"#,
+            statuses(&[("bootstrap", 400), ("flex", 499)]),
+        ),
+        (
+            "rejected create",
+            r#"{"type":"error","status":400,"response_id":"never-started","error":{"type":"invalid_request_error","message":"rejected"}}"#,
+            statuses(&[("bootstrap", 499), ("flex", 400)]),
+        ),
+        (
+            "ambiguous",
+            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"whose?"}}"#,
+            statuses(&[("bootstrap", 499), ("flex", 499)]),
+        ),
+        (
+            "account failure",
+            r#"{"type":"error","status":401,"error":{"type":"authentication_error","message":"expired"}}"#,
+            statuses(&[("bootstrap", 401), ("flex", 401)]),
+        ),
+    ] {
+        let up = Scripted::start(move |mut c: Peer| async move {
+            c.read().await;
+            c.write(&event("response.created", "r1")).await;
+            c.read().await;
+            c.write(held).await;
+            c.idle().await;
+        })
+        .await;
+        let client = Client::new(&format!("observed-outcome-{name}"));
+        let observer = Arc::new(Holding {
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            left: Default::default(),
+            repolled: tokio::sync::Notify::new(),
+        });
+        let ledger = Ledger::attempt();
+        let usage = cpa_core::exec::UsageSink::new(Arc::new(ledger.clone())).with_websocket(Some(observer.clone()));
+        let mut stream = client
+            .start_with(&up.url, &tiered("auto"), Format::OpenAIResponse, usage)
+            .await;
+        let created = next(&mut stream).await.unwrap().unwrap();
+        assert_eq!(created, event("response.created", "r1"), "{name}");
+        client.send(&tiered("flex")).await;
+        tokio::time::timeout(Duration::from_secs(5), observer.held.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the message was not observed"));
+        assert!(
+            ledger.sorted().is_empty(),
+            "{name}: settled before its observation returned"
+        );
+        // The consumer leaves while the observation runs. A poll of it after that shows
+        // the duplex saw the consumer gone: its stream no longer delivers.
+        drop(stream);
+        observer.left.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), observer.repolled.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the observation was not polled after the consumer left"));
+        observer.release.add_permits(1);
+        duplex_gone(&client).await;
+        assert_eq!(ledger.sorted(), want, "{name}");
+        up.finish().await;
+    }
+}
