@@ -320,6 +320,8 @@ fn without_removed(text: &str) -> String {
     if !text.trim_start().starts_with('{') {
         return cpa_core::removed::strip_settings(text);
     }
+    // Go's default discovery subtypes include the removed Gemini protocols.
+    let text = text.replace(r#","_generate-content","_interactions""#, "");
     let mut out = text.as_bytes().to_vec();
     for key in [
         "gemini-api-key",
@@ -346,7 +348,7 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
     let dir = std::env::temp_dir().join(format!("cpa-legacy-alias-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.yaml");
-    let yaml = "config-version: 8\nmanagement:\n  secret-key: '$HASH'\napi-keys:\n  gemini:\n    - name: g\n      keys: [{api-key: fake-g1}, {api-key: fake-g2}]\n  vertex:\n    - name: v\n      keys: [{api-key: fake-v1}]\n  openai-compatibility:\n    - name: Local\n      base-url: http://127.0.0.1:9/v1\n      keys: [{api-key: fake-o1}]\n";
+    let yaml = "config-version: 8\nmanagement:\n  secret-key: '$HASH'\napi-keys:\n  claude:\n    - name: g\n      keys: [{api-key: fake-g1}, {api-key: fake-g2}]\n  codex:\n    - name: v\n      base-url: http://127.0.0.1:9/v1\n      keys: [{api-key: fake-v1}]\n";
     std::fs::write(&path, with_auth_dir(&yaml.replace("$HASH", &hash), &dir)).unwrap();
     let (base, server) = serve(&path).await;
     let client = wreq::Client::new();
@@ -356,15 +358,16 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
             .bearer_auth("fake-secret")
             .send()
     };
-    // Each sign-in answers a fresh state; the rest of the answer matches.
+    // Each sign-in answers a fresh state and PKCE challenge; the rest of the answer
+    // matches.
     let mut started = Vec::new();
     for path in [
-        "/v0/management/antigravity-auth-url",
-        "/v8/management/oauth/auth-url?provider=antigravity",
+        "/v0/management/anthropic-auth-url",
+        "/v8/management/oauth/auth-url?provider=claude",
     ] {
         let v: Value = get("GET", path).await.unwrap().json().await.unwrap();
-        let state = v["state"].as_str().unwrap();
-        started.push((v["status"].clone(), v["url"].as_str().unwrap().replace(state, "STATE")));
+        let url = v["url"].as_str().unwrap();
+        started.push((v["status"].clone(), url.split('?').next().unwrap().to_owned()));
     }
     assert_eq!(started[0], started[1]);
     assert_eq!(started[0].0, "ok");
@@ -373,9 +376,10 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
             "/v0/management/xai-auth-url?is_webui=true",
             "/v8/management/oauth/auth-url?provider=xai&is_webui=true",
         ),
+        // A removed provider's login: the same migration error on both (issue #49).
         (
-            "/v0/management/devin-auth-url",
-            "/v8/management/oauth/auth-url?provider=devin",
+            "/v0/management/kimi-auth-url",
+            "/v8/management/oauth/auth-url?provider=kimi",
         ),
         ("/v0/management/logs", "/v8/management/observability/logs"),
         (
@@ -402,13 +406,13 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
         (b.status(), b.text().await.unwrap())
     );
 
-    let lists: Value = get("GET", "/v0/management/gemini-api-key")
+    let lists: Value = get("GET", "/v0/management/claude-api-key")
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let entries = lists["gemini-api-key"].as_array().unwrap();
+    let entries = lists["claude-api-key"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     let config = Config::load(&path).unwrap();
     let expected = |key: &str| {
@@ -422,28 +426,15 @@ async fn v0_aliases_match_v8_and_lists_carry_live_auth_indexes() {
     for (entry, key) in entries.iter().zip(["fake-g1", "fake-g2"]) {
         assert_eq!(entry["auth-index"].as_str(), Some(expected(key).as_str()), "{entry}");
     }
-    let vertex: Value = get("GET", "/v0/management/vertex-api-key")
+    let codex: Value = get("GET", "/v0/management/codex-api-key")
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
     assert_eq!(
-        vertex["vertex-api-key"][0]["auth-index"].as_str(),
+        codex["codex-api-key"][0]["auth-index"].as_str(),
         Some(expected("fake-v1").as_str())
-    );
-    let compat: Value = get("GET", "/v0/management/openai-compatibility")
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let entry = &compat["openai-compatibility"][0];
-    assert_eq!(entry["disabled"], false);
-    assert_eq!(
-        entry["api-key-entries"][0]["auth-index"].as_str(),
-        Some(expected("fake-o1").as_str()),
-        "{compat}"
     );
     server.abort();
     let _ = std::fs::remove_dir_all(&dir);

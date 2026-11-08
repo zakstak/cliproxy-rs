@@ -163,7 +163,11 @@ async fn body_limit_answers_match_go() {
         // The removed providers' routes (issue #49) answer 410 with migration guidance
         // before reading the body.
         let path = case["path"].as_str().unwrap();
-        if path.starts_with("/v1beta/") || path.contains("vertex") {
+        if path.starts_with("/v1beta/")
+            || ["vertex", "gemini-api-key", "interactions-api-key", "openai-compatibility", "antigravity", "kimi", "devin"]
+                .iter()
+                .any(|p| path.contains(p))
+        {
             if got.0 != 410 || !got.2.contains("is no longer supported") {
                 failures.push(format!("{name}: got {got:?}, want a removed-provider 410"));
             }

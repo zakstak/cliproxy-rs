@@ -489,13 +489,8 @@ fn load_normalize(cfg: &mut Value) {
         if d.get("subtypes").and_then(Value::as_array).is_none_or(Vec::is_empty) {
             d.insert(
                 "subtypes".into(),
-                serde_json::json!([
-                    "_chat-completions",
-                    "_responses",
-                    "_messages",
-                    "_generate-content",
-                    "_interactions"
-                ]),
+                // Go's default without the removed Gemini protocols (issue #49).
+                serde_json::json!(["_chat-completions", "_responses", "_messages"]),
             );
         }
     }

@@ -178,7 +178,10 @@ pub fn strip_settings(yaml: &str) -> String {
         "devin-catalog:",
         "kimi:",
     ];
-    let mut out = String::new();
+    const FLOW: [&str; 5] = ["{antigravity:", "{aistudio:", "{devin:", "{gemini:", "{vertex:"];
+    let mut kept: Vec<String> = Vec::new();
+    // Output lines that lost a child block to the strip.
+    let mut emptied: Vec<usize> = Vec::new();
     let mut skip: Option<usize> = None;
     for line in yaml.split_inclusive('\n') {
         let indent = line.len() - line.trim_start().len();
@@ -191,17 +194,30 @@ pub fn strip_settings(yaml: &str) -> String {
         }
         if KEYS.iter().any(|k| text.starts_with(k)) {
             skip = Some(indent);
+            if let Some(last) = kept.len().checked_sub(1) {
+                emptied.push(last);
+            }
             continue;
         }
-        if ["{antigravity:", "{aistudio:", "{devin:", "{gemini:", "{vertex:"]
-            .iter()
-            .any(|k| line.contains(k))
-        {
+        if FLOW.iter().any(|k| line.contains(k)) {
             continue;
         }
-        out.push_str(line);
+        kept.push(line.to_owned());
     }
-    out
+    // A mapping key whose only children were stripped reads as an empty mapping, not
+    // null, as its Go source would have it.
+    for &i in &emptied {
+        let indent = kept[i].len() - kept[i].trim_start().len();
+        let body = kept[i].trim_end().to_owned();
+        let has_child = kept[i + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| l.len() - l.trim_start().len() > indent);
+        if body.ends_with(':') && !has_child {
+            kept[i] = format!("{body} {{}}\n");
+        }
+    }
+    kept.concat()
 }
 
 #[cfg(test)]

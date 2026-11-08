@@ -266,8 +266,10 @@ async fn media_routes_match_go() {
     // (docs/DIFFERENCES-FROM-GO.md).
     let mut failures = replay("media", &media, |s| {
         if s.name.starts_with("models_grok_shell") {
-            s.response
-                .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}"))
+            without_compat_models(
+                &s.response
+                    .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}")),
+            )
         } else {
             forward_port::gpt_image_26::error_message(&s.response)
         }
@@ -283,6 +285,24 @@ async fn media_routes_match_go() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+/// Go's model list without the recorded OpenAI-compatible group's models (`chat`,
+/// `img`), which went with that provider (issue #49). Other bytes stay as recorded.
+fn without_compat_models(body: &str) -> String {
+    let mut out = body.as_bytes().to_vec();
+    loop {
+        let ids = cpa_common::json::get(&out, "data.#.id");
+        let Some(i) = ids
+            .array()
+            .iter()
+            .position(|id| matches!(&*id.str(), "chat" | "img"))
+        else {
+            break;
+        };
+        assert!(cpa_common::json::delete(&mut out, &format!("data.{i}")));
+    }
+    String::from_utf8(out).unwrap()
 }
 
 /// Replays `fixture` on a fresh runtime; `expected` is the response a scenario must give.

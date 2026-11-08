@@ -268,7 +268,8 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     // An empty remote `meta` section keeps the current one (Go tryRefreshModels).
     cpa_server::model_updater::refresh(&urls(&["no-meta"])).await;
     assert_eq!(catalog_generation(), generation + 1, "identical once meta is kept");
-    assert_eq!(pinned().channel("meta").len(), meta_before);
+    // The refreshed `meta` section carries the typed model too.
+    assert_eq!(pinned().channel("meta").len(), meta_before + 1);
 
     // `-0` is Go's 0 in the static catalog, the Meta credential's registration, the
     // client model list and the management rendering; the last of repeated header names

@@ -514,7 +514,8 @@ mod tests {
                 "{name}: typed thinking"
             );
         }
-        assert_eq!((bound, codex_oauth), (25, 4));
+        // 25 in Go; the OpenAI-compatible and Vertex cases went with those providers.
+        assert_eq!((bound, codex_oauth), (21, 4));
     }
 
     /// Go `TestResolveModelInfoConfiguredThinkingKeepsCatalogDisableType`: configured levels

@@ -691,23 +691,7 @@ async fn misc_routes_match_go() {
         cpa_server::runtime::OAuthDelivery::Delivered
     })));
     let callback = |path: &'static str| client.get(format!("{}{path}", p.url)).send();
-    let ok = callback("/callback?code=%20c1%20&state=s1").await.unwrap();
-    assert_eq!(ok.status().as_u16(), 200);
-    assert_eq!(
-        *got.lock().unwrap(),
-        Some(("devin", "s1".to_owned(), "c1".to_owned(), String::new()))
-    );
-    // Go's Devin handler trims `error` before falling back to `error_description`, so a
-    // blank error still reports the denial (server_routes.go devinCallbackHandler).
-    let denied = callback("/callback?state=s2&error=%20&error_description=access_denied")
-        .await
-        .unwrap();
-    assert_eq!(denied.status().as_u16(), 200);
-    assert_eq!(
-        *got.lock().unwrap(),
-        Some(("devin", "s2".to_owned(), String::new(), "access_denied".to_owned()))
-    );
-    // The other providers' handlers read `error` untrimmed: a blank one wins.
+    // The provider handlers read `error` untrimmed: a blank one wins.
     let blank = callback("/anthropic/callback?state=s3&error=%20&error_description=access_denied")
         .await
         .unwrap();
@@ -730,26 +714,6 @@ async fn misc_routes_match_go() {
     let other = callback("/anthropic/callback?state=siwc&code=c").await.unwrap();
     assert_eq!(other.status().as_u16(), 200);
     assert_eq!(other.headers()["content-type"], "text/html; charset=utf-8");
-    // Interactions validation (interactions_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/interactions", r#"{"model":"a","agent":"b"}"#).await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            400,
-            r#"{"error":{"message":"request requires exactly one of model or agent","type":"invalid_request_error"}}"#
-        )
-    );
-    // Gemini action parsing (gemini_handlers.go).
-    let (status, _, text) = post(&p.url, "/v1beta/models/x", "{}").await;
-    assert_eq!(
-        (status, text.as_str()),
-        (
-            404,
-            r#"{"error":{"message":"/v1beta/models/x not found.","type":"invalid_request_error"}}"#
-        )
-    );
-    let (status, _, text) = post(&p.url, &format!("/v1beta/models/{MODEL}:embed"), "{}").await;
-    assert_eq!((status, text.as_str()), (200, ""));
     // Compact through Claude (v8.0.35 2bc236d2): one non-stream summary turn, sealed
     // into a single compaction item.
     let (status, _, text) = post(

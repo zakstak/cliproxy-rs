@@ -887,7 +887,7 @@ async fn unreadable_auth_dir_never_blocks_secret_rotation_or_removal() {
 async fn writes_normalize_only_what_they_touch() {
     let f = Fixture::new("scoped");
     let path = f.dir.join("config.yaml");
-    let dirty = "  excluded-models:\n    Claude: [' Opus-X ', opus-x] # dirty\n    gemini: [a]\n  model-alias:\n    claude:\n      - {name: a, alias: a} # self alias\n";
+    let dirty = "  excluded-models:\n    Claude: [' Opus-X ', opus-x] # dirty\n    xai: [a]\n  model-alias:\n    claude:\n      - {name: a, alias: a} # self alias\n";
     let text = f.file().replacen("oauth:\n", &format!("oauth:\n{dirty}"), 1)
         + "observability:\n  pprof:\n    addr: null # keep\n";
     std::fs::write(&path, &text).unwrap();
@@ -902,7 +902,7 @@ async fn writes_normalize_only_what_they_touch() {
     };
     let r = send(
         wreq::Method::PUT,
-        "/config/oauth/excluded-models/gemini",
+        "/config/oauth/excluded-models/xai",
         r#"[" B ", "b", "c"]"#,
     )
     .await
@@ -918,7 +918,7 @@ async fn writes_normalize_only_what_they_touch() {
         .json()
         .await
         .unwrap();
-    assert_eq!(config["oauth"]["excluded-models"]["gemini"], json!([" B ", "b", "c"]));
+    assert_eq!(config["oauth"]["excluded-models"]["xai"], json!([" B ", "b", "c"]));
     let r = send(
         wreq::Method::PATCH,
         "/config",
@@ -1235,75 +1235,6 @@ async fn config_key_field_patch_is_not_found() {
         (&before.attributes, &before.metadata)
     );
     assert_eq!(f.file(), file, "config.yaml must not change");
-    server.abort();
-}
-
-/// Go d9451cb6: the fields patch writes `openapi-location` and `openapi-models` under
-/// their canonical names, and a Vertex file then registers the partner models it lists.
-#[tokio::test]
-async fn openapi_field_aliases_patch_their_canonical_keys() {
-    let f = Fixture::from_yaml("openapi-fields", |auth, hash| {
-        std::fs::write(auth.join("vertex.json"), r#"{"type":"vertex","project_id":"p"}"#).unwrap();
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        )
-    });
-    let id = f.rt.store().snapshot()[0].id.clone();
-    let (base, server) = f.server().await;
-    assert!(!f.rt.registry().client_supports(&id, "meta/llama-4"));
-    let r = wreq::Client::new()
-        .patch(format!("{base}/v8/management/credentials/fields"))
-        .bearer_auth("fake-management-only")
-        .json(&json!({"name": "vertex.json", "openapi-location": "us-east5", "openapi-models": ["meta/llama-4"]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
-    let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("auth").join("vertex.json")).unwrap()).unwrap();
-    assert_eq!(saved["openapi_location"], "us-east5", "{saved}");
-    assert_eq!(saved["openapi_models"], json!(["meta/llama-4"]), "{saved}");
-    assert!(
-        saved.get("openapi-location").is_none() && saved.get("openapi-models").is_none(),
-        "{saved}"
-    );
-    assert!(f.rt.registry().client_supports(&id, "meta/llama-4"));
-    server.abort();
-}
-
-/// Go d9451cb6 `AccountInfo`: a service-account file without a top-level `email` is an
-/// OAuth account named by the service account's trimmed `client_email`, in both the v0
-/// and v8 auth-file lists; no `email` key is listed (Go `buildAuthFileEntryLocked`).
-#[tokio::test]
-async fn a_service_account_file_lists_its_client_email_as_the_account() {
-    let f = Fixture::from_yaml("sa-account", |auth, hash| {
-        std::fs::write(
-            auth.join("vertex-sa.json"),
-            r#"{"type":"vertex","project_id":"p","service_account":{"client_email":" sa@p.iam.gserviceaccount.com ","private_key":"unused"}}"#,
-        )
-        .unwrap();
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        )
-    });
-    let (base, server) = f.server().await;
-    for path in ["/v8/management/credentials", "/v0/management/auth-files"] {
-        let listed: Value = wreq::Client::new()
-            .get(format!("{base}{path}"))
-            .bearer_auth("fake-management-only")
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let entry = &listed["files"][0];
-        assert_eq!(entry["account"], "sa@p.iam.gserviceaccount.com", "{path}: {entry}");
-        assert_eq!(entry["account_type"], "oauth", "{path}: {entry}");
-        assert_eq!(entry["project_id"], "p", "{path}: {entry}");
-        assert!(entry.get("email").is_none(), "{path}: {entry}");
-    }
     server.abort();
 }
 
@@ -1633,66 +1564,6 @@ async fn credential_models_come_from_registrations() {
     server.abort();
 }
 
-/// Go v8.0.35 `GetStaticModelDefinitions` (`50cfd238`): a channel without a built-in
-/// catalog lists the models its credentials registered, sorted by ID, as Go's
-/// `registry.ModelInfo` encodes them; a channel with neither is still unknown
-/// (`TestGetStaticModelDefinitions_FallsBackToRegistryModelsForPerAuthPlugin`,
-/// `TestGetStaticModelDefinitions_BuiltInChannel`,
-/// `TestGetStaticModelDefinitions_RejectsUnknownChannel`).
-#[tokio::test]
-async fn model_definitions_fall_back_to_registered_models_by_channel() {
-    let f = Fixture::from_yaml("definitions", |auth, hash| {
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\napi-keys:\n  openai-compatibility:\n    - name: Acme\n      base-url: http://127.0.0.1:9/v1\n      models: [{{name: up-z, alias: zeta}}, {{name: up-a, alias: alpha}}]\n      keys: [{{api-key: fake-acme}}]\n",
-            auth.display()
-        )
-    });
-    let (base, server) = f.server().await;
-    let get = |channel: &str| {
-        wreq::Client::new()
-            .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
-            .bearer_auth("fake-management-only")
-            .send()
-    };
-    let r = get("OpenAI-Compatible-Acme").await.unwrap();
-    assert_eq!(r.status(), 200);
-    let v: Value = r.json().await.unwrap();
-    assert_eq!(v["channel"], "openai-compatible-acme");
-    let models = v["models"].as_array().unwrap();
-    let ids: Vec<_> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["alpha", "zeta"]);
-    for internal in [
-        "user_defined",
-        "is_compat",
-        "max_context_length",
-        "support_configuration_update",
-    ] {
-        assert!(
-            models.iter().all(|m| m.get(internal).is_none()),
-            "{internal}: {models:?}"
-        );
-    }
-    let v0: Value = wreq::Client::new()
-        .get(format!("{base}/v0/management/model-definitions/openai-compatible-acme"))
-        .bearer_auth("fake-management-only")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(v0, v, "v0 serves the same handler");
-    let r = get("claude").await.unwrap();
-    assert_eq!(r.status(), 200, "the built-in catalog still wins");
-    let r = get("nobody").await.unwrap();
-    assert_eq!(r.status(), 400);
-    assert_eq!(
-        r.json::<Value>().await.unwrap(),
-        json!({"channel": "nobody", "error": "unknown channel"})
-    );
-    server.abort();
-}
-
 /// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
 /// the Codex, xAI and Devin built-ins. Every channel answers Go's bytes, recorded by
 /// `reference/manage` (its second output), with the GPT Image 2.6 forward port in the
@@ -1702,6 +1573,13 @@ async fn model_definitions_match_go_by_channel() {
     let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
     forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
+    // The removed providers' channels (issue #49) are unknown here.
+    let removed: Vec<String> = go
+        .keys()
+        .filter(|c| !matches!(c.as_str(), "claude" | "codex" | "xai" | "meta"))
+        .cloned()
+        .collect();
+    go.retain(|c, _| !removed.contains(c));
     let f = Fixture::from_yaml("definitions-go", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
@@ -1717,9 +1595,6 @@ async fn model_definitions_match_go_by_channel() {
     };
     // Aliases answer their canonical section under the requested (lowercased) name.
     let aliases = [
-        ("kimi-ai", "kimi"),
-        ("Kimi.AI", "kimi"),
-        ("kimi.com", "kimi"),
         ("x-ai", "xai"),
         ("GROK", "xai"),
         ("muse", "meta"),
@@ -1737,7 +1612,11 @@ async fn model_definitions_match_go_by_channel() {
         assert_eq!(r.text().await.unwrap(), want, "{channel}");
         compared += 1;
     }
-    assert_eq!(compared, 17);
+    assert_eq!(compared, 7);
+    for channel in removed {
+        let r = get(channel.clone()).await.unwrap();
+        assert_eq!(r.status(), 400, "{channel}");
+    }
     server.abort();
 }
 
@@ -1801,9 +1680,14 @@ async fn model_definitions_fall_back_to_plugin_static_models() {
 /// echoed `auth_index`/`auth-index` fields instead of saving them.
 #[tokio::test]
 async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
+    let mut fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
+    // The removed providers' groups go (issue #49).
+    for family in ["gemini", "interactions", "vertex", "openai-compatibility"] {
+        fixture["response"].as_object_mut().unwrap().remove(family);
+    }
+    let config = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
     let f = Fixture::from_yaml("authindex", |auth, hash| {
-        fixture["config"].as_str().unwrap().replace(
+        config.replace(
             "config-version: 8\n",
             &format!(
                 "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
@@ -1848,11 +1732,11 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
         .text()
         .await
         .unwrap();
-    assert!(yaml.contains("fake-o2") && !yaml.contains("896fb130477af684"), "{yaml}");
+    assert!(yaml.contains("fake-c2") && !yaml.contains("auth-index"), "{yaml}");
 
     // Echo the read back, at the provider list and at the root.
-    let acme = read["openai-compatibility"].clone();
-    let r = send(wreq::Method::PUT, "/api-keys/openai-compatibility", acme.to_string())
+    let codex = read["codex"].clone();
+    let r = send(wreq::Method::PUT, "/api-keys/codex", codex.to_string())
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
@@ -2143,7 +2027,7 @@ async fn github_token_stays_out_of_the_v0_config_json() {
 /// `/abs/models.json` is not absolute on Windows.
 #[tokio::test]
 async fn model_catalog_sources_survive_a_legacy_save() {
-    let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n  devin-catalog: 'http://localhost/devin.json'\n";
+    let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n";
     let f = Fixture::from_yaml("catalog-legacy", |auth, hash| private_config(raw, auth, hash, true));
     let (base, server) = f.server().await;
     let (status, text) = call(
@@ -2159,7 +2043,7 @@ async fn model_catalog_sources_survive_a_legacy_save() {
     let models = Config::parse(&file).unwrap().document["models"].clone();
     assert_eq!(
         serde_json::to_value(models).unwrap(),
-        json!({"catalog": "/abs/models.json", "codex-catalog": "https://codex.example.invalid/codex.json", "devin-catalog": "http://localhost/devin.json"}),
+        json!({"catalog": "/abs/models.json", "codex-catalog": "https://codex.example.invalid/codex.json"}),
         "{file}"
     );
     server.abort();
@@ -3427,14 +3311,14 @@ async fn config_writes_render_json_values_as_block_yaml() {
             r#"[{{"name":"compat-{n}","base-url":"https://api.example.com","headers":{{"User-Agent":"$User-Agent"}},"models":[{{"alias":"coding","name":"gpt-4o"}}],"keys":[{{"api-key":"fake-compat-{n}"}}]}}]"#
         )
     };
-    let block = "api-keys:\n  openai-compatibility:\n    - name: compat-N\n      base-url: https://api.example.com\n      headers:\n        User-Agent: $User-Agent\n      models:\n        - alias: coding\n          name: gpt-4o\n      keys:\n        - api-key: fake-compat-N\n";
-    let r = send(wreq::Method::PUT, "/config/api-keys/openai-compatibility", &compat("1"))
+    let block = "api-keys:\n  claude:\n    - name: compat-N\n      base-url: https://api.example.com\n      headers:\n        User-Agent: $User-Agent\n      models:\n        - alias: coding\n          name: gpt-4o\n      keys:\n        - api-key: fake-compat-N\n";
+    let r = send(wreq::Method::PUT, "/config/api-keys/claude", &compat("1"))
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(f.file().ends_with(&block.replace('N', "1")), "{}", f.file());
     let patch = format!(
-        r#"{{"api-keys":{{"openai-compatibility":{}}},"server":{{"trusted-proxies":[]}}}}"#,
+        r#"{{"api-keys":{{"claude":{}}},"server":{{"trusted-proxies":[]}}}}"#,
         compat("2")
     );
     let r = send(wreq::Method::PATCH, "/config", &patch).await.unwrap();
@@ -3449,7 +3333,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
     // A whole-config PUT is all JSON: block collections and plain keys throughout, and
     // the saved file loads.
     let root = format!(
-        r#"{{"config-version":8,"management":{{"secret-key":"fake-management-only"}},"server":{{"port":8317}},"api-keys":{{"openai-compatibility":{}}}}}"#,
+        r#"{{"config-version":8,"management":{{"secret-key":"fake-management-only"}},"server":{{"port":8317}},"api-keys":{{"claude":{}}}}}"#,
         compat("3")
     );
     let r = send(wreq::Method::PUT, "/config", &root).await.unwrap();
@@ -3460,7 +3344,7 @@ async fn config_writes_render_json_values_as_block_yaml() {
         assert!(!file.contains(quoted), "{quoted} in {file}");
     }
     let loaded = cpa_core::config::Config::parse(&file).unwrap();
-    let compat = &loaded.document["api-keys"]["openai-compatibility"][0];
+    let compat = &loaded.document["api-keys"]["claude"][0];
     assert_eq!(compat["headers"]["User-Agent"].as_str(), Some("$User-Agent"));
     server.abort();
 }

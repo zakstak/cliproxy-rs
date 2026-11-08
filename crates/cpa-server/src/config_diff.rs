@@ -696,11 +696,24 @@ mod tests {
         };
         let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/config_diff_go.json")).unwrap();
         let mut refused = 0;
+        let removed = |e: &anyhow::Error| e.to_string().contains("which is no longer supported");
+        let mut skipped = 0;
         for (i, case) in list(&cases).iter().enumerate() {
-            let old = Config::parse(&private_paths(text(&case["old"]))).unwrap();
+            // A case that sets a removed provider's settings is refused at load (issue #49).
+            let old = match Config::parse(&private_paths(text(&case["old"]))) {
+                Err(e) if removed(&e) => {
+                    skipped += 1;
+                    continue;
+                }
+                parsed => parsed.unwrap(),
+            };
             // A `codex-api-key` model marked `is-compat` makes the reload invalid (#28); the
             // running config stays, so there is no summary. Other providers keep the flag.
             let new = match Config::parse(&private_paths(text(&case["new"]))) {
+                Err(error) if removed(&error) => {
+                    skipped += 1;
+                    continue;
+                }
                 Err(error) if error.to_string().contains("is-compat is no longer supported") => {
                     assert!(text(&case["new"]).contains("codex-api-key"), "case {i}: {error}");
                     refused += 1;
@@ -717,6 +730,7 @@ mod tests {
             assert!(!actual.join("\n").contains("fixture-secret"));
         }
         assert_eq!(refused, 1, "the one Codex is-compat case");
+        assert_eq!(skipped, 0, "removed-provider cases");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -283,18 +283,27 @@ async fn websocket_turns_ignore_every_rewrite_control() {
     }
 }
 
-/// The control: another provider (Grok) under the same config still gets the
+/// The control: another provider (Claude) under the same config still gets the
 /// shared payload rules, so they are scoped to other providers, not silently dead.
 #[tokio::test]
 async fn other_providers_keep_the_shared_payload_rules() {
-    // Grok stands in for the other providers (Go's test used an OpenAI-compatible
-    // upstream, removed with issue #49).
+    // Claude stands in for the other providers (Go's test used an OpenAI-compatible
+    // upstream, removed with issue #49; Grok sends the Codex wire format, so Codex-scoped
+    // rules apply to it).
+    let claude_sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
     let proxy = proxy(
         Script {
-            http: vec![Reply::sse(SSE)],
+            http: vec![Reply::sse(claude_sse)],
             ..Script::default()
         },
-        "xai-api-key:\n  - api-key: key-FAKE-xai\n    base-url: {upstream}/v1\n    models: [{name: up-model, alias: control-model}]\n",
+        "claude-api-key:\n  - api-key: key-FAKE-claude\n    base-url: {upstream}\n    models: [{name: up-model, alias: control-model}]\n",
         |_| Vec::new(),
     )
     .await;
