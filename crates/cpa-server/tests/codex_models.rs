@@ -104,13 +104,20 @@ async fn catalog_matches_go_for_config_models() {
         };
         assert_eq!(slugs(got), slugs(want), "{version}: models and order");
         for (g, w) in got.iter().zip(want) {
-            // Go's `gpt-5.5` was also served by the recorded OpenAI-compatible group,
-            // which lacked apply_patch support; Codex alone serves it now.
-            let mut w = w.clone();
-            if w["slug"] == "gpt-5.5" && w["apply_patch_tool_type"].is_null() {
-                w["apply_patch_tool_type"] = Value::from("freeform");
+            // Go's `gpt-5.5` entry took the recorded OpenAI-compatible group's config model
+            // (text only, low and xhigh effort, no apply_patch). Codex alone serves it now,
+            // so it is the Codex catalog template.
+            if w["slug"] == "gpt-5.5" {
+                assert_eq!(g["apply_patch_tool_type"], "freeform", "{version}");
+                assert_eq!(g["input_modalities"], serde_json::json!(["text", "image"]), "{version}");
+                assert_eq!(
+                    g["supported_reasoning_levels"].as_array().unwrap().len(),
+                    4,
+                    "{version}"
+                );
+                continue;
             }
-            assert_eq!(g, &w, "{version}: {}", w["slug"]);
+            assert_eq!(g, w, "{version}: {}", w["slug"]);
         }
     }
 }

@@ -159,27 +159,40 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
 
 /// Test support for Go goldens recorded with settings of the removed providers: `yaml`
 /// without the block (or flow line) of each removed setting, so the rest of the recorded
-/// document still loads. Indentation decides a block's extent.
+/// document still loads. Indentation decides a block's extent; a key matches quoted, padded
+/// or in any case (`" Gemini-CLI ":`), as Go folds channel names.
 #[doc(hidden)]
 pub fn strip_settings(yaml: &str) -> String {
     const KEYS: [&str; 16] = [
-        "vertex:",
-        "openai-compatibility:",
-        "gemini:",
-        "gemini-cli:",
-        "interactions:",
-        "vertex-api-key:",
-        "gemini-api-key:",
-        "interactions-api-key:",
-        "antigravity:",
-        "antigravity-signature-cache-enabled:",
-        "antigravity-signature-bypass-strict:",
-        "aistudio:",
-        "ws-auth:",
-        "devin:",
-        "devin-catalog:",
-        "kimi:",
+        "vertex",
+        "openai-compatibility",
+        "gemini",
+        "gemini-cli",
+        "interactions",
+        "vertex-api-key",
+        "gemini-api-key",
+        "interactions-api-key",
+        "antigravity",
+        "antigravity-signature-cache-enabled",
+        "antigravity-signature-bypass-strict",
+        "aistudio",
+        "ws-auth",
+        "devin",
+        "devin-catalog",
+        "kimi",
     ];
+    // The mapping key a block line starts with, unquoted, trimmed and folded.
+    let key = |text: &str| -> Option<String> {
+        let key = match text.as_bytes().first() {
+            Some(&q @ (b'"' | b'\'')) => {
+                let end = text[1..].find(q as char)? + 1;
+                text[end + 1..].trim_start().strip_prefix(':')?;
+                &text[1..end]
+            }
+            _ => text.split_once(':')?.0,
+        };
+        Some(key.trim().go_lower())
+    };
     const FLOW: [&str; 5] = ["{antigravity:", "{aistudio:", "{devin:", "{gemini:", "{vertex:"];
     let mut kept: Vec<String> = Vec::new();
     // Output lines that lost a child block to the strip.
@@ -194,7 +207,7 @@ pub fn strip_settings(yaml: &str) -> String {
             }
             skip = None;
         }
-        if KEYS.iter().any(|k| text.starts_with(k)) {
+        if key(text).is_some_and(|k| KEYS.contains(&k.as_str())) {
             skip = Some(indent);
             if let Some(last) = kept.len().checked_sub(1) {
                 emptied.push(last);
@@ -259,6 +272,10 @@ mod tests {
         );
         assert!(err.contains("Claude, Codex, Grok (xai) and Muse (meta)"), "{err}");
         assert!(strip_settings("a: 1\napi-keys:\n  vertex:\n    - k: v\n  claude: []\n").contains("claude"));
+        assert_eq!(
+            strip_settings("oauth:\n  model-alias:\n    \" Gemini-CLI \":\n      - {name: a}\n  x: 1\n"),
+            "oauth:\n  model-alias: {}\n  x: 1\n"
+        );
         let err = config(&doc("oauth:\n  excluded-models:\n    antigravity: [a]\n"))
             .unwrap_err()
             .to_string();

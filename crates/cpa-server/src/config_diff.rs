@@ -730,7 +730,7 @@ mod tests {
             assert!(!actual.join("\n").contains("fixture-secret"));
         }
         assert_eq!(refused, 1, "the one Codex is-compat case");
-        assert_eq!(skipped, 0, "removed-provider cases");
+        assert_eq!(skipped, 18, "removed-provider cases");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

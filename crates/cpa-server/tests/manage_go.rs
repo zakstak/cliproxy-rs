@@ -1063,8 +1063,8 @@ mod config_writes {
         // reads/writes refused here; the scenarios that start from or write a removed
         // provider's setting (issue #49) stop at its refusal.
         eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte, {retired} retired");
-        assert_eq!((compared, retired), (0, 10));
-        assert_eq!(bytes_compared, 0, "steps compared byte for byte");
+        assert_eq!((compared, retired), (105, 10));
+        assert_eq!(bytes_compared, 79, "steps compared byte for byte");
     }
 }
 
