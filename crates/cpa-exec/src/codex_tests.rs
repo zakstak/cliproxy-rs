@@ -2579,3 +2579,33 @@ fn codex_headers_read_raw_translated_schemas() {
     assert_eq!(headers["x-codex-routing-hint"], "model=upstream;tier=flex");
     assert_eq!(req.body.as_ref(), raw.as_bytes());
 }
+
+#[test]
+fn translated_header_observation_keeps_independent_first_matches() {
+    for raw in [
+        r#"{"service_tier":"flex","service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"service_tier":"flex","service_\u0074ier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"model":"upstream","model":"upstream","service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"service_tier":"flex","prompt_cache_key":"cache-FAKE","prompt_cache_key":"later-FAKE"}"#,
+        r#"{"client_metadata":null,"client_metadata":{},"service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+    ] {
+        let mut req = plain_request(true, None);
+        req.source_format = Format::OpenAI;
+        req.body = Bytes::from(raw.to_owned());
+        req.original_body = req.body.clone();
+        let cache = request::prompt_cache_id(&req, raw, None, false);
+        assert_eq!(cache.as_deref(), Some("cache-FAKE"), "{raw}");
+        let credential = oauth_credential("http://127.0.0.1:1");
+        let headers = request::http_headers(
+            &View::new(&credential),
+            &req.headers,
+            raw,
+            "upstream",
+            cache.as_deref(),
+            true,
+            crate::codex_identity::Origin::Proxy,
+        );
+        assert_eq!(headers["x-codex-routing-hint"], "model=upstream;tier=flex");
+        assert_eq!(req.body.as_ref(), raw.as_bytes());
+    }
+}

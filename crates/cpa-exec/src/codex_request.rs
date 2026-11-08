@@ -15,16 +15,58 @@ use crate::codex_identity::{self as identity, Origin};
 /// Only the header inputs, borrowed from a native or translated body. Do not apply
 /// the native boundary here: translated bodies may retain raw source schemas with
 /// duplicate keys. Native requests have already passed that boundary at ingress.
-#[derive(serde::Deserialize)]
+#[derive(Default)]
 struct HeaderFields<'a> {
-    #[serde(borrow)]
     model: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     service_tier: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     prompt_cache_key: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     client_metadata: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'de> serde::Deserialize<'de> for HeaderFields<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Model,
+            ServiceTier,
+            PromptCacheKey,
+            ClientMetadata,
+            #[serde(other)]
+            Other,
+        }
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = HeaderFields<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object containing Codex header inputs")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut fields = HeaderFields::default();
+                while let Some(field) = map.next_key::<Field>()? {
+                    let slot = match field {
+                        Field::Model => &mut fields.model,
+                        Field::ServiceTier => &mut fields.service_tier,
+                        Field::PromptCacheKey => &mut fields.prompt_cache_key,
+                        Field::ClientMetadata => &mut fields.client_metadata,
+                        Field::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    let value = map.next_value()?;
+                    // Translated originals keep their existing first-match observation
+                    // policy. A duplicate must not erase unrelated valid header inputs.
+                    // Native duplicate refusal is enforced at ingress, before observation.
+                    if slot.is_none() {
+                        *slot = Some(value);
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
 }
 
 fn header_text(raw: Option<&serde_json::value::RawValue>) -> Option<String> {
