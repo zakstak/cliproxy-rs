@@ -1924,3 +1924,84 @@ fn returned_handshake_drops_the_model_the_proxy_rewrote() {
     assert_eq!(rewritten.get("x-codex-turn-state").unwrap(), "ts");
     assert!(returned_handshake(None, true).is_empty());
 }
+
+/// #3: a send that fails on the socket the turn just opened is retried once on a fresh
+/// socket, and the turn returns the fresh socket's handshake. The client's
+/// `response.metadata` comes from the socket that serves the turn, never from the one
+/// whose write failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = dials.clone();
+    let app = axum::Router::new().fallback(move |ws: WebSocketUpgrade| {
+        let dial = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let (turn_state, model) = if dial == 0 {
+                ("ts-failed", "gpt-failed")
+            } else {
+                ("ts-fresh", "gpt-fixture")
+            };
+            let ws = ws.max_message_size(64 << 20).max_frame_size(64 << 20);
+            let mut response = ws.on_upgrade(move |mut socket| async move {
+                if dial == 0 {
+                    // Half-open: hold the socket without reading, so the write times out.
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    return;
+                }
+                while let Some(Ok(message)) = socket.recv().await {
+                    if matches!(message, AxMessage::Text(_)) {
+                        for event in [CREATED, COMPLETED] {
+                            let _ = socket.send(AxMessage::Text(event.into())).await;
+                        }
+                    }
+                }
+            });
+            for (name, value) in [("x-codex-turn-state", turn_state), ("openai-model", model)] {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static(name),
+                    axum::http::HeaderValue::from_static(value),
+                );
+            }
+            response
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mut executor = CodexExecutor::new().unwrap();
+    // Long enough for the fresh socket to take the whole frame in a debug build.
+    executor.ws = Arc::new(Pool::with_write(WriteLimit {
+        floor: Duration::from_secs(3),
+        rate: usize::MAX,
+    }));
+    // Far larger than loopback socket buffers, so the first write cannot finish.
+    let body = format!(
+        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
+        "x".repeat(32 << 20)
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        executor.execute_in_session(&credential(&url), request(&body), &Config::default(), &session(false)),
+    )
+    .await
+    .expect("the retry ends the turn")
+    .expect("the fresh socket serves the turn");
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one retry on a fresh socket"
+    );
+    assert_eq!(
+        handshake_metadata_event(&response.headers).as_deref(),
+        Some(
+            r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-fresh","openai-model":"gpt-fixture"}}"#
+        )
+    );
+    let events: Vec<String> = collect(response)
+        .await
+        .into_iter()
+        .map(|event| event.expect("an upstream event"))
+        .collect();
+    assert_eq!(events, [CREATED, COMPLETED]);
+}
