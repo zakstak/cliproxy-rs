@@ -1917,12 +1917,11 @@ fn returned_handshake_drops_the_model_the_proxy_rewrote() {
     assert!(!model_kept("{\"model\":\"\u{212A}\"}".as_bytes(), r#"{"model":"k"}"#));
 
     let handshake = header_map(&[("openai-model", "gpt-5.5"), ("x-codex-turn-state", "ts")]);
-    let kept = returned_handshake(Some(handshake.clone()), true);
+    let kept = returned_handshake(handshake.clone(), true);
     assert_eq!(kept, handshake);
-    let rewritten = returned_handshake(Some(handshake), false);
+    let rewritten = returned_handshake(handshake, false);
     assert!(rewritten.get("openai-model").is_none());
     assert_eq!(rewritten.get("x-codex-turn-state").unwrap(), "ts");
-    assert!(returned_handshake(None, true).is_empty());
 }
 
 /// #3: a send that fails on the socket the turn just opened is retried once on a fresh
@@ -2004,4 +2003,192 @@ async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
         .map(|event| event.expect("an upstream event"))
         .collect();
     assert_eq!(events, [CREATED, COMPLETED]);
+}
+
+/// A loopback upstream that gives dial `n` the handshake headers `handshakes[n]` and
+/// answers every text frame with CREATED and COMPLETED. With `stall_first`, the first
+/// socket answers one frame and then stops reading, so a large later write times out.
+/// Returns the URL, the dial count and every frame received, in order.
+async fn handshake_upstream(
+    handshakes: Vec<Vec<(&'static str, &'static str)>>,
+    stall_first: bool,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frames: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (counted, received) = (dials.clone(), frames.clone());
+    let app = axum::Router::new().fallback(move |ws: WebSocketUpgrade| {
+        let dial = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let received = received.clone();
+        let handshake = handshakes[dial].clone();
+        async move {
+            let ws = ws.max_message_size(64 << 20).max_frame_size(64 << 20);
+            let mut response = ws.on_upgrade(move |mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    let AxMessage::Text(text) = message else {
+                        continue;
+                    };
+                    received.lock().unwrap().push(text.as_str().to_owned());
+                    for event in [CREATED, COMPLETED] {
+                        let _ = socket.send(AxMessage::Text(event.into())).await;
+                    }
+                    if stall_first && dial == 0 {
+                        // Half-open: hold the socket without reading again.
+                        tokio::time::sleep(Duration::from_secs(120)).await;
+                        return;
+                    }
+                }
+            });
+            for (name, value) in handshake {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static(name),
+                    axum::http::HeaderValue::from_static(value),
+                );
+            }
+            response
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (url, dials, frames)
+}
+
+/// A turn of `model` on session `conn-1`; returns the metadata event the server would
+/// deliver, the returned headers and the events.
+async fn metadata_turn(
+    executor: &CodexExecutor,
+    url: &str,
+    body: &str,
+    model: &str,
+    continuation: bool,
+) -> (Option<String>, HeaderMap, Vec<String>) {
+    let mut req = request(body);
+    req.model = model.into();
+    req.requested_model = model.into();
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        executor.execute_in_session(&credential(url), req, &Config::default(), &session(continuation)),
+    )
+    .await
+    .expect("the turn starts")
+    .expect("the turn is served");
+    let headers = response.headers.clone();
+    let events = collect(response)
+        .await
+        .into_iter()
+        .map(|event| event.expect("an upstream event"))
+        .collect();
+    (handshake_metadata_event(&headers), headers, events)
+}
+
+/// #24 (refs #3): a later request on a reused socket gets only `openai-model` from that
+/// socket's own upgrade. The pinned client re-emits its socket's upgrade model on every
+/// request (`responses_websocket.rs:302-303`); turn state belongs to the request that
+/// opened the socket and never repeats. The upgrade answered a request for one upstream
+/// model, so a request for another model on the same socket gets nothing: the header
+/// does not describe it. No other upgrade header travels on any request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_socket_repeats_only_its_own_upgrade_model() {
+    let (url, dials, frames) = handshake_upstream(
+        vec![vec![
+            ("x-codex-turn-state", "ts-open"),
+            ("openai-model", "gpt-served"),
+            ("x-reasoning-included", "true"),
+            ("set-cookie", "session=SECRET"),
+        ]],
+        false,
+    )
+    .await;
+    let executor = CodexExecutor::new().unwrap();
+    let body = |model: &str, previous: bool| {
+        let previous = if previous {
+            r#","previous_response_id":"r1""#
+        } else {
+            ""
+        };
+        format!(r#"{{"type":"response.create","model":"{model}"{previous},"input":[]}}"#)
+    };
+    const LATER: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-served"}}"#;
+    let turns = [
+        // (client model, continuation, the delivered metadata)
+        (
+            "gpt-fixture",
+            false,
+            Some(
+                r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-open","openai-model":"gpt-served"}}"#,
+            ),
+        ),
+        ("gpt-fixture", true, Some(LATER)),
+        ("gpt-other", false, None),
+        ("gpt-other", true, None),
+        ("gpt-fixture", false, Some(LATER)),
+        ("gpt-fixture", true, Some(LATER)),
+    ];
+    let mut sent = Vec::new();
+    for (i, (model, continuation, want)) in turns.into_iter().enumerate() {
+        let frame = body(model, continuation);
+        let (metadata, headers, events) = metadata_turn(&executor, &url, &frame, model, continuation).await;
+        assert_eq!(metadata.as_deref(), want, "turn {i}");
+        if i > 0 {
+            assert!(
+                headers.keys().all(|name| name == "openai-model"),
+                "turn {i}: a later request carries no other upgrade header: {headers:?}"
+            );
+        }
+        assert_eq!(events, [CREATED, COMPLETED], "turn {i}: upstream events unchanged");
+        sent.push(frame);
+    }
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1, "one socket");
+    assert_eq!(*frames.lock().unwrap(), sent, "only the client's frames, as sent");
+}
+
+/// #24 (refs #3): a later request whose send fails on the reused socket is retried on a
+/// fresh socket, which reports its own opening metadata: its new turn state, and no model
+/// when its upgrade had none (here a blank value). The replaced socket's model is never
+/// donated, then or on the next request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
+    let (url, dials, frames) = handshake_upstream(
+        vec![
+            vec![("x-codex-turn-state", "ts-old"), ("openai-model", "gpt-old")],
+            vec![("x-codex-turn-state", "ts-new"), ("openai-model", "   ")],
+        ],
+        true,
+    )
+    .await;
+    let mut executor = CodexExecutor::new().unwrap();
+    // Long enough for the fresh socket to take the whole frame in a debug build.
+    executor.ws = Arc::new(Pool::with_write(WriteLimit {
+        floor: Duration::from_secs(3),
+        rate: usize::MAX,
+    }));
+    let (opening, _, _) = metadata_turn(&executor, &url, BODY, "gpt-fixture", false).await;
+    assert_eq!(
+        opening.as_deref(),
+        Some(r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-old","openai-model":"gpt-old"}}"#)
+    );
+    // Far larger than loopback socket buffers: the stalled socket cannot take it.
+    let large = format!(
+        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
+        "x".repeat(32 << 20)
+    );
+    let (retried, _, events) = metadata_turn(&executor, &url, &large, "gpt-fixture", false).await;
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2, "one fresh socket");
+    assert_eq!(
+        retried.as_deref(),
+        Some(r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-new"}}"#),
+        "the fresh socket's opening metadata only"
+    );
+    assert_eq!(events, [CREATED, COMPLETED]);
+    let continuation = r#"{"model":"gpt-fixture","previous_response_id":"r1","input":[]}"#;
+    let (later, headers, _) = metadata_turn(&executor, &url, continuation, "gpt-fixture", true).await;
+    assert_eq!(later, None, "the new socket has no model to repeat");
+    assert!(headers.is_empty(), "{headers:?}");
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // The stalled socket read only the first frame; the fresh one read the retried frame
+    // once and then the continuation.
+    let received = frames.lock().unwrap();
+    assert_eq!(received.len(), 3);
+    assert!(received[1].len() > 32 << 20);
+    assert!(received[2].contains(r#""previous_response_id":"r1""#));
 }

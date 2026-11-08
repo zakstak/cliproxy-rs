@@ -147,7 +147,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
-| Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket | Native WebSocket turns (#3) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:198-222`). `openai-model` is left out when the routed model differs from the client's. No other header travels. |
+| Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or when the socket was opened for another upstream model. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
@@ -530,20 +530,57 @@ receives (`ExecError::delivered_event`).
 
 ### Handshake metadata
 
-The client receives `x-codex-turn-state` and `openai-model` from the upstream handshake
-as a `response.metadata` event. The event comes before the first event of each turn that
-opened a socket, including a send retried on a fresh socket.
-[Permitted transformations](#permitted-transformations) lists this edit. Metadata that
-the upstream puts in an event (a `headers` member) reaches the client inside that event,
-unchanged, on every turn.
+The proxy's downstream 101 is sent before the first request chooses a credential and a
+model, so it cannot carry the upstream handshake. The pinned client also reads two of the
+handshake's headers from a `response.metadata` event (`sse/responses.rs:193-222`), and
+the proxy delivers them that way. [Permitted transformations](#permitted-transformations)
+lists this edit. The headers have different lifetimes in the pinned client, so the proxy
+delivers them differently.
 
-The source sets two limits on this. The pinned client reads `x-reasoning-included` only
-from the handshake of a socket it opened itself (`responses_websocket.rs:617`). It also
-repeats `ServerModel` and `ServerReasoningIncluded` from that handshake on every request
-(lines 302-308). The proxy's downstream 101 carries neither header. No first-party
-mechanism sets them after the upgrade, so the proxy invents no per-turn event. A turn on
-a reused socket gets no metadata event, and reasoning-included metadata is not
-delivered.
+| Header | Pinned client | Proxy |
+| --- | --- | --- |
+| `x-codex-turn-state` | Set from the upgrade (`responses_websocket.rs:623-630`) or from a `response.metadata` event's top-level `headers` (`sse/responses.rs:214-222`, `responses_websocket.rs:934-938`). The turn's `OnceLock` keeps the first value; a new logical turn starts with a new lock (`core/src/client.rs:323-343`). | Delivered once, to the request that opened the socket. It is never repeated on a reused socket: in a later turn's new lock it would be a stale first value. |
+| `openai-model` | Read from the upgrade (lines 618-622) and re-emitted as `ServerModel` at the start of every request on that socket (lines 302-303). Any event can also carry it, in `response.headers` first and top-level `headers` second (`sse/responses.rs:193-212`); each response stream reports each distinct value once (`responses_websocket.rs:948-963`). | Delivered to the request that opened the socket, and alone to each later request on it. |
+| `x-reasoning-included` | Read from the upgrade (`responses_websocket.rs:617`) or HTTP response headers by presence only, and re-emitted on every request (lines 304-308). No event sets it. | Not delivered. |
+
+The rules for the proxy's event:
+
+- The opening event carries `x-codex-turn-state` and `openai-model`, each only when
+  present and not empty after trimming. It comes before the first delivered event of the
+  request that opened the socket, including a send retried on a fresh socket.
+- Each later request on the same socket gets `{"type":"response.metadata","headers":{"openai-model":...}}`
+  before its first delivered event. "Later" counts requests, not user turns: the first
+  real request after a prewarm, each continuation and each new logical turn. The pinned
+  client's startup prewarm drains its own notifications and keeps only completion
+  (`core/src/client.rs:2550-2557`), then hands the same session to the real request
+  (`core/src/tasks/regular.rs:100-131`). Without this event, that request would get no
+  model notification at all.
+- A socket opened on a later request delivers its own opening event, with its own turn
+  state. The value always comes from the socket that serves the request. A failed write,
+  a refused or failed upgrade, an attempt that failed over, a Home pick that was lost or
+  a replaced socket never supplies it. A socket whose upgrade had no model repeats
+  nothing, even when an earlier socket had one.
+- Omission is decided for each request. `openai-model` is left out when the model the
+  proxy sent upstream differs from the model that request named, comparing ASCII case
+  only as the pinned client does (`core/src/session/mod.rs:4650-4688`), so that an alias
+  or a payload rule never looks like a cyber-safety reroute. A native thinking suffix is
+  refused before this point. `openai-model` is also left out when the socket was opened
+  for another upstream model: the header answered that request. A genuine difference
+  between the requested model and the upgrade's model, with no proxy rewrite, stays
+  visible on every request.
+- On a response-steering connection, an explicit later `response.create` gets the event
+  right before the `response.created` that starts it. A create rejected before it
+  starts gets none, and neither does an automatic successor, which upstream starts on
+  its own. The pinned client does not use `response.steer`, so no steering rule follows
+  from these sources.
+- Metadata that the upstream puts in an event reaches the client inside that event,
+  unchanged and in order, after the proxy's event. The proxy never edits, replays or adds
+  an upstream frame, and its event is not counted as provider output or usage.
+
+The repeated model is upgrade metadata, as in the directly connected client. It does not
+show which model served each generation. `x-reasoning-included` has no event consumer in
+the pinned client, so copying it into JSON could not deliver it, and the proxy never
+infers it from body content. Reasoning-included metadata stays undelivered.
 
 ### WebSocket HTTP fallback
 
@@ -841,9 +878,11 @@ Passive accounting reads a copy and changes nothing.
   `websocket_connection_limit_reached` are retryable, and the client retries
   `previous_response_not_found` with full input on its own.
 - Handshake metadata. The client reads `x-reasoning-included`, `openai-model` and
-  `x-codex-turn-state` from the WebSocket upgrade response only
-  (`responses_websocket.rs:617-630`), and `x-models-etag` from a
-  `codex.response.metadata` event (lines 919-933).
+  `x-codex-turn-state` from the WebSocket upgrade response
+  (`responses_websocket.rs:617-630`). It also reads `x-codex-turn-state` from a
+  `response.metadata` event and `openai-model` from any event's headers
+  (`sse/responses.rs:193-222`), and `x-models-etag` from a `codex.response.metadata`
+  event (`responses_websocket.rs:919-933`). [Handshake metadata](#handshake-metadata) has the details.
 - Interrupted and incomplete responses. `response.incomplete` with reason `interrupted`
   ends the turn with `end_turn: false`. `content_filter` is its own error. Any other
   reason is an error that keeps the partial output and usage (`sse/responses.rs:451-512`).
@@ -891,12 +930,14 @@ regression tests.
 - #7 is fixed by the executor regression tests in PR #14. The issue is still open.
 - #3 is partly done by PR #16. The native WebSocket route covers the remaining part that
   a source supports: event metadata passes unchanged, and a reconnected socket's handshake
-  is reported. Metadata on a reused socket and `x-reasoning-included` are limits that
-  the source sets. [Handshake metadata](#handshake-metadata) explains both.
+  is reported. `x-reasoning-included` is a limit that the source sets. This list
+  originally named metadata on a reused socket as a second limit. That was wrong for
+  `openai-model`, which a later #24 change delivers on every later request.
+  [Handshake metadata](#handshake-metadata) explains the limit and the model rule.
 
 [QUALIFICATION.md](QUALIFICATION.md#4-delivery-state-and-landing-order-20-reconciliation)
 has the current state: which pieces are merged, each open PR's reviewed head, the landing
-order, and the criteria still open (#3's handshake-only metadata needs a design decision).
+order, and the criteria still open (#3's presence-based reasoning metadata needs a design decision).
 
 ## Implementation order
 

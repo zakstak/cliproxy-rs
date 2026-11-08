@@ -68,6 +68,15 @@ impl Scripted {
         F: Fn(Peer) -> Fut + Clone + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        Self::start_with_handshake(&[], script).await
+    }
+
+    /// [`Scripted::start`] with extra headers on every upgrade response.
+    async fn start_with_handshake<F, Fut>(handshake: &'static [(&'static str, &'static str)], script: F) -> Self
+    where
+        F: Fn(Peer) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let (dials, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let state = (script, errors.clone(), dials.clone(), done.clone());
@@ -75,10 +84,17 @@ impl Scripted {
             let (script, errors, dials, done) = state.clone();
             async move {
                 dials.fetch_add(1, Ordering::SeqCst);
-                ws.on_upgrade(move |socket| async move {
+                let mut response = ws.on_upgrade(move |socket| async move {
                     script(Peer { socket, errors }).await;
                     done.fetch_add(1, Ordering::SeqCst);
-                })
+                });
+                for (name, value) in handshake {
+                    response.headers_mut().insert(
+                        axum::http::HeaderName::from_static(name),
+                        axum::http::HeaderValue::from_static(value),
+                    );
+                }
+                response
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1496,4 +1512,100 @@ async fn later_creates_keep_unknown_bytes_after_a_boundary_refusal() {
     assert!(refused && completed);
     drop(stream);
     up.finish().await;
+}
+
+/// #24 (refs #3): on a duplex connection, an explicit later `response.create` is a client
+/// request, so it gets the socket's upgrade `openai-model` alone, right before the
+/// `response.created` that starts it. Turn state never repeats. An automatic successor is
+/// upstream's own response, not a request, and a create rejected before it started has
+/// no response: neither gets metadata. The bootstrap create's metadata is the server's
+/// (from the returned handshake), so the stream adds none for it. Nothing extra goes
+/// upstream.
+#[tokio::test]
+async fn later_creates_get_the_sockets_model_before_they_start() {
+    const LATER: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-6-astra-served"}}"#;
+    let response = |kind: &str, id: &str, parent: &str| {
+        format!(r#"{{"type":"{kind}","response":{{"id":"{id}","previous_response_id":"{parent}","output":[]}}}}"#)
+    };
+    let failed = r#"{"type":"response.failed","response":{"id":"rejected","output":[],"error":{"type":"invalid_request_error","message":"rejected"}}}"#;
+    let accepted = r#"{"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"first"}}"#;
+    let received: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = received.clone();
+    let up = Scripted::start_with_handshake(
+        &[
+            ("x-codex-turn-state", "ts-open"),
+            ("openai-model", "gpt-6-astra-served"),
+        ],
+        move |mut c: Peer| {
+            let log = log.clone();
+            async move {
+                let read = async |c: &mut Peer| {
+                    let frame = c.read().await;
+                    log.lock().unwrap().push(frame.clone());
+                    frame
+                };
+                read(&mut c).await;
+                c.write(&response("response.created", "first", "")).await;
+                let steer = read(&mut c).await;
+                if get(&steer, "type") != "response.steer" {
+                    c.error(format!("expected steering: {steer}"));
+                    return;
+                }
+                c.write(accepted).await;
+                c.write(&response("response.completed", "first", "")).await;
+                c.write(&response("response.created", "automatic", "first")).await;
+                c.write(&response("response.completed", "automatic", "first")).await;
+                read(&mut c).await;
+                read(&mut c).await;
+                c.write(failed).await;
+                c.write(&response("response.created", "good", "")).await;
+                c.write(&response("response.completed", "good", "")).await;
+                c.idle().await;
+            }
+        },
+    )
+    .await;
+    let client = Client::new("later-create-metadata");
+    let create = |key: &str| {
+        format!(r#"{{"type":"response.create","model":"gpt-6-astra","prompt_cache_key":"{key}","input":[]}}"#)
+    };
+    let steer = r#"{"type":"response.steer","previous_response_id":"first","input":"more"}"#;
+    let mut stream = client.start(&up.url, &create("first"), Format::OpenAIResponse).await;
+    let mut delivered = Vec::new();
+    while let Some(chunk) = next(&mut stream).await {
+        let chunk = chunk.expect("no stream failure");
+        let (kind, id) = (get(&chunk, "type"), get(&chunk, "response.id"));
+        delivered.push(chunk);
+        if kind == "response.created" && id == "first" {
+            client.send(steer).await;
+        }
+        if kind == "response.completed" && id == "automatic" {
+            client.send(&create("rejected")).await;
+            client.send(&create("good")).await;
+        }
+        if kind == "response.completed" && id == "good" {
+            break;
+        }
+    }
+    drop(stream);
+    assert_eq!(
+        delivered,
+        [
+            response("response.created", "first", ""),
+            accepted.to_owned(),
+            response("response.completed", "first", ""),
+            response("response.created", "automatic", "first"),
+            response("response.completed", "automatic", "first"),
+            failed.to_owned(),
+            LATER.to_owned(),
+            response("response.created", "good", ""),
+            response("response.completed", "good", ""),
+        ]
+    );
+    up.finish().await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        [create("first"), steer.to_owned(), create("rejected"), create("good")],
+        "the client's frames only, as sent"
+    );
 }

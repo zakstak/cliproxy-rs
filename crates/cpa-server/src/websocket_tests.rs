@@ -1481,11 +1481,12 @@ async fn handshake_run(
 /// Codex reads sticky turn state and the serving model from the upstream handshake, which
 /// this proxy cannot put in its own 101: that answer precedes the first request, which
 /// chooses the credential and the model. The turn that opened the upstream socket gets
-/// them as a `response.metadata` event ahead of its first event; a later turn on the
-/// same socket does not, since that turn state belongs to the earlier turn. Only the two
-/// allowlisted headers are carried: never cookies, `x-reasoning-included` (Codex reads it
-/// only from a handshake) or anything else. The upstream's model differs from the one
-/// asked for, a reroute the client must see.
+/// them as a `response.metadata` event ahead of its first event. A later turn on the
+/// same socket gets the model alone (#24): the directly connected client re-emits its
+/// upgrade model on every request, while that turn state belongs to the earlier turn.
+/// Only the allowlisted headers are carried: never cookies, `x-reasoning-included`
+/// (Codex reads it only from a handshake) or anything else. The upstream's model differs
+/// from the one asked for, a reroute the client must see on both turns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_only_metadata_reaches_the_turn_that_opened_the_socket() {
     let run = handshake_run(
@@ -1519,7 +1520,15 @@ async fn handshake_only_metadata_reaches_the_turn_that_opened_the_socket() {
             COMPLETED
         ]
     );
-    assert_eq!(run.turns[1], [CREATED, COMPLETED], "the continuation reused the socket");
+    assert_eq!(
+        run.turns[1],
+        [
+            r#"{"type":"response.metadata","headers":{"openai-model":"gpt-rerouted"}}"#,
+            CREATED,
+            COMPLETED
+        ],
+        "the continuation reused the socket: its model alone"
+    );
     assert!(
         run.turns
             .concat()
@@ -1733,6 +1742,212 @@ async fn a_failed_over_turn_reports_only_the_serving_sockets_handshake() {
                 COMPLETED
             ],
             "steering={steering}"
+        );
+    }
+}
+
+/// #24: the model omission rule follows the pinned client's comparison, ASCII case only
+/// (`core/src/session/mod.rs:4650-4688`), on the opening turn and on the continuation that
+/// reuses its socket. An alias that differs only in ASCII case cannot look like a
+/// reroute, so the model is kept. An alias spelled with the Kelvin sign is a different
+/// model to Codex (Go's Unicode folding would call it equal), so the model is omitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_omission_rule_compares_models_by_ascii_case_only() {
+    let handshake: &'static [(&'static str, &'static str)] =
+        &[("x-codex-turn-state", "ts-upstream"), ("openai-model", "k-model")];
+    let ascii = handshake_run(
+        handshake,
+        &[CREATED, COMPLETED],
+        ("k-model", Some("K-MODEL")),
+        None,
+        2,
+        None,
+    )
+    .await;
+    assert_eq!(ascii.upstream_models, ["k-model", "k-model"]);
+    assert_eq!(
+        ascii.turns,
+        [
+            [
+                r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-upstream","openai-model":"k-model"}}"#,
+                CREATED,
+                COMPLETED
+            ],
+            [
+                r#"{"type":"response.metadata","headers":{"openai-model":"k-model"}}"#,
+                CREATED,
+                COMPLETED
+            ]
+        ]
+    );
+    let kelvin = handshake_run(
+        handshake,
+        &[CREATED, COMPLETED],
+        ("k-model", Some("\u{212A}-model")),
+        None,
+        2,
+        None,
+    )
+    .await;
+    assert_eq!(kelvin.upstream_models, ["k-model", "k-model"]);
+    assert_eq!(
+        kelvin.turns,
+        [
+            vec![
+                r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-upstream"}}"#,
+                CREATED,
+                COMPLETED
+            ],
+            vec![CREATED, COMPLETED]
+        ]
+    );
+}
+
+/// #24: after a failover, later requests repeat only the serving socket's model. Here the
+/// failed socket's upgrade named a model and the serving socket's named none, so the
+/// opening event carries the serving turn state alone and the continuation gets nothing:
+/// the losing attempt donates neither value. Each socket used its own fake credential,
+/// the client key reached neither, and each received exactly the frames sent to it.
+/// With and without response steering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_attempt_never_donates_its_model_to_later_requests() {
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wreq::ws::message::Message as WsMessage;
+    const UNAVAILABLE: &str =
+        r#"{"type":"error","status":503,"error":{"type":"server_error","message":"try another"}}"#;
+    type Log = Arc<std::sync::Mutex<Vec<(usize, String)>>>;
+    for steering in [false, true] {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let auths: Log = Default::default();
+        let frames: Log = Default::default();
+        let upstream = {
+            let (dials, auths, frames) = (dials.clone(), auths.clone(), frames.clone());
+            serve(
+                axum::Router::new().fallback(move |headers: axum::http::HeaderMap, ws: WebSocketUpgrade| {
+                    let dial = dials.fetch_add(1, Ordering::SeqCst);
+                    let frames = frames.clone();
+                    let auth = headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .unwrap_or_default();
+                    auths.lock().unwrap().push((dial, auth));
+                    async move {
+                        let (handshake, events): (&'static [(&'static str, &'static str)], &'static [&'static str]) =
+                            if dial == 0 {
+                                (
+                                    &[("x-codex-turn-state", "ts-failed"), ("openai-model", "gpt-failed")],
+                                    &[UNAVAILABLE],
+                                )
+                            } else {
+                                (&[("x-codex-turn-state", "ts-serving")], &[CREATED, COMPLETED])
+                            };
+                        let mut response = ws.on_upgrade(move |mut socket| async move {
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if let AxMessage::Text(text) = message {
+                                    frames.lock().unwrap().push((dial, text.as_str().to_owned()));
+                                    for event in events {
+                                        let _ = socket.send(AxMessage::Text((*event).into())).await;
+                                    }
+                                }
+                            }
+                        });
+                        for (name, value) in handshake {
+                            response.headers_mut().insert(
+                                axum::http::HeaderName::from_static(name),
+                                axum::http::HeaderValue::from_static(value),
+                            );
+                        }
+                        response
+                    }
+                }),
+            )
+            .await
+        };
+        let dir = std::env::temp_dir().join(format!("cpa-ws-donate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let steering_line = if steering {
+            "codex:\n  response-steering: true\n"
+        } else {
+            ""
+        };
+        let key = |n: u8| {
+            format!(
+                "  - api-key: sk-FAKE-{n}\n    base-url: http://{upstream}\n    websockets: true\n    models:\n      - name: gpt-fixture\n"
+            )
+        };
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\naccess:\n  api-keys: [client-key-SECRET]\n{steering_line}codex-api-key:\n{}{}",
+            dir.display(),
+            key(1),
+            key(2)
+        ))
+        .unwrap();
+        let credentials = cpa_core::config::credentials::from_config(&cfg);
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let proxy = serve(router(Arc::new(crate::testing::runtime(cfg, credentials, executors)))).await;
+        let mut socket = wreq::Client::new()
+            .websocket(format!("ws://{proxy}/v1/responses"))
+            .header("authorization", "Bearer client-key-SECRET")
+            .send()
+            .await
+            .unwrap()
+            .into_websocket()
+            .await
+            .unwrap();
+        let first = r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let continuation = r#"{"type":"response.create","model":"gpt-fixture","previous_response_id":"r1","input":[]}"#;
+        let mut turns = Vec::new();
+        for frame in [first, continuation] {
+            socket.send(WsMessage::text(frame)).await.unwrap();
+            let mut delivered = Vec::new();
+            loop {
+                let frame = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+                    Ok(Some(Ok(WsMessage::Text(text)))) => text.as_str().to_owned(),
+                    Ok(Some(Ok(_))) => continue,
+                    other => panic!("steering={steering}: no text frame after {delivered:?}: {other:?}"),
+                };
+                let done = cpa_common::rawjson::get(&frame, "type").str() == "response.completed";
+                delivered.push(frame);
+                if done {
+                    break;
+                }
+            }
+            turns.push(delivered);
+        }
+        drop(socket);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "steering={steering}: no third dial");
+        assert_eq!(
+            turns,
+            [
+                vec![
+                    r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-serving"}}"#,
+                    CREATED,
+                    COMPLETED
+                ],
+                vec![CREATED, COMPLETED]
+            ],
+            "steering={steering}"
+        );
+        assert_eq!(
+            *auths.lock().unwrap(),
+            [(0, "Bearer sk-FAKE-1".to_owned()), (1, "Bearer sk-FAKE-2".to_owned())],
+            "steering={steering}: each socket its own credential, never the client key"
+        );
+        assert_eq!(
+            *frames.lock().unwrap(),
+            [
+                (0, first.to_owned()),
+                (1, first.to_owned()),
+                (1, continuation.to_owned())
+            ],
+            "steering={steering}: one send per attempt, then the continuation; no replay"
         );
     }
 }

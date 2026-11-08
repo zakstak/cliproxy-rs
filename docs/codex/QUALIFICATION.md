@@ -163,6 +163,7 @@ These criteria are not delivered by the migration or by merged code:
   - The pinned client reads `x-reasoning-included` only from the upgrade response of a socket it opened (`responses_websocket.rs:617`).
   - The proxy's downstream 101 is sent before the first frame chooses a credential and model, so it cannot carry the upstream handshake ([CONTRACT.md](CONTRACT.md#handshake-metadata)).
   - Delivering it needs a design decision. The source offers no mechanism, so it is not an implementation gap a test can close. The other #3 criteria have tests: `response.metadata` for the opening turn and for a send retried on a fresh socket; handshake-only, event-only and both cases; a model the proxy rewrote; the allowlist. Those tests are on `fork` through #16, or in #38.
+  - Later correction (2026-11-08, #24 follow-up): the reused-socket limit was wrong for `openai-model`. The pinned client reads it from a model-only `response.metadata` event, so the proxy now delivers it before each later request on the socket ([CONTRACT.md](CONTRACT.md#handshake-metadata)). The `x-reasoning-included` limit stands. The results recorded above are unchanged, and the test `handshake_metadata_reaches_the_opening_turn_and_event_metadata_every_turn` named in the ownership matrix of section 2 is now `handshake_metadata_reaches_each_turn_and_event_metadata_passes_unchanged`.
 - **Merging, and hosted CI on the merged result.** Neither has happened.
 - **The live gates in section 5.**
 

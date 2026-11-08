@@ -26,7 +26,7 @@ use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Turn, Upstream, transport, ws_error};
+use super::{Read, Turn, Upstream, model_kept, transport, ws_error};
 use crate::codex_request::View;
 use crate::codex_response as response;
 use crate::rawjson;
@@ -74,16 +74,24 @@ impl SteeringInput {
 pub(super) struct Prepared {
     /// Native Codex request (the Responses Lite marker).
     native: bool,
+    /// A later create's model-only `response.metadata` event, delivered right before
+    /// the `response.created` that starts it ([`Upstream::later_metadata`]). The
+    /// bootstrap create has none: the server delivers its metadata.
+    announce: Option<String>,
 }
 
 impl Prepared {
     pub(super) fn new(native: bool) -> Self {
-        Self { native }
+        Self { native, announce: None }
     }
 
-    /// The settings a response retains.
+    /// The settings a response retains. An automatic successor that inherits them is not
+    /// a client request, so it gets no metadata.
     fn retained(&self) -> Self {
-        self.clone()
+        Self {
+            native: self.native,
+            announce: None,
+        }
     }
 }
 
@@ -137,6 +145,8 @@ pub(super) struct Duplex {
     queued_creates: VecDeque<String>,
     /// A steer whose parent settings are unknown waits for pending creates to start.
     deferred_steer: Option<(String, String)>,
+    /// The metadata of the explicit create whose `response.created` is being handled.
+    announce: Option<String>,
     /// Client frames are read only after the first `response.created` was delivered.
     input_ready: bool,
     first_response: bool,
@@ -254,6 +264,7 @@ impl Duplex {
             automatic_active: false,
             queued_creates: VecDeque::new(),
             deferred_steer: None,
+            announce: None,
             input_ready: false,
             first_response: true,
             response_active: false,
@@ -545,11 +556,23 @@ impl Duplex {
         } else {
             self.req.model.trim().to_owned()
         };
-        let frame = match body.routed(&upstream, false) {
-            std::borrow::Cow::Borrowed(_) => payload,
-            std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
+        // Judged for this create: its own client model against the model sent upstream.
+        let (frame, kept) = match body.routed(&upstream, false) {
+            std::borrow::Cow::Borrowed(_) => {
+                let kept = model_kept(payload.as_bytes(), &payload);
+                (payload, kept)
+            }
+            std::borrow::Cow::Owned(bytes) => {
+                let frame = String::from_utf8(bytes).expect("Codex boundary validated UTF-8");
+                let kept = model_kept(payload.as_bytes(), &frame);
+                (frame, kept)
+            }
         };
-        let prepared = Prepared::new(self.initial.native);
+        let announce = super::handshake_metadata_event(&self.turn.conn.later_metadata(&upstream, kept));
+        let prepared = Prepared {
+            native: self.initial.native,
+            announce,
+        };
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
@@ -699,6 +722,12 @@ impl Duplex {
             self.response_active = false;
             self.automatic_active = false;
         }
+        // An explicit later create's model-only metadata, ahead of its first event.
+        if kind == "response.created"
+            && let Some(announce) = self.announce.take()
+        {
+            self.outbox.push_back(Ok(Bytes::from(announce)));
+        }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
         if establishing {
             // Delivered before any locally generated error, so the handler also sees the
@@ -730,7 +759,10 @@ impl Duplex {
         self.accepted.retain(|_, target| *target != parent);
         self.waiting_parent.clear();
         self.automatic_active = automatic;
-        if let Some(next) = self.pending.pop_front() {
+        // Only an explicit create taken from `pending` announces; nothing carries over.
+        self.announce = None;
+        if let Some(mut next) = self.pending.pop_front() {
+            self.announce = next.announce.take();
             self.current = next;
         }
         self.response_id = rawjson::get(payload, "response.id").str().to_owned();
