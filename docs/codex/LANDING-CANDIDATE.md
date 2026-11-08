@@ -72,4 +72,5 @@ Environment, following `.github/workflows/ci.yml`:
 - **Hosted CI:** none, on this tree or any component.
 - **Live acceptance:** the gates in [QUALIFICATION.md](QUALIFICATION.md#5-unproven-live-gates). No provider traffic was sent.
 - **#3:** presence-based reasoning metadata (`x-reasoning-included`) and metadata for a turn on a reused socket remain a design limitation. The pinned client reads them only from the handshake of a socket it opened, and no first-party mechanism lets the proxy deliver them.
+  - Later correction (2026-11-08, #24 follow-up): this was wrong for `openai-model`, which the pinned client also reads from a model-only `response.metadata` event. The proxy now delivers it on later requests ([CONTRACT.md](CONTRACT.md#handshake-metadata)). The reasoning limit stands. This snapshot's other statements are unchanged.
 - **No issue is closed by this branch.**

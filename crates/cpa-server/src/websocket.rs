@@ -32,7 +32,9 @@
 //! Handshake metadata: this 101 precedes the first request, which chooses the credential
 //! and the model, so the upstream socket's handshake comes later. A turn that opens a
 //! Codex socket passes its `x-codex-turn-state` and `openai-model` on as a
-//! `response.metadata` event before its first event (`handshake_metadata_event`).
+//! `response.metadata` event before its first event (`handshake_metadata_event`). A
+//! later request on that socket gets only the socket's `openai-model` the same way; turn
+//! state is never repeated.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1427,9 +1429,9 @@ impl Connection {
     /// `forwardResponsesWebsocket`.
     async fn forward(&self, socket: &mut Sink, started: Started, cfg: &Config, ctx: &mut TurnCtx) -> Forwarded {
         let Started { first, stream, headers } = started;
-        // Metadata from the handshake of the socket this turn opened, ahead of its first
-        // event. Only this turn gets it: a later turn on the same socket would receive a
-        // turn state that belongs to another turn.
+        // Metadata from the handshake of the socket serving this turn, ahead of its first
+        // event. The executor returns turn state only to the turn that opened the socket;
+        // a later turn gets that socket's `openai-model` alone, or nothing.
         let mut metadata = ctx
             .codex_socket
             .then(|| cpa_exec::codex::handshake_metadata_event(&headers))

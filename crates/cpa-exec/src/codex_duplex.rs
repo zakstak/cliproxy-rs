@@ -92,6 +92,10 @@ pub(super) struct Prepared {
     /// tier) an automatic successor of its response takes. Reports nothing until the
     /// attempt is detached.
     usage: UsageSink,
+    /// A later create's model-only `response.metadata` event, delivered right before
+    /// the `response.created` that starts it ([`Upstream::later_metadata`]). The
+    /// bootstrap create has none: the server delivers its metadata.
+    announce: Option<String>,
 }
 
 impl Prepared {
@@ -99,12 +103,18 @@ impl Prepared {
         Self {
             native,
             usage: UsageSink::default(),
+            announce: None,
         }
     }
 
-    /// The settings a response retains.
+    /// The settings a response retains. An automatic successor that inherits them is not
+    /// a client request, so it gets no metadata.
     fn retained(&self) -> Self {
-        self.clone()
+        Self {
+            native: self.native,
+            usage: self.usage.clone(),
+            announce: None,
+        }
     }
 }
 
@@ -243,6 +253,8 @@ pub(super) struct Duplex {
     queued_creates: VecDeque<String>,
     /// A steer whose parent settings are unknown waits for pending creates to start.
     deferred_steer: Option<(String, String)>,
+    /// The metadata of the explicit create whose `response.created` is being handled.
+    announce: Option<String>,
     /// Client frames are read only after the first `response.created` was delivered.
     input_ready: bool,
     first_response: bool,
@@ -366,6 +378,7 @@ impl Duplex {
             automatic_active: false,
             queued_creates: VecDeque::new(),
             deferred_steer: None,
+            announce: None,
             input_ready: false,
             first_response: true,
             response_active: false,
@@ -751,6 +764,12 @@ impl Duplex {
         } else {
             self.req.model.trim().to_owned()
         };
+        // Metadata eligibility and client facts are read before model routing.
+        let kept = body
+            .get("model")
+            .and_then(|m| m.text())
+            .is_some_and(|named| named.eq_ignore_ascii_case(&upstream));
+        let announce = super::handshake_metadata_event(&self.turn.conn.later_metadata(&upstream, kept));
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
@@ -769,6 +788,7 @@ impl Duplex {
         let prepared = Prepared {
             native: self.initial.native,
             usage,
+            announce,
         };
         self.pending.push_back(Pending { prepared, accounting });
         self.write(frame);
@@ -938,6 +958,12 @@ impl Duplex {
             // whether the client is still there to receive it.
             self.settle_terminal(payload, kind);
         }
+        // An explicit later create's model-only metadata, ahead of its first event.
+        if kind == "response.created"
+            && let Some(announce) = self.announce.take()
+        {
+            self.outbox.push_back(Ok(Bytes::from(announce)));
+        }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
         if establishing {
             // Delivered before any locally generated error, so the handler also sees the
@@ -969,13 +995,18 @@ impl Duplex {
         self.accepted.retain(|_, target| *target != parent);
         self.waiting_parent.clear();
         self.automatic_active = automatic;
+        // Only an explicit create taken from `pending` announces; nothing carries over.
+        self.announce = None;
         let accounting = match self.pending.pop_front() {
-            Some(Pending { prepared, accounting }) => {
+            Some(Pending {
+                mut prepared,
+                accounting,
+            }) => {
+                self.announce = prepared.announce.take();
                 self.current = prepared;
                 accounting.or_else(|| self.detach())
             }
-            // An automatic successor: a record of its own, with the facts of the request
-            // whose settings it runs on.
+            // An automatic successor keeps its parent's facts, without announcing.
             None => self.detached.then(|| {
                 self.current.usage = self.current.usage.successor(None);
                 Accounting::new(self.current.usage.clone())
