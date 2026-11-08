@@ -74,7 +74,7 @@ Paths in this table are relative to `crates/`.
 | `cpa-exec/src/codex_json.rs` | Go-compatible object remarshal for Alpha Search, plus byte-edit helpers used by translated requests, Images, token records and response normalization. The conditional model/stream setters remain live. |
 | `cpa-exec/src/codex.rs` | Quota model inspection in the shared send helper and Alpha Search response IDs. Alpha Search is outside the Codex Responses contract and retains Go behavior. |
 | `cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs` | Shared WebSocket transcript, prewarm, request and tool handling for xAI, the only other provider with a Responses WebSocket. Native Codex attempts use the preserved client frame instead. |
-| `cpa-server/src/codex_alpha.rs`, `management/quota_probe.rs` | Alpha Search and management quota probes, outside the Codex Responses contract. Preserve their Go behavior. |
+| `cpa-server/src/codex_alpha.rs` | Alpha Search, outside the Codex Responses contract. Preserve its Go behavior. |
 | Executor and server unit/integration tests returned by the inventory command | Assertions and helpers still use gjson. They also must migrate before deleting the dependency. Keep historical Go fixtures labelled with their recorded versions. |
 
 The translated and Images tool bodies can retain raw source schemas. Applying the

@@ -125,13 +125,30 @@ async fn catalog_matches_go_for_config_models() {
             // (text only, low and xhigh effort, no apply_patch). Codex alone serves it now,
             // so it is the Codex catalog template.
             if w["slug"] == "gpt-5.5" {
-                assert_eq!(g["apply_patch_tool_type"], "freeform", "{version}");
-                assert_eq!(g["input_modalities"], serde_json::json!(["text", "image"]), "{version}");
-                assert_eq!(
-                    g["supported_reasoning_levels"].as_array().unwrap().len(),
-                    4,
-                    "{version}"
-                );
+                let catalog: Value = serde_json::from_str(cpa_common::codex_client::CLIENT_MODELS_JSON).unwrap();
+                let mut expected = catalog["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["slug"] == "gpt-5.5")
+                    .unwrap()
+                    .clone();
+                expected.as_object_mut().unwrap().remove("priority");
+                // The configured Codex model keeps its pinned template plus the
+                // configured name and explicitly enabled client flag.
+                expected["display_name"] = serde_json::json!("gpt-5.5");
+                expected["multi_agent_version"] = serde_json::json!("v2");
+                if version == "cpa" {
+                    expected["cpa_capabilities"] = serde_json::json!({"web_search":true});
+                }
+                let mut got_keys: Vec<_> = g.as_object().unwrap().keys().collect();
+                let mut want_keys: Vec<_> = expected.as_object().unwrap().keys().collect();
+                got_keys.sort();
+                want_keys.sort();
+                assert_eq!(got_keys, want_keys, "{version}: full template keys");
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(g.get(key), Some(value), "{version}: template field {key}");
+                }
                 continue;
             }
             assert_eq!(g, w, "{version}: {}", w["slug"]);
