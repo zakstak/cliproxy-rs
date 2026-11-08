@@ -3143,6 +3143,48 @@ fn a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker() {
     assert_eq!((status, imported), (json!({"status": "ok"}), 200));
 }
 
+#[tokio::test]
+async fn removed_oauth_maps_refuse_writes_and_keep_the_running_config_on_reload() {
+    let f = Fixture::new("removed-oauth-maps");
+    let (base, server) = f.server().await;
+    let before = f.file();
+    let running = f.rt.config().document.clone();
+    let client = wreq::Client::new();
+    for (field, entries) in [
+        ("settings", json!([{"name":"model", "max-context-length":42}])),
+        (
+            "request-scoped-errors",
+            json!([{"status":401, "match":["denied"], "action":"stop"}]),
+        ),
+    ] {
+        let response = client
+            .put(format!("{base}/v8/management/config/oauth/{field}"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({" Gemini-CLI ": entries}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_config");
+        assert!(body["message"].as_str().unwrap().contains(&format!("oauth.{field}")));
+        assert_eq!(f.file(), before);
+        assert_eq!(f.rt.config().document, running);
+
+        let legacy = format!(
+            "{before}\noauth-{field}:\n  gemini: {}\n",
+            serde_json::to_string(&entries).unwrap()
+        );
+        std::fs::write(f.dir.join("config.yaml"), legacy).unwrap();
+        let error = watching::reload(&f.state).unwrap_err().to_string();
+        assert!(error.contains(&format!("oauth.{field}")), "{error}");
+        assert_eq!(f.rt.config().document, running);
+        std::fs::write(f.dir.join("config.yaml"), &before).unwrap();
+        watching::reload(&f.state).unwrap();
+    }
+    server.abort();
+}
+
 /// The removed providers' logins, imports and key lists answer 410, and a failed Codex
 /// exchange reports Go's "token exchange failed" text in the session.
 #[tokio::test]
@@ -3177,6 +3219,7 @@ async fn removed_provider_operations_fail_and_codex_exchange_errors_read_like_go
             .unwrap();
         assert_eq!(response.status().as_u16(), 410, "{method} {path}");
         let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "removed_provider", "{method} {path}: {body}");
         let error = body["error"].as_str().unwrap_or_default();
         assert!(
             error.contains("is no longer supported") && error.contains("Claude, Codex, Grok (xai) and Muse (meta)"),

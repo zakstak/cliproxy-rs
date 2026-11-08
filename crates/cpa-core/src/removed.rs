@@ -136,8 +136,13 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
             path.join(".")
         );
     }
-    // Per-provider maps: OAuth model aliases and excluded models keyed by channel.
-    for path in [["oauth", "model-alias"], ["oauth", "excluded-models"]] {
+    // Every provider-keyed OAuth map must enforce the same supported channels.
+    for path in [
+        ["oauth", "model-alias"],
+        ["oauth", "excluded-models"],
+        ["oauth", "request-scoped-errors"],
+        ["oauth", "settings"],
+    ] {
         let Some(Value::Mapping(map)) = path.iter().try_fold(doc, |node, part| node.get(*part)) else {
             continue;
         };
@@ -285,6 +290,32 @@ mod tests {
         );
         assert!(config(&doc("models:\n  devin-catalog: https://example.invalid/d.json\n")).is_err());
         assert!(config(&doc("oauth:\n  providers:\n    aistudio:\n      ws-auth: true\n")).is_err());
+    }
+
+    #[test]
+    fn removed_channels_fail_in_settings_and_request_scoped_errors() {
+        for (field, entry) in [
+            ("settings", "[{name: model, max-context-length: 42}]"),
+            (
+                "request-scoped-errors",
+                "[{status: 401, match: [denied], action: stop}]",
+            ),
+        ] {
+            for channel in ["gemini", " Gemini-CLI ", "KIMI.com", "openai-compatible-legacy"] {
+                for yaml in [
+                    format!("config-version: 8\noauth:\n  {field}:\n    '{channel}': {entry}\n"),
+                    format!("oauth-{field}:\n  '{channel}': {entry}\n"),
+                ] {
+                    let error = crate::config::Config::parse(&yaml).unwrap_err().to_string();
+                    assert!(error.contains(&format!("oauth.{field}.{channel}")), "{yaml}: {error}");
+                    assert!(error.contains(GUIDANCE), "{error}");
+                }
+            }
+            config(&doc(&format!(
+                "oauth:\n  {field}:\n    gemini: []\n    claude: {entry}\n"
+            )))
+            .unwrap();
+        }
     }
 
     #[test]

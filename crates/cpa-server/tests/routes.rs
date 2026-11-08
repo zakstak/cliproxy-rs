@@ -1199,6 +1199,105 @@ async fn usage_queue_records_every_attempt() {
     assert!(pop().is_empty());
 }
 
+/// Home picks in order, each with the client key Home authenticated.
+struct Picks(Mutex<Vec<(Credential, &'static str)>>);
+
+impl cpa_server::remote::RemoteDispatch for Picks {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn dispatch(
+        &self,
+        _: cpa_server::remote::RemoteRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<cpa_server::remote::RemoteGrant, cpa_server::remote::RemoteError>>
+    {
+        let (credential, key) = self.0.lock().unwrap().remove(0);
+        Box::pin(async move {
+            Ok(cpa_server::remote::RemoteGrant {
+                credential,
+                end: Box::new(|| None),
+                cancel: None,
+                request_retry: None,
+                user_api_key: key.into(),
+                private: Default::default(),
+            })
+        })
+    }
+
+    fn models(
+        &self,
+        _: Vec<(String, String)>,
+        _: Vec<(String, String)>,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, cpa_server::remote::ModelsError>> {
+        unreachable!("no model lists")
+    }
+}
+
+/// Home count-token failures retain Home's authenticated client key across picks,
+/// rather than the access middleware's client key, even when later picks omit it.
+#[tokio::test]
+async fn count_tokens_home_401s_record_the_home_client_key() {
+    let upstream = cpa_exec::test_support::CountTokensUpstream::start().await;
+    let mut cfg = Config::parse("access: {api-keys: [client-key]}\nrequest-retry: 0\nmax-retry-credentials: 3\nusage-statistics-enabled: true\n").unwrap();
+    let dir = std::env::temp_dir().join(format!("routes-home-count-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.auth_dir = dir.clone();
+    let rt = Arc::new(cpa_server::testing::runtime(
+        cfg.clone(),
+        vec![],
+        Executors {
+            claude: upstream.executor(),
+            codex: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
+        },
+    ));
+    rt.usage_queue().configure(true, &cfg);
+    let pick = |id: &str, token: &str| {
+        let mut c = cpa_server::testing::local(oauth(id, token, serde_json::json!({})));
+        c.attributes.insert(
+            cpa_core::config::credentials::HOME_AUTH_INDEX.into(),
+            format!("idx-{id}"),
+        );
+        c.attributes
+            .insert(cpa_server::remote::UPSTREAM_MODEL.into(), "claude-up".into());
+        c
+    };
+    rt.set_remote_dispatch(Some(Arc::new(Picks(Mutex::new(vec![
+        (pick("a.json", "sk-ant-api03-fake-A"), "home-client"),
+        (pick("b.json", "sk-ant-api03-fake-A"), ""),
+        (pick("c.json", "sk-ant-api03-fake-B"), ""),
+    ])))));
+    let url = serve(router(rt.clone())).await;
+    let (status, _, text) = post(
+        &url,
+        "/v1/messages/count_tokens",
+        r#"{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["input_tokens"], 5);
+    assert_eq!(
+        upstream.calls(),
+        ["sk-ant-api03-fake-A", "sk-ant-api03-fake-A", "sk-ant-api03-fake-B"]
+    );
+    let records: Vec<Value> = rt
+        .usage_queue()
+        .pop_oldest(10)
+        .iter()
+        .map(|r| serde_json::from_slice(r).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "only failed counts produce records: {records:?}");
+    for record in records {
+        assert_eq!(record["api_key"], "home-client");
+        assert_eq!(record["executor_type"], "home-result");
+        assert_eq!(record["fail"]["status_code"], 401);
+        assert_eq!(record["tokens"]["total_tokens"], 0);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Go's Responses handler applies `prepareCodexOrphanDelegation` before dispatch, so the
 /// rewrite reaches every provider (here Claude). Input and rewritten text come from
 /// Go's `RewriteCodexOrphanDelegationInput` golden (cpa-common codex_client_go.json).

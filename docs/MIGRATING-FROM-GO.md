@@ -47,7 +47,7 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 
 ## Management API differences
 
-The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs and model definitions behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Meta and xAI. Sign-in for Antigravity, Kimi and Devin, the Vertex import (`oauth/import?provider=vertex`, `/v0/management/vertex/import`) and the v0 `gemini-api-key`, `interactions-api-key`, `vertex-api-key` and `openai-compatibility` lists answer 410 with migration guidance.
+The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs and model definitions behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Meta and xAI. Sign-in for Antigravity, Kimi and Devin, the Vertex import (`oauth/import?provider=vertex`, `/v0/management/vertex/import`) and the v0 `gemini-api-key`, `interactions-api-key`, `vertex-api-key` and `openai-compatibility` lists answer 410 with top-level `code: "removed_provider"` and migration guidance in `error`.
 
 Not available on cliproxy-rs:
 

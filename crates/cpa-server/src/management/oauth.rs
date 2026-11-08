@@ -372,9 +372,12 @@ pub(super) fn install_callback_sink(state: &Arc<Management>) {
 
 /// 410 Gone with the migration guidance for an operation on a removed provider.
 pub(super) fn removed(provider: &str, operation: &str) -> Response {
-    fail(
+    respond(
         StatusCode::GONE,
-        cpa_core::removed::operation_error(provider, operation),
+        &json!({
+            "code": "removed_provider",
+            "error": cpa_core::removed::operation_error(provider, operation),
+        }),
     )
 }
 

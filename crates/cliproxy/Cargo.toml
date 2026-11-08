@@ -42,4 +42,5 @@ url = "2"
 wreq.workspace = true
 
 [dev-dependencies]
+cpa-exec = { workspace = true, features = ["test-support"] }
 cpa-home = { workspace = true, features = ["fake"] }

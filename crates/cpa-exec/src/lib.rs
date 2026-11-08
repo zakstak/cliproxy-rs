@@ -63,7 +63,9 @@ pub mod proxy;
 mod quota;
 mod rawjson;
 mod replay;
-#[cfg(test)]
+#[cfg(feature = "test-support")]
+pub mod test_support;
+#[cfg(any(test, feature = "test-support"))]
 mod test_tls;
 mod tls;
 mod tokenizer;

@@ -1054,14 +1054,14 @@ mod tests {
     }
 
     /// A Home whose RPOP replies come from `replies` in order (nil once empty).
-    async fn scripted(config: &'static str, replies: Vec<String>) -> FakeHome {
+    async fn scripted(config: &str, replies: Vec<String>) -> FakeHome {
         scripted_with_kv(config, replies, Default::default()).await
     }
 
     /// A Home serving `config`, the dispatch `replies` in order, and an in-memory KV
     /// seeded with `kv`.
     async fn scripted_with_kv(
-        config: &'static str,
+        config: &str,
         replies: Vec<String>,
         kv: std::collections::HashMap<String, String>,
     ) -> FakeHome {
@@ -1069,14 +1069,11 @@ mod tests {
     }
 
     /// [`scripted_with_kv`] with raw RPOP replies (errors as well as payloads).
-    async fn sequenced(
-        config: &'static str,
-        replies: Vec<Reply>,
-        kv: std::collections::HashMap<String, String>,
-    ) -> FakeHome {
+    async fn sequenced(config: &str, replies: Vec<Reply>, kv: std::collections::HashMap<String, String>) -> FakeHome {
+        let config = config.to_owned();
         let replies = Mutex::new(std::collections::VecDeque::from(replies));
         fake_home(with_kv(kv, move |args| match args[0].go_lower().as_str() {
-            "get" => fake::bulk(config),
+            "get" => fake::bulk(&config),
             "subscribe" => fake::raw(ACK),
             "ping" => fake::raw("+PONG\r\n"),
             "rpop" => replies
@@ -2556,6 +2553,108 @@ mod tests {
             .collect()
     }
 
+    /// A retained Claude first-party count path, using a private TLS mock and
+    /// injected transport, retains the original Home failure-accounting assertions.
+    /// Go `reportHomeUnauthorized`: a Home count-tokens attempt the upstream answers 401
+    /// becomes a zero-token `home-result` failure (no executor reporter records count
+    /// tokens) under the selection's provider, Home's upstream model and Home's session;
+    /// the next credential's success records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn count_tokens_401s_reach_home_as_home_results() {
+        use cpa_exec::test_support::{COUNT_DENIED as DENIED, CountTokensUpstream};
+        let upstream = CountTokensUpstream::start().await;
+        let dir = std::env::temp_dir().join(format!("home-count-tokens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pick = |id: &str, token: &str| {
+            let metadata = serde_json::json!({"type":"claude", "access_token":token});
+            let c = cpa_server::testing::local(
+                Credential::from_file(&dir, &dir.join(id), metadata.as_object().unwrap().clone()).unwrap(),
+            );
+            serde_json::json!({"model":"claude-up", "auth_index":format!("idx-{id}"), "user_api_key":"home-client",
+                "auth":{"id":id,"provider":"claude","attributes":c.attributes,"metadata":metadata}})
+            .to_string()
+        };
+        let home = scripted_with_kv(
+            &format!("port: 0\nauth-dir: {}\n", dir.display()),
+            vec![
+                pick("cred-a", "sk-ant-api03-fake-A"),
+                pick("cred-b", "sk-ant-api03-fake-B"),
+            ],
+            Default::default(),
+        )
+        .await;
+        let (base, rt, shutdown, task) = node_full(
+            &home,
+            cpa_exec::Executors {
+                claude: upstream.executor(),
+                codex: Default::default(),
+                meta: Default::default(),
+                xai: Default::default(),
+            },
+            vec![],
+        )
+        .await;
+        eventually("dispatch published", || {
+            rt.remote_dispatch().is_some_and(|d| d.available())
+        })
+        .await;
+        let response = wreq::Client::new()
+            .post(format!("{base}/v1/messages/count_tokens"))
+            .header("authorization", "Bearer client-key")
+            .header("x-session-id", "conv-count-1")
+            .json(&serde_json::json!({"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("5"), "{body}");
+        // Go `TestHomeCountTokensTriesFreshCredentialWhenRequestRetryIsZero`: the second
+        // pick excludes the failed credential.
+        assert_eq!(exclusions(&home), vec![vec![], strings(&["cred-a"])]);
+        eventually("the home result reached Home", || !usage_records(&home).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let records = usage_records(&home);
+        assert_eq!(records.len(), 1, "only the 401 is recorded: {records:?}");
+        let record = &records[0];
+        let sent_session = rpops(&home)[0]["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(sent_session, "header:conv-count-1");
+        let expect = [
+            ("executor_type", "home-result"),
+            ("provider", "claude"),
+            ("model", "claude-up"),
+            ("alias", "claude-x"),
+            ("auth_index", "idx-cred-a"),
+            (
+                "access_token_sha256",
+                "29e7ccf7c3096c86da26ce751aca3e0842446e940d66c84a82903c71bfaec081",
+            ),
+            ("auth_type", "oauth"),
+            ("source", ""),
+            // Go 37fe2608: open local access, so the key Home authenticated.
+            ("api_key", "home-client"),
+            ("endpoint", "POST /v1/messages/count_tokens"),
+        ];
+        for (key, want) in expect {
+            assert_eq!(record[key], want, "{key}: {record}");
+        }
+        assert_eq!(record["is_native_key"], false);
+        assert!(record.get("access_provider").is_none(), "{record}");
+        assert_eq!(
+            record["session_id"],
+            cpa_common::session::normalize_to_canonical_uuid(&sent_session)
+        );
+        assert_eq!(record["failed"], true);
+        assert_eq!(record["generate"], false);
+        assert_eq!(record["fail"], serde_json::json!({"status_code": 401, "body": DENIED}));
+        assert_eq!(record["tokens"]["total_tokens"], 0);
+        assert_eq!(upstream.calls(), ["sk-ant-api03-fake-A", "sk-ant-api03-fake-B"]);
+        shutdown.cancel();
+        task.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Go's Alpha Search reports an upstream 401 on a Home pick (`ReportHomeUnauthorized`
     /// with provider `codex` and the selection model) from a context holding only the
     /// request ID and the session: no client address, agent or endpoint.
@@ -3809,6 +3908,72 @@ mod tests {
             shutdown.cancel();
             task.await.unwrap();
         }
+    }
+
+    /// Go `TestHomePreferredErrorIgnoresLaterInternalExecutorFailure`: Meta's local
+    /// preparation failure must not replace an earlier Claude upstream response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_local_failure_keeps_the_upstream_error() {
+        let dir = std::env::temp_dir().join(format!("home-preferred-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let upstream = ContractUpstream::start(vec![("home-retry-a", bad_gateway())]).await;
+        let local = serde_json::json!({"model":"gpt", "auth_index":"idx-preferred-meta",
+            "auth":{"id":"home-retry-b", "provider":"meta", "attributes":{"base_url":upstream.base},
+            "metadata":{"type":"meta", "dca_token":"dca:home-preferred-fake"}}})
+        .to_string();
+        let replies = Mutex::new(std::collections::VecDeque::from([
+            contract_pick("home-retry-a", &upstream.base, None, &Value::Null),
+            local,
+        ]));
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = refreshes.clone();
+        let config = format!(
+            "port: 0\nrequest-retry: 0\nmax-retry-credentials: 2\nauth-dir: {}\n",
+            dir.display()
+        );
+        let home = fake_home(with_kv(Default::default(), move |args| {
+            match args[0].go_lower().as_str() {
+                "get" if args[1].starts_with('{') => {
+                    let request: Value = serde_json::from_str(&args[1]).unwrap();
+                    assert_eq!(request["type"], "refresh");
+                    assert_eq!(request["auth_index"], "idx-preferred-meta");
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // A dispatched Meta auth prepares via Home, never a local mint.
+                    fake::bulk(r#"{"error":{"type":"internal_error","message":"fake preparation failure"}}"#)
+                }
+                "get" => fake::bulk(&config),
+                "subscribe" => fake::raw(ACK),
+                "ping" => fake::raw("+PONG\r\n"),
+                "rpop" => replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map_or_else(|| fake::raw("$-1\r\n"), fake::bulk),
+                "lpush" => fake::raw(":1\r\n"),
+                _ => fake::raw("-ERR unexpected\r\n"),
+            }
+        }))
+        .await;
+        let executors = cpa_exec::Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new(&upstream.base).unwrap(),
+            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url("http://127.0.0.1:9/must-not-mint"),
+            codex: Default::default(),
+            xai: Default::default(),
+        };
+        let (base, rt, shutdown, task) = node_full(&home, executors, vec![]).await;
+        eventually("dispatch published", || {
+            rt.remote_dispatch().is_some_and(|d| d.available())
+        })
+        .await;
+        let (status, _, body) = chat(&base, false).await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("upstream unavailable"), "{body}");
+        assert_eq!(upstream.calls(), strings(&["home-retry-a"]));
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(exclusions(&home)[1], strings(&["home-retry-a"]));
+        shutdown.cancel();
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Go `TestHomeSelectionFailureIsNotHiddenByEarlierUpstreamAttempt`: a pick that fails
