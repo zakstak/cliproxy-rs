@@ -53,6 +53,14 @@ const LINE_REFUSAL: &str = "the config file contains a Unicode line separator ya
 const NOT_UTF8_REFUSED: &[&str] = &["binary secret that is not UTF-8"];
 const NOT_UTF8_REFUSAL: &str = "failed to parse config file: a !!binary value in the config file is not UTF-8 text";
 
+/// Recorded cases whose config sets a removed provider (issue #49).
+const REMOVED_PROVIDER: [&str; 4] = [
+    "undeclared nested antigravity field",
+    "null legacy weight",
+    "legacy weight above the limit",
+    "compatible weight above the limit",
+];
+
 #[test]
 fn prepare_for_upload_matches_go() {
     let cases: Vec<Json> = serde_json::from_str(include_str!("fixtures/prepare_upload_go.json")).unwrap();
@@ -88,6 +96,18 @@ fn prepare_for_upload_matches_go() {
         } else {
             None
         };
+        // Recorded uploads that configure a removed provider (issue #49) are refused with
+        // its migration guidance and left unchanged, whatever Go answered.
+        if REMOVED_PROVIDER.contains(&name) {
+            match &result {
+                Err(e) if format!("{e:#}").contains("which is no longer supported") => {}
+                other => fail(format!("{other:?}, expected a removed-provider refusal")),
+            }
+            if saved != yaml {
+                fail("changed".into());
+            }
+            continue;
+        }
         if let Some(refusal) = refusal {
             match &result {
                 Err(e) if format!("{e:#}") == refusal => {}

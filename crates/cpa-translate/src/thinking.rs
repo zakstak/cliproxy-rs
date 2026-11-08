@@ -36,11 +36,11 @@ mod tests {
 
     #[test]
     fn capabilities_come_from_every_static_catalog() {
-        // kimi-k2.5 is not a Claude model; Go still finds its levels through the static
+        // gpt-5.5 is not a Claude model; Go still finds its levels through the static
         // lookup, which is why Claude-bound translation uses adaptive thinking for it.
-        let kimi = lookup_model_info(" kimi-k2.5 ", "claude").unwrap().thinking.unwrap();
-        assert!(!kimi.levels.is_empty());
-        assert!(!has_level(&kimi.levels, "max"));
+        let gpt = lookup_model_info(" gpt-5.5 ", "claude").unwrap().thinking.unwrap();
+        assert!(!gpt.levels.is_empty());
+        assert!(!has_level(&gpt.levels, "max"));
         assert_eq!(map_to_claude_effort("xhigh", false), Some("high"));
         assert_eq!(map_to_claude_effort("xhigh", true), Some("max"));
         assert_eq!(map_to_claude_effort("auto", true), Some("high"));

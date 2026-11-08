@@ -29,10 +29,18 @@ fn format(v: &Value) -> Format {
     Format::parse(v.as_str().unwrap()).unwrap()
 }
 
+/// Whether a recorded vector names only the formats this fork keeps (Go also records
+/// Gemini, Interactions and Antigravity, which went with their providers, issue #49).
+fn retained(v: &Value) -> bool {
+    [&v["client"], &v["upstream"]]
+        .iter()
+        .all(|f| Format::parse(f.as_str().unwrap()).is_some())
+}
+
 #[test]
 fn registered_pairs_match_go() {
     let doc = load();
-    let regs = doc["registrations"].as_array().unwrap();
+    let regs: Vec<&Value> = doc["registrations"].as_array().unwrap().iter().filter(|r| retained(r)).collect();
     assert_eq!(regs.len(), Format::ALL.len() * Format::ALL.len());
     for r in regs {
         let (client, upstream) = (format(&r["client"]), format(&r["upstream"]));
@@ -59,7 +67,7 @@ fn fallbacks_match_go() {
     let vectors = doc["vectors"].as_array().unwrap();
     assert!(vectors.len() > 30, "generator lost vectors");
     let mut failures = vec![];
-    for v in vectors {
+    for v in vectors.iter().filter(|v| retained(v)) {
         let (client, upstream) = (format(&v["client"]), format(&v["upstream"]));
         let (input, want) = (latin1(&v["input"]), latin1(&v["output"]));
         let got = match v["path"].as_str().unwrap() {

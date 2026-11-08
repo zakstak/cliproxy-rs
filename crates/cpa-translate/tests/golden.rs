@@ -395,6 +395,13 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
 /// replayed at v8.0.35 by the named golden instead.
 const SUPERSEDED: &[(&str, &str)] = &[];
 
+/// A fixture for a Kimi model on a Claude pair: Go reads its token limit and thinking
+/// support from the Kimi catalog section, which went with the Kimi provider (issue #49);
+/// Kimi's Anthropic-compatible API was that integration's Claude route.
+fn removed_kimi_model(f: &Value) -> bool {
+    f["model"].as_str().is_some_and(|m| m.starts_with("kimi-"))
+}
+
 #[test]
 fn reference_goldens() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pairs");
@@ -428,6 +435,9 @@ fn reference_goldens() {
         // PENDING keys are exact names, so names must be unique within a pair.
         let mut names = std::collections::HashSet::new();
         for f in fixtures {
+            if removed_kimi_model(f) {
+                continue;
+            }
             total += 1;
             if !names.insert(f["name"].as_str().unwrap()) {
                 failures.push(format!("{}: duplicate fixture name {}", file.display(), f["name"]));
@@ -502,6 +512,9 @@ fn tool_search_goldens() {
             .copied()
             .inspect(|_| used += 1)
             .unwrap_or(f);
+        if removed_kimi_model(f) {
+            continue;
+        }
         let errors = check(
             Format::OpenAIResponse,
             Format::Claude,

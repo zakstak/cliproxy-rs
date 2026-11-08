@@ -70,10 +70,11 @@ fn dynamic_registry_overrides_static_capabilities() {
         thinking("claude-sonnet-4-5-20250929", "xhigh"),
         r#"{"type":"adaptive"} {"effort":"high"}"#
     );
-    // Models the overlay does not know still fall back to the static catalogs.
+    // Models the overlay does not know still fall back to the static catalogs: gpt-5.5
+    // lists xhigh, so it is kept.
     assert_eq!(
-        thinking("kimi-k2.5", "xhigh"),
-        r#"{"type":"adaptive"} {"effort":"high"}"#
+        thinking("gpt-5.5", "xhigh"),
+        r#"{"type":"adaptive"} {"effort":"xhigh"}"#
     );
     registry::install_overlay(None);
 }
