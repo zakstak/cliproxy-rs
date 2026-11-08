@@ -45,7 +45,6 @@ fn request(r: &Value) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::parse(s(&r["source"])).unwrap_or(Format::Gemini),
         response_format: Format::Gemini,
-        stream_payloads: false,
         requested_model: s(&r["model"]).to_owned(),
         model: s(&r["model"]).to_owned(),
         original_body: Bytes::from(s(&r["original"]).to_owned()),

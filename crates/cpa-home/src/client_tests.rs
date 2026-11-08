@@ -328,7 +328,6 @@ async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
         ("lpush_inflight", ":1\r\n"),
         ("rpush_request_log", ":1\r\n"),
         ("rpush_app_log", ":1\r\n"),
-        ("rpush_plugin_status", ":1\r\n"),
         ("get_refresh_auth", "$10\r\n{\"id\":\"a\"}\r\n"),
         ("get_refresh_auth_missing", "$-1\r\n"),
         ("get_models", "$11\r\n{\"data\":[]}\r\n"),
@@ -339,11 +338,7 @@ async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
     ]
     .into_iter()
     .collect();
-    let tasks = r#"[{"id":3,"operation":"install","plugin_id":"p","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z"}]"#;
-    let response = match name {
-        "get_plugin_tasks" => format!("${}\r\n{tasks}\r\n", tasks.len()),
-        _ => responses[name].to_owned(),
-    };
+    let response = responses[name].to_owned();
     let home = FakeHome::start(move |args| {
         if args[0].eq_ignore_ascii_case("ping") {
             return reply(args);
@@ -427,18 +422,6 @@ async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
             .map(|()| Json::Null),
         "rpush_request_log" => client.rpush_request_log(b"r").await.map(|()| Json::Null),
         "rpush_app_log" => client.rpush_app_log(b"a").await.map(|()| Json::Null),
-        "rpush_plugin_status" => client.rpush_plugin_status(b"p").await.map(|()| Json::Null),
-        "get_plugin_tasks" => client.get_plugin_tasks().await.map(|tasks| {
-            Json::Array(
-                tasks
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({"id": t.id, "operation": t.operation, "plugin_id": t.plugin_id,
-                            "created_at": t.created_at, "updated_at": t.updated_at})
-                    })
-                    .collect(),
-            )
-        }),
         "get_refresh_auth" => client.get_refresh_auth(" idx ", " sha ").await.map(text),
         "get_refresh_auth_missing" => client.get_refresh_auth("idx", "").await.map(text),
         "get_models" => {
@@ -484,15 +467,23 @@ async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
 /// Go `TestKVGetConvertsRedisNilToMiss`, `TestKVMGetConvertsNilItemsToMiss`,
 /// `TestKVSetConditionUnmetReturnsFalse`, `TestKVCompareAndSwapSendsCASCommand`,
 /// `TestKVCompareAndSwapOmitsPXWithoutTTL`, `TestKVCompareAndSwapLatchesUnsupportedHome`,
-/// `TestKVMSetUsesStableKeyOrder`, `TestRPushPluginStatusUsesPluginStatusKey`,
-/// `TestGetPluginTasksUsesPluginTasksKey`,
+/// `TestKVMSetUsesStableKeyOrder`,
 /// `TestModelsRequestSerializationCarriesCredentials` and the in-flight snapshot's
 /// dedicated key (`TestClientLPushInFlightSnapshotUsesDedicatedKeyWithoutChangingHeartbeat`):
 /// every client operation sends Go's commands and decodes Go's replies.
 #[tokio::test]
 async fn every_command_matches_go_on_the_wire() {
     let doc = golden();
-    let skipped = ["kv_ttl", "kv_ttl_missing", "kv_ttl_persistent"];
+    // The golden keeps Go's Home plugin commands (`rpush_plugin_status`,
+    // `get_plugin_tasks`) as historical evidence; native plugins and their Home sync are
+    // removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
+    let skipped = [
+        "kv_ttl",
+        "kv_ttl_missing",
+        "kv_ttl_persistent",
+        "rpush_plugin_status",
+        "get_plugin_tasks",
+    ];
     for case in doc["commands"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         if skipped.contains(&name) {

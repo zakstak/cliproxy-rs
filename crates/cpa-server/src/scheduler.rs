@@ -441,11 +441,6 @@ fn metadata<'a>(c: &'a Credential, key: &str) -> Option<&'a Value> {
         .or_else(|| c.metadata.get(key.replace('_', "-").as_str()))
 }
 
-/// A credential's priority tier, as selection reads it.
-pub(crate) fn priority(c: &Credential) -> i64 {
-    integer(c, "priority").unwrap_or(0)
-}
-
 fn integer(c: &Credential, key: &str) -> Option<i64> {
     c.attributes
         .get(key)
@@ -1115,22 +1110,6 @@ impl Scheduler {
                 self.affinity.compare_and_delete(key, &c.id);
             }
         }
-    }
-
-    /// Go's built-in scheduler with `strategy` (`pickSingleWithStrategy` and
-    /// `pickMixedWithStrategy`), without session affinity: what a plugin scheduler's
-    /// `delegate_builtin` answer runs.
-    /// ponytail: Go keeps the built-in scheduler's cursors apart from the configured
-    /// selector's; here they share the rotation state. Separate the maps if a plugin
-    /// scheduler mixing delegation and its own picks needs Go's exact rotation.
-    pub fn pick_builtin<'a>(
-        &mut self,
-        candidates: &[(&'a Credential, &str)],
-        selection: &Selection,
-        strategy: Strategy,
-        ranks: &Ranks<'_>,
-    ) -> Option<&'a Credential> {
-        self.pick_unbound(candidates, selection, strategy, ranks)
     }
 
     fn pick_unbound<'a>(

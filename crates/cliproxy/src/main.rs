@@ -1,8 +1,6 @@
 mod discovery;
 mod dotenv;
 mod home;
-mod home_plugins;
-mod plugin_cli;
 mod tui;
 
 use cpa_core::gostr::GoStr;
@@ -45,7 +43,7 @@ struct Args {
     /// Write process logs to this file (10 MiB rotation), without a shell wrapper.
     #[arg(long)]
     log_file: Option<PathBuf>,
-    /// Change to this directory first, before reading .env, plugins or relative paths.
+    /// Change to this directory first, before reading .env or relative paths.
     #[arg(long)]
     working_dir: Option<PathBuf>,
     /// Log in to Claude using browser OAuth and PKCE.
@@ -159,13 +157,8 @@ struct DiscoverArgs {
 /// which token is a value (a non-boolean flag takes the next token even when it starts
 /// with `-`), booleans accept `=value`, a repeated scalar keeps its last value, and
 /// parsing stops at the first operand or `--`; Go ignores everything after that.
-/// Unknown or malformed flags are passed on for clap to report. Plugin flags are set
-/// on `plugins` as they are parsed; a value they reject is Go's parse error.
-fn go_flags(
-    cmd: &clap::Command,
-    args: impl IntoIterator<Item = String>,
-    plugins: &dyn plugin_cli::PluginFlags,
-) -> Result<Vec<String>, String> {
+/// Unknown or malformed flags are passed on for clap to report.
+fn go_flags(cmd: &clap::Command, args: impl IntoIterator<Item = String>) -> Result<Vec<String>, String> {
     let mut args = args.into_iter();
     let mut out: Vec<String> = args.next().into_iter().collect();
     let args: Vec<String> = args.collect();
@@ -185,37 +178,6 @@ fn go_flags(
             Some((n, v)) => (n, Some(v)),
             None => (bare, None),
         };
-        // Go's FlagSet holds the plugin flags beside the built-in ones (names never
-        // clash: registration skips taken names).
-        if let Some(is_bool) = plugins
-            .lookup(name)
-            .filter(|_| !name.is_empty() && !name.starts_with(['-', '=']))
-        {
-            let quote = cpa_common::gostr::quote;
-            if is_bool {
-                match value {
-                    None => plugins
-                        .set(name, "true")
-                        .map_err(|e| format!("invalid boolean flag {name}: {e}"))?,
-                    Some(v) => plugins
-                        .set(name, v)
-                        .map_err(|e| format!("invalid boolean value {} for -{name}: {e}", quote(v)))?,
-                }
-                continue;
-            }
-            let value = match value {
-                Some(v) => v.to_owned(),
-                None if i < args.len() => {
-                    i += 1;
-                    args[i - 1].clone()
-                }
-                None => return Err(format!("flag needs an argument: -{name}")),
-            };
-            plugins
-                .set(name, &value)
-                .map_err(|e| format!("invalid value {} for flag -{name}: {e}", quote(&value)))?;
-            continue;
-        }
         let known = cmd.get_arguments().find(|a| a.get_long() == Some(name));
         let Some(flag) = known.filter(|_| !name.is_empty() && !name.starts_with(['-', '='])) else {
             tail = Some(if matches!(name, "h" | "help") {
@@ -358,12 +320,11 @@ fn argv_enables_bool_flag(args: &[String], name: &str) -> bool {
 
 /// The value of the built-in flag `wanted` (`-flag V`, `--flag V`, `-flag=V`,
 /// `--flag=V`; the last one wins), read from the raw arguments for what must happen
-/// before the parse: `-working-dir` changes the directory before `.env`, the plugin
-/// bootstrap or any relative path is read, and `-log-file` opens before the runtime
-/// starts. Like Go's parse it stops at the first operand or `--`, and built-in value
-/// flags take the next token. A flag the binary does not define may be a plugin flag:
-/// it is read as taking the next token unless that token is a flag; the full parse
-/// confirms the result.
+/// before the parse: `-working-dir` changes the directory before `.env` or any relative
+/// path is read, and `-log-file` opens before the runtime starts. Like Go's parse it
+/// stops at the first operand or `--`, and built-in value flags take the next token. A
+/// flag the binary does not define is read as taking the next token unless that token
+/// is a flag; the full parse then refuses it.
 fn prescan_value(args: &[String], wanted: &str) -> Option<String> {
     let mut found = None;
     let mut i = 0;
@@ -399,8 +360,35 @@ fn prescan_value(args: &[String], wanted: &str) -> Option<String> {
     found
 }
 
-/// Whether the binary itself defines `name` (plugin flags are only known once the
-/// plugins have loaded).
+/// The config path for sizing the runtime before the parse: the `-config` value from a
+/// raw scan of the arguments (up to `--`), else `./config.yaml`.
+fn prescan_config_path(args: &[String]) -> PathBuf {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--" => break,
+            "-config" | "--config" => {
+                if let Some(path) = args.get(i + 1) {
+                    return PathBuf::from(path);
+                }
+                break;
+            }
+            _ => {
+                if let Some(path) = arg.strip_prefix("-config=").or_else(|| arg.strip_prefix("--config=")) {
+                    return PathBuf::from(path);
+                }
+            }
+        }
+        i += 1;
+    }
+    match std::env::current_dir() {
+        Ok(wd) => wd.join("config.yaml"),
+        Err(_) => PathBuf::from("config.yaml"),
+    }
+}
+
+/// Whether the binary itself defines `name`.
 fn builtin_flag(name: &str) -> bool {
     static NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
         Args::command()
@@ -419,37 +407,6 @@ fn is_discover_flag(arg: &str) -> bool {
     let bare = bare.strip_prefix('-').unwrap_or(bare);
     let flag = bare.split_once('=').map_or(bare, |(f, _)| f);
     matches!(flag, "discover" | "discover-json")
-}
-
-/// In discover mode no plugin loads, so the parse accepts exactly the flags the
-/// pre-scan read as boolean plugin flags (an undefined flag right before
-/// `-discover` or `-discover-json`) and ignores them.
-struct PrescanBools(Vec<String>);
-
-impl PrescanBools {
-    fn from_args(args: &[String]) -> Self {
-        let names = args
-            .iter()
-            .zip(args.iter().skip(1))
-            .take_while(|(arg, _)| *arg != "--")
-            .filter(|(_, next)| is_discover_flag(next))
-            .filter_map(|(arg, _)| {
-                let bare = arg.strip_prefix('-')?;
-                let bare = bare.strip_prefix('-').unwrap_or(bare);
-                (!bare.is_empty() && !bare.contains('=') && !builtin_flag(bare)).then(|| bare.to_owned())
-            })
-            .collect();
-        Self(names)
-    }
-}
-
-impl plugin_cli::PluginFlags for PrescanBools {
-    fn lookup(&self, name: &str) -> Option<bool> {
-        self.0.iter().any(|n| n == name).then_some(true)
-    }
-    fn set(&self, _: &str, _: &str) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 /// Go's `appendCSV` flag function: each occurrence is split and appended.
@@ -489,8 +446,7 @@ fn discover_options(
 /// A personal proxy spends its time waiting on upstreams, so two workers serve hundreds
 /// of requests per second, and each extra worker can hold its own glibc arena. The
 /// blocking pool keeps tokio's default ceiling (512): its threads start on demand and
-/// exit after 10 idle seconds, and a native plugin call holds one for the whole call
-/// while its HTTP callbacks need others (DNS), so a low ceiling could deadlock.
+/// exit after 10 idle seconds.
 fn runtime(config: Option<&Path>) -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads(config))
@@ -588,7 +544,7 @@ fn flag_error(cmd: &mut clap::Command, message: &str) -> ! {
 fn main() -> anyhow::Result<()> {
     cpa_server::logging::init();
     let raw: Vec<String> = std::env::args().collect();
-    // First, so .env, plugins, the default config and relative paths resolve there.
+    // First, so .env, the default config and relative paths resolve there.
     let working_dir = prescan_value(&raw[1..], "working-dir");
     if let Some(dir) = &working_dir {
         std::env::set_current_dir(dir).with_context(|| format!("change to working directory {dir:?}"))?;
@@ -601,7 +557,7 @@ fn main() -> anyhow::Result<()> {
         cpa_server::logging::set_log_file(path.into()).context("open process log")?;
     }
     if raw.get(1).map(String::as_str) == Some("discover") {
-        let flags = go_flags(&DiscoverArgs::command(), raw.into_iter().skip(1), &())
+        let flags = go_flags(&DiscoverArgs::command(), raw.into_iter().skip(1))
             .unwrap_or_else(|e| flag_error(&mut DiscoverArgs::command(), &e));
         let args = DiscoverArgs::parse_from(flags);
         if !args.json {
@@ -614,49 +570,18 @@ fn main() -> anyhow::Result<()> {
     if !argv_enables_bool_flag(&raw[1..], "discover-json") {
         println!("{}", banner());
     }
-    // Go `isDiscoverMode`: discovery neither loads plugins nor reads .env.
+    // Go `isDiscoverMode`: discovery does not read .env.
     let discover_mode =
         argv_enables_bool_flag(&raw[1..], "discover-json") || argv_enables_bool_flag(&raw[1..], "discover");
     // Before the runtime starts: setting variables is only sound single-threaded.
-    // ponytail: Go reads .env after the flag parse, so plugins loaded for their flags do
-    // not see it; here it is read before they load (they do).
     if !discover_mode {
         dotenv::load_from_working_dir();
     }
-    let runtime = runtime(Some(&plugin_cli::bootstrap_config_path(&raw[1..], "")))?;
-    // Go: plugins from the bootstrap config register their flags before the parse.
-    let builtin_cmd = Args::command();
-    let plugins = (!discover_mode).then(|| {
-        let builtin = |name: &str| builtin_cmd.get_arguments().any(|a| a.get_long() == Some(name));
-        runtime.block_on(plugin_cli::bootstrap(&raw[1..], &builtin))
-    });
-    let mut cmd = match &plugins {
-        Some((_, flags)) => plugin_cli::with_flags(Args::command(), flags),
-        None => Args::command(),
-    };
-    let flags = match &plugins {
-        Some((host, _)) => go_flags(&cmd, raw, host),
-        None => {
-            let prescanned = PrescanBools::from_args(&raw[1..]);
-            go_flags(&cmd, raw, &prescanned)
-        }
-    }
-    .unwrap_or_else(|e| flag_error(&mut cmd, &e));
+    let runtime = runtime(Some(&prescan_config_path(&raw[1..])))?;
+    let mut cmd = Args::command();
+    let flags = go_flags(&cmd, raw).unwrap_or_else(|e| flag_error(&mut cmd, &e));
     let matches = cmd.clone().get_matches_from(flags);
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    if args.working_dir.as_deref() != working_dir.as_deref().map(Path::new) {
-        // The pre-scan read a plugin flag's value differently from the parse.
-        flag_error(
-            &mut cmd,
-            "-working-dir must come before any plugin flag that takes a value",
-        );
-    }
-    if args.log_file.as_deref() != log_file.as_deref().map(Path::new) {
-        flag_error(
-            &mut cmd,
-            "-log-file must come before any plugin flag that takes a value",
-        );
-    }
     if args.discover || args.discover_json {
         let cli = (csv_flags(&args.discover_include), csv_flags(&args.discover_exclude));
         let opts = discover_options(
@@ -668,12 +593,10 @@ fn main() -> anyhow::Result<()> {
         );
         std::process::exit(runtime.block_on(discovery::cli::discover(&opts)));
     }
-    let builtin = plugin_cli::builtin_values(&cmd, &matches);
-    let host = plugins.map(|(host, _)| host).unwrap_or_default();
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     runtime.spawn(heap_trim::run());
     let file_log = args.log_file.is_some();
-    let result = runtime.block_on(run(args, host, builtin));
+    let result = runtime.block_on(run(args));
     if file_log && let Err(error) = &result {
         tracing::error!("{error:#}");
     }
@@ -772,16 +695,11 @@ mod heap_trim {
     }
 }
 
-async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String)>) -> anyhow::Result<()> {
+async fn run(args: Args) -> anyhow::Result<()> {
     // An explicit remote URL makes `-tui` a pure management client: it needs no local
     // config, store or Home bootstrap (Go loads them first and can fail or wait there).
-    // Login, import and plugin flags still run first, as in Go.
-    if args.tui
-        && !args.standalone
-        && !args.management_base_url.trim().is_empty()
-        && !command_mode(&args)
-        && !plugins.has_triggered_command_line_flags()
-    {
+    // Login and import flags still run first, as in Go.
+    if args.tui && !args.standalone && !args.management_base_url.trim().is_empty() && !command_mode(&args) {
         remote_tui(args.management_base_url.trim().to_owned(), args.password).await;
         return Ok(());
     }
@@ -819,15 +737,15 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     let cloud = std::env::var("DEPLOY").is_ok_and(|v| v == "cloud");
     // Go main: with a Home JWT the config comes from Home; the config path stays for
     // downstream components but need not exist.
-    let (mut config, home_config, home_plugins) = match &home_jwt {
-        Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery, &plugins).await {
-            Ok((home_config, config, home_plugins)) => (config, Some(home_config), Some(home_plugins)),
+    let (mut config, home_config) = match &home_jwt {
+        Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery).await {
+            Ok((home_config, config)) => (config, Some(home_config)),
             Err(line) => {
                 tracing::error!("{line}");
                 return Ok(());
             }
         },
-        None => (load_config(&config_path, cloud)?, None, None),
+        None => (load_config(&config_path, cloud)?, None),
     };
     if let Some(store) = &store {
         config.auth_dir = store.auth_dir.clone();
@@ -860,24 +778,6 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     cpa_server::logging::configure(&config);
     tracing::info!("{}", banner());
     let before = store.as_ref().map(|store| auth_files(&store.auth_dir));
-    // Go: the loaded config reaches the plugins (and Home learns which of its plugins
-    // loaded), and a plugin flag hands the run to the plugins that own it.
-    plugins.apply_config(Arc::new(config.clone())).await;
-    if let Some(home_plugins) = home_plugins
-        && let Err(line) = home_plugins.finish(&plugins).await
-    {
-        tracing::error!("{line}");
-        return Ok(());
-    }
-    if let Some(code) = plugin_cli::execute(&plugins, &config_path, &builtin).await {
-        if let (Some(store), Some(before)) = (&store, &before) {
-            persist_login(store, before).await;
-        }
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
     let ran = command(&args, &config).await;
     if !matches!(ran, Ok(Ran::Nothing)) {
         if let (Some(store), Some(before)) = (&store, &before) {
@@ -894,16 +794,7 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     }
     if args.tui {
         if args.standalone {
-            standalone_tui(
-                config,
-                config_path,
-                args.password,
-                args.local_model,
-                store,
-                home_config,
-                plugins,
-            )
-            .await;
+            standalone_tui(config, config_path, args.password, args.local_model, store, home_config).await;
         } else {
             let base = resolve_management_base_url(&args.management_base_url, &config);
             remote_tui(base, args.password).await;
@@ -917,7 +808,6 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
         args.local_model,
         store,
         home_config,
-        plugins,
         shutdown_signal(),
         None,
     )
@@ -1016,7 +906,6 @@ async fn standalone_tui(
     local_model: bool,
     store: Option<cpa_store::Store>,
     home_config: Option<cpa_home::HomeConfig>,
-    plugins: cpa_plugin::Host,
 ) {
     let hook = cpa_server::logging::capture(2000);
     let (quiet, out): (Option<QuietStdio>, Box<dyn io::Write + Send>) = match QuietStdio::start() {
@@ -1043,7 +932,6 @@ async fn standalone_tui(
         local_model,
         store,
         home_config,
-        plugins,
         shutdown,
         Some(listening),
     ));
@@ -1332,7 +1220,6 @@ async fn serve(
     local_model: bool,
     store: Option<cpa_store::Store>,
     home_config: Option<cpa_home::HomeConfig>,
-    plugins: cpa_plugin::Host,
     shutdown: impl std::future::Future<Output = ()>,
     listening: Option<tokio::sync::oneshot::Sender<(SocketAddr, bool)>>,
 ) -> anyhow::Result<()> {
@@ -1373,7 +1260,7 @@ async fn serve(
         openai: Default::default(),
         google: Default::default(),
     };
-    let rt = Arc::new(Runtime::new(config, credentials, executors).with_plugin_host(plugins));
+    let rt = Arc::new(Runtime::new(config, credentials, executors));
     // What each file credential was loaded from, for Go-exact management saves.
     rt.store().note_loaded(&read);
     rt.set_local_model(local_model);
@@ -1404,11 +1291,6 @@ async fn serve(
         // Go enables the usage queue in Home mode whatever the management secret
         // (`redisqueue.SetEnabled(... || cfg.Home.Enabled)`); the forwarder drains it.
         rt.usage_queue().configure(true, &rt.config());
-    }
-    // Go applies the plugin config before serving; later publishes resync the host.
-    cpa_server::plugins::start(&rt).await;
-    if home.is_none() {
-        cpa_server::plugins::reload_plugin_auth_files(&rt).await;
     }
     let pprof = cpa_server::pprof::Server::start(&rt);
     // Home mode: the config comes from Home, and management answers 404 (Go
@@ -1609,11 +1491,11 @@ mod tests {
         }
     }
 
-    /// A flag the binary does not define may be a boolean plugin flag, so a discover
-    /// flag after it still selects discover mode, before any plugin loads. Built-in
-    /// flags that take a value keep consuming it as Go does.
+    /// A flag the binary does not define may be boolean, so a discover flag after it
+    /// still selects discover mode for the pre-parse scan (the full parse then refuses
+    /// the undefined flag). Built-in flags that take a value keep consuming it as Go does.
     #[test]
-    fn a_plugin_flag_before_discover_keeps_discover_mode() {
+    fn an_undefined_flag_before_discover_keeps_discover_mode() {
         let argv = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert!(argv_enables_bool_flag(
             &argv(&["-plugin-verbose", "-discover"]),
@@ -1627,7 +1509,7 @@ mod tests {
             &argv(&["-plugin-verbose", "-discover=true"]),
             "discover"
         ));
-        // A plugin flag still takes an ordinary value.
+        // An undefined flag still takes an ordinary value.
         assert!(argv_enables_bool_flag(
             &argv(&["-plugin-mode", "fast", "-discover"]),
             "discover"
@@ -1644,26 +1526,28 @@ mod tests {
         ));
     }
 
-    /// `-plugin-verbose -discover` selects discover mode, and the parse that follows
-    /// (without plugins) accepts that flag; another undefined flag still fails.
+    /// Native plugins are removed: a flag a plugin used to declare is an unknown flag,
+    /// refused by the parse, in discover mode too.
     #[test]
-    fn a_plugin_flag_before_discover_parses_in_discover_mode() {
+    fn a_former_plugin_flag_is_refused() {
         let parse = |a: &[&str]| {
             let raw: Vec<String> = std::iter::once("cliproxy")
                 .chain(a.iter().copied())
                 .map(str::to_owned)
                 .collect();
-            assert!(argv_enables_bool_flag(&raw[1..], "discover"), "{a:?}");
-            let flags = go_flags(&Args::command(), raw.clone(), &PrescanBools::from_args(&raw[1..]))?;
+            let flags = go_flags(&Args::command(), raw)?;
             Args::try_parse_from(flags).map_err(|e| e.to_string())
         };
-        assert!(parse(&["-plugin-verbose", "-discover"]).unwrap().discover);
-        assert!(
-            parse(&["--plugin-verbose", "--discover", "-discover-timeout", "5"])
-                .unwrap()
-                .discover
-        );
-        assert!(parse(&["-plugin-mode", "fast", "-discover"]).is_err());
+        for argv in [
+            &["-plugin-verbose"][..],
+            &["--plugin-mode", "fast"],
+            &["-plugin-verbose", "-discover"],
+        ] {
+            let Err(error) = parse(argv) else {
+                panic!("{argv:?}: an undefined flag fails the parse");
+            };
+            assert!(error.contains("plugin-"), "{argv:?}: {error}");
+        }
     }
 
     #[test]
@@ -1672,7 +1556,6 @@ mod tests {
             go_flags(
                 &Args::command(),
                 std::iter::once("cliproxy").chain(a.iter().copied()).map(String::from),
-                &(),
             )
             .unwrap()
         };
@@ -1720,7 +1603,6 @@ mod tests {
                 go_flags(
                     &DiscoverArgs::command(),
                     std::iter::once("discover").chain(a.iter().copied()).map(String::from),
-                    &(),
                 )
                 .unwrap(),
             )
@@ -1776,7 +1658,7 @@ mod tests {
                 &["--working-dir=d"],
                 &["-tui", "-config", "c.yaml", "--working-dir", "d", "-local-model"],
                 &["-working-dir", "x", "-working-dir=d"],
-                // An undefined (plugin) flag with a value, or a boolean one before a flag.
+                // An undefined flag with a value, or a boolean one before a flag.
                 &["-plugin-mode", "fast", "-working-dir", "d"],
                 &["-plugin-verbose", "-working-dir", "d"],
             ] {
@@ -1795,18 +1677,15 @@ mod tests {
         }
         let args = ["-working-dir", "-log-file", "l"].map(str::to_owned);
         assert_eq!(prescan_value(&args, "log-file"), None);
-        // The full parse agrees, and neither flag is passed to plugins.
+        // The full parse agrees.
         let raw = ["cliproxy", "-tui", "--working-dir=d", "-log-file", "l"].map(str::to_owned);
         let cmd = Args::command();
-        let matches = cmd.clone().get_matches_from(go_flags(&cmd, raw.clone(), &()).unwrap());
+        let matches = cmd.clone().get_matches_from(go_flags(&cmd, raw.clone()).unwrap());
         let args = Args::from_arg_matches(&matches).unwrap();
         assert_eq!(args.working_dir.as_deref(), Some(Path::new("d")));
         assert_eq!(args.log_file.as_deref(), Some(Path::new("l")));
         assert_eq!(prescan_value(&raw[1..], "working-dir").as_deref(), Some("d"));
         assert_eq!(prescan_value(&raw[1..], "log-file").as_deref(), Some("l"));
-        let builtin = plugin_cli::builtin_values(&cmd, &matches);
-        assert!(builtin.iter().all(|(n, _)| n != "working-dir" && n != "log-file"));
-        assert!(builtin.iter().any(|(n, v)| n == "tui" && v == "true"));
     }
 
     #[test]
@@ -1871,7 +1750,6 @@ mod tests {
             true,
             None,
             None,
-            cpa_plugin::Host::default(),
             async {
                 let _ = stopped.await;
             },

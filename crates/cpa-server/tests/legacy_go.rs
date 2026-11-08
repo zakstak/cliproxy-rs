@@ -11,6 +11,9 @@ use cpa_exec::claude::ClaudeExecutor;
 use cpa_server::management::{self, Management, Options};
 use serde_json::Value;
 
+mod plugins_removed;
+use plugins_removed::{without_plugins_json, without_plugins_yaml};
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/legacy_go.json")).expect("fixture JSON")
 }
@@ -186,7 +189,7 @@ async fn go_v0_routes_replay_byte_for_byte() {
         let dir = std::env::temp_dir().join(format!("cpa-legacy-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        let yaml = scenario["yaml"].as_str().unwrap().replace("$HASH", &hash);
+        let yaml = without_plugins_yaml(&scenario["yaml"].as_str().unwrap().replace("$HASH", &hash));
         std::fs::write(&path, with_auth_dir(&yaml, &dir)).unwrap();
         // routing.strategy in Go's state, from the fixture alone.
         let mut go_strategy = yaml_strategy(&yaml);
@@ -231,7 +234,8 @@ async fn go_v0_routes_replay_byte_for_byte() {
                 failures.push(format!("{at}: status {status}, Go {}: {body}", step["status"]));
                 continue;
             }
-            let mut want = step["raw_response"].as_str().unwrap();
+            let recorded = without_plugins_json(step["raw_response"].as_str().unwrap());
+            let mut want = recorded.as_str();
             // docs/DIFFERENCES-FROM-GO.md "Default routing strategy": for an unset strategy
             // Go answers round-robin, cliproxy-rs the effective soonest-reset.
             if strategy_read && unset {
@@ -255,7 +259,7 @@ async fn go_v0_routes_replay_byte_for_byte() {
             if let Some(go_cfg) = step["config"].as_str() {
                 let res = send("GET", "/config", String::new()).await.unwrap();
                 let got = res.text().await.unwrap();
-                if let Some(d) = first_difference(&got, go_cfg) {
+                if let Some(d) = first_difference(&got, &without_plugins_json(go_cfg)) {
                     failures.push(format!("{at}: config after write: {d}"));
                 }
             }

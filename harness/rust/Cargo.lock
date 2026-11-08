@@ -492,32 +492,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cpa-plugin"
-version = "0.4.1-zak.2"
-dependencies = [
- "async-compression",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "cpa-common",
- "cpa-core",
- "cpa-exec",
- "cpa-translate",
- "flate2",
- "futures-util",
- "http",
- "libc",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "wreq",
-]
-
-[[package]]
 name = "cpa-server"
 version = "0.4.1-zak.2"
 dependencies = [
@@ -532,7 +506,6 @@ dependencies = [
  "cpa-common",
  "cpa-core",
  "cpa-exec",
- "cpa-plugin",
  "cpa-translate",
  "futures-util",
  "getrandom 0.3.4",

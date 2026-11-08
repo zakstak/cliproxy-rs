@@ -804,50 +804,6 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
     }
 }
 
-/// Go `ParsePluginExecutorResponseUsage`: a plugin executor's buffered response in its
-/// output protocol; an unknown protocol reads as OpenAI.
-pub fn parse_plugin_body(protocol: &str, payload: &[u8]) -> Detail {
-    if payload.is_empty() {
-        return Detail::default();
-    }
-    match protocol.trim().go_lower().as_str() {
-        // Go `parseClaudePayloadUsage`: `usage`, else `message.usage`, of a valid body.
-        "claude" => {
-            if !gj::valid(payload) {
-                return Detail::default();
-            }
-            let node = first(&gj::parse(payload), &["usage", "message.usage"]);
-            if node.exists() {
-                parse_claude_node(&node)
-            } else {
-                Detail::default()
-            }
-        }
-        "gemini" => parse_gemini(payload),
-        "interactions" | "interactions-response" => parse_interactions(payload),
-        "antigravity" => parse_body(Format::Antigravity, payload),
-        // Go `parseResponsesPluginExecutorUsage`: an event's `response.usage`, else a
-        // completed object's top-level usage; a tier alone hides neither.
-        "codex" | "openai-response" => {
-            let codex = parse_codex(payload);
-            if let Some(d) = codex.as_ref().filter(|d| has_tokens(d)) {
-                return d.clone();
-            }
-            let mut openai = parse_openai(payload);
-            if has_tokens(&openai) {
-                if openai.response_service_tier.is_empty()
-                    && let Some(d) = &codex
-                {
-                    openai.response_service_tier = d.response_service_tier.clone();
-                }
-                return openai;
-            }
-            codex.unwrap_or(openai)
-        }
-        _ => parse_openai(payload),
-    }
-}
-
 /// Go `StreamUsageBuffer`, fed line by line in one format the way that format's Go
 /// executor feeds it.
 #[derive(Debug, Default)]
@@ -984,43 +940,6 @@ impl StreamUsage {
                     self.observe(d);
                 }
             }
-        }
-    }
-
-    /// Go `ObservePluginExecutorStreamUsage` for one trimmed line of a plugin
-    /// executor's stream in its output protocol; an unknown protocol reads as OpenAI.
-    pub fn plugin_line(&mut self, protocol: &str, line: &[u8]) {
-        match protocol.trim().go_lower().as_str() {
-            "claude" => {
-                if let Some(d) = parse_claude_stream(line) {
-                    self.observe_merged(d);
-                }
-            }
-            "gemini" => {
-                if let Some(d) = parse_gemini_stream(line) {
-                    self.observe(d);
-                }
-            }
-            "interactions" | "interactions-response" => {
-                if let Some(d) = parse_interactions_stream(line) {
-                    self.observe_merged(d);
-                }
-            }
-            "antigravity" => {
-                if let Some(d) = parse_antigravity_stream(line) {
-                    self.observe(d);
-                }
-            }
-            // A tier without `response.usage` is not token usage: a completed object's
-            // top-level usage still counts.
-            "codex" | "openai-response" => {
-                if let Some(d) = json_payload(line).and_then(parse_codex).filter(has_tokens) {
-                    self.observe(d);
-                    return;
-                }
-                self.observe_openai(line);
-            }
-            _ => self.observe_openai(line),
         }
     }
 
@@ -1927,8 +1846,6 @@ struct Reported {
     discarded: bool,
     exchange: Exchange,
     claude_cache: Option<cpa_core::exec::ClaudeCacheTelemetry>,
-    /// The plugin executor's provider when a plugin runs the attempt.
-    plugin_provider: Option<String>,
     /// The executor type and model of the built-in executor the attempt was handed to.
     delegated: Option<(String, String)>,
 }
@@ -2005,30 +1922,8 @@ impl cpa_core::exec::UsageObserver for Observer {
         r.stream.line(format, line);
     }
 
-    fn plugin_executor(&self, provider: &str) {
-        self.lock().plugin_provider = Some(provider.to_owned());
-    }
-
     fn delegated_executor(&self, executor_type: &str, model: &str) {
         self.lock().delegated = Some((executor_type.to_owned(), model.to_owned()));
-    }
-
-    fn plugin_response_body(&self, protocol: &str, body: &[u8]) {
-        let mut r = self.lock();
-        r.seen = true;
-        r.body = Some(parse_plugin_body(protocol, body));
-    }
-
-    fn plugin_response_line(&self, protocol: &str, line: &[u8]) {
-        let mut r = self.lock();
-        r.seen = true;
-        r.stream.plugin_line(protocol, line);
-        // Go `ObserveResponseModel` on each chunk (the TTFT observers) and the stream
-        // buffer's own model, for the executor's provider.
-        let Reported {
-            model, plugin_provider, ..
-        } = &mut *r;
-        model.observe(line, plugin_provider.as_deref().unwrap_or(&self.provider));
     }
 
     fn request(&self, format: Format, payload: &[u8]) {
@@ -2116,10 +2011,8 @@ pub struct Tracker {
     /// The request's client facts under this attempt's session, when it has its own:
     /// Home's canonical session for a dispatched credential, else its LCP pick's.
     client: Option<Client>,
-    /// Go `requestedAt`, for usage plugins.
+    /// Go `requestedAt`.
     requested_at: chrono::DateTime<chrono::FixedOffset>,
-    /// Go `baseURL`: the credential's `base_url` attribute, else its metadata's.
-    base_url: String,
     attempt: usize,
 }
 
@@ -2152,14 +2045,6 @@ impl Tracker {
     ) -> Self {
         let (provider, executor_type) = executor_identity(credential);
         let now = chrono::Local::now();
-        let base_url = credential
-            .attributes
-            .get("base_url")
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .or_else(|| credential.str("base_url").map(str::trim))
-            .unwrap_or_default()
-            .to_owned();
         let record = Record {
             timestamp: go_timestamp(&now),
             execution_id: uuid::Uuid::new_v4().to_string(),
@@ -2203,7 +2088,6 @@ impl Tracker {
             published: false,
             client: home_client,
             requested_at: now.fixed_offset(),
-            base_url,
             attempt: facts.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -2267,9 +2151,7 @@ impl Tracker {
             return;
         }
         let queue = self.queue.usage_queue();
-        // Go publishes every record to all usage plugins; the queue is one of them.
-        let plugins = self.queue.plugins().has_usage_plugins();
-        if !queue.accepts() && !plugins {
+        if !queue.accepts() {
             return;
         }
         let reported = std::mem::take(&mut *self.observer.lock());
@@ -2280,15 +2162,9 @@ impl Tracker {
         // Keep the returned TTL buckets as observations, not inferred accounting.
         let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));
         let mut record = std::mem::take(&mut self.record);
-        if let Some(provider) = &reported.plugin_provider {
-            // Go `ExecutorTypeName` of the host's `*executorAdapter`.
-            record.provider.clone_from(provider);
-            record.executor_type = "executorAdapter".into();
-        }
         if let Some((executor_type, model)) = reported.delegated.clone() {
             (record.executor_type, record.model) = (executor_type, model);
         }
-        let mut telemetry_only = false;
         let (latency, ttft);
         if let Some(outcome) = reported.outcome {
             record.failed = outcome.failed;
@@ -2309,8 +2185,7 @@ impl Tracker {
                         return;
                     }
                     // Keep activity and timestamps even when a Claude stream never
-                    // returns usage. Go plugins still receive nothing on this path.
-                    telemetry_only = true;
+                    // returns usage.
                     record.usage_observed = Some(false);
                     Detail::default()
                 }
@@ -2376,14 +2251,7 @@ impl Tracker {
         if let Some(effort) = reported.effort {
             record.reasoning_effort = effort;
         }
-        if plugins && !telemetry_only {
-            self.queue
-                .plugins()
-                .publish_usage(self.plugin_record(&record, latency, ttft));
-        }
-        if queue.accepts() {
-            queue.enqueue(queued(&record, self.client.as_ref().unwrap_or(&self.facts.client)));
-        }
+        queue.enqueue(queued(&record, self.client.as_ref().unwrap_or(&self.facts.client)));
         warn_model_substitution(&record, &reported.upstream_model, &self.auth_id);
     }
 }
@@ -2410,72 +2278,6 @@ impl Tracker {
             client_request_bytes: bytes(body.map(|(_, n)| n)),
             upstream_request_bytes: bytes(exchange.request_bytes),
             upstream_response_bytes: bytes(exchange.response_bytes),
-        }
-    }
-
-    /// Go `usageAdapter.HandleUsage`'s record.
-    fn plugin_record(
-        &self,
-        record: &Record,
-        latency: std::time::Duration,
-        ttft: std::time::Duration,
-    ) -> cpa_plugin::api::UsageRecord {
-        let client = self.client.as_ref().unwrap_or(&self.facts.client);
-        // Go `NewUsageReporter`: the client request's session; a parent that is not a
-        // hierarchy parent is dropped. The adapter then applies its own rule.
-        let parent = if client.session_id.is_empty() || client.session_id == client.parent_session_id {
-            String::new()
-        } else {
-            client.parent_session_id.clone()
-        };
-        let (session_id, parent_session_id) = cpa_plugin::transform::usage_session_ids(
-            &client.session_id,
-            &parent,
-            &client.session_id,
-            &client.parent_session_id,
-        );
-        let nanos = |d: std::time::Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
-        cpa_plugin::api::UsageRecord {
-            request_id: record.execution_id.clone(),
-            trace_id: client.request_id.trim().to_owned(),
-            provider: record.provider.clone(),
-            base_url: self.base_url.clone(),
-            executor_type: record.executor_type.clone(),
-            model: record.model.clone(),
-            alias: record.alias.clone(),
-            api_key: client.api_key.trim().to_owned(),
-            is_native_key: is_native_access_provider(&client.access_provider),
-            access_provider: client.access_provider.trim().to_owned(),
-            session_id,
-            parent_session_id,
-            auth_id: self.auth_id.clone(),
-            auth_index: record.auth_index.clone(),
-            auth_type: record.auth_type.clone(),
-            source: record.source.clone(),
-            reasoning_effort: record.reasoning_effort.clone(),
-            service_tier: record.service_tier.clone(),
-            response_service_tier: record.detail.response_service_tier.clone(),
-            response_model: record.response_model.clone(),
-            generate: record.generate,
-            stream: record.stream,
-            requested_at: cpa_plugin::gojson::GoTime(Some(self.requested_at)),
-            latency_ns: nanos(latency),
-            ttft_ns: nanos(ttft),
-            failed: record.failed,
-            failure: cpa_plugin::api::UsageFailure {
-                status_code: record.fail_status,
-                body: record.fail_body.clone(),
-            },
-            detail: cpa_plugin::api::UsageDetail {
-                input_tokens: record.detail.input,
-                output_tokens: record.detail.output,
-                reasoning_tokens: record.detail.reasoning,
-                cached_tokens: record.detail.cached,
-                cache_read_tokens: record.detail.cache_read,
-                cache_creation_tokens: record.detail.cache_creation,
-                total_tokens: record.detail.total,
-            },
-            response_headers: record.response_headers.iter().cloned().collect(),
         }
     }
 }
@@ -2713,41 +2515,6 @@ mod tests {
             go_timestamp(&t.with_timezone(&east)),
             "2026-10-03T13:30:00.123456+05:30"
         );
-    }
-
-    /// Go 8fbf152b (plugin_executor_usage_test.go): a Responses plugin executor's
-    /// top-level usage counts beside a service tier, buffered and streamed, and an
-    /// event's `response.usage` still wins over it.
-    #[test]
-    fn plugin_responses_usage_keeps_top_level_tokens_beside_a_service_tier() {
-        let tokens = |d: &Detail| (d.input, d.output, d.total, d.response_service_tier.clone());
-        let usage = r#""usage":{"input_tokens":34,"output_tokens":499,"total_tokens":533}"#;
-        let mut stream = StreamUsage::default();
-        let line = format!(r#"data: {{"type":"response.completed","service_tier":"default",{usage}}}"#);
-        stream.plugin_line("openai-response", line.as_bytes());
-        assert_eq!(tokens(stream.detail().unwrap()), (34, 499, 533, "default".into()));
-        for (protocol, payload, want) in [
-            (
-                "openai-response",
-                format!(r#"{{"id":"resp_1","object":"response","service_tier":"default",{usage}}}"#),
-                (34, 499, 533, "default"),
-            ),
-            ("openai-response", format!("{{{usage}}}"), (34, 499, 533, "")),
-            ("codex", format!(r#"{{"service_tier":"default",{usage}}}"#), (34, 499, 533, "default")),
-            (
-                "openai-response",
-                r#"{"service_tier":"priority","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"response":{"usage":{"input_tokens":18,"output_tokens":22,"total_tokens":40}}}"#.into(),
-                (18, 22, 40, "priority"),
-            ),
-            ("openai-response", r#"{"service_tier":"default"}"#.into(), (0, 0, 0, "default")),
-        ] {
-            let (input, output, total, tier) = want;
-            assert_eq!(
-                tokens(&parse_plugin_body(protocol, payload.as_bytes())),
-                (input, output, total, tier.to_owned()),
-                "{payload}"
-            );
-        }
     }
 
     /// Claude's executor-published outcomes through the queue: an apply_patch
@@ -3015,9 +2782,9 @@ mod tests {
                 r#""api_key":"k","is_native_key":true,"access_provider":"CONFIG-API-KEY","request_id""#,
             ),
             (
-                "custom-auth-plugin",
-                "plugin-principal-456",
-                r#""api_key":"plugin-principal-456","is_native_key":false,"access_provider":"custom-auth-plugin","request_id""#,
+                "custom-auth-provider",
+                "other-principal-456",
+                r#""api_key":"other-principal-456","is_native_key":false,"access_provider":"custom-auth-provider","request_id""#,
             ),
             (
                 "realtime-client-secret",
@@ -3034,36 +2801,6 @@ mod tests {
             let got = String::from_utf8(queued(&Record::default(), &client)).unwrap();
             assert!(got.contains(want), "{provider:?}: {got}");
         }
-        // The usage plugin record (Go `usageAdapter.HandleUsage`) trims both and
-        // derives the flag the same way.
-        let client = Client {
-            api_key: " sk-native ".into(),
-            access_provider: " Config-Inline ".into(),
-            ..Default::default()
-        };
-        let facts = std::sync::Arc::new(Facts::new(
-            client,
-            Format::OpenAIResponse,
-            Format::OpenAIResponse,
-            "claude-sonnet-4-6",
-            b"{}",
-            false,
-            &crate::dispatch::Trace::default(),
-        ));
-        let tracker = Tracker::start(&usage_runtime(), &facts, &credential_for("claude"), "claude-sonnet-4-6");
-        let got = tracker.plugin_record(&Record::default(), Default::default(), Default::default());
-        assert_eq!(
-            (got.api_key.as_str(), got.is_native_key, got.access_provider.as_str()),
-            ("sk-native", true, "Config-Inline")
-        );
-        // pluginapi.UsageRecord's Go field order: both follow APIKey.
-        let mut wire = Vec::new();
-        cpa_plugin::gojson::GoJson::encode(&got, &mut wire);
-        let wire = String::from_utf8(wire).unwrap();
-        assert!(
-            wire.contains(r#""APIKey":"sk-native","IsNativeKey":true,"AccessProvider":"Config-Inline","SessionID""#),
-            "{wire}"
-        );
     }
 
     /// A runtime whose usage queue keeps records.
@@ -3320,7 +3057,6 @@ mod tests {
                 attributes,
                 metadata: case["metadata"].as_object().cloned().unwrap_or_default(),
                 revision: 0,
-                next_refresh_after: None,
             };
             let request = &case["request"];
             let with_options = request["with_options"].as_bool().unwrap_or(false);

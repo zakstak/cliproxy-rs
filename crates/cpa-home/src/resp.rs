@@ -18,7 +18,7 @@ pub enum Value {
     Array(Vec<Value>),
 }
 
-// ponytail: fixed caps. Home's largest replies are config YAML and plugin sync manifests,
+// ponytail: fixed caps. Home's largest replies are config YAML and model catalogs,
 // far below these; raise them if a deployment ever sends more.
 const MAX_BULK: usize = 64 << 20;
 const MAX_ARRAY: usize = 1 << 20;

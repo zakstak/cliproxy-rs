@@ -644,7 +644,7 @@ async fn nonlocal_socket_requires_allow_remote_even_with_a_valid_key() {
 /// The binary's composition (`cpa_server::app`): API routes first, management and its
 /// NoRoute behind them. The API keeps gin's NoRoute rules (bare 404, no `Allow`, HEAD on
 /// `/healthz` only); management keeps its own HEAD handling, so a HEAD under
-/// `/v0/management` reaches the guard on the way to plugin routes.
+/// `/v0/management` reaches the guard before its bare 404.
 #[tokio::test]
 async fn served_app_keeps_api_and_management_no_route_rules() {
     let f = Fixture::new("served-app");
@@ -692,7 +692,8 @@ async fn served_app_keeps_api_and_management_no_route_rules() {
         );
     }
     assert_eq!(send(head.clone(), "/healthz", None).await.status(), 200);
-    // Go's NoRoute guards /v0/management before looking for a plugin route.
+    // Go's NoRoute guards /v0/management before looking for a plugin route; with none,
+    // the answer is a bare 404.
     assert_eq!(send(head.clone(), "/v0/management/nothing", None).await.status(), 401);
     let res = send(head, "/v0/management/nothing", Some("fake-management-only")).await;
     assert_eq!(res.status(), 404);
@@ -1740,61 +1741,6 @@ async fn model_definitions_match_go_by_channel() {
         compared += 1;
     }
     assert_eq!(compared, 17);
-    server.abort();
-}
-
-/// Go v8.0.35 `TestGetStaticModelDefinitions_FallsBackToPluginStaticModels`: a plugin
-/// channel lists the plugin's static models in plugin order. The plugin is the Go
-/// recorder test plugin.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_definitions_fall_back_to_plugin_static_models() {
-    let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let Some(built) = cpa_plugin::testing::built_plugins(tmp, "model_definitions_plugin") else {
-        return;
-    };
-    let dir = cpa_plugin::testing::scratch(tmp, "definitions-plugin");
-    let (plugins, records) = (dir.join("plugins"), dir.join("records"));
-    let respond = records.join("respond/workbuddy");
-    std::fs::create_dir_all(&plugins).unwrap();
-    std::fs::create_dir_all(&respond).unwrap();
-    std::fs::copy(built.join("recorder.so"), plugins.join("workbuddy.so")).unwrap();
-    // pluginapi.ModelInfo has no JSON tags: the wire names are Go's field names.
-    let models = json!({"provider": "workbuddy", "models": [
-        {"ID": "workbuddy-pro", "DisplayName": "WorkBuddy Pro"},
-        {"ID": "workbuddy-lite", "DisplayName": "WorkBuddy Lite"}]});
-    std::fs::write(
-        respond.join("model.static.json"),
-        json!({"ok": true, "result": models}).to_string(),
-    )
-    .unwrap();
-    let f = Fixture::from_yaml("definitions-plugin", |auth, hash| {
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    workbuddy:\n      enabled: true\n      label: workbuddy\n      record: {}\n      caps: model_provider\n",
-            auth.display(),
-            plugins.display(),
-            records.display()
-        )
-    });
-    // The startup sync registers the plugin's static models.
-    cpa_server::plugins::start(&f.rt).await;
-    let (base, server) = f.server().await;
-    let r = wreq::Client::new()
-        .get(format!("{base}/v8/management/routing/model-definitions/WorkBuddy"))
-        .bearer_auth("fake-management-only")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let v: Value = r.json().await.unwrap();
-    assert_eq!(v["channel"], "workbuddy");
-    let ids: Vec<_> = v["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["id"].clone())
-        .collect();
-    assert_eq!(ids, [json!("workbuddy-pro"), json!("workbuddy-lite")]);
-    assert_eq!(v["models"][0]["display_name"], "WorkBuddy Pro");
     server.abort();
 }
 
@@ -5377,16 +5323,22 @@ async fn json_numbers_in_string_settings_keep_their_text() {
 async fn v8_views_write_floats_as_go() {
     let f = Fixture::from_yaml("view-floats", |auth, hash| {
         format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\nplugins:\n  configs:\n    p: {{a: 1.0, b: -0.0, c: 1e20, d: 1.5, e: 1e21, f: 0.0000001, g: 7}}\n",
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\nrequests:\n  payload:\n    override:\n      - models: [{{name: m}}]\n        params: {{a: 1.0, b: -0.0, c: 1e20, d: 1.5, e: 1e21, f: 0.0000001, g: 7}}\n",
             auth.display()
         )
     });
     let (base, server) = f.server().await;
-    let (status, view) = call(&base, wreq::Method::GET, "/v8/management/config/plugins/configs/p", "").await;
+    let (status, view) = call(
+        &base,
+        wreq::Method::GET,
+        "/v8/management/config/requests/payload/override",
+        "",
+    )
+    .await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(
         view,
-        r#"{"a":1,"b":-0,"c":100000000000000000000,"d":1.5,"e":1e+21,"f":1e-7,"g":7}"#
+        r#"[{"models":[{"name":"m"}],"params":{"a":1,"b":-0,"c":100000000000000000000,"d":1.5,"e":1e+21,"f":1e-7,"g":7}}]"#
     );
     server.abort();
 }
@@ -5759,216 +5711,6 @@ async fn v0_legacy_saves_expand_merges_and_hash_the_key() {
     }
 }
 
-/// Go `TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe` (0c708401, 3d61c954): v8 lists
-/// name the quota plugin the host selects for each credential's provider (a first-pass
-/// identifier match beats an earlier plugin's described providers), and hide the
-/// declarative `quota_probe`, which only the v0 quota route runs. v0 lists keep the
-/// probe and never name the plugin.
-#[tokio::test]
-async fn auth_files_list_v8_quota_plugin_id_and_no_quota_probe() {
-    use cpa_plugin::testing::scripted::{Script, host_with};
-    let quota = |identifier: &'static str, describe: &'static str| Script {
-        caps: r#""quota_provider":true"#,
-        results: [("quota.identifier", identifier), ("quota.describe", describe)].into(),
-        fuse_on: None,
-    };
-    let dir = std::env::temp_dir().join(format!("manage-quota-plugins-{}", std::process::id()));
-    let (host, _) = host_with(
-        &dir,
-        [
-            (
-                "a-multi-quota",
-                quota(
-                    r#"{"identifier":"multi-quota"}"#,
-                    r#"{"supported_providers":["foo","bar"]}"#,
-                ),
-            ),
-            ("m-high-quota", quota(r#"{"identifier":"high"}"#, "{}")),
-            ("z-foo-quota", quota(r#"{"identifier":"foo"}"#, "{}")),
-        ]
-        .into(),
-    )
-    .await;
-    let auth = std::env::temp_dir().join(format!("manage-quota-auth-{}", std::process::id()));
-    std::fs::create_dir_all(&auth).unwrap();
-    for (name, body) in [
-        ("foo.json", r#"{"type":"foo"}"#),
-        ("bar.json", r#"{"type":"bar"}"#),
-        ("upper.json", r#"{"type":"high"}"#),
-        (
-            "probe.json",
-            r#"{"type":"custom","quota_probe":{"url":"https://api.example.invalid/quota"}}"#,
-        ),
-    ] {
-        std::fs::write(auth.join(name), body).unwrap();
-    }
-    let path = auth.join("config.yaml");
-    let hash = bcrypt::hash("fake-management-only", 4).unwrap();
-    std::fs::write(
-        &path,
-        format!(
-            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
-            auth.display()
-        ),
-    )
-    .unwrap();
-    let cfg = Config::load(&path).unwrap();
-    let mut credentials = cpa_core::config::credentials::load(&cfg);
-    // A provider that isn't lowercased yet: Go's strings.ToLower maps U+0130 to a plain
-    // "i", so the lookup finds the plugin keyed "high"; full Unicode lowercasing doesn't.
-    let upper = credentials.iter_mut().find(|c| c.id == "upper.json").unwrap();
-    upper.provider = "H\u{130}GH".to_owned();
-    let rt = Arc::new(
-        cpa_server::testing::runtime(
-            cfg.clone(),
-            credentials,
-            Executors {
-                claude: ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-                codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
-            },
-        )
-        .with_plugin_host(host),
-    );
-    let state = Management::new(rt, path);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            management::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    let list = |path: &'static str| {
-        let base = base.clone();
-        async move {
-            let listed: Value = wreq::Client::new()
-                .get(format!("{base}{path}"))
-                .bearer_auth("fake-management-only")
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            let files = listed["files"].as_array().unwrap().clone();
-            move |name: &str| files.iter().find(|f| f["name"] == name).unwrap().clone()
-        }
-    };
-    let v8 = list("/v8/management/credentials").await;
-    assert_eq!(v8("foo.json")["quota_plugin_id"], "z-foo-quota");
-    assert_eq!(v8("bar.json")["quota_plugin_id"], "a-multi-quota");
-    assert_eq!(v8("bar.json")["supports_quota"], true);
-    assert_eq!(v8("bar.json")["quota_provider"], "bar");
-    assert_eq!(v8("upper.json")["quota_plugin_id"], "m-high-quota");
-    assert_eq!(v8("upper.json")["quota_provider"], "H\u{130}GH");
-    let probe = v8("probe.json");
-    assert!(probe.get("supports_quota").is_none(), "{probe}");
-    assert!(probe.get("quota_probe").is_none(), "{probe}");
-
-    let v0 = list("/v0/management/auth-files").await;
-    let probe = v0("probe.json");
-    assert_eq!(probe["supports_quota"], true);
-    assert_eq!(probe["quota_probe"]["url"], "https://api.example.invalid/quota");
-    assert_eq!(v0("bar.json")["supports_quota"], true);
-    assert!(v0("bar.json").get("quota_plugin_id").is_none());
-    server.abort();
-    let _ = std::fs::remove_dir_all(&auth);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Go's management rules for plugin-virtual credentials (several a plugin parsed from
-/// one file): a field edit, status change or delete naming one of them is refused with
-/// 409, and the source file is never overwritten with one credential's document; a
-/// status change or delete naming the source file applies to the file and every
-/// credential parsed from it. Go `TestPatchPluginVirtualAuthStatusReturnsConflictForVirtualChild`,
-/// `TestPatchPluginVirtualSourceStatusDisablesAllExpandedAuths`,
-/// `TestPatchPluginVirtualAuthFieldsReturnsConflict` and
-/// `TestDeletePluginVirtualSourceRemovesExpandedRuntimeAuths`.
-#[tokio::test]
-async fn plugin_virtual_credentials_change_only_through_their_source_file() {
-    let f = Fixture::new("plugin-virtual");
-    let dir = f.dir.join("auth");
-    let source = dir.join("acme.json");
-    let original = r#"{"type":"acme","proxy-url":"http://proxy.invalid","openapi-location":"https://alias.invalid","openapi_location":"https://canonical.invalid","openapi-models":["m"]}"#;
-    std::fs::write(&source, original).unwrap();
-    let full = source.display().to_string();
-    let child = |id: &str, token: &str| {
-        let metadata = json!({"type": "acme", "token": token});
-        let mut c =
-            cpa_core::credential::Credential::from_file(&dir, &source, metadata.as_object().unwrap().clone()).unwrap();
-        c.id = id.into();
-        for (k, v) in [
-            ("plugin_virtual", "true"),
-            ("virtual_source", &full),
-            ("path", &full),
-            ("source", &full),
-        ] {
-            c.attributes.insert(k.into(), v.to_owned());
-        }
-        c
-    };
-    f.rt.store().reconcile(vec![child("acme-a", "a"), child("acme-b", "b")]);
-    let (base, server) = f.server().await;
-    let client = wreq::Client::new();
-    let call = |method: wreq::Method, path: &str, body: Option<Value>| {
-        let mut req = client
-            .request(method, format!("{base}/v8/management/credentials{path}"))
-            .bearer_auth("fake-management-only");
-        if let Some(body) = body {
-            req = req.json(&body);
-        }
-        async move {
-            let r = req.send().await.unwrap();
-            (r.status().as_u16(), r.json::<Value>().await.unwrap())
-        }
-    };
-    let refused =
-        json!({"error": "plugin virtual auth cannot be modified directly; edit or delete the source auth file"});
-    let status = |name: &str| Some(json!({"name": name, "disabled": true}));
-    assert_eq!(
-        call(wreq::Method::PATCH, "/status", status("acme-a")).await,
-        (409, refused.clone())
-    );
-    assert_eq!(
-        call(
-            wreq::Method::PATCH,
-            "/fields",
-            Some(json!({"name": "acme-a", "prefix": "x"}))
-        )
-        .await,
-        (409, refused.clone())
-    );
-    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
-    for id in ["acme-a", "acme-b"] {
-        assert!(!f.rt.store().get(id).unwrap().disabled, "{id}");
-    }
-    // Through the source file's name: the file and every parsed credential.
-    assert_eq!(
-        call(wreq::Method::PATCH, "/status", status("acme.json")).await,
-        (200, json!({"status": "ok", "disabled": true}))
-    );
-    assert_eq!(
-        std::fs::read_to_string(&source).unwrap(),
-        r#"{"disabled":true,"openapi_location":"https://canonical.invalid","openapi_models":["m"],"proxy_url":"http://proxy.invalid","type":"acme"}"#
-    );
-    for id in ["acme-a", "acme-b"] {
-        let c = f.rt.store().get(id).unwrap();
-        assert!(c.disabled, "{id}");
-        assert_eq!(c.metadata["token"], if id == "acme-a" { "a" } else { "b" });
-    }
-    // A refused delete still republishes the folder, as every delete does.
-    assert_eq!(call(wreq::Method::DELETE, "?name=acme-a", None).await, (409, refused));
-    assert!(source.exists());
-    assert_eq!(call(wreq::Method::DELETE, "?name=acme.json", None).await.0, 200);
-    assert!(!source.exists());
-    server.abort();
-}
-
 /// Go `ForceRefreshAuth` and `ForceRefreshAll` (`authHasRefreshCredential`): a Codex
 /// credential whose only refresh credential is its Sign in with ChatGPT partition
 /// refreshes by name and in bulk.
@@ -6081,4 +5823,194 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
     );
     server.abort();
     upstream.abort();
+}
+
+#[tokio::test]
+async fn retired_quota_probe_refuses_load_upload_and_field_edits() {
+    let legacy = br#"{"type":"codex","quota_probe":{"kind":"fake"},"unknown":{"keep":true}}"#;
+    let f = Fixture::from_yaml("quota-probe-removed", |auth, hash| {
+        std::fs::write(auth.join("legacy.json"), legacy).unwrap();
+        std::fs::write(
+            auth.join("active.json"),
+            br#"{"type":"codex","unknown":{"quota_probe":"keep"}}"#,
+        )
+        .unwrap();
+        format!(
+            "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
+            auth.display()
+        )
+    });
+    assert!(f.rt.store().get("legacy.json").is_none());
+    let before = f.rt.store().get("active.json").unwrap();
+    let auth = f.dir.join("auth");
+    let unchanged = std::fs::read(auth.join("active.json")).unwrap();
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    for value in [json!({"kind":"fake"}), Value::Null, json!(false)] {
+        let response = client
+            .post(format!("{base}/v8/management/credentials?name=uploaded.json"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({"type":"codex", "quota_probe":value}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("quota_probe"));
+        assert!(body["error"].as_str().unwrap().contains("requests/api-call"));
+        assert!(!auth.join("uploaded.json").exists());
+    }
+    for field in ["quota_probe", "quota_probe.url", " quota_probe . url "] {
+        let response = client
+            .patch(format!("{base}/v8/management/credentials/fields"))
+            .bearer_auth("fake-management-only")
+            .json(&json!({"name":"active.json", field:"fake-value"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("quota_probe"));
+        assert_eq!(std::fs::read(auth.join("active.json")).unwrap(), unchanged);
+        assert_eq!(f.rt.store().get("active.json").unwrap().revision, before.revision);
+    }
+    assert_eq!(std::fs::read(auth.join("legacy.json")).unwrap(), legacy);
+    assert_eq!(before.metadata["unknown"]["quota_probe"], "keep");
+    server.abort();
+}
+
+/// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): every
+/// plugin, plugin store and plugin quota route answers `410 plugins_removed` behind the
+/// management guard, plugin resources answer it without one, the API reports no plugin
+/// support, and the v0 config view has no `plugins` section.
+#[tokio::test]
+async fn retired_plugin_routes_answer_gone_behind_the_guard() {
+    let f = Fixture::new("plugins-removed");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    for (method, path) in [
+        (wreq::Method::GET, "/v8/management/plugins"),
+        (wreq::Method::DELETE, "/v8/management/plugins/acme"),
+        (wreq::Method::GET, "/v8/management/plugins/store"),
+        (wreq::Method::POST, "/v8/management/plugins/store/acme/install"),
+        (wreq::Method::POST, "/v8/management/plugins/acme/quota"),
+        (wreq::Method::GET, "/v0/management/plugins"),
+        (wreq::Method::PATCH, "/v0/management/plugins/acme/enabled"),
+        (wreq::Method::PUT, "/v0/management/plugins/acme/config"),
+        (wreq::Method::POST, "/v0/management/plugins/acme/quota/reset"),
+        (wreq::Method::GET, "/v0/management/plugin-store"),
+        (wreq::Method::POST, "/v0/management/plugin-store/acme/install"),
+        (wreq::Method::GET, "/v0/management/quota/providers"),
+        (wreq::Method::POST, "/v0/management/quota/fetch"),
+        (wreq::Method::POST, "/v0/management/quota/reset"),
+    ] {
+        let anonymous = client
+            .request(method.clone(), format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status().as_u16(), 401, "{method} {path}: guarded");
+        let r = client
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth("fake-management-only")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 410, "{method} {path}");
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "plugins_removed", "{method} {path}");
+        assert!(
+            body["message"].as_str().unwrap().contains("MIGRATING-FROM-GO.md"),
+            "{body}"
+        );
+    }
+    let r = client
+        .get(format!("{base}/v0/resource/plugins/acme/app.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 410);
+    // Paths that only resemble the retired ones keep gin's bare 404.
+    for path in ["/v8/management/quota/fetch", "/v8/management/plugin-store"] {
+        let r = client
+            .get(format!("{base}{path}"))
+            .bearer_auth("fake-management-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "{path}");
+    }
+    let r = client
+        .get(format!("{base}/v0/management/config"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers()["x-cpa-support-plugin"], "0");
+    let view: Value = r.json().await.unwrap();
+    assert!(view.get("plugins").is_none(), "{view}");
+    server.abort();
+}
+
+/// A management write that would add a `plugins` section is refused with the
+/// migration error and leaves the file and the running config as they were.
+#[tokio::test]
+async fn management_writes_refuse_a_plugins_section() {
+    let f = Fixture::new("plugins-write");
+    let (base, server) = f.server().await;
+    let before = f.file();
+    for (method, path, body) in [
+        (
+            wreq::Method::PUT,
+            "/v8/management/config/plugins",
+            r#"{"enabled":false}"#,
+        ),
+        (
+            wreq::Method::PATCH,
+            "/v8/management/config",
+            r#"{"plugins":{"enabled":true,"dir":"plugins"}}"#,
+        ),
+        (
+            wreq::Method::PUT,
+            "/v8/management/config.yaml",
+            "config-version: 8\nplugins:\n  enabled: false\n",
+        ),
+    ] {
+        let (status, text) = call(&base, method.clone(), path, body).await;
+        assert_eq!(status, 422, "{method} {path}: {text}");
+        assert!(text.contains(r#""error":"invalid_config""#), "{method} {path}: {text}");
+        assert!(
+            text.contains("plugins section is not supported"),
+            "{method} {path}: {text}"
+        );
+        assert_eq!(f.file(), before, "{method} {path} changed the file");
+    }
+    assert!(f.rt.config().document.get("plugins").is_none());
+    server.abort();
+}
+
+/// The v0 spellings of the OAuth status and cancel routes stay built in: an empty state
+/// is ok, an unknown one is reported, and a cancel needs a state.
+#[tokio::test]
+async fn v0_oauth_status_and_session_routes_answer_without_plugins() {
+    let f = Fixture::new("v0-oauth-routes");
+    let (base, server) = f.server().await;
+    let (status, body) = call(&base, wreq::Method::GET, "/v0/management/get-auth-status", "").await;
+    assert_eq!((status, body.contains(r#""status":"ok""#)), (200, true), "{body}");
+    let state = "a".repeat(64);
+    let (status, body) = call(
+        &base,
+        wreq::Method::GET,
+        &format!("/v0/management/get-auth-status?state={state}"),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("unknown or expired state"), "{body}");
+    let (status, body) = call(&base, wreq::Method::DELETE, "/v0/management/oauth-session", "").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("missing state"), "{body}");
+    server.abort();
 }

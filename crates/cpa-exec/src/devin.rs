@@ -559,7 +559,7 @@ impl DevinExecutor {
             tool_search: false,
         };
         if req.stream {
-            let translator = pair.map(|pair| crate::translate::stream(pair, &ctx, &req));
+            let translator = pair.map(|pair| crate::translate::stream(pair, &ctx));
             let claude = ClaudeInputTokens::new(
                 req.source_format,
                 Format::Interactions,

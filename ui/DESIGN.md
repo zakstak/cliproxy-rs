@@ -101,6 +101,6 @@ Motion only reports state. Keys press (120 ms). Lamps on live things (log tail, 
 
 - Do show each fact once, in the place it is used.
 - Do disable an action the server lacks and say so in one line. Don't offer it and let it fail.
-- Do keep explanatory copy to the actions that are costly to get wrong (deleting, draining the usage queue, installing native plugins).
+- Do keep explanatory copy to the actions that are costly to get wrong (deleting, draining the usage queue).
 - Don't add taglines, cards around sections, gradients, glows, or a second accent colour.
-- Don't render remote plugin HTML, store the management key, or show a metric the API does not report.
+- Don't render remote HTML, store the management key, or show a metric the API does not report.

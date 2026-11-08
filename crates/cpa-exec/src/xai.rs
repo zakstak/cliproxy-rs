@@ -357,8 +357,7 @@ fn translate_non_stream(req: &ExecRequest, p: &Prepared, to: Format, data: &[u8]
     };
     let out = match cpa_translate::pair(req.response_format, to) {
         Some(pair) => (pair.non_stream)(&ctx, data).map_err(|_| apply_patch_error())?,
-        None => cpa_translate::hooks::unregistered_non_stream(to.as_str(), req.response_format.as_str(), &ctx, data)
-            .unwrap_or_else(|| data.to_vec()),
+        None => data.to_vec(),
     };
     if out.is_empty() {
         return Err(apply_patch_error());
@@ -1001,7 +1000,6 @@ impl Pipeline {
                     translated_request: &p.body,
                     tool_search: false,
                 },
-                req,
             ),
             None => Box::new(Identity),
         };

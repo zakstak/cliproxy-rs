@@ -938,6 +938,7 @@ pub fn v8_layout_error(root: &Value) -> Option<String> {
         "models",
         "config-version",
         "api-keys",
+        // Accepted here so the load refuses it with `config::PLUGINS_REMOVED`.
         "plugins",
         "quota-exceeded",
         "client",

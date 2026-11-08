@@ -16,7 +16,6 @@
     client: "Per-client tweaks.",
     multimedia: "Image and video generation.",
     observability: "Logs and usage statistics.",
-    plugins: "Native plugins.",
   };
   let edit = $state<{ path: string; value: unknown; title: string; yaml: boolean } | null>(null);
   // Strategies this server understands; "soonest-reset" is a cliproxy-rs addition.

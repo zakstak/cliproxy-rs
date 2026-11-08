@@ -473,7 +473,6 @@ fn request(s: &Value) -> ExecRequest {
         },
         source_format: source,
         response_format: response,
-        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: original,
@@ -875,7 +874,6 @@ async fn pending_responses_frame_is_flushed_before_terminal_error() {
         translator: Box::new(Pending(None)),
         client: Format::OpenAIResponse,
         raw: false,
-        executor_chunks: false,
         claude: ClaudeInputTokens::new(
             Format::OpenAIResponse,
             Format::Gemini,
@@ -954,7 +952,6 @@ async fn apply_patch_hooks_follow_go_order() {
             translator: Box::new(hooks),
             client: Format::OpenAI,
             raw: false,
-            executor_chunks: false,
             claude: ClaudeInputTokens::new(Format::OpenAI, Format::Gemini, Format::OpenAI, Bytes::new()),
             usage: Default::default(),
             capture: Default::default(),

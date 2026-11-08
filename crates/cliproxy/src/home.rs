@@ -107,20 +107,14 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
         &["management", "disable-control-panel"],
         Some(Yaml::Bool(true)),
     );
-    set(&mut doc, &["plugins", "store-auth"], None);
-    let mut cfg = Config::parse(&cpa_core::config::yaml_string(&doc)?)?;
-    // Go hands plugins their raw nodes from Home's text; the overlay leaves them as sent.
-    cfg.plugin_configs = parsed.plugin_configs;
-    Ok(cfg)
+    Config::parse(&cpa_core::config::yaml_string(&doc)?)
 }
 
-/// Go main's Home bootstrap: Home's config, with its plugins synced and reported. The
-/// error is the line Go logs before exiting.
-pub async fn bootstrap(
-    jwt: &str,
-    disable_discovery: bool,
-    plugins: &cpa_plugin::Host,
-) -> Result<(HomeConfig, Config, crate::home_plugins::Bootstrap), String> {
+/// Go main's Home bootstrap: Home's config. Go also syncs and reports Home-managed
+/// plugins here; native plugins are removed, and a Home config with a `plugins` section
+/// is refused (`cpa_core::config::PLUGINS_REMOVED`). The error is the line Go logs
+/// before exiting.
+pub async fn bootstrap(jwt: &str, disable_discovery: bool) -> Result<(HomeConfig, Config), String> {
     let mut home = tokio::time::timeout(BOOTSTRAP_TIMEOUT, cpa_home::cert::config_from_jwt(jwt))
         .await
         .unwrap_or(Err(cpa_home::Error::Timeout))
@@ -134,21 +128,10 @@ pub async fn bootstrap(
         .unwrap_or(Err(cpa_home::Error::Timeout));
     let parsed = raw
         .map_err(|e| format!("failed to fetch config from home: {e}"))
-        .and_then(|raw| {
-            let config = overlay(&raw, None).map_err(|e| format!("failed to parse config payload from home: {e:#}"))?;
-            Ok((crate::home_plugins::sync_config(&raw, &config), config))
-        });
-    let (sync, config) = match parsed {
-        Ok(parsed) => parsed,
-        Err(line) => {
-            client.close();
-            return Err(line);
-        }
-    };
-    // Go closes the bootstrap client after the plugin load report; the service opens its
-    // own.
-    let plugins = crate::home_plugins::bootstrap(client, &home.node_id, &sync, plugins).await?;
-    Ok((home, config, plugins))
+        .and_then(|raw| overlay(&raw, None).map_err(|e| format!("failed to parse config payload from home: {e:#}")));
+    // Go closes the bootstrap client; the service opens its own.
+    client.close();
+    Ok((home, parsed?))
 }
 
 /// The client and registry of the live Home lifetime (Go `HomeDispatchBundle`).
@@ -636,6 +619,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    cpa_core::config::credentials::validate_metadata(&metadata).map_err(|e| reject(502, "invalid_auth", e))?;
     let provider = text("provider").go_lower();
     let label = text("label");
     let key = executor_key(&provider, &label, &attributes);
@@ -710,7 +694,6 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         attributes,
         metadata,
         revision: 0,
-        next_refresh_after: None,
     };
     // Go `attachResolvedHomeModelInfo` inputs, fixed for the lease: Home's definition of
     // the model (`registryModelInfo` is nil without an ID) and the `credential_options`
@@ -830,11 +813,6 @@ async fn run_lifetimes(
     let bound = || CredentialConcurrency::default().with_defaults().cancel_bound();
     // Go keeps the publisher settings on the auth manager, across lifetimes.
     let publisher = cpa_home::inflight::PublisherSettings::default();
-    // Go keeps the plugin sync key on the service, across lifetimes.
-    let plugins = Arc::new(crate::home_plugins::HomePlugins::new(
-        &home.node_id,
-        Some(rt.plugins().clone()),
-    ));
     while !shutdown.is_cancelled() {
         let client = match &previous {
             Some(client) => client.new_lifetime(),
@@ -861,7 +839,6 @@ async fn run_lifetimes(
                 app_log.clone(),
             );
             let (lifetime, published, publisher) = (lifetime.clone(), published.clone(), publisher.clone());
-            let plugins = plugins.clone();
             async move {
                 // Go `runHomeConfigWorkerWithSupervisor`: the lifetime's in-flight
                 // publisher and usage forwarder, awaited before it is torn down.
@@ -873,22 +850,12 @@ async fn run_lifetimes(
                 loop {
                     let mut raw = latest.borrow_and_update().clone();
                     if raw.is_some() {
-                        // Go `runHomeConfigWorker`: stage (overlay, plugin sync, plugin
-                        // tasks) until it succeeds, every 100ms with the newest payload;
-                        // then apply, then finalize until it succeeds.
-                        let (cfg, mut work) = loop {
+                        // Go `runHomeConfigWorker`: stage (the overlay) until it
+                        // succeeds, every 100ms with the newest payload; then apply. Go
+                        // also syncs Home-managed plugins and runs their tasks here.
+                        let cfg = loop {
                             let payload = raw.as_deref().unwrap_or_default();
-                            let staged = async {
-                                let cfg = overlay(payload, Some(rt.config().as_ref()))?;
-                                let sync = crate::home_plugins::sync_config(payload, &cfg);
-                                let work = plugins.stage(&sync, &client).await.map_err(anyhow::Error::msg)?;
-                                anyhow::Ok((cfg, work))
-                            };
-                            let staged = tokio::select! {
-                                _ = lifetime.cancelled() => return helpers,
-                                staged = staged => staged,
-                            };
-                            match staged {
+                            match overlay(payload, Some(rt.config().as_ref())) {
                                 Ok(staged) => break staged,
                                 Err(error) => tracing::warn!("failed to stage home config; retrying: {error:#}"),
                             }
@@ -902,32 +869,10 @@ async fn run_lifetimes(
                         };
                         // Go `redisqueue.SetEnabled(... || cfg.Home.Enabled)`.
                         rt.usage_queue().configure(true, &cfg);
-                        // Go registers the config's API keys before it syncs the plugin
-                        // models (`applyConfigRuntime`): the plugin worker this publish
-                        // wakes decides executor and model ownership from the store.
+                        // Go registers the config's API keys before it applies the rest
+                        // of the config (`applyConfigRuntime`).
                         rt.store().replace_config(config_api_keys(&cfg));
                         rt.publish_config(cfg);
-                        // Go applies the plugin config with the rest of the config
-                        // (`applyConfigRuntime`) before it finalizes: load marks, delete
-                        // tasks and the first dispatch all wait for the plugin worker.
-                        tokio::select! {
-                            _ = lifetime.cancelled() => return helpers,
-                            _ = cpa_server::plugins::applied(&rt) => {}
-                        }
-                        loop {
-                            let finalized = tokio::select! {
-                                _ = lifetime.cancelled() => return helpers,
-                                finalized = plugins.finalize(&lifetime, &client, &mut work) => finalized,
-                            };
-                            match finalized {
-                                Ok(()) => break,
-                                Err(error) => tracing::warn!("failed to finalize home plugins; retrying: {error}"),
-                            }
-                            tokio::select! {
-                                _ = lifetime.cancelled() => return helpers,
-                                _ = tokio::time::sleep(PRE_ACK_RETRY) => {}
-                            }
-                        }
                         if !published.swap(true, std::sync::atomic::Ordering::SeqCst) {
                             // The KV client goes first: an attempt that receives a Home
                             // credential must also see Home KV for its identities and
@@ -1054,7 +999,7 @@ async fn run_lifetimes(
 /// Responses WebSocket session can keep a Home pin on them). Dispatch stays Home's: the
 /// remote dispatcher is installed before the first config arrives. Unlike Go, a key
 /// removed from Home's config is dropped with its models (docs/DIFFERENCES-FROM-GO.md).
-/// The rest of the store (relay sessions, plugin-registered credentials) is kept.
+/// The rest of the store (relay sessions) is kept.
 fn config_api_keys(cfg: &Config) -> Vec<Credential> {
     cpa_core::config::credentials::from_config(cfg)
         .into_iter()
@@ -1070,17 +1015,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    /// A fake Home in front of `handler` that has no plugin tasks and accepts plugin
-    /// status reports, so a node's Home plugin finalization succeeds.
+    /// A fake Home in front of `handler`.
     async fn fake_home(handler: impl Fn(&[String]) -> Reply + Send + Sync + 'static) -> FakeHome {
-        FakeHome::start(
-            move |args| match (args[0].go_lower().as_str(), args.get(1).map(String::as_str)) {
-                ("get", Some(cpa_home::client::KEY_PLUGIN_TASKS)) => fake::raw("$-1\r\n"),
-                ("rpush", Some(cpa_home::client::KEY_PLUGIN_STATUS)) => fake::raw(":1\r\n"),
-                _ => handler(args),
-            },
-        )
-        .await
+        FakeHome::start(handler).await
     }
 
     const ACK: &str = "*3\r\n$9\r\nsubscribe\r\n$6\r\nconfig\r\n:1\r\n";
@@ -1304,8 +1241,6 @@ mod tests {
         let guard = ONE_NODE.lock().await;
         let dispatcher = Arc::new(Dispatcher::new(&rt));
         rt.set_remote_dispatch(Some(dispatcher.clone()));
-        // main.rs: the plugin worker runs; each lifetime waits for it to apply.
-        cpa_server::plugins::start(&rt).await;
         let shutdown = CancellationToken::new();
         let subscriber = spawn_subscriber(home.config(), rt.clone(), dispatcher, shutdown.clone());
         let task = tokio::spawn(async move {
@@ -1398,20 +1333,18 @@ mod tests {
         );
     }
 
-    /// Go builds the Home config with `ParseConfigBytes(raw)`, so plugins get their
-    /// scalars as Home wrote them.
+    /// Native plugins are removed: a Home config with a `plugins` section is refused
+    /// with the migration error, like a config file.
     #[test]
-    fn overlay_keeps_plugin_scalars_as_written() {
-        let cfg = overlay(
+    fn overlay_refuses_a_plugins_section() {
+        let error = overlay(
             b"plugins:\n  enabled: true\n  configs:\n    p: {threshold: 1.50}\n",
             None,
         )
-        .unwrap();
-        let rc = cpa_plugin::config::runtime_config(&cfg.document, &cfg.plugin_configs).unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&rc.items["p"].config_yaml),
-            "threshold: 1.50\nenabled: false\npriority: 0\n"
-        );
+        .unwrap_err();
+        assert_eq!(error.to_string(), cpa_core::config::PLUGINS_REMOVED);
+        let error = overlay(b"port: 0\nplugins: {enabled: false}\n", None).unwrap_err();
+        assert_eq!(error.to_string(), cpa_core::config::PLUGINS_REMOVED);
     }
 
     #[test]
@@ -1470,6 +1403,19 @@ mod tests {
             ("a.json", "claude", "e@x")
         );
         assert!(credential(&DispatchResponse::parse(br#"{"id":"x"}"#).unwrap(), "m").is_err());
+    }
+
+    #[test]
+    fn dispatched_auths_refuse_retired_quota_probe() {
+        let response = DispatchResponse::parse(
+            br#"{"id":"fake-home-auth","provider":"codex","metadata":{"quota_probe":{"kind":"fake"}}}"#,
+        )
+        .unwrap();
+        let error = credential(&response, "fake-model").unwrap_err();
+        assert_eq!(error.error.status, 502);
+        let body = String::from_utf8_lossy(&error.error.body);
+        assert!(body.contains("quota_probe"));
+        assert!(body.contains("requests/api-call"));
     }
 
     /// Go `TestHomeForceMappingAliasResult`,
@@ -3286,65 +3232,6 @@ mod tests {
         drop(socket);
         shutdown.cancel();
         task.await.unwrap();
-    }
-
-    /// Go `applyConfigRuntime` registers the config's API keys before
-    /// `syncPluginModelRuntime`: a plugin executor's model that a key in Home's config
-    /// serves stays with the key's built-in provider, from the first config on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_plugin_executor_does_not_claim_a_model_a_home_config_key_serves() {
-        use cpa_plugin::testing::scripted::{Script, host_with};
-        let dir = std::env::temp_dir().join(format!("cpa-home-key-owner-{}", std::process::id()));
-        let script = Script {
-            caps: r#""executor":true,"model_provider":true"#,
-            results: [(
-                "model.static",
-                r#"{"Provider":"acme","Models":[{"ID":"home-key-model"}]}"#,
-            )]
-            .into(),
-            fuse_on: None,
-        };
-        let (host, _) = host_with(&dir, [("acme", script)].into()).await;
-        let config: &'static str = String::leak(format!(
-            "port: 0\ncodex-api-key:\n  - api-key: sk-local\n    base-url: http://127.0.0.1:9\n    models:\n      - name: home-key-model\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    acme:\n      enabled: true\n      priority: 5\n",
-            dir.display()
-        ));
-        // A Home without plugin sync that accepts the plugin status report.
-        let home = FakeHome::start(
-            move |args| match (args[0].go_lower().as_str(), args.get(1).map(String::as_str)) {
-                ("get", Some("config")) => fake::bulk(config),
-                ("get", Some("plugin-sync")) => fake::raw("-ERR plugin_sync_unsupported\r\n"),
-                ("get", _) | ("rpop", _) => fake::raw("$-1\r\n"),
-                ("subscribe", _) => fake::raw(ACK),
-                ("ping", _) => fake::raw("+PONG\r\n"),
-                _ => fake::raw(":1\r\n"),
-            },
-        )
-        .await;
-        let rt = cpa_server::testing::runtime(
-            overlay(b"port: 0\n", None).unwrap(),
-            Vec::new(),
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
-                codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
-            },
-        )
-        .with_plugin_host(host.clone());
-        let (_base, rt, shutdown, task) = node_on(&home, Arc::new(rt)).await;
-        eventually("dispatch published", || {
-            rt.remote_dispatch().is_some_and(|d| d.available())
-        })
-        .await;
-        assert!(host.plugin_registered("acme"), "the plugin stays loaded");
-        assert_eq!(rt.registry().providers("home-key-model"), ["codex"]);
-        shutdown.cancel();
-        task.await.unwrap();
-        host.shutdown_all(None).await;
-        cpa_core::registry::dynamic::set_plugin_catalog(Default::default());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Go `forgetHomeRuntimeAuth` when a selection ends: after a turn on another provider
@@ -5832,13 +5719,10 @@ mod tests {
 
     impl Bare {
         async fn start(home: &FakeHome) -> Self {
-            let rt = test_runtime();
-            // main.rs: the plugin worker runs; each lifetime waits for it to apply.
-            cpa_server::plugins::start(&rt).await;
-            Self::start_with(home, rt).await
+            Self::start_with(home, test_runtime()).await
         }
 
-        /// With `rt`, whose plugin worker the caller started.
+        /// With `rt`.
         async fn start_with(home: &FakeHome, rt: Arc<Runtime>) -> Self {
             let guard = ONE_NODE.lock().await;
             let dispatcher = Arc::new(Dispatcher::new(&rt));
@@ -5865,268 +5749,50 @@ mod tests {
         }
     }
 
-    // ---- Go home_plugins_test.go: the config worker's plugin stage and finalization ----
-
-    /// A Home serving `config` whose `plugin-status` pushes go to `status`. Every other
-    /// GET is empty: no plugin tasks, and no plugin sync plan (a fetch fails).
-    async fn plugin_status_home(
-        config: &'static str,
-        status: impl Fn(usize) -> Reply + Send + Sync + 'static,
-    ) -> FakeHome {
-        let pushes = std::sync::atomic::AtomicUsize::new(0);
-        FakeHome::start(
-            move |args| match (args[0].go_lower().as_str(), args.get(1).map(String::as_str)) {
-                ("get", Some("config")) => fake::bulk(config),
-                ("get", _) => fake::raw("$-1\r\n"),
-                ("subscribe", _) => fake::raw(ACK),
-                ("ping", _) => fake::raw("+PONG\r\n"),
-                ("rpush", Some("plugin-status")) => status(pushes.fetch_add(1, Ordering::SeqCst)),
-                _ => fake::raw("+OK\r\n"),
-            },
-        )
-        .await
-    }
-
-    /// Go `TestReadyHomePluginFinalizationRetriesUntilStatusSucceeds`: a failed status
-    /// push is retried, and the lifetime publishes only once it succeeded.
+    /// Go `TestHomeConfigWorkerPreemptsFailingConfigWithNewerPayload_Issue6225`, with
+    /// the failure native plugin removal gives: while Home serves a config with a
+    /// `plugins` section the node refuses it (the lifetime ends before it subscribes and
+    /// starts again), applying and publishing nothing; once Home serves a config
+    /// without one, the node applies it and publishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ready_home_plugin_finalization_retries_until_status_succeeds() {
-        let home = plugin_status_home("port: 0\n", |n| {
-            fake::raw(if n == 0 { "-ERR blocked\r\n" } else { ":1\r\n" })
-        })
-        .await;
-        let node = Bare::start(&home).await;
-        node.published().await;
-        assert_eq!(home.count("rpush"), 2);
-        node.stop().await;
-    }
-
-    /// Go `TestShutdownCancelsBlockedHomePluginFinalization`: shutdown ends a lifetime
-    /// whose status push hangs, and it never publishes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_cancels_blocked_home_plugin_finalization() {
-        let home = plugin_status_home("port: 0\n", |_| Reply::Hang).await;
-        let node = Bare::start(&home).await;
-        eventually("the status push", || home.count("rpush") >= 1).await;
-        assert!(node.dispatcher.current().is_none());
-        let stopped = tokio::time::timeout(Duration::from_secs(5), node.stop()).await;
-        assert!(stopped.is_ok(), "shutdown waited for the blocked status push");
-    }
-
-    /// Go `TestStageHomeOverlayDoesNotApplyConfigAfterStageFailure`,
-    /// `TestApplyHomeOverlayReturnsRuntimePluginSyncFailureWithoutApplyingConfig` and
-    /// `TestHomeConfigWorkerPreemptsFailingConfigWithNewerPayload_Issue6225`: a payload
-    /// whose plugin sync fails is not applied and is retried until a newer payload
-    /// replaces it. The worker reads payloads from a watch channel, which keeps only the
-    /// newest (Go `TestHomeConfigWorkQueue_TryDequeueLatest_Issue6225` tests its queue's
-    /// equivalent).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn home_config_worker_preempts_failing_config_with_newer_payload_issue6225() {
-        // Plugins are enabled, and Home sends no plugin sync plan.
-        let broken = "port: 0\nrouting:\n  strategy: fill-first\nplugins:\n  enabled: true\n  configs:\n    broken:\n      enabled: true\n      store:\n        id: broken\n";
-        let home = plugin_status_home(broken, |_| fake::raw(":1\r\n")).await;
-        let node = Bare::start(&home).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            node.dispatcher.current().is_none(),
-            "a config whose plugin sync failed was published"
-        );
-        assert_eq!(home.count("rpush"), 0, "a failed stage reported its plugins");
-        assert_ne!(
-            node._rt
-                .config()
-                .document
-                .get("routing")
-                .and_then(|r| r.get("strategy")),
-            Some(&Yaml::from("fill-first")),
-            "a config whose plugin sync failed was applied"
-        );
-        home.push(fake::message(
-            "config",
-            b"port: 0\nrouting:\n  strategy: fill-first\nplugins:\n  enabled: false\n",
-        ));
-        node.published().await;
-        assert_eq!(
-            node._rt
-                .config()
-                .document
-                .get("routing")
-                .and_then(|r| r.get("strategy")),
-            Some(&Yaml::from("fill-first"))
-        );
-        node.stop().await;
-    }
-
-    /// A plugin whose shutdown blocks while `held` is set.
-    struct HeldPlugin(Arc<(Mutex<bool>, std::sync::Condvar)>);
-
-    impl cpa_plugin::client::PluginClient for HeldPlugin {
-        fn call(&self, method: &str, _: &[u8]) -> Result<axum::body::Bytes, String> {
-            Ok(axum::body::Bytes::from_static(match method {
-                "plugin.register" | "plugin.reconfigure" => {
-                    br#"{"ok":true,"result":{"schema_version":6,"metadata":{"Name":"n","Version":"1","Author":"a","GitHubRepository":"r"},"capabilities":{"usage_plugin":true}}}"#
-                }
-                _ => br#"{"ok":true,"result":{}}"#,
-            }))
-        }
-        fn shutdown(&self) {
-            let (held, cv) = &*self.0;
-            let mut held = held.lock().unwrap();
-            while *held {
-                held = cv.wait(held).unwrap();
-            }
-        }
-    }
-
-    struct HeldLoader(Arc<(Mutex<bool>, std::sync::Condvar)>);
-
-    impl cpa_plugin::host::Loader for HeldLoader {
-        fn open(
-            &self,
-            _: &cpa_plugin::platform::PluginFile,
-            _: Arc<dyn cpa_plugin::client::CallbackHandler>,
-            _: Arc<cpa_plugin::client::CallbackInstance>,
-        ) -> Result<Arc<dyn cpa_plugin::client::PluginClient>, String> {
-            Ok(Arc::new(HeldPlugin(self.0.clone())))
-        }
-    }
-
-    /// Go applies the published config, plugins included, before it finalizes Home
-    /// plugin work (`applyConfigRuntime` in `service_home.go`). While the plugin worker
-    /// cannot apply the config (an unload holds the host), no delete task runs and the
-    /// lifetime does not publish, with plugins disabled and with an unchanged plugin
-    /// sync key.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn home_plugin_finalization_waits_for_the_applied_config() {
-        let dir = std::env::temp_dir().join(format!("cpa-home-applied-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let platform = cpa_plugin::homeplugins::current_platform();
-        let extension = cpa_plugin::platform::extension(&platform.goos);
-        let artifacts = dir.join(&platform.goos).join(&platform.goarch);
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(dir.join(format!("blocker{extension}")), b"").unwrap();
-        let gone = |id: &str| {
-            let path = artifacts.join(format!("{id}{extension}"));
-            std::fs::write(&path, b"").unwrap();
-            path
-        };
-        let (first, second) = (gone("gone1"), gone("gone2"));
-
-        let held = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let host = cpa_plugin::Host::with_loader(Arc::new(HeldLoader(held.clone())));
-        let rt = Arc::new(
-            cpa_server::testing::runtime(
-                overlay(b"port: 0\n", None).unwrap(),
-                vec![],
-                cpa_exec::Executors {
-                    claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
-                    codex: Default::default(),
-                    devices: Default::default(),
-                    openai: Default::default(),
-                    google: Default::default(),
-                },
-            )
-            .with_plugin_host(host.clone()),
-        );
-        let enabled = Arc::new(
-            cpa_core::config::Config::parse(&format!(
-                "plugins:\n  enabled: true\n  dir: {}\n  configs:\n    blocker:\n      enabled: true\n",
-                dir.display()
-            ))
-            .unwrap(),
-        );
-        // Loads the blocker straight into the host, then holds the host's apply lock
-        // with an unload whose shutdown blocks.
-        async fn hold(
-            host: &cpa_plugin::Host,
-            held: &(Mutex<bool>, std::sync::Condvar),
-            enabled: &Arc<cpa_core::config::Config>,
-        ) -> tokio::task::JoinHandle<bool> {
-            host.apply_config(enabled.clone()).await;
-            assert!(host.plugin_registered("blocker"));
-            *held.0.lock().unwrap() = true;
-            let unload = tokio::spawn({
-                let host = host.clone();
-                async move { host.unload_plugin("blocker", None).await }
-            });
-            eventually("the unload to hold the host", || !host.plugin_registered("blocker")).await;
-            unload
-        }
-        let release = || {
-            *held.0.lock().unwrap() = false;
-            held.1.notify_all();
-        };
-
-        let disabled = format!("port: 0\nplugins:\n  enabled: false\n  dir: {}\n", dir.display());
-        let tasks = Arc::new(Mutex::new(
-            r#"[{"id":1,"operation":"delete","plugin_id":"gone1"}]"#.to_owned(),
-        ));
+    async fn a_home_config_with_plugins_is_refused_until_home_serves_one_without() {
+        const REFUSED: &str = "port: 0\nrouting:\n  strategy: fill-first\nplugins:\n  enabled: false\n";
+        let served = Arc::new(Mutex::new(REFUSED));
         let home = FakeHome::start({
-            let (config, tasks) = (disabled.clone(), tasks.clone());
+            let served = served.clone();
             move |args| match (args[0].go_lower().as_str(), args.get(1).map(String::as_str)) {
-                ("get", Some("config")) => fake::bulk(&config),
-                ("get", Some("plugin-tasks")) => fake::bulk(tasks.lock().unwrap().as_str()),
+                ("get", Some("config")) => fake::bulk(*served.lock().unwrap()),
                 ("get", _) => fake::raw("$-1\r\n"),
                 ("subscribe", _) => fake::raw(ACK),
                 ("ping", _) => fake::raw("+PONG\r\n"),
-                _ => fake::raw(":1\r\n"),
+                _ => fake::raw("+OK\r\n"),
             }
         })
         .await;
-
-        // Plugins disabled.
-        cpa_server::plugins::start(&rt).await;
-        let unload = hold(&host, &held, &enabled).await;
-        let node = Bare::start_with(&home, rt.clone()).await;
-        // ponytail: absence over a fixed window; the release below proves the order.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            first.exists(),
-            "a delete task ran before the plugin worker applied the config"
-        );
+        let node = Bare::start(&home).await;
+        eventually("a refused config fetched again", || home.count("get") >= 3).await;
         assert!(
             node.dispatcher.current().is_none(),
-            "published before the config applied"
+            "a config with a plugins section was published"
         );
-        release();
-        assert!(unload.await.unwrap());
-        node.published().await;
-        assert!(!first.exists());
-
-        // The same plugin config again: its sync key is unchanged. Only Home plugin
-        // reports count: once another test installs the process logger, this test's own
-        // plugin loads also reach Home as `app-log` lines.
-        let finalized = || {
-            home.commands()
-                .iter()
-                .filter(|c| {
-                    c[0].eq_ignore_ascii_case("rpush")
-                        && c.get(1).map(String::as_str) != Some(cpa_home::client::KEY_APP_LOG)
-                })
-                .count()
+        assert_eq!(home.count("subscribe"), 0, "a refused config subscribed");
+        let strategy = || {
+            node._rt
+                .config()
+                .document
+                .get("routing")
+                .and_then(|r| r.get("strategy"))
+                .cloned()
         };
-        let pushes = finalized();
-        let unload = hold(&host, &held, &enabled).await;
-        *tasks.lock().unwrap() = r#"[{"id":2,"operation":"delete","plugin_id":"gone2"}]"#.to_owned();
-        home.push(fake::message(
-            "config",
-            format!("{disabled}routing:\n  strategy: fill-first\n").as_bytes(),
-        ));
-        eventually("the new config to be published", || {
-            rt.config().document.get("routing").and_then(|r| r.get("strategy")) == Some(&Yaml::from("fill-first"))
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            second.exists(),
-            "a delete task ran before the plugin worker applied the config"
+        assert_ne!(
+            strategy(),
+            Some(Yaml::from("fill-first")),
+            "a config with a plugins section was applied"
         );
-        assert_eq!(finalized(), pushes, "finalized before the config applied");
-        release();
-        assert!(unload.await.unwrap());
-        eventually("the second delete", || !second.exists()).await;
+        *served.lock().unwrap() = "port: 0\nrouting:\n  strategy: fill-first\n";
+        node.published().await;
+        assert_eq!(strategy(), Some(Yaml::from("fill-first")));
         node.stop().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Go `TestServiceKeepsRegistryAcrossHeartbeatFailoverAndExposesOnlyAfterNewACK`: a

@@ -12,7 +12,6 @@
   // `now` also re-enables Check quota once an account's 2-minute wait is over.
   let now = $state(Date.now());
   $effect(() => every(10_000, () => ((now = Date.now()), store.creds.load(true))));
-  if (!store.plugins.data) store.plugins.load();
   let tab = $state("all"),
     filter = $state(""),
     checking = $state(false),
@@ -55,10 +54,8 @@
   const pick = (k: string) => (sel = sel.includes(k) ? sel.filter((x) => x !== k) : [...sel, k]);
   const all = $derived(shown.length > 0 && shown.every((r) => sel.includes(r.k)));
   const some = $derived(!all && shown.some((r) => sel.includes(r.k)));
-  // Accounts that share one file (multi-project files, plugin sources) change together: a
-  // delete removes the file, and a plugin source's status change reaches every account it
-  // expands to (Go auth_files_fields.go patchPluginVirtualSourceStatus). Batch actions act on
-  // whole files and name every account they reach, selected or not.
+  // Accounts that share one file (multi-project files) change together: a delete removes the
+  // file. Batch actions act on whole files and name every account they reach, selected or not.
   const file = (a: Data) => (a.runtime_only ? `\u0000${key(a)}` : a.name);
   const reach = $derived([...new Set(picked.map((r) => file(r.a)))].map((f) => rows.filter((r) => file(r.a) === f).map((r) => r.a)));
   const extra = $derived(reach.flat().filter((a) => !sel.includes(key(a))));
@@ -88,8 +85,7 @@
   // ends half switched.
   const toSwitch = (disabled: boolean) =>
     reach.filter((g) => g.some((a) => sel.includes(key(a)) && !!a.disabled !== disabled)).flat().filter((a) => !!a.disabled !== disabled);
-  // A plugin source switches its whole file on one request, which the list does not mark, so
-  // the outcome is read back: an account a file-wide change already switched is not asked
+  // The outcome is read back: an account a file-wide change already switched is not asked
   // again, and the counts are what the server reports afterwards.
   const setStatus = (disabled: boolean) => {
     const list = toSwitch(disabled);

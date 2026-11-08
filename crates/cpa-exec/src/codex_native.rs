@@ -80,9 +80,7 @@ pub(crate) fn eligible(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
         .flatten()
 }
 
-/// Whether the executor serves `req` natively. Every eligible request does: a request
-/// that asks for unframed stream payloads (a plugin model callback) gets each event's
-/// `data` payload, unchanged, instead of the framed event.
+/// Whether the executor serves `req` natively. Every eligible request does.
 pub(crate) fn route(view: &View<'_>, req: &ExecRequest) -> Option<Profile> {
     eligible(view, req)
 }
@@ -352,11 +350,6 @@ impl CodexExecutor {
             if ws_session.is_some() {
                 // A WebSocket client takes each event's payload as one text frame.
                 stream = stream.filter_map(|item| async move { unframed(item) }).boxed();
-            } else if req.stream_payloads {
-                // A plugin model callback reads executor chunks: each line of an event.
-                stream = stream
-                    .flat_map(|item| futures_util::stream::iter(event_lines(item)))
-                    .boxed();
             }
             return Ok(ExecResponse {
                 status,
@@ -585,18 +578,6 @@ fn parse_frame(frame: &[u8]) -> (Option<&str>, Option<Cow<'_, str>>) {
         }
     }
     (name, data)
-}
-
-/// An event as the executor chunks a plugin model callback reads: each non-empty line,
-/// its bytes unchanged.
-fn event_lines(item: Result<Bytes, ExecError>) -> Vec<Result<Bytes, ExecError>> {
-    match item {
-        Ok(frame) => sse_lines(&frame)
-            .filter(|line| !line.is_empty())
-            .map(|line| Ok(frame.slice_ref(line)))
-            .collect(),
-        Err(error) => vec![Err(error)],
-    }
 }
 
 /// An event as the payload a WebSocket client reads as one text frame: its `data`,

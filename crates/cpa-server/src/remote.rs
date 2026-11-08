@@ -576,7 +576,6 @@ pub async fn gate(
     let exempt = ["/v0/management", "/v8/management"]
         .iter()
         .any(|base| path == *base || path.strip_prefix(base).is_some_and(|rest| rest.starts_with('/')))
-        || path.starts_with("/v0/resource/plugins/")
         || path == "/management.html";
     if !exempt
         && let Some(remote) = rt.remote_dispatch()

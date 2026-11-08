@@ -571,7 +571,6 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             .collect(),
         metadata: auth["metadata"].as_object().cloned().unwrap_or_default(),
         revision: 0,
-        next_refresh_after: None,
     };
     let hooks = crate::proxy::Hooks {
         trust: Some(wreq::tls::trust::CertStore::from_pem_stack(upstream.ca.clone()).unwrap()),
@@ -623,7 +622,6 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             .as_str()
             .and_then(Format::parse)
             .unwrap_or(source),
-        stream_payloads: false,
         requested_model: metadata["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: if original.is_empty() {

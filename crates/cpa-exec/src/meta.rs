@@ -260,7 +260,7 @@ impl MetaExecutor {
             let (tapped, usage) = defer_usage(lines, &req.usage, UsageRule::MetaResponses);
             ResponseBody::Stream(stream_events(
                 tapped,
-                crate::translate::stream(prepared.response, &ctx, &req),
+                crate::translate::stream(prepared.response, &ctx),
                 crate::gemini_stream::ClaudeInputTokens::new(
                     req.source_format,
                     Format::Codex,
@@ -394,11 +394,10 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
             body,
             &client,
         )
-        .map(|t| t.body)
         .map_err(|e| ExecError::local(400, FailureScope::Request, e.0))
     };
     // Go translates the original request first, for payload-rule defaults, then the
-    // working one, even when they are equal (a stateful plugin normalizer sees both).
+    // working one, even when they are equal.
     let original_translated = translate(original(req));
     let mut body = translate(&req.body)?;
     let original_translated = crate::translate::baseline_or_working(original_translated, &body);

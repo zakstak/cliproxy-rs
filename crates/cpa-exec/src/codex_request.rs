@@ -999,7 +999,6 @@ mod tests {
                 .cloned()
                 .unwrap(),
             revision: 0,
-            next_refresh_after: None,
         };
         let settings = |c: &Credential| Settings {
             home: c
@@ -1012,7 +1011,6 @@ mod tests {
             operation: cpa_core::exec::Operation::Generate,
             source_format: Format::Codex,
             response_format: Format::Codex,
-            stream_payloads: false,
             requested_model: model.into(),
             model: model.into(),
             original_body: Default::default(),

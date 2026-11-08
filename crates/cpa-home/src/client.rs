@@ -29,13 +29,9 @@ pub const KEY_IN_FLIGHT_SNAPSHOT: &str = "in-flight-snapshot";
 pub const KEY_CONCURRENCY_RELEASE: &str = "concurrency-release";
 pub const KEY_REQUEST_LOG: &str = "request-log";
 pub const KEY_APP_LOG: &str = "app-log";
-pub const KEY_PLUGIN_STATUS: &str = "plugin-status";
-pub const KEY_PLUGIN_TASKS: &str = "plugin-tasks";
-pub const KEY_PLUGIN_SYNC: &str = "plugin-sync";
 
 pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(35);
-const PLUGIN_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_FAILOVER_THRESHOLD: u32 = 3;
 // ponytail: a small idle pool with an age cap instead of go-redis's health-checked pool;
 // a stale idle connection costs one failed command, as with MaxRetries -1 in Go.
@@ -308,19 +304,6 @@ impl ReleaseFrame {
             .int("release_seq", self.release_seq)
             .finish()
     }
-}
-
-/// Go `PluginTask`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct PluginTask {
-    pub id: u64,
-    pub operation: String,
-    pub plugin_id: String,
-    pub target_node_type: String,
-    pub target_node_id: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 struct State {
@@ -921,51 +904,6 @@ impl Client {
         self.push("rpush", KEY_APP_LOG, payload, true).await
     }
 
-    /// Go `RPushPluginStatus`.
-    pub async fn rpush_plugin_status(&self, payload: &[u8]) -> Result<()> {
-        self.push("rpush", KEY_PLUGIN_STATUS, payload, true).await
-    }
-
-    /// Go `GetPluginTasks`.
-    pub async fn get_plugin_tasks(&self) -> Result<Vec<PluginTask>> {
-        match Self::bytes(self.command(&["get", KEY_PLUGIN_TASKS]).await?)? {
-            None => Ok(Vec::new()),
-            Some(bytes) if bytes.is_empty() => Ok(Vec::new()),
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| Error::Other(e.to_string())),
-        }
-    }
-
-    /// Go `GetPluginSync` transport: `GET plugin-sync <request>` on a dedicated
-    /// connection with a two-minute budget. Returns the raw response; the plugin layer
-    /// decodes and validates it. Homes without plugin sync yield `PluginSyncUnsupported`.
-    pub async fn get_plugin_sync(&self, request: &[u8]) -> Result<Vec<u8>> {
-        let pool = self.command_pool()?;
-        let mut conn = pool.checkout().await?;
-        let reply = pool
-            .exchange(
-                &mut conn,
-                &[b"get".as_slice(), KEY_PLUGIN_SYNC.as_bytes(), request],
-                PLUGIN_SYNC_TIMEOUT,
-            )
-            .await?;
-        let bytes = match reply {
-            Value::Error(message) => {
-                return Err(match plugin_sync_unsupported_message(&message) {
-                    Some(m) => Error::PluginSyncUnsupported(m),
-                    None => Error::Server(message),
-                });
-            }
-            reply => Self::bytes(reply)?.unwrap_or_default(),
-        };
-        if bytes.is_empty() {
-            return Err(Error::EmptyResponse);
-        }
-        if let Some(message) = plugin_sync_unsupported_response(&bytes) {
-            return Err(Error::PluginSyncUnsupported(message));
-        }
-        Ok(bytes)
-    }
-
     /// Go `concurrencyReleaseClient`: an independent connection, refused while
     /// membership recovery is in progress.
     fn release_pool(&self) -> Result<Arc<Pool>> {
@@ -1210,48 +1148,6 @@ impl Drop for FenceOnDrop<'_> {
             client.abort_ambiguous_dispatch();
         }
     }
-}
-
-const PLUGIN_SYNC_UNSUPPORTED: &str = "plugin_sync_unsupported";
-
-/// Go `pluginSyncUnsupportedMessage`.
-fn plugin_sync_unsupported_message(message: &str) -> Option<String> {
-    let lowered = message.trim().go_lower();
-    let lowered = lowered.strip_prefix("err ").unwrap_or(&lowered).trim().to_owned();
-    matches!(
-        lowered.as_str(),
-        PLUGIN_SYNC_UNSUPPORTED | "unsupported key" | "wrong number of arguments for 'get' command"
-    )
-    .then_some(lowered)
-}
-
-/// Go `pluginSyncUnsupportedResponse`.
-fn plugin_sync_unsupported_response(raw: &[u8]) -> Option<String> {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct Detail {
-        code: String,
-        #[serde(rename = "type")]
-        kind: String,
-        message: String,
-    }
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct Envelope {
-        error: Detail,
-    }
-    let envelope: Envelope = serde_json::from_slice(raw).ok()?;
-    let detail = envelope.error;
-    let unsupported = |code: &str| code.trim().eq_ignore_ascii_case(PLUGIN_SYNC_UNSUPPORTED);
-    if unsupported(&detail.code) || unsupported(&detail.kind) {
-        let message = detail.message.trim();
-        return Some(if message.is_empty() {
-            PLUGIN_SYNC_UNSUPPORTED.to_owned()
-        } else {
-            message.to_owned()
-        });
-    }
-    plugin_sync_unsupported_message(&detail.message)
 }
 
 static CURRENT: RwLock<Option<Client>> = RwLock::new(None);

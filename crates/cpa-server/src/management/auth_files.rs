@@ -181,38 +181,6 @@ pub(super) fn runtime_only(c: &Credential) -> bool {
     matches!(c.source, Source::Runtime)
 }
 
-/// Go `errPluginVirtualAuth`.
-const PLUGIN_VIRTUAL: &str = "plugin virtual auth cannot be modified directly; edit or delete the source auth file";
-
-/// Go `IsPluginVirtualAuth`: one of several credentials a plugin parsed from one file.
-fn plugin_virtual(c: &Credential) -> bool {
-    c.attributes
-        .get("plugin_virtual")
-        .is_some_and(|v| v.trim().go_eq_fold("true"))
-}
-
-/// The file a plugin-virtual credential was parsed from (Go `virtual_source`, else
-/// `path`).
-fn virtual_source(c: &Credential) -> &str {
-    let attr = |key: &str| c.attributes.get(key).map_or("", |v| v.trim());
-    Some(attr("virtual_source"))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| attr("path"))
-}
-
-/// Go `isPluginVirtualSourceDelete`: a plugin-virtual credential is changed or deleted
-/// only through its source file's name.
-fn names_virtual_source(name: &str, c: &Credential) -> bool {
-    if !plugin_virtual(c) {
-        return true;
-    }
-    let base = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned());
-    match (base(name.trim()), base(virtual_source(c))) {
-        (Some(name), Some(source)) => name.go_eq_fold(&source),
-        _ => false,
-    }
-}
-
 /// Go `authFileListName`: the file name, else the credential ID.
 fn list_name(c: &Credential) -> String {
     file_name(c).unwrap_or_else(|| c.id.clone())
@@ -503,12 +471,9 @@ fn int_value(v: &Value) -> Option<i64> {
     }
 }
 
-/// Go `authFileQuotaContext`: the quota plugin selected per provider key.
-type QuotaPlugins = std::collections::HashMap<String, String>;
-
 /// Go `buildAuthFileEntryLocked`. `None` hides the credential (config API keys and
 /// disabled credentials whose file is gone).
-fn entry(state: &Management, c: &Credential, v8: bool, quota: &QuotaPlugins) -> Option<BTreeMap<&'static str, Value>> {
+fn entry(state: &Management, c: &Credential, v8: bool) -> Option<BTreeMap<&'static str, Value>> {
     let runtime = runtime_only(c);
     // Go `buildAuthFileEntryLocked`: runtime-only auths are listed from memory and
     // hidden while disabled; other credentials need a file path.
@@ -571,21 +536,6 @@ fn entry(state: &Management, c: &Credential, v8: bool, quota: &QuotaPlugins) -> 
     let model_quotas = model_quota_observations(state, c);
     if !model_quotas.is_empty() {
         e.insert("model_quotas", Value::Object(model_quotas));
-    }
-    if let Some(plugin_id) = quota
-        .get(&cpa_plugin::host::normalize_provider(&c.provider))
-        .filter(|id| !id.is_empty())
-    {
-        e.insert("supports_quota", true.into());
-        e.insert("quota_provider", c.provider.clone().into());
-        if v8 {
-            e.insert("quota_plugin_id", plugin_id.clone().into());
-        }
-    }
-    // Go 0c708401: only the v0 quota route runs a declarative `quota_probe`.
-    if !v8 && let Some(probe) = c.metadata.get("quota_probe").filter(|v| !v.is_null()) {
-        e.insert("supports_quota", true.into());
-        e.insert("quota_probe", super::sorted_keys(probe));
     }
     let email = meta_str(c, "email").map(str::trim).unwrap_or_default();
     if !email.is_empty() {
@@ -759,7 +709,6 @@ pub(crate) async fn list(State(state): State<Arc<Management>>, uri: Uri, RawQuer
         q.first("name").trim().to_owned(),
         q.first("auth_index").trim().to_owned(),
     );
-    let quota = state.rt.plugins().quota_provider_plugin_ids().await;
     let observed = go_time(chrono::Utc::now());
     let all = state.rt.store().snapshot();
     // Forget runtime-only credentials whose relay session ended.
@@ -776,7 +725,7 @@ pub(crate) async fn list(State(state): State<Arc<Management>>, uri: Uri, RawQuer
     if !paginated {
         let mut files: Vec<(String, Value)> = matching
             .iter()
-            .filter_map(|c| entry(&state, c, v8, &quota).map(|e| (list_name(c), entry_value(e))))
+            .filter_map(|c| entry(&state, c, v8).map(|e| (list_name(c), entry_value(e))))
             .collect();
         files.sort_by_key(|(n, _)| n.go_lower());
         return reply_ordered(
@@ -801,7 +750,7 @@ pub(crate) async fn list(State(state): State<Arc<Management>>, uri: Uri, RawQuer
     let end = (start + page_size).min(total);
     let files: Vec<Value> = matching[start..end]
         .iter()
-        .filter_map(|c| entry(&state, c, v8, &quota).map(entry_value))
+        .filter_map(|c| entry(&state, c, v8).map(entry_value))
         .collect();
     reply_ordered(
         StatusCode::OK,
@@ -897,6 +846,7 @@ fn prepare_upload(state: &Management, name: &str, data: &[u8]) -> Result<Upload,
         Ok(m) => m,
         Err(e) => return Err((true, format!("invalid auth file: {e}"))),
     };
+    credentials::validate_metadata(&meta).map_err(|e| (true, e.to_owned()))?;
     // Loading tolerates invalid exclusion rules, so they are rejected here (Go 1a28c61e),
     // after Go's `NormalizeCredentialMetadata`, so an error names the canonical key.
     let mut canonical = meta.clone();
@@ -965,7 +915,7 @@ fn store_file(
         if let Err(e) = write_file(&dst, &bytes) {
             return Ok(Err((false, format!("failed to write file: {e}"))));
         }
-        publish_stored(state, dst, &bytes, synthesized);
+        publish_stored(state, dst, synthesized.is_some());
         return Ok(Ok(()));
     }
     // Go writes the upload as sent, then saves its record under the file's credential
@@ -1012,23 +962,22 @@ fn store_file(
         Ok(merged) => merged,
         Err(_) => synthesized,
     };
-    publish_stored(state, dst, &bytes, synthesized);
+    publish_stored(state, dst, synthesized.is_some());
     Ok(Ok(()))
 }
 
 /// Publishes an upload stored as `bytes` at `dst`, and records whether a synthesizer
 /// claimed it.
-fn publish_stored(state: &Management, dst: PathBuf, bytes: &[u8], synthesized: Option<Credential>) {
+fn publish_stored(state: &Management, dst: PathBuf, claimed: bool) {
     {
         let mut fallbacks = state.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
-        if synthesized.is_none() {
-            fallbacks.insert(dst);
-        } else {
+        if claimed {
             fallbacks.remove(&dst);
+        } else {
+            fallbacks.insert(dst);
         }
     }
-    let written: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(bytes).into();
-    state.publish_upload((*state.rt.config()).clone(), None, synthesized.map(|c| (c, written)));
+    state.publish((*state.rt.config()).clone(), None);
 }
 
 pub(crate) async fn upload(
@@ -1194,9 +1143,6 @@ fn delete_one(state: &Management, name: &str, v8: bool) -> Result<String, (Statu
     // would remove a same-named file there; report the credential as not found instead.
     if found.is_some_and(|c| runtime_only(c)) {
         return Err((StatusCode::NOT_FOUND, "auth file not found".into()));
-    }
-    if found.is_some_and(|c| !names_virtual_source(name, c)) {
-        return Err((StatusCode::CONFLICT, PLUGIN_VIRTUAL.into()));
     }
     let target: PathBuf = found
         .and_then(|c| path_of(c).map(Path::to_path_buf))
@@ -1541,14 +1487,6 @@ pub(crate) async fn status(State(state): State<Arc<Management>>, body: Result<Fi
     }
     let saved = with_codex_lock(&state, move |state, lock| {
         let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        if plugin_virtual(&target) {
-            // Go: only through the source file's name, which toggles the file and every
-            // credential parsed from it; a parsed credential alone cannot be changed.
-            if !names_virtual_source(&name, &target) {
-                return Ok(fail(StatusCode::CONFLICT, PLUGIN_VIRTUAL));
-            }
-            return Ok(virtual_source_status(state, &target, disabled));
-        }
         if matches!(target.source, Source::Config { .. }) {
             return Ok(match toggle_config_key(state, &target.id, disabled) {
                 Ok(true) => reply(
@@ -1595,100 +1533,6 @@ pub(crate) async fn status(State(state): State<Arc<Management>>, body: Result<Fi
     })
     .await;
     saved.unwrap_or_else(|e| patch_error(Some(PatchError::Io(e))))
-}
-
-/// Go `patchPluginVirtualSourceStatus`: writes `disabled` into the source file (Go's
-/// `setSourceAuthFileDisabled`: normalized keys, `json.Marshal` form) and sets it on
-/// every credential parsed from that file, in memory (the store never writes a
-/// plugin-virtual credential's file). The watcher's reload of the file agrees.
-fn virtual_source_status(state: &Management, target: &Credential, disabled: bool) -> Response {
-    let source = virtual_source(target).to_owned();
-    if source.is_empty() {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, PLUGIN_VIRTUAL);
-    }
-    let data = match std::fs::read(&source) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return fail(StatusCode::NOT_FOUND, "auth file not found");
-        }
-        Err(e) => {
-            return fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to update source auth file: {e}"),
-            );
-        }
-    };
-    let mut meta = if data.trim_ascii().is_empty() {
-        Map::new()
-    } else {
-        match serde_json::from_slice::<Map<String, Value>>(&data) {
-            Ok(meta) => meta,
-            Err(e) => {
-                return fail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to update source auth file: invalid auth file: {e}"),
-                );
-            }
-        }
-    };
-    // Go `NormalizeCredentialMetadata`: the alias goes, and a canonical spelling already
-    // there wins.
-    for (alias, canon) in ALIASES {
-        if let Some(v) = meta.remove(*alias) {
-            meta.entry(*canon).or_insert(v);
-        }
-    }
-    meta.insert("disabled".into(), disabled.into());
-    let raw = serde_json::to_vec(&meta)
-        .ok()
-        .and_then(|b| cpa_common::json::GoValue::parse_f64(&b))
-        .map(|v| v.marshal());
-    let Some(raw) = raw else {
-        return fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to update source auth file: marshal auth file",
-        );
-    };
-    if let Err(e) = write_file(Path::new(&source), &raw) {
-        return fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to update source auth file: {e}"),
-        );
-    }
-    let same = |p: &str| {
-        let clean = |p: &str| std::path::absolute(p.trim()).ok();
-        !p.trim().is_empty() && clean(p) == clean(&source)
-    };
-    let store = state.rt.store();
-    for c in store.snapshot().iter() {
-        let path = c.attributes.get("path").map_or("", String::as_str);
-        let from = c.attributes.get("virtual_source").map_or("", String::as_str);
-        if !same(path) && !same(from) {
-            continue;
-        }
-        let mut patch = MetadataPatch::default();
-        patch.set.insert("disabled".into(), disabled.into());
-        let mut current = c.clone();
-        for _ in 0..16 {
-            match store.apply_patch(&current.id, current.revision, &patch) {
-                Ok(_) => {
-                    note_disabled(state, &current.id, Some(disabled));
-                    break;
-                }
-                Err(PatchError::Stale { .. }) => match store.get(&current.id) {
-                    Some(next) => current = next,
-                    None => break,
-                },
-                Err(e) => {
-                    return fail(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to update auth {}: {e:?}", current.id),
-                    );
-                }
-            }
-        }
-    }
-    reply(StatusCode::OK, [("status", "ok".into()), ("disabled", disabled.into())])
 }
 
 const ALIASES: &[(&str, &str)] = &[
@@ -1874,9 +1718,6 @@ fn apply_fields(
     if matches!(target.source, Source::Config { .. }) {
         return Ok(Some(fail(StatusCode::NOT_FOUND, "auth file not found")));
     }
-    if plugin_virtual(&target) {
-        return Ok(Some(fail(StatusCode::CONFLICT, PLUGIN_VIRTUAL)));
-    }
     // Start from Go's normalized metadata so aliases persist under canonical names.
     let mut meta = target.metadata.clone();
     for (alias, canon) in ALIASES {
@@ -1956,6 +1797,9 @@ fn apply_fields(
     }
     if !changed {
         return Ok(Some(fail(StatusCode::BAD_REQUEST, "no fields to update")));
+    }
+    if let Err(error) = credentials::validate_metadata(&meta) {
+        return Ok(Some(fail(StatusCode::BAD_REQUEST, error)));
     }
     let mut roots: Vec<String> = fields.iter().map(|f| root(&f.path)).collect();
     if retry.is_some() {
@@ -2462,9 +2306,9 @@ fn go_model_info(raw: &Map<String, Value>) -> Option<Value> {
     cpa_core::registry::go_model_json(raw).ok()
 }
 
-/// Go `GetStaticModelDefinitions`: the built-in catalog for `channel`, else (v8.0.35,
-/// `50cfd238`) a plugin's static catalog for that provider, else the models its
-/// credentials registered, sorted by ID.
+/// Go `GetStaticModelDefinitions`: the built-in catalog for `channel`, else the models
+/// its credentials registered, sorted by ID. Go v8.0.35 (`50cfd238`) consults a plugin's
+/// static catalog in between; native plugins are removed.
 pub(crate) async fn model_definitions(
     State(state): State<Arc<Management>>,
     UrlPath(channel): UrlPath<String>,
@@ -2489,12 +2333,8 @@ pub(crate) async fn model_definitions(
     )
 }
 
-/// Go `pluginModelDefinitionsByChannel`, each model as `registry.ModelInfo` encodes.
+/// The models `channel`'s credentials registered, each as `registry.ModelInfo` encodes.
 fn dynamic_definitions(state: &Management, channel: &str) -> Vec<Value> {
-    let plugin = state.rt.plugins().models_for_provider(channel);
-    if !plugin.is_empty() {
-        return plugin.iter().map(plugin_model_json).collect();
-    }
     let rt = &state.rt;
     let mut models: Vec<_> = rt
         .registry()
@@ -2504,72 +2344,6 @@ fn dynamic_definitions(state: &Management, channel: &str) -> Vec<Value> {
         .collect();
     models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     models.iter().filter_map(go_model_info).collect()
-}
-
-/// Go `pluginModelInfoToRegistryModelInfo` then `json.Marshal`: struct order, with
-/// Go's `omitempty` fields left out when zero.
-fn plugin_model_json(m: &cpa_plugin::api::ModelInfo) -> Value {
-    let mut out = Map::new();
-    out.insert("id".into(), m.id.clone().into());
-    out.insert("object".into(), m.object.clone().into());
-    out.insert("created".into(), m.created.into());
-    out.insert("owned_by".into(), m.owned_by.clone().into());
-    out.insert("type".into(), m.model_type.clone().into());
-    let mut text = |key: &str, v: &str| {
-        if !v.is_empty() {
-            out.insert(key.into(), v.into());
-        }
-    };
-    text("display_name", &m.display_name);
-    text("name", &m.name);
-    text("version", &m.version);
-    text("description", &m.description);
-    let numbers = [
-        ("inputTokenLimit", m.input_token_limit),
-        ("outputTokenLimit", m.output_token_limit),
-    ];
-    for (key, v) in numbers {
-        if v != 0 {
-            out.insert(key.into(), v.into());
-        }
-    }
-    let list = |out: &mut Map<String, Value>, key: &str, v: &[String]| {
-        if !v.is_empty() {
-            out.insert(key.into(), v.into());
-        }
-    };
-    list(&mut out, "supportedGenerationMethods", &m.supported_generation_methods);
-    for (key, v) in [
-        ("context_length", m.context_length),
-        ("max_completion_tokens", m.max_completion_tokens),
-    ] {
-        if v != 0 {
-            out.insert(key.into(), v.into());
-        }
-    }
-    list(&mut out, "supported_parameters", &m.supported_parameters);
-    list(&mut out, "supportedInputModalities", &m.supported_input_modalities);
-    list(&mut out, "supportedOutputModalities", &m.supported_output_modalities);
-    if let Some(t) = &m.thinking {
-        let mut thinking = Map::new();
-        for (key, v) in [("min", t.min), ("max", t.max)] {
-            if v != 0 {
-                thinking.insert(key.into(), v.into());
-            }
-        }
-        if t.zero_allowed {
-            thinking.insert("zero_allowed".into(), true.into());
-        }
-        if t.dynamic_allowed {
-            thinking.insert("dynamic_allowed".into(), true.into());
-        }
-        if !t.disable_type.is_empty() {
-            thinking.insert("disable_type".into(), t.disable_type.clone().into());
-        }
-        list(&mut thinking, "levels", &t.levels);
-        out.insert("thinking".into(), Value::Object(thinking));
-    }
-    Value::Object(out)
 }
 
 /// Go `GetModelsForClient`: the models the credential registers (the dynamic
@@ -2775,32 +2549,6 @@ mod tests {
         assert_eq!(go_time(t), "2023-11-14T22:13:20Z");
     }
 
-    /// `registry.ModelInfo`'s JSON tags: struct order, `omitempty` zeros dropped, and
-    /// the identity fields always present.
-    #[test]
-    fn plugin_models_encode_like_go_registry_model_info() {
-        use cpa_plugin::api::{ModelInfo, ThinkingSupport};
-        let model = ModelInfo {
-            id: "work-pro".into(),
-            display_name: "Work Pro".into(),
-            input_token_limit: 1000,
-            supported_generation_methods: vec!["generateContent".into()],
-            max_completion_tokens: 64,
-            supported_input_modalities: vec!["TEXT".into()],
-            thinking: Some(ThinkingSupport {
-                max: 2048,
-                dynamic_allowed: true,
-                ..Default::default()
-            }),
-            user_defined: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            serde_json::to_string(&plugin_model_json(&model)).unwrap(),
-            r#"{"id":"work-pro","object":"","created":0,"owned_by":"","type":"","display_name":"Work Pro","inputTokenLimit":1000,"supportedGenerationMethods":["generateContent"],"max_completion_tokens":64,"supportedInputModalities":["TEXT"],"thinking":{"max":2048,"dynamic_allowed":true}}"#
-        );
-    }
-
     fn management(name: &str, files: &[(&str, &str)]) -> (Arc<Management>, std::path::PathBuf) {
         management_with(name, files, |_| {})
     }
@@ -2861,15 +2609,11 @@ mod tests {
         let mut patch = MetadataPatch::default();
         patch.set.insert("access_token".into(), "p2".into());
         patch.set.insert("refresh_token".into(), "r2".into());
-        let fence = crate::runtime::RefreshFence {
-            registered,
-            plugin: true,
-        };
-        let committed = crate::runtime::commit_refresh(store, "a.json", &current, fence, &patch, |_| {}).unwrap();
+        let fence = crate::runtime::RefreshFence { registered };
+        let committed = crate::runtime::commit_refresh(store, "a.json", &current, fence, &patch).unwrap();
         assert_eq!(committed.metadata["refresh_token"], "r2", "the refresh commits");
         let on_disk: Value = serde_json::from_slice(&std::fs::read(dir.join("a.json")).unwrap()).unwrap();
         assert_eq!(on_disk["refresh_token"], "r2");
-        assert!(store.refresh_schedules().lock().unwrap()["a.json"].last.is_some());
         assert_eq!(
             codes,
             [
@@ -2887,66 +2631,6 @@ mod tests {
         .await;
         assert_eq!(r.status(), StatusCode::OK);
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The two management paths that disable and enable a plugin-parsed credential
-    /// register it without parsing its file again (DIFFERENCES-FROM-GO.md): a status
-    /// write re-synthesizes it as a built-in credential, without a parsed
-    /// `NextRefreshAfter`, while a patch (a plugin-virtual source's status) keeps the one
-    /// its last parse gave. Go's watcher parses the written file and takes that parse's.
-    #[tokio::test]
-    async fn management_status_changes_register_plugin_deadlines_without_a_parse() {
-        use chrono::TimeZone;
-        let parsed = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
-        let body = r#"{"type":"pp","access_token":"t","refresh_interval":"1h"}"#;
-        let (state, dir) = management_with("plugin-deadlines", &[("a.json", body), ("b.json", body)], |creds| {
-            for c in creds {
-                c.next_refresh_after = Some(parsed.into());
-            }
-        });
-        let store = state.rt.store();
-        store.end_bootstrap();
-        let next_after = |id: &str| {
-            store
-                .refresh_schedules()
-                .lock()
-                .unwrap()
-                .get(id)
-                .map(|s| (s.last.is_some(), s.next_after))
-        };
-        assert_eq!(next_after("a.json"), Some((false, Some(parsed))));
-        let now = chrono::Utc::now();
-        for id in ["a.json", "b.json"] {
-            let registration = store.get_registered(id).unwrap().1.registration;
-            store
-                .record_refresh(id, registration, None, |c, s| {
-                    crate::plugins::refresh::committed(c, s, now)
-                })
-                .unwrap();
-        }
-        for disabled in [true, false] {
-            let r = status(
-                State(state.clone()),
-                Ok(FirstJson(Bytes::from(format!(
-                    r#"{{"name":"a.json","disabled":{disabled}}}"#
-                )))),
-            )
-            .await;
-            assert_eq!(r.status(), StatusCode::OK);
-            assert_eq!(store.get("a.json").unwrap().disabled, disabled);
-            assert_eq!(next_after("a.json"), Some((false, None)), "status disabled={disabled}");
-            let mut patch = MetadataPatch::default();
-            patch.set.insert("disabled".into(), disabled.into());
-            store
-                .apply_patch("b.json", store.get("b.json").unwrap().revision, &patch)
-                .unwrap();
-            assert_eq!(
-                next_after("b.json"),
-                Some((false, Some(parsed))),
-                "patch disabled={disabled}"
-            );
-        }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// What a token refresh commits: the store's compare-and-swap patch.
@@ -3371,37 +3055,26 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// An upload registers what it uploaded, as Go's upload does without asking plugin
-    /// auth providers, even while one is active and has not parsed the new bytes: it
-    /// replaces the credential with the same ID instead of keeping the old one.
+    /// An upload registers what it uploaded: it replaces the credential with the same ID
+    /// instead of keeping the old one.
     #[tokio::test]
-    async fn an_upload_replaces_its_credential_while_plugins_parse_auth_files() {
-        use cpa_core::config::credentials::{ParseRequest, Parsed, PluginAuthParser};
-        struct Nothing;
-        impl PluginAuthParser for Nothing {
-            fn parse_auths(&self, _: &ParseRequest<'_>) -> Parsed {
-                Parsed::NotHandled
-            }
-        }
+    async fn an_upload_replaces_its_credential() {
         let (state, dir) = management(
-            "upload-plugins",
+            "upload-replaces",
             &[("a.json", r#"{"type":"claude","access_token":"fake-0"}"#)],
         );
-        // This thread only: tests sharing the process never see the parser.
-        credentials::with_thread_plugin_auth_parser(Arc::new(Nothing), || {
-            let token = |state: &Management| state.rt.store().get("a.json").unwrap().metadata["access_token"].clone();
-            assert_eq!(token(&state), "fake-0");
-            store_file(
-                &state,
-                "a.json",
-                br#"{"type":"claude","access_token":"fake-1"}"#,
-                true,
-                &mut CodexLock::default(),
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(token(&state), "fake-1");
-        });
+        let token = |state: &Management| state.rt.store().get("a.json").unwrap().metadata["access_token"].clone();
+        assert_eq!(token(&state), "fake-0");
+        store_file(
+            &state,
+            "a.json",
+            br#"{"type":"claude","access_token":"fake-1"}"#,
+            true,
+            &mut CodexLock::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(token(&state), "fake-1");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3409,38 +3082,28 @@ mod tests {
     /// changed the file: the refreshed credential stays, on disk and in the store.
     #[tokio::test]
     async fn a_refresh_between_an_upload_and_its_publication_survives() {
-        use cpa_core::config::credentials::{ParseRequest, Parsed, PluginAuthParser};
-        struct Nothing;
-        impl PluginAuthParser for Nothing {
-            fn parse_auths(&self, _: &ParseRequest<'_>) -> Parsed {
-                Parsed::NotHandled
-            }
-        }
         let (state, dir) = management(
             "upload-refresh",
             &[("a.json", r#"{"type":"claude","access_token":"fake-0"}"#)],
         );
-        // This thread only: tests sharing the process never see the parser.
-        credentials::with_thread_plugin_auth_parser(Arc::new(Nothing), || {
-            let refreshing = state.clone();
-            crate::management::BEFORE_RECONCILE.lock().unwrap().push((
-                state.rt.config().auth_dir.clone(),
-                Box::new(move || refresh(&refreshing, "a.json", "fake-refreshed")),
-            ));
-            store_file(
-                &state,
-                "a.json",
-                br#"{"type":"claude","access_token":"fake-1"}"#,
-                true,
-                &mut CodexLock::default(),
-            )
-            .unwrap()
-            .unwrap();
-            let stored = state.rt.store().get("a.json").unwrap();
-            assert_eq!(stored.provider, "claude");
-            assert_eq!(stored.metadata["access_token"], "fake-refreshed");
-            assert_eq!(on_disk(&dir, "a.json")["access_token"], "fake-refreshed");
-        });
+        let refreshing = state.clone();
+        crate::management::BEFORE_RECONCILE.lock().unwrap().push((
+            state.rt.config().auth_dir.clone(),
+            Box::new(move || refresh(&refreshing, "a.json", "fake-refreshed")),
+        ));
+        store_file(
+            &state,
+            "a.json",
+            br#"{"type":"claude","access_token":"fake-1"}"#,
+            true,
+            &mut CodexLock::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let stored = state.rt.store().get("a.json").unwrap();
+        assert_eq!(stored.provider, "claude");
+        assert_eq!(stored.metadata["access_token"], "fake-refreshed");
+        assert_eq!(on_disk(&dir, "a.json")["access_token"], "fake-refreshed");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

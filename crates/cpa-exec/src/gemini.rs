@@ -158,7 +158,7 @@ pub(crate) fn translate(
     };
     let client = crate::codex_client::Client::new(&req.headers, cfg, "", compat);
     deep_stack(body, || {
-        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client).map(|t| t.body)
+        crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client)
     })
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
@@ -461,9 +461,7 @@ pub(crate) fn translate_non_stream(
     };
     let mut out = match cpa_translate::pair(response, upstream) {
         Some(pair) => (pair.non_stream)(&ctx, data).map_err(|_| bad_gateway())?,
-        // Go's TranslateNonStream still runs the plugin response hooks.
-        None => cpa_translate::hooks::unregistered_non_stream(upstream.as_str(), response.as_str(), &ctx, data)
-            .unwrap_or_else(|| data.to_vec()),
+        None => data.to_vec(),
     };
     if out.is_empty() {
         return Err(bad_gateway());
@@ -692,10 +690,8 @@ impl Emit {
 /// Only Gemini upstreams reach it (a Codex client); every client format that takes the
 /// native Interactions path has a registered Interactions pair. Executors that pass
 /// scanned lines as [`line_event`]s get the line back without the terminator.
-/// With plugin response hooks active, each payload goes through them (`hooks`).
 struct Unregistered {
     options: cpa_translate::stream::StreamOptions,
-    hooks: Option<Box<dyn cpa_translate::stream::GoStream>>,
 }
 
 impl StreamTranslator for Unregistered {
@@ -709,10 +705,7 @@ impl StreamTranslator for Unregistered {
             Some(hook) => Bytes::from(hook(chunk)),
             None => Bytes::copy_from_slice(chunk),
         };
-        match &mut self.hooks {
-            Some(hooks) => Ok(hooks.line(line)?.iter().map(|c| emit(c)).collect()),
-            None => Ok(vec![emit(line)]),
-        }
+        Ok(vec![emit(line)])
     }
 
     fn finish(&mut self) -> Result<Vec<Bytes>, cpa_translate::Error> {
@@ -726,7 +719,6 @@ pub(crate) struct Output {
     client: Format,
     /// A Gemini client asked for `alt`: chunks are written bare.
     raw: bool,
-    executor_chunks: bool,
     claude: ClaudeInputTokens,
     /// The attempt's usage reporter; stream loops feed it what Go's reporter sees.
     pub(crate) usage: UsageSink,
@@ -786,20 +778,12 @@ impl Output {
             translated_request: translated,
             tool_search: false,
         };
-        let mut translator = cpa_translate::stream_with(client, upstream, &ctx, options).unwrap_or_else(|| {
-            Box::new(Unregistered {
-                options,
-                hooks: cpa_translate::hooks::wrap_stream(upstream.as_str(), client.as_str(), &ctx, None),
-            })
-        });
-        if req.stream_payloads {
-            translator.executor_chunks();
-        }
+        let translator = cpa_translate::stream_with(client, upstream, &ctx, options)
+            .unwrap_or_else(|| Box::new(Unregistered { options }));
         Self {
             translator,
             client,
             raw: alt(req).is_some(),
-            executor_chunks: req.stream_payloads,
             claude: ClaudeInputTokens::new(req.source_format, upstream, client, original_request(req).clone()),
             usage: req.usage.clone(),
             capture: req.capture().clone(),
@@ -1062,7 +1046,7 @@ impl Output {
     /// Gemini clients: translators frame chunks as SSE `data:` events; with `alt` the Go
     /// handler writes the chunk itself.
     fn frame(&self, out: &mut Vec<Bytes>) {
-        if self.client == Format::Gemini && !self.executor_chunks {
+        if self.client == Format::Gemini {
             for chunk in out.iter_mut() {
                 let bare = chunk
                     .strip_prefix(b"data: ")

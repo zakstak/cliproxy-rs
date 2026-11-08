@@ -581,7 +581,6 @@ async fn claude_replay_sequence_matches_go() {
             operation: Operation::Generate,
             source_format: Format::Claude,
             response_format: Format::Claude,
-            stream_payloads: false,
             requested_model: model.into(),
             model: model.into(),
             original_body: body.clone(),

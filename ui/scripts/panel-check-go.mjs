@@ -55,7 +55,7 @@ try {
   await main.getByText("(Go)").waitFor();
   pass("server detected as Go from X-CPA headers");
 
-  const pages = ["overview", "use", "accounts", "connect", "providers", "keys", "models", "payload", "usage", "logs", "config", "plugins", "system"];
+  const pages = ["overview", "use", "accounts", "connect", "providers", "keys", "models", "payload", "usage", "logs", "config", "system"];
   for (const theme of ["light", "dark"]) {
     if ((await page.evaluate(() => document.documentElement.dataset.theme)) !== theme)
       await page.locator('[aria-label^="Use "]').first().click();

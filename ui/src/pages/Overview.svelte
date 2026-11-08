@@ -25,7 +25,6 @@
   );
   const routing = $derived(readPath(store.config.data || {}, "routing", {}) as Data);
   const fmt = (n: number) => n.toLocaleString();
-  if (!store.plugins.data) store.plugins.load();
 
   // First run. The card opens when this server has no accounts and stays, in this browser, until
   // its three steps are done or it is dismissed. A server that already had accounts never shows it,

@@ -165,8 +165,8 @@ pub(crate) fn violation(credential: &Credential) -> Option<Violation> {
 }
 
 /// Refuses a Codex request whose credential carries an operator header the policy
-/// forbids, wherever the attribute came from (config, an auth file's `headers`, Home or
-/// a plugin store). The error names the header, never its value.
+/// forbids, wherever the attribute came from (config, an auth file's `headers` or
+/// Home). The error names the header, never its value.
 pub(crate) fn check_credential(credential: &Credential) -> Result<(), ExecError> {
     match violation(credential) {
         None => Ok(()),
@@ -213,7 +213,6 @@ mod tests {
             attributes: Default::default(),
             metadata: Default::default(),
             revision: 0,
-            next_refresh_after: None,
         };
         for (name, value) in headers {
             credential.attributes.insert(format!("header:{name}"), (*value).into());

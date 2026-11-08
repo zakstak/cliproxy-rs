@@ -12,7 +12,6 @@ pub enum Error {
     AuthNotFound,
     ConfigNotFound,
     ModelsNotFound,
-    PluginSyncUnsupported(String),
     /// This client lifetime ended (closed or an ambiguous dispatch fenced it).
     DispatchFenced,
     /// This Home predates the `CAS` command.
@@ -41,7 +40,6 @@ impl fmt::Display for Error {
             Error::AuthNotFound => f.write_str("home auth not found"),
             Error::ConfigNotFound => f.write_str("home config not found"),
             Error::ModelsNotFound => f.write_str("home models not found"),
-            Error::PluginSyncUnsupported(message) => write!(f, "home plugin sync is unsupported: {message}"),
             Error::DispatchFenced => f.write_str("home auth dispatch is fenced"),
             Error::CompareAndSwapUnsupported => f.write_str("home compare-and-swap is unsupported"),
             Error::Server(message) | Error::Transport(message) | Error::Other(message) => f.write_str(message),

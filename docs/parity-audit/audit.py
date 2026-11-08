@@ -350,6 +350,34 @@ def judge_config(item, sources):
     return ("partial", f"read in {short(used)}; no test sets it", owner, "heuristic: key name match")
 
 
+# Native plugins are removed (#47): the plugin ABI, host, store, `plugins.*` settings,
+# plugin routes and the suites that test only them are retired, a deliberate difference.
+# Rows owned by `plugins` are retired except the translator registry suites, which test the
+# built-in registry too; these rows owned by other areas are retired as well. Suites that
+# mix plugin cases with other behaviour keep their judgment.
+RETIRED = {
+    "M6-0001", "M6-0022", "M6-0023", "M6-0024", "M6-0034", "M6-0035", "M6-0036",
+    "M5-0076", "M5-0077", "M5-0089", "M5-0090", "M5-0091", "M5-0092", "M5-0093", "M5-0094",
+    "M5-0095", "M5-0096", "M5-0097", "M5-0098", "M5-0099", "M5-0100", "M5-0128", "M5-0129",
+    "M5-0130", "M6-0156", "M6-0157", "M6-0158", "M6-0159", "M6-0217",
+    # Go's htmlsanitize escapes plugin management and resource responses only.
+    "M4-0299",
+}
+RETIRED_KEEP = {"M2-0156", "M2-0157"}
+RETIRED_NOTE = ('Deliberate difference: native plugins removed (#47); see DIFFERENCES-FROM-GO.md '
+                '"Native plugins" and MIGRATING-FROM-GO.md "Native plugins".')
+RETIRED_EVIDENCE = ("retired: a `plugins` section fails the load (crates/cpa-core/src/config.rs "
+                    "a_plugins_section_is_refused_with_the_migration_error); plugin routes answer 410 "
+                    "(crates/cpa-server/tests/management.rs retired_plugin_routes_answer_gone_behind_the_guard)")
+
+
+def retired(item, owner):
+    """Whether native plugin removal retired `item`, whose area is `owner`."""
+    if item["id"] in RETIRED_KEEP:
+        return False
+    return owner == "plugins" or item["id"] in RETIRED
+
+
 def main():
     only = None
     if "--milestones" in sys.argv:
@@ -380,6 +408,8 @@ def main():
             status = man["status"] or status
             evidence = man["evidence"] or evidence
             note = man["note"] or note
+        if retired(item, (man and man["owner"]) or auto_owner or owner_for(item["text"])):
+            status, evidence, note = "covered", RETIRED_EVIDENCE, RETIRED_NOTE
         owner = ""
         if status != "covered":
             owner = (man and man["owner"]) or auto_owner or owner_for(item["text"])

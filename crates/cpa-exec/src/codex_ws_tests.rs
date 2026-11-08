@@ -215,7 +215,6 @@ fn request(body: &str) -> ExecRequest {
         operation: Operation::Generate,
         source_format: Format::OpenAIResponse,
         response_format: Format::OpenAIResponse,
-        stream_payloads: false,
         requested_model: "gpt-fixture".into(),
         model: "gpt-fixture".into(),
         original_body: body.clone(),

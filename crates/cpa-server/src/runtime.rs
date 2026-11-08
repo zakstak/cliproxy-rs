@@ -46,8 +46,6 @@ pub struct Runtime {
     usage: Arc<crate::usage::UsageQueue>,
     /// `--local-model`: embedded model catalogs only, no remote catalog refresh.
     local_model: std::sync::atomic::AtomicBool,
-    /// The native plugin host, synced with each published config (see [`crate::plugins`]).
-    plugins: crate::plugins::PluginRuntime,
     /// The remote dispatcher that replaces local selection (Go Home mode).
     remote: RwLock<Option<Arc<dyn crate::remote::RemoteDispatch>>>,
     /// Set only by [`crate::testing::runtime`]: executor calls get credentials that
@@ -120,7 +118,6 @@ impl Runtime {
             pool_offsets: Mutex::default(),
             usage: Arc::default(),
             local_model: Default::default(),
-            plugins: Default::default(),
             remote: RwLock::default(),
             deny_external: Default::default(),
             config_changed: tokio::sync::watch::Sender::new(()),
@@ -161,24 +158,6 @@ impl Runtime {
     /// Whether `--local-model` was given.
     pub fn local_model(&self) -> bool {
         self.local_model.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Serves with `host`, a plugin host that already runs (Go hands the host that
-    /// registered plugin command-line flags to the service; additive API). Call before
-    /// [`crate::plugins::start`].
-    pub fn with_plugin_host(mut self, host: cpa_plugin::Host) -> Self {
-        self.plugins = crate::plugins::PluginRuntime::with_host(host);
-        self
-    }
-
-    /// The plugin host (additive API). [`crate::plugins::start`] syncs it with the
-    /// config.
-    pub fn plugins(&self) -> &cpa_plugin::Host {
-        self.plugins.host()
-    }
-
-    pub(crate) fn plugin_runtime(&self) -> &crate::plugins::PluginRuntime {
-        &self.plugins
     }
 
     /// The config snapshot to use for one whole request.
@@ -243,12 +222,8 @@ impl Runtime {
         // `UpdateModelCatalogSources`, so readers never wait on a catalog publish.
         let commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
         let previous = {
-            // The plugin worker is told under the same lock, so concurrent publishes
-            // reach it in the order they replaced the config.
             let mut current = self.config.write().unwrap_or_else(PoisonError::into_inner);
-            let previous = std::mem::replace(&mut *current, config.clone());
-            self.plugins.config_published(config.clone());
-            previous
+            std::mem::replace(&mut *current, config.clone())
         };
         // Go `UpdateModelCatalogSources`; the reads stay async.
         if let Some(catalogs) = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
@@ -385,7 +360,7 @@ impl Runtime {
     ) -> Result<Lease, AcquireError> {
         let aliases = crate::registry::global_aliases(cfg);
         let scope = selection.clone();
-        let admit = admission(registry, &aliases, &scope, &self.executors, self.plugin_runtime());
+        let admit = admission(registry, &aliases, &scope, &self.executors);
         // `soonest-reset` ranks by the quota windows the executors last observed.
         let now = std::time::SystemTime::now();
         let ranks = |c: &Credential| {
@@ -399,9 +374,7 @@ impl Runtime {
                 crate::scheduler::Windows::observed(&provider, &s.signals, s.observed_at, now)
             })
         };
-        let request = crate::plugins::scheduler_request(self, &selection, &policy, &admit)?;
-        let pick = crate::plugins::scheduler_pick(self, request).await?;
-        let mut lease = self.store.select_picked(selection, policy, &admit, &ranks, pick)?;
+        let mut lease = self.store.select_ranked(selection, policy, &admit, &ranks)?;
         if self.executors.readiness(&lease.credential, cfg) != Readiness::PrepareNow {
             return Ok(lease);
         }
@@ -565,7 +538,7 @@ impl Runtime {
         // cannot stop, so the lock covers the read through the commit either way.
         let guard = self.store.prepare_lock(id).lock_owned().await;
         // Another request may have prepared it while we waited. The registration it is
-        // current under is what a plugin refresh records its outcome for.
+        // current under is what the refresh commits under.
         let (current, registered) = self
             .store
             .get_registered(id)
@@ -594,14 +567,10 @@ impl Runtime {
         }
         let refused = refused.map(|c| Arc::new(c.clone()));
         let view = self.for_executor(&current);
-        let plugin = crate::plugins::refresh::route(self, &current, cfg);
         // Go `CodexExecutor.Refresh` on a Codex credential file: one transaction, under
-        // the file's credential lock, owned apart from the caller. A plugin-virtual one
-        // refreshes in memory and leaves the plugin's file alone (DIFFERENCES-FROM-GO.md).
+        // the file's credential lock, owned apart from the caller.
         if let Source::File(path) = &current.source
-            && plugin.is_none()
             && current.provider == "codex"
-            && !marked(&current, "plugin_virtual")
             && path.exists()
         {
             let mode = match failed {
@@ -625,47 +594,30 @@ impl Runtime {
             )
             .await;
         }
-        // A plugin answer also publishes the committed document's proxy URL (the merged
-        // one, or a concurrent edit's when that wins the merge) as the credential's.
-        let prepared = match (&plugin, failed) {
-            (Some(route), _) => crate::plugins::refresh::refresh(self, route, &view, &current, registered.registration)
-                .await
-                .map(|r| (r.patch, r.answered)),
-            (None, Some(_)) if management => self.executors.prepare_management(&view, cfg).await.map(|p| (p, false)),
-            (None, Some(_)) => self.executors.prepare_forced(&view, cfg).await.map(|p| (p, false)),
-            (None, None) => self.executors.prepare(&view, cfg).await.map(|p| (p, false)),
+        let prepared = match failed {
+            Some(_) if management => self.executors.prepare_management(&view, cfg).await,
+            Some(_) => self.executors.prepare_forced(&view, cfg).await,
+            None => self.executors.prepare(&view, cfg).await,
         };
         // Still under the preparation lock, so a refresh queued behind this one sees it.
-        let (patch, publish_proxy) = prepared.inspect_err(|e| {
+        let patch = prepared.inspect_err(|e| {
             if let Some(refused) = &refused {
                 self.store.reject_refused(refused, registered.registration, e);
             }
         })?;
-        let publish_proxy = move |c: &mut Credential| {
-            if publish_proxy {
-                publish_metadata_proxy(c);
-            }
-        };
         let store = self.store.clone();
-        let fence = RefreshFence {
-            registered,
-            plugin: plugin.is_some(),
-        };
+        let fence = RefreshFence { registered };
         let committed = tokio::task::spawn_blocking({
             let id = id.to_owned();
             move || {
                 let _guard = guard;
-                commit_refresh(&store, &id, &current, fence, &patch, publish_proxy)
+                commit_refresh(&store, &id, &current, fence, &patch)
             }
         })
         .await
         .map_err(|e| PatchError::Io(e.to_string()))
         .and_then(|r| r)
         .map_err(|e| {
-            // The plugin refreshed but nothing was saved: back off as for a failed refresh.
-            if plugin.is_some() {
-                crate::plugins::refresh::failed(&self.store, id, registered.registration, chrono::Utc::now());
-            }
             ExecError::local(
                 500,
                 FailureScope::Request,
@@ -675,18 +627,9 @@ impl Runtime {
         Ok(committed)
     }
 
-    /// [`Executors::readiness`], plus the schedule of credentials a plugin refreshes
-    /// ([`crate::plugins::refresh`]), which never holds a request. Built-in providers
-    /// read their executor alone.
+    /// [`Executors::readiness`].
     fn readiness(&self, c: &Credential, cfg: &Config) -> Readiness {
-        match self.executors.readiness(c, cfg) {
-            Readiness::Ready if self.plugin_refresh_due(c, cfg, chrono::Utc::now()) => Readiness::RefreshSoon,
-            readiness => readiness,
-        }
-    }
-
-    fn plugin_refresh_due(&self, c: &Credential, cfg: &Config, now: chrono::DateTime<chrono::Utc>) -> bool {
-        crate::plugins::refresh::due_at(self, c, cfg).is_some_and(|at| at <= now)
+        self.executors.readiness(c, cfg)
     }
 
     /// Go `tryRefreshAfterUnauthorized`: after an upstream 401 on a credential whose
@@ -719,7 +662,7 @@ impl Runtime {
                         credential.provider,
                         credential.id,
                         error.status,
-                        refresh_error_text(&error)
+                        crate::sanitize::summary(&String::from_utf8_lossy(&error.body))
                     );
                     return None;
                 }
@@ -847,14 +790,10 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                     // Go refreshes a disabled credential; here its due refresh waits until
                     // it is enabled, logged once per revision, when it comes due.
                     if c.disabled && refreshable(c) && !state.disabled_noted(c) {
-                        let plugin_due = crate::plugins::refresh::due_at(&rt, c, &cfg);
-                        if rt.executors.needs_prepare_at(c, &cfg, eventually) || plugin_due.is_some() {
+                        if rt.executors.needs_prepare_at(c, &cfg, eventually) {
                             soonest(now + HORIZON);
                         }
-                        let due = rt
-                            .executors
-                            .prepare_due(c, &cfg, wall, horizon)
-                            .or_else(|| plugin_due.filter(|at| *at <= wall + horizon).map(|at| at.max(wall)));
+                        let due = rt.executors.prepare_due(c, &cfg, wall, horizon);
                         match due {
                             Some(at) if at > wall => soonest(now + (at - wall).to_std().unwrap_or_default()),
                             Some(_) => {
@@ -897,14 +836,10 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                     }
                     continue;
                 }
-                let plugin_due = crate::plugins::refresh::due_at(&rt, c, &cfg);
-                if rt.executors.needs_prepare_at(c, &cfg, eventually) || plugin_due.is_some() {
+                if rt.executors.needs_prepare_at(c, &cfg, eventually) {
                     soonest(now + HORIZON);
                 }
-                let due = rt
-                    .executors
-                    .prepare_due(c, &cfg, wall, horizon)
-                    .or_else(|| plugin_due.filter(|at| *at <= wall + horizon).map(|at| at.max(wall)));
+                let due = rt.executors.prepare_due(c, &cfg, wall, horizon);
                 match due {
                     Some(at) if at > wall => soonest(now + (at - wall).to_std().unwrap_or_default()),
                     Some(_) if state.reserve(c, now) => jobs.push(spawn(c, false)),
@@ -1013,12 +948,11 @@ async fn run_refresh_job(
             prepare.await
         }
     };
-    // A panic records no plugin deadline: it backs off here, plugin route or not.
-    let (result, panicked) = match prepared {
-        Ok(result) => (result, false),
+    let result = match prepared {
+        Ok(result) => result,
         Err(panic) => {
             let text = format!("refresh panicked: {}", panic_text(&*panic));
-            (Err(ExecError::local(500, FailureScope::Request, text)), true)
+            Err(ExecError::local(500, FailureScope::Request, text))
         }
     };
     if rejected && result.is_ok() {
@@ -1038,23 +972,15 @@ async fn run_refresh_job(
         }
         return;
     };
-    // A plugin refresh keeps its own deadlines (Go `NextRefreshAfter`,
-    // `crate::plugins::refresh`): release the reservation only.
-    let plugin = !panicked && crate::plugins::refresh::route(&rt, &current, &cfg).is_some();
-    let ineffective = !plugin && result.is_ok() && rt.readiness(&current, &cfg) != Readiness::Ready;
+    let ineffective = result.is_ok() && rt.readiness(&current, &cfg) != Readiness::Ready;
     let now = Instant::now();
     let retry = reservation.end(|state| {
-        state.finish(&current, result.as_ref().err().filter(|_| !plugin), ineffective, now);
+        state.finish(&current, result.as_ref().err(), ineffective, now);
         state.retry_at(&current)
     });
     match &result {
         Err(error) => {
-            let next = if plugin {
-                crate::plugins::refresh::due_at(&rt, &current, &cfg)
-                    .map(|at| (at - chrono::Utc::now()).to_std().unwrap_or_default())
-            } else {
-                retry.map(|at| at.saturating_duration_since(now))
-            };
+            let next = retry.map(|at| at.saturating_duration_since(now));
             warn_refresh_failed(&current, trigger, error, next);
         }
         // Go retries an ineffective refresh after 30 s and logs nothing.
@@ -1128,11 +1054,10 @@ const REFRESH_LOOP_RESTART: Duration = Duration::from_secs(if cfg!(test) { 0 } e
 /// One warning per failed refresh (Go logs most of these at Debug; see
 /// DIFFERENCES-FROM-GO.md): provider, credential, status, the error and when the next
 /// attempt is. `trigger` names what started it. A built-in executor's error text is
-/// sanitized as client-facing upstream errors are (Go `SanitizeUpstreamErrorSummary`);
-/// of a plugin's failure only its error code is logged, never its message, and token
-/// endpoint bodies never reach the error text.
+/// sanitized as client-facing upstream errors are (Go `SanitizeUpstreamErrorSummary`),
+/// and token endpoint bodies never reach the error text.
 fn warn_refresh_failed(c: &Credential, trigger: &str, error: &ExecError, next: Option<Duration>) {
-    let text = refresh_error_text(error);
+    let text = crate::sanitize::summary(&String::from_utf8_lossy(&error.body));
     let next = match next {
         Some(after) if !after.is_zero() => format!("next attempt in {}s", ceil_secs(after)),
         _ => "next attempt when it is next due".to_owned(),
@@ -1143,17 +1068,6 @@ fn warn_refresh_failed(c: &Credential, trigger: &str, error: &ExecError, next: O
         c.id,
         error.status
     );
-}
-
-/// What [`warn_refresh_failed`] logs of a refresh error.
-fn refresh_error_text(error: &ExecError) -> String {
-    match error.headers.get(crate::plugins::refresh::PLUGIN_ERROR) {
-        Some(code) => match code.to_str().unwrap_or_default() {
-            "" => "plugin refresh failed".to_owned(),
-            code => format!("plugin refresh failed: {code}"),
-        },
-        None => crate::sanitize::summary(&String::from_utf8_lossy(&error.body)),
-    }
 }
 
 /// A due refresh held back by its previous job, which is still running: logged once
@@ -1196,21 +1110,10 @@ fn refresh_workers(cfg: &Config) -> usize {
         .map_or(16, |n| n as usize)
 }
 
-/// How a selection picks among its ready candidates.
-pub(crate) enum Pick {
-    /// The configured selector (strategy and session affinity).
-    Configured,
-    /// A plugin scheduler's delegation to a built-in strategy.
-    Builtin(crate::scheduler::Strategy),
-    /// A plugin scheduler's chosen credential.
-    Auth(String),
-}
-
 /// A selection's eligible credentials with their execution models, and those of them
 /// that are ready now with their provider keys; when none is ready, the error Go's
-/// availability check reports. `configured` adds the configured selector's own filter
-/// (weighted round-robin skips non-positive weights); a plugin scheduler and its
-/// built-in delegates see every available credential.
+/// availability check reports. The configured selector's own filter applies (weighted
+/// round-robin skips non-positive weights).
 #[allow(clippy::type_complexity)]
 fn ready<'a>(
     creds: &'a [Arc<Credential>],
@@ -1219,12 +1122,11 @@ fn ready<'a>(
     policy: &Policy,
     admit: &Admit<'_>,
     now: Instant,
-    configured: bool,
 ) -> Result<(Vec<(&'a Arc<Credential>, String)>, Vec<(&'a Arc<Credential>, String)>), AcquireError> {
     let eligible: Vec<_> = creds
         .iter()
         .filter(|c| !c.disabled && !selection.exclude.contains(&c.id))
-        .filter(|c| policy.retry_limit(c) >= selection.retry_round && (!configured || scheduler.admits(c, policy)))
+        .filter(|c| policy.retry_limit(c) >= selection.retry_round && scheduler.admits(c, policy))
         .filter_map(|c| admit(c).map(|m| (c, m)))
         .collect();
     let candidates: Vec<_> = eligible
@@ -1270,13 +1172,6 @@ pub enum AcquireError {
         id: String,
         error: ExecError,
     },
-    /// A plugin scheduler rejected the selection (Go `pickViaPluginScheduler`).
-    Rejected {
-        code: String,
-        message: String,
-    },
-    /// A plugin scheduler's call failed; Go returns its error as the selection error.
-    Scheduler(ExecError),
 }
 
 /// Route-model state is separate from the lease's resolved execution model.
@@ -1301,9 +1196,6 @@ pub struct Selection {
     /// Credential IDs already tried in this request.
     pub exclude: Vec<String>,
     pub retry_round: usize,
-    /// What a plugin scheduler learns about the request (Go `SchedulerPickRequest`'s
-    /// `Stream` and `Options`); without it the scheduler sees no headers or metadata.
-    pub scheduler: Option<Arc<crate::plugins::SchedulerContext>>,
 }
 
 impl Selection {
@@ -1397,20 +1289,16 @@ pub enum Outcome {
 /// cooldowns live. `None` rejects the credential.
 pub type Admit<'a> = dyn Fn(&Credential) -> Option<String> + 'a;
 
-/// Registry admission (Go `authSupportsRouteModel`) plus a registered executor, built-in
-/// or plugin.
+/// Registry admission (Go `authSupportsRouteModel`) plus a registered built-in executor.
 pub fn admission<'a>(
     registry: &'a Registry,
     aliases: &'a HashMap<String, Vec<crate::registry::OAuthAlias>>,
     selection: &'a Selection,
     executors: &'a Executors,
-    plugins: &'a crate::plugins::PluginRuntime,
 ) -> impl Fn(&Credential) -> Option<String> + 'a {
     move |c| {
         let provider = crate::registry::provider_key(c);
-        if !selection.provider_keys().contains(&provider)
-            || !(executors.supports(&c.provider) || plugins.has_executor(&c.provider))
-        {
+        if !selection.provider_keys().contains(&provider) || !executors.supports(&c.provider) {
             return None;
         }
         let key = crate::registry::selection_model(aliases, c, &selection.model);
@@ -1565,9 +1453,7 @@ pub enum PatchError {
 pub(crate) struct RefreshFence {
     /// The registration and credential version the refresh started under
     /// ([`CredentialStore::get_registered`]).
-    pub registered: crate::plugins::refresh::Registered,
-    /// A plugin refresh, whose schedule the commit records.
-    pub plugin: bool,
+    pub registered: crate::registrations::Registered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1630,10 +1516,9 @@ pub struct CredentialStore {
     /// Ends the upstream WebSocket sessions a removed credential serves (set by the
     /// runtime to [`cpa_exec::Executors::credential_session_closer`]).
     session_closer: std::sync::OnceLock<SessionCloser>,
-    /// Go `LastRefreshedAt` and `NextRefreshAfter` of the credentials a plugin
-    /// refreshes, registered with every change to the set
-    /// ([`crate::plugins::refresh::register`]).
-    refresh_schedules: crate::plugins::refresh::Schedules,
+    /// Go `RegistrationEpoch` and `CredentialVersion` of every credential, registered
+    /// with every change to the set ([`crate::registrations::register`]).
+    registrations: crate::registrations::Registrations,
 }
 
 /// Ends the upstream WebSocket sessions of one removed credential.
@@ -1649,8 +1534,7 @@ fn removed_ids(before: &[Arc<Credential>], after: &[Arc<Credential>]) -> Vec<Str
         .collect()
 }
 
-/// Whether `key` is set to `true` on `credential` (Go `IsPluginVirtualAuth`,
-/// `isRuntimeOnlyAuth`).
+/// Whether `key` is set to `true` on `credential` (Go `isRuntimeOnlyAuth`).
 fn marked(credential: &Credential, key: &str) -> bool {
     credential
         .attributes
@@ -1727,9 +1611,8 @@ impl CredentialStore {
             cred.revision = inner.generation;
             inner.creds.push(Arc::new(cred));
         }
-        let refresh_schedules = crate::plugins::refresh::Schedules::default();
-        crate::plugins::refresh::register(&refresh_schedules, &[], &inner.creds, &[]);
-        crate::plugins::refresh::begin_bootstrap(&refresh_schedules);
+        let registrations = crate::registrations::Registrations::default();
+        crate::registrations::register(&registrations, &[], &inner.creds);
         Arc::new(Self {
             inner: RwLock::new(inner),
             policy: RwLock::new(Arc::new(Policy::default())),
@@ -1750,34 +1633,32 @@ impl CredentialStore {
             unauthorized: Mutex::default(),
             unauthorized_noted: tokio::sync::watch::Sender::new(()),
             session_closer: std::sync::OnceLock::new(),
-            refresh_schedules,
+            registrations,
         })
     }
 
     /// Credential `id` and what a refresh of it starts under: its registration and
-    /// credential version ([`crate::plugins::refresh::Registered`]), read together.
-    pub(crate) fn get_registered(&self, id: &str) -> Option<(Arc<Credential>, crate::plugins::refresh::Registered)> {
+    /// credential version ([`crate::registrations::Registered`]), read together.
+    pub(crate) fn get_registered(&self, id: &str) -> Option<(Arc<Credential>, crate::registrations::Registered)> {
         let inner = self.read();
         let credential = inner.creds.iter().find(|c| c.id == id)?.clone();
         Some((credential, self.registered(id)))
     }
 
     /// What a refresh of `id` starts under; zeros for none.
-    fn registered(&self, id: &str) -> crate::plugins::refresh::Registered {
-        crate::plugins::refresh::registered(&self.refresh_schedules, id).unwrap_or_default()
+    fn registered(&self, id: &str) -> crate::registrations::Registered {
+        crate::registrations::registered(&self.registrations, id).unwrap_or_default()
     }
 
-    /// Records a refresh outcome of credential `id` (Go reads `m.auths[id]` under
-    /// `m.mu`): `record` sees the current credential and its schedule while it is under
-    /// `registration` (`NotFound` otherwise) and, given `at`, still at that revision
-    /// and credential version (`Stale` otherwise). No registration can land in
-    /// between.
-    pub(crate) fn record_refresh(
+    /// The current credential `id` while it is under `registration` (`NotFound`
+    /// otherwise) and, given `at`, still at that revision and credential version
+    /// (`Stale` otherwise), read under the store's lock so no registration can land in
+    /// between (Go reads `m.auths[id]` under `m.mu`).
+    pub(crate) fn registered_current(
         &self,
         id: &str,
         registration: u64,
         at: Option<(u64, u64)>,
-        record: impl FnOnce(&Credential, &mut crate::plugins::refresh::Schedule),
     ) -> Result<Arc<Credential>, PatchError> {
         let inner = self.read();
         let current = inner.creds.iter().find(|c| c.id == id).ok_or(PatchError::NotFound)?;
@@ -1790,33 +1671,13 @@ impl CredentialStore {
                 current: current.revision,
             });
         }
-        crate::plugins::refresh::record(&self.refresh_schedules, current, record);
         Ok(current.clone())
     }
 
-    /// The plugin refresh schedules ([`crate::plugins::refresh::register`]).
-    pub(crate) fn refresh_schedules(&self) -> &crate::plugins::refresh::Schedules {
-        &self.refresh_schedules
-    }
-
-    /// Ends the startup window in which the credentials loaded before plugins parse auth
-    /// files are provisional ([`crate::plugins::refresh::end_bootstrap`]).
-    pub fn end_bootstrap(&self) {
-        if crate::plugins::refresh::end_bootstrap(&self.refresh_schedules) {
-            // The refresh loop skips provisional schedules; it looks again.
-            self.changed.send_replace(());
-        }
-    }
-
-    /// Registers the plugin refresh schedules of a change from `before` to `after`;
-    /// called with the change, under the write lock.
-    fn register(
-        &self,
-        before: &[Arc<Credential>],
-        after: &[Arc<Credential>],
-        saved: &[cpa_plugin::hostauth::SavedRefresh],
-    ) {
-        crate::plugins::refresh::register(&self.refresh_schedules, before, after, saved);
+    /// Registers a change from `before` to `after`; called with the change, under the
+    /// write lock.
+    fn register(&self, before: &[Arc<Credential>], after: &[Arc<Credential>]) {
+        crate::registrations::register(&self.registrations, before, after);
     }
 
     /// Go `ApplyConfigWithCooldownStateStore` plus the restore that follows a config
@@ -1926,8 +1787,8 @@ impl CredentialStore {
         let Source::File(path) = &credential.source else {
             return;
         };
-        // Go also skips runtime-only credentials and plugin-virtual ones.
-        if credential.disabled || marked(credential, "runtime_only") || marked(credential, "plugin_virtual") {
+        // Go also skips runtime-only credentials.
+        if credential.disabled || marked(credential, "runtime_only") {
             return;
         }
         {
@@ -2072,79 +1933,15 @@ impl CredentialStore {
         admit: &Admit<'_>,
         ranks: &crate::scheduler::Ranks<'_>,
     ) -> Result<Lease, AcquireError> {
-        self.select_picked(selection, policy, admit, ranks, Pick::Configured)
-    }
-
-    /// The ready candidates a plugin scheduler chooses among (Go
-    /// `availableAuthsForSelector`'s priority list): the highest priority tier, or every
-    /// tier when the scheduler asks for them.
-    pub(crate) fn scheduler_candidates(
-        &self,
-        selection: &Selection,
-        policy: &Policy,
-        admit: &Admit<'_>,
-        across: bool,
-    ) -> Result<Vec<Arc<Credential>>, AcquireError> {
-        let inner = self.read();
-        let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-        let (_, ready) = ready(
-            &inner.creds,
-            &scheduler,
-            selection,
-            policy,
-            admit,
-            Instant::now(),
-            false,
-        )?;
-        let tier = ready.iter().map(|(c, _)| crate::scheduler::priority(c)).max();
-        let mut out: Vec<_> = ready
-            .into_iter()
-            .filter(|(c, _)| across || Some(crate::scheduler::priority(c)) == tier)
-            .map(|(c, _)| Arc::clone(c))
-            .collect();
-        // Go `availableAuthsFromPriorityBuckets` orders both modes by ID.
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(out)
-    }
-
-    /// [`Self::select_ranked`] with the choice a plugin scheduler made.
-    pub(crate) fn select_picked(
-        self: &Arc<Self>,
-        selection: Selection,
-        policy: Arc<Policy>,
-        admit: &Admit<'_>,
-        ranks: &crate::scheduler::Ranks<'_>,
-        pick: Pick,
-    ) -> Result<Lease, AcquireError> {
         let now = Instant::now();
         let credential = {
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let configured = matches!(pick, Pick::Configured);
-            let (eligible, candidates) = ready(&inner.creds, &scheduler, &selection, &policy, admit, now, configured)?;
+            let (eligible, candidates) = ready(&inner.creds, &scheduler, &selection, &policy, admit, now)?;
             let refs: Vec<(&Credential, &str)> = candidates.iter().map(|(c, p)| (c.as_ref(), p.as_str())).collect();
-            let chosen = match &pick {
-                // Go serves the candidate from its pre-call snapshot without checking it
-                // again; here one that stopped being ready during the call leaves the
-                // choice to the configured selector (docs/DIFFERENCES-FROM-GO.md).
-                Pick::Auth(id) => refs.iter().find(|(c, _)| c.id == *id).map(|(c, _)| (*c, None)),
-                Pick::Builtin(strategy) => scheduler
-                    .pick_builtin(&refs, &selection, *strategy, ranks)
-                    .map(|c| (c, None)),
-                Pick::Configured => None,
-            };
-            let (picked, lcp) = match chosen {
-                Some(chosen) => chosen,
-                None => {
-                    let refs: Vec<_> = refs.into_iter().filter(|(c, _)| scheduler.admits(c, &policy)).collect();
-                    if refs.is_empty() {
-                        // Only the configured selector's filter removed them: its error.
-                        return Err(ready(&inner.creds, &scheduler, &selection, &policy, admit, now, true)
-                            .expect_err("no admitted candidate is ready"));
-                    }
-                    scheduler.pick_session(&refs, &selection, &policy, ranks, now).unwrap()
-                }
-            };
+            let (picked, lcp) = scheduler
+                .pick_session(&refs, &selection, &policy, ranks, now)
+                .expect("ready candidates exist");
             let (c, m) = eligible.iter().find(|(c, _)| c.id == picked.id).unwrap();
             let generation = scheduler.reserve_probe(c, m, now);
             (Arc::clone(c), lcp, generation, scheduler.dispatch())
@@ -2450,8 +2247,7 @@ impl CredentialStore {
 
     /// [`Self::apply_patch`] for a token refresh that started under `fence`'s
     /// registration: refused (`NotFound`) once the credential's ID was registered again
-    /// (Go's `RegistrationEpoch` check), and a plugin refresh's schedule is recorded
-    /// with the commit ([`crate::plugins::refresh::committed`]). When `rotated` says the
+    /// (Go's `RegistrationEpoch` check). When `rotated` says the
     /// commit replaced the tokens, its time is recorded under the same lock that 401s
     /// are noted under, before any scan can see the new revision without it (Go
     /// `LastRefreshedAt`).
@@ -2461,11 +2257,10 @@ impl CredentialStore {
         expected_revision: u64,
         fence: RefreshFence,
         patch: &MetadataPatch,
-        edit: impl FnOnce(&mut Credential),
         rotated: impl FnOnce(&Credential) -> bool,
     ) -> Result<(Arc<Credential>, bool), PatchError> {
         let mut state = self.unauthorized.lock().unwrap_or_else(PoisonError::into_inner);
-        let committed = self.apply_patch_with(id, expected_revision, Some(fence), patch, edit)?;
+        let committed = self.apply_patch_with(id, expected_revision, Some(fence), patch)?;
         let rotated = rotated(&committed);
         if rotated {
             state
@@ -2487,7 +2282,7 @@ impl CredentialStore {
     fn admit_codex_refresh(
         &self,
         original: &Credential,
-        registered: crate::plugins::refresh::Registered,
+        registered: crate::registrations::Registered,
         patch: &cpa_exec::codex_refresh::RefreshPatch,
     ) -> Result<CodexAdmission, PatchError> {
         let id = original.id.as_str();
@@ -2541,11 +2336,7 @@ impl CredentialStore {
                                 .remove(&next.id);
                         }
                         let next = Arc::new(next);
-                        self.register(
-                            std::slice::from_ref(&inner.creds[index]),
-                            std::slice::from_ref(&next),
-                            &[],
-                        );
+                        self.register(std::slice::from_ref(&inner.creds[index]), std::slice::from_ref(&next));
                         inner.creds[index] = next;
                         inner.epoch += 1;
                         self.changed.send_replace(());
@@ -2610,19 +2401,16 @@ impl CredentialStore {
         expected_revision: u64,
         patch: &MetadataPatch,
     ) -> Result<Arc<Credential>, PatchError> {
-        self.apply_patch_with(id, expected_revision, None, patch, |_| {})
+        self.apply_patch_with(id, expected_revision, None, patch)
     }
 
-    /// [`Self::apply_patch`], with `edit` applied to the credential before it is
-    /// published (fields outside the document, such as a plugin refresh's proxy URL),
-    /// and a token refresh's `fence` ([`Self::apply_refresh`]).
+    /// [`Self::apply_patch`] with a token refresh's `fence` ([`Self::apply_refresh`]).
     fn apply_patch_with(
         &self,
         id: &str,
         expected_revision: u64,
         fence: Option<RefreshFence>,
         patch: &MetadataPatch,
-        edit: impl FnOnce(&mut Credential),
     ) -> Result<Arc<Credential>, PatchError> {
         let committed = self.write_unlocked(
             id,
@@ -2644,7 +2432,6 @@ impl CredentialStore {
                 let mut next = Credential::clone(current);
                 patch.apply(&mut next.metadata);
                 next.refresh_derived();
-                edit(&mut next);
                 // Go `FileTokenStore.Save` always records the disabled state.
                 next.metadata.insert("disabled".into(), Value::Bool(next.disabled));
                 // Go's `json.NewEncoder(f).Encode`: compact JSON and a newline.
@@ -2679,20 +2466,7 @@ impl CredentialStore {
                     }
                 }
                 let next = Arc::new(next);
-                self.register(
-                    std::slice::from_ref(&inner.creds[index]),
-                    std::slice::from_ref(&next),
-                    &[],
-                );
-                // Go publishes `LastRefreshedAt` with the refreshed auth (`MergeRefreshedAuth`
-                // under `m.mu`), so a registration after this commit replaces it. The
-                // writer checked the refresh's registration under the gate. Lock order:
-                // `inner`, then the schedules, as in `register`.
-                if fence.is_some_and(|f| f.plugin) {
-                    crate::plugins::refresh::record(&self.refresh_schedules, &next, |c, s| {
-                        crate::plugins::refresh::committed(c, s, chrono::Utc::now())
-                    });
-                }
+                self.register(std::slice::from_ref(&inner.creds[index]), std::slice::from_ref(&next));
                 inner.creds[index] = next;
                 inner.epoch += 1;
                 self.changed.send_replace(());
@@ -2719,7 +2493,7 @@ impl CredentialStore {
         &self,
         id: &str,
         expected_revision: u64,
-        registered: Option<crate::plugins::refresh::Registered>,
+        registered: Option<crate::registrations::Registered>,
         exclusive: bool,
         prepare: impl FnOnce(&Arc<Credential>) -> Result<Option<(Option<std::path::PathBuf>, Vec<u8>, T)>, PatchError>,
         publish: impl FnOnce(&mut Inner, usize, &[u8], T) -> R,
@@ -2764,10 +2538,7 @@ impl CredentialStore {
         let Some((path, bytes, value)) = prepare(&current)? else {
             return Ok(None);
         };
-        // Go `Manager.persist` never writes a plugin-virtual credential (one of several a
-        // plugin parsed from one file): its document is not the file's. A refresh or
-        // patch of one is kept in memory.
-        if let Some(path) = path.filter(|_| !marked(&current, "plugin_virtual")) {
+        if let Some(path) = path {
             write_bytes_atomic(&path, &bytes).map_err(|e| PatchError::Io(e.to_string()))?;
         }
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
@@ -2803,7 +2574,7 @@ impl CredentialStore {
         next.source = slot.source.clone();
         next.revision = generation;
         let next = Arc::new(next);
-        self.register(std::slice::from_ref(slot), std::slice::from_ref(&next), &[]);
+        self.register(std::slice::from_ref(slot), std::slice::from_ref(&next));
         let cleared = self.clear_replaced_unauthorized(std::slice::from_ref(slot), std::slice::from_ref(&next));
         *slot = next;
         let committed = slot.clone();
@@ -2900,7 +2671,7 @@ impl CredentialStore {
                     let at = index.min(inner.creds.len());
                     inner.creds.insert(at, Arc::new(next));
                 }
-                self.register(&before, &inner.creds, &[]);
+                self.register(&before, &inner.creds);
                 self.clear_replaced_unauthorized(&before, &inner.creds);
                 inner.epoch += 1;
                 self.changed.send_replace(());
@@ -3032,23 +2803,11 @@ impl CredentialStore {
         credentials: Vec<Credential>,
         read: &std::collections::BTreeMap<std::path::PathBuf, [u8; 32]>,
     ) -> Vec<std::path::PathBuf> {
-        self.reconcile_scanned_with(credentials, read, |_, _| {})
-    }
-
-    /// [`Self::reconcile_scanned`]; `keep` first adds to the set from the current
-    /// credentials, under the gate, so no write lands between what it reads and the swap.
-    pub fn reconcile_scanned_with(
-        &self,
-        credentials: Vec<Credential>,
-        read: &std::collections::BTreeMap<std::path::PathBuf, [u8; 32]>,
-        keep: impl FnOnce(&[Arc<Credential>], &mut Vec<Credential>),
-    ) -> Vec<std::path::PathBuf> {
         use sha2::{Digest, Sha256};
         let reload = self.reload.write().unwrap_or_else(PoisonError::into_inner);
         let mut credentials = credentials;
-        keep(&self.snapshot(), &mut credentials);
         // A credential this scan synthesized has no revision yet; one kept for an
-        // incomplete or deferred file is the store's own record, not built from `read`.
+        // incomplete file is the store's own record, not built from `read`.
         let built: std::collections::HashSet<std::path::PathBuf> = credentials
             .iter()
             .filter(|c| c.revision == 0)
@@ -3088,16 +2847,8 @@ impl CredentialStore {
         for c in &inner.creds {
             by_id.entry(c.id.as_str()).or_insert(c);
         }
-        // A credential the startup load registered provisionally is registered again
-        // when the first plugin-aware load parses another `NextRefreshAfter` for it,
-        // whatever else it equals: Go's first load registers it with that one.
-        let provisional = crate::plugins::refresh::provisional(&self.refresh_schedules);
         for mut cred in credentials {
-            let same = |c: &Credential| {
-                unchanged(c, &cred)
-                    && !(provisional.contains(c.id.as_str()) && c.next_refresh_after != cred.next_refresh_after)
-            };
-            match by_id.get(cred.id.as_str()).filter(|c| same(c)) {
+            match by_id.get(cred.id.as_str()).filter(|c| unchanged(c, &cred)) {
                 Some(&existing) => next.push(existing.clone()),
                 None => {
                     inner.generation += 1;
@@ -3116,7 +2867,7 @@ impl CredentialStore {
             .collect();
         next.extend(runtime);
         let removed = removed_ids(&inner.creds, &next);
-        self.register(&inner.creds, &next, &[]);
+        self.register(&inner.creds, &next);
         self.clear_replaced_unauthorized(&inner.creds, &next);
         inner.creds = next;
         inner.epoch += 1;
@@ -3167,7 +2918,7 @@ impl CredentialStore {
             }
         }
         let removed = removed_ids(&inner.creds, &next);
-        self.register(&inner.creds, &next, &[]);
+        self.register(&inner.creds, &next);
         self.clear_replaced_unauthorized(&inner.creds, &next);
         inner.creds = next;
         inner.epoch += 1;
@@ -3183,63 +2934,26 @@ impl CredentialStore {
         self.persist_cooldowns();
     }
 
-    /// Inserts or replaces one credential (a plugin's `host.auth.save`) under a single
-    /// write lock, so a concurrent `apply_patch` on another credential is never undone
-    /// the way a snapshot followed by [`Self::reconcile`] could undo it. An unchanged
-    /// credential keeps its revision, as in `reconcile`.
-    pub fn upsert(&self, credential: Credential) {
-        self.upsert_file(None, vec![credential], &[]);
-    }
-
-    /// [`Self::upsert`] for every credential an auth file saved at `path` holds (Go
-    /// `upsertAuthRecordsForPath`): the file's other credentials, parsed from it
-    /// earlier, go, runtime-only ones excepted. `saved` has the refresh schedules a
-    /// plugin's save registers its credentials with.
-    pub fn upsert_file(
-        &self,
-        path: Option<&std::path::Path>,
-        credentials: Vec<Credential>,
-        saved: &[cpa_plugin::hostauth::SavedRefresh],
-    ) {
+    /// Inserts or replaces one credential under a single write lock, so a concurrent
+    /// `apply_patch` on another credential is never undone the way a snapshot followed
+    /// by [`Self::reconcile`] could undo it. An unchanged credential keeps its revision,
+    /// as in `reconcile`.
+    pub fn upsert(&self, mut credential: Credential) {
         let reload = self.reload.write().unwrap_or_else(PoisonError::into_inner);
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let before = inner.creds.clone();
-        let mut changed = false;
-        let mut removed = Vec::new();
-        if let Some(path) = path {
-            let clean = cpa_core::config::credentials::absolute_clean_path;
-            let target = clean(path);
-            let before = std::mem::take(&mut inner.creds);
-            for credential in before {
-                let stale = !marked(&credential, "runtime_only")
-                    && !credentials.iter().any(|c| c.id == credential.id)
-                    && matches!(&credential.source, Source::File(p) if clean(p) == target);
-                if stale {
-                    removed.push(credential.id.clone());
-                } else {
-                    inner.creds.push(credential);
-                }
-            }
-            changed = !removed.is_empty();
-        }
-        for mut credential in credentials {
-            let slot = inner.creds.iter().position(|c| c.id == credential.id);
-            if slot.is_some_and(|i| unchanged(&inner.creds[i], &credential)) {
-                continue;
-            }
-            inner.generation += 1;
-            credential.revision = inner.generation;
-            let credential = Arc::new(credential);
-            match slot {
-                Some(i) => inner.creds[i] = credential,
-                None => inner.creds.push(credential),
-            }
-            changed = true;
-        }
-        if !changed {
+        let slot = inner.creds.iter().position(|c| c.id == credential.id);
+        if slot.is_some_and(|i| unchanged(&inner.creds[i], &credential)) {
             return;
         }
-        self.register(&before, &inner.creds, saved);
+        inner.generation += 1;
+        credential.revision = inner.generation;
+        let credential = Arc::new(credential);
+        match slot {
+            Some(i) => inner.creds[i] = credential,
+            None => inner.creds.push(credential),
+        }
+        self.register(&before, &inner.creds);
         self.clear_replaced_unauthorized(&before, &inner.creds);
         inner.epoch += 1;
         self.changed.send_replace(());
@@ -3249,7 +2963,6 @@ impl CredentialStore {
             .reconcile(&inner.creds);
         drop(inner);
         drop(reload);
-        self.close_sessions(removed);
         self.clear_disabled_cooldowns();
         self.persist_cooldowns();
     }
@@ -3266,7 +2979,7 @@ impl CredentialStore {
         inner.generation += 1;
         credential.revision = inner.generation;
         inner.creds.push(Arc::new(credential));
-        self.register(&before, &inner.creds, &[]);
+        self.register(&before, &inner.creds);
         inner.epoch += 1;
         self.changed.send_replace(());
         self.scheduler
@@ -3285,7 +2998,7 @@ impl CredentialStore {
         if inner.creds.len() == before.len() {
             return;
         }
-        self.register(&before, &inner.creds, &[]);
+        self.register(&before, &inner.creds);
         inner.epoch += 1;
         self.changed.send_replace(());
         self.scheduler
@@ -3410,14 +3123,11 @@ pub(crate) fn commit_refresh(
     current: &Credential,
     mut fence: RefreshFence,
     patch: &MetadataPatch,
-    publish_proxy: impl Fn(&mut Credential) + Copy,
 ) -> Result<Arc<Credential>, PatchError> {
     let mut revision = current.revision;
     let mut attempt = patch.clone();
     loop {
-        match store.apply_refresh(id, revision, fence, &attempt, publish_proxy, |c| {
-            credentials_changed(current, c)
-        }) {
+        match store.apply_refresh(id, revision, fence, &attempt, |c| credentials_changed(current, c)) {
             // Edited since the snapshot (the prepare lock does not hold off other writers),
             // within the refresh's registration: the writer refuses a re-registered ID
             // first (Go "stale registration epoch"), on every retry. Go 935aa6e3: an edit
@@ -3458,11 +3168,7 @@ pub(crate) fn commit_refresh(
                     // check, as revisions are never reused, so the empty patch is never
                     // written.
                     let at = (revision, fence.registered.credential_version);
-                    match store.record_refresh(id, fence.registered.registration, Some(at), |c, s| {
-                        if fence.plugin {
-                            crate::plugins::refresh::committed(c, s, chrono::Utc::now());
-                        }
-                    }) {
+                    match store.registered_current(id, fence.registered.registration, Some(at)) {
                         Err(PatchError::Stale { .. }) => continue,
                         recorded => return recorded,
                     }
@@ -3629,7 +3335,7 @@ async fn refresh_codex_file(
     refresher: cpa_exec::codex_refresh::Refresher,
     guard: tokio::sync::OwnedMutexGuard<()>,
     current: Arc<Credential>,
-    registered: crate::plugins::refresh::Registered,
+    registered: crate::registrations::Registered,
     view: Arc<Credential>,
     path: std::path::PathBuf,
     mode: cpa_exec::codex_refresh::RefreshMode,
@@ -3703,12 +3409,12 @@ fn codex_patched(bytes: &[u8], patch: &cpa_exec::codex_refresh::RefreshPatch, re
     if !refresh_write {
         let legacy: Vec<String> = doc
             .keys()
-            .filter(|k| cpa_plugin::auth::canonical_metadata_key(k) != k.as_str())
+            .filter(|k| cpa_core::config::credentials::canonical_metadata_key(k) != k.as_str())
             .cloned()
             .collect();
         for key in legacy {
             let value = doc.remove(&key).expect("listed above");
-            doc.entry(cpa_plugin::auth::canonical_metadata_key(&key).to_owned())
+            doc.entry(cpa_core::config::credentials::canonical_metadata_key(&key).to_owned())
                 .or_insert(value);
         }
     }
@@ -4181,9 +3887,8 @@ pub(crate) mod tests {
         patch.set.insert("access_token".into(), "p2".into());
         let fence = RefreshFence {
             registered: registration,
-            plugin: false,
         };
-        let committed = commit_refresh(&store, "a.json", &current, fence, &patch, |_| {});
+        let committed = commit_refresh(&store, "a.json", &current, fence, &patch);
         assert!(AFTER_STALE.with(|hook| hook.take()).is_none(), "the hook ran");
         assert!(matches!(committed, Err(PatchError::NotFound)), "{committed:?}");
         assert_eq!(store.get("a.json").unwrap().metadata["access_token"], "b");
@@ -4425,7 +4130,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A plugin save running alongside token refreshes of another credential never
+    /// An upsert running alongside token refreshes of another credential never
     /// reinstalls a stale copy of it: every refresh finds the revision it left.
     #[test]
     fn upsert_never_undoes_a_concurrent_patch() {
@@ -4466,7 +4171,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Home config updates replacing the config keys never undo a concurrent plugin save
+    /// Home config updates replacing the config keys never undo a concurrent upsert
     /// or relay session change, and unchanged keys keep their revision.
     #[test]
     fn replace_config_keeps_concurrent_changes_to_other_credentials() {
@@ -5216,32 +4921,6 @@ pub(crate) mod tests {
         store.persist_credential(&stale);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), refreshed);
         assert!(refreshed.contains("\"new\"") && refreshed.contains("\"disabled\":false"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Go `Manager.persist` skips plugin-virtual auths: a refresh of one of the
-    /// credentials a plugin parsed from one file commits in memory and leaves the shared
-    /// file alone.
-    #[test]
-    fn a_plugin_virtual_refresh_never_rewrites_the_shared_source_file() {
-        let dir = std::env::temp_dir().join(format!("virtual-{}-{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("multi.json");
-        let source = r#"{"type":"claude","accounts":[{"access_token":"a"},{"access_token":"b"}]}"#;
-        std::fs::write(&path, source).unwrap();
-        let metadata: Map<String, Value> = serde_json::from_str(r#"{"type":"claude","access_token":"a"}"#).unwrap();
-        let mut credential = Credential::from_file(&dir, &path, metadata).unwrap();
-        credential.id = "multi-a".into();
-        credential.attributes.insert("plugin_virtual".into(), "true".into());
-        let store = CredentialStore::new(vec![credential]);
-        let current = store.get("multi-a").unwrap();
-        let mut patch = MetadataPatch::default();
-        patch.set.insert("access_token".into(), "refreshed".into());
-        let committed = store.apply_patch("multi-a", current.revision, &patch).unwrap();
-        assert_eq!(committed.metadata["access_token"], "refreshed");
-        assert_eq!(store.get("multi-a").unwrap().metadata["access_token"], "refreshed");
-        store.persist_credential(&committed);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7753,171 +7432,6 @@ pub(crate) mod tests {
         )));
         rt.stop_auto_refresh();
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A plugin-routed refresh job that panics records no deadline of the plugin's, so
-    /// the refresh state backs it off like any failure instead of starting it again on
-    /// the next scan.
-    ///
-    /// Loading an auth-provider plugin installs the process-global plugin auth parser, and
-    /// while it is active every auth-folder scan in the process defers its files to the
-    /// plugin. Run in this binary's process, the test emptied the stores of credential
-    /// tests running beside or after it. It runs in a child process instead, holding only
-    /// this test; the parent checks that the child ran it and that its own parser stayed
-    /// inactive.
-    #[test]
-    #[cfg_attr(feature = "media-relay", ignore = "needs the Go plugin toolchain")]
-    fn a_panicking_plugin_refresh_backs_off() {
-        const NAME: &str = "runtime::tests::a_panicking_plugin_refresh_backs_off";
-        const CHILD: &str = "CPA_TEST_PLUGIN_REFRESH_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            // The child: the real test.
-            return tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(a_panicking_plugin_refresh_backs_off_in_child());
-        }
-        // The environment is inherited, so the Go toolchain lookup and CPA_TEST_NO_SKIP
-        // behave as they would here; the marker stops the child from spawning again.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        // A skip line (no Go toolchain) stays visible: straight to this process's stderr,
-        // which the harness does not capture (as cpa_plugin::testing writes it).
-        for line in stderr.lines().filter(|l| l.starts_with("SKIPPED:")) {
-            use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "{line}");
-        }
-        assert!(output.status.success(), "child test failed:\n{stdout}\n{stderr}");
-        assert!(
-            stdout.contains(&format!("test {NAME} ... ok")) && stdout.contains("1 passed"),
-            "the child did not run the test:\n{stdout}\n{stderr}"
-        );
-        assert!(
-            !cpa_core::config::credentials::plugin_auth_parser_active(),
-            "the plugin auth parser must never become active in this process"
-        );
-    }
-
-    async fn a_panicking_plugin_refresh_backs_off_in_child() {
-        let tmp = std::env::temp_dir();
-        let Some(built) = cpa_plugin::testing::built_plugins(&tmp, "a_panicking_plugin_refresh") else {
-            return;
-        };
-        let dir = cpa_plugin::testing::scratch(&tmp, "plugin-refresh-panic");
-        let (auths, plugins, records) = (dir.join("auths"), dir.join("plugins"), dir.join("records"));
-        for d in [&auths, &plugins, &records] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::copy(built.join("recorder.so"), plugins.join("acme.so")).unwrap();
-        std::fs::write(
-            auths.join("p.json"),
-            r#"{"type":"acme","access_token":"p","refresh_interval":"1h"}"#,
-        )
-        .unwrap();
-        let yaml = format!(
-            "auth-dir: {}\nplugins:\n  enabled: true\n  dir: {}\n  configs:\n    acme:\n      enabled: true\n      label: acme\n      record: {}\n      caps: auth_provider\n",
-            auths.display(),
-            plugins.display(),
-            records.display()
-        );
-        let cfg = Config::parse(&yaml).unwrap();
-        let credentials = cpa_core::config::credentials::load(&cfg);
-        let rt = Arc::new(crate::testing::runtime(
-            cfg,
-            credentials,
-            Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
-                codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
-            },
-        ));
-        crate::plugins::start(&rt).await;
-        // As after the first plugin-aware load.
-        rt.store.end_bootstrap();
-        let c = rt.store.get("p.json").unwrap();
-        assert!(
-            crate::plugins::refresh::route(&rt, &c, &rt.config()).is_some(),
-            "plugin-routed"
-        );
-        tests::arm_panic("prepare", "p.json");
-        rt.start_auto_refresh();
-        let backed_off = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let c = rt.store.get("p.json").unwrap();
-                let retry = rt.refresh_state.lock().unwrap().retry_at(&c);
-                if retry.is_some_and(|at| at > Instant::now() + Duration::from_secs(250)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-        if backed_off.await.is_err() {
-            let c = rt.store.get("p.json").unwrap();
-            panic!(
-                "no backoff: reached {}, retry {:?}, due {:?}, schedule {:?}",
-                tests::reached("prepare", "p.json"),
-                rt.refresh_state
-                    .lock()
-                    .unwrap()
-                    .retry_at(&c)
-                    .map(|at| at.saturating_duration_since(Instant::now())),
-                crate::plugins::refresh::due_at(&rt, &c, &rt.config()),
-                rt.store.refresh_schedules().lock().unwrap().get("p.json").copied()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(
-            tests::reached("prepare", "p.json"),
-            1,
-            "no second attempt before the backoff"
-        );
-        rt.stop_auto_refresh();
-        // Unload the plugin as the plugin integration tests' `finish` does; this process
-        // holds only this test, but a clean shutdown is part of what it checks.
-        rt.plugins().shutdown_all(None).await;
-        assert!(!cpa_core::config::credentials::plugin_auth_parser_active());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Of a plugin's refresh failure only the status and a known error code are logged:
-    /// its free message may hold anything, an unlabelled token included, which the
-    /// pattern-based sanitizer cannot see.
-    #[test]
-    fn a_plugin_refresh_failure_logs_no_plugin_message() {
-        let logs = Logs::default();
-        let _guard = logs.install();
-        let c = cred("p.json", "acme", false);
-        for code in ["invalid_grant", "rejected"] {
-            let error = crate::plugins::refresh::call_error(cpa_plugin::rpc::CallError::Rpc {
-                code: code.into(),
-                message: "rejected abc123xyz456opaque".into(),
-                status: 401,
-            });
-            warn_refresh_failed(&c, "", &error, None);
-        }
-        let text = logs.text();
-        assert!(
-            text.contains(
-                "credential refresh failed for acme (p.json): status 401: plugin refresh failed: invalid_grant;"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("status 401: plugin refresh failed; next attempt"),
-            "an unknown code, which could be a token, is left out: {text}"
-        );
-        assert!(!text.contains("abc123"), "{text}");
     }
 
     /// The loop sets no timer while nothing can come due, and a credential added later

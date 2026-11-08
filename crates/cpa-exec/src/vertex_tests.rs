@@ -182,7 +182,6 @@ fn request(s: &Value) -> ExecRequest {
         },
         source_format: source,
         response_format: source,
-        stream_payloads: false,
         requested_model: s["requested_model"].as_str().unwrap_or(&model).to_owned(),
         model,
         original_body: body.clone(),

@@ -7,43 +7,6 @@
         "devin-catalog": "string"
       }
     },
-    "plugins": {
-      "fields": {
-        "enabled": "bool",
-        "dir": "string",
-        "store-sources": {
-          "list": "string"
-        },
-        "store-auth": {
-          "list": {
-            "fields": {
-              "match": "string",
-              "apply-to": {
-                "list": "string"
-              },
-              "type": "string",
-              "token-env": "string",
-              "username-env": "string",
-              "password-env": "string",
-              "header-name": "string",
-              "header-value-env": "string",
-              "allow-insecure": "bool"
-            }
-          }
-        },
-        "auth-revision": "int",
-        "configs": {
-          "map": {
-            "fields": {
-              "enabled": {
-                "optional": "bool"
-              },
-              "priority": "int"
-            }
-          }
-        }
-      }
-    },
     "quota-exceeded": {
       "fields": {
         "switch-project": "bool",

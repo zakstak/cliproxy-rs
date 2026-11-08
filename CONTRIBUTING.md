@@ -9,7 +9,7 @@ Thanks for helping. Bug reports, fixes and new tests are all welcome.
 
 ## Building and testing
 
-You need Rust (stable), `cmake`, `clang` and `perl` for BoringSSL. Go 1.26 and PostgreSQL let the plugin and storage tests run instead of skipping; with `CPA_TEST_NO_SKIP=1`, as in CI, those tests fail instead.
+You need Rust (stable), `cmake`, `clang` and `perl` for BoringSSL. PostgreSQL lets the storage tests run instead of skipping; with `CPA_TEST_NO_SKIP=1`, as in CI, those tests fail instead.
 
 ```sh
 cargo fmt --all --check

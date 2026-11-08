@@ -420,7 +420,6 @@ async fn execute_chat(
             body,
             &codex_client,
         )
-        .map(|t| t.body)
         .map_err(|e| request_error(e.to_string()))
     };
     // Go translates the original request first (stream false) for payload-rule
@@ -471,7 +470,7 @@ async fn execute_chat(
         );
         ResponseBody::Stream(translate_lines(
             tapped,
-            crate::translate::stream(response_pair, &ctx, &req),
+            crate::translate::stream(response_pair, &ctx),
             StreamEnd::Chat,
             usage,
         ))
@@ -814,7 +813,7 @@ async fn execute_responses(
         match response_pair {
             Some(pair) => ResponseBody::Stream(translate_lines(
                 bridged,
-                crate::translate::stream(pair, &ctx, &req),
+                crate::translate::stream(pair, &ctx),
                 StreamEnd::Responses,
                 usage,
             )),
