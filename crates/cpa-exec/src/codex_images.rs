@@ -9,12 +9,14 @@
 //! `<prefix>.completed` SSE frames when streaming.
 
 use cpa_core::gostr::GoStr;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::rawjson::{self, Kind};
 use base64::Engine;
 use bytes::Bytes;
+use cpa_common::codex_body::{self as body, BodyError, CodexBody, Member};
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, ExecStream, ResponseBody};
@@ -83,12 +85,25 @@ impl CodexExecutor {
         let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
         let settings = Settings::scoped(cfg, &view);
         let path = request_path.trim();
+        // The client's JSON is read once, through the Codex request boundary (#22); a
+        // multipart edit is read as a form by the path that sends it.
+        let raw = req.body.clone();
+        let json = if is_form(&req, path) {
+            None
+        } else {
+            Some(ImagesJson::parse(&raw)?)
+        };
+        let payload_model = json.as_ref().and_then(ImagesJson::model);
         // A Sign in with ChatGPT credential has no direct Images endpoint.
-        match (direct_model(&req, &settings), direct_endpoint(path)) {
+        match (
+            direct_model(&req, payload_model.as_deref(), &settings),
+            direct_endpoint(path),
+        ) {
             (Some(model), Some(endpoint)) if !view.siwc => {
-                self.direct(&view, &settings, req, path, endpoint, &model).await
+                self.direct(&view, &settings, req, json.as_ref(), endpoint, &model)
+                    .await
             }
-            _ => self.tool(&view, &settings, req, path).await,
+            _ => self.tool(&view, &settings, req, json.as_ref(), path).await,
         }
     }
 
@@ -100,15 +115,19 @@ impl CodexExecutor {
         view: &View<'_>,
         settings: &Settings,
         req: ExecRequest,
-        path: &str,
+        json: Option<&ImagesJson<'_>>,
         endpoint: &str,
         model: &str,
     ) -> Result<ExecResponse, ExecError> {
-        let content_type = request::header(&req.headers, "content-type").to_owned();
-        let (body, content_type) = if path.ends_with(EDITS) {
-            direct_edit_payload(&req.body, model, &content_type, req.stream)?
-        } else {
-            prepare_images_payload(&req.body, model, &content_type, req.stream)?
+        let (body, content_type) = match json {
+            Some(json) => (
+                direct_json_payload(&req.body, json, model, req.stream),
+                "application/json".to_owned(),
+            ),
+            None => {
+                let content_type = request::header(&req.headers, "content-type");
+                direct_edit_form(&req.body, model, content_type, req.stream)?
+            }
         };
         if req.usage.enabled() {
             req.usage.request(Format::OpenAI, &body);
@@ -210,9 +229,10 @@ impl CodexExecutor {
         view: &View<'_>,
         settings: &Settings,
         req: ExecRequest,
+        json: Option<&ImagesJson<'_>>,
         path: &str,
     ) -> Result<ExecResponse, ExecError> {
-        let prepared = prepare(&req, path)?;
+        let prepared = prepare(&req, json, path)?;
         let main_model = main_model(&settings.image_base_model);
         let body = tool_body(&prepared.body, main_model)?;
         // No synthesized prompt-cache key in the body (#27); the session identity reaches
@@ -387,25 +407,22 @@ fn data_lines(event: &[u8]) -> Vec<&str> {
 /// `codexDirectOpenAIImageRouteModel`: the client's model (multipart handlers pass it
 /// beside the raw form), the JSON payload's model, then the execution model, when one
 /// is a gpt-image-* model.
-fn direct_route_model(req: &ExecRequest) -> Option<String> {
-    let payload_model = if cpa_common::json::std_valid(&req.body) {
-        rawjson::get(&String::from_utf8_lossy(&req.body), "model")
-            .str()
-            .to_owned()
-    } else {
-        String::new()
-    };
-    [req.requested_model.trim(), payload_model.as_str(), req.model.as_str()]
-        .into_iter()
-        .map(image_base_model)
-        .find(|m| DIRECT_MODELS.contains(&m.as_str()))
+fn direct_route_model(req: &ExecRequest, payload_model: Option<&str>) -> Option<String> {
+    [
+        req.requested_model.trim(),
+        payload_model.unwrap_or_default(),
+        req.model.as_str(),
+    ]
+    .into_iter()
+    .map(image_base_model)
+    .find(|m| DIRECT_MODELS.contains(&m.as_str()))
 }
 
 /// `directOpenAIImageModel`: for a direct route, the resolved upstream model. A name
 /// the credential's config lists is sent as it is; otherwise a gpt-image-* model loses
 /// its routing prefix and case (51bde0ff).
-fn direct_model(req: &ExecRequest, settings: &Settings) -> Option<String> {
-    let route = direct_route_model(req)?;
+fn direct_model(req: &ExecRequest, payload_model: Option<&str>, settings: &Settings) -> Option<String> {
+    let route = direct_route_model(req, payload_model)?;
     let model = request::base_model(&req.model).trim().to_owned();
     if model.is_empty() {
         return Some(route);
@@ -460,17 +477,14 @@ fn main_model(configured: &str) -> &str {
     }
 }
 
-/// `codexPrepareDirectOpenAIImageEditPayload`: JSON as for generations; a multipart edit
-/// is rewritten to JSON with data URLs.
-fn direct_edit_payload(
+/// `codexPrepareDirectOpenAIImageEditPayload` for a multipart edit: the form is rewritten
+/// to JSON with data URLs. A JSON edit takes [`direct_json_payload`], as a generation does.
+fn direct_edit_form(
     payload: &[u8],
     model: &str,
     content_type: &str,
     stream: bool,
 ) -> Result<(Bytes, String), ExecError> {
-    if cpa_common::json::std_valid(payload) {
-        return prepare_images_payload(payload, model, content_type, stream);
-    }
     let unsupported = || plain_err(format!("unsupported OpenAI image edit Content-Type {content_type:?}"));
     let MediaType::Ok(media, params) = multipart::parse_media_type(content_type.trim()) else {
         return Err(unsupported());
@@ -485,7 +499,7 @@ fn direct_edit_payload(
     let form =
         multipart::read_form(payload, boundary).map_err(|e| plain_err(format!("read multipart form failed: {e}")))?;
     Ok((
-        Bytes::from(edit_form_to_json(&form, model, stream)),
+        Bytes::from(edit_form_to_json(&form, model, stream)?),
         "application/json".into(),
     ))
 }
@@ -493,7 +507,7 @@ fn direct_edit_payload(
 /// `codexRewriteOpenAIImageEditMultipartToJSON`.
 // ponytail: Go ranges over its form map, so field order varies per run; this keeps the
 // order fields arrived in, one of Go's orders.
-fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> String {
+fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, ExecError> {
     let mut out = set_str("{}", "model", model);
     if stream {
         out = set_raw(&out, "stream", "true");
@@ -509,9 +523,12 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> String {
             other => other,
         };
         let raw = if let [value] = values.as_slice() {
-            form_json_value(path, value)
+            form_json_value(path, value)?
         } else {
-            let items: Vec<String> = values.iter().map(|v| form_json_value(key, v)).collect();
+            let items = values
+                .iter()
+                .map(|v| form_json_value(key, v))
+                .collect::<Result<Vec<_>, _>>()?;
             format!("[{}]", items.join(","))
         };
         out = set_raw(&out, path, &raw);
@@ -534,21 +551,34 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> String {
             out = set_str(&out, "images.-1.image_url", &data_url(file));
         }
     }
-    out
+    Ok(out)
 }
 
 /// `codexOpenAIImageEditFormJSONValue`: integers for the count fields, strings otherwise.
-fn form_json_value(key: &str, value: &[u8]) -> String {
-    let text = String::from_utf8_lossy(value);
-    let text = text.trim();
-    if matches!(
-        key.trim().go_lower().as_str(),
-        "n" | "output_compression" | "partial_images"
-    ) && let Ok(n) = go_parse_int(text)
+/// A value that is not UTF-8 is refused rather than replaced, and the count fields are
+/// matched by their exact names; Go lowercases the field name with Unicode rules (#22).
+fn form_json_value(key: &str, value: &[u8]) -> Result<String, ExecError> {
+    let text = form_utf8(key, value)?.trim();
+    if matches!(key.trim(), "n" | "output_compression" | "partial_images")
+        && let Ok(n) = go_parse_int(text)
     {
-        return n.to_string();
+        return Ok(n.to_string());
     }
-    String::from_utf8_lossy(&cpa_common::json::quote(text)).into_owned()
+    Ok(String::from_utf8_lossy(&cpa_common::json::quote(text)).into_owned())
+}
+
+/// A multipart text field's value as UTF-8, or a request error that names the field.
+fn form_utf8<'a>(key: &str, value: &'a [u8]) -> Result<&'a str, ExecError> {
+    std::str::from_utf8(value).map_err(|e| {
+        ExecError::local(
+            400,
+            cpa_core::exec::FailureScope::Request,
+            format!(
+                "request form field `{key}` is not valid UTF-8 at byte {}",
+                e.valid_up_to()
+            ),
+        )
+    })
 }
 
 /// `strconv.ParseInt(s, 10, 64)`.
@@ -612,27 +642,98 @@ fn detect_content_type(data: &[u8]) -> &'static str {
     }
 }
 
-/// `codexPrepareOpenAIImageRequest`.
-fn prepare(req: &ExecRequest, path: &str) -> Result<Prepared, ExecError> {
-    if path.ends_with(GENERATIONS) {
-        return generation_json(&req.body, &req.model);
-    }
+/// Whether the request is a multipart edit: an edit whose `Content-Type` names a
+/// multipart media type. Every other Images body is JSON.
+fn is_form(req: &ExecRequest, path: &str) -> bool {
     if !path.ends_with(EDITS) {
-        return Err(plain_err(format!("unsupported OpenAI image endpoint path {path:?}")));
+        return false;
     }
     let content_type = request::header(&req.headers, "content-type").trim();
-    let media = match multipart::parse_media_type(content_type) {
-        MediaType::Ok(media, _) | MediaType::BadParams(media) => media,
-        MediaType::Invalid(_) => String::new(),
-    };
-    if media.starts_with("multipart/") {
-        return edit_multipart(&req.body, &req.model, content_type);
+    match multipart::parse_media_type(content_type) {
+        MediaType::Ok(media, _) | MediaType::BadParams(media) => media.starts_with("multipart/"),
+        MediaType::Invalid(_) => false,
     }
-    edit_json(&req.body, &req.model)
 }
 
-fn json_text(raw: &[u8]) -> Option<String> {
-    cpa_common::json::std_valid(raw).then(|| String::from_utf8_lossy(raw).into_owned())
+/// `codexPrepareOpenAIImageRequest`. `json` is the body read through the boundary; it is
+/// `None` only for a multipart edit ([`is_form`]).
+fn prepare(req: &ExecRequest, json: Option<&ImagesJson<'_>>, path: &str) -> Result<Prepared, ExecError> {
+    if !path.ends_with(GENERATIONS) && !path.ends_with(EDITS) {
+        return Err(plain_err(format!("unsupported OpenAI image endpoint path {path:?}")));
+    }
+    match json {
+        Some(json) if path.ends_with(GENERATIONS) => generation_json(json, &req.model),
+        Some(json) => edit_json(json, &req.model),
+        None => edit_multipart(
+            &req.body,
+            &req.model,
+            request::header(&req.headers, "content-type").trim(),
+        ),
+    }
+}
+
+/// A client's Images JSON request after the Codex request boundary
+/// ([`cpa_common::codex_body`]): UTF-8, RFC 8259 JSON with nothing after it, no key
+/// repeated in any object, at most 100 levels deep, at most 64 MiB, and an object (#22).
+/// The members the adapter reads are typed where they are read. A member of the wrong
+/// type is refused; it is never read as text or as a number, as Go's gjson reads it.
+/// `null` reads as absent, as the Images API documents for its optional parameters.
+struct ImagesJson<'a>(CodexBody<'a>);
+
+impl<'a> ImagesJson<'a> {
+    fn parse(raw: &'a [u8]) -> Result<Self, ExecError> {
+        let json = Self(CodexBody::parse_object(raw)?);
+        json.string("model")?;
+        match json.0.get("stream").map(|m| m.kind) {
+            None | Some(body::Kind::True | body::Kind::False | body::Kind::Null) => {}
+            Some(_) => {
+                return Err(BodyError::FieldType {
+                    field: "stream",
+                    expected: "a boolean",
+                }
+                .into());
+            }
+        }
+        Ok(json)
+    }
+
+    /// The client's `model`, which [`Self::parse`] checked.
+    fn model(&self) -> Option<Cow<'a, str>> {
+        self.string("model").ok().flatten()
+    }
+
+    fn string(&self, field: &'static str) -> Result<Option<Cow<'a, str>>, ExecError> {
+        self.0.get(field).map_or(Ok(None), |m| typed_string(m, field))
+    }
+
+    /// A number member's exact spelling: it is copied, never converted.
+    fn number(&self, field: &'static str) -> Result<Option<&'a str>, ExecError> {
+        match self.0.get(field) {
+            None => Ok(None),
+            Some(m) => match m.kind {
+                body::Kind::Null => Ok(None),
+                // The scanner checked the number grammar, which is ASCII.
+                body::Kind::Number => Ok(std::str::from_utf8(m.raw).ok()),
+                _ => Err(BodyError::FieldType {
+                    field,
+                    expected: "a number",
+                }
+                .into()),
+            },
+        }
+    }
+}
+
+fn typed_string<'a>(member: &Member<'a>, field: &'static str) -> Result<Option<Cow<'a, str>>, ExecError> {
+    match member.kind {
+        body::Kind::Null => Ok(None),
+        body::Kind::String => Ok(member.text()),
+        _ => Err(BodyError::FieldType {
+            field,
+            expected: "a string",
+        }
+        .into()),
+    }
 }
 
 /// Images API fields the `image_generation` tool expresses (OpenAI Images API and the
@@ -674,18 +775,16 @@ fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, ex
     Ok(())
 }
 
-fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
-    let root = rawjson::parse(raw);
-    let mut fields = Vec::new();
-    root.each(|key, value| {
-        let number = match value.kind() {
-            Kind::Null => None,
-            _ => Some(value.f64()),
-        };
-        fields.push((key.str().to_owned(), number));
-        true
-    });
-    check_fields(fields.iter().map(|(k, n)| (k.as_str(), *n)), extra)
+fn expressible(json: &ImagesJson<'_>, extra: &[&str]) -> Result<(), ExecError> {
+    // `n` is a number, compared by value: `1`, `1.0` and `1e0` are one image.
+    let n = json.number("n")?.map(|raw| raw.parse::<f64>().unwrap_or(f64::NAN));
+    check_fields(
+        json.0
+            .members()
+            .iter()
+            .map(|m| (&*m.key, if m.key == "n" { n } else { None })),
+        extra,
+    )
 }
 
 /// An image the tool request carries: a URL (a data URL included) or an uploaded file.
@@ -696,56 +795,57 @@ enum Image {
 
 /// A JSON image reference (`{"image_url":...}` or `{"file_id":...}`, the Images API
 /// forms the Responses `input_image` and `input_image_mask` also take). Anything else is
-/// refused rather than dropped.
-fn image_reference(value: &rawjson::Value<'_>, what: &str) -> Result<Image, ExecError> {
-    let url = value.get("image_url").str().trim().to_owned();
-    let file = value.get("file_id").str().trim().to_owned();
+/// refused rather than dropped. `raw` is part of a body that passed the boundary.
+fn image_reference(raw: &[u8], what: &str) -> Result<Image, ExecError> {
+    let refused = || unexpressible(&format!("{what} without exactly one image_url or file_id"));
+    let Ok(object) = CodexBody::parse_object(raw) else {
+        return Err(refused());
+    };
+    let text = |field: &'static str| -> Result<String, ExecError> {
+        let value = object.get(field).map_or(Ok(None), |m| typed_string(m, field))?;
+        Ok(value.as_deref().unwrap_or_default().trim().to_owned())
+    };
+    let (url, file) = (text("image_url")?, text("file_id")?);
     match (url.is_empty(), file.is_empty()) {
         (false, true) => Ok(Image::Url(url)),
         (true, false) => Ok(Image::File(file)),
-        _ => Err(unexpressible(&format!(
-            "{what} without exactly one image_url or file_id"
-        ))),
+        _ => Err(refused()),
     }
 }
 
 /// `codexPrepareOpenAIImageGenerationJSON`.
-fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
-    let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image generation request JSON"))?;
-    expressible(&raw, &[])?;
-    let prompt = rawjson::get(&raw, "prompt").str().trim().to_owned();
+fn generation_json(json: &ImagesJson<'_>, route_model: &str) -> Result<Prepared, ExecError> {
+    expressible(json, &[])?;
+    let prompt = json.string("prompt")?.unwrap_or_default().trim().to_owned();
     let tool = tool_json(
-        &raw,
+        json,
         route_model,
         "generate",
         &["size", "quality", "background", "output_format", "moderation"],
-    );
+    )?;
     Ok(Prepared {
         body: responses_request(&prompt, &[], &tool),
-        url_format: url_format(rawjson::get(&raw, "response_format").str()),
+        url_format: url_format(&json.string("response_format")?.unwrap_or_default()),
         prefix: "image_generation",
     })
 }
 
 /// `codexPrepareOpenAIImageEditJSON`.
-fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
-    let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image edit request JSON"))?;
-    expressible(&raw, &["images", "mask", "input_fidelity"])?;
-    let prompt = rawjson::get(&raw, "prompt").str().trim().to_owned();
-    let images_value = rawjson::get(&raw, "images");
-    let images: Vec<Image> = if images_value.kind() == Kind::Array {
-        images_value
-            .items()
-            .iter()
-            .map(|img| image_reference(img, "an image"))
-            .collect::<Result<_, _>>()?
-    } else if images_value.exists() {
-        return Err(unexpressible("images that is not an array"));
-    } else {
-        Vec::new()
+fn edit_json(json: &ImagesJson<'_>, route_model: &str) -> Result<Prepared, ExecError> {
+    expressible(json, &["images", "mask", "input_fidelity"])?;
+    let prompt = json.string("prompt")?.unwrap_or_default().trim().to_owned();
+    let images: Vec<Image> = match json.0.get("images") {
+        None => Vec::new(),
+        Some(images) => match images.items() {
+            Some(items) => items
+                .into_iter()
+                .map(|item| image_reference(item, "an image"))
+                .collect::<Result<_, _>>()?,
+            None => return Err(unexpressible("images that is not an array")),
+        },
     };
     let mut tool = tool_json(
-        &raw,
+        json,
         route_model,
         "edit",
         &[
@@ -756,17 +856,16 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
             "input_fidelity",
             "moderation",
         ],
-    );
-    let mask = rawjson::get(&raw, "mask");
-    if mask.exists() && mask.kind() != Kind::Null {
-        tool = match image_reference(&mask, "a mask")? {
+    )?;
+    if let Some(mask) = json.0.get("mask").filter(|m| m.kind != body::Kind::Null) {
+        tool = match image_reference(mask.raw, "a mask")? {
             Image::Url(url) => set_str(&tool, "input_image_mask.image_url", &url),
             Image::File(id) => set_str(&tool, "input_image_mask.file_id", &id),
         };
     }
     Ok(Prepared {
         body: responses_request(&prompt, &images, &tool),
-        url_format: url_format(rawjson::get(&raw, "response_format").str()),
+        url_format: url_format(&json.string("response_format")?.unwrap_or_default()),
         prefix: "image_edit",
     })
 }
@@ -787,6 +886,20 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
     }
     let form =
         multipart::read_form(body, boundary).map_err(|e| plain_err(format!("parse multipart form failed: {e}")))?;
+    // The tool reads one value per text field: a repeated field is ambiguous, and a
+    // value that is not UTF-8 is refused rather than replaced (#22).
+    for (key, values) in &form.values {
+        if values.len() > 1 {
+            return Err(ExecError::local(
+                400,
+                cpa_core::exec::FailureScope::Request,
+                format!("request form field `{key}` is repeated"),
+            ));
+        }
+        for value in values {
+            form_utf8(key, value)?;
+        }
+    }
     let value = |key: &str| form.value(key).trim().to_owned();
     // The same field policy as JSON (#27): form values the tool expresses, and image and
     // mask files; anything else is refused.
@@ -856,29 +969,31 @@ fn tool_model(request_model: &str, route_model: &str) -> String {
         .to_owned()
 }
 
-/// `codexBuildOpenAIImageTool`: string fields as Go's `String()` reads them, the count
-/// fields only when numeric (truncated to integers).
-fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str]) -> String {
+/// `codexBuildOpenAIImageTool`: the client's string fields, trimmed, and the count fields
+/// with their number spelling. A field of another type is refused; Go reads it as text
+/// with `String()`, and truncates or drops a count (#22).
+fn tool_json(
+    json: &ImagesJson<'_>,
+    route_model: &str,
+    action: &str,
+    string_fields: &[&'static str],
+) -> Result<String, ExecError> {
     let mut tool = set_str(r#"{"type":"image_generation","action":""}"#, "action", action);
-    tool = set_str(
-        &tool,
-        "model",
-        &tool_model(rawjson::get(raw, "model").str(), route_model),
-    );
-    for field in string_fields {
-        let value = rawjson::get(raw, field);
-        let value = value.str().trim();
-        if !value.is_empty() {
-            tool = set_str(&tool, field, value);
+    let model = json.model().unwrap_or_default();
+    tool = set_str(&tool, "model", &tool_model(&model, route_model));
+    for &field in string_fields {
+        if let Some(value) = json.string(field)?
+            && !value.trim().is_empty()
+        {
+            tool = set_str(&tool, field, value.trim());
         }
     }
     for field in ["output_compression", "partial_images"] {
-        let value = rawjson::get(raw, field);
-        if value.kind() == Kind::Number {
-            tool = set_raw(&tool, field, &value.i64().to_string());
+        if let Some(raw) = json.number(field)? {
+            tool = set_raw(&tool, field, raw);
         }
     }
-    tool
+    Ok(tool)
 }
 
 /// `codexBuildImagesResponsesRequest`.
@@ -1054,34 +1169,30 @@ fn mime_type(output_format: &str) -> &'static str {
     }
 }
 
-/// `prepareOpenAICompatImagesPayload`.
-pub(crate) fn prepare_images_payload(
-    body: &[u8],
-    model: &str,
-    content_type: &str,
-    stream: bool,
-) -> Result<(Bytes, String), ExecError> {
-    if crate::go_std::json_valid(body) {
-        let mut body = body.to_vec();
-        if !model.is_empty() {
-            crate::openai_payload::set_str_if_different(&mut body, "model", model);
-        }
-        if stream {
-            crate::openai_payload::set_bool_if_different(&mut body, "stream", true);
-        } else {
-            cpa_common::json::delete(&mut body, "stream");
-        }
-        return Ok((Bytes::from(body), "application/json".into()));
-    }
-    let Some(boundary) = multipart::boundary(content_type) else {
-        return Ok((Bytes::copy_from_slice(body), content_type.to_owned()));
+/// `prepareOpenAICompatImagesPayload` for a JSON body that passed the boundary: the
+/// routed `model`, and `stream` set or removed. The edits are sjson's, so a member the
+/// body lacks is appended as Go appends it, and every other byte stays. `raw` holds the
+/// bytes `json` read; they are shared, not copied, when nothing changes.
+fn direct_json_payload(raw: &Bytes, json: &ImagesJson<'_>, model: &str, stream: bool) -> Bytes {
+    let model_kept = model.is_empty() || json.model().as_deref() == Some(model);
+    let stream_kept = match json.0.get("stream").map(|m| m.kind) {
+        Some(body::Kind::True) => stream,
+        None => !stream,
+        Some(_) => false,
     };
-    // Go returns a plain error here; the handler answers 500.
-    let boundary = boundary.map_err(plain_err)?;
-    let form =
-        multipart::read_form(body, &boundary).map_err(|e| plain_err(format!("read multipart form failed: {e}")))?;
-    let (out, content_type) = multipart::rewrite_images_form(&form, model, stream, false);
-    Ok((Bytes::from(out), content_type))
+    if model_kept && stream_kept {
+        return raw.clone();
+    }
+    let mut body = json.0.raw().to_vec();
+    if !model.is_empty() {
+        crate::openai_payload::set_str_if_different(&mut body, "model", model);
+    }
+    if stream {
+        crate::openai_payload::set_bool_if_different(&mut body, "stream", true);
+    } else {
+        cpa_common::json::delete(&mut body, "stream");
+    }
+    Bytes::from(body)
 }
 
 #[cfg(test)]
@@ -1114,6 +1225,13 @@ mod tests {
         }
     }
 
+    /// [`direct_model`] with the payload model read as `images` reads it: from a JSON
+    /// body, and none from a form.
+    fn route(req: &ExecRequest, settings: &Settings) -> Option<String> {
+        let json = ImagesJson::parse(&req.body).ok();
+        direct_model(req, json.as_ref().and_then(ImagesJson::model).as_deref(), settings)
+    }
+
     /// Go `TestCodexImagePayloadPreservesResolvedAlias` and the model column of
     /// `TestCodexImageResolvedModelOnWire` (its payload-rule rows need the media payload
     /// finalizer, 868e137): a configured upstream name is sent as it is, and only an
@@ -1124,7 +1242,7 @@ mod tests {
         let json: &[u8] = br#"{"model":"gpt-image-2","prompt":"diagnostic"}"#;
         let form: &[u8] = b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--b--\r\n";
         assert_eq!(
-            direct_model(&request("", "openai/gpt-image-2-cpr", json), &plain).as_deref(),
+            route(&request("", "openai/gpt-image-2-cpr", json), &plain).as_deref(),
             Some("openai/gpt-image-2-cpr")
         );
         for (requested, resolved, configured, want) in [
@@ -1184,7 +1302,7 @@ mod tests {
             // A multipart edit has no JSON model; the client's model carries the route.
             for body in [json, form] {
                 assert_eq!(
-                    direct_model(&request(requested, resolved, body), &settings).as_deref(),
+                    route(&request(requested, resolved, body), &settings).as_deref(),
                     Some(want),
                     "{requested} -> {resolved}"
                 );
@@ -1220,7 +1338,7 @@ mod tests {
                     .leak();
                 for body in [json, form] {
                     assert_eq!(
-                        direct_model(&request(&model, &model, body), &plain).as_deref(),
+                        route(&request(&model, &model, body), &plain).as_deref(),
                         Some(base),
                         "{model}"
                     );
@@ -1228,9 +1346,6 @@ mod tests {
             }
         }
         let json: &[u8] = br#"{"model":"gpt-image-2.6","prompt":"x"}"#;
-        assert_eq!(
-            direct_model(&request("gpt-image-2.6", "gpt-image-2.6", json), &plain),
-            None
-        );
+        assert_eq!(route(&request("gpt-image-2.6", "gpt-image-2.6", json), &plain), None);
     }
 }

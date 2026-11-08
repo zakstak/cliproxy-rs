@@ -299,3 +299,121 @@ fn routing_borrows_unchanged_bodies_and_quotes_only_a_changed_model() {
         br#"{"model":"a\"b\\c\n","stream":false}"#
     );
 }
+
+/// The HTTP body of a WebSocket frame in one copy: `type` goes with one comma, `model`
+/// is routed and `stream: true` is set or added, whatever the member order.
+#[test]
+fn routing_without_a_member_is_one_edit() {
+    for (raw, expected) in [
+        (
+            r#"{"type":"response.create","model":"alias","input":[{"type":"message"}]}"#,
+            r#"{"stream":true,"model":"upstream","input":[{"type":"message"}]}"#,
+        ),
+        (
+            r#"{"model":"upstream","type":"response.create","stream":false,"n":1.50}"#,
+            r#"{"model":"upstream","stream":true,"n":1.50}"#,
+        ),
+        (
+            r#" { "type" : "response.create" , "stream":true, "model":"upstream" } "#,
+            r#" {"stream":true, "model":"upstream" } "#,
+        ),
+        (r#"{"type":"response.create"}"#, r#"{"stream":true,"model":"upstream"}"#),
+        (
+            r#"{"input":[],"model":"upstream","stream":true,"type":"response.create"}"#,
+            r#"{"input":[],"model":"upstream","stream":true}"#,
+        ),
+        (
+            r#"{"t\u0079pe":"response.create","model":"upstream","stream":true,"x":1e400}"#,
+            r#"{"model":"upstream","stream":true,"x":1e400}"#,
+        ),
+    ] {
+        let body = CodexBody::parse(raw.as_bytes()).unwrap();
+        let out = body.routed_without("upstream", true, "type");
+        assert_eq!(out.as_ref(), expected.as_bytes(), "{raw}");
+        CodexBody::parse(&out).unwrap();
+    }
+    // Nothing to change: the caller's bytes, borrowed.
+    let raw = br#"{"model":"upstream","stream":true}"#;
+    let body = CodexBody::parse(raw).unwrap();
+    assert!(matches!(
+        body.routed_without("upstream", true, "type"),
+        Cow::Borrowed(_)
+    ));
+}
+
+/// `routed_without` gives what the separate steps give, on every member order: remove
+/// the member, parse again, then route.
+#[test]
+fn routing_without_a_member_matches_the_separate_steps() {
+    let members = [
+        r#""type":"response.create""#,
+        r#""model":"alias""#,
+        r#""stream":false"#,
+        r#""input":[{"type":"message","n":-0.0}]"#,
+    ];
+    let mut checked = 0;
+    for mask in 0u32..(1 << members.len()) {
+        let chosen: Vec<&str> = (0..members.len())
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| members[i])
+            .collect();
+        for rotation in 0..chosen.len().max(1) {
+            let mut order = chosen.clone();
+            order.rotate_left(rotation);
+            for separator in [",", " , "] {
+                let raw = format!("{{{}}}", order.join(separator));
+                let body = CodexBody::parse(raw.as_bytes()).unwrap();
+                for (model, stream) in [("alias", false), ("upstream", false), ("upstream", true)] {
+                    let untagged = body.without_member("type");
+                    let stepwise = CodexBody::parse(&untagged).unwrap().routed(model, stream).into_owned();
+                    let once = body.routed_without(model, stream, "type");
+                    assert_eq!(
+                        String::from_utf8_lossy(&once),
+                        String::from_utf8_lossy(&stepwise),
+                        "{raw} {model} {stream}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "{checked}");
+}
+
+/// An array member's elements are slices of the body; other values have none.
+#[test]
+fn array_items_are_slices_of_the_input() {
+    let raw = br#"{"images":[ {"image_url":"a"} ,"x",1e400,[[]],null ],"empty":[ ],"s":"[1]"}"#;
+    let body = CodexBody::parse_object(raw).unwrap();
+    let items = body.get("images").unwrap().items().unwrap();
+    let expected: [&[u8]; 5] = [br#"{"image_url":"a"}"#, br#""x""#, b"1e400", b"[[]]", b"null"];
+    assert_eq!(items, expected);
+    assert!(raw.as_ptr_range().contains(&items[2].as_ptr()));
+    assert_eq!(body.get("empty").unwrap().items(), Some(vec![]));
+    assert_eq!(body.get("s").unwrap().items(), None);
+    let keys: Vec<&str> = body.members().iter().map(|m| &*m.key).collect();
+    assert_eq!(keys, ["images", "empty", "s"]);
+    assert_eq!(body.raw(), raw);
+}
+
+/// `parse_object` applies every rule but the Responses member types.
+#[test]
+fn object_parsing_skips_only_the_responses_member_types() {
+    for raw in [r#"{"model":5}"#, r#"{"stream":"yes"}"#, r#"{"previous_response_id":1}"#] {
+        assert!(CodexBody::parse(raw.as_bytes()).is_err(), "{raw}");
+        CodexBody::parse_object(raw.as_bytes()).unwrap();
+    }
+    for raw in [
+        &b"{\"a\":\"\xff\"}"[..],
+        br#"{"a":1,"a":2}"#,
+        br#"{"a":1} x"#,
+        br#"[1]"#,
+        &json(r#"{"a":"~ud800"}"#)[..],
+    ] {
+        assert!(
+            CodexBody::parse_object(raw).is_err(),
+            "{}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+}

@@ -1192,6 +1192,20 @@ async fn images_match_go_on_every_fixture_case() {
             assert!(captured.is_empty(), "{name}: nothing is sent");
             continue;
         }
+        if name == "tool_invalid_json" {
+            // The Codex request boundary (#22) refuses malformed client JSON with a
+            // request-scoped 400 that names the byte. Go answers its plain error,
+            // "invalid OpenAI image generation request JSON", as a 500
+            // (docs/DIFFERENCES-FROM-GO.md).
+            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
+            assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
+            assert_eq!(
+                String::from_utf8_lossy(&error.body),
+                "request body is not valid JSON at byte 10"
+            );
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+            continue;
+        }
         match case.get("upstream").filter(|u| !u.is_null()) {
             None => assert!(captured.is_empty(), "{name}: no upstream request"),
             Some(go) => {

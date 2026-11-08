@@ -27,7 +27,7 @@ copy.
 | --- | --- | --- |
 | `cpa-exec/src/codex_response.rs`, `codex_quota.rs` | `rawjson` | Failure classification, usage-limit and retry hints, quota headers. Quota and frame headers copy numbers raw, so `12.50` stays `12.50`. |
 | `cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | `rawjson` for upstream events; `CodexBody` for client frames, as before | Event types, response IDs, interrupt acknowledgements and wrapped error frames, for bookkeeping. The client receives each frame as it arrived. |
-| `cpa-exec/src/codex_images.rs` | `rawjson` | Images input parsing, the image tool settings and the aggregated Images response. This is a cross-API conversion, so the generated Responses body does not go through the native request boundary. |
+| `cpa-exec/src/codex_images.rs` | `CodexBody` for the client's JSON; `rawjson` for upstream events | The client's Images JSON goes through the Codex request boundary with typed member reads ([codex/CONTRACT.md](codex/CONTRACT.md#request-boundary)). The upstream events and the aggregated Images response read through `rawjson`. The tool path's generated Responses body does not go through the native request boundary. |
 | `cpa-exec/src/codex_json.rs` | `cpa_common::json` and `rawjson` | The Go-compatible remarshal for Alpha Search, and the conditional `model` and `stream` setters for translated and Images bodies. |
 | `cpa-exec/src/codex.rs` | `rawjson` | The model in the shared send helper's quota bookkeeping, and the Alpha Search `id`. |
 | `cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs` | `rawjson` | The shared Responses WebSocket transcript, prewarm, tool repair and error frames for xAI. Native Codex attempts still take the preserved client frame from `NativeRequest`. |

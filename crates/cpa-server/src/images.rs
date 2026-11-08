@@ -88,6 +88,19 @@ pub(crate) fn bad_request(message: &str) -> Response {
     respond::error_detail(400, message, "invalid_request_error")
 }
 
+/// The refusal of a JSON `stream` that is not a boolean, for the models Codex serves:
+/// the tool models and the `openai-image` models, which only the Codex catalog registers
+/// (`cpa_common::codex_catalog`). The Codex Images adapter reads every member without
+/// coercion (#22, docs/codex/CONTRACT.md "Request boundary"), but this handler rewrites
+/// `stream` before the adapter sees the body. Go reads it with gjson's `Bool()`, so
+/// `"true"` or `1` streams and reaches the upstream as `true`. xAI keeps Go's reading.
+fn codex_stream_refused(body: &[u8]) -> Option<Response> {
+    match gj::get(body, "stream").kind {
+        Kind::True | Kind::False | Kind::Null => None,
+        _ => Some(bad_request("Invalid request: request field `stream` must be a boolean")),
+    }
+}
+
 /// `rejectUnsupportedImagesModel`.
 fn unsupported(model: &str) -> Option<Response> {
     if is_codex_tool_model(model) || is_xai_model(model) || is_compat_model(model) {
@@ -715,6 +728,11 @@ pub async fn generations(
         headers,
         path: dispatch::route_path(matched.as_ref(), &uri),
     };
+    if !is_xai_model(&model)
+        && let Some(rejected) = codex_stream_refused(&body)
+    {
+        return rejected;
+    }
     if is_codex_tool_model(&model) {
         let req = compat_json_request(&body, &model, stream);
         return raw(p, &model, req, stream, true).await;
@@ -888,6 +906,11 @@ async fn edits_json(p: Prepared, body: &[u8]) -> Response {
         format = "b64_json".into();
     }
     let stream = gj::get(body, "stream").bool();
+    if !is_xai_model(&model)
+        && let Some(rejected) = codex_stream_refused(body)
+    {
+        return rejected;
+    }
     if is_codex_tool_model(&model) {
         let req = compat_json_request(body, &model, stream);
         return raw(p, &model, req, stream, true).await;

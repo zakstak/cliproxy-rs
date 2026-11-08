@@ -223,13 +223,26 @@ content. Any other member, at any depth, passes as long as it is valid JSON.
 
 The Codex executor applies the boundary at its entry points, `CodexExecutor::execute`
 and `CodexExecutor::execute_in_session`, to every body whose source and response formats
-are both Responses: HTTP streaming, buffered, compact and WebSocket turns. A refused body
-fails there, before translation and before any upstream send. A body that passes goes
+are both Responses: HTTP streaming, buffered, compact and WebSocket turns, and a local
+token count. A refused body fails there, before translation and before any upstream send. A body that passes goes
 upstream unchanged except for the permitted transformations: every Responses request
 takes a native route (#28). A native WebSocket connection also reads each later client frame through the
 boundary. The
 boundary does not judge bodies from other client formats, which reach Codex through a
 cross-API translator (#27).
+
+The Images API adapter reads a client's JSON body through the same rules
+(`CodexBody::parse_object`), on the direct and the tool path, before anything is sent.
+The Responses member types do not apply to an Images body. The adapter types each member
+it reads instead: `model`, `prompt`, `response_format` and the image settings are strings,
+`stream` is a boolean, `n`, `output_compression` and `partial_images` are numbers, and an
+image or mask reference holds string `image_url` or `file_id` members. `null` reads as
+absent. A member of another type is refused with the same 400 message, for example
+``request field `size` must be a string``. Nothing is coerced, and the tool request copies
+a count with its number spelling. In a multipart edit, a text field that is not UTF-8 is
+refused (``request form field `prompt` is not valid UTF-8 at byte N``), and the tool path
+refuses a text field that appears twice. The boundary does not apply to the Responses
+body that the tool path generates.
 
 The shared ingress parser `cpa_server::claude::peek` reads `model` and `stream` for
 every provider before a credential is chosen. It keeps its Go behaviour: it already fails
@@ -251,15 +264,16 @@ reader semantics.
 
 | Code | What it parses | Status |
 | --- | --- | --- |
-| `crates/cpa-exec/src/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes |
-| `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request, OAuth and SIWC token files | Retained for those callers; the native boundary is not applied to raw schemas in generated bodies |
+| `crates/cpa-exec/src/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes. The Lite marker is matched as an ASCII token: ASCII white space and case only |
+| `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request it builds, OAuth and SIWC token files | Retained for those callers; the bodies it edits are generated, so the native boundary does not apply. #27 owns the translated route |
 | `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. No Codex route calls it; the registered Responses-to-Codex pair keeps it for the providers that share it | Other providers |
-| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; [Translated route](#translated-route) |
+| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; #27, [Translated route](#translated-route) |
 | `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
-| `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | Retained; #33 owns image model IDs |
-| `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | Retained |
-| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads |
-| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy | Upstream observation remains |
+| `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | The client's JSON goes through the boundary and typed member reads ([Request boundary](#request-boundary)). The direct path's `model` and `stream` edits stay sjson's, so a missing member is appended as the Go goldens record. The upstream events and the Images response read through `rawjson` (#25); #33 owns image model IDs |
+| `crates/cpa-server/src/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | Other providers, and Go's ingress for Codex models, like `peek`. A Codex request then meets the adapter's boundary before any send |
+| `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | A Responses body passes the boundary first and is read in place. The counter's text reads stay on `cpa_common::json` over that validated body or the strict conversion; they read each item in place, never from the root |
+| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads; #25 |
+| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `cpa_common::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue (#24) |
 | `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A Codex attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the frame for other providers | Other providers |
 | `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A Codex attempt gets the client's bytes from `NativeRequest` instead | Other providers |
 | `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers |
@@ -663,12 +677,14 @@ its own error format.
 ### Token counts and images
 
 A token count reads the body the request would send: the client's own bytes for a
-Responses client, or the strict conversion. No Codex-client rewrite, default or payload
+Responses client, after the [request boundary](#request-boundary), or the strict
+conversion. No Codex-client rewrite, default or payload
 rule changes it. The response carries `x-cliproxy-token-count: local-estimate`, because
 the number is this proxy's tokenizer estimate, not provider usage.
 
 The Images API adapter has two paths. Neither runs payload rules or input-ID rewrites,
-and neither synthesizes a prompt-cache key.
+and neither synthesizes a prompt-cache key. Both read the client's JSON through the
+[request boundary](#request-boundary) first.
 
 - A direct request (an image model on the direct list, or a configured API-key image
   model) reaches the provider's Images endpoint as the client sent it, with only its

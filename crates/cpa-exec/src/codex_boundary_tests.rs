@@ -198,3 +198,213 @@ async fn translated_formats_are_outside_the_boundary() {
     drop(response);
     assert_eq!(mock.take().len(), 1);
 }
+
+/// A client's Images API request on `path`, as the images handler hands it over.
+fn images_request(path: &str, model: &str, content_type: &str, body: impl Into<Bytes>) -> ExecRequest {
+    let mut req = request(Format::OpenAI, body, false, None);
+    req.requested_model = model.into();
+    req.model = model.into();
+    req.request_path = path.into();
+    req.headers
+        .insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
+    req
+}
+
+fn form(fields: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, value) in fields {
+        out.extend_from_slice(format!("--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes());
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"--B--\r\n");
+    out
+}
+
+/// The Images adapter reads a client's JSON through the same boundary (#22): malformed,
+/// non-UTF-8, repeated-key, too-deep and non-object bodies, and members of the wrong
+/// type, are refused before anything is sent, on the tool and the direct path. Nothing is
+/// coerced: Go reads `"n":"1"` and `"size":1024` as a count and a size.
+#[tokio::test]
+async fn images_json_passes_the_boundary_before_the_send() {
+    let mock = Mock::start().await;
+    let executor = executor();
+    let cfg = Config::default();
+    let credential = credential(&mock.url);
+    let deep = format!(r#"{{"prompt":"p","x":{}{}}}"#, "[".repeat(200), "]".repeat(200));
+    let both: Vec<(&str, Vec<u8>)> = vec![
+        ("invalid UTF-8", b"{\"prompt\":\"\xff\"}".to_vec()),
+        ("repeated key", br#"{"prompt":"a","prompt":"b"}"#.to_vec()),
+        (
+            "nested repeated key",
+            br#"{"prompt":"a","images":[{"image_url":"u","image_url":"v"}]}"#.to_vec(),
+        ),
+        ("trailing content", br#"{"prompt":"p"} {}"#.to_vec()),
+        ("lone surrogate", br#"{"prompt":"\ud800"}"#.to_vec()),
+        ("depth", deep.into_bytes()),
+        ("root type", br#"[{"prompt":"p"}]"#.to_vec()),
+        ("model type", br#"{"model":5,"prompt":"p"}"#.to_vec()),
+        ("stream type", br#"{"prompt":"p","stream":"yes"}"#.to_vec()),
+    ];
+    let tool_only: Vec<(&str, Vec<u8>)> = vec![
+        ("prompt type", br#"{"prompt":5}"#.to_vec()),
+        ("size type", br#"{"prompt":"p","size":1024}"#.to_vec()),
+        ("n as text", br#"{"prompt":"p","n":"1"}"#.to_vec()),
+        ("n as a flag", br#"{"prompt":"p","n":true}"#.to_vec()),
+        ("count as text", br#"{"prompt":"p","output_compression":"50"}"#.to_vec()),
+        (
+            "image reference type",
+            br#"{"prompt":"p","images":[{"image_url":5}]}"#.to_vec(),
+        ),
+        (
+            "mask reference type",
+            br#"{"prompt":"p","mask":{"file_id":["f"]}}"#.to_vec(),
+        ),
+    ];
+    let mut cases = Vec::new();
+    for (name, body) in &both {
+        for (path, model) in [
+            ("/v1/images/generations", "gpt-5.4"),
+            ("/v1/images/edits", "gpt-5.4"),
+            ("/v1/images/generations", "gpt-image-2"),
+            ("/v1/images/edits", "gpt-image-2"),
+        ] {
+            cases.push((*name, path, model, body.clone()));
+        }
+    }
+    for (name, body) in &tool_only {
+        cases.push((*name, "/v1/images/edits", "gpt-5.4", body.clone()));
+    }
+    for (name, path, model, body) in cases {
+        let req = images_request(path, model, "application/json", body);
+        let error = executor
+            .images(&credential, req, path, &cfg)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name} {path} {model}: accepted"));
+        assert_eq!(
+            (error.status, error.scope),
+            (400, FailureScope::Request),
+            "{name} {path} {model}"
+        );
+        let message = String::from_utf8_lossy(&error.body);
+        assert!(message.starts_with("request "), "{name} {path} {model}: {message}");
+    }
+    assert!(mock.take().is_empty(), "a refused Images body reached the upstream");
+}
+
+/// A valid Images body is read without loss: the tool copies count fields with their
+/// number spelling and reads escaped text, and the direct path forwards the client's own
+/// bytes, unknown members and number spellings included, when nothing needs routing.
+#[tokio::test]
+async fn images_json_is_read_without_loss() {
+    let mock = Mock::start().await;
+    let executor = executor();
+    let cfg = Config::default();
+    let credential = credential(&mock.url);
+    mock.script("/responses", vec![sse_reply()]);
+    let tool = br#"{"prompt":"\u0061 cat","n":1.0,"output_compression":50.0,"partial_images":2,"size":null}"#;
+    let path = "/v1/images/generations";
+    // The fixture's completion has no image output: the adapter answers 502 after the send.
+    let _ = executor
+        .images(
+            &credential,
+            images_request(path, "gpt-5.4", "application/json", &tool[..]),
+            path,
+            &cfg,
+        )
+        .await;
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    let body = std::str::from_utf8(&sent[0].body).unwrap();
+    assert!(body.contains(r#""output_compression":50.0"#), "{body}");
+    assert!(body.contains(r#""partial_images":2"#), "{body}");
+    assert!(body.contains(r#""text":"a cat""#), "{body}");
+    assert!(!body.contains("size"), "{body}");
+
+    mock.script(
+        "/images/generations",
+        vec![crate::codex_testkit::json(200, r#"{"created":1,"data":[]}"#)],
+    );
+    let direct = br#"{"model":"gpt-image-2","prompt":"x","future":{"n":1e400,"big":123456789012345678901234567890,"s":"\u00e9"}}"#;
+    executor
+        .images(
+            &credential,
+            images_request(path, "gpt-image-2", "application/json", &direct[..]),
+            path,
+            &cfg,
+        )
+        .await
+        .unwrap();
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].path, "/images/generations");
+    assert_eq!(&sent[0].body[..], &direct[..]);
+}
+
+/// A multipart edit's text fields are read as UTF-8 and once: a value that is not UTF-8
+/// is refused rather than replaced, and the tool refuses a repeated field it would read
+/// only once.
+#[tokio::test]
+async fn images_forms_are_read_without_loss() {
+    let mock = Mock::start().await;
+    let executor = executor();
+    let cfg = Config::default();
+    let credential = credential(&mock.url);
+    let path = "/v1/images/edits";
+    let content_type = "multipart/form-data; boundary=B";
+    for (name, model, fields) in [
+        ("invalid UTF-8", "gpt-5.4", vec![("prompt", &b"a \xff"[..])]),
+        (
+            "repeated field",
+            "gpt-5.4",
+            vec![("prompt", &b"a"[..]), ("prompt", &b"b"[..])],
+        ),
+        (
+            "direct invalid UTF-8",
+            "gpt-image-2",
+            vec![("prompt", &b"a"[..]), ("quality", &b"\xc3"[..])],
+        ),
+    ] {
+        let req = images_request(path, model, content_type, form(&fields));
+        let error = executor
+            .images(&credential, req, path, &cfg)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name}: accepted"));
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
+        assert!(
+            String::from_utf8_lossy(&error.body).starts_with("request form field `"),
+            "{name}: {:?}",
+            error.body
+        );
+    }
+    assert!(mock.take().is_empty(), "a refused form reached the upstream");
+}
+
+/// A local token count reads a Responses body through the same boundary as the routes
+/// that would send it.
+#[tokio::test]
+async fn token_counts_read_responses_bodies_through_the_boundary() {
+    let executor = executor();
+    let cfg = Config::default();
+    // Nothing is sent: the base URL is unroutable.
+    let credential = credential("http://127.0.0.1:1");
+    for source in [Format::OpenAIResponse, Format::Codex] {
+        for (name, body, status) in refused() {
+            let mut req = request(source, body, false, None);
+            req.operation = Operation::CountTokens;
+            let error = executor
+                .execute(&credential, req, &cfg)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: counted"));
+            assert_eq!((error.status, error.scope), (status, FailureScope::Request), "{name}");
+        }
+        let mut req = request(source, fixture("http-request-full").bytes(), false, None);
+        req.operation = Operation::CountTokens;
+        let response = executor.execute(&credential, req, &cfg).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers[crate::codex::LOCAL_TOKEN_COUNT], "local-estimate");
+    }
+}

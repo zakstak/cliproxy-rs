@@ -350,3 +350,50 @@ async fn built_ins_follow_codex_key_registration_and_exclusions() {
         );
     }
 }
+
+/// The Codex Images path reads the client's JSON without coercion (#22,
+/// docs/codex/CONTRACT.md "Request boundary"): the handler refuses a `stream` that is not
+/// a boolean before it rewrites `stream`, and the adapter refuses a body that is not
+/// UTF-8 or repeats a key, before any upstream request. Go streams for `"stream":"true"`
+/// and forwards the others. A valid body still reaches the backend.
+#[tokio::test]
+async fn codex_images_json_meets_the_request_boundary() {
+    let auth_dir = AuthDir::new();
+    let (proxy, seen) = proxy(&auth_dir).await;
+    for (path, body) in [
+        (
+            "/v1/images/generations",
+            br#"{"model":"gpt-image-2","prompt":"p","stream":"true"}"#.to_vec(),
+        ),
+        (
+            "/v1/images/edits",
+            br#"{"model":"gpt-image-2","prompt":"p","stream":1}"#.to_vec(),
+        ),
+        (
+            "/v1/images/generations",
+            b"{\"model\":\"gpt-image-2\",\"prompt\":\"\xff\"}".to_vec(),
+        ),
+        (
+            "/v1/images/generations",
+            br#"{"model":"gpt-image-2","prompt":"a","prompt":"b"}"#.to_vec(),
+        ),
+        (
+            "/v1/images/edits",
+            br#"{"model":"gpt-image-2","prompt":"p","images":[{"image_url":"u","image_url":"v"}]}"#.to_vec(),
+        ),
+    ] {
+        let (status, text) = post(format!("{proxy}{path}"), "application/json", body.clone()).await;
+        assert_eq!(status, 400, "{path} {}: {text}", String::from_utf8_lossy(&body));
+    }
+    assert!(seen.lock().unwrap().is_empty(), "nothing went upstream");
+
+    let body = br#"{"model":"gpt-image-2","prompt":"p","stream":false,"future":{"n":1e400}}"#.to_vec();
+    let (status, text) = post(format!("{proxy}/v1/images/generations"), "application/json", body).await;
+    assert_eq!(status, 200, "{text}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].2,
+        r#"{"model":"gpt-image-2","prompt":"p","future":{"n":1e400}}"#
+    );
+}
