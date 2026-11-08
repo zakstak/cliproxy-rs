@@ -4,7 +4,6 @@
 
 use chrono::{DateTime, Utc};
 use cpa_common::gostr::GoStr;
-use cpa_core::config::Config;
 use cpa_core::credential::{Credential, MetadataPatch};
 use cpa_core::exec::{ExecError, FailureScope};
 use cpa_plugin::hostauth::SavedRefresh;
@@ -18,9 +17,6 @@ use crate::Runtime;
 pub(crate) enum Route {
     /// A plugin executor serves it (Go `executorAdapter.Refresh`).
     Executor,
-    /// Go's OpenAI-compatible executor wrapped by `pluginRefreshCompatExecutor`;
-    /// `identifier` is the wrapped executor's provider key.
-    Compat { identifier: String },
 }
 
 /// The plugin refresh route of `c`, or `None` when its executor refreshes it.
@@ -29,57 +25,15 @@ pub(crate) enum Route {
 /// providers outside its built-in executor table (`registerExecutorForAuth`): built-in
 /// providers return `None` here, compat-named ones included (see
 /// docs/DIFFERENCES-FROM-GO.md). For any other provider, a credential a plugin executor
-/// serves takes [`Route::Executor`]; the rest are bound to the OpenAI-compatible
-/// executor, which Go wraps when a plugin auth provider matches the provider, the
-/// `provider_key` or `compat_name` attribute, or the executor's own key
-/// (`wrapOpenAICompatIfPluginAuth`). Go asks Home first when Home is enabled
-/// (`RefreshAuthViaHome`); that is not ported, so Home mode keeps the compat executor's
-/// refresh off.
-pub(crate) fn route(rt: &Runtime, c: &Credential, cfg: &Config) -> Option<Route> {
+/// serves takes [`Route::Executor`]. Go binds the rest to its OpenAI-compatible executor
+/// and wraps it with plugin auth refresh (`wrapOpenAICompatIfPluginAuth`); this fork
+/// removed that executor (issue #49), so they have no refresh route.
+pub(crate) fn route(rt: &Runtime, c: &Credential) -> Option<Route> {
     let provider = c.provider.trim().go_lower();
     if super::BUILTIN.contains(&provider.as_str()) {
         return None;
     }
-    if rt.plugin_runtime().executor(c, cfg).is_some() {
-        return Some(Route::Executor);
-    }
-    // Home mode installs the remote dispatcher; the config may not carry `home.enabled`.
-    let home = rt.remote_dispatch().is_some()
-        || cfg
-            .document
-            .get("home")
-            .and_then(|h| h.get("enabled"))
-            .and_then(serde_yaml_ng::Value::as_bool)
-            .unwrap_or(false);
-    if home {
-        return None;
-    }
-    let attr = |k: &str| c.attributes.get(k).map_or("", |v| v.trim());
-    // Go `openAICompatInfoFromAuth`, else the provider (`registerExecutorForAuth`).
-    let identifier = if !attr("compat_name").is_empty() {
-        let key = if attr("provider_key").is_empty() {
-            attr("compat_name")
-        } else {
-            attr("provider_key")
-        };
-        cpa_core::config::credentials::openai_compat_provider(key)
-    } else if provider == "openai-compatibility" {
-        cpa_core::config::credentials::openai_compat_provider(&c.label)
-    } else if provider.is_empty() {
-        "openai-compatibility".to_owned()
-    } else {
-        provider.clone()
-    };
-    let host = rt.plugins();
-    [
-        provider.as_str(),
-        attr("provider_key"),
-        attr("compat_name"),
-        identifier.as_str(),
-    ]
-    .iter()
-    .any(|key| !key.is_empty() && host.has_auth_provider(key))
-    .then_some(Route::Compat { identifier })
+    rt.plugin_runtime().executor(c).is_some().then_some(Route::Executor)
 }
 
 /// When `c` comes due for a plugin refresh: Go `shouldRefresh` for a provider with no
@@ -88,9 +42,9 @@ pub(crate) fn route(rt: &Runtime, c: &Credential, cfg: &Config) -> Option<Route>
 /// for the credential (Go `LastRefreshedAt`), else the credential's own timestamp;
 /// without either it is due at once. `None` when it never comes due or no plugin
 /// refreshes it.
-pub(crate) fn due_at(rt: &Runtime, c: &Credential, cfg: &Config) -> Option<DateTime<Utc>> {
+pub(crate) fn due_at(rt: &Runtime, c: &Credential) -> Option<DateTime<Utc>> {
     let interval = cpa_exec::preferred_interval(c)?;
-    route(rt, c, cfg)?;
+    route(rt, c)?;
     let schedule = lock(rt.store().refresh_schedules())
         .get(&c.id)
         .copied()
@@ -398,18 +352,6 @@ async fn refresh_once(
         };
         return match route {
             Route::Executor => Ok(unchanged),
-            Route::Compat { identifier } => {
-                let filled = |k: &str| c.str(k).is_some_and(|v| !v.trim().is_empty());
-                if filled("refresh_token") || filled("refreshToken") {
-                    Err(ExecError::local(
-                        500,
-                        FailureScope::Credential,
-                        format!("plugin auth provider refresh is unavailable for provider {identifier}"),
-                    ))
-                } else {
-                    Ok(unchanged)
-                }
-            }
         };
     };
     let (from, to) = (

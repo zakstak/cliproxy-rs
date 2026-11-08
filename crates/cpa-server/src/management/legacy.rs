@@ -139,19 +139,34 @@ const FIELDS: [Field; 15] = [
 ];
 
 /// Go's provider key lists and OAuth maps, by v0 route.
-pub(crate) const LIST_ROUTES: [&str; 11] = [
-    "gemini-api-key",
-    "interactions-api-key",
+pub(crate) const LIST_ROUTES: [&str; 7] = [
     "claude-api-key",
     "codex-api-key",
     "xai-api-key",
     "meta-api-key",
-    "openai-compatibility",
-    "vertex-api-key",
     "oauth-excluded-models",
     "oauth-model-alias",
     "oauth-request-scoped-errors",
 ];
+
+/// Go's v0 key lists of the providers this fork removed (issue #49), with the provider
+/// each configures. Every method answers 410 Gone with migration guidance.
+pub(crate) const REMOVED_LIST_ROUTES: [(&str, &str); 4] = [
+    ("gemini-api-key", "gemini"),
+    ("interactions-api-key", "interactions"),
+    ("openai-compatibility", "openai-compatibility"),
+    ("vertex-api-key", "vertex"),
+];
+
+/// A v0 key list of a removed provider ([`REMOVED_LIST_ROUTES`]).
+pub(crate) async fn removed_list_route(OriginalUri(uri): OriginalUri) -> Response {
+    let route = route_of(&uri);
+    let provider = REMOVED_LIST_ROUTES
+        .iter()
+        .find(|(r, _)| *r == route)
+        .map_or(route, |(_, p)| p);
+    super::oauth::removed(provider, &format!("The {route} list"))
+}
 
 /// v0 `*-auth-url` routes and the provider the v8 handler dispatches them to.
 pub(crate) const AUTH_URL_ROUTES: [(&str, &str); 8] = [

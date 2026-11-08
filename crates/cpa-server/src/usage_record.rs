@@ -788,19 +788,20 @@ pub fn parse_body(format: Format, body: &[u8]) -> Detail {
         // A buffered Responses body is the completed response object: usage and
         // service_tier are top-level, as `ParseOpenAIUsage` reads them.
         Format::OpenAI | Format::OpenAIResponse | Format::Codex => parse_openai(body),
-        Format::Gemini => parse_gemini(body),
-        Format::Antigravity => {
-            let node = first(
-                &gj::parse(body),
-                &["response.usageMetadata", "usageMetadata", "usage_metadata"],
-            );
-            if node.exists() {
-                parse_gemini_node(&node)
-            } else {
-                Detail::default()
-            }
-        }
-        Format::Interactions => parse_interactions(body),
+    }
+}
+
+/// Go `ParseAntigravityUsage`, for plugin executors whose output protocol is
+/// `antigravity` (the built-in Antigravity executor was removed, issue #49).
+fn parse_antigravity_body(body: &[u8]) -> Detail {
+    let node = first(
+        &gj::parse(body),
+        &["response.usageMetadata", "usageMetadata", "usage_metadata"],
+    );
+    if node.exists() {
+        parse_gemini_node(&node)
+    } else {
+        Detail::default()
     }
 }
 
@@ -825,7 +826,7 @@ pub fn parse_plugin_body(protocol: &str, payload: &[u8]) -> Detail {
         }
         "gemini" => parse_gemini(payload),
         "interactions" | "interactions-response" => parse_interactions(payload),
-        "antigravity" => parse_body(Format::Antigravity, payload),
+        "antigravity" => parse_antigravity_body(payload),
         // Go `parseResponsesPluginExecutorUsage`: an event's `response.usage`, else a
         // completed object's top-level usage; a tier alone hides neither.
         "codex" | "openai-response" => {
@@ -966,21 +967,6 @@ impl StreamUsage {
                     return;
                 }
                 if let Some(d) = parse_codex(payload) {
-                    self.observe(d);
-                }
-            }
-            Format::Gemini => {
-                if let Some(d) = parse_gemini_stream(line) {
-                    self.observe(d);
-                }
-            }
-            Format::Antigravity => {
-                if let Some(d) = parse_antigravity_stream(line) {
-                    self.observe(d);
-                }
-            }
-            Format::Interactions => {
-                if let Some(d) = parse_interactions_stream(line) {
                     self.observe(d);
                 }
             }
@@ -1739,7 +1725,7 @@ impl Facts {
 /// Cost: one walk over the body's top-level members (large values are skipped by
 /// bracket matching; nothing is decoded or copied), SHA-256 over the two values, and
 /// one 16-byte string.
-// ponytail: Chat Completions, Antigravity and Interactions bodies get none (their system
+// ponytail: Chat Completions bodies get none (their system
 // prompt is a message or sits in an envelope); add a lookup when a client of theirs
 // needs one.
 pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
@@ -1747,7 +1733,6 @@ pub(crate) fn prompt_prefix(format: Format, body: &[u8]) -> String {
     let system: &[&[u8]] = match format {
         Format::Claude => &[b"system"],
         Format::OpenAIResponse | Format::Codex => &[b"instructions"],
-        Format::Gemini => &[b"systemInstruction", b"system_instruction"],
         _ => return String::new(),
     };
     let (mut tools, mut instructions) = (None, None);

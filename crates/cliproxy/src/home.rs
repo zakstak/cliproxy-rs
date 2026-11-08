@@ -96,11 +96,6 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
         &["routing", "cooldown", "save-cooldown-status"],
         Some(Yaml::Bool(false)),
     );
-    set(
-        &mut doc,
-        &["oauth", "providers", "aistudio", "ws-auth"],
-        Some(Yaml::Bool(false)),
-    );
     set(&mut doc, &["management", "allow-remote"], Some(Yaml::Bool(false)));
     set(
         &mut doc,
@@ -440,16 +435,8 @@ impl Dispatcher {
             );
         }
         let supports = |provider: &str| self.rt.upgrade().is_some_and(|rt| rt.executors.supports(provider));
-        // Go: an unregistered provider with a base URL runs on the generic
-        // OpenAI-compatible executor.
-        if !supports(&credential.provider)
-            && credential
-                .attributes
-                .get("base_url")
-                .is_some_and(|u| !u.trim().is_empty())
-        {
-            credential.provider = "openai-compatibility".into();
-        }
+        // Go runs an unregistered provider with a base URL on its generic
+        // OpenAI-compatible executor, which this fork removed (issue #49).
         if !supports(&credential.provider) {
             end_scope(&scope);
             return Err(reject(502, "executor_not_found", "executor not registered"));
@@ -544,25 +531,11 @@ impl RemoteDispatch for Dispatcher {
     }
 }
 
-/// Go `executorKeyFromAuth`: the provider key executors are registered under.
-fn executor_key(provider: &str, label: &str, attributes: &BTreeMap<String, String>) -> String {
-    let attr = |key: &str| attributes.get(key).map(|v| v.trim()).unwrap_or_default();
-    if !attr("compat_name").is_empty() {
-        let key = if attr("provider_key").is_empty() {
-            attr("compat_name")
-        } else {
-            attr("provider_key")
-        };
-        return cpa_core::config::credentials::openai_compat_provider(key);
-    }
-    if provider.trim().eq_ignore_ascii_case("openai-compatibility") {
-        return cpa_core::config::credentials::openai_compat_provider(label.trim());
-    }
-    match provider.trim().go_lower().as_str() {
-        "kimi.com" => "kimi".into(),
-        "kimi.ai" => "kimi-ai".into(),
-        other => other.to_owned(),
-    }
+/// Go `executorKeyFromAuth`: the provider key executors are registered under, for the
+/// retained providers (its OpenAI-compatible and Kimi branches went with those
+/// providers, issue #49).
+fn executor_key(provider: &str) -> String {
+    provider.trim().go_lower()
 }
 
 /// Go's typed decoding of the dispatched auth's runtime state, on the reply as written:
@@ -638,7 +611,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         .unwrap_or_default();
     let provider = text("provider").go_lower();
     let label = text("label");
-    let key = executor_key(&provider, &label, &attributes);
+    let key = executor_key(&provider);
     if provider.is_empty() || key.is_empty() {
         return Err(reject(502, "invalid_auth", "home returned auth without provider"));
     }

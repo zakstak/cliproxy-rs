@@ -932,16 +932,6 @@ impl Scheduler {
         }
     }
 
-    /// The generation of a lease picked outside selection (the Antigravity credits
-    /// fallback, which runs on credentials selection refused): one that every bounded
-    /// window and probe reservation within 2^30 generations of now, before or after, is
-    /// newer than. Such a lease answers none of them: a cancelled or successful credits
-    /// attempt neither frees another request's probe nor ends a window, which stays with
-    /// its own probe.
-    pub fn outside_selection_generation(&self) -> u32 {
-        self.generation.wrapping_sub(1 << 30)
-    }
-
     /// Reserves the probe of `c` for `model` when its pick ends a bounded window: until
     /// the probe's result is recorded (or [`PROBE_HOLD`] passes), the window's keys keep
     /// cooling, so concurrent requests do not each go upstream. Returns the generation

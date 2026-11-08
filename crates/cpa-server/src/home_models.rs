@@ -277,37 +277,6 @@ pub(crate) fn grok(entries: &[Entry]) -> String {
     serde_json::to_string(&json!({ "object": "list", "data": data })).unwrap_or_default()
 }
 
-/// Go `formatHomeGeminiModel`.
-pub(crate) fn gemini(entry: &Entry) -> Value {
-    let name = if entry.id.starts_with("models/") {
-        entry.id.clone()
-    } else {
-        format!("models/{}", entry.id)
-    };
-    let display = if entry.display_name.is_empty() {
-        entry.id.clone()
-    } else {
-        entry.display_name.clone()
-    };
-    json!({
-        "name": name,
-        "displayName": display,
-        "description": display,
-        "supportedGenerationMethods": ["generateContent"],
-    })
-}
-
-/// Go `homeGeminiModelMatches`.
-pub(crate) fn gemini_matches(entry: &Entry, action: &str) -> bool {
-    let id = entry.id.trim();
-    if id.is_empty() || action.is_empty() {
-        return false;
-    }
-    action == id
-        || action == format!("models/{id}")
-        || action.trim_start_matches("models/") == id.trim_start_matches("models/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,7 +22,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::json::{self as gj, Kind};
 use cpa_core::exec::{Caller, ExecError, Operation};
 use cpa_core::format::Format;
-use cpa_exec::openai_compat_multipart::{self as multipart, Form, MediaType};
+use cpa_exec::multipart::{self as multipart, Form, MediaType};
 
 use crate::claude::read_failed;
 use crate::dispatch::{self, Call, Done, Failure, Media, MediaKind, SseError};

@@ -1,5 +1,6 @@
 //! Model catalog updaters (Go internal/registry/catalog_sources.go): one updater each
-//! for models.json, the Codex client catalog and the Devin catalog. Each reads its
+//! for models.json and the Codex client catalog (Go's Devin catalog updater went with
+//! the Devin provider, issue #49). Each reads its
 //! effective source ([`effective_sources`]) now and every three hours, validates what it
 //! read, and publishes it only while that source is still the configured one. A failed
 //! read or an invalid catalog keeps the last valid one. A config reload that changes a
@@ -12,10 +13,9 @@
 //! rules (environment proxy, Go's redirects) and are bounded to 30 seconds; Go sets no
 //! timeout.
 //!
-//! The empty source of the Codex client and Devin catalogs starts lazily outside Home
-//! mode: with the first Codex or Devin credential, or (Codex) the first request from a
-//! Codex client that needs the catalog. Go starts them at launch. The Antigravity client
-//! version updater likewise starts with the first Antigravity credential.
+//! The empty source of the Codex client catalog starts lazily outside Home mode: with the
+//! first Codex credential or the first request from a Codex client that needs the
+//! catalog. Go starts it at launch.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -36,11 +36,6 @@ pub const MODELS_URLS: [&str; 2] = [
 const CODEX_URLS: [&str; 2] = [
     "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json",
     "https://models.router-for.me/codex_client_models.json",
-];
-/// Go `devinModelsURLs`.
-const DEVIN_URLS: [&str; 2] = [
-    "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/devin_models.json",
-    "https://models.router-for.me/devin_models.json",
 ];
 
 /// Go `ModelsRefreshInterval`.
@@ -296,8 +291,8 @@ fn publish_general(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The process-wide updaters: models.json, the Codex client catalog, the Devin catalog.
-static CATALOGS: LazyLock<[Arc<Updater>; 3]> = LazyLock::new(|| {
+/// The process-wide updaters: models.json and the Codex client catalog.
+static CATALOGS: LazyLock<[Arc<Updater>; 2]> = LazyLock::new(|| {
     [
         Updater::new(general_fetcher(owned(&MODELS_URLS)), Box::new(publish_general)),
         Updater::new(
@@ -308,25 +303,17 @@ static CATALOGS: LazyLock<[Arc<Updater>; 3]> = LazyLock::new(|| {
             ),
             Box::new(|data| cpa_common::codex_catalog::load(data).map(drop)),
         ),
-        Updater::new(
-            fetcher(cpa_core::registry::devin::EMBEDDED, owned(&DEVIN_URLS), |data| {
-                cpa_core::registry::devin::validate(data).map(drop)
-            }),
-            Box::new(|data| cpa_core::registry::devin::global().load(data, "catalog").map(drop)),
-        ),
     ]
 });
 
-/// Go `effectiveCatalogSources` over `[catalog, codex-catalog, devin-catalog]`: an
-/// empty source is `embed` under `--local-model`, and Home mode disables models.json and
-/// the Devin catalog whatever their source.
-pub(crate) fn effective_sources(sources: &[String; 3], local: bool, home: bool) -> [String; 3] {
+/// Go `effectiveCatalogSources` over `[catalog, codex-catalog]`: an empty source is
+/// `embed` under `--local-model`, and Home mode disables models.json whatever its source.
+pub(crate) fn effective_sources(sources: &[String; 2], local: bool, home: bool) -> [String; 2] {
     let mut effective = sources
         .clone()
         .map(|s| if s.is_empty() && local { EMBED.to_owned() } else { s });
     if home {
         effective[0] = DISABLED.to_owned();
-        effective[2] = DISABLED.to_owned();
     }
     effective
 }
@@ -340,8 +327,8 @@ struct Policy {
 }
 
 /// Go `configureCatalogs` for sources the config load already validated. At startup the
-/// empty Codex and Devin sources wait outside Home mode.
-fn configure(updaters: &[Arc<Updater>; 3], lifetime: &Lifetime, sources: &[String; 3], policy: Policy, startup: bool) {
+/// empty Codex source waits outside Home mode.
+fn configure(updaters: &[Arc<Updater>; 2], lifetime: &Lifetime, sources: &[String; 2], policy: Policy, startup: bool) {
     // Go `UpdateModelCatalogSources`: nothing after shutdown.
     if lifetime.token.is_cancelled() {
         return;
@@ -385,10 +372,10 @@ impl Session {
     }
 }
 
-/// Go `startModelCatalogUpdaters` and `misc.StartAntigravityVersionUpdater`, for the
-/// lifetime of `rt`: configures the catalogs from the current config, and every later
-/// config commit configures them again ([`Runtime::publish_config_and_policy`]). Call
-/// once per runtime. Cost while no Codex, Devin or Antigravity credential exists: one
+/// Go `startModelCatalogUpdaters`, for the lifetime of `rt`: configures the catalogs
+/// from the current config, and every later config commit configures them again
+/// ([`Runtime::publish_config_and_policy`]). Call once per runtime. Cost while no Codex
+/// credential exists: one
 /// parked task that looks at the credentials' providers after each change to the set.
 /// In Home mode the local store stays empty, so every updater starts at once, as in Go.
 pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
@@ -404,19 +391,14 @@ pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
     });
     if home_enabled {
         tracing::info!(
-            "Home mode: models.json and Devin catalog updates disabled; Codex client model list follows Home model IDs"
+            "Home mode: models.json updates disabled; Codex client model list follows Home model IDs"
         );
     }
     if deny_default {
         return;
     }
     // Updaters that serve one provider, each started by that provider's first credential.
-    let mut wanted: Vec<(&'static str, fn())> = vec![
-        ("codex", || CATALOGS[1].wake()),
-        (cpa_exec::devin::PROVIDER, || CATALOGS[2].wake()),
-        // The client version Antigravity requests carry; Go refreshes it whatever the plan.
-        (cpa_exec::antigravity::PROVIDER, cpa_exec::antigravity_version::start),
-    ];
+    let mut wanted: Vec<(&'static str, fn())> = vec![("codex", || CATALOGS[1].wake())];
     if home_enabled {
         for (_, start) in wanted {
             start();

@@ -107,8 +107,6 @@ impl Runtime {
         let mut policy = crate::management::policy(&config);
         policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
         let cooldown_dir = cooldown_dir(&config, &policy);
-        let (enabled, strict) = signature_cache_config(&config);
-        cpa_translate::set_antigravity_signature_cache_config(enabled, strict);
         let rt = Self {
             config: RwLock::new(Arc::new(config)),
             store: CredentialStore::new(credentials),
@@ -233,33 +231,24 @@ impl Runtime {
             return false;
         }
         policy.compat_disable_cooling = crate::scheduler::compat_cooling(&config);
-        let (enabled, strict) = signature_cache_config(&config);
-        cpa_translate::set_antigravity_signature_cache_config(enabled, strict);
         let dir = cooldown_dir(&config, &policy);
-        let ws_auth = crate::relay::ws_auth(&config);
         let config = Arc::new(config);
         // Commits are serialized, so the catalogs are configured in commit order; the
         // config lock itself is released first, as Go releases cfgMu before
         // `UpdateModelCatalogSources`, so readers never wait on a catalog publish.
         let commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
-        let previous = {
+        {
             // The plugin worker is told under the same lock, so concurrent publishes
             // reach it in the order they replaced the config.
             let mut current = self.config.write().unwrap_or_else(PoisonError::into_inner);
-            let previous = std::mem::replace(&mut *current, config.clone());
+            *current = config.clone();
             self.plugins.config_published(config.clone());
-            previous
-        };
+        }
         // Go `UpdateModelCatalogSources`; the reads stay async.
         if let Some(catalogs) = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             catalogs.configure(&config, false);
         }
         drop(commit);
-        // Go's websocket auth change handler: turning ws-auth on ends the relay sessions
-        // that connected without a key.
-        if ws_auth && !crate::relay::ws_auth(&previous) {
-            self.executors.google.aistudio.relay.stop();
-        }
         self.publish_policy(policy);
         self.store.configure_cooldown_store(dir);
         self.config_changed.send_replace(());
@@ -349,8 +338,6 @@ impl Runtime {
         }
         let snapshot = self.store.snapshot();
         let registry = Arc::new(Registry::build(&config, &snapshot));
-        let credentials: Vec<_> = snapshot.iter().map(|c| self.for_executor(c)).collect();
-        self.executors.models_registered(&credentials, &config);
         *cache = Some((config, generation, registry.clone()));
         registry
     }
@@ -418,41 +405,6 @@ impl Runtime {
             }
         }
         Ok(lease)
-    }
-
-    /// A lease on credential `id` outside selection, prepared like [`Self::acquire`]
-    /// (Go's credits fallback, `findAllAntigravityCreditsCandidateAuths` then
-    /// `prepareRequestAuth`). `None` when the credential is gone or preparation fails;
-    /// Go records no result for either.
-    pub(crate) async fn lease_credential(
-        &self,
-        id: &str,
-        selection: Selection,
-        cfg: &Config,
-        prepare: impl FnOnce(&Credential) -> Credential,
-    ) -> Option<Lease> {
-        let mut credential = self.store.get(id).filter(|c| !self.store.tokens_rejected(c))?;
-        if self.executors.readiness(&credential, cfg) == Readiness::PrepareNow {
-            credential = self.prepare_credential(id, cfg, None).await.ok()?;
-        }
-        // Outside selection: the lease answers no bounded window or probe reservation.
-        let (picked, seq) = {
-            let mut scheduler = self.store.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            (scheduler.outside_selection_generation(), scheduler.dispatch())
-        };
-        Some(Lease {
-            store: self.store.clone(),
-            credential: Arc::new(prepare(&credential)),
-            execution_model: selection.model.clone(),
-            selection,
-            attempt: self.store.attempts.fetch_add(1, Ordering::Relaxed),
-            policy: self.policy(),
-            reported: false,
-            picked,
-            seq,
-            remote: None,
-            lcp: None,
-        })
     }
 
     /// The installed remote dispatcher (Go Home mode), if any.
@@ -594,7 +546,7 @@ impl Runtime {
         }
         let refused = refused.map(|c| Arc::new(c.clone()));
         let view = self.for_executor(&current);
-        let plugin = crate::plugins::refresh::route(self, &current, cfg);
+        let plugin = crate::plugins::refresh::route(self, &current);
         // Go `CodexExecutor.Refresh` on a Codex credential file: one transaction, under
         // the file's credential lock, owned apart from the caller. A plugin-virtual one
         // refreshes in memory and leaves the plugin's file alone (DIFFERENCES-FROM-GO.md).
@@ -680,13 +632,13 @@ impl Runtime {
     /// read their executor alone.
     fn readiness(&self, c: &Credential, cfg: &Config) -> Readiness {
         match self.executors.readiness(c, cfg) {
-            Readiness::Ready if self.plugin_refresh_due(c, cfg, chrono::Utc::now()) => Readiness::RefreshSoon,
+            Readiness::Ready if self.plugin_refresh_due(c, chrono::Utc::now()) => Readiness::RefreshSoon,
             readiness => readiness,
         }
     }
 
-    fn plugin_refresh_due(&self, c: &Credential, cfg: &Config, now: chrono::DateTime<chrono::Utc>) -> bool {
-        crate::plugins::refresh::due_at(self, c, cfg).is_some_and(|at| at <= now)
+    fn plugin_refresh_due(&self, c: &Credential, now: chrono::DateTime<chrono::Utc>) -> bool {
+        crate::plugins::refresh::due_at(self, c).is_some_and(|at| at <= now)
     }
 
     /// Go `tryRefreshAfterUnauthorized`: after an upstream 401 on a credential whose
@@ -847,7 +799,7 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                     // Go refreshes a disabled credential; here its due refresh waits until
                     // it is enabled, logged once per revision, when it comes due.
                     if c.disabled && refreshable(c) && !state.disabled_noted(c) {
-                        let plugin_due = crate::plugins::refresh::due_at(&rt, c, &cfg);
+                        let plugin_due = crate::plugins::refresh::due_at(&rt, c);
                         if rt.executors.needs_prepare_at(c, &cfg, eventually) || plugin_due.is_some() {
                             soonest(now + HORIZON);
                         }
@@ -897,7 +849,7 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                     }
                     continue;
                 }
-                let plugin_due = crate::plugins::refresh::due_at(&rt, c, &cfg);
+                let plugin_due = crate::plugins::refresh::due_at(&rt, c);
                 if rt.executors.needs_prepare_at(c, &cfg, eventually) || plugin_due.is_some() {
                     soonest(now + HORIZON);
                 }
@@ -1040,7 +992,7 @@ async fn run_refresh_job(
     };
     // A plugin refresh keeps its own deadlines (Go `NextRefreshAfter`,
     // `crate::plugins::refresh`): release the reservation only.
-    let plugin = !panicked && crate::plugins::refresh::route(&rt, &current, &cfg).is_some();
+    let plugin = !panicked && crate::plugins::refresh::route(&rt, &current).is_some();
     let ineffective = !plugin && result.is_ok() && rt.readiness(&current, &cfg) != Readiness::Ready;
     let now = Instant::now();
     let retry = reservation.end(|state| {
@@ -1050,7 +1002,7 @@ async fn run_refresh_job(
     match &result {
         Err(error) => {
             let next = if plugin {
-                crate::plugins::refresh::due_at(&rt, &current, &cfg)
+                crate::plugins::refresh::due_at(&rt, &current)
                     .map(|at| (at - chrono::Utc::now()).to_std().unwrap_or_default())
             } else {
                 retry.map(|at| at.saturating_duration_since(now))
@@ -4026,26 +3978,6 @@ impl Stream for Completing {
     }
 }
 
-/// Go `configuredSignatureCacheEnabled` / `configuredSignatureBypassStrict`
-/// (internal/api/server_reload.go): `oauth.providers.antigravity.signature-cache-enabled`
-/// (default true) and `.signature-bypass-strict` (default false), legacy
-/// `antigravity-signature-*` spellings included. Applied on every publish, as Go
-/// applies them at startup and on each reload.
-fn signature_cache_config(cfg: &Config) -> (bool, bool) {
-    let flag = |key: &str| {
-        cfg.document
-            .get("oauth")
-            .and_then(|o| o.get("providers"))
-            .and_then(|p| p.get("antigravity"))
-            .and_then(|a| a.get(key))
-            .and_then(serde_yaml_ng::Value::as_bool)
-    };
-    (
-        flag("signature-cache-enabled").unwrap_or(true),
-        flag("signature-bypass-strict").unwrap_or(false),
-    )
-}
-
 /// Credentials the background refresh considers: enabled auth files, never API-key
 /// kinds (Go `nextRefreshCheckAt` skips `AuthKind() == apikey` for every provider).
 /// The access token requests send (Go `authAccessToken`): a Sign in with ChatGPT
@@ -4216,24 +4148,6 @@ pub(crate) mod tests {
             assert!(!refresh_candidate(&c));
         }
         assert!(kinds.contains("apikey") && kinds.contains("oauth"), "{kinds:?}");
-    }
-
-    #[test]
-    fn signature_cache_config_reads_v8_and_legacy_keys() {
-        let at = |yaml: &str| signature_cache_config(&Config::parse(yaml).unwrap());
-        assert_eq!(at("{}\n"), (true, false));
-        assert_eq!(
-            at("antigravity-signature-cache-enabled: false\nantigravity-signature-bypass-strict: true\n"),
-            (false, true)
-        );
-        assert_eq!(
-            at("oauth: {providers: {antigravity: {signature-cache-enabled: false, signature-bypass-strict: true}}}\n"),
-            (false, true)
-        );
-        assert_eq!(
-            at("oauth: {providers: {antigravity: {signature-cache-enabled: null}}}\n"),
-            (true, false)
-        );
     }
 
     fn cred(id: &str, provider: &str, disabled: bool) -> Credential {
@@ -7847,7 +7761,7 @@ pub(crate) mod tests {
         rt.store.end_bootstrap();
         let c = rt.store.get("p.json").unwrap();
         assert!(
-            crate::plugins::refresh::route(&rt, &c, &rt.config()).is_some(),
+            crate::plugins::refresh::route(&rt, &c).is_some(),
             "plugin-routed"
         );
         tests::arm_panic("prepare", "p.json");
@@ -7872,7 +7786,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .retry_at(&c)
                     .map(|at| at.saturating_duration_since(Instant::now())),
-                crate::plugins::refresh::due_at(&rt, &c, &rt.config()),
+                crate::plugins::refresh::due_at(&rt, &c),
                 rt.store.refresh_schedules().lock().unwrap().get("p.json").copied()
             );
         }

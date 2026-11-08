@@ -1163,26 +1163,6 @@ fn request_to_format(
     media: Option<crate::dispatch::MediaKind>,
 ) -> String {
     let format = |f: Format| f.as_str().to_owned();
-    match provider {
-        "gemini-interactions"
-            if matches!(
-                req.source_format,
-                Format::Interactions | Format::OpenAI | Format::OpenAIResponse | Format::Claude | Format::Gemini
-            ) =>
-        {
-            return format(Format::Interactions);
-        }
-        "gemini" | "gemini-interactions" => return format(Format::Gemini),
-        "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com" => {
-            return match req.source_format {
-                Format::Claude => format(Format::Claude),
-                Format::OpenAIResponse => format(Format::OpenAIResponse),
-                _ => format(Format::OpenAI),
-            };
-        }
-        "devin" => return format(Format::Interactions),
-        _ => {}
-    }
     if media.is_some() {
         return source.to_owned();
     }
@@ -1192,8 +1172,6 @@ fn request_to_format(
     match provider {
         "codex" | "xai" | "meta" => format(Format::Codex),
         "claude" => format(Format::Claude),
-        "vertex" | "aistudio" => format(Format::Gemini),
-        "antigravity" => format(Format::Antigravity),
         _ => format(Format::OpenAI),
     }
 }

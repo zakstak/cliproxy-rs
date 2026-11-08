@@ -509,10 +509,10 @@ impl PartialEq for Derived {
 impl Eq for Derived {}
 
 impl Config {
-    /// `models.catalog`, `models.codex-catalog` and `models.devin-catalog` (Go
-    /// `CatalogSources`); empty when unset.
-    pub fn catalog_sources(&self) -> [String; 3] {
-        ["catalog", "codex-catalog", "devin-catalog"].map(|name| {
+    /// `models.catalog` and `models.codex-catalog` (Go `CatalogSources` without the
+    /// removed Devin catalog); empty when unset.
+    pub fn catalog_sources(&self) -> [String; 2] {
+        ["catalog", "codex-catalog"].map(|name| {
             self.document
                 .get("models")
                 .and_then(|models| models.get(name))

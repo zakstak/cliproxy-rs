@@ -50,8 +50,7 @@ pub fn response(rt: &Runtime, client_version: &str) -> Response {
         let providers = registry.providers(model);
         !providers.is_empty()
             && providers.iter().all(|p| {
-                rt.executors.supports(p)
-                    && (APPLY_PATCH_PROVIDERS.contains(&p.as_str()) || cpa_exec::openai_compat::handles(p))
+                rt.executors.supports(p) && APPLY_PATCH_PROVIDERS.contains(&p.as_str())
             })
     };
     let capability: Option<&dyn Fn(&str) -> bool> = if flag(&cfg, &["client", "codex", "enable-apply-patch"]) {

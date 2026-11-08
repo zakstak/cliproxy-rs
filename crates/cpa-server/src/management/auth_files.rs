@@ -129,8 +129,6 @@ fn quota_observation(state: &Management, c: &Credential) -> Value {
     let snapshot = match c.provider.trim().go_lower().as_str() {
         "codex" => state.rt.executors.codex.quota().snapshot(&c.id),
         "claude" => state.rt.executors.claude.quota().snapshot(&c.id),
-        // Devin's credential snapshot comes from its status refresh.
-        cpa_exec::devin::PROVIDER => state.rt.executors.devices.devin.quota(&c.id),
         _ => None,
     };
     match snapshot {

@@ -767,6 +767,16 @@ pub fn router(state: Arc<Management>) -> Router {
                 .delete(guarded!(s, legacy::list_route)),
         );
     }
+    for (path, _) in legacy::REMOVED_LIST_ROUTES {
+        router = router.route(
+            &format!("{v0}/{path}"),
+            methods()
+                .get(guarded!(s, legacy::removed_list_route))
+                .put(guarded!(s, legacy::removed_list_route))
+                .patch(guarded!(s, legacy::removed_list_route))
+                .delete(guarded!(s, legacy::removed_list_route)),
+        );
+    }
     for (path, _) in legacy::AUTH_URL_ROUTES {
         router = router.route(&format!("{v0}/{path}"), methods().get(guarded!(s, legacy::auth_url)));
     }

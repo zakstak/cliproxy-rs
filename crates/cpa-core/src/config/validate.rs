@@ -58,7 +58,7 @@ pub(super) fn codex_compat(cfg: &super::Config) -> Result<()> {
 /// with a host. Go walks a map, so with several invalid sources it names any one of
 /// them; this names the first in field order.
 pub fn catalog_sources(section: Option<&Value>) -> Result<()> {
-    for name in ["catalog", "codex-catalog", "devin-catalog"] {
+    for name in ["catalog", "codex-catalog"] {
         let source = text(section, name, "");
         if source.is_empty() || go_is_abs(&source) {
             continue;
