@@ -1135,7 +1135,36 @@ async fn direct_images_send_the_configured_upstream_model() {
 async fn images_match_go_on_every_fixture_case() {
     use base64::Engine;
     let executor = executor();
-    for case in GO["images"].as_array().unwrap() {
+    let mut cases = GO["images"].as_array().unwrap().clone();
+    // `tool_edit_multipart_stream` sends `partial_images=nope`, which the tool path now
+    // refuses (#22; Go drops it), so the recorded case asserts that refusal below. Its
+    // copy with `partial_images=2` keeps the case's other assertions: the upstream request
+    // (Go's, with the tool's `"partial_images":2` that Go sends for that text) and the
+    // partial-image and completed frames of the same recorded reply. The fixture is
+    // unchanged; only this copy is edited.
+    let recorded = cases
+        .iter()
+        .find(|c| c["name"] == "tool_edit_multipart_stream")
+        .expect("the recorded multipart stream case");
+    let mut valid = recorded.clone();
+    valid["name"] = "tool_edit_multipart_stream_partial_images_2".into();
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(recorded["payload_b64"].as_str().unwrap())
+        .unwrap();
+    let nope: &[u8] = b"name=\"partial_images\"\r\n\r\nnope\r\n";
+    let at = payload
+        .windows(nope.len())
+        .position(|w| w == nope)
+        .expect("the recorded partial_images field");
+    let mut fixed = payload[..at].to_vec();
+    fixed.extend_from_slice(b"name=\"partial_images\"\r\n\r\n2\r\n");
+    fixed.extend_from_slice(&payload[at + nope.len()..]);
+    valid["payload_b64"] = base64::engine::general_purpose::STANDARD.encode(fixed).into();
+    let mut go_body: Value = serde_json::from_str(recorded["upstream"]["body"].as_str().unwrap()).unwrap();
+    go_body["tools"][0]["partial_images"] = 2.into();
+    valid["upstream"]["body"] = go_body.to_string().into();
+    cases.push(valid);
+    for case in &cases {
         let name = case["name"].as_str().unwrap();
         let mock = Mock::start().await;
         let path = case["upstream"]["path"].as_str().unwrap_or("/responses");
@@ -1189,6 +1218,19 @@ async fn images_match_go_on_every_fixture_case() {
             // (and the edit's file-ID image too).
             let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
             assert_eq!(error.status, 400, "{name}");
+            assert!(captured.is_empty(), "{name}: nothing is sent");
+            continue;
+        }
+        if name == "tool_edit_multipart_stream" {
+            // A present count that is not an integer is refused before the send (#22,
+            // docs/DIFFERENCES-FROM-GO.md); Go omits it, so the provider default applies.
+            // The `partial_images=2` copy above keeps this case's stream coverage.
+            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
+            assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
+            assert_eq!(
+                String::from_utf8_lossy(&error.body),
+                "request form field `partial_images` must be an integer"
+            );
             assert!(captured.is_empty(), "{name}: nothing is sent");
             continue;
         }

@@ -508,6 +508,9 @@ fn direct_edit_form(
 // ponytail: Go ranges over its form map, so field order varies per run; this keeps the
 // order fields arrived in, one of Go's orders.
 fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, ExecError> {
+    // The routed `model` and `stream` replace the form's, but the form's are still read
+    // under the Codex rules first rather than skipped (#22).
+    form_routing(form)?;
     let mut out = set_str("{}", "model", model);
     if stream {
         out = set_raw(&out, "stream", "true");
@@ -557,6 +560,11 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, E
 /// `codexOpenAIImageEditFormJSONValue`: integers for the count fields, strings otherwise.
 /// A value that is not UTF-8 is refused rather than replaced, and the count fields are
 /// matched by their exact names; Go lowercases the field name with Unicode rules (#22).
+/// This is the direct profile's form-to-JSON rule: a count whose text is a decimal
+/// `i64` becomes that JSON integer, and any other count text (`nope`, `1.5`, an
+/// overflowing integer) stays a JSON string, so the Images endpoint judges the value the
+/// client sent. The tool path refuses such a count instead ([`edit_multipart`]): it has
+/// no endpoint of the client's to judge it, and omitting it would mean the default.
 fn form_json_value(key: &str, value: &[u8]) -> Result<String, ExecError> {
     let text = form_utf8(key, value)?.trim();
     if matches!(key.trim(), "n" | "output_compression" | "partial_images")
@@ -567,18 +575,137 @@ fn form_json_value(key: &str, value: &[u8]) -> Result<String, ExecError> {
     Ok(String::from_utf8_lossy(&cpa_common::json::quote(text)).into_owned())
 }
 
+/// A request error about multipart text field `key`. It names the field, never its value.
+fn form_error(key: &str, problem: std::fmt::Arguments<'_>) -> ExecError {
+    ExecError::local(
+        400,
+        cpa_core::exec::FailureScope::Request,
+        format!("request form field `{key}` {problem}"),
+    )
+}
+
 /// A multipart text field's value as UTF-8, or a request error that names the field.
 fn form_utf8<'a>(key: &str, value: &'a [u8]) -> Result<&'a str, ExecError> {
-    std::str::from_utf8(value).map_err(|e| {
-        ExecError::local(
-            400,
-            cpa_core::exec::FailureScope::Request,
-            format!(
-                "request form field `{key}` is not valid UTF-8 at byte {}",
-                e.valid_up_to()
-            ),
-        )
-    })
+    std::str::from_utf8(value)
+        .map_err(|e| form_error(key, format_args!("is not valid UTF-8 at byte {}", e.valid_up_to())))
+}
+
+/// The one value of text field `key` as UTF-8, `None` when the form lacks it. A field
+/// read for one meaning must not repeat.
+fn single_text<'a>(form: &'a Form, key: &str) -> Result<Option<&'a str>, ExecError> {
+    let Some((_, values)) = form.values.iter().find(|(k, _)| k == key) else {
+        return Ok(None);
+    };
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => form_utf8(key, value).map(Some),
+        _ => Err(form_error(key, format_args!("is repeated"))),
+    }
+}
+
+/// The routing fields of a Codex multipart edit, which decide where the request goes and
+/// whether it streams: `model` and `stream` appear at most once, as UTF-8, and `stream`
+/// is a boolean. Returns the client's `stream`.
+///
+/// Form text carries no JSON type, so `stream` takes the spellings Go's `parseBoolField`
+/// reads: `true`, `1`, `yes`, `on`, and `false`, `0`, `no`, `off`. They are protocol
+/// tokens, matched with ASCII white space trimmed and ASCII case ignored. An empty value
+/// is false, as an unset form field is. Any other value is refused; Go reads it as false.
+///
+/// The shared Images handler applies this to the client's form before it rebuilds the
+/// form without these fields (`cpa_server::images`), and both adapter paths apply it to
+/// the form they receive (#22).
+pub fn form_routing(form: &Form) -> Result<bool, ExecError> {
+    single_text(form, "model")?;
+    let Some(text) = single_text(form, "stream")? else {
+        return Ok(false);
+    };
+    let token = text.trim_ascii();
+    let spelled = |words: &[&str]| words.iter().any(|w| token.eq_ignore_ascii_case(w));
+    if spelled(&["true", "1", "yes", "on"]) {
+        Ok(true)
+    } else if spelled(&["", "false", "0", "no", "off"]) {
+        Ok(false)
+    } else {
+        Err(form_error("stream", format_args!("must be a boolean")))
+    }
+}
+
+/// The Codex adapter's rules for a client's Images JSON ([`ImagesJson::parse`]). The
+/// shared Images handler applies them to the client's original bytes before it edits
+/// `model` and `stream`, so that its edits cannot erase a fault the adapter would refuse,
+/// such as a repeated `stream` (#22).
+pub fn check_json(raw: &[u8]) -> Result<(), ExecError> {
+    ImagesJson::parse(raw).map(|_| ())
+}
+
+/// Whether `text`, a number in JSON spelling, is exactly one. The decimal digits are
+/// compared, never a float: `1`, `1.0`, `1e0`, `10e-1` and `0.1e1` are one, and
+/// `1.0000000000000001`, which a float rounds to one, is not. Text that is not a JSON
+/// number is not one. One pass over the spelling.
+fn decimal_is_one(text: &str) -> bool {
+    let b = text.as_bytes();
+    let digits_from = |mut i: usize| {
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        i
+    };
+    // A negative number is never one; `-0` is zero.
+    let int_end = digits_from(0);
+    let int = &b[..int_end];
+    if int.is_empty() || (int.len() > 1 && int[0] == b'0') {
+        return false;
+    }
+    let mut i = int_end;
+    let mut frac: &[u8] = &[];
+    if b.get(i) == Some(&b'.') {
+        let end = digits_from(i + 1);
+        frac = &b[i + 1..end];
+        if frac.is_empty() {
+            return false;
+        }
+        i = end;
+    }
+    let mut exponent: i128 = 0;
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        let negative = b.get(i) == Some(&b'-');
+        if matches!(b.get(i), Some(b'-' | b'+')) {
+            i += 1;
+        }
+        let end = digits_from(i);
+        // An exponent beyond `i64` cannot bring a body-sized mantissa back to one.
+        let Ok(e) = text[i..end].parse::<i64>() else {
+            return false;
+        };
+        exponent = if negative { -i128::from(e) } else { i128::from(e) };
+        i = end;
+    }
+    if i != b.len() {
+        return false;
+    }
+    // The value is the digit string times 10^(exponent - frac.len()). It is one when
+    // exactly one digit is not zero, that digit is 1, and its place cancels the exponent.
+    let mut one_at = None;
+    for (at, &digit) in int.iter().chain(frac).enumerate() {
+        match (digit, one_at) {
+            (b'0', _) => {}
+            (b'1', None) => one_at = Some(at),
+            _ => return false,
+        }
+    }
+    let Some(at) = one_at else {
+        return false;
+    };
+    let (Ok(len), Ok(at), Ok(frac_len)) = (
+        i128::try_from(int.len() + frac.len()),
+        i128::try_from(at),
+        i128::try_from(frac.len()),
+    ) else {
+        return false;
+    };
+    len - 1 - at + exponent - frac_len == 0
 }
 
 /// `strconv.ParseInt(s, 10, 64)`.
@@ -763,11 +890,15 @@ fn unexpressible(field: &str) -> ExecError {
     )
 }
 
-/// Checks each `(field, number)` of a request: a [`TOOL_FIELDS`] or `extra` field, or `n`
-/// of 1; anything else is refused.
-fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, extra: &[&str]) -> Result<(), ExecError> {
-    for (field, number) in fields {
-        let one = field == "n" && number.is_none_or(|n| n == 1.0);
+/// Checks each field of a request: a [`TOOL_FIELDS`] or `extra` field, or `n` when the
+/// request's `n` is one image; anything else is refused.
+fn check_fields<'a>(
+    fields: impl IntoIterator<Item = &'a str>,
+    n_is_one: bool,
+    extra: &[&str],
+) -> Result<(), ExecError> {
+    for field in fields {
+        let one = field == "n" && n_is_one;
         if !(TOOL_FIELDS.contains(&field) || extra.contains(&field) || one) {
             return Err(unexpressible(field));
         }
@@ -776,15 +907,9 @@ fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, ex
 }
 
 fn expressible(json: &ImagesJson<'_>, extra: &[&str]) -> Result<(), ExecError> {
-    // `n` is a number, compared by value: `1`, `1.0` and `1e0` are one image.
-    let n = json.number("n")?.map(|raw| raw.parse::<f64>().unwrap_or(f64::NAN));
-    check_fields(
-        json.0
-            .members()
-            .iter()
-            .map(|m| (&*m.key, if m.key == "n" { n } else { None })),
-        extra,
-    )
+    // `n` is a number, compared with one exactly ([`decimal_is_one`]).
+    let n_is_one = json.number("n")?.is_none_or(decimal_is_one);
+    check_fields(json.0.members().iter().map(|m| &*m.key), n_is_one, extra)
 }
 
 /// An image the tool request carries: a URL (a data URL included) or an uploaded file.
@@ -900,14 +1025,19 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
             form_utf8(key, value)?;
         }
     }
+    // `stream` is read as the handler reads it, though `req.stream` decides the mode.
+    form_routing(&form)?;
     let value = |key: &str| form.value(key).trim().to_owned();
     // The same field policy as JSON (#27): form values the tool expresses, and image and
-    // mask files; anything else is refused.
+    // mask files; anything else is refused. `n` is compared with one as its JSON
+    // spelling, after an optional `+` that form text may carry.
+    let n_is_one = single_text(&form, "n")?.is_none_or(|n| {
+        let n = n.trim();
+        decimal_is_one(n.strip_prefix('+').unwrap_or(n))
+    });
     check_fields(
-        form.values.iter().map(|(key, _)| {
-            let number = (key == "n").then(|| value("n").parse::<f64>().unwrap_or(f64::NAN));
-            (key.as_str(), number)
-        }),
+        form.values.iter().map(|(key, _)| key.as_str()),
+        n_is_one,
         &["input_fidelity"],
     )?;
     if let Some((file, _)) = form
@@ -939,8 +1069,12 @@ fn edit_multipart(body: &[u8], route_model: &str, content_type: &str) -> Result<
             tool = set_str(&tool, field, &v);
         }
     }
+    // A present count is a decimal `i64` (an optional sign, digits) or it is refused: the
+    // tool request has no other spelling for it, and leaving it out would ask for the
+    // provider's default instead of the client's value. Go drops it (#22).
     for field in ["output_compression", "partial_images"] {
-        if let Ok(n) = go_parse_int(&value(field)) {
+        if let Some(text) = single_text(&form, field)? {
+            let n = go_parse_int(text.trim()).map_err(|_| form_error(field, format_args!("must be an integer")))?;
             tool = set_raw(&tool, field, &n.to_string());
         }
     }
@@ -1222,6 +1356,114 @@ mod tests {
                 source: "",
                 provider: String::new(),
             },
+        }
+    }
+
+    /// `n` is one image only when its decimal value is exactly one (#22). Spellings
+    /// written by hand; a float comparison accepts `1.0000000000000001`.
+    #[test]
+    fn one_image_is_compared_by_decimal_digits() {
+        for one in [
+            "1", "1.0", "1.000", "1e0", "1E0", "1e+0", "1e-0", "10e-1", "0.1e1", "0.01e2", "100E-2", "1e00000",
+        ] {
+            assert!(decimal_is_one(one), "{one}");
+        }
+        for other in [
+            "1.0000000000000001",
+            "0.9999999999999999999",
+            "2",
+            "11",
+            "0",
+            "-1",
+            "-0",
+            "0.0",
+            "1e1",
+            "1e-1",
+            "10",
+            "0.1",
+            "1e99999999999999999999",
+            "1e-99999999999999999999",
+            "01",
+            "+1",
+            "1.",
+            ".1e1",
+            "1e",
+            "1e+",
+            "1 ",
+            "",
+            "one",
+            "inf",
+            "NaN",
+        ] {
+            assert!(!decimal_is_one(other), "{other}");
+        }
+    }
+
+    fn form_of(fields: &[(&str, &[u8])]) -> Form {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!("--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        multipart::read_form(&body, "b").unwrap()
+    }
+
+    /// The routing fields of a Codex form are read once, as UTF-8, and `stream` as one
+    /// of the boolean spellings; nothing else becomes false.
+    #[test]
+    fn form_routing_reads_model_and_stream_once() {
+        for (text, want) in [
+            (&b"true"[..], true),
+            (b"TRUE", true),
+            (b" 1 ", true),
+            (b"yes", true),
+            (b"On", true),
+            (b"false", false),
+            (b"0", false),
+            (b"no", false),
+            (b"off", false),
+            (b"", false),
+        ] {
+            let form = form_of(&[("model", b"gpt-image-2"), ("stream", text)]);
+            assert_eq!(form_routing(&form).unwrap(), want, "{text:?}");
+        }
+        assert!(!form_routing(&form_of(&[("prompt", b"p")])).unwrap());
+        for (fields, message) in [
+            (
+                vec![("stream", &b"nope"[..])],
+                "request form field `stream` must be a boolean",
+            ),
+            (
+                vec![("stream", &b"\xc2\xa0true"[..])],
+                "request form field `stream` must be a boolean",
+            ),
+            (
+                vec![("stream", &b"\xff"[..])],
+                "request form field `stream` is not valid UTF-8 at byte 0",
+            ),
+            (
+                vec![("stream", &b"false"[..]), ("stream", &b"true"[..])],
+                "request form field `stream` is repeated",
+            ),
+            (
+                vec![("model", &b"gpt-image-2"[..]), ("model", &b"gpt-image-1.5"[..])],
+                "request form field `model` is repeated",
+            ),
+            (
+                vec![("model", &b"\xff/gpt-image-2"[..])],
+                "request form field `model` is not valid UTF-8 at byte 0",
+            ),
+        ] {
+            let error = form_routing(&form_of(&fields)).unwrap_err();
+            assert_eq!(
+                (error.status, error.scope),
+                (400, cpa_core::exec::FailureScope::Request)
+            );
+            assert_eq!(String::from_utf8_lossy(&error.body), message, "{fields:?}");
         }
     }
 

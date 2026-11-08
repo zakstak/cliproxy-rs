@@ -397,3 +397,225 @@ async fn codex_images_json_meets_the_request_boundary() {
         r#"{"model":"gpt-image-2","prompt":"p","future":{"n":1e400}}"#
     );
 }
+
+/// One request a recording upstream saw: its `Authorization` header and body.
+type Calls = Arc<Mutex<Vec<(String, String)>>>;
+
+/// A loopback upstream that records each request and answers one Images result.
+async fn recording_upstream() -> (String, Calls) {
+    let calls: Calls = Arc::default();
+    let record = calls.clone();
+    let url = serve(
+        axum::Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let record = record.clone();
+            async move {
+                let authorization = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                record
+                    .lock()
+                    .unwrap()
+                    .push((authorization, String::from_utf8_lossy(&body).into_owned()));
+                (
+                    [("content-type", "application/json")],
+                    r#"{"created":1,"data":[{"b64_json":"aGk="}]}"#,
+                )
+            }
+        }),
+    )
+    .await;
+    (url, calls)
+}
+
+/// A multipart edit with one image, the given text fields first.
+fn form_with(fields: &[(&str, &[u8])]) -> (String, Vec<u8>) {
+    let boundary = "cpa-image-boundary";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"in.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGDATA\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// The Images handler rewrites `model` and `stream` before the Codex adapter sees the
+/// request, so it reads the client's own JSON and form under the adapter's rules first
+/// (#22, docs/codex/CONTRACT.md "Request boundary"). A repeated `stream`, in either order,
+/// a repeated `model`, a `stream` form value that is not UTF-8 or not a boolean spelling,
+/// and a repeated form field the handler reads once, are refused before anything is sent.
+/// Before, deleting a `"stream":false` left the other `stream` for the adapter, and the
+/// form's first `stream` was read lossily, with any other text read as false.
+#[tokio::test]
+async fn codex_images_read_the_original_request_before_rewriting_it() {
+    let auth_dir = AuthDir::new();
+    let (proxy, seen) = proxy(&auth_dir).await;
+    let duplicates: [&[u8]; 4] = [
+        br#"{"model":"gpt-image-2","prompt":"p","stream":false,"stream":true}"#,
+        br#"{"model":"gpt-image-2","prompt":"p","stream":true,"stream":false}"#,
+        br#"{"model":"gpt-image-2","prompt":"p","stream":false,"stream":false}"#,
+        br#"{"model":"gpt-image-2","model":"gpt-image-1.5","prompt":"p"}"#,
+    ];
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        for body in duplicates {
+            let (status, text) = post(format!("{proxy}{path}"), "application/json", body.to_vec()).await;
+            let shown = String::from_utf8_lossy(body);
+            assert_eq!(status, 400, "{path} {shown}: {text}");
+            assert!(
+                text.contains("request body repeats an object key at byte "),
+                "{path} {shown}: {text}"
+            );
+        }
+        let (status, text) = post(
+            format!("{proxy}{path}"),
+            "application/json",
+            br#"{"model":"gpt-image-2","prompt":"p","stream":"true"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 400, "{path}: {text}");
+        assert!(text.contains("request field `stream` must be a boolean"), "{text}");
+    }
+    for (fields, message) in [
+        (
+            vec![("model", &b"gpt-image-2"[..]), ("prompt", b"p"), ("stream", b"\xff")],
+            "request form field `stream` is not valid UTF-8 at byte 0",
+        ),
+        (
+            vec![("model", &b"gpt-image-2"[..]), ("prompt", b"p"), ("stream", b"nope")],
+            "request form field `stream` must be a boolean",
+        ),
+        (
+            vec![
+                ("model", &b"gpt-image-2"[..]),
+                ("prompt", b"p"),
+                ("stream", b"false"),
+                ("stream", b"true"),
+            ],
+            "request form field `stream` is repeated",
+        ),
+        (
+            vec![
+                ("model", &b"gpt-image-2"[..]),
+                ("model", b"gpt-image-1.5"),
+                ("prompt", b"p"),
+            ],
+            "request form field `model` is repeated",
+        ),
+        (
+            vec![("model", &b"\xff/gpt-image-2"[..]), ("prompt", b"p")],
+            "request form field `model` is not valid UTF-8 at byte 0",
+        ),
+    ] {
+        let (content_type, body) = form_with(&fields);
+        let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, body).await;
+        assert_eq!(status, 400, "{fields:?}: {text}");
+        assert!(text.contains(message), "{fields:?}: {text}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "nothing went upstream");
+
+    // Valid spellings still reach the backend, with the routed `stream`.
+    let (content_type, body) = form_with(&[("model", b"gpt-image-2"), ("prompt", b"p"), ("stream", b" False ")]);
+    let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, body).await;
+    assert_eq!(status, 200, "{text}");
+    let (status, text) = post(
+        format!("{proxy}/v1/images/generations"),
+        "application/json",
+        br#"{"model":"gpt-image-2","prompt":"p","stream":null}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, "/images/edits");
+    assert_eq!(
+        seen[0].2,
+        r#"{"model":"gpt-image-2","prompt":"p","images":[{"image_url":"data:image/png;base64,UE5HREFUQQ=="}]}"#
+    );
+    assert_eq!(
+        seen[1],
+        (
+            "/images/generations".to_owned(),
+            "application/json".to_owned(),
+            r#"{"model":"gpt-image-2","prompt":"p"}"#.to_owned()
+        )
+    );
+}
+
+/// xAI keeps Go's Images ingress, and the Codex rules decide nothing for it: a repeated
+/// `stream` on an xAI model still reaches xAI. A repeated `model` cannot move a request
+/// between providers: Go's first `model` picks xAI, and then only the xAI credential is
+/// used; a first Codex `model` meets the Codex rules and nothing is sent anywhere.
+#[tokio::test]
+async fn xai_images_keep_go_ingress_and_duplicates_cannot_cross_providers() {
+    let auth_dir = AuthDir::new();
+    let (codex_url, codex_calls) = recording_upstream().await;
+    let (xai_url, xai_calls) = recording_upstream().await;
+    let cfg = auth_dir.config(&format!(
+        "xai-api-key:\n  - api-key: xai-key-FAKE\n    base-url: {xai_url}\n"
+    ));
+    let mut credentials = cpa_core::config::credentials::from_config(&cfg);
+    assert_eq!(credentials.len(), 1, "the xAI key");
+    credentials.push(codex_oauth(&codex_url));
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors()));
+    let proxy = serve(cpa_server::router(rt)).await;
+
+    for body in [
+        &br#"{"model":"grok-imagine-image","prompt":"p","stream":false,"stream":true}"#[..],
+        br#"{"model":"grok-imagine-image","model":"gpt-image-2","prompt":"p"}"#,
+    ] {
+        let (status, text) = post(
+            format!("{proxy}/v1/images/generations"),
+            "application/json",
+            body.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 200, "{}: {text}", String::from_utf8_lossy(body));
+    }
+    let (content_type, form) = form_with(&[
+        ("model", b"grok-imagine-image"),
+        ("model", b"gpt-image-2"),
+        ("prompt", b"p"),
+    ]);
+    let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, form).await;
+    assert_eq!(status, 200, "{text}");
+    {
+        let xai = xai_calls.lock().unwrap();
+        assert_eq!(xai.len(), 3);
+        for (authorization, body) in xai.iter() {
+            assert_eq!(authorization, "Bearer xai-key-FAKE");
+            assert!(body.contains(r#""model":"grok-imagine-image""#), "{body}");
+        }
+    }
+    assert!(
+        codex_calls.lock().unwrap().is_empty(),
+        "the Codex credential took no xAI request"
+    );
+
+    let (status, text) = post(
+        format!("{proxy}/v1/images/generations"),
+        "application/json",
+        br#"{"model":"gpt-image-2","model":"grok-imagine-image","prompt":"p"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    let (content_type, form) = form_with(&[
+        ("model", b"gpt-image-2"),
+        ("model", b"grok-imagine-image"),
+        ("prompt", b"p"),
+    ]);
+    let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, form).await;
+    assert_eq!(status, 400, "{text}");
+    assert_eq!(xai_calls.lock().unwrap().len(), 3, "no further xAI request");
+    assert!(codex_calls.lock().unwrap().is_empty(), "no Codex request");
+}

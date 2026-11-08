@@ -207,6 +207,49 @@ async fn codex_request_boundary_refuses_before_the_upstream_send() {
     assert!(sent.contains(r#""model":"gpt-5.5""#), "{sent}");
 }
 
+/// The size rule through the real route (docs/codex/CONTRACT.md "Request boundary"): the
+/// server's shared 64 MiB request limit (`cpa_server::MAX_REQUEST_BYTES`) reads the body
+/// before any provider is known, so a body one byte over it gets the shared 400 with
+/// axum's reason (docs/DIFFERENCES-FROM-GO.md "Request body limits"), never the
+/// boundary's own 413, which only a caller of the executor that skips the server can
+/// meet. A body of exactly 64 MiB passes that limit and meets the Codex boundary, here
+/// for its repeated key. Neither reaches the upstream.
+#[tokio::test]
+async fn oversized_bodies_get_the_server_limit_before_the_boundary() {
+    let proxy = proxy(false).await;
+    let limit = cpa_server::MAX_REQUEST_BYTES;
+    assert_eq!(limit, cpa_common::codex_body::MAX_BODY_BYTES);
+    // A repeated key below the root: the shared ingress reads only `model` and `stream`.
+    let head = br#"{"model":"gpt-5.5","input":[],"x":{"a":1,"a":2}"#;
+    let mut exact = head.to_vec();
+    exact.resize(limit - 1, b' ');
+    exact.push(b'}');
+    let mut over = exact.clone();
+    over.insert(head.len(), b' ');
+    for (body, status, message) in [
+        (exact, 400, "request body repeats an object key at byte 41"),
+        (
+            over,
+            400,
+            "Invalid request: Failed to buffer the request body: length limit exceeded",
+        ),
+    ] {
+        let len = body.len();
+        let response = wreq::Client::new()
+            .post(format!("{}/v1/responses", proxy.url))
+            .header("authorization", "Bearer client-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status, "{len} bytes");
+        let text = response.text().await.unwrap();
+        assert!(text.contains(message), "{len} bytes: {text}");
+    }
+    assert!(proxy.seen.lock().unwrap().is_empty(), "nothing went upstream");
+}
+
 // The native HTTP route through the real router, with the shared capture upstream.
 
 use cpa_exec::codex_contract::fixture;

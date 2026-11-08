@@ -209,7 +209,7 @@ The boundary refuses a body for the following reasons, with these client-facing 
 
 | Rule | Status | Message |
 | --- | --- | --- |
-| Larger than 64 MiB, the server's request limit | 413 | `request body exceeds 67108864 bytes` |
+| Larger than 64 MiB, the server's request limit (see below for the route) | 413 | `request body exceeds 67108864 bytes` |
 | Not UTF-8 | 400 | `request body is not valid UTF-8 at byte N` |
 | Not RFC 8259 JSON, including content after the root value, a control character in a string, and a lone or mismatched surrogate escape | 400 | `request body is not valid JSON at byte N` |
 | A key repeated in any object, compared after unescaping | 400 | `request body repeats an object key at byte N` |
@@ -220,6 +220,18 @@ The boundary refuses a body for the following reasons, with these client-facing 
 Every refusal is a request fault (`FailureScope::Request`), so it never fails over to
 another credential. Messages name byte offsets and protocol fields only, never body
 content. Any other member, at any depth, passes as long as it is valid JSON.
+
+The size row is the boundary's own limit. Through the server, a body never reaches it:
+the server reads every client request under the shared 64 MiB limit
+(`cpa_server::MAX_REQUEST_BYTES`, the same number) before it knows the provider, and a
+WebSocket message under the same limit. A larger HTTP body gets the server's answer for
+every provider: 400 with `Invalid request: Failed to buffer the request body: length limit
+exceeded`, or 413 with `http: request body too large` under a smaller
+`server.max-request-body-bytes`
+([Request body limits](../DIFFERENCES-FROM-GO.md)). Both are client-safe and come before
+any upstream send. The boundary's 413 applies to a caller of the executor that skips the
+server. Mapping the server's limit to 413 would change the shared limit for every
+provider, so it is not done here.
 
 The Codex executor applies the boundary at its entry points, `CodexExecutor::execute`
 and `CodexExecutor::execute_in_session`, to every body whose source and response formats
@@ -239,10 +251,36 @@ it reads instead: `model`, `prompt`, `response_format` and the image settings ar
 image or mask reference holds string `image_url` or `file_id` members. `null` reads as
 absent. A member of another type is refused with the same 400 message, for example
 ``request field `size` must be a string``. Nothing is coerced, and the tool request copies
-a count with its number spelling. In a multipart edit, a text field that is not UTF-8 is
-refused (``request form field `prompt` is not valid UTF-8 at byte N``), and the tool path
-refuses a text field that appears twice. The boundary does not apply to the Responses
-body that the tool path generates.
+a count with its number spelling. The tool path expresses `n` only as one image, and
+compares it with one by its decimal digits: `1`, `1.0` and `1e0` are one, and
+`1.0000000000000001`, which a float rounds to one, is refused as an `n` the tool cannot
+express. The boundary does not apply to the Responses body that the tool path generates.
+
+The shared Images handler (`cpa_server::images`) rewrites `model` and `stream` before the
+adapter sees the request. For a model Codex serves, it first applies the adapter's rules
+to the client's original bytes (`cpa_exec::codex_images::check_json` and `form_routing`),
+so its rewrite cannot erase a fault: `{"stream":false,"stream":true}` is refused, in
+either order, rather than reaching the adapter with one `stream` left. xAI models keep
+Go's ingress, and a repeated `model` cannot move a request between providers: Go's first
+`model` picks xAI, and a first Codex `model` meets these rules before any credential is
+chosen.
+
+A multipart edit has no JSON types, so the form rules are these, on both paths:
+
+| Form text | Rule |
+| --- | --- |
+| Any text field | Must be UTF-8: ``request form field `prompt` is not valid UTF-8 at byte N`` |
+| `model`, `stream` | Must not repeat (``request form field `stream` is repeated``), because each decides where the request goes or how it is answered |
+| `stream` | One of `true`, `1`, `yes`, `on`, `false`, `0`, `no`, `off` (Go's `parseBoolField` spellings), ASCII white space trimmed and ASCII case ignored; empty is false, as an unset field. Anything else gets ``request form field `stream` must be a boolean``; Go reads it as false |
+| Other fields, tool path | Must not repeat: the tool reads one value |
+| `output_compression`, `partial_images`, tool path | A decimal `i64` (optional sign, digits) after trimming, or ``request form field `partial_images` must be an integer``. The tool has no other spelling for it, and leaving it out would request the provider's default instead of the client's value |
+| `n`, tool path | A JSON number spelling, optionally with a leading `+`, exactly equal to one; otherwise the `n` conversion refusal |
+| Count fields, direct path | Text that is a decimal `i64` becomes that JSON integer; other text stays a JSON string, so the Images endpoint judges the value the client sent. Other repeated fields become JSON arrays, as in Go |
+
+Image and mask files are binary and are never read as text. The OpenAI Images API documents
+`n`, `output_compression` and `partial_images` as integers and `stream` as a boolean.
+Whether the ChatGPT backend, or a Sign in with ChatGPT credential's tool path, accepts a
+given value is unknown; the proxy refuses only what it cannot represent.
 
 The shared ingress parser `cpa_server::claude::peek` reads `model` and `stream` for
 every provider before a credential is chosen. It keeps its Go behaviour: it already fails
@@ -270,7 +308,7 @@ reader semantics.
 | `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; #27, [Translated route](#translated-route) |
 | `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | The client's JSON goes through the boundary and typed member reads ([Request boundary](#request-boundary)). The direct path's `model` and `stream` edits stay sjson's, so a missing member is appended as the Go goldens record. The upstream events and the Images response read through `rawjson` (#25); #33 owns image model IDs |
-| `crates/cpa-server/src/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | Other providers, and Go's ingress for Codex models, like `peek`. A Codex request then meets the adapter's boundary before any send |
+| `crates/cpa-server/src/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | xAI keeps Go's ingress. A Codex model's original JSON and form pass the adapter's rules before the handler reads `prompt` or rewrites `model` and `stream`; the handler's Go reads then see a body without repeated keys and with typed routing members |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | A Responses body passes the boundary first and is read in place. The counter's text reads stay on `cpa_common::json` over that validated body or the strict conversion; they read each item in place, never from the root |
 | `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads; #25 |
 | `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `cpa_common::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue (#24) |
