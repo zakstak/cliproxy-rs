@@ -1,7 +1,5 @@
-//! Codex request shaping: body rules and upstream headers, applied in Go's order so
-//! appended keys land where Go puts them (codex_executor_execute.go, codex_executor_stream.go,
-//! codex_executor_request.go, codex_websockets_request.go, helps/codex_input_ids.go,
-//! helps/codex_tool_schema.go, openai_responses_signature.go).
+//! Codex routing and upstream headers. Request inspection borrows raw fields; it
+//! never rewrites a body or coerces a protocol string from another type.
 
 use cpa_core::gostr::GoStr;
 use std::time::Duration;
@@ -10,10 +8,70 @@ use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, FailureScope};
 use cpa_core::format::Format;
-use gjson::Kind;
 use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::codex_identity::{self as identity, Origin};
+
+/// Only the header inputs, borrowed from a native or translated body. Do not apply
+/// the native boundary here: translated bodies may retain raw source schemas with
+/// duplicate keys. Native requests have already passed that boundary at ingress.
+#[derive(Default)]
+struct HeaderFields<'a> {
+    model: Option<&'a serde_json::value::RawValue>,
+    service_tier: Option<&'a serde_json::value::RawValue>,
+    prompt_cache_key: Option<&'a serde_json::value::RawValue>,
+    client_metadata: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'de> serde::Deserialize<'de> for HeaderFields<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Model,
+            ServiceTier,
+            PromptCacheKey,
+            ClientMetadata,
+            #[serde(other)]
+            Other,
+        }
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = HeaderFields<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object containing Codex header inputs")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut fields = HeaderFields::default();
+                while let Some(field) = map.next_key::<Field>()? {
+                    let slot = match field {
+                        Field::Model => &mut fields.model,
+                        Field::ServiceTier => &mut fields.service_tier,
+                        Field::PromptCacheKey => &mut fields.prompt_cache_key,
+                        Field::ClientMetadata => &mut fields.client_metadata,
+                        Field::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    let value = map.next_value()?;
+                    // Translated originals keep their existing first-match observation
+                    // policy. A duplicate must not erase unrelated valid header inputs.
+                    // Native duplicate refusal is enforced at ingress, before observation.
+                    if slot.is_none() {
+                        *slot = Some(value);
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+fn header_text(raw: Option<&serde_json::value::RawValue>) -> Option<String> {
+    serde_json::from_str(raw?.get()).ok()
+}
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(crate) const WS_BETA: &str = "responses_websockets=2026-02-06";
@@ -347,11 +405,29 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
     if lite.trim().go_eq_fold("true") {
         return true;
     }
-    let v = gjson::get(
-        body,
-        "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite",
-    );
-    v.kind() == Kind::True || (v.kind() == Kind::String && v.str().trim().eq_ignore_ascii_case("true"))
+    #[derive(serde::Deserialize)]
+    struct Metadata<'a> {
+        #[serde(borrow)]
+        ws_request_header_x_openai_internal_codex_responses_lite: Option<&'a serde_json::value::RawValue>,
+    }
+    let Ok(body) = serde_json::from_str::<HeaderFields<'_>>(body) else {
+        return false;
+    };
+    let Some(metadata) = body.client_metadata else {
+        return false;
+    };
+    // serde structs also accept a sequence; the Lite marker is an object member.
+    if !metadata.get().starts_with('{') {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_str::<Metadata<'_>>(metadata.get()) else {
+        return false;
+    };
+    let Some(marker) = metadata.ws_request_header_x_openai_internal_codex_responses_lite else {
+        return false;
+    };
+    marker.get() == "true"
+        || serde_json::from_str::<String>(marker.get()).is_ok_and(|s| s.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Codex/Responses formats on both sides ([`responses_pair`]).
@@ -444,18 +520,28 @@ pub(crate) fn prompt_cache_id(
     ws_session: Option<&str>,
     websocket: bool,
 ) -> Option<String> {
-    let original = String::from_utf8_lossy(&req.body);
-    let client_key = gjson::get(&original, "prompt_cache_key");
     let mut id = match req.source_format {
         Format::Claude => {
-            let mut model = gjson::get(body, "model").str().trim().to_owned();
+            let parsed = serde_json::from_str::<HeaderFields<'_>>(body).ok();
+            let mut model = parsed
+                .as_ref()
+                .and_then(|b| header_text(b.model))
+                .map(|m| m.trim().to_owned())
+                .unwrap_or_default();
             if model.is_empty() {
                 model = base_model(&req.model);
             }
             claude_code_prompt_cache(&model, &req.body, &req.headers).unwrap_or_default()
         }
-        Format::OpenAIResponse if client_key.exists() => client_key.str().to_owned(),
-        Format::OpenAI if client_key.exists() && !websocket => client_key.str().trim().to_owned(),
+        Format::OpenAIResponse | Format::OpenAI => {
+            let original = serde_json::from_slice::<HeaderFields<'_>>(&req.body).ok();
+            let key = original.as_ref().and_then(|b| header_text(b.prompt_cache_key));
+            match (req.source_format, key) {
+                (Format::OpenAIResponse, Some(key)) => key,
+                (Format::OpenAI, Some(key)) if !websocket => key.trim().to_owned(),
+                _ => String::new(),
+            }
+        }
         _ => String::new(),
     };
     if id.is_empty() {
@@ -670,10 +756,12 @@ fn routing_hint(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, body: &s
         return;
     }
     let mut hint = format!("model={model}");
-    let tier = gjson::get(body, "service_tier");
-    if tier.kind() == Kind::String && !tier.str().trim().is_empty() {
+    let body = serde_json::from_str::<HeaderFields<'_>>(body).ok();
+    if let Some(tier) = body.as_ref().and_then(|b| header_text(b.service_tier))
+        && !tier.trim().is_empty()
+    {
         hint.push_str(";tier=");
-        hint.push_str(tier.str().trim());
+        hint.push_str(tier.trim());
     }
     set(h, ROUTING_HINT, &hint);
 }
@@ -829,6 +917,35 @@ fn siwc_ws_headers(h: &mut HeaderMap, view: &View<'_>, client: &HeaderMap, origi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract probes for Responses Lite's marker. Unknown metadata remains raw,
+    /// even when a JSON number cannot fit in a Rust floating-point value.
+    #[test]
+    fn lite_inspection_preserves_unknown_metadata_and_requires_a_marker_type() {
+        for (marker, expected) in [
+            ("true", true),
+            (r#"" TrUe ""#, true),
+            (r#""tr\u0075e""#, true),
+            ("false", false),
+            ("1", false),
+            (r#"{"value":true}"#, false),
+            ("null", false),
+        ] {
+            let body = format!(
+                r#"{{"client_metadata":{{"ws_request_header_x_openai_internal_codex_responses_lite":{marker},"future":{{"n":1e400}}}}}}"#
+            );
+            assert_eq!(is_lite(&body, &HeaderMap::new()), expected, "{body}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(LITE_HEADER, "true".parse().unwrap());
+        assert!(is_lite("{}", &headers));
+        for metadata in ["[true]", r#""true""#, "true", "null"] {
+            assert!(!is_lite(
+                &format!(r#"{{"client_metadata":{metadata}}}"#),
+                &HeaderMap::new()
+            ));
+        }
+    }
 
     /// Go's `NormalizeCodexToolIntegerTypes` vectors (tests/fixtures/codex_tool_schema_go.json,
     /// recorded from v8.0.35): a Codex client's `number` tool parameters become `integer`

@@ -125,7 +125,7 @@ pub(crate) fn apply(body: &str, device: &str, account: &str, session: &str) -> R
 /// `metadata`/`user_id` members as a request error (Go returns 400).
 fn existing_user_id(body: &str) -> Result<String, String> {
     let root = rawjson::parse(body);
-    if !rawjson::valid(body) || root.kind() != gjson::Kind::Object {
+    if !rawjson::valid(body) || root.kind() != rawjson::Kind::Object {
         return Err("apply Claude credential metadata: request must be a JSON object".into());
     }
     let mut metadata = None;
@@ -144,7 +144,7 @@ fn existing_user_id(body: &str) -> Result<String, String> {
         return Ok(String::new());
     };
     let m = rawjson::parse(&metadata);
-    if m.kind() != gjson::Kind::Object {
+    if m.kind() != rawjson::Kind::Object {
         return Ok(String::new());
     }
     let mut user = None;
@@ -160,7 +160,7 @@ fn existing_user_id(body: &str) -> Result<String, String> {
         return Err("apply Claude credential metadata: metadata: duplicate JSON object key \"user_id\"".into());
     }
     Ok(match user {
-        Some((gjson::Kind::String, s)) => s,
+        Some((rawjson::Kind::String, s)) => s,
         _ => String::new(),
     })
 }

@@ -166,7 +166,7 @@ pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, set
     let ua = profile::accepted_user_agent(headers, user_agent, settings);
     let betas = has_claude_code_beta(headers);
     let user_id = rawjson::get(payload, "metadata.user_id");
-    let metadata_user_id = user_id.kind() == gjson::Kind::String && valid_user_id(user_id.str());
+    let metadata_user_id = user_id.kind() == rawjson::Kind::String && valid_user_id(user_id.str());
     let native = NATIVE_ENTRYPOINTS.contains(&entrypoint.as_str());
     let standard = x_app && ua && betas && (count_tokens || metadata_user_id);
     let helper = native
@@ -308,11 +308,11 @@ fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
 
 fn helper_session(headers: &HeaderMap, payload: &str) -> bool {
     let metadata = rawjson::get(payload, "metadata");
-    if metadata.kind() != gjson::Kind::Object || !keys_exactly(metadata.json(), &["user_id"]) {
+    if metadata.kind() != rawjson::Kind::Object || !keys_exactly(metadata.json(), &["user_id"]) {
         return false;
     }
     let user_id = metadata.get("user_id");
-    if user_id.kind() != gjson::Kind::String || !valid_user_id(user_id.str()) {
+    if user_id.kind() != rawjson::Kind::String || !valid_user_id(user_id.str()) {
         return false;
     }
     let identity = user_id.str();
@@ -329,7 +329,7 @@ fn helper_session(headers: &HeaderMap, payload: &str) -> bool {
 
 /// `claudeJSONObjectHasKeys`: valid JSON object whose keys are exactly `want`, in order.
 pub(crate) fn keys_exactly(raw: &str, want: &[&str]) -> bool {
-    if !rawjson::valid(raw) || rawjson::parse(raw).kind() != gjson::Kind::Object {
+    if !rawjson::valid(raw) || rawjson::parse(raw).kind() != rawjson::Kind::Object {
         return false;
     }
     let mut keys = Vec::new();
@@ -366,11 +366,11 @@ fn body_shape(payload: &str) -> Option<Shape> {
     };
     let get = |p: &'static str| rawjson::get(payload, p);
     let max_tokens = get("max_tokens");
-    if get("model").str() != HELPER_MODEL || max_tokens.kind() != gjson::Kind::Number {
+    if get("model").str() != HELPER_MODEL || max_tokens.kind() != rawjson::Kind::Number {
         return None;
     }
     let messages = get("messages");
-    if messages.kind() != gjson::Kind::Array || messages.array().len() != 1 {
+    if messages.kind() != rawjson::Kind::Array || messages.array().len() != 1 {
         return None;
     }
     let message = messages.get("0");
@@ -385,12 +385,12 @@ fn body_shape(payload: &str) -> Option<Shape> {
             && format.get("type").str() == "json_schema"
     };
     match shape {
-        Shape::Minimal => (max_tokens.json() == "1" && content.kind() == gjson::Kind::String).then_some(shape),
+        Shape::Minimal => (max_tokens.json() == "1" && content.kind() == rawjson::Kind::String).then_some(shape),
         Shape::Title280 => {
             let oc = get("output_config");
             let schema = oc.get("format.schema");
             (max_tokens.json() == "80"
-                && content.kind() == gjson::Kind::String
+                && content.kind() == rawjson::Kind::String
                 && schema_object(&oc)
                 && keys_exactly(schema.json(), &["type"])
                 && schema.get("type").str() == "object")
@@ -398,7 +398,7 @@ fn body_shape(payload: &str) -> Option<Shape> {
         }
         Shape::Structured => {
             let blocks = content.array();
-            if content.kind() != gjson::Kind::Array || blocks.len() != 1 {
+            if content.kind() != rawjson::Kind::Array || blocks.len() != 1 {
                 return None;
             }
             if !keys_exactly(blocks[0].json(), &["type", "text"]) || blocks[0].get("type").str() != "text" {
@@ -406,7 +406,7 @@ fn body_shape(payload: &str) -> Option<Shape> {
             }
             let system = get("system");
             let sys = system.array();
-            if system.kind() != gjson::Kind::Array
+            if system.kind() != rawjson::Kind::Array
                 || sys.len() != 3
                 || sys
                     .iter()
@@ -422,7 +422,7 @@ fn body_shape(payload: &str) -> Option<Shape> {
                 return None;
             }
             let tools = get("tools");
-            if tools.kind() != gjson::Kind::Array || !tools.array().is_empty() {
+            if tools.kind() != rawjson::Kind::Array || !tools.array().is_empty() {
                 return None;
             }
             let thinking = get("thinking");
@@ -443,13 +443,13 @@ fn body_shape(payload: &str) -> Option<Shape> {
                 && keys_exactly(props.json(), &["title"])
                 && keys_exactly(title.json(), &["type"])
                 && title.get("type").str() == "string"
-                && required.kind() == gjson::Kind::Array
+                && required.kind() == rawjson::Kind::Array
                 && required.array().len() == 1
                 && required.get("0").str() == "title"
-                && schema.get("additionalProperties").kind() == gjson::Kind::False
+                && schema.get("additionalProperties").kind() == rawjson::Kind::False
                 && max_tokens.json() == "32000"
                 && get("temperature").json() == "1"
-                && get("stream").kind() == gjson::Kind::True;
+                && get("stream").kind() == rawjson::Kind::True;
             ok.then_some(shape)
         }
     }
