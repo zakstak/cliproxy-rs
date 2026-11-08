@@ -1419,6 +1419,35 @@ impl Facts {
             attempts: Default::default(),
         }
     }
+
+    /// The facts of a later request on the same connection, from its frame (in the
+    /// connection's format, `format`): its model (the connection's alias when it names
+    /// none), reasoning effort, service tier, `generate` and prompt prefix, as
+    /// [`Facts::new`] reads them. The client, clock, stream mode and attempt counter stay
+    /// the connection's.
+    fn successor(&self, body: &[u8]) -> Self {
+        let model = gj::get(body, "model");
+        let model = model.str();
+        let alias = match model.trim() {
+            "" => self.alias.clone(),
+            model => model.to_owned(),
+        };
+        let tier = gj::get(body, "service_tier");
+        let tier = tier.str().trim().to_owned();
+        let generate = gj::get(body, "generate");
+        Self {
+            client: self.client.clone(),
+            format: self.format,
+            reasoning_effort: cpa_common::thinking::extract_reasoning_effort(body, self.format.as_str(), &alias),
+            alias,
+            service_tier: if tier.is_empty() { "auto".into() } else { tier },
+            generate: !(generate.is_bool() && !generate.bool()),
+            stream: self.stream,
+            clock: self.clock.clone(),
+            prompt_prefix_hash: prompt_prefix(self.format, body),
+            attempts: self.attempts.clone(),
+        }
+    }
 }
 
 /// A fingerprint of the client's system prompt and tool definitions as it sent them
@@ -1613,12 +1642,16 @@ struct Reported {
     ttft: Ttft,
     usage_required: bool,
     outcome: Option<Outcome>,
-    /// Go created no reporter for this attempt: publish nothing.
+    /// Go created no reporter for this attempt: publish nothing. Also set once the
+    /// attempt's report was taken for its one record, or handed to a detached record.
     discarded: bool,
     exchange: Exchange,
     claude_cache: Option<cpa_core::exec::ClaudeCacheTelemetry>,
     /// The executor type and model of the built-in executor the attempt was handed to.
     delegated: Option<(String, String)>,
+    /// For a record of its own ([`Own`]): when its first upstream payload arrived, from
+    /// the record's start.
+    first: Option<std::time::Duration>,
 }
 
 impl Reported {
@@ -1626,6 +1659,48 @@ impl Reported {
     fn usage(&self) -> Option<Detail> {
         self.body.clone().or_else(|| self.stream.detail().cloned())
     }
+
+    /// What is left once a report was taken: a later publish or detach finds nothing.
+    fn taken() -> Self {
+        Self {
+            discarded: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// What every record of one attempt shares: where records go, the request, and the
+/// credential and model the attempt runs on, with what it learned while it ran (the
+/// upstream's response headers, the session an LCP pick bound). The attempt's
+/// [`Tracker`] publishes its one record from it. Once the executor detached the attempt
+/// ([`cpa_core::exec::UsageObserver::detach`]), the Tracker publishes nothing and each
+/// upstream response's record ([`Own`]) publishes from it instead.
+struct Origin {
+    queue: std::sync::Arc<crate::Runtime>,
+    facts: std::sync::Arc<Facts>,
+    auth_id: String,
+    /// The record before any outcome ([`Tracker::start`], [`Tracker::arrived`]).
+    template: Record,
+    /// The request's client facts under this attempt's session, when it has its own:
+    /// Home's canonical session for a dispatched credential, else its LCP pick's.
+    client: Option<Client>,
+    /// Go `requestedAt`.
+    requested_at: chrono::DateTime<chrono::FixedOffset>,
+    attempt: usize,
+}
+
+/// A record that publishes itself, for one upstream response on a connection that
+/// carries several: once, when the executor settles it, or when dropped unsettled.
+struct Own {
+    /// The facts of the request that asked for this response.
+    facts: std::sync::Arc<Facts>,
+    /// When the record started.
+    requested_at: chrono::DateTime<chrono::FixedOffset>,
+    /// The attempt's own response, detached: it keeps the attempt's execution ID and
+    /// timings. A successor gets its own execution ID and no timings, which measure the
+    /// attempt's request.
+    detached: bool,
+    published: std::sync::atomic::AtomicBool,
 }
 
 /// The executor-facing observer; `provider` picks the response-model extractor.
@@ -1634,6 +1709,18 @@ struct Observer {
     started: std::time::Instant,
     cache_telemetry: bool,
     state: std::sync::Mutex<Reported>,
+    origin: std::sync::Arc<std::sync::Mutex<Origin>>,
+    /// `None` for an attempt, which its [`Tracker`] publishes.
+    own: Option<Own>,
+}
+
+/// The clock a record measures from and the attempt it belongs to.
+struct Stamp<'a> {
+    started: std::time::Instant,
+    requested_at: chrono::DateTime<chrono::FixedOffset>,
+    attempt: usize,
+    client: &'a Client,
+    auth_id: &'a str,
 }
 
 impl Observer {
@@ -1641,26 +1728,147 @@ impl Observer {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Lock order: the origin before the report.
+    fn origin(&self) -> std::sync::MutexGuard<'_, Origin> {
+        self.origin.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Everything reported so far, for the one record that publishes it.
+    fn take(&self) -> Reported {
+        std::mem::replace(&mut *self.lock(), Reported::taken())
+    }
+
+    /// A record of its own notes its first upstream payload.
+    fn first_payload(&self, r: &mut Reported) {
+        if self.own.is_some() && r.first.is_none() {
+            r.first = Some(self.started.elapsed());
+        }
+    }
+
     /// `keep_usage`: a failure that keeps the usage reported so far.
     fn settle(&self, failed: bool, keep_usage: bool, status: i64, body: &str) {
-        let mut r = self.lock();
-        if r.outcome.is_some() {
+        {
+            let mut r = self.lock();
+            if r.outcome.is_some() {
+                return;
+            }
+            let detail = if failed && !keep_usage {
+                Detail::default()
+            } else {
+                r.usage().unwrap_or_default()
+            };
+            r.outcome = Some(Outcome {
+                failed,
+                status,
+                body: body.trim().to_owned(),
+                detail,
+                model: r.model.get().to_owned(),
+                latency: self.started.elapsed(),
+                ttft: r.ttft.get(),
+            });
+        }
+        self.publish_own();
+    }
+
+    /// A record of its own: publishes, once, its settled outcome, or, settled by nobody,
+    /// what it observed (an attempt's Tracker does the same with `Ending::Done`).
+    fn publish_own(&self) {
+        let Some(own) = &self.own else { return };
+        if own.published.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        let detail = if failed && !keep_usage {
-            Detail::default()
+        let origin = self.origin();
+        let queue = origin.queue.usage_queue();
+        if !queue.accepts() {
+            return;
+        }
+        let mut reported = self.take();
+        if reported.discarded {
+            return;
+        }
+        let facts = &own.facts;
+        let mut record = origin.template.clone();
+        if !own.detached {
+            record.execution_id = uuid::Uuid::new_v4().to_string();
+        }
+        record.timestamp = go_timestamp(&own.requested_at);
+        record.alias.clone_from(&facts.alias);
+        record.reasoning_effort.clone_from(&facts.reasoning_effort);
+        record.service_tier.clone_from(&facts.service_tier);
+        record.generate = facts.generate;
+        record.stream = facts.stream;
+        if let Some((executor_type, model)) = reported.delegated.clone() {
+            (record.executor_type, record.model) = (executor_type, model);
+        }
+        let (latency, ttft);
+        if let Some(outcome) = reported.outcome.take() {
+            record.failed = outcome.failed;
+            record.fail_status = outcome.status;
+            record.fail_body = outcome.body;
+            record.detail = outcome.detail;
+            record.response_model = outcome.model;
+            (latency, ttft) = (outcome.latency, outcome.ttft);
         } else {
-            r.usage().unwrap_or_default()
+            let usage = reported.usage();
+            record.detail = if reported.usage_required && usage.is_none() {
+                if reported.claude_cache.is_none() {
+                    return;
+                }
+                record.usage_observed = Some(false);
+                Detail::default()
+            } else {
+                usage.unwrap_or_default()
+            };
+            record.response_model = reported.model.get().to_owned();
+            latency = self.started.elapsed();
+            ttft = if reported.ttft.tracked {
+                reported.ttft.get()
+            } else {
+                reported.first.unwrap_or_default()
+            };
+        }
+        record.timings = if own.detached {
+            timings(&origin.facts, &reported.exchange)
+        } else {
+            Timings::default()
         };
-        r.outcome = Some(Outcome {
-            failed,
-            status,
-            body: body.trim().to_owned(),
-            detail,
-            model: r.model.get().to_owned(),
-            latency: self.started.elapsed(),
-            ttft: r.ttft.get(),
-        });
+        record.prompt_prefix_hash.clone_from(&facts.prompt_prefix_hash);
+        let stamp = Stamp {
+            started: self.started,
+            requested_at: own.requested_at,
+            attempt: origin.attempt,
+            client: origin.client.as_ref().unwrap_or(&facts.client),
+            auth_id: &origin.auth_id,
+        };
+        finish(queue, record, reported, latency, ttft, &stamp);
+    }
+
+    /// A record of its own on this observer's origin.
+    fn record(&self, facts: std::sync::Arc<Facts>, reported: Reported, detached: bool) -> Self {
+        let (started, requested_at) = if detached {
+            (self.started, self.origin().requested_at)
+        } else {
+            (std::time::Instant::now(), chrono::Local::now().fixed_offset())
+        };
+        Self {
+            provider: self.provider.clone(),
+            started,
+            cache_telemetry: self.cache_telemetry,
+            state: std::sync::Mutex::new(reported),
+            origin: self.origin.clone(),
+            own: Some(Own {
+                facts,
+                requested_at,
+                detached,
+                published: Default::default(),
+            }),
+        }
+    }
+}
+
+impl Drop for Observer {
+    fn drop(&mut self) {
+        self.publish_own();
     }
 }
 
@@ -1675,6 +1883,7 @@ impl cpa_core::exec::UsageObserver for Observer {
 
     fn response_body(&self, format: Format, body: &[u8]) {
         let mut r = self.lock();
+        self.first_payload(&mut r);
         r.seen = true;
         r.body = Some(parse_body(format, body));
         r.model.observe(body, &self.provider);
@@ -1682,6 +1891,7 @@ impl cpa_core::exec::UsageObserver for Observer {
 
     fn response_line(&self, format: Format, line: &[u8]) {
         let mut r = self.lock();
+        self.first_payload(&mut r);
         r.seen = true;
         r.stream.line(format, line);
         r.model.observe(line, &self.provider);
@@ -1689,6 +1899,7 @@ impl cpa_core::exec::UsageObserver for Observer {
 
     fn response_usage_line(&self, format: Format, line: &[u8]) {
         let mut r = self.lock();
+        self.first_payload(&mut r);
         r.seen = true;
         r.stream.line(format, line);
     }
@@ -1755,6 +1966,107 @@ impl cpa_core::exec::UsageObserver for Observer {
         let now = std::time::Instant::now();
         self.lock().exchange.mark(stage, now);
     }
+
+    /// The attempt's report so far moves to the record, which keeps the attempt's
+    /// start, execution ID and timings; the attempt is then discarded, so its Tracker
+    /// publishes nothing. An attempt already published or discarded detaches nothing.
+    fn detach(&self) -> Option<std::sync::Arc<dyn cpa_core::exec::UsageObserver>> {
+        if self.own.is_some() {
+            return None;
+        }
+        let reported = {
+            let mut r = self.lock();
+            if r.discarded {
+                return None;
+            }
+            std::mem::replace(&mut *r, Reported::taken())
+        };
+        let facts = self.origin().facts.clone();
+        Some(std::sync::Arc::new(self.record(facts, reported, true)))
+    }
+
+    fn successor(&self, request: Option<&[u8]>) -> Option<std::sync::Arc<dyn cpa_core::exec::UsageObserver>> {
+        let own = self.own.as_ref()?;
+        let facts = match request {
+            Some(body) => std::sync::Arc::new(own.facts.successor(body)),
+            None => own.facts.clone(),
+        };
+        Some(std::sync::Arc::new(self.record(facts, Reported::default(), false)))
+    }
+}
+
+/// The record's [`Timings`]: each mark as an offset from the request's arrival.
+fn timings(facts: &Facts, exchange: &Exchange) -> Timings {
+    let clock = &facts.clock;
+    let accepted = clock.accepted();
+    let ms = |at: Option<std::time::Instant>| {
+        at.map(|at| i64::try_from(at.saturating_duration_since(accepted).as_millis()).unwrap_or(i64::MAX))
+    };
+    let bytes = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+    let body = clock.body_received();
+    Timings {
+        client_body_received_ms: ms(body.map(|(at, _)| at)),
+        upstream_started_ms: ms(exchange.started),
+        upstream_connected_ms: ms(exchange.connected),
+        upstream_connection_reused: exchange.reused,
+        upstream_body_sent_ms: ms(exchange.body_sent),
+        upstream_headers_ms: ms(exchange.headers),
+        upstream_first_byte_ms: ms(exchange.first_byte),
+        client_first_byte_ms: ms(clock.response_started()),
+        client_request_bytes: bytes(body.map(|(_, n)| n)),
+        upstream_request_bytes: bytes(exchange.request_bytes),
+        upstream_response_bytes: bytes(exchange.response_bytes),
+    }
+}
+
+/// What every record takes from its report once its outcome, detail, timings and prompt
+/// prefix are set: latency, TTFT, returned cache buckets, Claude cache telemetry and
+/// the reported reasoning effort. Then it is queued.
+fn finish(
+    queue: &crate::usage::UsageQueue,
+    mut record: Record,
+    reported: Reported,
+    latency: std::time::Duration,
+    ttft: std::time::Duration,
+    stamp: &Stamp<'_>,
+) {
+    // Go can publish a tokenless failure after observing a Claude response.
+    // Keep the returned TTL buckets as observations, not inferred accounting.
+    let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));
+    record.latency_ms = latency.as_millis() as i64;
+    record.ttft_ms = ttft.as_millis() as i64;
+    if let Some((five, hour)) = returned_cache {
+        record.detail.cache_creation_5m = five;
+        record.detail.cache_creation_1h = hour;
+    }
+    if let Some(mut cache) = reported.claude_cache {
+        let at = |instant: Option<std::time::Instant>| {
+            instant.map(|instant| {
+                let offset = instant.saturating_duration_since(stamp.started).as_millis() as i64;
+                stamp.requested_at.timestamp_millis().saturating_add(offset)
+            })
+        };
+        cache.request_start_unix_ms = at(reported.exchange.started);
+        cache.first_response_byte_unix_ms = at(reported.exchange.first_byte);
+        // Completion of this upstream attempt, not the downstream socket flush.
+        cache.end_unix_ms = Some(stamp.requested_at.timestamp_millis().saturating_add(record.latency_ms));
+        cache.attempt = stamp.attempt;
+        if stamp.client.is_compaction {
+            cache.base_request_type = "compaction".into();
+            if cache.request_type != "retry" {
+                cache.request_type = "compaction".into();
+            }
+        }
+        if stamp.attempt > 0 {
+            cache.request_type = "retry".into();
+        }
+        record.claude_cache = Some(cache);
+    }
+    if let Some(effort) = reported.effort {
+        record.reasoning_effort = effort;
+    }
+    queue.enqueue(queued(&record, stamp.client));
+    warn_model_substitution(&record, &reported.upstream_model, stamp.auth_id);
 }
 
 /// How the attempt ended for the server.
@@ -1766,12 +2078,10 @@ enum Ending<'a> {
 
 /// One upstream attempt's record in progress. It publishes at most once: what the
 /// executor published itself, else on success, on failure, or when dropped
-/// mid-stream (Go's deferred publish).
+/// mid-stream (Go's deferred publish). An attempt the executor detached publishes
+/// nothing here: its responses publish their own records.
 pub struct Tracker {
-    queue: std::sync::Arc<crate::Runtime>,
     facts: std::sync::Arc<Facts>,
-    record: Record,
-    auth_id: String,
     started: std::time::Instant,
     observer: std::sync::Arc<Observer>,
     stream: StreamUsage,
@@ -1779,12 +2089,6 @@ pub struct Tracker {
     model: ResponseModel,
     first: Option<std::time::Duration>,
     published: bool,
-    /// The request's client facts under this attempt's session, when it has its own:
-    /// Home's canonical session for a dispatched credential, else its LCP pick's.
-    client: Option<Client>,
-    /// Go `requestedAt`.
-    requested_at: chrono::DateTime<chrono::FixedOffset>,
-    attempt: usize,
 }
 
 impl Tracker {
@@ -1804,7 +2108,7 @@ impl Tracker {
         client.is_fork = fork;
         client.is_compaction = compaction;
         client.session_source = "lcp";
-        self.client = Some(client);
+        self.observer.origin().client = Some(client);
     }
 
     /// Starts the record for one attempt of `credential` on `upstream_model`.
@@ -1840,26 +2144,31 @@ impl Tracker {
             std::borrow::Cow::Owned(client) => Some(client),
             std::borrow::Cow::Borrowed(_) => None,
         };
-        Self {
+        let origin = Origin {
             queue: rt.clone(),
             facts: facts.clone(),
-            record,
             auth_id: credential.id.clone(),
+            template: record,
+            client: home_client,
+            requested_at: now.fixed_offset(),
+            attempt: facts.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        Self {
+            facts: facts.clone(),
             started,
             observer: std::sync::Arc::new(Observer {
                 provider,
                 started,
                 cache_telemetry: rt.usage_queue().wants_claude_cache(),
                 state: std::sync::Mutex::default(),
+                origin: std::sync::Arc::new(std::sync::Mutex::new(origin)),
+                own: None,
             }),
             stream: StreamUsage::default(),
             body: None,
             model: ResponseModel::default(),
             first: None,
             published: false,
-            client: home_client,
-            requested_at: now.fixed_offset(),
-            attempt: facts.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1874,7 +2183,7 @@ impl Tracker {
     // event (streams); Go measures from the upstream request to its first body byte.
     pub fn arrived(&mut self, headers: &axum::http::HeaderMap) {
         self.first.get_or_insert_with(|| self.started.elapsed());
-        self.record.response_headers = go_headers(headers);
+        self.observer.origin().template.response_headers = go_headers(headers);
     }
 
     /// The buffered client-format body (or the joined events of a stream the client
@@ -1921,23 +2230,24 @@ impl Tracker {
         if std::mem::replace(&mut self.published, true) {
             return;
         }
-        let queue = self.queue.usage_queue();
+        let mut origin = self.observer.origin();
+        let rt = origin.queue.clone();
+        let queue = rt.usage_queue();
         if !queue.accepts() {
             return;
         }
-        let reported = std::mem::take(&mut *self.observer.lock());
+        let mut reported = self.observer.take();
         if reported.discarded {
             return;
         }
-        // Go can publish a tokenless failure after observing a Claude response.
-        // Keep the returned TTL buckets as observations, not inferred accounting.
-        let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));
-        let mut record = std::mem::take(&mut self.record);
+        // Only an attempt that was never detached gets here, so no other record reads
+        // the template.
+        let mut record = std::mem::take(&mut origin.template);
         if let Some((executor_type, model)) = reported.delegated.clone() {
             (record.executor_type, record.model) = (executor_type, model);
         }
         let (latency, ttft);
-        if let Some(outcome) = reported.outcome {
+        if let Some(outcome) = reported.outcome.take() {
             record.failed = outcome.failed;
             record.fail_status = outcome.status;
             record.fail_body = outcome.body;
@@ -1988,68 +2298,16 @@ impl Tracker {
                 self.first.unwrap_or_default()
             };
         }
-        record.latency_ms = latency.as_millis() as i64;
-        record.ttft_ms = ttft.as_millis() as i64;
-        if let Some((five, hour)) = returned_cache {
-            record.detail.cache_creation_5m = five;
-            record.detail.cache_creation_1h = hour;
-        }
-        record.timings = self.timings(&reported.exchange);
+        record.timings = timings(&self.facts, &reported.exchange);
         record.prompt_prefix_hash = self.facts.prompt_prefix_hash.clone();
-        if let Some(mut cache) = reported.claude_cache {
-            let at = |instant: Option<std::time::Instant>| {
-                instant.map(|instant| {
-                    let offset = instant.saturating_duration_since(self.started).as_millis() as i64;
-                    self.requested_at.timestamp_millis().saturating_add(offset)
-                })
-            };
-            cache.request_start_unix_ms = at(reported.exchange.started);
-            cache.first_response_byte_unix_ms = at(reported.exchange.first_byte);
-            // Completion of this upstream attempt, not the downstream socket flush.
-            cache.end_unix_ms = Some(self.requested_at.timestamp_millis().saturating_add(record.latency_ms));
-            cache.attempt = self.attempt;
-            if self.client.as_ref().unwrap_or(&self.facts.client).is_compaction {
-                cache.base_request_type = "compaction".into();
-                if cache.request_type != "retry" {
-                    cache.request_type = "compaction".into();
-                }
-            }
-            if self.attempt > 0 {
-                cache.request_type = "retry".into();
-            }
-            record.claude_cache = Some(cache);
-        }
-        if let Some(effort) = reported.effort {
-            record.reasoning_effort = effort;
-        }
-        queue.enqueue(queued(&record, self.client.as_ref().unwrap_or(&self.facts.client)));
-        warn_model_substitution(&record, &reported.upstream_model, &self.auth_id);
-    }
-}
-
-impl Tracker {
-    /// The record's [`Timings`]: each mark as an offset from the request's arrival.
-    fn timings(&self, exchange: &Exchange) -> Timings {
-        let clock = &self.facts.clock;
-        let accepted = clock.accepted();
-        let ms = |at: Option<std::time::Instant>| {
-            at.map(|at| i64::try_from(at.saturating_duration_since(accepted).as_millis()).unwrap_or(i64::MAX))
+        let stamp = Stamp {
+            started: self.started,
+            requested_at: origin.requested_at,
+            attempt: origin.attempt,
+            client: origin.client.as_ref().unwrap_or(&self.facts.client),
+            auth_id: &origin.auth_id,
         };
-        let bytes = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
-        let body = clock.body_received();
-        Timings {
-            client_body_received_ms: ms(body.map(|(at, _)| at)),
-            upstream_started_ms: ms(exchange.started),
-            upstream_connected_ms: ms(exchange.connected),
-            upstream_connection_reused: exchange.reused,
-            upstream_body_sent_ms: ms(exchange.body_sent),
-            upstream_headers_ms: ms(exchange.headers),
-            upstream_first_byte_ms: ms(exchange.first_byte),
-            client_first_byte_ms: ms(clock.response_started()),
-            client_request_bytes: bytes(body.map(|(_, n)| n)),
-            upstream_request_bytes: bytes(exchange.request_bytes),
-            upstream_response_bytes: bytes(exchange.response_bytes),
-        }
+        finish(queue, record, reported, latency, ttft, &stamp);
     }
 }
 
@@ -2286,6 +2544,77 @@ mod tests {
             go_timestamp(&t.with_timezone(&east)),
             "2026-10-03T13:30:00.123456+05:30"
         );
+    }
+
+    /// Per-response records (#25): a detached attempt publishes nothing itself, each
+    /// record publishes once when settled (not when the attempt's stream ends), a
+    /// record dropped unsettled publishes what it observed, and an attempt that already
+    /// published cannot be detached into a second record of the same response.
+    #[test]
+    fn detached_records_publish_once_each_and_the_attempt_none() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAIResponse,
+            Format::OpenAIResponse,
+            "gpt-fixture",
+            br#"{"model":"gpt-fixture","input":[]}"#,
+            true,
+            &crate::dispatch::Trace::default(),
+        ));
+        let line = |id: &str, input: i64| {
+            format!(
+                r#"{{"type":"response.completed","response":{{"id":"{id}","usage":{{"input_tokens":{input},"output_tokens":1,"total_tokens":{}}}}}}}"#,
+                input + 1
+            )
+        };
+        let tracker = Tracker::start(&rt, &facts, &credential_for("codex"), "gpt-fixture");
+        let first = tracker.sink().detach().expect("an attempt detaches once");
+        assert!(tracker.sink().detach().is_none(), "the attempt is detached already");
+        first.response_line(Format::Codex, line("r1", 5).as_bytes());
+        first.publish();
+        // A later failure of the same record changes nothing.
+        first.publish_failure(502, "late");
+        let queue = rt.usage_queue();
+        let r1: Vec<Value> = queue
+            .pop_oldest(10)
+            .iter()
+            .map(|q| serde_json::from_slice(q).unwrap())
+            .collect();
+        assert_eq!(r1.len(), 1, "{r1:?}");
+        assert_eq!(
+            (r1[0]["failed"].clone(), r1[0]["tokens"]["input_tokens"].clone()),
+            (false.into(), 5.into())
+        );
+        let second = first.successor(Some(br#"{"type":"response.create","service_tier":"flex","input":[]}"#));
+        second.response_line(Format::Codex, line("r2", 11).as_bytes());
+        drop(second);
+        // The attempt's own end publishes nothing.
+        tracker.fail(&cpa_core::exec::ExecError::local(
+            502,
+            cpa_core::exec::FailureScope::Request,
+            "socket closed",
+        ));
+        let rest: Vec<Value> = queue
+            .pop_oldest(10)
+            .iter()
+            .map(|q| serde_json::from_slice(q).unwrap())
+            .collect();
+        assert_eq!(rest.len(), 1, "{rest:?}");
+        assert_eq!(rest[0]["tokens"]["input_tokens"], 11);
+        assert_eq!(rest[0]["service_tier"], "flex");
+        assert_eq!(
+            rest[0]["alias"], "gpt-fixture",
+            "the connection's model when the frame names none"
+        );
+        assert_ne!(rest[0]["execution_id"], r1[0]["execution_id"]);
+
+        // The attempt published first (its stream ended): no record to detach.
+        let tracker = Tracker::start(&rt, &facts, &credential_for("codex"), "gpt-fixture");
+        let sink = tracker.sink();
+        tracker.succeed();
+        assert_eq!(queue.pop_oldest(10).len(), 1);
+        assert!(sink.detach().is_none());
     }
 
     /// Claude's executor-published outcomes through the queue: an apply_patch

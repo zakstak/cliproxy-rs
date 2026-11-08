@@ -187,6 +187,26 @@ pub trait UsageObserver: Send + Sync {
     fn upstream_stage(&self, stage: UpstreamStage) {
         let _ = stage;
     }
+    /// For an attempt whose connection carries more than one upstream response (a Codex
+    /// response-steering socket): the rest of the attempt's accounting moves to a record
+    /// of its own for the response now running, and the attempt itself publishes nothing
+    /// afterwards. That record publishes when the executor settles it (`publish`,
+    /// `publish_failure`, `publish_failure_with_usage`), not when the attempt's stream
+    /// ends; dropped unsettled, it publishes what it observed, as an attempt that ends
+    /// without a settled outcome does. `None`: the observer keeps no such records (the
+    /// default), or the attempt already published; its accounting then stays as it was.
+    fn detach(&self) -> Option<std::sync::Arc<dyn UsageObserver>> {
+        None
+    }
+    /// From a record [`UsageObserver::detach`] made (or one made here): a new record on
+    /// the same credential, model and connection for another upstream response.
+    /// `request` is the frame that asked for it, whose request facts the record takes;
+    /// `None` for a response the upstream started on its own, which keeps this record's
+    /// request facts. `None` from an observer that keeps no such records.
+    fn successor(&self, request: Option<&[u8]>) -> Option<std::sync::Arc<dyn UsageObserver>> {
+        let _ = request;
+        None
+    }
 }
 
 /// A stage of one upstream exchange, as the shared HTTP client sees it
@@ -441,6 +461,20 @@ impl UsageSink {
         if let Some(o) = &self.0 {
             o.upstream_stage(stage);
         }
+    }
+
+    /// See [`UsageObserver::detach`]: the detached record's sink, with this sink's
+    /// capture and WebSocket observer. `None` leaves the attempt's accounting as it was.
+    pub fn detach(&self) -> Option<UsageSink> {
+        let record = self.0.as_ref()?.detach()?;
+        Some(Self(Some(record), self.1.clone(), self.2.clone()))
+    }
+
+    /// See [`UsageObserver::successor`]: the new record's sink, or a sink that reports
+    /// nothing when this one keeps no such records.
+    pub fn successor(&self, request: Option<&[u8]>) -> UsageSink {
+        let record = self.0.as_ref().and_then(|o| o.successor(request));
+        Self(record, self.1.clone(), self.2.clone())
     }
 }
 

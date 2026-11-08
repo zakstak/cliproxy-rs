@@ -15,6 +15,19 @@
 //! separate writer task owns the socket's writes, so a write blocked in the network never
 //! stops upstream events (Go's writer blocking in `writeCodexWebsocketMessage`). Writer
 //! waits (`waitFor`, queued creates) become state the task re-checks after every step.
+//!
+//! Usage is recorded per upstream response, not per connection (#25). The attempt that
+//! opened the socket accounts for the bootstrap create until its `response.created`; then
+//! its accounting moves to that response's own record (`UsageSink::detach`), and the
+//! attempt publishes nothing more. Every later create sent upstream, and every automatic
+//! successor upstream starts, gets a record of its own (`UsageSink::successor`), bound to
+//! its response ID once it starts. A record settles once, as soon as its outcome is
+//! observed, while the connection stays open: its terminal event (with the usage that
+//! event reported, or none), its own failure, or a rejection before it started. Settled
+//! records are never revisited. When the connection ends, only records still open
+//! settle: as the connection's failure, or as the proxy's cancellation (`crate::cancel`)
+//! when the client left. A frame refused here, or a create still queued here, never went
+//! upstream and gets no record.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -22,14 +35,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cpa_common::codex_body::CodexBody;
 use cpa_core::credential::Credential;
-use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
+use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope, UsageSink};
+use cpa_core::format::Format;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use super::{Read, Turn, Upstream, transport, ws_error};
 use crate::codex_request::View;
 use crate::codex_response as response;
-use crate::rawjson;
+use crate::rawjson::{self, Kind};
 
 /// Bound on queued and outstanding `response.create` requests.
 const MAX_PENDING: usize = 16;
@@ -74,17 +88,101 @@ impl SteeringInput {
 pub(super) struct Prepared {
     /// Native Codex request (the Responses Lite marker).
     native: bool,
+    /// A usage record of the request, whose facts (model, reasoning effort, service
+    /// tier) an automatic successor of its response takes. Reports nothing until the
+    /// attempt is detached.
+    usage: UsageSink,
 }
 
 impl Prepared {
     pub(super) fn new(native: bool) -> Self {
-        Self { native }
+        Self {
+            native,
+            usage: UsageSink::default(),
+        }
     }
 
     /// The settings a response retains.
     fn retained(&self) -> Self {
         self.clone()
     }
+}
+
+/// One upstream response's usage record on this connection: from the create that asked
+/// for it (or the `response.created` of an automatic successor) until it settles, once.
+/// Dropped unsettled, because the connection ended under it without a cause of its own
+/// (the client left), it records the proxy's cancellation (`crate::cancel`).
+struct Accounting {
+    usage: UsageSink,
+    settled: bool,
+}
+
+impl Accounting {
+    fn new(usage: UsageSink) -> Self {
+        Self { usage, settled: false }
+    }
+
+    fn observe(&self, payload: &str) {
+        if self.usage.enabled() {
+            self.usage.response_line(Format::Codex, payload.as_bytes());
+        }
+    }
+
+    /// The upstream ended the response: the record has the usage its terminal event
+    /// reported, or none.
+    fn complete(mut self) {
+        self.settled = true;
+        self.usage.publish();
+    }
+
+    /// The response failed, or the connection failed under it.
+    fn fail(mut self, error: &ExecError) {
+        self.settled = true;
+        crate::openai_http::publish_failure(&self.usage, error);
+    }
+
+    /// The client left while the response ran or waited to start.
+    fn cancel(mut self) {
+        self.settled = true;
+        self.usage.publish_failure(crate::cancel::STATUS, crate::cancel::BODY);
+    }
+}
+
+impl Drop for Accounting {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.usage.publish_failure(crate::cancel::STATUS, crate::cancel::BODY);
+        }
+    }
+}
+
+/// A create sent upstream and not yet started or rejected.
+struct Pending {
+    prepared: Prepared,
+    /// `None` for the bootstrap create, which the attempt accounts for until it starts,
+    /// and on a connection whose attempt keeps its own accounting.
+    accounting: Option<Accounting>,
+}
+
+/// A started response whose record has not settled.
+struct Open {
+    id: String,
+    accounting: Accounting,
+}
+
+/// Events that carry the `response` object, whose `response.id` names their response.
+const RESPONSE_EVENTS: [&str; 7] = [
+    "response.created",
+    "response.queued",
+    "response.in_progress",
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+    "response.done",
+];
+
+fn response_terminal(kind: &str) -> bool {
+    matches!(kind, "response.completed" | "response.done" | "response.incomplete")
 }
 
 /// The duplex stream's state: Go's writer and reader goroutines' shared metadata.
@@ -118,7 +216,15 @@ pub(super) struct Duplex {
     /// The bootstrap request's client model (Go `initial.originalPayload` `model`).
     initial_model: String,
     /// Creates sent upstream and not yet started or rejected, oldest first.
-    pending: VecDeque<Prepared>,
+    pending: VecDeque<Pending>,
+    /// Started responses whose records have not settled, oldest first; at most
+    /// [`RETAINED_RESPONSES`].
+    open: VecDeque<Open>,
+    /// The attempt's accounting moved to per-response records. Until then, or when the
+    /// attempt's observer keeps no such records, every event feeds the attempt's own.
+    detached: bool,
+    /// The client's frames ended: what still runs is canceled, not failed.
+    client_gone: bool,
     /// Parents of steers written and not yet acknowledged.
     unacknowledged: Vec<String>,
     /// Accepted steer id to parent response.
@@ -241,7 +347,13 @@ impl Duplex {
             credential: view.credential.clone(),
             image_generation,
             current: initial.clone(),
-            pending: VecDeque::from([initial.clone()]),
+            pending: VecDeque::from([Pending {
+                prepared: initial.clone(),
+                accounting: None,
+            }]),
+            open: VecDeque::new(),
+            detached: false,
+            client_gone: false,
             initial,
             initial_model,
             unacknowledged: Vec::new(),
@@ -278,7 +390,10 @@ impl Duplex {
         // session) is released.
         if let Some(observing) = self.observing.take() {
             observing.observation.await;
+            // The upstream ended that response, though nobody reads the stream any more.
+            self.settle_terminal(&observing.payload, &observing.kind);
         }
+        // Records still open settle as the client's cancellation when `self` drops.
     }
 
     async fn serve(&mut self) {
@@ -362,8 +477,97 @@ impl Duplex {
             self.failing.get_or_insert(error);
             return;
         }
-        self.outbox.push_back(Err(connection(error)));
+        let error = connection(error);
+        if self.client_gone {
+            self.cancel_records();
+        } else {
+            self.fail_records(&error);
+        }
+        self.outbox.push_back(Err(error));
         self.done = true;
+    }
+
+    /// The stream ends with `error`: every response still running, and every create
+    /// upstream has not started, fails with it. Settled records stay as they are.
+    fn fail_records(&mut self, error: &ExecError) {
+        for open in self.open.drain(..) {
+            open.accounting.fail(error);
+        }
+        for pending in &mut self.pending {
+            if let Some(accounting) = pending.accounting.take() {
+                accounting.fail(error);
+            }
+        }
+    }
+
+    /// The client left: every response still running, and every create upstream has not
+    /// started, is canceled. Settled records stay as they are.
+    fn cancel_records(&mut self) {
+        for open in self.open.drain(..) {
+            open.accounting.cancel();
+        }
+        for pending in &mut self.pending {
+            if let Some(accounting) = pending.accounting.take() {
+                accounting.cancel();
+            }
+        }
+    }
+
+    /// Feeds one upstream event to the usage record it belongs to: the attempt's own
+    /// until the attempt is detached, then the open response the event names (or the
+    /// latest). An event of no open response feeds none.
+    fn account(&self, payload: &str, kind: &str) {
+        if !self.detached {
+            if self.turn.usage.enabled() {
+                self.turn.usage.response_line(Format::Codex, payload.as_bytes());
+            }
+            return;
+        }
+        if let Some(i) = self.open_index(payload, kind) {
+            self.open[i].accounting.observe(payload);
+        }
+    }
+
+    /// The open response an upstream event belongs to: the latest one with the
+    /// `response.id` a response event names; any other event, or one without an ID,
+    /// belongs to the latest. A response event naming no open response (a duplicate
+    /// terminal event, say) belongs to none.
+    fn open_index(&self, payload: &str, kind: &str) -> Option<usize> {
+        let latest = self.open.len().checked_sub(1)?;
+        if !RESPONSE_EVENTS.contains(&kind) {
+            return Some(latest);
+        }
+        let id = rawjson::get(payload, "response.id");
+        if id.kind() != Kind::String || id.str().is_empty() {
+            return Some(latest);
+        }
+        self.open.iter().rposition(|open| open.id == id.str())
+    }
+
+    /// A terminal event settles its response's record with what it reported.
+    fn settle_terminal(&mut self, payload: &str, kind: &str) {
+        if !response_terminal(kind) {
+            return;
+        }
+        if let Some(open) = self.open_index(payload, kind).and_then(|i| self.open.remove(i)) {
+            open.accounting.complete();
+        }
+    }
+
+    /// A started response gets its record. Records stay bounded: past
+    /// [`RETAINED_RESPONSES`], the oldest response still open, which upstream left
+    /// without a terminal event while it started that many others, settles as failed.
+    // ponytail: a response upstream never ends counts as failed only once it is that old;
+    // a per-response deadline would need a timer this task does not have.
+    fn track(&mut self, id: String, accounting: Accounting) {
+        if self.open.len() >= RETAINED_RESPONSES
+            && let Some(oldest) = self.open.pop_front()
+        {
+            oldest
+                .accounting
+                .fail(&local("response superseded without a terminal event"));
+        }
+        self.open.push_back(Open { id, accounting });
     }
 
     fn enabled(&self) -> bool {
@@ -424,7 +628,9 @@ impl Duplex {
     fn client(&mut self, frame: Option<Bytes>) {
         let Some(frame) = frame else {
             // The downstream reader stopped: Go's writer fails with `context.Canceled`,
-            // a connection error that does not cool the credential.
+            // a connection error that does not cool the credential. Responses still
+            // running are the client's cancellation, not this error.
+            self.client_gone = true;
             self.fail(local("context canceled"));
             return;
         };
@@ -549,12 +755,22 @@ impl Duplex {
             std::borrow::Cow::Borrowed(_) => payload,
             std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
         };
-        let prepared = Prepared::new(self.initial.native);
         if self.pending.len() >= MAX_PENDING {
             self.fail(local("too many outstanding response.create requests"));
             return;
         }
-        self.pending.push_back(prepared);
+        // The create goes upstream: a record of its own, with this frame's facts and
+        // the reasoning effort it sends (as `report_request` reports the bootstrap's).
+        let usage = self.current.usage.successor(Some(frame.as_bytes()));
+        if usage.enabled() {
+            usage.request(Format::Codex, frame.as_bytes());
+        }
+        let accounting = self.detached.then(|| Accounting::new(usage.clone()));
+        let prepared = Prepared {
+            native: self.initial.native,
+            usage,
+        };
+        self.pending.push_back(Pending { prepared, accounting });
         self.write(frame);
     }
 
@@ -593,7 +809,8 @@ impl Duplex {
         if kind == "response.created" && !self.response_created(payload) {
             return;
         }
-        self.turn.observe(payload);
+        self.turn.signals(payload);
+        self.account(payload, &kind);
         match self.turn.wire.ws_response_observation(payload) {
             Some(observation) => {
                 self.observing = Some(Observing {
@@ -618,15 +835,16 @@ impl Duplex {
         }
         let failure = kind == "error" || kind == "response.failed";
         let cooling = self.turn.cooling;
-        let classify = |payload: &str| {
-            ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
-        };
+        let terminal =
+            ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e));
         // An account failure on a native connection never reaches the client as sent,
         // whichever request it belongs to: its frame can name the pooled account. The
         // error alone ends the stream, and the server delivers the allowlisted
         // subscription-limit event (#6) or closes silently.
-        if failure && let Some(error) = classify(payload).filter(|e| super::account_failure(e.status)) {
-            self.turn.wire.ws_exec_error("upstream_error", &error);
+        if failure && let Some(error) = terminal.as_ref().filter(|e| super::account_failure(e.status)) {
+            self.turn.wire.ws_exec_error("upstream_error", error);
+            let error = error.clone();
+            self.fail_records(&error);
             self.outbox.push_back(Err(error));
             self.done = true;
             return;
@@ -651,14 +869,33 @@ impl Duplex {
                 ));
                 return;
             }
+            // Both failure kinds always classify; the fallback only keeps the record a
+            // failure.
+            let error = terminal
+                .clone()
+                .unwrap_or_else(|| local("upstream failure event without details"));
             match self.pending.pop_front() {
-                Some(_) if !current_failure => {}
+                // The upstream rejected that create before it started.
+                Some(rejected) if !current_failure => {
+                    if let Some(accounting) = rejected.accounting {
+                        accounting.fail(&error);
+                    }
+                }
                 popped => {
                     if let Some(popped) = popped {
                         self.pending.push_front(popped);
                     }
                     self.response_active = false;
                     self.automatic_active = false;
+                    // The running response failed: the open one it names, else the latest.
+                    let index = if failed.is_empty() {
+                        self.open.len().checked_sub(1)
+                    } else {
+                        self.open.iter().rposition(|open| open.id == failed)
+                    };
+                    if let Some(open) = index.and_then(|i| self.open.remove(i)) {
+                        open.accounting.fail(&error);
+                    }
                 }
             }
         }
@@ -666,7 +903,6 @@ impl Duplex {
         // restored.
         // Only the first rejection fails the stream (and can enter bootstrap retry);
         // later ones are events the client may correct on this socket.
-        let terminal = classify(payload);
         if let Some(error) = &terminal {
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
@@ -695,9 +931,12 @@ impl Duplex {
         if kind == "response.output_item.done" {
             self.turn.items.collect(payload);
         }
-        if matches!(kind, "response.completed" | "response.done" | "response.incomplete") {
+        if response_terminal(kind) {
             self.response_active = false;
             self.automatic_active = false;
+            // Settled before the event is delivered: the record does not depend on
+            // whether the client is still there to receive it.
+            self.settle_terminal(payload, kind);
         }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
         if establishing {
@@ -730,10 +969,22 @@ impl Duplex {
         self.accepted.retain(|_, target| *target != parent);
         self.waiting_parent.clear();
         self.automatic_active = automatic;
-        if let Some(next) = self.pending.pop_front() {
-            self.current = next;
-        }
+        let accounting = match self.pending.pop_front() {
+            Some(Pending { prepared, accounting }) => {
+                self.current = prepared;
+                accounting.or_else(|| self.detach())
+            }
+            // An automatic successor: a record of its own, with the facts of the request
+            // whose settings it runs on.
+            None => self.detached.then(|| {
+                self.current.usage = self.current.usage.successor(None);
+                Accounting::new(self.current.usage.clone())
+            }),
+        };
         self.response_id = rawjson::get(payload, "response.id").str().to_owned();
+        if let Some(accounting) = accounting {
+            self.track(self.response_id.clone(), accounting);
+        }
         self.response_settings
             .insert(self.response_id.clone(), self.current.retained());
         self.response_order.push_back(self.response_id.clone());
@@ -747,6 +998,17 @@ impl Duplex {
         self.response_active = true;
         self.turn.items = Default::default();
         true
+    }
+
+    /// The bootstrap create started: the attempt's accounting moves to that response's
+    /// own record, and later creates and automatic successors get records of their own.
+    /// `None` when the attempt's observer keeps no such records, or already published;
+    /// the attempt then keeps its accounting for the whole connection.
+    fn detach(&mut self) -> Option<Accounting> {
+        let usage = self.turn.usage.detach()?;
+        self.detached = true;
+        self.current.usage = usage.clone();
+        Some(Accounting::new(usage))
     }
 
     /// `response.steer.*`: acknowledgement bookkeeping.
