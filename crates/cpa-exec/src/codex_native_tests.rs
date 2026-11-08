@@ -49,7 +49,6 @@ fn request(body: impl Into<Bytes>, model: &str, stream: bool, alt: Option<&str>)
         operation: Operation::Generate,
         source_format: Format::OpenAIResponse,
         response_format: Format::OpenAIResponse,
-        stream_payloads: false,
         requested_model: model.into(),
         model: model.into(),
         original_body: body.clone(),

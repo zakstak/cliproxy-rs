@@ -18,8 +18,8 @@ use futures_util::future::{BoxFuture, Shared};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::login::{form, open_browser, write_private};
 use crate::helpers::rfc3339_utc;
+use crate::login::{form, open_browser, write_private};
 use crate::meta_wire::{Slot, check_valid, unmarshal};
 use crate::proxy::{GoHeaders, MAX_ERROR_BODY, read_all, send};
 

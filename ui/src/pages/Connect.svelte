@@ -9,11 +9,7 @@
   const builtIn = ["claude", "codex", "xai", "meta"];
   // Go starts a local callback forwarder for these when asked by a web UI.
   const forwarded = ["claude", "codex", "xai"];
-  if (!store.plugins.data) store.plugins.load();
-  const providers = $derived([
-    ...builtIn,
-    ...(store.plugins.data || []).filter((p) => p.supports_oauth).map((p) => String(p.oauth_provider || p.id)),
-  ]);
+  const providers = builtIn;
   let gone = $state<string[]>([]),
     session = $state<Data | null>(null),
     status = $state(""),
@@ -81,8 +77,7 @@
       // cliproxy-rs keeps a finished sign-in's result for 30 minutes; Go and older servers
       // forget a successful one after a minute. Then only a new credential name for exactly
       // this built-in provider, between two successful reads, says the sign-in worked.
-      // Anything else is unknown: a rewritten file can be a refresh or an upload, and a
-      // plugin's provider name need not match its credentials'.
+      // Anything else is unknown: a rewritten file can be a refresh or an upload.
       now = Date.now();
       if (r.error === "unknown or expired state") {
         const fresh = (await mine(s)).filter((c) => !s.seen.has(c.name));

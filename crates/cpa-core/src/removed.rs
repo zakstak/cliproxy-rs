@@ -88,7 +88,10 @@ const SETTINGS: &[(&[&str], &str)] = &[
     (&["api-keys", "interactions"], "interactions-api-key"),
     (&["api-keys", "vertex"], "vertex-api-key"),
     (&["api-keys", "openai-compatibility"], "openai-compatibility"),
-    (&["oauth", "providers", "antigravity"], "antigravity, antigravity-signature-*, quota-exceeded.antigravity-credits"),
+    (
+        &["oauth", "providers", "antigravity"],
+        "antigravity, antigravity-signature-*, quota-exceeded.antigravity-credits",
+    ),
     (&["oauth", "providers", "devin"], "devin"),
     (&["oauth", "providers", "aistudio"], "ws-auth"),
     (&["oauth", "providers", "kimi"], ""),
@@ -122,8 +125,7 @@ pub fn config(doc: &Value) -> anyhow::Result<()> {
         if !set(value) {
             continue;
         }
-        let name = provider(path[path.len() - 1].trim_end_matches("-catalog"))
-            .map_or("a removed provider", |r| r.name);
+        let name = provider(path[path.len() - 1].trim_end_matches("-catalog")).map_or("a removed provider", |r| r.name);
         let legacy = if legacy.is_empty() {
             String::new()
         } else {
@@ -230,7 +232,14 @@ mod tests {
 
     #[test]
     fn providers_fold_like_go() {
-        for name in ["kimi", " KIMI.com ", "Devin", "gemini-cli", "openai-compatible-deepseek", "AISTUDIO"] {
+        for name in [
+            "kimi",
+            " KIMI.com ",
+            "Devin",
+            "gemini-cli",
+            "openai-compatible-deepseek",
+            "AISTUDIO",
+        ] {
             assert!(provider(name).is_some(), "{name}");
         }
         for name in SUPPORTED {
@@ -244,13 +253,19 @@ mod tests {
         let err = config(&doc("api-keys:\n  gemini:\n    - keys: [{api-key: k}]\n"))
             .unwrap_err()
             .to_string();
-        assert!(err.starts_with("api-keys.gemini (legacy `gemini-api-key`) configures Gemini"), "{err}");
+        assert!(
+            err.starts_with("api-keys.gemini (legacy `gemini-api-key`) configures Gemini"),
+            "{err}"
+        );
         assert!(err.contains("Claude, Codex, Grok (xai) and Muse (meta)"), "{err}");
         assert!(strip_settings("a: 1\napi-keys:\n  vertex:\n    - k: v\n  claude: []\n").contains("claude"));
         let err = config(&doc("oauth:\n  excluded-models:\n    antigravity: [a]\n"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("oauth.excluded-models.antigravity configures Antigravity"), "{err}");
+        assert!(
+            err.contains("oauth.excluded-models.antigravity configures Antigravity"),
+            "{err}"
+        );
         assert!(config(&doc("models:\n  devin-catalog: https://example.invalid/d.json\n")).is_err());
         assert!(config(&doc("oauth:\n  providers:\n    aistudio:\n      ws-auth: true\n")).is_err());
     }

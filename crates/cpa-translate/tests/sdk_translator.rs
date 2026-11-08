@@ -40,7 +40,12 @@ fn retained(v: &Value) -> bool {
 #[test]
 fn registered_pairs_match_go() {
     let doc = load();
-    let regs: Vec<&Value> = doc["registrations"].as_array().unwrap().iter().filter(|r| retained(r)).collect();
+    let regs: Vec<&Value> = doc["registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| retained(r))
+        .collect();
     assert_eq!(regs.len(), Format::ALL.len() * Format::ALL.len());
     for r in regs {
         let (client, upstream) = (format(&r["client"]), format(&r["upstream"]));

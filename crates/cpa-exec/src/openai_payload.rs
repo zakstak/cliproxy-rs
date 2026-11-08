@@ -1,7 +1,6 @@
 //! Pure Responses request and response rewrites shared by the xAI, Meta and Codex
 //! executors, each a port of the Go helper named in its doc comment.
 
-
 use cpa_common::json::{self as gj, Kind};
 use cpa_core::credential::Credential;
 use http::HeaderMap;

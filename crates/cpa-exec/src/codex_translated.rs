@@ -2,8 +2,7 @@
 //! served by a Codex credential on a `chatgpt`, `api-key` or `compatible` profile (`docs/codex/CONTRACT.md` "Translated route").
 //!
 //! The request is converted into a Responses body by the built-in translator of its
-//! pair, and nothing else edits it. No plugin request normalizer or plugin translator
-//! runs, no payload rule, prompt-cache key, reasoning replay, input-ID rewrite, tool
+//! pair, and nothing else edits it. No payload rule, prompt-cache key, reasoning replay, input-ID rewrite, tool
 //! injection or schema normalization, no namespace optimization and no default
 //! `instructions`. The translator refuses, before the send, any content part the
 //! destination cannot express. Two transport edits follow the conversion: the routed
@@ -11,7 +10,7 @@
 //! either way.
 //!
 //! The response is converted back by the same pair's built-in translator, without
-//! plugin response hooks, namespace restoration or a local token estimate in place of
+//! namespace restoration or a local token estimate in place of
 //! provider usage. A buffered client receives the aggregate of the upstream's events.
 
 use super::*;
@@ -184,9 +183,8 @@ fn response_ctx<'a>(req: &'a ExecRequest, translated: &'a str) -> cpa_translate:
 /// The client's buffered body: the built-in non-stream translation of the aggregate.
 fn client_body(req: &ExecRequest, translated: &str, completed: &str) -> Result<Bytes, ExecError> {
     let ctx = response_ctx(req, translated);
-    let out = cpa_translate::builtin_non_stream(req.response_format, Format::Codex, &ctx, completed.as_bytes())
-        .ok_or_else(unregistered_response)?
-        .map_err(translate_error)?;
+    let pair = cpa_translate::pair(req.response_format, Format::Codex).ok_or_else(unregistered_response)?;
+    let out = (pair.non_stream)(&ctx, completed.as_bytes()).map_err(translate_error)?;
     if out.is_empty() {
         return Err(ExecError::local(
             502,
@@ -202,13 +200,10 @@ fn client_body(req: &ExecRequest, translated: &str, completed: &str) -> Result<B
 /// local token estimate stands in for provider usage.
 fn client_stream(req: &ExecRequest, translated: &str, upstream: ExecStream) -> ExecStream {
     let ctx = response_ctx(req, translated);
-    let Some(mut translator) = cpa_translate::builtin_stream(req.response_format, Format::Codex, &ctx) else {
+    let Some(pair) = cpa_translate::pair(req.response_format, Format::Codex) else {
         return futures_util::stream::once(async { Err(unregistered_response()) }).boxed();
     };
-    // The server's stream interceptors frame the client's payloads themselves.
-    if req.stream_payloads {
-        translator.executor_chunks();
-    }
+    let translator = (pair.stream)(&ctx);
     struct State {
         upstream: ExecStream,
         translator: Box<dyn cpa_translate::StreamTranslator>,

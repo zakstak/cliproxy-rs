@@ -663,7 +663,11 @@ fn deeply_nested_upstream_bodies_translate_without_overflowing() {
     ]
     .concat();
     let out = (pair(Format::OpenAI, Format::Claude).unwrap().non_stream)(&rctx, &body).unwrap();
-    assert!(out.starts_with(br#"{"id":"m""#), "{}", String::from_utf8_lossy(&out[..80]));
+    assert!(
+        out.starts_with(br#"{"id":"m""#),
+        "{}",
+        String::from_utf8_lossy(&out[..80])
+    );
     // Stream: a deeply nested content block as one upstream event.
     let mut stream = (pair(Format::OpenAIResponse, Format::Claude).unwrap().stream)(&rctx);
     let event = [

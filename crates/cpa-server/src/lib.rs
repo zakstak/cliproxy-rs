@@ -28,10 +28,10 @@ mod models;
 pub mod observability;
 mod openai;
 pub mod persist;
-pub mod plugins;
 pub mod pprof;
 mod realtime;
 mod refresh;
+mod registrations;
 pub mod registry;
 pub mod remote;
 pub mod request_logging;
@@ -281,4 +281,3 @@ async fn callback(State(rt): State<Arc<Runtime>>, OriginalUri(uri): OriginalUri)
     }
     html()
 }
-

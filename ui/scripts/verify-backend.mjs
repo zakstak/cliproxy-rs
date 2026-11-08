@@ -44,8 +44,9 @@ try {
   await call("/observability/usage/api-keys");
   await call("/observability/usage/queue?count=50");
   await call("/observability/usage/live");
-  await call("/plugins");
-  await call("/plugins/store");
+  // Native plugins are removed: their routes answer 410 plugins_removed.
+  await call("/plugins", "GET", undefined, 410);
+  await call("/plugins/store", "GET", undefined, 410);
   await call("/server/latest-version");
   const upstream = await call("/requests/api-call", "POST", {
     method: "GET",
@@ -219,13 +220,7 @@ try {
     undefined,
     404,
   );
-  await call(
-    "/plugins/dashboard-test/quota?auth_index=no-such-account",
-    "GET",
-    undefined,
-    404,
-  );
-  await call("/plugins/dashboard-test", "DELETE", undefined, 404);
+  await call("/plugins/dashboard-test", "DELETE", undefined, 410);
   console.log(
     `PASS: ${checks} endpoint checks, including write/readback, rejection, OAuth start/poll/callback/cancel, credential CRUD, and cursor logs.`,
   );

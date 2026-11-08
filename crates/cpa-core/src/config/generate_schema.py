@@ -16,7 +16,7 @@ revision = subprocess.check_output(["git", "-C", str(reference), "rev-parse", "H
 assert revision.startswith("ae3ee3be"), "Use the pinned parity reference"
 structs = {}
 aliases = {}
-for directory, prefix in [("internal/config", ""), ("internal/registry", "registry."), ("internal/pluginstore", "sdkpluginstore.")]:
+for directory, prefix in [("internal/config", ""), ("internal/registry", "registry.")]:
     for file in sorted((reference / directory).glob("*.go")):
         if file.name.endswith("_test.go"):
             continue
@@ -48,6 +48,9 @@ def shape(type_name):
     assert type_name in primitives, f"Unresolved Go type: {type_name}"
     return primitives[type_name]
 
+# Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): a config
+# with a `plugins` section is refused before the schema is read.
+structs["Config"].pop("plugins")
 schema = shape("Config")
 schema["fields"].update(shape("SDKConfig")["fields"])
 

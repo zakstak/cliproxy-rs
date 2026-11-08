@@ -226,7 +226,6 @@ fn request(turn: &Value, session: &str, usage: cpa_core::exec::UsageSink) -> Exe
             .as_str()
             .and_then(Format::parse)
             .unwrap_or(Format::OpenAIResponse),
-        stream_payloads: false,
         requested_model: model.clone(),
         model,
         original_body: payload.clone(),

@@ -334,7 +334,6 @@ pub(crate) struct DeferredUsage {
 }
 
 impl DeferredUsage {
-
     /// Reports the held usage.
     pub(crate) fn commit(&self) {
         let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner));

@@ -390,9 +390,7 @@ pub fn start(rt: &Arc<Runtime>, home_enabled: bool) {
         policy,
     });
     if home_enabled {
-        tracing::info!(
-            "Home mode: models.json updates disabled; Codex client model list follows Home model IDs"
-        );
+        tracing::info!("Home mode: models.json updates disabled; Codex client model list follows Home model IDs");
     }
     if deny_default {
         return;
@@ -820,7 +818,13 @@ mod tests {
         configure(&updaters, &lifetime, &sources(url, ""), policy(true, false), true);
         assert_eq!(next(&mut general_rx).await, url);
         assert_eq!(next(&mut codex_rx).await, EMBED);
-        configure(&updaters, &lifetime, &sources("", codex_url), policy(true, false), false);
+        configure(
+            &updaters,
+            &lifetime,
+            &sources("", codex_url),
+            policy(true, false),
+            false,
+        );
         assert_eq!(next(&mut general_rx).await, EMBED);
         assert_eq!(next(&mut codex_rx).await, codex_url);
         let ignored = "https://example.com/ignored";

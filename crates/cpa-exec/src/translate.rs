@@ -10,13 +10,9 @@ use futures_util::StreamExt;
 
 use crate::openai_payload::ensure_responses_usage_details;
 
-/// Choose the output boundary once, before the stream and its interceptors run.
-pub(crate) fn stream(pair: &Pair, ctx: &ResponseCtx<'_>, req: &ExecRequest) -> Box<dyn StreamTranslator> {
-    let mut translator = (pair.stream)(ctx);
-    if req.stream_payloads {
-        translator.executor_chunks();
-    }
-    translator
+/// The pair's client-framed stream translator.
+pub(crate) fn stream(pair: &Pair, ctx: &ResponseCtx<'_>) -> Box<dyn StreamTranslator> {
+    (pair.stream)(ctx)
 }
 
 /// `TranslateRequestWithAPIKeyModelCompatibilityForExecutor` to Claude for `model` (the
@@ -133,7 +129,7 @@ fn translate_body(
         is_compat,
     };
     crate::codex_client::translate_request(req.source_format, Format::Claude, &ctx, body, &client)
-        .map(|t| Bytes::from(t.body))
+        .map(Bytes::from)
         .map_err(error)
 }
 
@@ -177,7 +173,7 @@ async fn transform(
         match body {
             ResponseBody::Stream(stream) => Ok(ResponseBody::Stream(streaming(
                 stream,
-                self::stream(pair, &context, &req),
+                self::stream(pair, &context),
                 responses,
                 req.usage.clone(),
             ))),
@@ -362,7 +358,6 @@ mod tests {
             operation,
             source_format: Format::OpenAI,
             response_format: Format::OpenAI,
-            stream_payloads: false,
             requested_model: "requested".into(),
             model: "resolved".into(),
             original_body: Bytes::from_static(b"original"),

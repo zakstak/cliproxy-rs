@@ -1,6 +1,6 @@
 // Fake provider login endpoints for end-to-end OAuth checks. Never a real provider.
 // Answers the token, profile, device-code, key-mint and Claude usage routes that cliproxy-rs and Go call
-// during Claude, Codex, Kimi, Meta, xAI and Devin logins, with fake tokens and @example.invalid emails.
+// during Claude, Codex, Meta and xAI logins, with fake tokens and @example.invalid emails.
 // Device flows answer "authorization_pending" on the first poll, then succeed.
 // Usage: node scripts/fake-logins.mjs [port]   (default 9102)
 import http from "node:http";
@@ -41,19 +41,6 @@ const routes = {
     organization: { uuid: "org-fake", name: "Fake Org" },
   }),
   "/api/oauth/claude_cli/roles": () => ({ organization_role: "admin", workspace_role: null }),
-  // Kimi (device flow)
-  "/api/oauth/device_authorization": () => ({
-    device_code: "fake-kimi-dc",
-    user_code: "KIMI-FAKE",
-    verification_uri: "https://kimi.example.invalid/device",
-    verification_uri_complete: "https://kimi.example.invalid/device?code=KIMI-FAKE",
-    expires_in: 600,
-    interval: 1,
-  }),
-  "/api/oauth/token": () =>
-    pending("kimi")
-      ? [400, { error: "authorization_pending" }]
-      : { access_token: "fake-kimi-at", refresh_token: "fake-kimi-rt", token_type: "Bearer", expires_in: 3600, scope: "s" },
   // Meta (device flow, then API-key mint)
   "/oidc/device/authorization/": () => ({
     device_code: "fake-meta-dc",
@@ -96,10 +83,6 @@ const routes = {
           token_type: "Bearer",
           expires_in: 3600,
         },
-  // Devin (PKCE code exchange and profile; the user-status RPC gets {} and the login
-  // tolerates its failure)
-  "/auth/cli/token": () => ({ token: "fake-devin-session" }),
-  "/v3/self": () => ({ user_name: "devin-login", user_id: "u-fake-devin", org_id: "o-fake-devin" }),
 };
 
 http

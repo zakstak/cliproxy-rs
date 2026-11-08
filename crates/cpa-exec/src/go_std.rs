@@ -227,5 +227,4 @@ mod tests {
         assert_eq!(trim_space("\u{a0} x \u{3000}\r".as_bytes()), b"x");
         assert_eq!(trim_space(b"\xff "), b"\xff");
     }
-
 }

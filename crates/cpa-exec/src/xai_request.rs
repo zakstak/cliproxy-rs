@@ -126,7 +126,6 @@ fn translate(
         body,
         client,
     )
-    .map(|t| t.body)
     .map_err(|e| bad_request(e.to_string()))
 }
 

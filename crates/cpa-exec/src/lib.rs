@@ -87,12 +87,6 @@ use cpa_core::config::Config;
 use cpa_core::credential::{Credential, MetadataPatch};
 use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureScope};
 
-/// Go `Auth.ExpirationTime`, `authLastRefreshTimestamp` and `authPreferredInterval`, for
-/// the server's plugin refresh schedule (Go `shouldRefresh` for providers without a lead).
-pub use helpers::{expiration, last_refresh, preferred_interval};
-/// Go `helps.EnsureResponsesUsageDetails`, for paths outside the executors (plugin
-/// executors' Responses payloads and stream chunks).
-pub use openai_payload::ensure_responses_usage_details;
 pub use xai_ws::websockets_enabled;
 
 /// What a credential needs before or around use. See the module docs.

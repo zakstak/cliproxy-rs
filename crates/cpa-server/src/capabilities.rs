@@ -15,7 +15,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::thinking::parse_suffix;
 use cpa_core::config::Config;
 use cpa_core::config::credentials;
-use cpa_core::credential::{Credential, Source};
+use cpa_core::credential::Credential;
 use cpa_core::exec::{ResolvedModel, ResolvedSource};
 use cpa_core::registry::dynamic::{self, ConfigModel};
 use cpa_core::registry::{ModelInfo, ThinkingSupport, pinned};

@@ -16,9 +16,8 @@
 //!   bytes are framed the way the client's Go route handler writes them ([`stream::frame`]).
 //! - [`token_count`] renders an upstream token count in the client's shape (Go's
 //!   TokenCount); `count_tokens` is the older body-based form and stays unset.
-//! - Plugin translator hooks ([`hooks`]) run inside these entry points and inside every
-//!   pair's `non_stream` and `stream`, in Go's registry order; with none active, the
-//!   bytes are those of the native path.
+//! - Go's plugin translator hooks are not part of this registry: native plugins are
+//!   removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
 //! - Response transforms run after the executor has reversed provider rewrites (tool
 //!   aliases, cloak) and see the client's original request and the translated request
 //!   from before those rewrites.
@@ -41,27 +40,14 @@ macro_rules! registered {
                 },
                 non_stream: |ctx, body| {
                     let non_stream: $crate::NonStreamFn = $non_stream;
-                    $crate::hooks::non_stream(
-                        cpa_core::format::Format::$upstream.as_str(),
-                        cpa_core::format::Format::$client.as_str(),
-                        ctx,
-                        body,
-                        |body| {
-                            let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
-                            $crate::deep_stack(levels, || non_stream(ctx, body))
-                        },
-                    )
+                    let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
+                    $crate::deep_stack(levels, || non_stream(ctx, body))
                 },
                 stream: |ctx| {
                     $crate::stream::framed(
                         cpa_core::format::Format::$client,
                         cpa_core::format::Format::$upstream,
-                        $crate::hooks::stream(
-                            cpa_core::format::Format::$upstream.as_str(),
-                            cpa_core::format::Format::$client.as_str(),
-                            ctx,
-                            ($go_stream)(ctx),
-                        ),
+                        ($go_stream)(ctx),
                         $crate::levels(&[ctx.original_request, ctx.translated_request]),
                     )
                 },
@@ -69,11 +55,6 @@ macro_rules! registered {
             },
             token_count: $token_count,
             go_stream: $go_stream,
-            builtin_non_stream: |ctx, body| {
-                let non_stream: $crate::NonStreamFn = $non_stream;
-                let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
-                $crate::deep_stack(levels, || non_stream(ctx, body))
-            },
         }
     };
 }
@@ -91,7 +72,6 @@ mod codex_claude_response;
 mod codex_responses;
 mod codex_strict;
 mod common;
-pub mod hooks;
 mod openai;
 mod openai_claude;
 mod openai_claude_response;
@@ -189,9 +169,6 @@ pub struct ResponseCtx<'a> {
 }
 
 pub trait StreamTranslator: Send {
-    /// Select executor chunks before the HTTP handler's framing. Native translators
-    /// already emit executor chunks; the shared framing adapter overrides this.
-    fn executor_chunks(&mut self) {}
     /// One complete upstream event in, zero or more complete client events out.
     fn event(&mut self, event: &[u8]) -> Result<Vec<Bytes>, Error>;
     /// Upstream ended cleanly; emit any closing events.
@@ -250,12 +227,10 @@ pub(crate) struct Registered {
     pub pair: Pair,
     pub token_count: Option<TokenCountFn>,
     pub go_stream: GoStreamFn,
-    /// The pair's non-stream translation without plugin response hooks.
-    pub builtin_non_stream: NonStreamFn,
 }
 
 fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
-    // ponytail: static match; plugins translate through [`hooks`] for pairs without one.
+    // ponytail: static match over the built-in pairs.
     match (client, upstream) {
         (Format::OpenAI, Format::OpenAI) => Some(&openai::PAIR),
         (Format::OpenAI, Format::Claude) => Some(&claude_chat_request::PAIR),
@@ -293,7 +268,7 @@ pub fn stream_with(
         stream::framed_with(
             client,
             upstream,
-            hooks::stream(upstream.as_str(), client.as_str(), ctx, (r.go_stream)(ctx)),
+            (r.go_stream)(ctx),
             levels(&[ctx.original_request, ctx.translated_request]),
             options,
         )
@@ -307,44 +282,24 @@ pub fn go_stream(client: Format, upstream: Format) -> Option<GoStreamFn> {
 }
 
 /// sdk/translator TranslateRequest. A registered pair runs between summary extraction
-/// (from the client body) and summary application (to the upstream body), then the
-/// plugin request normalizers, which own the final payload. Without a pair, a differing
-/// top-level `model` is rewritten; with plugin hooks, the normalizers run on that body
-/// and a plugin request translator may take it, wrapped in the summary pipeline.
+/// (from the client body) and summary application (to the upstream body). Without a
+/// pair, a differing top-level `model` is rewritten. Go's plugin request normalizers
+/// and translators are removed with native plugins.
 pub fn translate_request(
     client: Format,
     upstream: Format,
     ctx: &RequestCtx<'_>,
     body: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    translate_request_tracked(client, upstream, ctx, body).map(|t| t.body)
-}
-
-/// A translated request and whether a plugin request normalizer changed its Responses
-/// `configuration_update` input items (Go `RequestEnvelope.ConfigurationUpdatesChanged`,
-/// which the Codex executor passes on to thinking).
-pub struct Translated {
-    pub body: Vec<u8>,
-    pub configuration_updates_changed: bool,
-}
-
-/// [`translate_request`] with [`Translated::configuration_updates_changed`].
-pub fn translate_request_tracked(
-    client: Format,
-    upstream: Format,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-) -> Result<Translated, Error> {
     match pair(client, upstream) {
         Some(pair) => translate_registered(client, upstream, ctx, body, |body| (pair.request)(ctx, body)),
-        None => Ok(translate_fallback(client.as_str(), upstream.as_str(), ctx, body)),
+        None => Ok(translate_fallback(ctx, body)),
     }
 }
 
 /// The Codex translated route's request conversion (`docs/codex/CONTRACT.md`
 /// "Translated route"): the built-in converter of `client` into Codex in its strict
-/// mode, without plugin request normalizers or plugin translators, whose output no hook
-/// may change. The thinking summary pipeline runs, as it converts the client's own
+/// mode. The thinking summary pipeline runs, as it converts the client's own
 /// reasoning-summary choice. `None` for a source the route does not convert.
 pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Option<Result<Vec<u8>, Error>> {
     let convert: RequestFn = match client {
@@ -366,44 +321,6 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
     }))
 }
 
-/// A registered pair's non-stream response translation without plugin response hooks
-/// (see [`codex_request`]).
-pub fn builtin_non_stream(
-    client: Format,
-    upstream: Format,
-    ctx: &ResponseCtx<'_>,
-    body: &[u8],
-) -> Option<Result<Vec<u8>, Error>> {
-    registered(client, upstream).map(|r| (r.builtin_non_stream)(ctx, body))
-}
-
-/// A registered pair's stream translation without plugin response hooks (see
-/// [`codex_request`]).
-pub fn builtin_stream(client: Format, upstream: Format, ctx: &ResponseCtx<'_>) -> Option<Box<dyn StreamTranslator>> {
-    registered(client, upstream).map(|r| {
-        stream::framed(
-            client,
-            upstream,
-            (r.go_stream)(ctx),
-            levels(&[ctx.original_request, ctx.translated_request]),
-        )
-    })
-}
-
-/// [`translate_request`] between format names, which may name a format only a plugin
-/// knows (Go's registry is keyed by name): such a pair has no native translator.
-pub fn translate_request_named(
-    client: &str,
-    upstream: &str,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-) -> Result<Vec<u8>, Error> {
-    match Format::parse(client).zip(Format::parse(upstream)) {
-        Some((client, upstream)) => translate_request(client, upstream, ctx, body),
-        None => Ok(translate_fallback(client, upstream, ctx, body).body),
-    }
-}
-
 /// The registered branch of Go `TranslateRequestEnvelope`.
 fn translate_registered(
     client: Format,
@@ -411,8 +328,8 @@ fn translate_registered(
     ctx: &RequestCtx<'_>,
     body: &[u8],
     native: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error> + Send,
-) -> Result<Translated, Error> {
-    let out = deep_stack(levels(&[body]), || {
+) -> Result<Vec<u8>, Error> {
+    deep_stack(levels(&[body]), || {
         let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
         let out = native(body)?;
         Ok(thinking::apply_summary_for_model(
@@ -421,54 +338,26 @@ fn translate_registered(
             ctx.model,
             summary,
         ))
-    })?;
-    let Some(h) = hooks::current() else {
-        return Ok(Translated {
-            body: out,
-            configuration_updates_changed: false,
-        });
-    };
-    let (body, changed) = hooks::normalize_tracked(&*h, client.as_str(), upstream.as_str(), ctx.model, out, ctx.stream);
-    Ok(Translated {
-        body,
-        configuration_updates_changed: changed,
     })
 }
 
 /// The unregistered branch of Go `TranslateRequestEnvelope`.
-fn translate_fallback(from: &str, to: &str, ctx: &RequestCtx<'_>, body: &[u8]) -> Translated {
+fn translate_fallback(ctx: &RequestCtx<'_>, body: &[u8]) -> Vec<u8> {
     let mut out = body.to_vec();
     if !ctx.model.is_empty() && *gj::get(body, "model").bytes() != *ctx.model.as_bytes() {
         gj::set_str(&mut out, "model", ctx.model);
     }
-    let Some(h) = hooks::current() else {
-        return Translated {
-            body: out,
-            configuration_updates_changed: false,
-        };
-    };
-    // The normalizers canonicalize the source before a plugin translator handles the
-    // missing route; summary intent is read from the normalized source.
-    let (mut out, changed) = hooks::normalize_tracked(&*h, from, to, ctx.model, out, ctx.stream);
-    let summary = thinking::extract_translated_summary(&out, from, to);
-    if let Some(translated) = h.translate_request(from, to, ctx.model, &out, ctx.stream) {
-        out = thinking::apply_summary_for_model(translated, to, ctx.model, summary);
-    }
-    Translated {
-        body: out,
-        configuration_updates_changed: changed,
-    }
+    out
 }
 
-/// The pair's Go-shaped stream translator with the plugin response hooks around it, for
-/// executors that drive Go lines themselves. `None` when no pair is registered and no
-/// hooks are active (Go's `TranslateStream` then passes each chunk through).
-pub fn hooked_go_stream(client: &str, upstream: &str, ctx: &ResponseCtx<'_>) -> Option<Box<dyn stream::GoStream>> {
-    let native = Format::parse(client)
+/// The pair's Go-shaped stream translator, for executors that drive Go lines
+/// themselves. `None` when no pair is registered (Go's `TranslateStream` then passes
+/// each chunk through).
+pub fn named_go_stream(client: &str, upstream: &str, ctx: &ResponseCtx<'_>) -> Option<Box<dyn stream::GoStream>> {
+    Format::parse(client)
         .zip(Format::parse(upstream))
         .and_then(|(c, u)| registered(c, u))
-        .map(|r| (r.go_stream)(ctx));
-    hooks::wrap_stream(upstream, client, ctx, native)
+        .map(|r| (r.go_stream)(ctx))
 }
 
 /// sdk/translator TranslateTokenCount: the pair's token-count shape, or the upstream body

@@ -76,7 +76,6 @@ fn meta_credential(fx: &Value, origin: &str, url: &str) -> Credential {
         attributes: Default::default(),
         metadata,
         revision: 0,
-        next_refresh_after: None,
     };
     c.refresh_derived();
     c.attributes = replace_origin(&fx["attributes"], origin, url)

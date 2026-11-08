@@ -242,11 +242,9 @@ impl ClaudeExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let model = base_model(&req.model);
         let stream = req.stream;
-        req.body = compaction::summary_payload(crate::compaction_capsule::source_payload(
-            &req.body,
-            &req.original_body,
-        ))
-        .into();
+        req.body =
+            compaction::summary_payload(crate::compaction_capsule::source_payload(&req.body, &req.original_body))
+                .into();
         req.original_body = Bytes::new();
         req.alt = None;
         req.stream = false;
@@ -504,11 +502,7 @@ impl ClaudeExecutor {
         translate::response(req, translated, response, tool_search).await
     }
 
-    async fn count_tokens(
-        &self,
-        ctx: Ctx<'_>,
-        mut req: ExecRequest,
-    ) -> Result<ExecResponse, ExecError> {
+    async fn count_tokens(&self, ctx: Ctx<'_>, mut req: ExecRequest) -> Result<ExecResponse, ExecError> {
         ctx.tool_search_fallback(&mut req);
         let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search())?;
         // sdktranslator.TranslateTokenCount(to=claude, responseFormat, count, raw).
@@ -1021,12 +1015,7 @@ fn extract_betas(body: String) -> (Vec<String>, String) {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(
-        exec: &ClaudeExecutor,
-        credential: &'a Credential,
-        req: &ExecRequest,
-        cfg: &Config,
-    ) -> Self {
+    fn new(exec: &ClaudeExecutor, credential: &'a Credential, req: &ExecRequest, cfg: &Config) -> Self {
         let settings = Settings::from_config(cfg);
         let attr = |k: &str| credential.attributes.get(k).map(String::as_str).unwrap_or_default();
         let api_key = if attr("api_key").is_empty() {

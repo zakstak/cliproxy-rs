@@ -293,11 +293,7 @@ fn without_compat_models(body: &str) -> String {
     let mut out = body.as_bytes().to_vec();
     loop {
         let ids = cpa_common::json::get(&out, "data.#.id");
-        let Some(i) = ids
-            .array()
-            .iter()
-            .position(|id| matches!(&*id.str(), "chat" | "img"))
-        else {
+        let Some(i) = ids.array().iter().position(|id| matches!(&*id.str(), "chat" | "img")) else {
             break;
         };
         assert!(cpa_common::json::delete(&mut out, &format!("data.{i}")));

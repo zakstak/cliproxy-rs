@@ -11,14 +11,15 @@ const KEY: &str = "a tagged or aliased mapping key in the config file is not sup
 const MERGE: &str = "yaml: map merge requires map or sequence of maps as the value";
 const QUOTED_MERGE: &str = "a quoted << mapping key in the config file is not supported";
 const ANCHOR: &str = "a YAML anchor name is defined more than once in the config file";
-const PIN: &str =
-    "a plugin's store.version or store.release-tag in the config file is a !!binary value, which is not supported";
+/// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
+/// plugin cases are refused for their `plugins` section.
+const PLUGINS: &str = cpa_core::config::PLUGINS_REMOVED;
 const REFUSED: &[(&str, &str)] = &[
-    ("binary plugin pin", PIN),
-    ("aliased binary plugin pin", PIN),
-    ("binary plugin pin through a merge", PIN),
-    // Go pins the explicit `!keep 4.5.6`; the binary merge candidate is refused anyway.
-    ("shadowed binary plugin pin", PIN),
+    ("binary plugin pin", PLUGINS),
+    ("aliased binary plugin pin", PLUGINS),
+    ("binary plugin pin through a merge", PLUGINS),
+    ("shadowed binary plugin pin", PLUGINS),
+    ("binary plugin setting", PLUGINS),
     ("not UTF-8", "a !!binary value in the config file is not UTF-8 text"),
     ("redefined anchor around a binary secret", ANCHOR),
     ("redefined anchor", ANCHOR),
@@ -45,7 +46,7 @@ const REFUSED: &[(&str, &str)] = &[
     // yaml.v3 skips a merge source a key already set shadows; the merge checks run anyway.
     ("shadowed merge of an aliased sequence", MERGE),
     ("shadowed scalar merge", MERGE),
-    ("binary plugin pin through a tagged merge source", PIN),
+    ("binary plugin pin through a tagged merge source", PLUGINS),
 ];
 
 #[test]

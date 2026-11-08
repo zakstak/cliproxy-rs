@@ -6,8 +6,8 @@
 //! Formats and providers are Go's lowercase identifiers (`openai`, `openai-response`,
 //! `codex`, `claude`, `gemini`, `antigravity`, `interactions`, `kimi`, `xai`).
 //!
-//! ponytail: Go's plugin-registered appliers (RegisterPluginProvider, M6) are not
-//! ported; only the built-in appliers exist. Debug logging is omitted.
+//! Only the built-in appliers exist: Go's plugin-registered appliers
+//! (`RegisterPluginProvider`) went with native plugins. Debug logging is omitted.
 
 use crate::gostr::GoStr;
 mod apply;
@@ -16,9 +16,7 @@ mod summary;
 mod validate;
 
 pub use apply::*;
-pub use providers::{
-    PluginApplier, apply_provider, clear_plugin_providers, register_plugin_provider, unregister_plugin_providers,
-};
+pub use providers::apply_provider;
 pub use summary::*;
 pub use validate::validate_config;
 

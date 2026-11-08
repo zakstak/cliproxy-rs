@@ -1,6 +1,6 @@
 // Live quota checks, shared by Overview and Quotas. A check asks the provider through the
-// server (/requests/api-call with the credential's own token, or a quota plugin), so it
-// only ever runs when the user presses a button.
+// server (/requests/api-call with the credential's own token), so it only ever runs when the
+// user presses a button.
 import { api } from "./api";
 import { store } from "./store.svelte";
 import { provider, quotaWindows, signalWindows, type Data, type Window } from "./core";
@@ -10,12 +10,9 @@ const usageURL: Record<string, string> = {
   claude: "https://api.anthropic.com/api/oauth/usage",
   codex: "https://chatgpt.com/backend-api/wham/usage",
 };
-const plugin = (p: string) =>
-  (store.plugins.data || []).find((x) => x.supports_quota && (x.quota_provider || x.id) === p);
 export const quotaKey = (a: Data) => a.auth_index || a.name;
-/** The provider has a usage endpoint or quota plugin this server can call. */
-export const hasSource = (a: Data) =>
-  !!plugin(provider(a)) || (!!usageURL[provider(a)] && store.can("POST", "/requests/api-call"));
+/** The provider has a usage endpoint this server can call. */
+export const hasSource = (a: Data) => !!usageURL[provider(a)] && store.can("POST", "/requests/api-call");
 export const canCheck = (a: Data) => !a.disabled && hasSource(a);
 
 /** Keep known limits visible alongside a failed check: last successful check, else passive signals. */
@@ -57,31 +54,26 @@ export function check(a: Data) {
 async function read(a: Data) {
   const p = provider(a);
   try {
-    let raw: Data;
-    const pl = plugin(p);
-    if (pl) raw = await api(`/plugins/${encodeURIComponent(pl.id)}/quota`, "POST", { name: a.name, auth_index: a.auth_index });
-    else {
-      const header: Data = { Authorization: "Bearer $TOKEN$", "Content-Type": "application/json" };
-      if (p === "claude") Object.assign(header, { "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)" });
-      if (p === "codex") {
-        header["User-Agent"] = "codex-tui/0.149.1";
-        const account = a.account_id || a.id_token?.chatgpt_account_id;
-        if (account) header["Chatgpt-Account-Id"] = account;
-      }
-      const r = await api("/requests/api-call", "POST", { authIndex: a.auth_index, method: "GET", url: usageURL[p], header });
-      if (r.status_code < 200 || r.status_code >= 300)
-        // `code` lets Connect tell a refused token (401/403) from any other failed read.
-        throw Object.assign(new Error(
-          p === "claude" && r.status_code === 403
-            ? "Claude denied access to usage (HTTP 403). Setup tokens cannot read usage. Connect Claude through the dashboard's OAuth flow for usage checks."
-            : r.status_code === 401 || r.status_code === 403
-              ? `The provider rejected the account's token (HTTP ${r.status_code}). Refresh the token, or connect the account again.`
-              : `The provider answered HTTP ${r.status_code}. Try again later.`,
-          ),
-          { code: r.status_code },
-        );
-      raw = typeof r.body === "string" ? JSON.parse(r.body) : r.body;
+    const header: Data = { Authorization: "Bearer $TOKEN$", "Content-Type": "application/json" };
+    if (p === "claude") Object.assign(header, { "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)" });
+    if (p === "codex") {
+      header["User-Agent"] = "codex-tui/0.149.1";
+      const account = a.account_id || a.id_token?.chatgpt_account_id;
+      if (account) header["Chatgpt-Account-Id"] = account;
     }
+    const r = await api("/requests/api-call", "POST", { authIndex: a.auth_index, method: "GET", url: usageURL[p], header });
+    if (r.status_code < 200 || r.status_code >= 300)
+      // `code` lets Connect tell a refused token (401/403) from any other failed read.
+      throw Object.assign(new Error(
+        p === "claude" && r.status_code === 403
+          ? "Claude denied access to usage (HTTP 403). Setup tokens cannot read usage. Connect Claude through the dashboard's OAuth flow for usage checks."
+          : r.status_code === 401 || r.status_code === 403
+            ? `The provider rejected the account's token (HTTP ${r.status_code}). Refresh the token, or connect the account again.`
+            : `The provider answered HTTP ${r.status_code}. Try again later.`,
+        ),
+        { code: r.status_code },
+      );
+    const raw: Data = typeof r.body === "string" ? JSON.parse(r.body) : r.body;
     store.quota[quotaKey(a)] = { at: Date.now(), windows: quotaWindows(p, raw) };
   } catch (e) {
     store.quota[quotaKey(a)] = { ...store.quota[quotaKey(a)], error: e instanceof Error ? e.message : String(e), code: (e as { code?: number }).code };

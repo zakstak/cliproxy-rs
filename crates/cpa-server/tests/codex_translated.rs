@@ -841,4 +841,3 @@ async fn failed_tool_results_are_refused() {
         assert_eq!(status, 200, "{content}: an ordinary result: {answer}");
     }
 }
-

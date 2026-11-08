@@ -138,7 +138,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Replace `model` with the upstream model of an operator-configured alias or a caller-selected route, or add it as the first member when the body has none | All profiles | Explicit routing choice. Only the `model` value changes. |
 | Wrap an HTTP Responses body in a `response.create` frame by adding `"type":"response.create"` | A credential with `websockets: true` that serves an HTTP client over a WebSocket | Transport envelope. No other field changes. |
 | Send a WebSocket `response.create` frame as an HTTP Responses body by removing its `type` member, and send `stream: true` when the frame omits `stream` or sets it to `false` | A credential without `websockets` that serves a Responses WebSocket turn ([WebSocket HTTP fallback](#websocket-http-fallback)) | Transport envelope and adaptation. The first-party frame is the HTTP request plus its tag (`codex-api/src/common.rs:315-339`, 400-406). A WebSocket turn always delivers its response as events, so the HTTP request asks for them; the client receives the upstream's events, never an aggregate. No other field changes; a continuation or prewarm is refused instead. |
-| Hand a plugin model callback each line of an upstream event as its own chunk, and a WebSocket client each event's `data` payload as one text frame | A Responses model callback on the native HTTP route; a WebSocket turn served over HTTP | Transport framing. The callback interface reads executor chunks, and a WebSocket text frame carries one event; the bytes of each line and payload are unchanged. |
+| Hand a WebSocket client each event's `data` payload as one text frame | A WebSocket turn served over HTTP | Transport framing. A WebSocket text frame carries one event; the bytes of each payload are unchanged. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
 | Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
@@ -253,7 +253,7 @@ manifest dependencies, including consumers outside Codex Responses.
 | `crates/cpa-exec/src/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes |
 | `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request, OAuth and SIWC token files | Retained for those callers; the native boundary is not applied to raw schemas in generated bodies |
 | `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. No Codex route calls it; the registered Responses-to-Codex pair keeps it for the providers that share it | Other providers |
-| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators without plugin hooks; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; [Translated route](#translated-route) |
+| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; [Translated route](#translated-route) |
 | `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | Retained; #33 owns image model IDs |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | Retained |
@@ -287,37 +287,22 @@ ingress rewrites never reaches Codex.
 The request goes upstream as the client sent it, with only the permitted
 transformations: the routed `model`, and `stream: true` for a buffered client on
 `chatgpt`. The server keeps the client's body, headers and route path in
-`dispatch::NativeRequest`, from before the Codex-client ingress rewrite, compact's
-`stream` deletion and plugin before-auth interceptors, so a native attempt never sees
-their output.
+`dispatch::NativeRequest`, from before the Codex-client ingress rewrite and compact's
+`stream` deletion, so a native attempt never sees their output.
 
-Plugin before-auth interceptors run once, before a credential is chosen, so their output
-follows one rule. A native attempt is possible when the selectable credentials for the
-model include a built-in Codex credential on a native profile without a plugin executor.
-Under Home the pool is remote and unknown, so every Responses HTTP request counts. When it
-is possible, the before-auth result (headers, body, path and termination) is held back
-from the request and applied to each attempt that is not native: a Sign in with ChatGPT,
-plugin-executor or other-provider attempt gets it, termination included, and a native
-attempt never does. That holds on every attempt path: local selection, a Home pick and
-the Antigravity credits fallback. Delivering the before-auth result is separate from the
-after-auth chain, so Home still runs no after-auth chain and a buffered credits fallback
-still skips it, as before. The session, session affinity, the LCP prefix, Home dispatch headers,
-the plugin scheduler's headers and context, and the executor's session metadata then come
-from the client's own request (`Call::selection_inputs`), so before-auth output cannot
-choose the session or the credential. When a native attempt is not possible (a model only
-Sign in with ChatGPT credentials or other providers serve), before-auth applies as in Go,
-selection included.
+A native attempt is possible when the selectable credentials for the model include a
+built-in Codex credential on a native profile. Under Home the pool is remote and unknown,
+so every Responses HTTP request counts. The session, session affinity, the LCP prefix,
+Home dispatch headers and the executor's session metadata then come from the client's
+own request (`Call::selection_inputs`). When a native attempt is not possible (a model
+only Sign in with ChatGPT credentials or other providers serve), selection reads the
+rewritten request, as in Go. No translation, thinking suffix, payload rule, prompt-cache
+key, reasoning replay, or tool or namespace preparation runs on a native attempt. A model
+with a thinking suffix, such as `gpt-5.5(high)`, is refused with a 400, because the
+suffix would need a body change the contract does not permit.
 
-A plugin model callback whose entry and exit protocols are both Responses, in either
-spelling (`openai-response` or `codex`, the executor's own test), takes this route like a
-client request: the server keeps the callback's own bytes in `NativeRequest`, other
-plugins' before-auth output reaches only the attempts that are not native, and the
-executor hands the callback each line of an upstream event as its own chunk, bytes
-unchanged. No chunk interceptor runs on it, as on any native attempt. The boundary validates those
-bytes. No translation, thinking suffix, payload rule, prompt-cache key, reasoning replay,
-tool or namespace preparation, or plugin `after_auth` hook runs. A model with a thinking
-suffix, such as `gpt-5.5(high)`, is refused with a 400, because the suffix would need a
-body change the contract does not permit.
+There are no plugin hooks to bypass: native plugins are removed (#47), and a config with a
+`plugins` section is refused ([Settings](#settings)).
 
 The response reaches the client as the upstream sent it:
 
@@ -344,8 +329,7 @@ The response reaches the client as the upstream sent it:
   `{"error":<the provider's error object>,"sequence_number":<as sent>}`, byte for byte
   from the event, or as the whole event when it has no error object. Nothing is filled
   in. It arrived on an HTTP 200, so its status is the classified one.
-- Plugin after-auth, response and chunk interceptors do not run. The plugin lifecycle
-  still completes. The alias `force-mapping` model rewrite does not run either.
+- The alias `force-mapping` model rewrite does not run.
 
 [Settings](#settings) lists the final outcome of every Codex rewrite and impersonation
 control on every route.
@@ -364,8 +348,8 @@ of these hold:
   profile, with `websockets: true`.
 
 A Codex credential without `websockets` serves the turn over HTTP, as described under
-[WebSocket HTTP fallback](#websocket-http-fallback). A plugin-executor or other-provider
-credential follows its own rules, as on HTTP.
+[WebSocket HTTP fallback](#websocket-http-fallback). An other-provider credential follows
+its own rules, as on HTTP.
 
 Any other client frame bound for a built-in Codex credential is refused with a 400 that
 names it, before anything is sent (#28). That covers Go's `response.append`, which no
@@ -384,9 +368,8 @@ none. The server keeps the client's frame, headers and route path in
 `dispatch::NativeRequest`. It does this before the transcript normalization
 (`websocket_requests::normalize`, and `normalize_passthrough`, which adds
 `stream: true`), the multi-agent and orphan-delegation preparation, the tool-call repair
-(`websocket_tools::prepare_fallback_turn`) and the plugin before-auth interceptors. Those
-steps now build only the frame for an attempt that is not native (another provider or a
-plugin executor), and they cannot refuse a frame that a native attempt may carry. When
+(`websocket_tools::prepare_fallback_turn`). Those steps now build only the frame for an
+attempt that is not native (another provider), and they cannot refuse a frame that a native attempt may carry. When
 they cannot convert a `response.create` (for example a string or `null` `input`), their
 error stops every attempt that is not native, before anything is sent, and the client
 gets the same error frame as before on a connection that stays open. Every Codex turn is
@@ -399,13 +382,10 @@ payload rules, prompt-cache key in the body, reasoning replay, ID sanitizing, na
 renames, Sign in with ChatGPT rules or `type` re-tag any more (#28). The prompt-cache
 identity goes into the handshake headers only, and #26 owns those headers.
 
-Plugin before-auth output follows the HTTP rule. A native attempt is possible when the
-frame is a `response.create` and the selectable credentials include a built-in Codex
-credential without a plugin executor, with or without `websockets` (#28). Under
-Home, every `response.create` counts. When a native attempt is possible, the before-auth
-result reaches only the attempts that are not native. Plugin after-auth, response and
-chunk interceptors never run on a native turn. WebSocket response observers are passive
-and still receive every frame.
+A native attempt is possible when the frame is a `response.create` and the selectable
+credentials include a built-in Codex credential, with or without `websockets` (#28).
+Under Home, every `response.create` counts. Selection then reads the client's own frame,
+as on HTTP.
 
 When the proxy's `codex.response-steering` setting is on, the connection keeps the
 upstream socket after its first response. The proxy then reads each later client frame
@@ -574,7 +554,6 @@ The request is converted by its pair's built-in converter in strict mode
 (`cpa_translate::codex_request`). The request's own fields are then checked by
 `cpa_translate::codex_strict`. Nothing else edits it:
 
-- No plugin request normalizer or plugin translator runs.
 - No payload rule runs.
 - Nothing is synthesized: no prompt-cache key, no default `instructions` (the pinned
   client sends none: `codex-api/src/common.rs:286-314`), and no reasoning effort the
@@ -673,7 +652,7 @@ equivalent; remove it or send the request to a provider that accepts it`.
 ### Responses
 
 The same pair's built-in response translator converts the upstream's events, without
-plugin response hooks and without namespace restoration. A buffered client receives
+namespace restoration. A buffered client receives
 the translation of the aggregated terminal event. Usage is the provider's. A Claude
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
@@ -736,9 +715,9 @@ request silently, and none of them turns a rewrite back on.
 | `upstream.codex.disable-codex-cloaking`, `codex_disable_cloaking` attribute | Config, credential | Kept with its one remaining effect: a native WebSocket handshake carries the caller's session headers. No value changes identity. | [IDENTITY.md](IDENTITY.md) (#26) |
 | `oauth.providers.codex.header-defaults.user-agent` | Config | Refused (#26) | [IDENTITY.md](IDENTITY.md) |
 | `oauth.providers.codex.header-defaults.beta-features` | Config | Kept: the `x-codex-beta-features` default for OAuth requests when the caller sends none | Protocol negotiation; [IDENTITY.md](IDENTITY.md) (#26) |
-| Operator `headers` on Codex credentials, catalog `override_header` | Config, auth file, Home, plugin store, catalog | Identity and credential headers refused, others applied (#26) | [IDENTITY.md](IDENTITY.md) |
-| Plugin request, response and chunk interceptors, normalizers and translators | Plugins | Never run on a Codex attempt: native attempts get the client's bytes from `NativeRequest`, and translated attempts use the built-in conversion. A plugin model callback with Responses protocols is native too. | [Native HTTP route](#native-http-route), [Translated route](#translated-route) |
-| Plugin executors for the `codex` provider | Plugins | Outside this contract: a plugin executor serves the request itself, as for any provider | The plugin owns that transport |
+| Operator `headers` on Codex credentials, catalog `override_header` | Config, auth file, Home, catalog | Identity and credential headers refused, others applied (#26) | [IDENTITY.md](IDENTITY.md) |
+| `plugins` section (interceptors, normalizers, translators, executors, model callbacks and every other native plugin hook) | Config, Home config | Refused: the config does not load, a reload keeps the running one, a Management API write is refused with `422`, and the plugin routes answer `410`. No plugin code runs on any route (#47). | Native plugins are removed ([DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md)) |
+| Top-level `quota_probe` credential metadata | Auth files, credential uploads and edits, Home dispatch | Refused for any value. Local scans skip the credential with a migration warning; uploads and edits return `400` before persistence, and Home dispatch returns `502 invalid_auth`. Unknown nested metadata stays unchanged. | The declarative quota probe was removed with native plugins (#47). Use `requests/api-call` with `$TOKEN$` ([migration guide](../MIGRATING-FROM-GO.md#native-plugins)). |
 | Client headers (`User-Agent`, `originator`, `x-openai-subagent`, Responses Lite) | Client | Change no Codex body. They select only #5 and #6 failure delivery for official Codex clients, and the identity policy | Go used them to choose the multi-agent, `parallel_tool_calls`, `include` and tier rewrites, which are deleted |
 | Codex-client response handling of the legacy path: namespace restoration, completed-output repair, usage-detail filling, `response.done` rename, Grok Build keepalive comments | Client headers | Deleted with the legacy path; every Codex answer passes unchanged | Response mutation |
 
@@ -874,8 +853,8 @@ new one, and never half of a reversible rewrite.
 3. The native WebSocket group takes #24, the WebSocket parts of #25, the parts of #3
    the proxy can resolve, and the route-local parts of #22 and #28.
 4. Required translation, #27, and identity, #26, stay separate PRs.
-5. Each migrated path blocks payload rules, plugin normalizers and other mutation
-   hooks in the same PR. A response restoration leaves in the same PR as its request
+5. Each migrated path blocks payload rules and other mutation hooks in the same PR
+   (plugin normalizers went with native plugins, #47). A response restoration leaves in the same PR as its request
    rewrite.
 6. #28 and [#29](https://github.com/zakstak/cliproxy-rs/issues/29) consolidate
    qualification across routes. They do not hold back safety that an earlier PR could

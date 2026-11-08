@@ -335,7 +335,12 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
     // A saved Antigravity login is no longer loaded (issue #49), so its models have no
     // provider; Go answers 401 `missing refresh token` from the Antigravity executor.
     // The file itself stays as it was.
-    for model in ["gemini-3-flash", "gemini-pro-agent", "gemini-3.1-pro-low", "gemini-3.7-flash-high"] {
+    for model in [
+        "gemini-3-flash",
+        "gemini-pro-agent",
+        "gemini-3.1-pro-low",
+        "gemini-3.7-flash-high",
+    ] {
         let res = post(Box::leak(format!(r#"{{"model":"{model}"}}"#).into_boxed_str()))
             .await
             .unwrap();

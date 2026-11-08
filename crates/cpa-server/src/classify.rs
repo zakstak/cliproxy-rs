@@ -262,8 +262,8 @@ pub fn credential_scoped(e: &ExecError) -> bool {
     e.scope == FailureScope::Credential && e.status == 429
 }
 
-/// A statusless model-scoped error: a plugin executor's `rpcError` without a status or
-/// plain error, or a built-in executor's Go `fmt.Errorf` that is no connection fault (the
+/// A statusless model-scoped error: a built-in executor's Go `fmt.Errorf` that is no
+/// connection fault (the
 /// Claude and Antigravity compaction summary extraction and seal). Built-in executors
 /// report connection faults as transport. Go classifies such an error by its message, in three separate decisions
 /// (sdk/cliproxy/auth/conductor_cooldown.go): the result code (`resultErrorFromError`),

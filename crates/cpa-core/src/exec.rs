@@ -32,7 +32,7 @@ pub struct Caller {
     /// Where the key came from: `authorization`, `x-api-key`, `query-key`, ...
     pub source: &'static str,
     /// The access provider that accepted the key (Go gin `accessProvider`): `config-inline`
-    /// for a configured client key, else the plugin's provider; empty when access is open.
+    /// for a configured client key; empty when access is open.
     pub provider: String,
 }
 
@@ -62,9 +62,6 @@ pub struct ExecRequest {
     pub body: Bytes,
     /// The client asked for a stream. The upstream mode is the executor's decision.
     pub stream: bool,
-    /// Return Go executor chunks before HTTP framing, for internal model callbacks.
-    /// Captured when preparing the attempt, independent of plugin interceptor lifetime.
-    pub stream_payloads: bool,
     /// Alternate operation from `alt` / `$alt` (for example `responses/compact`).
     pub alt: Option<String>,
     /// Session key for affinity and provider session identity, when one was derived:
@@ -131,27 +128,11 @@ pub trait UsageObserver: Send + Sync {
     /// The translated payload sent upstream in `format` (Go
     /// `SetTranslatedReasoningEffort`: the record's `reasoning_effort`).
     fn request(&self, format: Format, payload: &[u8]);
-    /// The attempt runs on a plugin executor registered for `provider` (Go
-    /// `NewExecutorUsageReporter` with the host's `executorAdapter`): the record's
-    /// provider is that identifier and its executor type `executorAdapter`.
-    fn plugin_executor(&self, provider: &str) {
-        let _ = provider;
-    }
     /// The attempt runs on another built-in executor's code (Go's Vertex openapi route
     /// calls `OpenAICompatExecutor.executeWithCredentials`, whose reporter names its
     /// own `executor_type`, picking the token rule, and `model`).
     fn delegated_executor(&self, executor_type: &str, model: &str) {
         let _ = (executor_type, model);
-    }
-    /// Go `ParsePluginExecutorResponseUsage`: a plugin executor's whole response in its
-    /// output `protocol`, which may be a format cliproxy-rs does not know.
-    fn plugin_response_body(&self, protocol: &str, body: &[u8]) {
-        let _ = (protocol, body);
-    }
-    /// Go `ObservePluginExecutorStreamUsage` on one trimmed, non-empty line of a plugin
-    /// executor's stream in its output `protocol`.
-    fn plugin_response_line(&self, protocol: &str, line: &[u8]) {
-        let _ = (protocol, line);
     }
     /// [`UsageObserver::request`] where Go passes an executor identifier instead of a
     /// format (Kimi passes `kimi`).
@@ -375,27 +356,9 @@ impl UsageSink {
         }
     }
 
-    pub fn plugin_executor(&self, provider: &str) {
-        if let Some(o) = &self.0 {
-            o.plugin_executor(provider);
-        }
-    }
-
     pub fn delegated_executor(&self, executor_type: &str, model: &str) {
         if let Some(o) = &self.0 {
             o.delegated_executor(executor_type, model);
-        }
-    }
-
-    pub fn plugin_response_body(&self, protocol: &str, body: &[u8]) {
-        if let Some(o) = &self.0 {
-            o.plugin_response_body(protocol, body);
-        }
-    }
-
-    pub fn plugin_response_line(&self, protocol: &str, line: &[u8]) {
-        if let Some(o) = &self.0 {
-            o.plugin_response_line(protocol, line);
         }
     }
 

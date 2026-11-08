@@ -57,7 +57,7 @@ impl HttpBody for Counted {
     }
 }
 
-fn app(dir: &std::path::Path, yaml: &str, plugin_auth: bool) -> (axum::Router, Arc<cpa_server::Runtime>) {
+fn app(dir: &std::path::Path, yaml: &str) -> (axum::Router, Arc<cpa_server::Runtime>) {
     std::fs::create_dir_all(dir.join("auth")).unwrap();
     let path = dir.join("config.yaml");
     std::fs::write(&path, format!("{yaml}auth-dir: {}\n", dir.join("auth").display())).unwrap();
@@ -71,9 +71,6 @@ fn app(dir: &std::path::Path, yaml: &str, plugin_auth: bool) -> (axum::Router, A
             xai: Default::default(),
         },
     ));
-    if plugin_auth {
-        cpa_server::testing::unloaded_frontend_auth(&rt);
-    }
     let state = Management::with_options(rt.clone(), path, management::Options::default());
     // crates/cliproxy/src/main.rs, without Home, observability and the heap trimmer.
     let app = cpa_server::app(rt.clone(), management::router(state.clone()));
@@ -81,6 +78,18 @@ fn app(dir: &std::path::Path, yaml: &str, plugin_auth: bool) -> (axum::Router, A
     let app = app.layer(axum::middleware::from_fn(management::cors));
     let app = cpa_server::request_logging::router(&state, app);
     (cpa_server::body_limit::layer(&rt, app), rt)
+}
+
+/// The plugin, plugin store and plugin quota routes native plugin removal retired.
+fn retired(path: &str) -> bool {
+    [
+        "/v0/management/plugins",
+        "/v8/management/plugins",
+        "/v0/management/plugin-store",
+        "/v0/management/quota/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 /// Go answers a failed `/openai/v1/videos` request with a random video ID.
@@ -109,8 +118,13 @@ async fn body_limit_answers_match_go() {
     let mut failures = Vec::new();
     for (i, case) in fixture.iter().enumerate() {
         let name = case["name"].as_str().unwrap();
+        // Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
+        // cases with a plugin frontend auth provider have no counterpart here.
+        if case["plugin_auth"] == true {
+            continue;
+        }
         let dir = std::env::temp_dir().join(format!("cpa-body-limit-{}-{i}", std::process::id()));
-        let (app, _) = app(&dir, case["yaml"].as_str().unwrap(), case["plugin_auth"] == true);
+        let (app, _) = app(&dir, case["yaml"].as_str().unwrap());
         let mut raw = base64::engine::general_purpose::STANDARD
             .decode(case["body_b64"].as_str().unwrap())
             .unwrap();
@@ -160,21 +174,35 @@ async fn body_limit_answers_match_go() {
         // failure is a plain-text 400 where gin's handlers write their own JSON 400
         // (docs/DIFFERENCES-FROM-GO.md).
         let status_only = STATUS_ONLY.contains(&name);
-        // The removed providers' routes (issue #49) answer 410 with migration guidance
-        // before reading the body.
         let path = case["path"].as_str().unwrap();
-        if path.starts_with("/v1beta/")
-            || ["vertex", "gemini-api-key", "interactions-api-key", "openai-compatibility", "antigravity", "kimi", "devin"]
-                .iter()
-                .any(|p| path.contains(p))
+        if retired(path) {
+            // A retired plugin route (docs/DIFFERENCES-FROM-GO.md "Native plugins"): a
+            // declared length over the limit is still refused before routing, as Go
+            // does; any other request gets the removal answer without its body read.
+            let refused_early = want.0 == 413 && !chunked;
+            let removed = got.0 == 410 && got.2.contains("plugins_removed");
+            if !(refused_early && got.0 == 413 || !refused_early && removed) {
+                failures.push(format!("{name}: got {got:?} on a retired plugin route"));
+            }
+        } else if path.starts_with("/v1beta/")
+            || [
+                "vertex",
+                "gemini-api-key",
+                "interactions-api-key",
+                "openai-compatibility",
+                "antigravity",
+                "kimi",
+                "devin",
+            ]
+            .iter()
+            .any(|p| path.contains(p))
         {
+            // The removed providers' routes (issue #49) answer 410 with migration
+            // guidance before reading the body.
             if got.0 != 410 || !got.2.contains("is no longer supported") {
                 failures.push(format!("{name}: got {got:?}, want a removed-provider 410"));
             }
-            let _ = std::fs::remove_dir_all(&dir);
-            continue;
-        }
-        if status_only && got.0 != want.0 || !status_only && got != want {
+        } else if status_only && got.0 != want.0 || !status_only && got != want {
             failures.push(format!("{name}: got {got:?}, want {want:?}"));
         }
         // Go reads at most the limit plus one byte; frames arrive whole here.
@@ -205,7 +233,7 @@ async fn body_limit_answers_match_go() {
 async fn a_published_limit_applies_to_the_next_request() {
     let dir = std::env::temp_dir().join(format!("cpa-body-limit-reload-{}", std::process::id()));
     let yaml = "config-version: 8\naccess:\n  api-keys:\n    - test-key\n";
-    let (app, rt) = app(&dir, yaml, false);
+    let (app, rt) = app(&dir, yaml);
     let send = |app: axum::Router| async move {
         let request = axum::http::Request::post("/v1/responses")
             .header("authorization", "Bearer test-key")
@@ -231,7 +259,7 @@ async fn a_reload_during_a_request_keeps_its_limit() {
     use futures_util::StreamExt as _;
     let dir = std::env::temp_dir().join(format!("cpa-body-limit-mid-{}", std::process::id()));
     let yaml = "config-version: 8\nserver:\n  max-request-body-bytes: 128\naccess:\n  api-keys:\n    - test-key\n";
-    let (app, rt) = app(&dir, yaml, false);
+    let (app, rt) = app(&dir, yaml);
     let decoded = format!(r#"{{"model":"gpt-5","input":"{}"}}"#, "z".repeat(512));
     let compressed = zstd::encode_all(decoded.as_bytes(), 3).unwrap();
     assert!(compressed.len() < 128);
@@ -323,7 +351,7 @@ async fn a_stale_config_write_fails_before_its_body_is_read() {
             let yaml = format!(
                 "config-version: 8\nserver:\n  max-request-body-bytes: {limit}\nmanagement:\n  allow-remote: true\n  secret-key: mgmt-secret\n"
             );
-            let (app, _) = app(&dir, &yaml, false);
+            let (app, _) = app(&dir, &yaml);
             // Corrupted after the runtime loaded it.
             if let Some(bytes) = stored {
                 std::fs::write(dir.join("config.yaml"), bytes).unwrap();

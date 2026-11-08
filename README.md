@@ -36,7 +36,7 @@ To upgrade, pull and rebuild; the config and credentials stay where they are. [I
 
 cliproxy-rs is a Rust rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It reads the same `config.yaml` and credential formats and implements the client routes and v8 Management API. The dashboard shows provider keys and their traffic, request history and tool settings.
 
-The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,053 covered, 872 partial and 26 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
+The compatibility target is CLIProxyAPI v8.0.35. Parity is incomplete: the audit has 1,951 items, with 1,140 covered, 794 partial and 17 missing. [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md) defines those counts.
 
 ## How it compares
 
@@ -127,7 +127,6 @@ Before switching, read [MIGRATING-FROM-GO.md](https://github.com/vayungodara/cli
 
 Not in cliproxy-rs yet:
 
-- Three plugin pieces: model discovery for each credential, response hooks on a buffered Claude answer, and sending your GitHub token on plugin store requests.
 - The remaining parity gaps and Go test cases, listed in [PARITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/PARITY.md).
 
 ## Performance

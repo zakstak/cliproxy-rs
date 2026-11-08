@@ -23,7 +23,6 @@ mod text;
 mod timestamp;
 mod trusted;
 mod validate;
-pub use binary::{PLAIN as PLAIN_SCALAR, double_quoted as yaml_double_quoted};
 pub use document::{ConfigDocument, archive_comments, credential_error, is_v8_layout, v8_group_error, v8_layout_error};
 pub use schema::validate as validate_config_fields;
 pub use schema::{coerce_typed_scalars, go_bool, go_int};
@@ -324,43 +323,12 @@ pub fn config_value(text: &str) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-/// [`Config::plugin_configs`] of `text`, whose parsed root is `root`.
-fn plugin_configs(text: &str, root: &Mapping) -> Value {
-    if !lookup(root, "plugins.configs").is_some_and(|c| c.as_mapping().is_some_and(|m| !m.is_empty())) {
-        return Value::Null;
-    }
-    let raw = || {
-        let mut value = parse_yaml(text)?;
-        binary::decode(text, &mut value, Some(&[]), binary::Mode::Plugins)?;
-        expand_merges(&mut value)?;
-        anyhow::Ok(value)
-    };
-    match raw() {
-        Ok(v) => v
-            .get("plugins")
-            .and_then(|p| p.get("configs"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        // The same text loaded, so only a limit this read alone hits (alias copies of
-        // plugin scalars) gets here.
-        Err(e) => {
-            // Management reads re-parse the file: warn once per text.
-            static WARNED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-            let hash = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                text.hash(&mut h);
-                h.finish()
-            };
-            let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *warned != hash {
-                *warned = hash;
-                tracing::warn!("plugin configs keep their parsed values: {e:#}");
-            }
-            Value::Null
-        }
-    }
-}
+/// The load error for a config that still has a `plugins` section. Native plugins are
+/// removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): the section would configure
+/// nothing, so the config is refused instead of running without what it asks for.
+pub const PLUGINS_REMOVED: &str = "the plugins section is not supported: cliproxy-rs removed native plugin support \
+     (loader, plugin store, plugin hooks and Home plugin sync); delete the plugins section from the config and \
+     see docs/MIGRATING-FROM-GO.md \"Native plugins\" for replacements";
 
 /// A management write's body, the value at `keys` of the config: Go parses it as YAML
 /// nodes and saves their text, so a number or boolean in a string setting whose text the
@@ -478,11 +446,6 @@ pub struct Config {
     /// apply to OAuth credentials only; see [`Config::for_api_key`]. Settings written
     /// in the legacy layout stay global, as in Go.
     pub oauth_only: std::collections::BTreeSet<String>,
-    /// `plugins.configs` as Go hands each plugin its raw node (pluginhost
-    /// `runtimeConfigYAML`): a plain scalar that is not plain text to serde_yaml_ng is its
-    /// YAML text tagged [`PLAIN_SCALAR`] (`1.50`, `1e3`, `0x1F`, `007`, `!!float 1`), where
-    /// [`Config::document`] holds what serde_yaml_ng reads. Null without plugin configs.
-    pub plugin_configs: Value,
     /// Values derived from this snapshot, built on first use ([`Config::derived`]).
     pub derived: Derived,
 }
@@ -956,6 +919,9 @@ fn decode(text: &str, mode: Decode) -> anyhow::Result<(Mapping, ConfigDocument)>
         Value::Mapping(m) => m,
         _ => bail!("config must be a mapping"),
     };
+    // Any `plugins` key, even an empty or disabled one, before any other check: nothing
+    // reads it any more, so the operator learns that first.
+    anyhow::ensure!(!root.contains_key("plugins"), PLUGINS_REMOVED);
     validate_shape(&root)?;
     let credentials = if mode == Decode::Upload {
         v8_group_error(&root)
@@ -1050,7 +1016,6 @@ impl Config {
         trusted::validate(&trusted_proxies)?;
         validate::go_custom(document.value())?;
         let oauth_only = schema::oauth_only_paths(&Value::Mapping(root.clone()));
-        let plugin_configs = plugin_configs(text, &root);
         let cfg = Config {
             host,
             port,
@@ -1061,7 +1026,6 @@ impl Config {
             management,
             document: document.into_value(),
             oauth_only,
-            plugin_configs,
             derived: Derived::default(),
         };
         validate::codex_compat(&cfg)?;
@@ -1611,12 +1575,6 @@ oauth-excluded-models: {{c: [{numbers}]}}
             "0x1FFFFFFFFFFFFFFFFF".into(),
         ];
         assert_eq!(any["x"].as_sequence().unwrap(), &want);
-        // A plugin gets the text, which its yaml.v3 reads as Go's float.
-        let cfg = Config::parse(&format!("plugins: {{configs: {{p: {{n: {token}}}}}}}\n")).unwrap();
-        let Value::Tagged(n) = &cfg.plugin_configs["p"]["n"] else {
-            panic!("{:?}", cfg.plugin_configs)
-        };
-        assert_eq!(n.value, Value::from(token));
         // Any number of them, read in one pass; marks after a BOM still line up.
         let many = yaml_value(&format!("x: [{}]\n", vec!["-18446744073709551616"; 100].join(", "))).unwrap();
         assert!(
@@ -1998,12 +1956,22 @@ oauth-excluded-models: {{c: [{numbers}]}}
     fn scalar_settings_keep_their_yaml_text() {
         let go: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/scalar_settings_go.json")).unwrap();
+        // Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): the
+        // recording's one-line `plugins` section is dropped and its check skipped.
+        let without_plugins = |yaml: &str| {
+            yaml.lines()
+                .filter(|l| !l.starts_with("plugins:"))
+                .map(|l| format!("{l}\n"))
+                .collect::<String>()
+        };
         for case in go["cases"].as_array().unwrap() {
-            // The removed providers' settings (issue #49) and their checks go.
-            let cfg = Config::parse(&crate::removed::strip_settings(case["yaml"].as_str().unwrap())).unwrap();
+            // The removed providers' settings (issue #49) and their checks go too.
+            let yaml = crate::removed::strip_settings(&without_plugins(case["yaml"].as_str().unwrap()));
+            let cfg = Config::parse(&yaml).unwrap();
             for check in case["checks"].as_array().unwrap() {
                 let path = check["rust"].as_str().unwrap();
-                if path.contains("openai-compatibility") || path.contains("antigravity") {
+                if path.starts_with("plugins.") || path.contains("openai-compatibility") || path.contains("antigravity")
+                {
                     continue;
                 }
                 let mut node = &cfg.document;
@@ -2018,7 +1986,10 @@ oauth-excluded-models: {{c: [{numbers}]}}
         }
         // A model with a display name written as a number registers under its prefix,
         // both as Go reads them.
-        let cfg = Config::parse(&crate::removed::strip_settings(go["cases"][0]["yaml"].as_str().unwrap())).unwrap();
+        let cfg = Config::parse(&crate::removed::strip_settings(&without_plugins(
+            go["cases"][0]["yaml"].as_str().unwrap(),
+        )))
+        .unwrap();
         let aliases = crate::registry::dynamic::global_aliases(&cfg);
         let models: Vec<(String, String)> = credentials::from_config(&cfg)
             .iter()
@@ -2026,5 +1997,29 @@ oauth-excluded-models: {{c: [{numbers}]}}
             .map(|m| (m.id, m.display_name))
             .collect();
         assert!(models.contains(&("0x1F/a".into(), "1.50".into())), "{models:?}");
+    }
+
+    /// Native plugins are removed: any `plugins` section, enabled or not, empty, null or
+    /// malformed, in either layout, fails the load with the migration error before any
+    /// other check, on file loads and on management writes alike.
+    #[test]
+    fn a_plugins_section_is_refused_with_the_migration_error() {
+        for text in [
+            "plugins: {enabled: true, dir: plugins}\n",
+            "plugins: {enabled: false}\n",
+            "plugins: {}\n",
+            "plugins:\n",
+            "plugins: [x]\n",
+            "config-version: 8\nplugins: {configs: {acme: {enabled: true, store: {version: v1}}}}\n",
+            "request-retry: 3\nplugins: {store-sources: [https://example.invalid/index.json]}\n",
+        ] {
+            let err = Config::parse(text).unwrap_err();
+            assert_eq!(err.to_string(), PLUGINS_REMOVED, "{text}");
+            let err = Config::parse_payload(text).unwrap_err();
+            assert!(format!("{err:#}").contains(PLUGINS_REMOVED), "{text}: {err:#}");
+        }
+        assert!(PLUGINS_REMOVED.contains("delete the plugins section"));
+        // The same config without the section loads.
+        Config::parse("config-version: 8\nrouting: {strategy: fill-first}\n").unwrap();
     }
 }

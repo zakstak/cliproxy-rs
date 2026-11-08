@@ -158,7 +158,6 @@ impl Capture {
             Err(error) => self.error(error),
         }
     }
-
 }
 
 /// Go's plain `statusErr`: never credential-scoped, so a 429 cools only the model

@@ -55,7 +55,6 @@ impl Captured {
             body,
         }
     }
-
 }
 
 /// One scripted upstream answer: status, ordered headers, body.
@@ -268,7 +267,6 @@ pub(crate) fn request(fixture: &Value, principal: &str) -> ExecRequest {
         },
         source_format: source,
         response_format: source,
-        stream_payloads: false,
         requested_model: r["model"].as_str().unwrap().into(),
         model: r["model"].as_str().unwrap().into(),
         original_body: body.clone(),

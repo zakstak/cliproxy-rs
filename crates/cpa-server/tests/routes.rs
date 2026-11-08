@@ -152,7 +152,6 @@ struct Proxy {
     url: String,
     seen: Arc<Seen>,
     rt: Arc<Runtime>,
-    upstream: String,
 }
 
 async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
@@ -171,12 +170,7 @@ async fn proxy(config: &str, credentials: Vec<Credential>) -> Proxy {
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
     let url = serve(router(rt.clone())).await;
-    Proxy {
-        url,
-        seen,
-        rt,
-        upstream: upstream_url,
-    }
+    Proxy { url, seen, rt }
 }
 
 async fn post(url: &str, path: &str, body: &str) -> (u16, wreq::header::HeaderMap, String) {
@@ -559,7 +553,6 @@ async fn anthropic_model_list_cloaking_reads_the_shared_setting() {
                 .unwrap()
                 .clone(),
             revision: 0,
-            next_refresh_after: None,
         };
         let p = proxy(config, vec![key]).await;
         let models: Value = wreq::Client::new()
@@ -607,7 +600,6 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
             .unwrap()
             .clone(),
         revision: 0,
-        next_refresh_after: None,
     };
     key.attributes.insert("prefix".into(), "team".into());
     let p = proxy("", vec![key]).await;

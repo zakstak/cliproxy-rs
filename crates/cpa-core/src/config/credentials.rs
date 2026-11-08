@@ -22,16 +22,6 @@ use super::Config;
 use crate::credential::{Credential, Source};
 use crate::gostr::GoStr;
 
-mod plugin_auth;
-use plugin_auth::Ask;
-#[cfg(feature = "test-support")]
-pub use plugin_auth::with_thread_plugin_auth_parser;
-pub use plugin_auth::{
-    ParseRequest, Parsed, ParsedAuth, PluginAuthParser, clean as absolute_clean_path, note_plugin_auth_write,
-    on_plugin_auth_change, plugin_auth_epoch, plugin_auth_parser_active, plugin_save_credentials, preparse_auth_dir,
-    set_plugin_auth_parser, set_plugin_auth_providers,
-};
-
 const WEIGHT_MAX: i64 = 1_000_000;
 
 fn hex(bytes: &[u8]) -> String {
@@ -427,7 +417,6 @@ impl Draft {
             attributes: self.attrs,
             metadata: self.meta,
             revision: 0,
-            next_refresh_after: None,
         }
     }
 }
@@ -710,23 +699,34 @@ fn raw_models(v: Option<&Value>) -> Vec<Json> {
         .collect()
 }
 
-/// Go `NormalizeCredentialMetadata`: config-style aliases become snake_case unless the
-/// canonical key is present.
+/// Go's legacy credential metadata keys and their canonical names.
+const LEGACY_METADATA_KEYS: [(&str, &str); 12] = [
+    ("api-key", "api_key"),
+    ("base-url", "base_url"),
+    ("disable-cooling", "disable_cooling"),
+    ("excluded-models", "excluded_models"),
+    ("fingerprint-profile", "fingerprint_profile"),
+    ("model-aliases", "model_aliases"),
+    ("openapi-location", "openapi_location"),
+    ("openapi-models", "openapi_models"),
+    ("proxy-url", "proxy_url"),
+    ("request-retry", "request_retry"),
+    ("request-scoped-errors", "request_scoped_errors"),
+    ("tool-prefix-disabled", "tool_prefix_disabled"),
+];
+
+/// Go `CanonicalCredentialMetadataKey`.
+pub fn canonical_metadata_key(key: &str) -> &str {
+    LEGACY_METADATA_KEYS
+        .iter()
+        .find(|(legacy, _)| *legacy == key)
+        .map_or(key, |(_, canonical)| canonical)
+}
+
+/// Go `NormalizeCredentialMetadata`: legacy keys move to their canonical name unless
+/// the canonical one is already present.
 fn normalize_metadata(meta: &mut Map<String, Json>) {
-    for (alias, canonical) in [
-        ("api-key", "api_key"),
-        ("base-url", "base_url"),
-        ("disable-cooling", "disable_cooling"),
-        ("excluded-models", "excluded_models"),
-        ("fingerprint-profile", "fingerprint_profile"),
-        ("model-aliases", "model_aliases"),
-        ("openapi-location", "openapi_location"),
-        ("openapi-models", "openapi_models"),
-        ("proxy-url", "proxy_url"),
-        ("request-retry", "request_retry"),
-        ("request-scoped-errors", "request_scoped_errors"),
-        ("tool-prefix-disabled", "tool_prefix_disabled"),
-    ] {
+    for (alias, canonical) in LEGACY_METADATA_KEYS {
         if let Some(value) = meta.remove(alias) {
             meta.entry(canonical).or_insert(value);
         }
@@ -770,39 +770,31 @@ pub fn parse_weight(value: &Json) -> Result<i64, String> {
 /// Builds one auth-file credential as Go's `FileSynthesizer` does. `Ok(None)` is a
 /// silently ignored file; `Err` is a skipped file worth a warning. The config (Go's
 /// synthesis context) no longer shapes a file credential: global excluded models apply
-/// at registration (Go b015f208). Like Go's management upload synthesis, this does not
-/// ask plugin auth providers; only [`scan_auth_dir`] does.
+/// at registration (Go b015f208).
 pub fn from_file(_cfg: &Config, auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<Credential>, String> {
-    Ok(match file_credentials(None, auth_dir, path, data)? {
-        Some(FileCredentials::One(c)) => Some(*c),
-        Some(FileCredentials::Plugin(_) | FileCredentials::Unapplied(_) | FileCredentials::Deferred) | None => None,
-    })
+    file_credential(auth_dir, path, data)
 }
 
-/// What one auth file synthesizes to.
-enum FileCredentials {
-    One(Box<Credential>),
-    /// What a plugin parsed: possibly none (the plugin suppresses the file) or several.
-    Plugin(Vec<Credential>),
-    /// No cached plugin answer for these bytes yet ([`plugin_auth::Ask::Cached`]).
-    Deferred,
-    /// The answer of the parse whose own `host.auth.save` wrote these bytes: published,
-    /// but the plugin has yet to parse them.
-    Unapplied(Vec<Credential>),
+/// Migration error for the retired declarative quota probe, including disabled or
+/// null values. Unknown credential metadata remains supported.
+pub const QUOTA_PROBE_REMOVED: &str = "credential metadata quota_probe is removed; remove quota_probe and use POST /v8/management/requests/api-call with $TOKEN$ for provider usage requests; see docs/MIGRATING-FROM-GO.md#native-plugins";
+
+/// Validate known retired credential settings before publishing or saving them.
+pub fn validate_metadata(meta: &Map<String, Json>) -> Result<(), &'static str> {
+    if meta.contains_key("quota_probe") {
+        return Err(QUOTA_PROBE_REMOVED);
+    }
+    Ok(())
 }
 
-fn file_credentials(
-    parser: Option<Ask<'_>>,
-    auth_dir: &Path,
-    path: &Path,
-    data: &[u8],
-) -> Result<Option<FileCredentials>, String> {
+fn file_credential(auth_dir: &Path, path: &Path, data: &[u8]) -> Result<Option<Credential>, String> {
     if data.is_empty() {
         return Ok(None);
     }
     let Ok(mut meta) = serde_json::from_slice::<Map<String, Json>>(data) else {
         return Ok(None);
     };
+    validate_metadata(&meta)?;
     normalize_metadata(&mut meta);
     let weight = match meta.get("weight") {
         Some(w) => Some(parse_weight(w).map_err(|e| format!("invalid metadata weight: {e}"))?),
@@ -814,13 +806,6 @@ fn file_credentials(
         .unwrap_or_default()
         .trim()
         .go_lower();
-    // Go asks the plugin auth parser before the built-in synthesizer, which a plugin
-    // owning the type (or, without one, any auth provider) replaces.
-    if let Some(parser) = parser
-        && let Some(parsed) = plugin_auth::credentials(parser, &meta, &provider, path, data)
-    {
-        return parsed.map(Some);
-    }
     if provider.is_empty() {
         return Ok(None);
     }
@@ -926,10 +911,9 @@ fn file_credentials(
         attributes: attrs,
         metadata: meta,
         revision: 0,
-        next_refresh_after: None,
     };
     cred.refresh_derived();
-    Ok(Some(FileCredentials::One(Box::new(cred))))
+    Ok(Some(cred))
 }
 
 /// Go `buildAuthFromFileData`'s fallback for an uploaded file no synthesizer claims:
@@ -938,6 +922,7 @@ fn file_credentials(
 /// restart; the caller decides how long it lives. `None` for invalid JSON.
 pub fn upload_fallback(auth_dir: &Path, path: &Path, data: &[u8]) -> Option<Credential> {
     let mut meta = serde_json::from_slice::<Map<String, Json>>(data).ok()?;
+    validate_metadata(&meta).ok()?;
     normalize_metadata(&mut meta);
     let provider = match meta.get("type").and_then(Json::as_str) {
         Some(t) if !t.is_empty() => t.to_owned(),
@@ -971,7 +956,6 @@ pub fn upload_fallback(auth_dir: &Path, path: &Path, data: &[u8]) -> Option<Cred
         attributes,
         metadata: meta,
         revision: 0,
-        next_refresh_after: None,
     })
 }
 
@@ -1118,29 +1102,13 @@ pub struct AuthScan {
     /// `SynthesisContext.IncompleteFiles`); a caller keeps their last good credentials.
     pub incomplete: HashSet<PathBuf>,
     /// The SHA-256 of every file read, so the watcher records what it applied rather than
-    /// what it observed before a later write. Deferred files are left out.
+    /// what it observed before a later write.
     pub read: BTreeMap<PathBuf, [u8; 32]>,
-    /// The files no plugin auth provider has answered for yet ([`preparse_auth_dir`]).
-    /// Go's watcher asks the plugin before anything is published, so a caller keeps a
-    /// file's current credentials and publishes nothing new for it; the watcher reloads
-    /// the file again.
-    pub deferred: HashSet<PathBuf>,
-    /// Files published from the answer of a parse that wrote their current bytes itself
-    /// (`host.auth.save` from inside `auth.parse`): plugins have yet to parse these bytes,
-    /// so the watcher does not record them as applied and parses them on its next tick.
-    pub unapplied: HashSet<PathBuf>,
 }
 
 /// [`from_auth_dir`], with the files it found incomplete and the hashes of what it read.
 /// A file that cannot be read is skipped, as in Go's full scan.
-///
-/// While a plugin offers an auth provider, only answers [`preparse_auth_dir`] cached
-/// are used, so callers may hold locks a plugin waits on; other files are deferred.
 pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
-    scan_with(cfg, plugin_auth::current().map(|_| Ask::Cached))
-}
-
-fn scan_with(cfg: &Config, parser: Option<Ask<'_>>) -> AuthScan {
     let mut scan = AuthScan::default();
     let entries = match std::fs::read_dir(&cfg.auth_dir) {
         Ok(entries) => entries,
@@ -1151,19 +1119,7 @@ fn scan_with(cfg: &Config, parser: Option<Ask<'_>>) -> AuthScan {
             return scan;
         }
     };
-    // With a plugin parser, Go's traversal: file-name order (`os.ReadDir`), and the last
-    // auth read under an ID wins. Without one, nothing changes.
-    let (mut plain, mut sorted);
-    let entries: &mut dyn Iterator<Item = std::fs::DirEntry> = if parser.is_some() {
-        let mut all: Vec<_> = entries.flatten().collect();
-        all.sort_by_key(std::fs::DirEntry::file_name);
-        sorted = all.into_iter();
-        &mut sorted
-    } else {
-        plain = entries.flatten();
-        &mut plain
-    };
-    for entry in entries {
+    for entry in entries.flatten() {
         let path: PathBuf = entry.path();
         if !entry.file_name().to_string_lossy().go_lower().ends_with(".json") {
             continue;
@@ -1174,32 +1130,13 @@ fn scan_with(cfg: &Config, parser: Option<Ask<'_>>) -> AuthScan {
             scan.incomplete.insert(path);
             continue;
         }
-        match file_credentials(parser, &cfg.auth_dir, &path, &data) {
-            Ok(Some(FileCredentials::One(c))) => scan.credentials.push(*c),
-            Ok(Some(FileCredentials::Plugin(all))) => scan.credentials.extend(all),
-            Ok(Some(FileCredentials::Unapplied(all))) => {
-                scan.credentials.extend(all);
-                scan.unapplied.insert(path);
-            }
-            Ok(Some(FileCredentials::Deferred)) => {
-                scan.read.remove(&path);
-                scan.deferred.insert(path);
-            }
+        match file_credential(&cfg.auth_dir, &path, &data) {
+            Ok(Some(c)) => scan.credentials.push(c),
             Ok(None) => {}
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping auth file"),
         }
     }
     scan.credentials.sort_by(|a, b| a.id.cmp(&b.id));
-    if parser.is_some() {
-        // The sort is stable: of equal IDs, the last read is last.
-        let all = std::mem::take(&mut scan.credentials);
-        for c in all {
-            if scan.credentials.last().is_some_and(|last| last.id == c.id) {
-                scan.credentials.pop();
-            }
-            scan.credentials.push(c);
-        }
-    }
     scan
 }
 
@@ -1369,8 +1306,6 @@ mod tests {
         );
     }
 
-
-
     /// yaml.v3 reads a plain scalar into a string field as its text, so a model name or
     /// alias written as a number or boolean (`0x1F`, `1.50`, `007`, `true`, aliased or
     /// merged in too) registers and executes as written, and so do exclusions and OAuth
@@ -1448,7 +1383,10 @@ mod tests {
         let mut stale = second.clone();
         stale.attributes.insert("config_index".into(), "9".into());
         assert_eq!(resolve_api_key_entry(&cfg, "claude", &stale).unwrap().index, 0);
-        assert!(api_key_entries(&cfg, "gemini").is_empty(), "a removed family has no entries");
+        assert!(
+            api_key_entries(&cfg, "gemini").is_empty(),
+            "a removed family has no entries"
+        );
     }
 
     /// Go `proxyURLFromAPIKeyConfig`: the first matching entry wins, so a repeated key
@@ -1522,6 +1460,21 @@ mod tests {
             let want: Vec<String> = want.iter().map(|s: &&str| s.to_string()).collect();
             assert_eq!(read(json), (want, Some(error.to_owned())), "{json}");
         }
+    }
+
+    #[test]
+    fn retired_quota_probe_is_refused_without_dropping_unknown_metadata() {
+        let cfg = Config::default();
+        let dir = Path::new("/private-fake-auth");
+        let path = dir.join("a.json");
+        for value in [serde_json::json!({"kind": "fake"}), Json::Null, Json::Bool(false)] {
+            let raw = serde_json::to_vec(&serde_json::json!({"type":"codex", "quota_probe":value})).unwrap();
+            assert_eq!(from_file(&cfg, dir, &path, &raw).unwrap_err(), QUOTA_PROBE_REMOVED);
+            assert!(upload_fallback(dir, &path, &raw).is_none());
+        }
+        let raw = br#"{"type":"codex","unknown":{"quota_probe":{"keep":true}}}"#;
+        let credential = from_file(&cfg, dir, &path, raw).unwrap().unwrap();
+        assert_eq!(credential.metadata["unknown"]["quota_probe"]["keep"], true);
     }
 
     /// Go's synthesizer lowercases with `strings.ToLower`, which maps U+0130 (İ) to a
