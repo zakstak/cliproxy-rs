@@ -1442,3 +1442,56 @@ async fn an_acknowledgement_for_another_response_never_reaches_the_stream() {
     drop(stream);
     up.finish().await;
 }
+
+/// Contract probe: the later-frame reader uses the same boundary as the first turn.
+/// Escaped routing strings are decoded only for inspection; unknown JSON stays raw.
+#[tokio::test]
+async fn later_creates_keep_unknown_bytes_after_a_boundary_refusal() {
+    const CREATE: &str = r#"{ "type":"response.\u0063reate", "model":"gpt-6-\u0061stra", "previous_response_id":null, "future":{"n":1e400,"s":"\u0061"}, "input":[] }"#;
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+            .await;
+        let create = c.read().await;
+        if create != CREATE {
+            c.error(format!("later create changed: {create}"));
+        }
+        c.write(r#"{"type":"response.created","response":{"id":"r2","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"r2","output":[]}}"#)
+            .await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("raw-later-create");
+    let mut stream = client
+        .start(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex)
+        .await;
+    let mut refused = false;
+    let mut completed = false;
+    while let Some(chunk) = next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        match (get(&chunk, "type").as_str(), get(&chunk, "response.id").as_str()) {
+            ("response.completed", "r1") => {
+                client
+                    .send(r#"{"type":"response.create","model":"gpt-6-astra","mod\u0065l":"duplicate"}"#)
+                    .await
+            }
+            ("error", _) => {
+                assert!(get(&chunk, "error.message").contains("repeats an object key"));
+                refused = true;
+                client.send(CREATE).await;
+            }
+            ("response.completed", "r2") => {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(refused && completed);
+    drop(stream);
+    up.finish().await;
+}

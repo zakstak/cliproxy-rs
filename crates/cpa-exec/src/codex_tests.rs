@@ -2516,3 +2516,96 @@ async fn image_references_are_kept_or_refused() {
         );
     }
 }
+
+/// Contract probes for header inspection, not captured client traffic. A cache key is
+/// opaque text; other JSON types still travel in the body, but cannot become identity.
+#[test]
+fn codex_cache_identity_reads_strings_without_gjson_coercion() {
+    for (raw, expected) in [
+        (
+            r#"{"prompt_cache_key":"opaque\u002dkey","future":1e400}"#,
+            Some("opaque-key"),
+        ),
+        (r#"{"prompt_cache_key":"  opaque key  "}"#, Some("  opaque key  ")),
+        (r#"{"prompt_cache_key":123}"#, None),
+        (r#"{"prompt_cache_key":true}"#, None),
+        (r#"{"prompt_cache_key":{"future":1e400}}"#, None),
+        (r#"{"prompt_cache_key":null}"#, None),
+        (r#"{}"#, None),
+    ] {
+        let mut req = plain_request(true, None);
+        req.source_format = Format::OpenAIResponse;
+        req.body = Bytes::from(raw.to_owned());
+        req.original_body = req.body.clone();
+        req.execution_session = None;
+        req.derived_session = None;
+        assert_eq!(
+            request::prompt_cache_id(&req, raw, None, false).as_deref(),
+            expected,
+            "{raw}"
+        );
+        assert_eq!(req.body.as_ref(), raw.as_bytes());
+        req.derived_session = Some("fallback-session".into());
+        let fallback = request::provider_session_uuid("derived-session", "fallback-session");
+        assert_eq!(
+            request::prompt_cache_id(&req, raw, None, true).as_deref(),
+            expected.or(fallback.as_deref())
+        );
+    }
+}
+
+/// Header observation must not apply the native-only duplicate-key policy to raw
+/// schemas retained by a translated request. This is a contract probe, not a fixture.
+#[test]
+fn codex_headers_read_raw_translated_schemas() {
+    let raw = r#"{"model":"upstream","service_tier":"fl\u0065x","prompt_cache_key":"  client-key  ","tools":[{"parameters":{"future":1e400,"same":1,"same":2}}]}"#;
+    let mut req = plain_request(true, None);
+    req.source_format = Format::OpenAI;
+    req.body = Bytes::from(raw.to_owned());
+    req.original_body = req.body.clone();
+    let credential = oauth_credential("http://127.0.0.1:1");
+    let view = View::new(&credential);
+    let cache = request::prompt_cache_id(&req, raw, None, false);
+    assert_eq!(cache.as_deref(), Some("client-key"));
+    let headers = request::http_headers(
+        &view,
+        &req.headers,
+        raw,
+        "upstream",
+        cache.as_deref(),
+        true,
+        crate::codex_identity::Origin::Proxy,
+    );
+    assert_eq!(headers["x-codex-routing-hint"], "model=upstream;tier=flex");
+    assert_eq!(req.body.as_ref(), raw.as_bytes());
+}
+
+#[test]
+fn translated_header_observation_keeps_independent_first_matches() {
+    for raw in [
+        r#"{"service_tier":"flex","service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"service_tier":"flex","service_\u0074ier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"model":"upstream","model":"upstream","service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+        r#"{"service_tier":"flex","prompt_cache_key":"cache-FAKE","prompt_cache_key":"later-FAKE"}"#,
+        r#"{"client_metadata":null,"client_metadata":{},"service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#,
+    ] {
+        let mut req = plain_request(true, None);
+        req.source_format = Format::OpenAI;
+        req.body = Bytes::from(raw.to_owned());
+        req.original_body = req.body.clone();
+        let cache = request::prompt_cache_id(&req, raw, None, false);
+        assert_eq!(cache.as_deref(), Some("cache-FAKE"), "{raw}");
+        let credential = oauth_credential("http://127.0.0.1:1");
+        let headers = request::http_headers(
+            &View::new(&credential),
+            &req.headers,
+            raw,
+            "upstream",
+            cache.as_deref(),
+            true,
+            crate::codex_identity::Origin::Proxy,
+        );
+        assert_eq!(headers["x-codex-routing-hint"], "model=upstream;tier=flex");
+        assert_eq!(req.body.as_ref(), raw.as_bytes());
+    }
+}

@@ -158,8 +158,8 @@ pub(crate) fn fingerprint_message(body: &str) -> String {
     let content = rawjson::get(body, &format!("messages.{idx}.content")).json().to_owned();
     let content = rawjson::parse(&content);
     match content.kind() {
-        gjson::Kind::String => content.str().to_owned(),
-        gjson::Kind::Array => content
+        rawjson::Kind::String => content.str().to_owned(),
+        rawjson::Kind::Array => content
             .array()
             .iter()
             .filter(|p| p.get("type").str() == "text")
@@ -173,8 +173,8 @@ pub(crate) fn fingerprint_message(body: &str) -> String {
 /// `isValidClaudeCacheControl` (v8.0.27, be8c35f): only an object whose `type` is the
 /// string `ephemeral` is a breakpoint; `null` and other shapes are ignored.
 pub(crate) fn valid_cache_control(cc: &rawjson::Value) -> bool {
-    cc.kind() == gjson::Kind::Object
-        && cc.get("type").kind() == gjson::Kind::String
+    cc.kind() == rawjson::Kind::Object
+        && cc.get("type").kind() == rawjson::Kind::String
         && cc.get("type").str() == "ephemeral"
 }
 
@@ -200,7 +200,7 @@ pub(crate) fn forwarded_system_blocks(body: &str) -> Vec<Forwarded> {
     let system = rawjson::get(body, "system");
     let keep = |t: &str| !t.trim().is_empty() && !t.trim_start().starts_with(BILLING_PREFIX) && t != CLI_IDENTITY;
     match system.kind() {
-        gjson::Kind::Array => system
+        rawjson::Kind::Array => system
             .array()
             .iter()
             .filter(|p| p.get("type").str() == "text" && keep(p.get("text").str()))
@@ -212,7 +212,7 @@ pub(crate) fn forwarded_system_blocks(body: &str) -> Vec<Forwarded> {
                 }
             })
             .collect(),
-        gjson::Kind::String if keep(system.str()) => vec![Forwarded::plain(system.str())],
+        rawjson::Kind::String if keep(system.str()) => vec![Forwarded::plain(system.str())],
         _ => Vec::new(),
     }
 }
@@ -230,7 +230,7 @@ fn forwarded_block(text: &str, block: &Forwarded, explicit: bool) -> String {
 /// `validateClaudeCallerSystemBlocks`: non-text system blocks have no destination.
 pub(crate) fn invalid_system_block(body: &str) -> Option<String> {
     let system = rawjson::get(body, "system");
-    if system.kind() != gjson::Kind::Array {
+    if system.kind() != rawjson::Kind::Array {
         return None;
     }
     system.array().iter().enumerate().find_map(|(i, p)| {
@@ -274,7 +274,7 @@ pub(crate) fn prepend_reminders(body: &str, blocks: &[Forwarded], explicit: bool
     };
     let path = format!("messages.{idx}.content");
     let content = rawjson::get(body, &path);
-    if content.kind() == gjson::Kind::Array {
+    if content.kind() == rawjson::Kind::Array {
         let blocks = content.array();
         let mut existing: std::collections::HashMap<String, usize> = Default::default();
         for b in &blocks {
@@ -300,7 +300,7 @@ pub(crate) fn prepend_reminders(body: &str, blocks: &[Forwarded], explicit: bool
         raw.splice(at..at, new_blocks);
         return rawjson::set_raw(body, &path, &format!("[{}]", raw.join(",")));
     }
-    if content.kind() == gjson::Kind::String {
+    if content.kind() == rawjson::Kind::String {
         let mut raw: Vec<String> = (0..reminders.len()).map(reminder_block).collect();
         raw.push(text_block(content.str(), None));
         return rawjson::set_raw(body, &path, &format!("[{}]", raw.join(",")));
@@ -310,8 +310,8 @@ pub(crate) fn prepend_reminders(body: &str, blocks: &[Forwarded], explicit: bool
 
 pub(crate) fn message_text(content: &rawjson::Value) -> String {
     match content.kind() {
-        gjson::Kind::String => content.str().to_owned(),
-        gjson::Kind::Array => content
+        rawjson::Kind::String => content.str().to_owned(),
+        rawjson::Kind::Array => content
             .array()
             .iter()
             .filter(|b| b.get("type").str() == "text")
@@ -328,7 +328,7 @@ fn system_directive(message: &rawjson::Value) -> bool {
     let content = message.get("content");
     message.get("role").str() == "system"
         && message.get("output_config").exists()
-        && content.kind() == gjson::Kind::Array
+        && content.kind() == rawjson::Kind::Array
         && content.array().is_empty()
 }
 
@@ -350,7 +350,7 @@ pub(crate) fn insert_mid_system(body: &str, blocks: &[Forwarded], explicit: bool
         return body.to_owned();
     };
     let messages = rawjson::get(body, "messages");
-    if blocks.is_empty() || messages.kind() != gjson::Kind::Array {
+    if blocks.is_empty() || messages.kind() != rawjson::Kind::Array {
         return body.to_owned();
     }
     let msgs = messages.array();
@@ -398,23 +398,23 @@ pub(crate) fn has_advisor_history(body: &str) -> bool {
     rawjson::get(body, "messages").items().iter().any(|msg| {
         let content = msg.get("content");
         match content.kind() {
-            gjson::Kind::Array => content.array().iter().any(|b| match b.get("type").str() {
+            rawjson::Kind::Array => content.array().iter().any(|b| match b.get("type").str() {
                 "advisor_tool_result" | "advisor_redacted_result" => true,
                 "server_tool_use" => b.get("name").str() == "advisor",
                 "tool_result" => {
                     let inner = b.get("content");
                     match inner.kind() {
-                        gjson::Kind::Array => inner
+                        rawjson::Kind::Array => inner
                             .array()
                             .iter()
                             .any(|x| x.get("type").str() == "advisor_redacted_result"),
-                        gjson::Kind::Object => inner.get("type").str() == "advisor_redacted_result",
+                        rawjson::Kind::Object => inner.get("type").str() == "advisor_redacted_result",
                         _ => false,
                     }
                 }
                 _ => false,
             }),
-            gjson::Kind::Object => matches!(
+            rawjson::Kind::Object => matches!(
                 content.get("type").str(),
                 "advisor_tool_result" | "advisor_redacted_result"
             ),
@@ -444,11 +444,11 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
     let path = format!("messages.{idx}.content");
     let content = rawjson::get(body, &path);
     let date_block = text_block(&date_reminder(date), None);
-    if content.kind() == gjson::Kind::String {
+    if content.kind() == rawjson::Kind::String {
         let user = text_block(content.str(), if explicit { None } else { EPHEMERAL });
         return rawjson::set_raw(body, &path, &format!("[{date_block},{user}]"));
     }
-    if content.kind() != gjson::Kind::Array {
+    if content.kind() != rawjson::Kind::Array {
         return body.to_owned();
     }
     let mut raw = Vec::new();
@@ -617,9 +617,9 @@ pub(crate) fn upgrade_ttl(body: String, ttl: &str) -> String {
     let mut edits = Vec::new();
     for (path, block) in signals::blocks(&body) {
         let parsed = rawjson::get(&block, "cache_control");
-        if parsed.kind() != gjson::Kind::Object
+        if parsed.kind() != rawjson::Kind::Object
             || parsed.get("ttl").exists()
-            || parsed.get("type").kind() != gjson::Kind::String
+            || parsed.get("type").kind() != rawjson::Kind::String
         {
             continue;
         }
@@ -649,7 +649,7 @@ pub(crate) fn strip_ttl(body: String) -> String {
         .into_iter()
         .filter(|(_, block)| {
             let cc = rawjson::get(block, "cache_control");
-            cc.kind() == gjson::Kind::Object && cc.get("ttl").exists()
+            cc.kind() == rawjson::Kind::Object && cc.get("ttl").exists()
         })
         .map(|(path, _)| format!("{path}.cache_control.ttl"))
         .collect();
@@ -669,7 +669,7 @@ pub(crate) fn normalize_ttl(body: String) -> String {
             continue;
         }
         let ttl = parsed.get("ttl");
-        if ttl.kind() != gjson::Kind::String || ttl.str() != "1h" {
+        if ttl.kind() != rawjson::Kind::String || ttl.str() != "1h" {
             seen_5m = true;
             continue;
         }
@@ -744,8 +744,8 @@ pub(crate) fn enforce_cache_limit(body: String, mut max: usize) -> String {
 fn cacheable_system(body: &str) -> bool {
     let system = rawjson::get(body, "system");
     match system.kind() {
-        gjson::Kind::Array => !system.array().is_empty(),
-        gjson::Kind::String => !system.str().trim().is_empty(),
+        rawjson::Kind::Array => !system.array().is_empty(),
+        rawjson::Kind::String => !system.str().trim().is_empty(),
         _ => false,
     }
 }
@@ -763,7 +763,7 @@ const MARKER: &str = r#"{"type":"ephemeral"}"#;
 
 fn inject_tools_cache(body: &str) -> String {
     let tools = rawjson::get(body, "tools");
-    if tools.kind() != gjson::Kind::Array {
+    if tools.kind() != rawjson::Kind::Array {
         return body.to_owned();
     }
     let mut last = None;
@@ -784,14 +784,14 @@ fn inject_tools_cache(body: &str) -> String {
 fn inject_system_cache(body: &str) -> String {
     let system = rawjson::get(body, "system");
     match system.kind() {
-        gjson::Kind::Array => {
+        rawjson::Kind::Array => {
             let items = system.array();
             if items.is_empty() || items.iter().any(|b| valid_cache_control(&b.get("cache_control"))) {
                 return body.to_owned();
             }
             rawjson::set_raw(body, &format!("system.{}.cache_control", items.len() - 1), MARKER)
         }
-        gjson::Kind::String if !system.str().trim().is_empty() => {
+        rawjson::Kind::String if !system.str().trim().is_empty() => {
             rawjson::set_raw(body, "system", &format!("[{}]", text_block(system.str(), EPHEMERAL)))
         }
         _ => body.to_owned(),
@@ -800,11 +800,11 @@ fn inject_system_cache(body: &str) -> String {
 
 fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
     let content = message.get("content");
-    if content.kind() == gjson::Kind::String {
+    if content.kind() == rawjson::Kind::String {
         return true;
     }
     let blocks = content.array();
-    if content.kind() != gjson::Kind::Array || blocks.is_empty() {
+    if content.kind() != rawjson::Kind::Array || blocks.is_empty() {
         return false;
     }
     if message.get("role").str() != "assistant" {
@@ -818,7 +818,7 @@ fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
 
 fn inject_messages_cache(body: &str) -> String {
     let messages = rawjson::get(body, "messages");
-    if messages.kind() != gjson::Kind::Array {
+    if messages.kind() != rawjson::Kind::Array {
         return body.to_owned();
     }
     let msgs = messages.array();
@@ -831,7 +831,7 @@ fn inject_messages_cache(body: &str) -> String {
     if let Some(final_msg) = msgs.last() {
         let content = final_msg.get("content");
         if final_msg.get("role").str() == "system"
-            && content.kind() == gjson::Kind::String
+            && content.kind() == rawjson::Kind::String
             && !content.str().trim().is_empty()
         {
             return rawjson::set_raw(
@@ -844,14 +844,14 @@ fn inject_messages_cache(body: &str) -> String {
     let path = format!("messages.{idx}.content");
     let content = rawjson::get(body, &path);
     match content.kind() {
-        gjson::Kind::Array => {
+        rawjson::Kind::Array => {
             let blocks = content.array();
             if blocks.iter().any(|b| valid_cache_control(&b.get("cache_control"))) || blocks.is_empty() {
                 return body.to_owned();
             }
             rawjson::set_raw(body, &format!("{path}.{}.cache_control", blocks.len() - 1), MARKER)
         }
-        gjson::Kind::String => rawjson::set_raw(body, &path, &format!("[{}]", text_block(content.str(), EPHEMERAL))),
+        rawjson::Kind::String => rawjson::set_raw(body, &path, &format!("[{}]", text_block(content.str(), EPHEMERAL))),
         _ => body.to_owned(),
     }
 }
@@ -914,7 +914,7 @@ impl SensitiveWords {
         let mut body = body.to_owned();
         let system = rawjson::get(&body, "system");
         match system.kind() {
-            gjson::Kind::Array => {
+            rawjson::Kind::Array => {
                 let edits: Vec<(String, String)> = system
                     .array()
                     .iter()
@@ -930,7 +930,7 @@ impl SensitiveWords {
                     body = rawjson::set_str(&body, &path, &text);
                 }
             }
-            gjson::Kind::String if !system.str().starts_with(BILLING_PREFIX) => {
+            rawjson::Kind::String if !system.str().starts_with(BILLING_PREFIX) => {
                 let text = system.str().to_owned();
                 let out = self.apply(&text);
                 if out != text {
@@ -945,13 +945,13 @@ impl SensitiveWords {
             let content = rawjson::get(&body, &path).json().to_owned();
             let parsed = rawjson::parse(&content);
             match parsed.kind() {
-                gjson::Kind::String => {
+                rawjson::Kind::String => {
                     let out = self.apply(parsed.str());
                     if out != parsed.str() {
                         body = rawjson::set_str(&body, &path, &out);
                     }
                 }
-                gjson::Kind::Array => {
+                rawjson::Kind::Array => {
                     for (i, block) in parsed.array().iter().enumerate() {
                         if block.get("type").str() != "text" {
                             continue;

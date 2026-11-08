@@ -129,6 +129,51 @@ async fn post(url: &str, path: &str, body: &Value) -> (u16, String) {
     (status, response.text().await.unwrap())
 }
 
+/// Raw source duplicates survive the test ingress: serializing Value would erase
+/// the condition that previously discarded an unrelated, valid cache identity.
+#[tokio::test]
+async fn translated_duplicate_tier_keeps_valid_cache_identity() {
+    let mut control = None;
+    for tier in [
+        r#""service_tier":"flex""#,
+        r#""service_tier":"flex","service_tier":"flex""#,
+        r#""service_tier":"flex","service_\u0074ier":"flex""#,
+    ] {
+        let body = format!(
+            r#"{{"model":"gpt-5.5","messages":[{{"role":"user","content":"hi"}}],{tier},"prompt_cache_key":"cache-FAKE"}}"#
+        );
+        let proxy = proxy(vec![completed()], "").await;
+        let response = wreq::Client::new()
+            .post(format!("{}/v1/chat/completions", proxy.url))
+            .header("authorization", "Bearer client-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        response.bytes().await.unwrap();
+        let sent = proxy.upstream.http();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].headers["session-id"], "cache-FAKE", "{tier}");
+        match &control {
+            Some(body) => assert_eq!(&sent[0].body, body, "translation stays identical"),
+            None => control = Some(sent[0].body.clone()),
+        }
+    }
+    let proxy = proxy(vec![completed()], "").await;
+    let response = wreq::Client::new()
+        .post(format!("{}/v1/responses", proxy.url))
+        .header("authorization", "Bearer client-key")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5.5","input":[],"service_tier":"flex","service_tier":"flex","prompt_cache_key":"cache-FAKE"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    assert!(proxy.upstream.http().is_empty(), "native duplicates stay refused");
+}
+
 /// The one upstream request, as JSON.
 fn sent(proxy: &Proxy) -> Value {
     let http = proxy.upstream.http();

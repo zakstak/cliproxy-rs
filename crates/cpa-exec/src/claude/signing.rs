@@ -17,7 +17,7 @@ pub(crate) fn enabled(api_key: &str, cli_fingerprint: bool, first_party: bool) -
 /// body has none) with `cch=00000`. Runs before the payload rules; [`sign`] after.
 pub(crate) fn placeholder(mut body: String, fallback: &str) -> String {
     let billing = rawjson::get(&body, "system.0.text");
-    if billing.kind() != gjson::Kind::String || !billing.str().starts_with(BILLING_PREFIX) {
+    if billing.kind() != rawjson::Kind::String || !billing.str().starts_with(BILLING_PREFIX) {
         if fallback.is_empty() {
             return body;
         }
@@ -42,8 +42,8 @@ fn prepend_billing(body: &str, billing: &str) -> String {
     let block = text_block(billing, None);
     let system = rawjson::get(body, "system");
     let array = match system.kind() {
-        gjson::Kind::String => format!("[{block},{}]", text_block(system.str(), None)),
-        gjson::Kind::Array => {
+        rawjson::Kind::String => format!("[{block},{}]", text_block(system.str(), None)),
+        rawjson::Kind::Array => {
             let raw = system.json().trim();
             if raw == "[]" {
                 format!("[{block}]")
@@ -59,7 +59,7 @@ fn prepend_billing(body: &str, billing: &str) -> String {
 /// Offset of the five `cch=` hex digits inside the first billing block.
 fn digits_offset(body: &str) -> Option<usize> {
     let billing = rawjson::get(body, "system.0.text");
-    if billing.kind() != gjson::Kind::String || !billing.str().starts_with(BILLING_PREFIX) {
+    if billing.kind() != rawjson::Kind::String || !billing.str().starts_with(BILLING_PREFIX) {
         return None;
     }
     let base = rawjson::offset(body, &billing)?;

@@ -567,7 +567,7 @@ pub(crate) fn restore_response(body: &str, reverse: &Reverse) -> Result<String, 
         return Ok(body.to_owned());
     }
     let content = rawjson::get(body, "content");
-    if content.kind() != gjson::Kind::Array {
+    if content.kind() != rawjson::Kind::Array {
         return Ok(body.to_owned());
     }
     let resolver = Resolver::new(reverse);
@@ -578,7 +578,7 @@ pub(crate) fn restore_response(body: &str, reverse: &Reverse) -> Result<String, 
             "tool_reference" => paths.push(format!("content.{i}.tool_name")),
             "tool_result" => {
                 let nested = part.get("content");
-                if nested.kind() == gjson::Kind::Array {
+                if nested.kind() == rawjson::Kind::Array {
                     for (n, np) in nested.array().iter().enumerate() {
                         if np.get("type").str() == "tool_reference" {
                             paths.push(format!("content.{i}.content.{n}.tool_name"));
@@ -588,7 +588,7 @@ pub(crate) fn restore_response(body: &str, reverse: &Reverse) -> Result<String, 
             }
             "tool_search_tool_result" => {
                 let refs = part.get("content.tool_references");
-                if refs.kind() == gjson::Kind::Array {
+                if refs.kind() == rawjson::Kind::Array {
                     for (n, rp) in refs.array().iter().enumerate() {
                         if rp.get("type").str() == "tool_reference" {
                             paths.push(format!("content.{i}.content.tool_references.{n}.tool_name"));
@@ -625,7 +625,7 @@ pub(crate) fn restore_event_payload(payload: &str, reverse: &Reverse) -> Result<
         "tool_reference" => vec!["content_block.tool_name".into()],
         "tool_search_tool_result" => {
             let refs = block.get("content.tool_references");
-            if refs.kind() != gjson::Kind::Array {
+            if refs.kind() != rawjson::Kind::Array {
                 return Ok(None);
             }
             refs.array()

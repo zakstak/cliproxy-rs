@@ -922,7 +922,7 @@ fn text(bytes: Vec<u8>) -> String {
 /// `helps.SetStringIfDifferent`.
 fn set_string_if_different(body: String, path: &str, value: &str) -> String {
     let current = rawjson::get(&body, path);
-    if current.kind() == gjson::Kind::String && current.str() == value {
+    if current.kind() == rawjson::Kind::String && current.str() == value {
         return body;
     }
     rawjson::set_str(&body, path, value)
@@ -988,7 +988,7 @@ fn sanitize_for_upstream(mut body: String, base_model: &str, preserve_empty_thin
         }
         for field in ["allowed_domains", "blocked_domains"] {
             let v = tool.get(field);
-            if v.kind() == gjson::Kind::Array && v.array().is_empty() {
+            if v.kind() == rawjson::Kind::Array && v.array().is_empty() {
                 empty.push(format!("tools.{t}.{field}"));
             }
         }
@@ -1005,7 +1005,7 @@ fn extract_betas(body: String) -> (Vec<String>, String) {
     if !v.exists() {
         return (Vec::new(), body);
     }
-    let betas = if v.kind() == gjson::Kind::Array {
+    let betas = if v.kind() == rawjson::Kind::Array {
         v.array()
             .iter()
             .map(|b| b.str().trim().to_owned())
@@ -1911,7 +1911,7 @@ fn disable_thinking_if_tool_choice_forced(body: String) -> String {
         members += 1;
         true
     });
-    if oc.kind() == gjson::Kind::Object && members == 0 {
+    if oc.kind() == rawjson::Kind::Object && members == 0 {
         body = rawjson::delete(&body, "output_config");
     }
     body
@@ -1974,7 +1974,7 @@ fn validate_mid_system(body: &str, confirmed: bool, first_party: bool) -> Result
 /// `rebuildMidSystemMessagesToTopLevel`: fold role=system turns into `system`.
 fn rebuild_mid_system(body: &str) -> String {
     let messages = rawjson::get(body, "messages");
-    if messages.kind() != gjson::Kind::Array {
+    if messages.kind() != rawjson::Kind::Array {
         return body.to_owned();
     }
     let mut moved = Vec::new();
@@ -1999,13 +1999,13 @@ fn rebuild_mid_system(body: &str) -> String {
 fn system_text_parts(content: &rawjson::Value<'_>) -> Vec<String> {
     let block = |text: &str| rawjson::set_str(r#"{"type":"text","text":""}"#, "text", text);
     match content.kind() {
-        gjson::Kind::String if !content.str().trim().is_empty() => vec![block(content.str())],
-        gjson::Kind::Array => content
+        rawjson::Kind::String if !content.str().trim().is_empty() => vec![block(content.str())],
+        rawjson::Kind::Array => content
             .array()
             .iter()
             .filter_map(|item| match item.kind() {
-                gjson::Kind::String if !item.str().trim().is_empty() => Some(block(item.str())),
-                gjson::Kind::Object
+                rawjson::Kind::String if !item.str().trim().is_empty() => Some(block(item.str())),
+                rawjson::Kind::Object
                     if item.get("type").str() == "text" && !item.get("text").str().trim().is_empty() =>
                 {
                     Some(item.json().to_owned())
@@ -2022,8 +2022,8 @@ fn strip_attribution_system(body: &str) -> String {
     let system = rawjson::get(body, "system");
     let attribution = |t: &str| t.trim_start().starts_with(cloak::BILLING_PREFIX);
     match system.kind() {
-        gjson::Kind::String if attribution(system.str()) => rawjson::delete(body, "system"),
-        gjson::Kind::Array => {
+        rawjson::Kind::String if attribution(system.str()) => rawjson::delete(body, "system"),
+        rawjson::Kind::Array => {
             let blocks = system.array();
             let kept: Vec<String> = blocks
                 .iter()

@@ -65,7 +65,7 @@ impl Aliases {
             return None;
         }
         let tools = rawjson::get(body, "tools");
-        if tools.kind() == gjson::Kind::Array && !tools.array().is_empty() {
+        if tools.kind() == rawjson::Kind::Array && !tools.array().is_empty() {
             return None;
         }
         Some(self.load(&format!("message:{}", thread.previous)).ok_or_else(not_found))
@@ -112,7 +112,7 @@ impl Thread {
 pub(crate) fn present(body: &str) -> bool {
     may_contain(body, &["\"thread\""]) && {
         let thread = rawjson::get(body, "thread");
-        thread.exists() && thread.kind() != gjson::Kind::Null
+        thread.exists() && thread.kind() != rawjson::Kind::Null
     }
 }
 

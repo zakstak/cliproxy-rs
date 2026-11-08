@@ -10,7 +10,18 @@
 use std::borrow::Cow;
 
 use cpa_common::json::{self, Res};
-pub(crate) use gjson::Kind;
+/// JSON kinds exposed by the Go-compatible reader. This adapter does not use the
+/// third-party gjson crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Null,
+    False,
+    True,
+    Number,
+    String,
+    Array,
+    Object,
+}
 
 /// A gjson `Result` with the method names the Claude executor reads it by.
 #[derive(Clone, Debug, Default)]
