@@ -365,6 +365,9 @@ async fn images_forms_are_read_without_loss() {
             "gpt-image-2",
             vec![("prompt", &b"a"[..]), ("quality", &b"\xc3"[..])],
         ),
+        ("padded stream", "gpt-image-2", vec![("stream ", &b"\xff"[..])]),
+        ("padded model", "gpt-image-2", vec![(" model", &b"\xff"[..])]),
+        ("blank name", "gpt-image-2", vec![(" ", &b"\xff"[..])]),
     ] {
         let req = images_request(path, model, content_type, form(&fields));
         let error = executor
@@ -528,6 +531,52 @@ async fn images_form_controls_keep_their_values() {
     assert_eq!(
         std::str::from_utf8(&sent[0].body).unwrap(),
         r#"{"model":"gpt-image-2","prompt":"p","partial_images":"nope","output_compression":70}"#
+    );
+}
+
+/// Direct multipart conversion keeps literal names, including padding and editor
+/// metacharacters. Unknown fields never become recognized routing or count controls.
+#[tokio::test]
+async fn images_direct_form_names_are_literal() {
+    let mock = Mock::start().await;
+    let executor = executor();
+    let credential = credential(&mock.url);
+    mock.script(
+        "/images/edits",
+        vec![crate::codex_testkit::json(200, r#"{"created":1,"data":[]}"#)],
+    );
+    let fields: Fields = vec![
+        ("prompt", b"p"),
+        ("stream ", b"literal"),
+        (" model", b"other"),
+        ("partial_images ", b"2"),
+        ("partial_images", b"3"),
+        (" ", b"blank"),
+        ("future.path", b"dotted"),
+        (":future", b"colon"),
+        ("future#?", b"symbols"),
+        ("", b"unnamed"),
+    ];
+    let path = "/v1/images/edits";
+    executor
+        .images(
+            &credential,
+            images_request(path, "gpt-image-2", "multipart/form-data; boundary=B", form(&fields)),
+            path,
+            &Config::default(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "model": "gpt-image-2", "prompt": "p", "stream ": "literal", " model": "other",
+            "partial_images ": "2", "partial_images": 3, " ": "blank", "future.path": "dotted",
+            ":future": "colon", "future#?": "symbols"
+        })
     );
 }
 

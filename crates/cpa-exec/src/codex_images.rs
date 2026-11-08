@@ -516,17 +516,30 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, E
         out = set_raw(&out, "stream", "true");
     }
     for (key, values) in &form.values {
-        let key = key.trim();
-        if key.is_empty() || key == "model" || key == "stream" || values.is_empty() {
+        for value in values {
+            form_utf8(key, value)?;
+        }
+        if key == "model" || key == "stream" || values.is_empty() {
             continue;
         }
-        let path = match key {
-            "mask[file_id]" => "mask.file_id",
-            "mask[image_url]" => "mask.image_url",
-            other => other,
+        let path = match key.as_str() {
+            "mask[file_id]" => Cow::Borrowed("mask.file_id"),
+            "mask[image_url]" => Cow::Borrowed("mask.image_url"),
+            other => {
+                // A literal object key, not an editor path: preserve spaces and path
+                // metacharacters. The prefix also permits an empty or numeric key.
+                let mut path = String::from(":");
+                for c in other.chars() {
+                    if matches!(c, '.' | '\\' | '|' | '#' | '@' | '*' | '?') {
+                        path.push('\\');
+                    }
+                    path.push(c);
+                }
+                Cow::Owned(path)
+            }
         };
         let raw = if let [value] = values.as_slice() {
-            form_json_value(path, value)?
+            form_json_value(key, value)?
         } else {
             let items = values
                 .iter()
@@ -534,7 +547,7 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, E
                 .collect::<Result<Vec<_>, _>>()?;
             format!("[{}]", items.join(","))
         };
-        out = set_raw(&out, path, &raw);
+        out = set_raw(&out, &path, &raw);
     }
     if let Some(mask) = form.files("mask").first() {
         out = set_str(&out, "mask.image_url", &data_url(mask));
@@ -567,7 +580,7 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> Result<String, E
 /// no endpoint of the client's to judge it, and omitting it would mean the default.
 fn form_json_value(key: &str, value: &[u8]) -> Result<String, ExecError> {
     let text = form_utf8(key, value)?.trim();
-    if matches!(key.trim(), "n" | "output_compression" | "partial_images")
+    if matches!(key, "n" | "output_compression" | "partial_images")
         && let Ok(n) = go_parse_int(text)
     {
         return Ok(n.to_string());

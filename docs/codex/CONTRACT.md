@@ -277,6 +277,11 @@ A multipart edit has no JSON types, so the form rules are these, on both paths:
 | `n`, tool path | A JSON number spelling, optionally with a leading `+`, exactly equal to one; otherwise the `n` conversion refusal |
 | Count fields, direct path | Text that is a decimal `i64` becomes that JSON integer; other text stays a JSON string, so the Images endpoint judges the value the client sent. Other repeated fields become JSON arrays, as in Go |
 
+Field names are literal, without trimming or case folding. A padded count name stays an
+unknown string field, not a recognized numeric control, and its text still must be UTF-8.
+The shared multipart decoder ignores parts with an empty name; a whitespace-only name
+is still a field name and is preserved on the direct path.
+
 Image and mask files are binary and are never read as text. The OpenAI Images API documents
 `n`, `output_compression` and `partial_images` as integers and `stream` as a boolean.
 Whether the ChatGPT backend, or a Sign in with ChatGPT credential's tool path, accepts a

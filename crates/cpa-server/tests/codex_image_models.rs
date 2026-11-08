@@ -516,6 +516,18 @@ async fn codex_images_read_the_original_request_before_rewriting_it() {
             vec![("model", &b"\xff/gpt-image-2"[..]), ("prompt", b"p")],
             "request form field `model` is not valid UTF-8 at byte 0",
         ),
+        (
+            vec![("model", &b"gpt-image-2"[..]), ("prompt", b"p"), ("stream ", b"\xff")],
+            "request form field `stream ` is not valid UTF-8 at byte 0",
+        ),
+        (
+            vec![("model", &b"gpt-image-2"[..]), ("prompt", b"p"), (" model", b"\xff")],
+            "request form field ` model` is not valid UTF-8 at byte 0",
+        ),
+        (
+            vec![("model", &b"gpt-image-2"[..]), ("prompt", b"p"), (" ", b"\xff")],
+            "request form field ` ` is not valid UTF-8 at byte 0",
+        ),
     ] {
         let (content_type, body) = form_with(&fields);
         let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, body).await;
@@ -535,20 +547,43 @@ async fn codex_images_read_the_original_request_before_rewriting_it() {
     )
     .await;
     assert_eq!(status, 200, "{text}");
-    let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[0].0, "/images/edits");
+    let captures = seen.lock().unwrap().clone();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0].0, "/images/edits");
     assert_eq!(
-        seen[0].2,
+        captures[0].2,
         r#"{"model":"gpt-image-2","prompt":"p","images":[{"image_url":"data:image/png;base64,UE5HREFUQQ=="}]}"#
     );
     assert_eq!(
-        seen[1],
+        captures[1],
         (
             "/images/generations".to_owned(),
             "application/json".to_owned(),
             r#"{"model":"gpt-image-2","prompt":"p"}"#.to_owned()
         )
+    );
+
+    let (content_type, body) = form_with(&[
+        ("model", b"gpt-image-2"),
+        ("prompt", b"p"),
+        ("stream ", b"literal"),
+        ("partial_images ", b"2"),
+        (" ", b"blank"),
+        ("future.path", b"literal"),
+        ("", b"unnamed"),
+    ]);
+    let (status, text) = post(format!("{proxy}/v1/images/edits"), &content_type, body).await;
+    assert_eq!(status, 200, "{text}");
+    let captures = seen.lock().unwrap();
+    assert_eq!(captures.len(), 3);
+    let body: Value = serde_json::from_str(&captures[2].2).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "model": "gpt-image-2", "prompt": "p", "stream ": "literal", "partial_images ": "2",
+            " ": "blank", "future.path": "literal",
+            "images": [{"image_url": "data:image/png;base64,UE5HREFUQQ=="}]
+        })
     );
 }
 
