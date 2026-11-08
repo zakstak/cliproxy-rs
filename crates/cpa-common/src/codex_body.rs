@@ -25,6 +25,10 @@
 //!
 //! Error messages carry byte offsets and protocol field names, never body content, so
 //! they are safe to return to the client and to log.
+//!
+//! [`CodexBody::parse_object`] applies the same rules without the Responses member types,
+//! for Codex inputs that are not Responses requests (the Images API adapter). Its
+//! callers type the members they read themselves.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -119,9 +123,16 @@ pub struct Member<'a> {
     pub key: Cow<'a, str>,
     pub kind: Kind,
     pub raw: &'a [u8],
+    /// Where `raw` starts in the body, recorded by the scanner.
+    start: usize,
 }
 
 impl<'a> Member<'a> {
+    /// The offset just past the value.
+    fn end(&self) -> usize {
+        self.start + self.raw.len()
+    }
+
     /// The unescaped text of a string value, borrowed when it has no escapes.
     pub fn text(&self) -> Option<Cow<'a, str>> {
         if self.kind != Kind::String {
@@ -130,6 +141,35 @@ impl<'a> Member<'a> {
         // The value passed the scanner, so it is UTF-8 and a well-formed string.
         let text = std::str::from_utf8(self.raw).ok()?;
         Scanner { text, at: 0 }.string(true).ok().flatten()
+    }
+
+    /// The elements of an array value, each as a slice of the body; `None` for any
+    /// other value.
+    pub fn items(&self) -> Option<Vec<&'a [u8]>> {
+        if self.kind != Kind::Array {
+            return None;
+        }
+        // The value passed the scanner, so this pass cannot fail.
+        let text = std::str::from_utf8(self.raw).ok()?;
+        let mut scanner = Scanner { text, at: 0 };
+        scanner.eat(b'[').ok()?;
+        let mut items = Vec::new();
+        scanner.whitespace();
+        if scanner.peek() == Some(b']') {
+            return Some(items);
+        }
+        loop {
+            scanner.whitespace();
+            let start = scanner.at;
+            scanner.value(1).ok()?;
+            items.push(&self.raw[start..scanner.at]);
+            scanner.whitespace();
+            match scanner.peek() {
+                Some(b',') => scanner.at += 1,
+                Some(b']') => return Some(items),
+                _ => return None,
+            }
+        }
     }
 }
 
@@ -143,6 +183,14 @@ pub struct CodexBody<'a> {
 
 impl<'a> CodexBody<'a> {
     pub fn parse(raw: &'a [u8]) -> Result<Self, BodyError> {
+        let body = Self::parse_limited(raw, MAX_BODY_BYTES)?;
+        body.check_routing_types()?;
+        Ok(body)
+    }
+
+    /// Every rule of [`Self::parse`] except the Responses member types. For a Codex input
+    /// that is not a Responses request, whose caller checks the types of what it reads.
+    pub fn parse_object(raw: &'a [u8]) -> Result<Self, BodyError> {
         Self::parse_limited(raw, MAX_BODY_BYTES)
     }
 
@@ -168,7 +216,11 @@ impl<'a> CodexBody<'a> {
         let mut members = Vec::new();
         scanner.object(1, Some(&mut members))?;
         scanner.end()?;
-        for member in &members {
+        Ok(Self { raw, members })
+    }
+
+    fn check_routing_types(&self) -> Result<(), BodyError> {
+        for member in &self.members {
             let (field, expected, ok) = match &*member.key {
                 "model" => ("model", "a string", member.kind == Kind::String),
                 "stream" => ("stream", "a boolean", matches!(member.kind, Kind::True | Kind::False)),
@@ -183,7 +235,7 @@ impl<'a> CodexBody<'a> {
                 return Err(BodyError::FieldType { field, expected });
             }
         }
-        Ok(Self { raw, members })
+        Ok(())
     }
 
     /// The top-level member named `key`. Keys are unique, so there is at most one.
@@ -191,20 +243,45 @@ impl<'a> CodexBody<'a> {
         self.members.iter().find(|m| m.key == key)
     }
 
+    /// The top-level members, in document order.
+    pub fn members(&self) -> &[Member<'a>] {
+        &self.members
+    }
+
+    /// The body's bytes, as given to [`Self::parse`].
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
     /// Apply the permitted model and streaming transport edits in one copy. An
     /// unchanged body stays borrowed, including an equivalent escaped model string.
     /// Missing members are inserted first, as in [`Self::with_member`].
     pub fn routed(&self, model: &str, force_stream: bool) -> Cow<'a, [u8]> {
+        self.edited(model, force_stream, None)
+    }
+
+    /// [`Self::routed`] without the top-level member `remove`, still in one copy: the
+    /// HTTP body of a WebSocket `response.create` frame, which drops the frame's `type`.
+    /// The result equals [`Self::without_member`] followed by [`Self::routed`]. `remove`
+    /// is never `model` or `stream`.
+    pub fn routed_without(&self, model: &str, force_stream: bool, remove: &str) -> Cow<'a, [u8]> {
+        debug_assert!(remove != "model" && remove != "stream", "routed_without({remove})");
+        self.edited(model, force_stream, Some(remove))
+    }
+
+    fn edited(&self, model: &str, force_stream: bool, remove: Option<&str>) -> Cow<'a, [u8]> {
         let model_member = self.get("model");
         let model_value = (model_member.and_then(Member::text).as_deref() != Some(model))
             .then(|| serde_json::to_string(model).expect("serialize a string"));
         let stream_member = self.get("stream");
         let stream_value = (force_stream && stream_member.map(|m| m.kind) != Some(Kind::True)).then_some("true");
-        if model_value.is_none() && stream_value.is_none() {
+        let removed = remove.and_then(|key| self.members.iter().position(|m| m.key == key));
+        if model_value.is_none() && stream_value.is_none() && removed.is_none() {
             return Cow::Borrowed(self.raw);
         }
 
-        let mut replacements = Vec::with_capacity(2);
+        // Ranges of the body to replace, in body order; they never overlap.
+        let mut cuts: Vec<(usize, usize, &[u8])> = Vec::with_capacity(3);
         let mut missing = Vec::with_capacity(2);
         for (key, member, value) in [
             ("model", model_member, model_value.as_deref()),
@@ -212,18 +289,19 @@ impl<'a> CodexBody<'a> {
         ] {
             let Some(value) = value else { continue };
             match member {
-                Some(member) => {
-                    let start = member.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
-                    replacements.push((start, start + member.raw.len(), value));
-                }
+                Some(member) => cuts.push((member.start, member.end(), value.as_bytes())),
                 None => missing.push((key, value)),
             }
         }
-        replacements.sort_unstable_by_key(|(start, _, _)| *start);
+        if let Some(index) = removed {
+            let (start, end) = self.member_span(index);
+            cuts.push((start, end, b""));
+        }
+        cuts.sort_unstable_by_key(|(start, _, _)| *start);
         let mut out = Vec::with_capacity(self.raw.len() + model_value.as_ref().map_or(0, String::len) + 32);
         let mut copied = 0;
         if !missing.is_empty() {
-            let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
+            let open = self.open();
             out.extend_from_slice(&self.raw[..open]);
             // Same order as routing model, then inserting stream with with_member.
             for (i, (key, value)) in missing.iter().rev().enumerate() {
@@ -235,18 +313,49 @@ impl<'a> CodexBody<'a> {
                 out.extend_from_slice(b"\":");
                 out.extend_from_slice(value.as_bytes());
             }
-            if !self.members.is_empty() {
+            if self.members.len() > usize::from(removed.is_some()) {
                 out.push(b',');
             }
             copied = open;
         }
-        for (start, end, value) in replacements {
+        for (start, end, value) in cuts {
             out.extend_from_slice(&self.raw[copied..start]);
-            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(value);
             copied = end;
         }
         out.extend_from_slice(&self.raw[copied..]);
         Cow::Owned(out)
+    }
+
+    /// Just past the root object's `{`, the first byte that is not whitespace.
+    fn open(&self) -> usize {
+        self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1
+    }
+
+    /// The bytes that go with member `index` when it is removed, its separating comma
+    /// included: after the previous member's value for any member but the first, else
+    /// up to the next member's key.
+    fn member_span(&self, index: usize) -> (usize, usize) {
+        let member = &self.members[index];
+        if index > 0 {
+            return (self.members[index - 1].end(), member.end());
+        }
+        let end = match self.members.get(1) {
+            // Past the comma and the whitespace before the next key.
+            Some(_) => {
+                let mut at = member.end();
+                while at < self.raw.len() && self.raw[at] != b',' {
+                    at += 1;
+                }
+                at += 1;
+                while at < self.raw.len() && matches!(self.raw[at], b' ' | b'\t' | b'\n' | b'\r') {
+                    at += 1;
+                }
+                at
+            }
+            None => member.end(),
+        };
+        (self.open(), end)
     }
 
     /// The body with top-level `key` set to `value`, a JSON value the caller wrote. An
@@ -258,14 +367,12 @@ impl<'a> CodexBody<'a> {
         let mut out = Vec::with_capacity(self.raw.len() + key.len() + value.len() + 4);
         match self.get(key) {
             Some(member) => {
-                let start = member.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
-                out.extend_from_slice(&self.raw[..start]);
+                out.extend_from_slice(&self.raw[..member.start]);
                 out.extend_from_slice(value.as_bytes());
-                out.extend_from_slice(&self.raw[start + member.raw.len()..]);
+                out.extend_from_slice(&self.raw[member.end()..]);
             }
             None => {
-                // The root object's `{` is the first byte that is not whitespace.
-                let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
+                let open = self.open();
                 out.extend_from_slice(&self.raw[..open]);
                 out.extend_from_slice(serde_json::to_string(key).unwrap_or_default().as_bytes());
                 out.push(b':');
@@ -280,38 +387,15 @@ impl<'a> CodexBody<'a> {
     }
 
     /// The body without top-level `key`, every other byte copied unchanged, once. The
-    /// member goes with its separating comma: after the previous member's value for any
-    /// member but the first, else up to the next member's key. A missing key leaves the
-    /// bytes as they are. This serves the WebSocket `type` envelope, the one member a
-    /// contract transformation removes; it is not a general editing tool.
+    /// member goes with its separating comma ([`Self::member_span`]). A missing key leaves
+    /// the bytes as they are. The WebSocket `type` envelope is the one member a contract
+    /// transformation removes ([`Self::routed_without`] does that together with the
+    /// routing edits); this is not a general editing tool.
     pub fn without_member(&self, key: &str) -> Vec<u8> {
         let Some(index) = self.members.iter().position(|m| m.key == key) else {
             return self.raw.to_vec();
         };
-        let offset = |m: &Member<'_>| m.raw.as_ptr() as usize - self.raw.as_ptr() as usize;
-        let value_end = |m: &Member<'_>| offset(m) + m.raw.len();
-        let member = &self.members[index];
-        let (cut_start, cut_end) = if index > 0 {
-            (value_end(&self.members[index - 1]), value_end(member))
-        } else {
-            let open = self.raw.iter().position(|&b| b == b'{').unwrap_or(0) + 1;
-            let end = match self.members.get(1) {
-                // Past the comma and the whitespace before the next key.
-                Some(_) => {
-                    let mut at = value_end(member);
-                    while at < self.raw.len() && self.raw[at] != b',' {
-                        at += 1;
-                    }
-                    at += 1;
-                    while at < self.raw.len() && matches!(self.raw[at], b' ' | b'\t' | b'\n' | b'\r') {
-                        at += 1;
-                    }
-                    at
-                }
-                None => value_end(member),
-            };
-            (open, end)
-        };
+        let (cut_start, cut_end) = self.member_span(index);
         let mut out = Vec::with_capacity(self.raw.len() - (cut_end - cut_start));
         out.extend_from_slice(&self.raw[..cut_start]);
         out.extend_from_slice(&self.raw[cut_end..]);
@@ -423,7 +507,7 @@ impl<'a> Scanner<'a> {
             let kind = self.value(depth + 1)?;
             if let Some(top) = top.as_deref_mut() {
                 let raw = &self.text.as_bytes()[start..self.at];
-                top.push(Member { key, kind, raw });
+                top.push(Member { key, kind, raw, start });
             }
             self.whitespace();
             match self.peek() {

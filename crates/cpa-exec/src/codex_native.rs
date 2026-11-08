@@ -151,13 +151,11 @@ pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecErro
             "a prewarm (`generate: false`) needs an upstream WebSocket; enable `websockets` on the Codex credential or send the turn without `generate`",
         ));
     }
-    let untagged = CodexBody::parse(frame)?.without_member("type");
-    let body = routed(&Bytes::from(untagged), model)?;
-    let current = CodexBody::parse(&body)?;
-    if current.get("stream").map(|m| m.kind) == Some(Kind::True) {
-        return Ok(body);
+    // One pass and at most one copy: drop `type`, route `model`, ask for the stream.
+    match body.routed_without(model, true, "type") {
+        Cow::Borrowed(_) => Ok(frame.clone()),
+        Cow::Owned(bytes) => Ok(Bytes::from(bytes)),
     }
-    Ok(Bytes::from(current.with_member("stream", "true")))
 }
 
 /// Whether `frame` is a `response.create`. A frame the request boundary refuses counts

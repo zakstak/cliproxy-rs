@@ -395,14 +395,15 @@ pub(crate) fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default()
 }
 
-/// `util.IsCodexResponsesLiteRequest`. The header is decoded as UTF-8 rather than through
-/// [`header`], so Go's `TrimSpace` also strips non-ASCII spaces such as U+00A0.
+/// Whether a request is Responses Lite. The pinned client marks it with the header
+/// `x-openai-internal-codex-responses-lite: true` and the `client_metadata` member
+/// `ws_request_header_x_openai_internal_codex_responses_lite: "true"`
+/// (`core/src/client.rs:174-178`, 1092-1106 and 2701-2707). Both are protocol tokens, so
+/// only ASCII white space is trimmed and only ASCII case is folded; Go's
+/// `IsCodexResponsesLiteRequest` also trims Unicode spaces such as U+00A0.
 pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
-    let lite = headers
-        .get(LITE_HEADER)
-        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-        .unwrap_or_default();
-    if lite.trim().go_eq_fold("true") {
+    let lite = headers.get(LITE_HEADER).map_or(&b""[..], |v| v.as_bytes());
+    if lite.trim_ascii().eq_ignore_ascii_case(b"true") {
         return true;
     }
     #[derive(serde::Deserialize)]
@@ -427,7 +428,7 @@ pub(crate) fn is_lite(body: &str, headers: &HeaderMap) -> bool {
         return false;
     };
     marker.get() == "true"
-        || serde_json::from_str::<String>(marker.get()).is_ok_and(|s| s.trim().eq_ignore_ascii_case("true"))
+        || serde_json::from_str::<String>(marker.get()).is_ok_and(|s| s.trim_ascii().eq_ignore_ascii_case("true"))
 }
 
 /// Codex/Responses formats on both sides ([`responses_pair`]).
@@ -939,6 +940,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(LITE_HEADER, "true".parse().unwrap());
         assert!(is_lite("{}", &headers));
+        headers.insert(LITE_HEADER, " TRUE\t".parse().unwrap());
+        assert!(is_lite("{}", &headers));
+        // Protocol tokens: no Unicode trimming (U+00A0) and no Unicode case folding.
+        headers.insert(LITE_HEADER, HeaderValue::from_bytes("true\u{a0}".as_bytes()).unwrap());
+        assert!(!is_lite("{}", &headers));
+        for marker in [r#""true\u00a0""#, "\"\u{a0}true\""] {
+            let body = format!(
+                r#"{{"client_metadata":{{"ws_request_header_x_openai_internal_codex_responses_lite":{marker}}}}}"#
+            );
+            assert!(!is_lite(&body, &HeaderMap::new()), "{body}");
+        }
         for metadata in ["[true]", r#""true""#, "true", "null"] {
             assert!(!is_lite(
                 &format!(r#"{{"client_metadata":{metadata}}}"#),

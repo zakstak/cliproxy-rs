@@ -578,14 +578,18 @@ fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecEr
     let model = request::base_model(&req.model);
     // The body the request would send: a Responses client's own bytes, or the built-in
     // translation (#27). No Codex-client rewrite, default instructions or payload rule
-    // changes what is counted.
-    let body = if request::responses_formats(req) {
-        req.body.to_vec()
+    // changes what is counted. A Responses body is read in place, after the same request
+    // boundary as the routes that would send it.
+    let translated;
+    let body: &[u8] = if request::responses_formats(req) {
+        check_native_body(req)?;
+        &req.body
     } else {
-        translated::upstream_body(req, &model)?.into_bytes()
+        translated = translated::upstream_body(req, &model)?;
+        translated.as_bytes()
     };
     let encoding = crate::codex_tokens::encoding_for_model(&model);
-    let count = crate::codex_tokens::count_input_tokens(encoding, &body).map_err(|e| {
+    let count = crate::codex_tokens::count_input_tokens(encoding, body).map_err(|e| {
         ExecError::local(
             500,
             FailureScope::Request,

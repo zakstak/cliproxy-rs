@@ -1492,17 +1492,18 @@ impl CodexExecutor {
         let model = crate::codex::native::upstream_model(&req)?;
         let frame = crate::codex::native::routed(&req.body, &model)?;
         settings.refuse_image_tool(&req.request_path, &frame)?;
-        // The frame passed the request boundary, so it is UTF-8.
-        let body = String::from_utf8(frame.to_vec())
+        // The frame passed the request boundary, so it is UTF-8. It is read in place and
+        // sent as these bytes: no copy of the frame.
+        let body = std::str::from_utf8(&frame)
             .map_err(|_| ExecError::local(400, FailureScope::Request, "request body is not valid UTF-8"))?;
-        let cache = request::prompt_cache_id(&req, &body, Some(&exec_session.id), true);
-        crate::codex::report_request(&req, cpa_core::format::Format::Codex, &body);
+        let cache = request::prompt_cache_id(&req, body, Some(&exec_session.id), true);
+        crate::codex::report_request(&req, cpa_core::format::Format::Codex, body);
         let native = request::is_native(&req);
         let headers = request::ws_headers(
             view,
             settings,
             &req.headers,
-            &body,
+            body,
             &model,
             cache.as_deref(),
             native,
@@ -1518,12 +1519,11 @@ impl CodexExecutor {
             .flatten()
             .map(|input| (input, duplex::Prepared::new(native)));
         let guard = session.turn.clone().lock_owned().await;
-        let model_kept = model_kept(&req.original_body, &body);
+        let model_kept = model_kept(&req.original_body, body);
         // A native frame is already a `response.create`.
-        let frame = body;
         let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
-        wire.ws_request(&target.url, &headers, frame.as_bytes());
+        wire.ws_request(&target.url, &headers, &frame);
         let (mut conn, mut handshake) = if exec_session.continuation {
             match session.current().filter(|c| c.target.serves(&target)) {
                 Some(conn) => (conn, None),
@@ -1547,7 +1547,7 @@ impl CodexExecutor {
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
         let mut rx = conn.activate(preserves);
-        if let Err(error) = conn.send(frame.clone()).await {
+        if let Err(error) = conn.send_raw(frame.clone()).await {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
             let retry = error.scope != FailureScope::Request;
@@ -1572,11 +1572,11 @@ impl CodexExecutor {
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
             rx = fresh.activate(preserves);
-            wire.ws_request(&target.url, &headers, frame.as_bytes());
+            wire.ws_request(&target.url, &headers, &frame);
             if let Some(handshake) = &fresh_handshake {
                 wire.ws_handshake(101, handshake);
             }
-            if let Err(error) = fresh.send(frame).await {
+            if let Err(error) = fresh.send_raw(frame).await {
                 wire.ws_exec_error("send_retry", &error);
                 session.invalidate(&fresh, &error, true);
                 return Err(error);
