@@ -30,7 +30,7 @@ Issue #49 removed these built-in integrations and their maintenance: Kimi (`kimi
 - Claude executor: Go's Kimi delegation is gone. A Claude API key whose base URL is Kimi's (`api.kimi.com`, `api.kimi.ai`) is an ordinary Claude-compatible upstream: its Claude Code attribution block is no longer stripped and its device identity seeds from the key.
 - Codex translated route: it converts Claude Messages and Chat Completions; Gemini and Interactions sources are no longer clients.
 - Home mode: a dispatched credential of an unsupported provider is refused (`executor not registered`); Go would run one with a base URL on its OpenAI-compatible executor.
-- LAN discovery advertises the `chat-completions`, `responses` and `messages` protocols and no `api_gemini` path.
+- LAN discovery advertises the `chat-completions`, `responses` and `messages` protocols and no `api_gemini` path. Without that record, a TXT set that reaches its size limit can keep a later record (such as `protocols`) that Go dropped, which can in turn leave out one Go kept (such as `node_role`).
 
 ## Additions in cliproxy-rs
 

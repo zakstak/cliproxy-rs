@@ -206,12 +206,14 @@ async fn drive() {
         "{auth}"
     );
 
-    // OAuth: every provider, Antigravity included, is offered as in Go.
+    // OAuth: the four retained providers, and none of the removed ones (issue #49).
     keys(&mut app, &["tab", "tab"]).await;
     assert_eq!(app.active, app::OAUTH);
     let oauth = joined(&app.oauth.vp.text());
-    assert!(oauth.contains(" 🟪 Antigravity \n"), "{oauth}");
-    assert!(oauth.contains(" Codex (OpenAI) \n"), "{oauth}");
+    for provider in [" Claude (Anthropic) \n", " Codex (OpenAI) \n", " xAI \n", " Meta \n"] {
+        assert!(oauth.contains(provider), "{provider}: {oauth}");
+    }
+    assert!(!oauth.contains("Antigravity") && !oauth.contains("Kimi"), "{oauth}");
     keys(&mut app, &["shift+tab", "shift+tab"]).await;
 
     // `L` switches every tab to Chinese; `q` quits outside the logs tab.

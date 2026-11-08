@@ -103,7 +103,24 @@ async fn catalog_matches_go_for_config_models() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(slugs(got), slugs(want), "{version}: models and order");
+        // A synthesized entry's priority follows its position, which the removed group's
+        // models no longer take; the order of priorities still matches Go's.
+        let priorities = |m: &[Value]| m.iter().map(|e| e["priority"].as_i64()).collect::<Vec<_>>();
+        let order = |p: Vec<Option<i64>>| {
+            let mut idx: Vec<usize> = (0..p.len()).collect();
+            idx.sort_by_key(|&i| p[i]);
+            idx
+        };
+        assert_eq!(
+            order(priorities(got)),
+            order(priorities(want)),
+            "{version}: priority order"
+        );
         for (g, w) in got.iter().zip(want) {
+            let (mut g, mut w) = (g.clone(), w.clone());
+            g.as_object_mut().unwrap().remove("priority");
+            w.as_object_mut().unwrap().remove("priority");
+            let (g, w) = (&g, &w);
             // Go's `gpt-5.5` entry took the recorded OpenAI-compatible group's config model
             // (text only, low and xhigh effort, no apply_patch). Codex alone serves it now,
             // so it is the Codex catalog template.

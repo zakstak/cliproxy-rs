@@ -103,10 +103,15 @@ fn group_difference(saved: &Value, go: &serde_json::Map<String, Value>) -> Optio
         .keys()
         .chain(saved.as_object().into_iter().flat_map(|o| o.keys()))
         .collect();
-    families.into_iter().find_map(|family| {
-        let (rust, go) = (names(saved.get(family)), names(go.get(family)));
-        (rust != go).then(|| format!("{family}: Rust {rust:?} vs Go {go:?}"))
-    })
+    // The removed providers' groups (issue #49).
+    const REMOVED: [&str; 4] = ["gemini", "interactions", "vertex", "openai-compatibility"];
+    families
+        .into_iter()
+        .filter(|f| !REMOVED.contains(&f.as_str()))
+        .find_map(|family| {
+            let (rust, go) = (names(saved.get(family)), names(go.get(family)));
+            (rust != go).then(|| format!("{family}: Rust {rust:?} vs Go {go:?}"))
+        })
 }
 
 /// Gives a test config its own auth directory (the legacy top-level `auth-dir`, which
@@ -293,7 +298,9 @@ async fn go_v0_routes_replay_byte_for_byte() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     eprintln!("v0 replay: {compared} steps compared, {skipped} removed-provider steps skipped");
-    assert!(compared >= 816, "{compared}");
+    // The scenarios that set or read a removed provider's settings (issue #49) are
+    // skipped step by step; the rest still compare byte for byte.
+    assert_eq!((compared, skipped), (463, 223));
     assert!(
         failures.is_empty(),
         "{} of {compared} steps differ:\n{}",
@@ -352,6 +359,16 @@ fn without_removed(text: &str) -> String {
             "devin",
         ] {
             cpa_common::json::delete(&mut out, &format!("{map}.{channel}"));
+        }
+        // A map that only held removed channels is absent here: Rust keeps no empty map,
+        // and its own route answers null.
+        if cpa_common::json::get(&out, map).raw.as_ref() == b"{}" {
+            let only = serde_json::from_slice::<serde_json::Map<String, Value>>(&out).is_ok_and(|o| o.len() == 1);
+            if only {
+                out = format!("{{\"{map}\":null}}").into_bytes();
+            } else {
+                cpa_common::json::delete(&mut out, map);
+            }
         }
     }
     String::from_utf8(out).unwrap()
