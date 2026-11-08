@@ -145,6 +145,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
+| Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
 | Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
@@ -636,6 +637,18 @@ client as sent ([Responses and failures](#responses-and-failures)).
   pick, with a message that says so. After a pick on an upstream socket, a prewarm goes
   to the provider on that socket. Go answers such a prewarm locally with a made-up
   `resp_prewarm_` response; other providers keep that behaviour.
+- An interrupt (`response.interrupt`) has no upstream socket to go to. For the running
+  response, the proxy cancels the HTTP request, sends
+  `{"type":"response.interrupt.accepted","response_id":...}` with the interrupt's ID, and
+  then sends a `response.incomplete` with that ID, `status: "incomplete"`, the reason
+  `interrupted` and the output items the provider already delivered. The proxy adds no
+  usage and no text, and never sends a successful completion. An interrupt for the
+  response the connection just finished gets the acknowledgement alone. The pinned
+  client reads only the ID, the reason and the usage of an interrupted response
+  (`sse/responses.rs:451-518`), and ends the turn with `end_turn: false`. These events
+  answer the client's cancel handshake. They are not provider output, and nothing
+  further reaches the upstream (#1,
+  [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md)).
 
 The server's transcript merge, tool-call repair and Codex-client preparation still build
 the frame that other providers receive; no Codex attempt sees it.
@@ -914,7 +927,9 @@ Passive accounting reads a copy and changes nothing.
 - The proxy forwards a client's prewarm and never sends its own. It sends no inference
   keepalive. A prewarm that only the [HTTP fallback](#websocket-http-fallback) could
   serve is refused, never answered locally.
-- The proxy forwards `response.interrupt` and its acknowledgements unchanged.
+- The proxy forwards `response.interrupt` and its acknowledgements unchanged. On a turn
+  served over HTTP, which has no upstream socket, the proxy answers the interrupt
+  itself, as described in [WebSocket HTTP fallback](#websocket-http-fallback).
 - A 426 handshake fails the turn with that status. The only proxy-side HTTP conversion
   is the [WebSocket HTTP fallback](#websocket-http-fallback) for credentials without
   `websockets`, which removes only the frame's `type`.

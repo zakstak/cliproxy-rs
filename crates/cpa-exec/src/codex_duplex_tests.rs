@@ -1912,3 +1912,105 @@ async fn an_outcome_observed_when_the_consumer_leaves_still_settles() {
         up.finish().await;
     }
 }
+
+// ------------------------------------------------------------------ bounded queues (#24)
+
+/// #24, `docs/codex/CONTRACT.md` "Socket and account ownership": the duplex keeps at most
+/// 16 creates outstanding upstream, and holds at most 16 creates back while a steer is
+/// unacknowledged. One more ends the connection with a local, request-scoped error
+/// instead of growing a queue. That create never reaches upstream, and neither does a
+/// held create. Barriers on what upstream read, not quiet periods, order each step.
+#[tokio::test]
+async fn outstanding_and_held_creates_stay_bounded() {
+    const BOUND: usize = 16;
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","input":"hold"}"#;
+    let create = |n: usize| {
+        format!(
+            r#"{{"type":"response.create","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"turn {n}"}}]}}]}}"#
+        )
+    };
+    for held in [false, true] {
+        let received: Arc<Mutex<Vec<String>>> = Arc::default();
+        let read_all = Arc::new(tokio::sync::Notify::new());
+        let (log, signal) = (received.clone(), read_all.clone());
+        let up = Scripted::start(move |mut c: Peer| {
+            let (log, signal) = (log.clone(), signal.clone());
+            async move {
+                c.read().await;
+                c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                if !held {
+                    c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+                        .await;
+                }
+                // Outstanding: the 16 creates. Held: only the steer, never acknowledged.
+                let expected = if held { 1 } else { BOUND };
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), c.socket.recv()).await {
+                        Ok(Some(Ok(AxMessage::Text(text)))) => {
+                            let mut log = log.lock().unwrap();
+                            log.push(text.as_str().to_owned());
+                            if log.len() == expected {
+                                signal.notify_one();
+                            }
+                        }
+                        Ok(Some(Ok(AxMessage::Ping(_) | AxMessage::Pong(_)))) => {}
+                        _ => break,
+                    }
+                }
+            }
+        })
+        .await;
+        let client = Client::new(&format!("duplex-bounded-{held}"));
+        let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+        let created = next(&mut stream).await.unwrap().unwrap();
+        assert_eq!(get(&created, "type"), "response.created", "held={held}");
+        if held {
+            client.send(STEER).await;
+            tokio::time::timeout(Duration::from_secs(5), read_all.notified())
+                .await
+                .unwrap_or_else(|_| panic!("held={held}: the steer never reached upstream"));
+            for n in 0..BOUND {
+                client.send(&create(n)).await;
+            }
+        } else {
+            let completed = next(&mut stream).await.unwrap().unwrap();
+            assert_eq!(get(&completed, "type"), "response.completed");
+            for n in 0..BOUND {
+                client.send(&create(n)).await;
+            }
+            tokio::time::timeout(Duration::from_secs(5), read_all.notified())
+                .await
+                .unwrap_or_else(|_| panic!("held={held}: the outstanding creates never reached upstream"));
+        }
+        client.send(&create(BOUND)).await;
+        let error = loop {
+            match next(&mut stream).await {
+                Some(Ok(event)) => panic!("held={held}: unexpected event {event}"),
+                Some(Err(error)) => break error,
+                None => panic!("held={held}: the stream ended without the bound's error"),
+            }
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("too many outstanding response.create requests"),
+            "held={held}: {error}"
+        );
+        assert_eq!(error.scope, FailureScope::Request, "held={held}: {error}");
+        assert!(next(&mut stream).await.is_none(), "held={held}: the stream ends");
+        drop(stream);
+        up.finish().await;
+        let routed = |n: usize| format!(r#"{{"model":"{MODEL}",{}"#, &create(n)[1..]);
+        let want: Vec<String> = if held {
+            vec![STEER.to_owned()]
+        } else {
+            (0..BOUND).map(routed).collect()
+        };
+        assert_eq!(
+            *received.lock().unwrap(),
+            want,
+            "held={held}: nothing past the bound, and no held create, went upstream"
+        );
+    }
+}
