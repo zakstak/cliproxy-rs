@@ -199,7 +199,7 @@ async fn next(stream: &mut BoxStream<'static, Result<Bytes, ExecError>>) -> Opti
 }
 
 fn get(payload: &str, path: &str) -> String {
-    gjson::get(payload, path).str().to_owned()
+    crate::rawjson::get(payload, path).str().to_owned()
 }
 
 // ------------------------------------------------------------------ codex_websockets_duplex_test.go
@@ -400,7 +400,7 @@ async fn standalone_create_does_not_inherit_parent_id() {
         if get(&second, "type") != "response.create" {
             c.error(format!("second type: {second}"));
         }
-        if gjson::get(&second, "previous_response_id").exists() {
+        if crate::rawjson::get(&second, "previous_response_id").exists() {
             c.error(format!(
                 "standalone create must not gain previous_response_id: {second}"
             ));
@@ -1018,7 +1018,8 @@ async fn a_slow_observer_does_not_hold_client_input() {
             payload: &'a [u8],
         ) -> futures_util::future::BoxFuture<'a, ()> {
             Box::pin(async move {
-                if gjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta" {
+                if crate::rawjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta"
+                {
                     self.held.notify_one();
                     let _ = self.release.acquire().await.unwrap();
                 }
@@ -1118,7 +1119,8 @@ async fn a_failure_waits_for_the_observed_message() {
             payload: &'a [u8],
         ) -> futures_util::future::BoxFuture<'a, ()> {
             Box::pin(async move {
-                if gjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta" {
+                if crate::rawjson::get(&String::from_utf8_lossy(payload), "type").str() == "response.output_text.delta"
+                {
                     self.held.notify_one();
                     let _ = self.release.acquire().await.unwrap();
                 }
@@ -1192,7 +1194,7 @@ async fn a_progress_failure_stops_client_input_during_an_observation() {
             payload: &'a [u8],
         ) -> futures_util::future::BoxFuture<'a, ()> {
             Box::pin(async move {
-                if gjson::get(&String::from_utf8_lossy(payload), "response.id").str() == "r2" {
+                if crate::rawjson::get(&String::from_utf8_lossy(payload), "response.id").str() == "r2" {
                     self.held.notify_one();
                     let _ = self.release.acquire().await.unwrap();
                 }

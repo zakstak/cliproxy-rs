@@ -243,10 +243,11 @@ header observation borrows raw fields without changing the body.
 #28 deleted the last request rewrites (`shape` and its helpers, the payload finalizer,
 the Sign in with ChatGPT body rules and the Codex executor's multi-agent optimization),
 so no Codex request path edits a body through the Go helpers. The callers below read,
-or rewrite only for other providers. `crates/cpa-common/src/json.rs` and the vendored
-gjson stay while other providers and response observers use them.
-[The migration inventory](../GJSON-MIGRATION.md) lists the remaining source and
-manifest dependencies, including consumers outside Codex Responses.
+or rewrite only for other providers. They read through `crates/cpa-common/src/json.rs`, the
+Go-compatible port, directly or through its `&str` facade `cpa_common::rawjson`; the
+third-party Rust gjson crate and its vendored copy are removed.
+[The migration record](../GJSON-MIGRATION.md) lists the reader of each surface and the
+reader semantics.
 
 | Code | What it parses | Status |
 | --- | --- | --- |
@@ -258,7 +259,7 @@ manifest dependencies, including consumers outside Codex Responses.
 | `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | Retained; #33 owns image model IDs |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | Retained |
 | `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads |
-| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `gjson` still reads upstream event types and response IDs for bookkeeping | Upstream observation remains |
+| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy | Upstream observation remains |
 | `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A Codex attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the frame for other providers | Other providers |
 | `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A Codex attempt gets the client's bytes from `NativeRequest` instead | Other providers |
 | `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers |

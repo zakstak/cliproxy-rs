@@ -109,8 +109,8 @@ fn local_prewarm_detection_matches_go() {
 fn prewarm_payloads_match_go() {
     let v = vectors("prewarm_payloads")[0];
     let go = strings(v, "list");
-    let id = gjson::get(&go[0], "response.id").str().to_owned();
-    let created_at = gjson::get(&go[0], "response.created_at").i64();
+    let id = cpa_common::rawjson::get(&go[0], "response.id").str().to_owned();
+    let created_at = cpa_common::rawjson::get(&go[0], "response.created_at").i64();
     assert!(id.starts_with("resp_prewarm_"));
     assert_eq!(prewarm_payloads(s(v, "raw"), &id, created_at).to_vec(), go);
 }
@@ -160,7 +160,7 @@ fn completion_restore_and_pending_calls_match_go() {
         let mut got = Vec::new();
         for event in strings(v, "events") {
             turn.collect(&event);
-            let kind = gjson::get(&event, "type").str().to_owned();
+            let kind = cpa_common::rawjson::get(&event, "type").str().to_owned();
             let event = if kind == "response.completed" || kind == "response.done" {
                 let restored = turn.restore_completion(event);
                 got.push(restored.clone());
@@ -207,4 +207,26 @@ fn close_reason_truncation_matches_go() {
         let max = v["max"].as_u64().unwrap_or(0) as usize;
         assert_eq!(truncate_reason(s(v, "raw"), max), s(v, "out"));
     }
+}
+
+/// The xAI transcript reads frames through `cpa_common::rawjson` (the third-party gjson
+/// crate is gone). Item metadata keys match case-insensitively with the last duplicate
+/// winning, as Go's unmarshal does, and every item keeps its own bytes: number spellings,
+/// escapes and duplicate members included.
+#[test]
+fn transcript_items_keep_their_bytes() {
+    let raw = r#"{"type":"message","TYPE":"function_call","id":"a","id":"b","call_id":"c","n":1e400,"s":"\u0061"}"#;
+    let item = Item::parse(&rawjson::parse(raw));
+    assert_eq!(
+        (item.kind.as_str(), item.id.as_str(), item.call_id.as_str()),
+        ("function_call", "b", "c")
+    );
+    assert_eq!(item.raw, raw);
+    let previous = r#"{"input":[{"type":"message","id":"m1","n":1.50}]}"#;
+    let append = r#"[{"type":"message","id":"m2","x":123456789012345678901234567890,"s":"\ud83d\ude00"}]"#;
+    let merged = merge_input(previous, "", append).unwrap();
+    assert_eq!(
+        merged,
+        r#"[{"type":"message","id":"m1","n":1.50},{"type":"message","id":"m2","x":123456789012345678901234567890,"s":"\ud83d\ude00"}]"#
+    );
 }

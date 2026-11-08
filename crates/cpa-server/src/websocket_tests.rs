@@ -671,14 +671,18 @@ async fn interrupt_diagnostics_are_sanitized() {
     socket.send(WsMessage::text(secret)).await.unwrap();
     let rejected = read_text(&mut socket).await;
     assert_eq!(
-        gjson::get(&rejected, "error.message").str(),
+        cpa_common::rawjson::get(&rejected, "error.message").str(),
         "no active upstream websocket for response.interrupt",
         "{rejected}"
     );
     let create = r#"{"type":"response.create","model":"gpt-fixture","input":[]}"#;
     socket.send(WsMessage::text(create)).await.unwrap();
     let created = read_text(&mut socket).await;
-    assert_eq!(gjson::get(&created, "type").str(), "response.created", "{created}");
+    assert_eq!(
+        cpa_common::rawjson::get(&created, "type").str(),
+        "response.created",
+        "{created}"
+    );
     assert_eq!(read_text(&mut socket).await, ITEM);
     socket
         .send(WsMessage::text(
@@ -695,7 +699,7 @@ async fn interrupt_diagnostics_are_sanitized() {
     );
     let incomplete = read_text(&mut socket).await;
     assert_eq!(
-        gjson::get(&incomplete, "type").str(),
+        cpa_common::rawjson::get(&incomplete, "type").str(),
         "response.incomplete",
         "{incomplete}"
     );
@@ -786,7 +790,7 @@ async fn uninterrupted_claude_turns_send_masters_bytes() {
                 ];
                 let sse: String = events
                     .iter()
-                    .map(|e| format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str()))
+                    .map(|e| format!("event: {}\ndata: {e}\n\n", cpa_common::rawjson::get(e, "type").str()))
                     .collect();
                 ([("content-type", "text/event-stream")], sse)
             }
@@ -828,8 +832,8 @@ async fn uninterrupted_claude_turns_send_masters_bytes() {
                 Ok(Some(Ok(WsMessage::Text(text)))) => text.as_str().to_owned(),
                 other => panic!("no text frame: {other:?}"),
             };
-            if gjson::get(&frame, "type").str() == "response.completed" {
-                id = gjson::get(&frame, "response.id").str().to_owned();
+            if cpa_common::rawjson::get(&frame, "type").str() == "response.completed" {
+                id = cpa_common::rawjson::get(&frame, "response.id").str().to_owned();
                 break;
             }
         }
@@ -889,7 +893,7 @@ async fn interrupt_accepts_the_sessions_home_credential() {
                     while let Some(Ok(AxMessage::Text(text))) = socket.recv().await {
                         frames.lock().unwrap().push(text.as_str().to_owned());
                         // The create starts r1; only the interrupt finishes it.
-                        let reply = if gjson::get(text.as_str(), "type").str() == "response.interrupt" {
+                        let reply = if cpa_common::rawjson::get(text.as_str(), "type").str() == "response.interrupt" {
                             r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}"#
                         } else {
                             r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#
@@ -948,7 +952,11 @@ async fn interrupt_accepts_the_sessions_home_credential() {
         .await
         .unwrap();
     let created = read_text(&mut socket).await;
-    assert_eq!(gjson::get(&created, "type").str(), "response.created", "{created}");
+    assert_eq!(
+        cpa_common::rawjson::get(&created, "type").str(),
+        "response.created",
+        "{created}"
+    );
     assert!(
         rt.store().get("home-interrupt-auth").is_none(),
         "the Home credential stays out of the store"
@@ -956,7 +964,7 @@ async fn interrupt_accepts_the_sessions_home_credential() {
     socket.send(WsMessage::text(INTERRUPT)).await.unwrap();
     let completed = read_text(&mut socket).await;
     assert_eq!(
-        gjson::get(&completed, "type").str(),
+        cpa_common::rawjson::get(&completed, "type").str(),
         "response.completed",
         "{completed}"
     );
@@ -1291,7 +1299,7 @@ async fn removal_closes_only_its_sockets(section: &str) {
                 Ok(Some(Ok(WsMessage::Text(text)))) => text.as_str().to_owned(),
                 other => panic!("{key}: no text frame: {other:?}"),
             };
-            match gjson::get(&frame, "type").str() {
+            match cpa_common::rawjson::get(&frame, "type").str() {
                 "response.completed" => return,
                 "error" => panic!("{key}: {frame}"),
                 _ => {}
@@ -1377,7 +1385,7 @@ async fn handshake_run(
                             models
                                 .lock()
                                 .unwrap()
-                                .push(gjson::get(text.as_str(), "model").str().to_owned());
+                                .push(cpa_common::rawjson::get(text.as_str(), "model").str().to_owned());
                             for event in events {
                                 let _ = socket.send(AxMessage::Text((*event).into())).await;
                             }
@@ -1447,10 +1455,10 @@ async fn handshake_run(
                 other => panic!("turn {turn}: no text frame: {other:?}"),
             };
             let done = matches!(
-                gjson::get(&frame, "type").str(),
+                cpa_common::rawjson::get(&frame, "type").str(),
                 "response.completed" | "response.failed"
             );
-            assert_ne!(gjson::get(&frame, "type").str(), "error", "{frame}");
+            assert_ne!(cpa_common::rawjson::get(&frame, "type").str(), "error", "{frame}");
             frames.push(frame);
             if done {
                 break;
@@ -1789,7 +1797,7 @@ mod committed_context_failure {
                 }
                 let kinds: Vec<String> = frames
                     .iter()
-                    .map(|f| gjson::get(f, "type").str().to_owned())
+                    .map(|f| cpa_common::rawjson::get(f, "type").str().to_owned())
                     .filter(|k| k.starts_with("response.failed") || k == "response.incomplete" || k == "error")
                     .collect();
                 assert_eq!(kinds, ["response.failed"], "{name}: one terminal event\n{frames:#?}");

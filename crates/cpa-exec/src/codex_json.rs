@@ -4,8 +4,8 @@
 //! keep their order, spacing and number spelling. An edit sjson rejects leaves the input
 //! unchanged, as Go callers that ignore the error do.
 
+use crate::rawjson::{self, Kind};
 use cpa_common::json as gj;
-use gjson::Kind;
 
 fn edited(json: &str, edit: impl FnOnce(&mut Vec<u8>) -> bool) -> String {
     let mut out = json.as_bytes().to_vec();
@@ -32,7 +32,7 @@ pub fn delete(json: &str, path: &str) -> String {
 
 /// `helps.SetStringIfDifferent`.
 pub fn set_str_if_different(json: String, path: &str, value: &str) -> String {
-    let current = gjson::get(&json, path);
+    let current = rawjson::get(&json, path);
     if current.kind() == Kind::String && current.str() == value {
         return json;
     }
@@ -41,7 +41,7 @@ pub fn set_str_if_different(json: String, path: &str, value: &str) -> String {
 
 /// `helps.SetBoolIfDifferent`.
 pub fn set_bool_if_different(json: String, path: &str, value: bool) -> String {
-    let kind = gjson::get(&json, path).kind();
+    let kind = rawjson::get(&json, path).kind();
     if (value && kind == Kind::True) || (!value && kind == Kind::False) {
         return json;
     }
@@ -62,10 +62,10 @@ pub fn go_remarshal_object(
     json: &str,
     edit: impl FnOnce(&mut std::collections::BTreeMap<String, String>) -> bool,
 ) -> Option<String> {
-    if !gjson::valid(json) {
+    if !rawjson::valid(json) {
         return None;
     }
-    let root = gjson::parse(json);
+    let root = rawjson::parse(json);
     if root.kind() != Kind::Object {
         return None;
     }

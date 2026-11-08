@@ -15,6 +15,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use cpa_common::rawjson;
 use cpa_core::credential::Credential;
 
 use crate::runtime::{AcquireError, Runtime, Selection};
@@ -39,18 +40,18 @@ fn error(status: u16, message: &str) -> Response {
 fn routing(body: &[u8]) -> (String, String) {
     let (mut id, mut model) = (String::new(), String::new());
     let text = String::from_utf8_lossy(body);
-    if !gjson::valid(&text) {
+    if !rawjson::valid(&text) {
         return (id, model);
     }
-    let root = gjson::parse(&text);
-    if root.kind() == gjson::Kind::Object {
+    let root = rawjson::parse(&text);
+    if root.kind() == rawjson::Kind::Object {
         root.each(|key, value| {
             let slot = match key.str() {
                 k if k.eq_ignore_ascii_case("id") => &mut id,
                 k if k.eq_ignore_ascii_case("model") => &mut model,
                 _ => return true,
             };
-            if value.kind() == gjson::Kind::String {
+            if value.kind() == rawjson::Kind::String {
                 *slot = value.str().to_owned();
             }
             true

@@ -119,7 +119,7 @@ async fn upstream_handler(State(up): State<Arc<Upstream>>, mut req: axum::extrac
     let mut sse = String::new();
     for event in reply["events"].as_array().into_iter().flatten() {
         let event = event.as_str().unwrap();
-        let kind = gjson::get(event, "type");
+        let kind = cpa_common::rawjson::get(event, "type");
         sse.push_str(&format!("event: {}\ndata: {event}\n\n", kind.str()));
     }
     if reply["then"] == "hold" {
@@ -440,7 +440,7 @@ async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
 /// and ID.
 fn native_terminals(scenario: &mut Value) {
     const TERMINAL: [&str; 3] = ["response.completed", "response.done", "response.incomplete"];
-    let terminal = |text: &str| TERMINAL.contains(&gjson::get(text, "type").str());
+    let terminal = |text: &str| TERMINAL.contains(&cpa_common::rawjson::get(text, "type").str());
     let Some(go) = scenario["upstream"].as_array() else {
         return;
     };
@@ -459,12 +459,15 @@ fn native_terminals(scenario: &mut Value) {
             if matches!(consumer, Some("ws_frame" | "http")) {
                 for event in reply["events"].as_array().into_iter().flatten() {
                     let event = event.as_str().unwrap();
-                    let id = gjson::get(event, "response.id").str().to_owned();
+                    let id = cpa_common::rawjson::get(event, "response.id").str().to_owned();
                     if terminal(event) {
                         raw.insert(id.clone(), event.to_owned());
                     }
                     if consumer == Some("http") && !id.is_empty() {
-                        events.insert((gjson::get(event, "type").str().to_owned(), id), event.to_owned());
+                        events.insert(
+                            (cpa_common::rawjson::get(event, "type").str().to_owned(), id),
+                            event.to_owned(),
+                        );
                     }
                 }
             }
@@ -476,11 +479,11 @@ fn native_terminals(scenario: &mut Value) {
             let Some(text) = frame["text"].as_str() else {
                 continue;
             };
-            let id = gjson::get(text, "response.id").str().to_owned();
+            let id = cpa_common::rawjson::get(text, "response.id").str().to_owned();
             let replaced = if terminal(text) {
                 raw.get(&id)
             } else {
-                events.get(&(gjson::get(text, "type").str().to_owned(), id))
+                events.get(&(cpa_common::rawjson::get(text, "type").str().to_owned(), id))
             };
             if let Some(event) = replaced {
                 frame["text"] = Value::String(event.clone());
@@ -638,14 +641,14 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
                     break;
                 }
             };
-            let kind = gjson::get(&text, "type").str().to_owned();
+            let kind = cpa_common::rawjson::get(&text, "type").str().to_owned();
             if kind == "response.completed" || kind == "response.done" {
-                last_id = gjson::get(&text, "response.id").str().to_owned();
+                last_id = cpa_common::rawjson::get(&text, "response.id").str().to_owned();
             }
             got.push(Frame::Text(mask(&text)));
             if let Some((want_kind, want_id)) = until
                 && kind == want_kind
-                && (want_id.is_empty() || gjson::get(&text, "response.id").str() == want_id)
+                && (want_id.is_empty() || cpa_common::rawjson::get(&text, "response.id").str() == want_id)
             {
                 break;
             }
@@ -697,19 +700,26 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
     // a native create goes upstream as the client sent it, an append keeps Go's framing.
     let mut requests = sent
         .iter()
-        .filter(|s| matches!(gjson::get(s, "type").str(), "response.create" | "response.append"))
+        .filter(|s| {
+            matches!(
+                cpa_common::rawjson::get(s, "type").str(),
+                "response.create" | "response.append"
+            )
+        })
         .peekable();
     for (i, (rust, go)) in captured.iter().zip(&go).enumerate() {
         let go_body = mask(&go_upstream_body(name, go["body"].as_str().unwrap_or_default()));
         if rust.kind == "ws_frame"
-            && gjson::get(go["body"].as_str().unwrap_or_default(), "type").str() == "response.create"
+            && cpa_common::rawjson::get(go["body"].as_str().unwrap_or_default(), "type").str() == "response.create"
         {
-            let model = gjson::get(&rust.body, "model").str().to_owned();
+            let model = cpa_common::rawjson::get(&rust.body, "model").str().to_owned();
             // A create the proxy rejected locally never reached upstream: skip it.
-            let matched = requests.by_ref().find(|s| match gjson::get(s, "type").str() {
-                "response.create" => native_frame(s, &model) == rust.body,
-                _ => mask(&rust.body) == go_body,
-            });
+            let matched = requests
+                .by_ref()
+                .find(|s| match cpa_common::rawjson::get(s, "type").str() {
+                    "response.create" => native_frame(s, &model) == rust.body,
+                    _ => mask(&rust.body) == go_body,
+                });
             assert!(
                 matched.is_some(),
                 "{name}: upstream frame #{i} is neither a client create as sent nor Go's append framing\n rust: {}\n   go: {go_body}",
@@ -718,10 +728,10 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         } else if rust.kind == "http" {
             // A Codex turn over HTTP (#28): the client's create without its `type` tag,
             // with only `model` routed, where Go sent its merged and shaped transcript.
-            let model = gjson::get(&rust.body, "model").str().to_owned();
-            let matched = requests
-                .by_ref()
-                .find(|s| gjson::get(s, "type").str() == "response.create" && http_body(s, &model) == rust.body);
+            let model = cpa_common::rawjson::get(&rust.body, "model").str().to_owned();
+            let matched = requests.by_ref().find(|s| {
+                cpa_common::rawjson::get(s, "type").str() == "response.create" && http_body(s, &model) == rust.body
+            });
             assert!(
                 matched.is_some(),
                 "{name}: upstream request #{i} is not a client create without its tag\n rust: {}",

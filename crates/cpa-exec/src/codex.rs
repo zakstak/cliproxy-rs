@@ -23,6 +23,7 @@ use crate::codex_oauth::{self, CodexOAuth};
 use crate::codex_quota::QuotaSignals;
 use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response::{self as response, Bootstrap, Processor};
+use crate::rawjson;
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
@@ -321,7 +322,7 @@ impl CodexExecutor {
         error_body: ErrorBody,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         // The shaped body names the base model, the key of per-model quota snapshots.
-        let model = gjson::get(&body, "model").str().to_owned();
+        let model = rawjson::get(&body, "model").str().to_owned();
         self.open_for(
             view,
             settings,
@@ -455,7 +456,10 @@ impl CodexExecutor {
         // Go selects with `X-Session-ID` set from the body's `id`; the request context then
         // carries that explicit session for `$CPA-SESSION-ID`.
         let mut selection_headers = client.clone();
-        let id = gjson::get(&String::from_utf8_lossy(body), "id").str().trim().to_owned();
+        let id = rawjson::get(&String::from_utf8_lossy(body), "id")
+            .str()
+            .trim()
+            .to_owned();
         if !id.is_empty()
             && let Ok(value) = http::HeaderValue::from_str(&id)
         {

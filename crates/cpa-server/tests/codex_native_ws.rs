@@ -159,7 +159,7 @@ async fn read(socket: &mut WebSocket, until: &[&str]) -> Read {
         match next {
             Some(Ok(Message::Text(text))) => {
                 let text = text.as_str().to_owned();
-                let kind = gjson::get(&text, "type").str().to_owned();
+                let kind = cpa_common::rawjson::get(&text, "type").str().to_owned();
                 read.frames.push(text);
                 if until.contains(&kind.as_str()) {
                     return read;

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::rawjson::{self, Kind};
 use bytes::Bytes;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
@@ -29,7 +30,6 @@ use cpa_core::exec::{
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use gjson::Kind;
 use http::HeaderMap;
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
@@ -182,11 +182,11 @@ pub(crate) struct Link {
 /// `response.interrupt.accepted` and `.failed`: the `response_id` they acknowledge, empty
 /// when it is missing or not a string. `None` for any other event.
 fn acknowledged_id(payload: &str) -> Option<String> {
-    let kind = gjson::get(payload, "type");
+    let kind = rawjson::get(payload, "type");
     if !matches!(kind.str(), "response.interrupt.accepted" | "response.interrupt.failed") {
         return None;
     }
-    let id = gjson::get(payload, "response_id");
+    let id = rawjson::get(payload, "response_id");
     Some(if id.kind() == Kind::String {
         id.str().to_owned()
     } else {
@@ -197,14 +197,14 @@ fn acknowledged_id(payload: &str) -> Option<String> {
 /// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
 /// without `error`) with a non-empty string `response.id`.
 fn terminal_response_id(payload: &str) -> Option<String> {
-    let kind = gjson::get(payload, "type");
+    let kind = rawjson::get(payload, "type");
     if !matches!(
         kind.str(),
         "response.completed" | "response.done" | "response.incomplete" | "response.failed"
     ) {
         return None;
     }
-    let id = gjson::get(payload, "response.id");
+    let id = rawjson::get(payload, "response.id");
     (id.kind() == Kind::String && !id.str().is_empty()).then(|| id.str().to_owned())
 }
 
@@ -826,12 +826,12 @@ fn ws_url(http_url: &str) -> Result<String, ExecError> {
 /// `buildCodexWebsocketErrorPayload` for an `error` frame with a positive status: the
 /// status and the body Go classifies (and clears the reasoning replay with).
 fn ws_error_body(payload: &str) -> Option<(u16, String)> {
-    if gjson::get(payload, "type").str().trim() != "error" {
+    if rawjson::get(payload, "type").str().trim() != "error" {
         return None;
     }
-    let mut status = gjson::get(payload, "status").i64();
+    let mut status = rawjson::get(payload, "status").i64();
     if status == 0 {
-        status = gjson::get(payload, "status_code").i64();
+        status = rawjson::get(payload, "status_code").i64();
     }
     // Go accepts any positive status; larger than u16 cannot be represented here.
     let Ok(status) = u16::try_from(status) else {
@@ -841,8 +841,8 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
         return None;
     }
     let mut out = set_raw("{}", "status", &status.to_string());
-    let body = gjson::get(payload, "body");
-    let error = gjson::get(payload, "error");
+    let body = rawjson::get(payload, "body");
+    let error = rawjson::get(payload, "error");
     if body.exists() {
         out = set_raw(&out, "body", body.json());
     }
@@ -861,7 +861,7 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
 pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecError> {
     let (status, out) = ws_error_body(payload)?;
     let mut headers = HeaderMap::new();
-    let raw_headers = gjson::get(payload, "headers");
+    let raw_headers = rawjson::get(payload, "headers");
     if raw_headers.kind() == Kind::Object {
         raw_headers.each(|k, v| {
             let value = match v.kind() {
@@ -888,7 +888,7 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
         "error",
     ]
     .iter()
-    .any(|p| gjson::get(payload, p).str().trim() == "websocket_connection_limit_reached");
+    .any(|p| rawjson::get(payload, p).str().trim() == "websocket_connection_limit_reached");
     // Go `statusErrWithHeaders`: the frame's headers reach the client under passthrough.
     let addon = (!headers.is_empty()).then(|| Box::new(headers.clone()));
     let mut error = response::status_error_raw(status, &out, headers, model_level_cooling);
@@ -1043,7 +1043,7 @@ impl Turn {
                 event,
             };
         }
-        let kind = gjson::get(payload, "type");
+        let kind = rawjson::get(payload, "type");
         let kind = kind.str().to_owned();
         if response::meaningful_delta(payload) {
             self.saw_delta = true;
@@ -1069,7 +1069,7 @@ impl Turn {
             "response.completed" | "response.done" | "response.incomplete"
         );
         let terminal_id = terminal
-            .then(|| gjson::get(payload, "response.id"))
+            .then(|| rawjson::get(payload, "response.id"))
             .filter(|id| id.kind() == Kind::String)
             .map(|id| id.str().to_owned());
         let ack = acknowledged_id(payload);

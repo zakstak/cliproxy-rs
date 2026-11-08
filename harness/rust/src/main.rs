@@ -32,9 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let executors = Executors {
         claude: ClaudeExecutor::with_hooks(hooks, DEFAULT_BASE_URL),
         codex: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
-        devices: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await?;
     let rt = Arc::new(Runtime::new(config, credentials, executors));

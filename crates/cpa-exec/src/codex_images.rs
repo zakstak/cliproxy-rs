@@ -12,6 +12,7 @@ use cpa_core::gostr::GoStr;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::rawjson::{self, Kind};
 use base64::Engine;
 use bytes::Bytes;
 use cpa_core::config::Config;
@@ -19,7 +20,6 @@ use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, ExecStream, ResponseBody};
 use cpa_core::format::Format;
 use futures_util::StreamExt;
-use gjson::Kind;
 
 use crate::codex::{CodexExecutor, events, explicit_session, report_request};
 use crate::codex_capture::Wire;
@@ -266,7 +266,7 @@ impl CodexExecutor {
                 if req.usage.enabled() {
                     req.usage.response_line(Format::Codex, data.as_bytes());
                 }
-                match gjson::get(data, "type").str() {
+                match rawjson::get(data, "type").str() {
                     "response.output_item.done" => items.collect(data),
                     "response.completed" => {
                         let (calls, created, usage) = extract(data, &items);
@@ -346,7 +346,7 @@ fn frames(upstream: ExecStream, prepared: Prepared, usage: cpa_core::exec::Usage
                 if st.usage.enabled() {
                     st.usage.response_line(Format::Codex, data.as_bytes());
                 }
-                match gjson::get(data, "type").str() {
+                match rawjson::get(data, "type").str() {
                     "response.output_item.done" => st.items.collect(data),
                     "response.image_generation_call.partial_image" => {
                         if let Some(frame) = partial_frame(data, &st.prepared) {
@@ -389,7 +389,7 @@ fn data_lines(event: &[u8]) -> Vec<&str> {
 /// is a gpt-image-* model.
 fn direct_route_model(req: &ExecRequest) -> Option<String> {
     let payload_model = if cpa_common::json::std_valid(&req.body) {
-        gjson::get(&String::from_utf8_lossy(&req.body), "model")
+        rawjson::get(&String::from_utf8_lossy(&req.body), "model")
             .str()
             .to_owned()
     } else {
@@ -520,9 +520,9 @@ fn edit_form_to_json(form: &Form, model: &str, stream: bool) -> String {
         out = set_str(&out, "mask.image_url", &data_url(mask));
     }
     let files = image_files(form);
-    let existing = gjson::get(&out, "images");
+    let existing = rawjson::get(&out, "images");
     if !existing.exists() || existing.kind() == Kind::Array {
-        let mut items: Vec<String> = existing.array().iter().map(|v| v.json().to_owned()).collect();
+        let mut items: Vec<String> = existing.items().iter().map(|v| v.json().to_owned()).collect();
         for file in files {
             items.push(set_str(r#"{"image_url":""}"#, "image_url", &data_url(file)));
         }
@@ -675,7 +675,7 @@ fn check_fields<'a>(fields: impl IntoIterator<Item = (&'a str, Option<f64>)>, ex
 }
 
 fn expressible(raw: &str, extra: &[&str]) -> Result<(), ExecError> {
-    let root = gjson::parse(raw);
+    let root = rawjson::parse(raw);
     let mut fields = Vec::new();
     root.each(|key, value| {
         let number = match value.kind() {
@@ -697,7 +697,7 @@ enum Image {
 /// A JSON image reference (`{"image_url":...}` or `{"file_id":...}`, the Images API
 /// forms the Responses `input_image` and `input_image_mask` also take). Anything else is
 /// refused rather than dropped.
-fn image_reference(value: &gjson::Value<'_>, what: &str) -> Result<Image, ExecError> {
+fn image_reference(value: &rawjson::Value<'_>, what: &str) -> Result<Image, ExecError> {
     let url = value.get("image_url").str().trim().to_owned();
     let file = value.get("file_id").str().trim().to_owned();
     match (url.is_empty(), file.is_empty()) {
@@ -713,7 +713,7 @@ fn image_reference(value: &gjson::Value<'_>, what: &str) -> Result<Image, ExecEr
 fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image generation request JSON"))?;
     expressible(&raw, &[])?;
-    let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
+    let prompt = rawjson::get(&raw, "prompt").str().trim().to_owned();
     let tool = tool_json(
         &raw,
         route_model,
@@ -722,7 +722,7 @@ fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError>
     );
     Ok(Prepared {
         body: responses_request(&prompt, &[], &tool),
-        url_format: url_format(gjson::get(&raw, "response_format").str()),
+        url_format: url_format(rawjson::get(&raw, "response_format").str()),
         prefix: "image_generation",
     })
 }
@@ -731,11 +731,11 @@ fn generation_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError>
 fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     let raw = json_text(raw).ok_or_else(|| plain_err("invalid OpenAI image edit request JSON"))?;
     expressible(&raw, &["images", "mask", "input_fidelity"])?;
-    let prompt = gjson::get(&raw, "prompt").str().trim().to_owned();
-    let images_value = gjson::get(&raw, "images");
+    let prompt = rawjson::get(&raw, "prompt").str().trim().to_owned();
+    let images_value = rawjson::get(&raw, "images");
     let images: Vec<Image> = if images_value.kind() == Kind::Array {
         images_value
-            .array()
+            .items()
             .iter()
             .map(|img| image_reference(img, "an image"))
             .collect::<Result<_, _>>()?
@@ -757,7 +757,7 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
             "moderation",
         ],
     );
-    let mask = gjson::get(&raw, "mask");
+    let mask = rawjson::get(&raw, "mask");
     if mask.exists() && mask.kind() != Kind::Null {
         tool = match image_reference(&mask, "a mask")? {
             Image::Url(url) => set_str(&tool, "input_image_mask.image_url", &url),
@@ -766,7 +766,7 @@ fn edit_json(raw: &[u8], route_model: &str) -> Result<Prepared, ExecError> {
     }
     Ok(Prepared {
         body: responses_request(&prompt, &images, &tool),
-        url_format: url_format(gjson::get(&raw, "response_format").str()),
+        url_format: url_format(rawjson::get(&raw, "response_format").str()),
         prefix: "image_edit",
     })
 }
@@ -860,16 +860,20 @@ fn tool_model(request_model: &str, route_model: &str) -> String {
 /// fields only when numeric (truncated to integers).
 fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str]) -> String {
     let mut tool = set_str(r#"{"type":"image_generation","action":""}"#, "action", action);
-    tool = set_str(&tool, "model", &tool_model(gjson::get(raw, "model").str(), route_model));
+    tool = set_str(
+        &tool,
+        "model",
+        &tool_model(rawjson::get(raw, "model").str(), route_model),
+    );
     for field in string_fields {
-        let value = gjson::get(raw, field);
+        let value = rawjson::get(raw, field);
         let value = value.str().trim();
         if !value.is_empty() {
             tool = set_str(&tool, field, value);
         }
     }
     for field in ["output_compression", "partial_images"] {
-        let value = gjson::get(raw, field);
+        let value = rawjson::get(raw, field);
         if value.kind() == Kind::Number {
             tool = set_raw(&tool, field, &value.i64().to_string());
         }
@@ -886,7 +890,7 @@ fn responses_request(prompt: &str, images: &[Image], tool: &str) -> String {
     let mut req =
         r#"{"stream":true,"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
     req = set_str(&req, "model", MAIN_MODEL);
-    if !tool.is_empty() && gjson::valid(tool) {
+    if !tool.is_empty() && rawjson::valid(tool) {
         req = set_raw(&req, "tools", &format!("[{tool}]"));
     }
     let mut content = vec![set_str(r#"{"type":"input_text","text":""}"#, "text", prompt)];
@@ -934,15 +938,15 @@ fn tool_body(body: &str, main_model: &str) -> Result<String, ExecError> {
 /// collected `output_item.done` items in index order; the creation time (now when
 /// absent); and `tool_usage.image_gen`.
 fn extract(completed: &str, items: &OutputItems) -> (Vec<ImageCall>, i64, Option<String>) {
-    let mut created = gjson::get(completed, "response.created_at").i64();
+    let mut created = rawjson::get(completed, "response.created_at").i64();
     if created <= 0 {
         created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
     }
     let patched = items.patch(completed.to_owned());
-    let calls = gjson::get(&patched, "response.output")
-        .array()
+    let calls = rawjson::get(&patched, "response.output")
+        .items()
         .iter()
         .filter(|item| item.get("type").str() == "image_generation_call")
         .filter_map(|item| {
@@ -958,7 +962,7 @@ fn extract(completed: &str, items: &OutputItems) -> (Vec<ImageCall>, i64, Option
             })
         })
         .collect();
-    let usage = gjson::get(completed, "response.tool_usage.image_gen");
+    let usage = rawjson::get(completed, "response.tool_usage.image_gen");
     let usage = (usage.kind() == Kind::Object).then(|| usage.json().to_owned());
     (calls, created, usage)
 }
@@ -977,7 +981,7 @@ fn images_response(calls: &[ImageCall], created: i64, usage: Option<&str>, url: 
             out = set_str(&out, key, value);
         }
     }
-    if let Some(usage) = usage.filter(|u| gjson::valid(u)) {
+    if let Some(usage) = usage.filter(|u| rawjson::valid(u)) {
         out = set_raw(&out, "usage", usage);
     }
     let items: Vec<String> = calls
@@ -1008,13 +1012,13 @@ fn image_field(json: String, call: &ImageCall, url: bool) -> String {
 
 /// `codexBuildImagePartialFrame`.
 fn partial_frame(payload: &str, prepared: &Prepared) -> Option<String> {
-    let b64 = gjson::get(payload, "partial_image_b64").str().trim().to_owned();
+    let b64 = rawjson::get(payload, "partial_image_b64").str().trim().to_owned();
     if b64.is_empty() {
         return None;
     }
     let call = ImageCall {
         result: b64,
-        output_format: gjson::get(payload, "output_format").str().trim().to_owned(),
+        output_format: rawjson::get(payload, "output_format").str().trim().to_owned(),
         ..Default::default()
     };
     let event = format!("{}.partial_image", prepared.prefix);
@@ -1022,7 +1026,7 @@ fn partial_frame(payload: &str, prepared: &Prepared) -> Option<String> {
     data = set_raw(
         &data,
         "partial_image_index",
-        &gjson::get(payload, "partial_image_index").i64().to_string(),
+        &rawjson::get(payload, "partial_image_index").i64().to_string(),
     );
     Some(sse_frame(&event, &image_field(data, &call, prepared.url_format)))
 }
@@ -1031,7 +1035,7 @@ fn partial_frame(payload: &str, prepared: &Prepared) -> Option<String> {
 fn completed_frame(call: &ImageCall, usage: Option<&str>, prepared: &Prepared) -> String {
     let event = format!("{}.completed", prepared.prefix);
     let mut data = set_str(r#"{"type":""}"#, "type", &event);
-    if let Some(usage) = usage.filter(|u| gjson::valid(u)) {
+    if let Some(usage) = usage.filter(|u| rawjson::valid(u)) {
         data = set_raw(&data, "usage", usage);
     }
     sse_frame(&event, &image_field(data, call, prepared.url_format))

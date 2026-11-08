@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cpa_common::json as gj;
-use gjson::Kind;
+use cpa_common::rawjson::{self, Kind};
 
 /// `sjson.SetRawBytes` through `cpa_common::json`; an edit sjson rejects keeps the input.
 pub(crate) fn set_raw(json: &str, path: &str, raw: &str) -> String {
@@ -75,15 +75,15 @@ fn requires_array() -> WsError {
     WsError::bad("websocket request requires array field: input")
 }
 
-fn text(v: &gjson::Value<'_>) -> String {
+fn text(v: &rawjson::Value<'_>) -> String {
     v.str().trim().to_owned()
 }
 
 pub(crate) fn field(json: &str, path: &str) -> String {
-    text(&gjson::get(json, path))
+    text(&rawjson::get(json, path))
 }
 
-fn is_array(v: &gjson::Value<'_>) -> bool {
+fn is_array(v: &rawjson::Value<'_>) -> bool {
     v.kind() == Kind::Array
 }
 
@@ -120,12 +120,12 @@ pub(crate) fn normalize(
 
 /// `normalizeResponseCreateRequest`.
 pub(crate) fn normalize_create(raw: &str) -> Result<(String, String), WsError> {
-    let input = gjson::get(raw, "input");
+    let input = rawjson::get(raw, "input");
     if input.exists() && !is_array(&input) {
         return Err(requires_array());
     }
     let mut normalized = stream_true(&delete(raw, "type"));
-    if !gjson::get(&normalized, "input").exists() {
+    if !rawjson::get(&normalized, "input").exists() {
         normalized = set_raw(&normalized, "input", "[]");
     }
     if field(&normalized, "model").is_empty() {
@@ -136,14 +136,14 @@ pub(crate) fn normalize_create(raw: &str) -> Result<(String, String), WsError> {
 
 /// `model` and `instructions` carried over from the previous request when absent.
 fn inherit(mut normalized: String, last_request: &str) -> String {
-    if !gjson::get(&normalized, "model").exists() {
+    if !rawjson::get(&normalized, "model").exists() {
         let model = field(last_request, "model");
         if !model.is_empty() {
             normalized = set_str(&normalized, "model", &model);
         }
     }
-    if !gjson::get(&normalized, "instructions").exists() {
-        let instructions = gjson::get(last_request, "instructions");
+    if !rawjson::get(&normalized, "instructions").exists() {
+        let instructions = rawjson::get(last_request, "instructions");
         if instructions.exists() {
             normalized = set_raw(&normalized, "instructions", instructions.json());
         }
@@ -163,7 +163,7 @@ fn normalize_subsequent(
     if last_request.is_empty() {
         return Err(WsError::bad("websocket request received before response.create"));
     }
-    let next = gjson::get(raw, "input");
+    let next = rawjson::get(raw, "input");
     if !next.exists() || !is_array(&next) {
         return Err(requires_array());
     }
@@ -204,19 +204,19 @@ fn normalize_subsequent(
 }
 
 /// `shouldReplaceWebsocketTranscript`.
-fn should_replace_transcript(raw: &str, next: &gjson::Value<'_>) -> bool {
+fn should_replace_transcript(raw: &str, next: &rawjson::Value<'_>) -> bool {
     let kind = field(raw, "type");
     if kind != CREATE && kind != APPEND {
         return false;
     }
-    let prev = gjson::get(raw, "previous_response_id");
+    let prev = rawjson::get(raw, "previous_response_id");
     if !text(&prev).is_empty() || !next.exists() || !is_array(next) {
         return false;
     }
     if kind == CREATE && !prev.exists() && has_local_compaction_summary(next) {
         return true;
     }
-    next.array().iter().any(|item| match text(&item.get("type")).as_str() {
+    next.items().iter().any(|item| match text(&item.get("type")).as_str() {
         "function_call" | "custom_tool_call" => true,
         "message" => text(&item.get("role")) == "assistant",
         _ => false,
@@ -224,12 +224,12 @@ fn should_replace_transcript(raw: &str, next: &gjson::Value<'_>) -> bool {
 }
 
 /// `inputHasCodexLocalCompactionSummary`.
-fn has_local_compaction_summary(input: &gjson::Value<'_>) -> bool {
+fn has_local_compaction_summary(input: &rawjson::Value<'_>) -> bool {
     if !is_array(input) {
         return false;
     }
     let mut found = false;
-    for (index, item) in input.array().iter().enumerate() {
+    for (index, item) in input.items().iter().enumerate() {
         let kind = text(&item.get("type"));
         if kind == "additional_tools" {
             let tools = item.get("tools");
@@ -237,7 +237,7 @@ fn has_local_compaction_summary(input: &gjson::Value<'_>) -> bool {
                 return false;
             }
             if tools
-                .array()
+                .items()
                 .iter()
                 .any(|t| t.kind() != Kind::Object || text(&t.get("type")).is_empty())
             {
@@ -259,12 +259,12 @@ fn has_local_compaction_summary(input: &gjson::Value<'_>) -> bool {
     found
 }
 
-fn message_text(message: &gjson::Value<'_>) -> String {
+fn message_text(message: &rawjson::Value<'_>) -> String {
     let content = message.get("content");
     match content.kind() {
         Kind::String => content.str().to_owned(),
         Kind::Array => content
-            .array()
+            .items()
             .iter()
             .filter(|p| text(&p.get("type")) == "input_text")
             .map(|p| p.get("text").str().to_owned())
@@ -274,7 +274,7 @@ fn message_text(message: &gjson::Value<'_>) -> String {
 }
 
 /// `inputSatisfiesPendingToolCalls`.
-fn satisfies_pending(input: &gjson::Value<'_>, pending: &[String]) -> bool {
+fn satisfies_pending(input: &rawjson::Value<'_>, pending: &[String]) -> bool {
     if pending.is_empty() {
         return true;
     }
@@ -282,7 +282,7 @@ fn satisfies_pending(input: &gjson::Value<'_>, pending: &[String]) -> bool {
         return false;
     }
     let outputs: HashSet<String> = input
-        .array()
+        .items()
         .iter()
         .filter(|i| is_tool_output(&text(&i.get("type"))))
         .map(|i| text(&i.get("call_id")))
@@ -321,7 +321,7 @@ pub(crate) struct Item {
 impl Item {
     /// `parseResponsesWebsocketInputItem`: metadata keys match case-insensitively; the
     /// last duplicate wins.
-    pub fn parse(value: &gjson::Value<'_>) -> Self {
+    pub fn parse(value: &rawjson::Value<'_>) -> Self {
         let mut item = Item {
             raw: value.json().to_owned(),
             kind: String::new(),
@@ -345,17 +345,17 @@ impl Item {
     }
 }
 
-pub(crate) fn parse_items(array: &gjson::Value<'_>) -> Vec<Item> {
-    array.array().iter().map(Item::parse).collect()
+pub(crate) fn parse_items(array: &rawjson::Value<'_>) -> Vec<Item> {
+    array.items().iter().map(Item::parse).collect()
 }
 
 /// `responsesWebsocketPreviousInputNoCopy`: the remembered request's `input` array.
 /// Errors carry Go's text (`encoding/json` type mismatch on `input`).
 fn previous_input(last_request: &str) -> Result<String, String> {
-    if !gjson::valid(last_request) {
+    if !rawjson::valid(last_request) {
         return Err("invalid previous request input".into());
     }
-    let root = gjson::parse(last_request);
+    let root = rawjson::parse(last_request);
     match root.kind() {
         Kind::Null => return Ok("[]".into()),
         Kind::Object => {}
@@ -396,10 +396,10 @@ fn unmarshal_error(kind: Kind) -> String {
 /// then the new items; duplicate tool calls and ids are dropped.
 pub(crate) fn merge_input(last_request: &str, last_output: &str, append: &str) -> Result<String, String> {
     let previous = previous_input(last_request)?;
-    let mut items = parse_items(&gjson::parse(&previous));
+    let mut items = parse_items(&rawjson::parse(&previous));
     let output = last_output.trim();
-    if output.starts_with('[') && gjson::valid(output) {
-        let output = gjson::parse(output);
+    if output.starts_with('[') && rawjson::valid(output) {
+        let output = rawjson::parse(output);
         if contains_full_transcript(&output) {
             items.retain(|i| i.kind != "compaction_trigger");
         }
@@ -409,10 +409,10 @@ pub(crate) fn merge_input(last_request: &str, last_output: &str, append: &str) -
         "" => "[]",
         a => a,
     };
-    if !gjson::valid(append) {
+    if !rawjson::valid(append) {
         return Err("invalid request input".into());
     }
-    let parsed = gjson::parse(append);
+    let parsed = rawjson::parse(append);
     match parsed.kind() {
         Kind::Array => items.extend(parse_items(&parsed)),
         Kind::Null => {}
@@ -475,16 +475,16 @@ pub(crate) fn marshal(items: &[Item]) -> String {
 }
 
 /// `inputContainsFullTranscript`: compaction markers mean the client resent everything.
-pub(crate) fn contains_full_transcript(input: &gjson::Value<'_>) -> bool {
+pub(crate) fn contains_full_transcript(input: &rawjson::Value<'_>) -> bool {
     is_array(input)
         && input
-            .array()
+            .items()
             .iter()
             .any(|i| matches!(i.get("type").str(), "compaction" | "compaction_summary"))
 }
 
-fn without_compaction_items(input: &gjson::Value<'_>) -> String {
-    let items = input.array();
+fn without_compaction_items(input: &rawjson::Value<'_>) -> String {
+    let items = input.items();
     let kept: Vec<&str> = items
         .iter()
         .filter(|i| !matches!(i.get("type").str(), "compaction" | "compaction_summary"))
@@ -496,7 +496,7 @@ fn without_compaction_items(input: &gjson::Value<'_>) -> String {
 /// `normalizeResponsesWebsocketPassthroughRequest`: a turn for the pinned upstream
 /// socket keeps its type and `previous_response_id`.
 pub(crate) fn normalize_passthrough(raw: &str, model: &str) -> Result<String, WsError> {
-    if !gjson::valid(raw) {
+    if !rawjson::valid(raw) {
         return Err(WsError::bad("invalid websocket request JSON"));
     }
     let kind = field(raw, "type");
@@ -517,12 +517,12 @@ pub(crate) fn normalize_passthrough(raw: &str, model: &str) -> Result<String, Ws
 /// `shouldHandleResponsesWebsocketPrewarmLocally`: `response.create` with
 /// `generate: false` is answered locally.
 pub(crate) fn is_local_prewarm(raw: &str) -> bool {
-    let generate = gjson::get(raw, "generate");
+    let generate = rawjson::get(raw, "generate");
     field(raw, "type") == CREATE && generate.exists() && !go_bool(&generate)
 }
 
 /// gjson `Result.Bool()`.
-fn go_bool(v: &gjson::Value<'_>) -> bool {
+fn go_bool(v: &rawjson::Value<'_>) -> bool {
     match v.kind() {
         Kind::True => true,
         Kind::String => matches!(v.str().to_ascii_lowercase().as_str(), "1" | "t" | "true"),
@@ -538,7 +538,7 @@ pub(crate) fn prewarm_followup(raw: &str, warmup: &str) -> Result<(String, Strin
     if kind != CREATE && kind != APPEND {
         return Err(WsError::bad(format!("unsupported websocket request type: {kind}")));
     }
-    let input = gjson::get(raw, "input");
+    let input = rawjson::get(raw, "input");
     if !is_array(&input) {
         return Err(requires_array());
     }
@@ -587,13 +587,13 @@ pub(crate) fn payloads_from_chunk(chunk: &[u8]) -> Vec<String> {
         if line.is_empty() || line == "[DONE]" {
             continue;
         }
-        if gjson::valid(&line) {
+        if rawjson::valid(&line) {
             payloads.push(line);
         }
     }
     if payloads.is_empty() {
         let whole = strip(chunk.trim_ascii());
-        if !whole.is_empty() && whole != "[DONE]" && gjson::valid(&whole) {
+        if !whole.is_empty() && whole != "[DONE]" && rawjson::valid(&whole) {
             payloads.push(whole);
         }
     }
@@ -601,7 +601,7 @@ pub(crate) fn payloads_from_chunk(chunk: &[u8]) -> Vec<String> {
 }
 
 /// `isCompleteResponsesWebsocketToolCall`.
-pub(crate) fn is_complete_tool_call(item: &gjson::Value<'_>) -> bool {
+pub(crate) fn is_complete_tool_call(item: &rawjson::Value<'_>) -> bool {
     if item.kind() != Kind::Object {
         return false;
     }
@@ -638,14 +638,14 @@ impl Turn {
 
     /// `collectResponsesWebsocketOutputItem`.
     pub fn collect(&mut self, payload: &str) {
-        if gjson::get(payload, "type").str() != "response.output_item.done" {
+        if rawjson::get(payload, "type").str() != "response.output_item.done" {
             return;
         }
-        let item = gjson::get(payload, "item");
+        let item = rawjson::get(payload, "item");
         if item.kind() != Kind::Object {
             return;
         }
-        let index = gjson::get(payload, "output_index");
+        let index = rawjson::get(payload, "output_index");
         if index.exists() {
             self.by_index.insert(index.i64(), item.json().to_owned());
         } else {
@@ -659,8 +659,8 @@ impl Turn {
 
     /// `restoreResponsesWebsocketCompletionOutput`.
     pub fn restore_completion(&self, payload: String) -> String {
-        let output = gjson::get(&payload, "response.output");
-        if is_array(&output) && !output.array().is_empty() {
+        let output = rawjson::get(&payload, "response.output");
+        if is_array(&output) && !output.items().is_empty() {
             return match self.reconcile_tool_calls(&output) {
                 Some(reconciled) => set_raw(&payload, "response.output", &reconciled),
                 None => payload,
@@ -675,10 +675,10 @@ impl Turn {
 
     /// `reconcileResponsesWebsocketCompletionToolCalls`: complete tool calls seen in
     /// `output_item.done` replace their counterparts in the completion output.
-    fn reconcile_tool_calls(&self, output: &gjson::Value<'_>) -> Option<String> {
+    fn reconcile_tool_calls(&self, output: &rawjson::Value<'_>) -> Option<String> {
         let mut collected: HashMap<String, String> = HashMap::new();
         for raw in self.collected() {
-            let item = gjson::parse(raw);
+            let item = rawjson::parse(raw);
             if is_complete_tool_call(&item) {
                 collected.insert(text(&item.get("call_id")), raw.clone());
             }
@@ -688,7 +688,7 @@ impl Turn {
         }
         let mut changed = false;
         let items: Vec<String> = output
-            .array()
+            .items()
             .iter()
             .map(|item| {
                 if is_tool_call(item.get("type").str())
@@ -706,8 +706,8 @@ impl Turn {
 
     /// `responseCompletedOutputFromPayload`.
     pub fn completed_output(&self, payload: &str) -> String {
-        let output = gjson::get(payload, "response.output");
-        if is_array(&output) && !output.array().is_empty() {
+        let output = rawjson::get(payload, "response.output");
+        if is_array(&output) && !output.items().is_empty() {
             return output.json().to_owned();
         }
         if self.by_index.is_empty() && self.fallback.is_empty() {
@@ -716,7 +716,7 @@ impl Turn {
         let items: Vec<String> = self
             .collected()
             .filter(|raw| {
-                let item = gjson::parse(raw);
+                let item = rawjson::parse(raw);
                 !is_tool_call(item.get("type").str()) || is_complete_tool_call(&item)
             })
             .map(|raw| compact(raw))
@@ -726,16 +726,16 @@ impl Turn {
 
     /// `recordPendingToolCallIDsFromPayload`.
     pub fn track_pending(&mut self, payload: &str) {
-        self.track_item(&gjson::get(payload, "item"));
-        let output = gjson::get(payload, "response.output");
+        self.track_item(&rawjson::get(payload, "item"));
+        let output = rawjson::get(payload, "response.output");
         if is_array(&output) {
-            for item in output.array() {
+            for item in output.items() {
                 self.track_item(&item);
             }
         }
     }
 
-    fn track_item(&mut self, item: &gjson::Value<'_>) {
+    fn track_item(&mut self, item: &rawjson::Value<'_>) {
         if !item.exists() {
             return;
         }
@@ -814,7 +814,7 @@ fn http_status_text(status: u16) -> &'static str {
 /// `handlers.BuildErrorResponseBodyWithError` (no terminal-auth classification).
 fn error_body(status: u16, text: &str) -> String {
     let trimmed = text.trim();
-    if !trimmed.is_empty() && gjson::valid(trimmed) {
+    if !trimmed.is_empty() && rawjson::valid(trimmed) {
         return crate::errors::compact_json(trimmed);
     }
     let (kind, code) = match status {
@@ -859,15 +859,15 @@ pub(crate) fn error_payload(status: u16, message: &str, addon: Option<&axum::htt
         }
         payload = set_raw(&payload, "headers", &headers);
     }
-    if gjson::valid(&body) {
-        let error = gjson::get(&body, "error");
+    if rawjson::valid(&body) {
+        let error = rawjson::get(&body, "error");
         payload = if error.exists() {
             set_raw(&payload, "error", error.json())
         } else {
             set_raw(&payload, "error", &body)
         };
     }
-    if !gjson::get(&payload, "error").exists() {
+    if !rawjson::get(&payload, "error").exists() {
         payload = set_str(&payload, "error.type", "server_error");
         payload = set_str(&payload, "error.message", &text);
     }

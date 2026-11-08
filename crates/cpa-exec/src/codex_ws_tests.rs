@@ -17,6 +17,36 @@ use cpa_core::exec::{Caller, Operation};
 use cpa_core::format::Format;
 use serde_json::Value;
 
+/// Frame observation reads through `cpa_common::rawjson` (the third-party gjson crate is
+/// gone): the first of duplicate keys decides, the classified body copies the frame's
+/// `error` raw, and quota and frame headers keep the frame's number spelling.
+#[test]
+fn observers_read_first_duplicates_and_keep_raw_numbers() {
+    let frame = r#"{"type":"error","status":429,"status":503,"error":{"type":"rate_limit_error","n":1e400,"big":123456789012345678901234567890},"headers":{"x-codex-primary-used-percent":12.50}}"#;
+    let error = ws_error(frame, false).expect("classified");
+    assert_eq!(error.status, 429);
+    assert_eq!(
+        String::from_utf8_lossy(&error.body),
+        r#"{"status":429,"error":{"type":"rate_limit_error","n":1e400,"big":123456789012345678901234567890}}"#
+    );
+    assert_eq!(error.headers.get("x-codex-primary-used-percent").unwrap(), "12.50");
+    let ack = r#"{"type":"response.interrupt.accepted","response_id":"r1","response_id":"r2"}"#;
+    assert_eq!(acknowledged_id(ack).as_deref(), Some("r1"));
+    let done = r#"{"type":"response.completed","response":{"id":"r1"},"response":{"id":"r2"}}"#;
+    assert_eq!(terminal_response_id(done).as_deref(), Some("r1"));
+    let limits = r#"{"type":"codex.rate_limits","rate_limits":{"allowed":true,"primary":{"used_percent":12.50,"window_minutes":3e2,"reset_after_seconds":60}}}"#;
+    let headers = crate::codex_quota::event_headers(limits).expect("quota headers");
+    for (name, value) in [
+        ("X-Codex-Primary-Used-Percent", "12.50"),
+        ("X-Codex-Primary-Window-Minutes", "3e2"),
+    ] {
+        assert!(
+            headers.iter().any(|(k, v)| k == name && v == value),
+            "{name}: {headers:?}"
+        );
+    }
+}
+
 #[test]
 fn error_frames_match_go() {
     let cases: Vec<Value> =
@@ -613,7 +643,7 @@ async fn close_1009_is_a_request_scoped_413_and_notifies() {
         .expect("session notified");
     assert_eq!(notified.status, 413);
     assert_eq!(
-        gjson::get(&String::from_utf8_lossy(&notified.body), "error.message").str(),
+        crate::rawjson::get(&String::from_utf8_lossy(&notified.body), "error.message").str(),
         "bye"
     );
     assert_eq!(executor.session_loss("conn-1").map(|e| e.body), Some(notified.body));
@@ -949,7 +979,7 @@ async fn close_1009_on_a_full_turn_channel_keeps_the_413() {
     let error = events.last().unwrap().as_ref().expect_err("turn ends with the close");
     assert_eq!(error.status, 413);
     assert_eq!(
-        gjson::get(&String::from_utf8_lossy(&error.body), "error.message").str(),
+        crate::rawjson::get(&String::from_utf8_lossy(&error.body), "error.message").str(),
         "upstream websocket message too big"
     );
 }
@@ -987,7 +1017,7 @@ async fn duplex_delivers_upstream_events_while_a_write_is_blocked() {
     };
     let created = stream.next().await.unwrap().unwrap();
     assert_eq!(
-        gjson::get(&String::from_utf8_lossy(&created), "type").str(),
+        crate::rawjson::get(&String::from_utf8_lossy(&created), "type").str(),
         "response.created"
     );
     // Far larger than loopback socket buffers: the write cannot finish while upstream
@@ -1042,7 +1072,11 @@ async fn capture_records_websocket_turns_as_go_does() {
             panic!("{taps:?}");
         };
         assert_eq!(url, &ws_url);
-        assert_eq!(gjson::get(body, "type").str(), "response.create", "the frame as sent");
+        assert_eq!(
+            crate::rawjson::get(body, "type").str(),
+            "response.create",
+            "the frame as sent"
+        );
         assert!(
             headers.contains(&("Authorization".into(), "Bearer sk-FAKE".into())),
             "{headers:?}"
@@ -1700,7 +1734,7 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
         assert_eq!(error.status, 400, "{name}");
         assert_eq!(error.scope, FailureScope::Request, "{name}");
         let code = |e: &ExecError| {
-            gjson::get(&String::from_utf8_lossy(&e.body), "error.code")
+            crate::rawjson::get(&String::from_utf8_lossy(&e.body), "error.code")
                 .str()
                 .to_owned()
         };

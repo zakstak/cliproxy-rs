@@ -9,7 +9,7 @@ the shard's log, checks that nextest ran exactly the tests the list assigns to t
 and writes its counts. `total` checks that the shards are 1 to N with the same full list
 and that their tests add up to every test in it that is not ignored, then prints the totals
 for the whole suite in the same form as before sharding: nextest's tests and cargo test's
-result lines (doc tests and the vendored gjson tests), with ignored tests counted as ignored.
+result lines (doc tests), with ignored tests counted as ignored.
 """
 import json
 import re

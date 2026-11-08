@@ -56,7 +56,7 @@ fn kinds(events: &[Result<String, ExecError>]) -> Vec<String> {
     events
         .iter()
         .map(|e| match e {
-            Ok(text) => gjson::get(text, "type").str().to_owned(),
+            Ok(text) => crate::rawjson::get(text, "type").str().to_owned(),
             Err(error) => format!("error {}: {}", error.status, String::from_utf8_lossy(&error.body)),
         })
         .collect()
@@ -78,14 +78,18 @@ async fn follow_up_is_clean(executor: &CodexExecutor, url: &str, up: &Upstream) 
         ["response.created", "response.completed"],
         "follow-up: {events:?}"
     );
-    assert_eq!(gjson::get(texts(&events)[0], "response.id").str(), "r2");
+    assert_eq!(crate::rawjson::get(texts(&events)[0], "response.id").str(), "r2");
     assert_eq!(up.dials.lock().unwrap().len(), 1, "the socket was reused");
 }
 
 /// What upstream received after the turn's `response.create`.
 async fn after_create(up: &Upstream) -> Vec<String> {
     let frames = received(up, 2).await;
-    assert_eq!(gjson::get(&frames[0], "type").str(), "response.create", "{frames:?}");
+    assert_eq!(
+        crate::rawjson::get(&frames[0], "type").str(),
+        "response.create",
+        "{frames:?}"
+    );
     frames[1..].to_vec()
 }
 
@@ -109,7 +113,10 @@ async fn an_acknowledgement_after_the_terminal_event_reaches_the_turn() {
     .await;
     let executor = CodexExecutor::new().unwrap();
     let mut stream = start(&executor, &url, false).await;
-    assert_eq!(gjson::get(&next(&mut stream).await, "type").str(), "response.created");
+    assert_eq!(
+        crate::rawjson::get(&next(&mut stream).await, "type").str(),
+        "response.created"
+    );
     interrupt_r1(&executor).await;
     let events = rest_of(stream).await;
     assert_eq!(
@@ -360,10 +367,10 @@ async fn a_zero_token_interrupted_response_is_a_normal_end() {
         "{events:?}"
     );
     let incomplete = texts(&events)[0];
-    assert_eq!(gjson::get(incomplete, "response.id").str(), "r1");
-    assert_eq!(gjson::get(incomplete, "response.usage.input_tokens").i64(), 5);
+    assert_eq!(crate::rawjson::get(incomplete, "response.id").str(), "r1");
+    assert_eq!(crate::rawjson::get(incomplete, "response.usage.input_tokens").i64(), 5);
     assert_eq!(
-        gjson::get(incomplete, "response.incomplete_details.reason").str(),
+        crate::rawjson::get(incomplete, "response.incomplete_details.reason").str(),
         "interrupted"
     );
     assert!(executor.ws.loss("conn-1").is_none(), "the socket was not dropped");

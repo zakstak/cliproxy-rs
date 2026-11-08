@@ -48,6 +48,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use cpa_common::gostr::GoStr;
+use cpa_common::rawjson;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{Caller, ExecError, ExecSession, ExecStream, Operation};
@@ -967,8 +968,8 @@ impl Connection {
         }
         let kind = field(&payload, "type");
         let replacement = |payload: &str, last: &str| {
-            let input = gjson::get(payload, "input");
-            if input.exists() && input.kind() != gjson::Kind::Array {
+            let input = rawjson::get(payload, "input");
+            if input.exists() && input.kind() != rawjson::Kind::Array {
                 return Err(WsError::bad("websocket request requires array field: input"));
             }
             requests::normalize_create(&requests::transcript_replacement(payload, last))
@@ -1073,7 +1074,7 @@ impl Connection {
             ctx.tool_turn = tool_turn;
             request.clone()
         };
-        let model = gjson::get(&request, "model").str().to_owned();
+        let model = rawjson::get(&request, "model").str().to_owned();
         let started = self
             .attempt(&frame, &request, &model, fallback_error.as_ref(), &mut ctx)
             .await;
@@ -1511,7 +1512,7 @@ impl Connection {
                 payloads_from_chunk(&chunk)
             };
             for mut payload in payloads {
-                let kind = gjson::get(&payload, "type").str().to_owned();
+                let kind = rawjson::get(&payload, "type").str().to_owned();
                 if kind == "response.created" {
                     response_started = true;
                     completed = false;
@@ -1532,9 +1533,9 @@ impl Connection {
                 // close it.
                 if kind == "error" && !(response_started && duplex) {
                     // `responsesWebsocketErrorMessageFromPayload`.
-                    let mut status = gjson::get(&payload, "status").i64();
+                    let mut status = rawjson::get(&payload, "status").i64();
                     if status <= 0 {
-                        status = gjson::get(&payload, "status_code").i64();
+                        status = rawjson::get(&payload, "status_code").i64();
                     }
                     let status = u16::try_from(status).ok().filter(|s| *s > 0).unwrap_or(500);
                     let failure = Failure::from_event(status, payload.trim());
@@ -1674,12 +1675,12 @@ fn lite_request(payload: &str, headers: &HeaderMap) -> bool {
     if header.trim().eq_ignore_ascii_case("true") {
         return true;
     }
-    let value = gjson::get(
+    let value = rawjson::get(
         payload,
         "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite",
     );
-    value.kind() == gjson::Kind::True
-        || (value.kind() == gjson::Kind::String && value.str().trim().eq_ignore_ascii_case("true"))
+    value.kind() == rawjson::Kind::True
+        || (value.kind() == rawjson::Kind::String && value.str().trim().eq_ignore_ascii_case("true"))
 }
 
 /// `writeResponsesWebsocketPayload`: the frame joins the timeline, then goes out.
@@ -1712,14 +1713,14 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
     if failure.replay {
         return Some((CLOSE_SERVICE_RESTART, "upstream requires HTTP replay".into()));
     }
-    if failure.status == 413 && gjson::get(&failure.text, "error.code").str() == "message_too_big" {
+    if failure.status == 413 && rawjson::get(&failure.text, "error.code").str() == "message_too_big" {
         // An upstream close keeps gorilla's `CloseError.Text` verbatim; a mapped 413's
         // message is trimmed.
-        let raw = gjson::get(&failure.text, "close_reason");
-        let reason = if raw.kind() == gjson::Kind::String {
+        let raw = rawjson::get(&failure.text, "close_reason");
+        let reason = if raw.kind() == rawjson::Kind::String {
             raw.str().to_owned()
         } else {
-            gjson::get(&failure.text, "error.message").str().trim().to_owned()
+            rawjson::get(&failure.text, "error.message").str().trim().to_owned()
         };
         let reason = if reason.is_empty() {
             "message too big".into()
@@ -1734,7 +1735,7 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
 /// The executor's classified error for an upstream context-window `response.failed`
 /// (cpa-exec `terminal_failure`: status 400, `context_too_large`).
 fn preserved_failure(failure: &Failure) -> bool {
-    failure.status == 400 && gjson::get(&failure.text, "error.code").str() == "context_too_large"
+    failure.status == 400 && rawjson::get(&failure.text, "error.code").str() == "context_too_large"
 }
 
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,

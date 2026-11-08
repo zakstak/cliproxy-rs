@@ -1000,7 +1000,11 @@ async fn usage_records_the_payload_override_reasoning_effort() {
             (_, true) => "medium",
             _ => "high",
         };
-        assert_eq!(gjson::get(&sent, "reasoning.effort").str(), effort, "{name}: upstream");
+        assert_eq!(
+            crate::rawjson::get(&sent, "reasoning.effort").str(),
+            effort,
+            "{name}: upstream"
+        );
         let reports = recorded.0.lock().unwrap().clone();
         assert_eq!(reports[0].0, "request", "{name}");
         assert_eq!(reports[0].2, sent, "{name}: the usage record reads the sent body");
@@ -1631,7 +1635,10 @@ async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<St
     if !stream {
         let mut processor = processor;
         let completed = processor.buffered(sse.as_bytes())?.expect("a terminal event");
-        return Ok((vec![gjson::get(&completed, "response").json().to_owned()], None));
+        return Ok((
+            vec![crate::rawjson::get(&completed, "response").json().to_owned()],
+            None,
+        ));
     }
     let upstream = crate::codex::events(ResponseBody::Stream(crate::upstream::framed(
         futures_util::stream::iter([Ok::<_, ExecError>(Bytes::from(sse.to_owned()))]).boxed(),
@@ -2289,7 +2296,7 @@ fn count_tokens_ignores_the_payload_rules_and_is_marked_local() {
             panic!("count answers are buffered")
         };
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        gjson::get(&text, "response.usage.input_tokens").i64()
+        crate::rawjson::get(&text, "response.usage.input_tokens").i64()
     };
     let plain = count("");
     let configured = count(
@@ -2335,7 +2342,7 @@ fn native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint() {
         let hint = headers
             .get("x-codex-routing-hint")
             .map(|v| v.to_str().unwrap().to_owned());
-        (gjson::get(&body, "service_tier").json().to_owned(), hint)
+        (crate::rawjson::get(&body, "service_tier").json().to_owned(), hint)
     };
     let codex = "codex-tui/0.160.0 (Mac OS 26.5.2; arm64)";
     for (tier, want, want_hint) in [

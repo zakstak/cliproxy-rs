@@ -29,6 +29,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 use super::{Read, Turn, Upstream, transport, ws_error};
 use crate::codex_request::View;
 use crate::codex_response as response;
+use crate::rawjson;
 
 /// Bound on queued and outstanding `response.create` requests.
 const MAX_PENDING: usize = 16;
@@ -587,7 +588,7 @@ impl Duplex {
         }
         // A native connection hands each frame on as it arrived.
         let payload = text.as_str();
-        let kind = gjson::get(payload, "type").str().to_owned();
+        let kind = rawjson::get(payload, "type").str().to_owned();
         let establishing = self.first_response && kind == "response.created";
         if kind == "response.created" && !self.response_created(payload) {
             return;
@@ -633,9 +634,9 @@ impl Duplex {
         // A failure before `response.created` rejects the oldest pending create, which
         // leaves the queue; a failure of the running response ends it.
         if !self.first_response && failure {
-            let mut failed = gjson::get(payload, "response.id").str().to_owned();
+            let mut failed = rawjson::get(payload, "response.id").str().to_owned();
             if failed.is_empty() {
-                failed = gjson::get(payload, "response_id").str().to_owned();
+                failed = rawjson::get(payload, "response_id").str().to_owned();
             }
             // A failure of the running response must not consume a queued create; a
             // rejection before `response.created` belongs to the oldest pending create.
@@ -709,7 +710,7 @@ impl Duplex {
     /// `response.created`: which request it serves and what it retains. False ends the
     /// stream (an automatic successor without retained parent settings).
     fn response_created(&mut self, payload: &str) -> bool {
-        let mut parent = gjson::get(payload, "response.previous_response_id").str().to_owned();
+        let mut parent = rawjson::get(payload, "response.previous_response_id").str().to_owned();
         if parent.is_empty() {
             parent.clone_from(&self.response_id);
         }
@@ -732,7 +733,7 @@ impl Duplex {
         if let Some(next) = self.pending.pop_front() {
             self.current = next;
         }
-        self.response_id = gjson::get(payload, "response.id").str().to_owned();
+        self.response_id = rawjson::get(payload, "response.id").str().to_owned();
         self.response_settings
             .insert(self.response_id.clone(), self.current.retained());
         self.response_order.push_back(self.response_id.clone());
@@ -750,8 +751,8 @@ impl Duplex {
 
     /// `response.steer.*`: acknowledgement bookkeeping.
     fn steer_event(&mut self, kind: &str, payload: &str) {
-        let id = gjson::get(payload, "steer.id").str().to_owned();
-        let mut parent = gjson::get(payload, "steer.previous_response_id").str().to_owned();
+        let id = rawjson::get(payload, "steer.id").str().to_owned();
+        let mut parent = rawjson::get(payload, "steer.previous_response_id").str().to_owned();
         if parent.is_empty() {
             parent.clone_from(&self.response_id);
         }

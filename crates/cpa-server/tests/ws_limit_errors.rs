@@ -119,7 +119,7 @@ async fn upstream(State(mock): State<Arc<Mock>>, mut req: axum::extract::Request
         let event = event.as_str().unwrap();
         sse.push_str(&format!(
             "event: {}\ndata: {event}\n\n",
-            gjson::get(event, "type").str()
+            cpa_common::rawjson::get(event, "type").str()
         ));
     }
     ([("content-type", "text/event-stream")], sse).into_response()
