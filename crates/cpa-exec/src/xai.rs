@@ -22,6 +22,7 @@ use cpa_translate::{ResponseCtx, StreamTranslator};
 use futures_util::StreamExt;
 use http::HeaderMap;
 
+use crate::cancel::fail_if_canceled;
 use crate::claude_input_tokens::ClaudeInputTokens;
 use crate::openai_http::status_err;
 use crate::openai_http::{self as wire, Clients, GoHeaders};
@@ -192,28 +193,6 @@ fn track_first_byte(mut upstream: wire::Upstream, usage: &cpa_core::exec::UsageS
             .boxed();
     }
     upstream
-}
-
-/// Go's deferred `TrackFailure` (or the scanner's `PublishFailure`) when the client goes
-/// away mid-request: the canceled context fails the pending HTTP send or body read with
-/// `context canceled`, status 499. Dropping a pending future runs none of the executor's
-/// error paths, so this publishes that failure when `op` is dropped before it settles,
-/// ahead of the server's own end-of-attempt record.
-pub(crate) async fn fail_if_canceled<F: std::future::Future>(usage: &cpa_core::exec::UsageSink, op: F) -> F::Output {
-    struct Pending<'a>(Option<&'a cpa_core::exec::UsageSink>);
-    impl Drop for Pending<'_> {
-        fn drop(&mut self) {
-            if let Some(usage) = self.0 {
-                // Go's url.Error for a canceled send also names the method and URL; the
-                // URL is left out, as in every transport error here.
-                usage.publish_failure(499, "context canceled");
-            }
-        }
-    }
-    let mut pending = Pending(Some(usage));
-    let out = op.await;
-    pending.0 = None;
-    out
 }
 
 /// An error Go returns before creating its usage reporter: the attempt publishes no

@@ -18,6 +18,7 @@
 //! `tryRefreshAfterUnauthorized`). An already expired token is still `RefreshSoon`:
 //! Go sends it and recovers on 401.
 
+mod cancel;
 pub mod claude;
 mod claude_input_tokens;
 pub mod claude_login;
