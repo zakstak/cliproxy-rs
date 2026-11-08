@@ -269,15 +269,15 @@ fn trusted_proxy_validation_errors_match_go_text() {
         // decode messages (line numbers, Go type names) are not ported, only the refusal.
         let want = case["error"].as_str().unwrap();
         // A removed provider's setting fails with its migration guidance (issue #49).
-        if yaml.contains("devin-catalog")
-            || yaml.contains("antigravity")
-            || yaml.contains("vertex")
-            || yaml.contains("gemini-api-key")
-            || yaml.contains("openai-compatibility")
-        {
-            if got.contains("which is no longer supported") {
-                continue;
-            }
+        let removed = [
+            "devin-catalog",
+            "antigravity",
+            "vertex",
+            "gemini-api-key",
+            "openai-compatibility",
+        ];
+        if removed.iter().any(|r| yaml.contains(r)) && got.contains("which is no longer supported") {
+            continue;
         }
         match want.strip_prefix("failed to parse config file: ") {
             Some(yaml_error) if yaml_error.starts_with("yaml: ") => assert!(!got.is_empty(), "{yaml}"),
