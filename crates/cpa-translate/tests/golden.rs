@@ -232,28 +232,9 @@ fn run(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: bo
             (Format::OpenAI, Format::Claude) => cpa_translate::openai_to_claude_with_compat(&ctx, &input),
             (Format::OpenAIResponse, Format::Claude) => cpa_translate::responses_to_claude_with_compat(&ctx, &input),
             (Format::Claude, Format::OpenAI) => cpa_translate::claude_to_openai_with_compat(&ctx, &input),
-            (Format::Claude, Format::Gemini) => cpa_translate::claude_to_gemini_with_compat(&ctx, &input),
             (Format::Claude, Format::Codex) => cpa_translate::claude_to_codex_with_compat(&ctx, &input),
-            (Format::Claude, Format::Interactions) => cpa_translate::claude_to_interactions_with_compat(&ctx, &input),
             other => panic!("no compat request for {other:?}"),
         })],
-        "request_envelope" => {
-            // The executor's ResolvedModelInfo with native web search on.
-            let info = cpa_core::registry::ModelInfo::from_raw(
-                serde_json::json!({"id": model, "native_capabilities": {"web_search": true}})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-            vec![request_output(cpa_translate::translate_request_envelope(
-                client,
-                upstream,
-                &ctx,
-                &input,
-                Some(&info),
-            ))]
-        }
         // Go returns nil (written as "") when the apply_patch bridge rejects the body.
         "non_stream" => vec![match (pair.non_stream)(&rctx, &input) {
             Ok(out) => out,
@@ -412,11 +393,7 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
 
 /// Pair fixtures (recorded at 6fecc6e) whose behaviour a later Go commit changed, each
 /// replayed at v8.0.35 by the named golden instead.
-const SUPERSEDED: &[(&str, &str)] = &[(
-    "claude->antigravity tools/schema/11",
-    "the v8.0.35 schema cleaner (a0fd8448, c558d320): cpa-common gemini_schema.json.gz; \
-         the same fixture recorded at v8.0.35 matches",
-)];
+const SUPERSEDED: &[(&str, &str)] = &[];
 
 #[test]
 fn reference_goldens() {
@@ -665,53 +642,30 @@ fn deeply_nested_upstream_bodies_translate_without_overflowing() {
         translated_request: b"{}",
         tool_search: false,
     };
-    // Non-stream: a Gemini body whose function-call arguments nest deeply.
+    // Non-stream: a Claude body whose tool input nests deeply.
     let body = [
-        &br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{"x":"#[..],
+        &br#"{"id":"m","type":"message","role":"assistant","model":"c","content":[{"type":"tool_use","id":"t","name":"f","input":{"x":"#[..],
         &nested,
-        b"}}}]}}]}",
+        b"}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
     ]
     .concat();
-    let out = (pair(Format::Claude, Format::Gemini).unwrap().non_stream)(&rctx, &body).unwrap();
-    assert!(out.starts_with(br#"{"id":"","type":"message""#));
-    // Stream: the same payload as one upstream event.
-    let mut stream = (pair(Format::OpenAI, Format::Gemini).unwrap().stream)(&rctx);
-    let chunks = stream.event(&[&b"data: "[..], &body, b"\n\n"].concat()).unwrap();
-    assert_eq!(chunks.len(), 1);
+    let out = (pair(Format::OpenAI, Format::Claude).unwrap().non_stream)(&rctx, &body).unwrap();
+    assert!(out.starts_with(br#"{"id":"m""#), "{}", String::from_utf8_lossy(&out[..80]));
+    // Stream: a deeply nested content block as one upstream event.
+    let mut stream = (pair(Format::OpenAIResponse, Format::Claude).unwrap().stream)(&rctx);
+    let event = [
+        &br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"f","input":{"x":"#[..],
+        &nested,
+        b"}}}\n\n",
+    ]
+    .concat();
+    stream.event(&event).unwrap();
 }
 
 #[test]
 fn deeply_nested_retained_state_translates_without_overflowing() {
     let depth = 50_000;
-    let nested = [vec![b'['; depth], vec![b']'; depth]].concat();
     let deep_run = |out: &[u8]| out.windows(depth).any(|w| w.iter().all(|&c| c == b'['));
-    // Responses completions echo the request's metadata (Go's Value() re-marshal) while
-    // the upstream events themselves are shallow.
-    let original = [&br#"{"model":"m","input":"q","metadata":{"x":"#[..], &nested, b"}}"].concat();
-    let ctx = ResponseCtx {
-        model: "gemini-2.5-pro",
-        original_request: &original,
-        translated_request: b"{}",
-        tool_search: false,
-    };
-    let gemini = pair(Format::OpenAIResponse, Format::Gemini).unwrap();
-    let mut stream = (gemini.stream)(&ctx);
-    let mut out = vec![];
-    for event in [
-        &b"data: {\"responseId\":\"r\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]}}]}\n\n"[..],
-        b"data: [DONE]\n\n",
-    ] {
-        out.extend(stream.event(event).unwrap());
-    }
-    out.extend(stream.finish().unwrap());
-    let completed = out
-        .iter()
-        .find(|f| f.starts_with(b"event: response.completed"))
-        .unwrap();
-    assert!(deep_run(completed));
-    let body = br#"{"responseId":"r","candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]}"#;
-    assert!(deep_run(&(gemini.non_stream)(&ctx, body).unwrap()));
-
     // Tool arguments that only nest once the stream's string deltas are joined.
     let ctx = ResponseCtx {
         model: "claude-sonnet-4-5",
@@ -753,66 +707,6 @@ fn deeply_nested_retained_state_translates_without_overflowing() {
         .find(|f| f.starts_with(b"event: response.completed"))
         .unwrap();
     assert!(deep_run(completed));
-}
-
-#[test]
-fn apply_patch_failures_reach_the_stream_contract() {
-    let original = br#"{"model":"m","input":"q","tools":[{"type":"custom","name":"apply_patch"}]}"#;
-    let ctx = ResponseCtx {
-        model: "gemini-2.5-pro",
-        original_request: original,
-        translated_request: b"{}",
-        tool_search: false,
-    };
-    let pair = pair(Format::OpenAIResponse, Format::Gemini).unwrap();
-    let failed = |frame: &bytes::Bytes| frame.starts_with(b"event: response.failed\ndata: ");
-
-    // Invalid patch input: the event's frames end in response.failed, then the executor
-    // stops with the 502 message.
-    let mut stream = (pair.stream)(&ctx);
-    let frames = stream
-        .event(b"data: {\"responseId\":\"r\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"},{\"functionCall\":{\"name\":\"apply_patch\",\"args\":{\"input\":5}}}]}}]}\n\n")
-        .unwrap();
-    assert!(stream.tool_input_failed());
-    assert!(failed(frames.last().unwrap()), "{frames:?}");
-    assert!(frames.iter().filter(|f| failed(f)).count() == 1);
-
-    // A patch-enabled stream that ends without its terminator fails at EOF.
-    let mut stream = (pair.stream)(&ctx);
-    stream
-        .event(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]}}]}\n\n")
-        .unwrap();
-    assert!(!stream.tool_input_failed());
-    let frames = stream.finalize_tool_input();
-    assert_eq!(frames.len(), 1);
-    assert!(failed(&frames[0]));
-    assert!(stream.tool_input_failed());
-    assert!(stream.finalize_tool_input().is_empty(), "the failure is reported once");
-
-    // A completed stream, or one without apply_patch, has nothing to finalize.
-    let mut stream = (pair.stream)(&ctx);
-    stream
-        .event(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n")
-        .unwrap();
-    assert!(stream.finalize_tool_input().is_empty());
-    let plain = ResponseCtx {
-        original_request: br#"{"input":"q"}"#,
-        ..ctx
-    };
-    let mut stream = (pair.stream)(&plain);
-    stream
-        .event(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]}}]}\n\n")
-        .unwrap();
-    assert!(stream.finalize_tool_input().is_empty());
-    assert!(!stream.tool_input_failed());
-
-    // Buffered responses report the same failure as an error carrying Go's message.
-    let err = (pair.non_stream)(
-        &ctx,
-        br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":5}}}]}}]}"#,
-    )
-    .unwrap_err();
-    assert_eq!(err.0, cpa_translate::APPLY_PATCH_UPSTREAM_ERROR);
 }
 
 #[test]

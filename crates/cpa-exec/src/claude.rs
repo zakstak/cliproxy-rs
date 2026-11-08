@@ -7,7 +7,7 @@
 //!
 //! First-party Anthropic gets the native Claude Code transport (tls.rs); every other
 //! origin gets Go's standard transport (proxy.rs), exactly as Go's fallback round
-//! tripper does. Delegating executors (Kimi) pass a [`Delegation`].
+//! tripper does.
 //!
 //! Thinking (`cpa_common::thinking`), signature sanitizing (`cpa_common::signature`)
 //! and request translation (`cpa_translate::translate_request`) are the shared modules.
@@ -106,19 +106,6 @@ enum Native {
     Fixed(wreq::Client),
 }
 
-/// What a delegating executor changes in the Claude pipeline. Go embeds a
-/// `ClaudeExecutor` configured this way (`NewKimiExecutor`).
-#[derive(Clone, Copy, Default)]
-pub struct Delegation {
-    /// `upstreamModelNormalizer`: the model sent upstream, given the base model.
-    pub upstream_model: Option<fn(&str) -> String>,
-    /// `countTokensUpstream`: count on the upstream for every origin and credential.
-    pub count_upstream: bool,
-    /// `requestLogProvider`: the provider request logs name (Kimi logs `kimi`); `None`
-    /// is the executor's identifier, `claude`.
-    pub request_log_provider: Option<&'static str>,
-}
-
 pub struct ClaudeExecutor {
     native: Native,
     /// Go standard-transport clients for every other origin.
@@ -128,10 +115,8 @@ pub struct ClaudeExecutor {
     replay: Arc<replay::ReplayCache>,
     /// Passive quota snapshots per credential, for the management credential entry.
     quota: Arc<crate::quota::Observations>,
-    /// Tool aliases thread continuations restore (thread.rs): this executor's, and a
-    /// delegating executor's (Kimi), which Go keeps in an executor of its own.
+    /// Tool aliases thread continuations restore (thread.rs).
     thread_aliases: Arc<thread::Aliases>,
-    delegated_thread_aliases: Arc<thread::Aliases>,
 }
 
 impl ClaudeExecutor {
@@ -156,7 +141,6 @@ impl ClaudeExecutor {
             replay: replay::shared(),
             quota: Arc::default(),
             thread_aliases: Arc::default(),
-            delegated_thread_aliases: Arc::default(),
             native: Native::Transport(transport),
             go: Arc::new(GoClients::new(hooks).timed()),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -171,7 +155,6 @@ impl ClaudeExecutor {
             replay: replay::shared(),
             quota: Arc::default(),
             thread_aliases: Arc::default(),
-            delegated_thread_aliases: Arc::default(),
             go: Arc::new(GoClients::with_default(client.clone())),
             native: Native::Fixed(client),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -218,18 +201,6 @@ impl ClaudeExecutor {
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
-        self.execute_delegated(credential, req, cfg, Delegation::default())
-            .await
-    }
-
-    /// [`Self::execute`] on behalf of a delegating executor.
-    pub async fn execute_delegated(
-        &self,
-        credential: &Credential,
-        req: ExecRequest,
-        cfg: &Config,
-        delegation: Delegation,
-    ) -> Result<ExecResponse, ExecError> {
         tracing::trace!(target: "cpa_latency", stage = "executor");
         // Go executorForAuth: an API-key credential runs with cfg.ForAPIKey(), which
         // zeroes the v8 OAuth-only provider settings.
@@ -243,22 +214,22 @@ impl ClaudeExecutor {
         // upstream unauthenticated and gets its answer.
         let mut req = req;
         if req.operation == Operation::Generate {
-            if let Err(e) = crate::antigravity_compaction::expand_request(&mut req, "claude") {
+            if let Err(e) = crate::compaction_capsule::expand_request(&mut req, "claude") {
                 // Go rejects the capsule before it creates the usage reporter.
                 req.usage.discard();
-                return Err(crate::gemini::status_err(400, e));
+                return Err(ExecError::local(400, FailureScope::Request, e));
             }
             if req.alt.as_deref() == Some("responses/compact")
-                || crate::antigravity_compaction::has_trigger(&req.body)
-                || crate::antigravity_compaction::has_trigger(&req.original_body)
+                || crate::compaction_capsule::has_trigger(&req.body)
+                || crate::compaction_capsule::has_trigger(&req.original_body)
             {
-                return Box::pin(self.compact(credential, req, cfg, delegation)).await;
+                return Box::pin(self.compact(credential, req, cfg)).await;
             }
         }
         // Both paths are boxed: a request future of about 10 KB inline in every caller's
         // state (the dispatch loop, Home, the WebSocket session) overflowed a 2 MiB
         // worker stack in debug builds once the summary turn added a second one.
-        Box::pin(self.run(credential, req, cfg, delegation, false)).await
+        Box::pin(self.run(credential, req, cfg, false)).await
     }
 
     /// `executeClaudeCompaction` / `executeClaudeCompactionStream`: a non-stream Claude
@@ -268,11 +239,10 @@ impl ClaudeExecutor {
         credential: &Credential,
         mut req: ExecRequest,
         cfg: &Config,
-        delegation: Delegation,
     ) -> Result<ExecResponse, ExecError> {
         let model = base_model(&req.model);
         let stream = req.stream;
-        req.body = compaction::summary_payload(crate::antigravity_compaction::source_payload(
+        req.body = compaction::summary_payload(crate::compaction_capsule::source_payload(
             &req.body,
             &req.original_body,
         ))
@@ -282,16 +252,16 @@ impl ClaudeExecutor {
         req.stream = false;
         req.source_format = Format::OpenAIResponse;
         req.response_format = Format::Claude;
-        let answer = self.run(credential, req, cfg, delegation, true).await?;
+        let answer = self.run(credential, req, cfg, true).await?;
         let ResponseBody::Buffered(payload) = answer.body else {
-            return Err(crate::antigravity_compaction::statusless(
+            return Err(crate::compaction_capsule::statusless(
                 "extract summary: no summary text found in upstream response",
             ));
         };
-        let text = crate::antigravity_compaction::summary_text(&payload)
-            .map_err(|e| crate::antigravity_compaction::statusless(format!("extract summary: {e}")))?;
-        let sealed = crate::antigravity_compaction::seal(&text, &model)
-            .map_err(|e| crate::antigravity_compaction::statusless(format!("seal compaction capsule: {e}")))?;
+        let text = crate::compaction_capsule::summary_text(&payload)
+            .map_err(|e| crate::compaction_capsule::statusless(format!("extract summary: {e}")))?;
+        let sealed = crate::compaction_capsule::seal(&text, &model)
+            .map_err(|e| crate::compaction_capsule::statusless(format!("seal compaction capsule: {e}")))?;
         let usage = compaction::Usage::of(&payload);
         let mut headers = answer.headers;
         if !stream {
@@ -323,7 +293,6 @@ impl ClaudeExecutor {
         credential: &Credential,
         req: ExecRequest,
         cfg: &Config,
-        delegation: Delegation,
         compaction_summary: bool,
     ) -> Result<ExecResponse, ExecError> {
         if req.response_format != Format::Claude && cpa_translate::pair(req.response_format, Format::Claude).is_none() {
@@ -333,11 +302,11 @@ impl ClaudeExecutor {
                 "Claude response translation pair is not registered",
             ));
         }
-        let mut ctx = Ctx::new(self, credential, &req, cfg, delegation);
+        let mut ctx = Ctx::new(self, credential, &req, cfg);
         ctx.compaction_summary = compaction_summary;
         match req.operation {
             Operation::Generate => self.generate(ctx, req).await,
-            Operation::CountTokens => self.count_tokens(ctx, req, delegation.count_upstream).await,
+            Operation::CountTokens => self.count_tokens(ctx, req).await,
         }
     }
 
@@ -387,10 +356,6 @@ impl ClaudeExecutor {
         replay: Option<&replay::Scope>,
     ) -> Result<ExecResponse, ExecError> {
         let upstream_stream = req.stream || req.response_format != Format::Claude;
-        // reporter.SetUpstreamModel when the delegation renames the model.
-        if ctx.upstream_model != ctx.base_model {
-            req.usage.upstream_model(&ctx.upstream_model);
-        }
         let tool_search = ctx.tool_search();
         let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, tool_search)?;
         let original_translated = translate::original(
@@ -428,7 +393,7 @@ impl ClaudeExecutor {
             .send(&ctx, &mut prepared, "/v1/messages", Some(&req.usage), req.capture())
             .await;
         let response = response.inspect_err(|error| {
-            // shouldClearKimiThinkingReplayAfterError: an upstream rejection of applied replay.
+            // shouldClearKimiThinkingReplayAfterError (Go's name): an upstream rejection of applied replay.
             if let Some(scope) = replay.filter(|s| s.applied)
                 && replay::upstream_rejects(error)
             {
@@ -543,7 +508,6 @@ impl ClaudeExecutor {
         &self,
         ctx: Ctx<'_>,
         mut req: ExecRequest,
-        upstream: bool,
     ) -> Result<ExecResponse, ExecError> {
         ctx.tool_search_fallback(&mut req);
         let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search())?;
@@ -565,7 +529,7 @@ impl ClaudeExecutor {
             ctx.is_compat,
             ctx.tool_search(),
         )?;
-        if !upstream && (ctx.api_key.trim().is_empty() || !ctx.first_party) {
+        if ctx.api_key.trim().is_empty() || !ctx.first_party {
             let mut body = ctx.apply_thinking(&req, String::from_utf8_lossy(&translated).into_owned())?;
             if ctx.rebuild_mid_system() {
                 body = rebuild_mid_system(&body);
@@ -647,7 +611,7 @@ impl ClaudeExecutor {
                     method: "POST",
                     headers: &prepared.headers,
                     body: &body,
-                    provider: ctx.log_provider,
+                    provider: "claude",
                     auth_id: &ctx.credential.id,
                     auth_label: &ctx.credential.label,
                     auth_type,
@@ -897,13 +861,6 @@ struct Ctx<'a> {
     /// `requests.tls-handshake-timeout-seconds` for the native transport.
     handshake: Option<std::time::Duration>,
     base_model: String,
-    /// The model sent upstream (`upstreamModel`): the base model unless a delegating
-    /// executor normalizes it.
-    upstream_model: String,
-    /// `isKimiMessagesUpstream`.
-    kimi: bool,
-    /// `upstreamRequestLogProvider`: the provider request logs name.
-    log_provider: &'static str,
     /// The summary turn of a Responses compaction (`claudeCompactionSummaryFromContext`).
     compaction_summary: bool,
     /// Normalized execution-session ID (websocket executions), or empty.
@@ -969,30 +926,6 @@ fn set_string_if_different(body: String, path: &str, value: &str) -> String {
         return body;
     }
     rawjson::set_str(&body, path, value)
-}
-
-/// `isKimiMessagesUpstream`: a Kimi credential, or Kimi's API host.
-fn kimi_upstream(provider: &str, base_url: &str) -> bool {
-    let provider = provider.trim().go_lower();
-    if matches!(provider.as_str(), "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com") {
-        return true;
-    }
-    url::Url::parse(base_url.trim()).is_ok_and(|u| {
-        u.host_str()
-            .is_some_and(|h| h.eq_ignore_ascii_case("api.kimi.com") || h.eq_ignore_ascii_case("api.kimi.ai"))
-    })
-}
-
-/// `helps.ClaudeCLIAuthIdentitySeed`.
-// ponytail: Go falls back to the auth index and file name when the ID is empty; every
-// loaded or synthesized credential here has an ID.
-fn identity_seed(credential: &Credential) -> String {
-    let id = credential.id.trim();
-    if id.is_empty() {
-        String::new()
-    } else {
-        format!("auth-id|{id}")
-    }
 }
 
 /// `upstream.claude.tool-search` (Go `ClientToolSearchEnabled`), for translations outside
@@ -1093,7 +1026,6 @@ impl<'a> Ctx<'a> {
         credential: &'a Credential,
         req: &ExecRequest,
         cfg: &Config,
-        delegation: Delegation,
     ) -> Self {
         let settings = Settings::from_config(cfg);
         let attr = |k: &str| credential.attributes.get(k).map(String::as_str).unwrap_or_default();
@@ -1140,9 +1072,6 @@ impl<'a> Ctx<'a> {
             first_party: tokens::first_party(&base_url),
             proxy: Proxy::effective(credential, cfg),
             handshake: crate::tls::handshake_timeout(cfg),
-            upstream_model: delegation.upstream_model.map_or_else(|| base.clone(), |f| f(&base)),
-            kimi: kimi_upstream(&credential.provider, &base_url),
-            log_provider: delegation.request_log_provider.unwrap_or("claude"),
             compaction_summary: false,
             execution: session::normalize(req.execution_session.as_deref().unwrap_or_default()),
             is_compat: req.resolved_model.as_ref().is_some_and(|r| r.is_compat()),
@@ -1157,11 +1086,7 @@ impl<'a> Ctx<'a> {
             api_key,
             base_url,
             today: String::new(),
-            thread_aliases: if delegation.request_log_provider.is_some() {
-                exec.delegated_thread_aliases.clone()
-            } else {
-                exec.thread_aliases.clone()
-            },
+            thread_aliases: exec.thread_aliases.clone(),
         }
         .with_today(credential, chrono::Utc::now())
     }
@@ -1327,7 +1252,7 @@ impl<'a> Ctx<'a> {
             String::new()
         };
         let mut body = translated;
-        body = set_string_if_different(body, "model", &self.upstream_model);
+        body = set_string_if_different(body, "model", &self.base_model);
         body = self.apply_thinking(req, body)?;
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
@@ -1493,10 +1418,6 @@ impl<'a> Ctx<'a> {
             };
             body = signing::placeholder(body, &fallback);
         }
-        if self.kimi && !self.cli_profile {
-            // stripDefaultKimiClaudeCodeAttribution: Kimi reads the block as prompt text.
-            body = strip_attribution_system(&body);
-        }
         if self.compaction_summary {
             body = compaction::finalize(body);
         }
@@ -1604,7 +1525,7 @@ impl<'a> Ctx<'a> {
             String::new()
         };
         let mut body = utf8(translated).into_owned();
-        body = set_string_if_different(body, "model", &self.upstream_model);
+        body = set_string_if_different(body, "model", &self.base_model);
         body = self.apply_thinking(req, body)?;
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
@@ -1757,7 +1678,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn supports_native_tool_search(&self) -> bool {
-        supports_native_tool_search(&self.settings, self.credential, &self.upstream_model)
+        supports_native_tool_search(&self.settings, self.credential, &self.base_model)
     }
 
     /// `applyNativeToolSearchFallback`: a Responses request with tool_search whose
@@ -1779,7 +1700,7 @@ impl<'a> Ctx<'a> {
         }
         tracing::debug!(
             "claude executor: native tool search unavailable, removed tool_search from request (model={})",
-            self.upstream_model
+            self.base_model
         );
     }
 
@@ -1899,14 +1820,7 @@ impl<'a> Ctx<'a> {
 
     fn apply_identity(&self, body: &str, session_id: &str) -> Result<String, ExecError> {
         let synthesize = self.cli_profile && !self.oauth_token;
-        // Delegated providers seed from the stable auth identity, so a token rotation
-        // does not rotate the device fingerprint.
-        let seed = if self.kimi {
-            identity_seed(self.credential)
-        } else {
-            self.api_key.clone()
-        };
-        let (device, account) = identity::wire_identity(self.credential, &seed, synthesize);
+        let (device, account) = identity::wire_identity(self.credential, &self.api_key, synthesize);
         // applyClaudeCLIIdentity wraps every ApplyClaudeCredentialMetadata error once more.
         identity::apply(body, &device, &account, session_id).map_err(|e| match e {
             identity::ApplyError::Plain(e) => plain_error(format!("apply Claude credential metadata: {e}")),

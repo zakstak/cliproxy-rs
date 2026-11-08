@@ -13,7 +13,7 @@ use cpa_core::exec::{ExecError, ExecRequest, FailureScope};
 use cpa_core::format::Format;
 use cpa_translate::RequestCtx;
 
-use crate::openai_compat_payload::{self as compat, set_bool_if_different, set_str_if_different};
+use crate::openai_payload::{self as compat, set_bool_if_different, set_str_if_different};
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_response::{
     self as response, CUSTOM, ClientToolKey, FUNCTION, NAMESPACE, NamespaceRef, NamespaceRefs, WEB_SEARCH, text,
@@ -206,7 +206,7 @@ pub(crate) async fn prepare(
     let mut apply_patch = apply_patch::State::new(req.source_format, &original_payload, &original_translated);
     // A plain Go error (translator/common NormalizeApplyPatchResponsesRequest).
     body = apply_patch::normalize_executor_request(&body, Some(&original_payload))
-        .map_err(crate::openai_compat::plain_err)?;
+        .map_err(crate::openai_http::plain_err)?;
     let will_inject = inject_x_search(cfg);
     let fold = should_fold_namespace_tools(&body, will_inject);
     let namespace_tools = collect_namespace_refs(&body, fold);

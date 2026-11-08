@@ -713,7 +713,7 @@ fn unrouted(req: &ExecRequest) -> ExecError {
         400,
         FailureScope::Request,
         format!(
-            "this request cannot be sent to Codex: {} -> {} {} is neither a native Responses request nor a supported translation (Claude, Chat Completions, Gemini or Gemini Interactions generations)",
+            "this request cannot be sent to Codex: {} -> {} {} is neither a native Responses request nor a supported translation (Claude Messages or Chat Completions generations)",
             req.source_format.as_str(),
             req.response_format.as_str(),
             req.alt.as_deref().unwrap_or("generation"),

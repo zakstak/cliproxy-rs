@@ -26,19 +26,8 @@ use crate::gostr::GoStr;
 /// Go `responsesWebSearchProviderPathSupport`.
 fn provider_web_search_path(provider: &str) -> Option<bool> {
     match provider.trim().go_lower().as_str() {
-        "codex" | "xai" | "claude" | "antigravity" => Some(true),
-        "openai"
-        | "openai-compatibility"
-        | "gemini"
-        | "aistudio"
-        | "vertex"
-        | "kimi"
-        | "kimi-ai"
-        | "kimi.ai"
-        | "kimi.com"
-        | "interactions"
-        | "gemini-interactions" => Some(false),
-        p if p.starts_with("openai-compatible-") => Some(false),
+        "codex" | "xai" | "claude" => Some(true),
+        "openai" => Some(false),
         _ => None,
     }
 }
@@ -297,28 +286,11 @@ pub fn is_api_key(c: &Credential) -> bool {
     auth_kind(c) == Some("apikey")
 }
 
-/// Go `openAICompatInfoFromAuth`: a `compat_name` or the `openai-compatibility`
-/// provider. A `provider_key` alone does not count; Vertex API keys carry one.
-fn openai_compat(c: &Credential) -> bool {
-    c.attributes.get("compat_name").is_some_and(|v| !v.trim().is_empty())
-        || c.provider.trim().go_eq_fold("openai-compatibility")
-}
-
-/// The provider key a credential registers and is scheduled under. For an
-/// OpenAI-compatible credential, Go `registerModelsForAuth` takes a `provider_key`
-/// lowercased as written, and otherwise the `openAICompatInfoFromAuth` key: the
-/// `compat_name`, or else the label, through `util.OpenAICompatibleProviderKey`. A
-/// `provider_key` of `openai-compatibility` gives way to the bare, lowercased `compat_name`.
+/// The provider key a credential registers and is scheduled under: its provider,
+/// lowercased (Go `registerModelsForAuth` outside its OpenAI-compatible branch, which
+/// this fork removed with that provider; issue #49).
 pub fn provider_key(c: &Credential) -> String {
-    if !openai_compat(c) {
-        return c.provider.trim().go_lower();
-    }
-    let attr = |key: &str| c.attributes.get(key).map(|s| s.trim()).filter(|s| !s.is_empty());
-    match (attr("provider_key").map(|k| k.go_lower()), attr("compat_name")) {
-        (Some(key), Some(name)) if key == "openai-compatibility" => name.go_lower(),
-        (Some(key), _) => key,
-        (None, name) => crate::config::credentials::openai_compat_provider(name.unwrap_or(c.label.trim())),
-    }
+    c.provider.trim().go_lower()
 }
 
 /// The authoritative `prefix` (attributes first, then file metadata).
@@ -459,13 +431,13 @@ fn attribute_aliases(c: &Credential) -> Vec<OAuthAlias> {
         .unwrap_or_default()
 }
 
-/// `OAuthModelAliasChannel`: API keys and Gemini keys have none.
+/// `OAuthModelAliasChannel`: API keys have none.
 fn alias_channel(c: &Credential) -> Option<String> {
     if is_api_key(c) {
         return None;
     }
     match c.provider.trim().go_lower().as_str() {
-        "gemini" | "" => None,
+        "" => None,
         other => Some(other.to_owned()),
     }
 }
@@ -557,14 +529,8 @@ fn apply_excluded(models: Vec<Spec>, excluded: &[String]) -> Vec<Spec> {
 fn static_channel(name: &str) -> Vec<Spec> {
     match name.trim().go_lower().as_str() {
         "claude" => channel("claude"),
-        "gemini" | "gemini-interactions" => channel("gemini"),
-        "vertex" => channel("vertex"),
-        "aistudio" => channel("aistudio"),
         "codex" => codex_channel("codex-pro"),
-        "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com" => channel("kimi"),
-        "antigravity" => channel("antigravity"),
         "xai" | "x-ai" | "grok" => with_xai_builtins(channel("xai")),
-        "devin" => super::devin::models().iter().map(Spec::from_static).collect(),
         "meta" | "muse" => channel("meta"),
         _ => Vec::new(),
     }
@@ -592,15 +558,6 @@ fn native_web_search(info: &ModelInfo) -> Option<bool> {
         .get("native_capabilities")
         .and_then(|c| c.get("web_search"))
         .and_then(Value::as_bool)
-}
-
-/// Go `normalizeCompatConfigModalities`: lowercase, trimmed, unique, in order.
-fn normalize_modalities(raw: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    raw.iter()
-        .map(|m| m.trim().go_lower())
-        .filter(|m| !m.is_empty() && seen.insert(m.clone()))
-        .collect()
 }
 
 fn channel(name: &str) -> Vec<Spec> {
@@ -662,14 +619,8 @@ pub fn static_definitions(channel: &str) -> Option<Vec<ModelInfo>> {
     let info = |specs: Vec<Spec>| specs.iter().map(Spec::to_info).collect();
     Some(match channel.trim().go_lower().as_str() {
         "claude" => section("claude"),
-        "gemini" | "gemini-interactions" => section("gemini"),
-        "vertex" => section("vertex"),
-        "aistudio" => section("aistudio"),
         "codex" => upsert(section("codex-pro"), info(codex_builtins()), |m| &m.id),
-        "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com" => section("kimi"),
-        "antigravity" => section("antigravity"),
         "xai" | "x-ai" | "grok" => upsert(section("xai"), info(xai_builtins()), |m| &m.id),
-        "devin" => super::devin::models(),
         "meta" | "muse" => section("meta"),
         _ => return None,
     })
@@ -829,60 +780,6 @@ pub fn normalize_thinking(mut t: ThinkingSupport) -> ThinkingSupport {
     t
 }
 
-fn compat_models(models: &[ConfigModel], owned_by: &str, now: i64) -> Vec<Spec> {
-    models
-        .iter()
-        .filter_map(|m| {
-            let name = m.name.trim();
-            let alias = if m.alias.trim().is_empty() {
-                name
-            } else {
-                m.alias.trim()
-            };
-            if alias.is_empty() {
-                return None;
-            }
-            let display = [m.display_name.trim(), m.alias.trim(), alias]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or(alias);
-            let thinking = match &m.thinking {
-                Some(t) => Some(normalize_thinking(t.clone())),
-                None if !m.image => Some(ThinkingSupport {
-                    levels: vec!["low".into(), "medium".into(), "high".into()],
-                    ..ThinkingSupport::default()
-                }),
-                None => None,
-            };
-            Some(Spec {
-                id: alias.to_owned(),
-                metadata_model_id: if name.is_empty() {
-                    alias.to_owned()
-                } else {
-                    name.to_owned()
-                },
-                object: "model".into(),
-                created: now,
-                owned_by: owned_by.into(),
-                kind: if m.image {
-                    "openai-image".into()
-                } else {
-                    "openai-compatibility".into()
-                },
-                display_name: display.to_owned(),
-                context_length: m.max_context_length.max(0),
-                max_context_length: m.max_context_length.max(0),
-                thinking,
-                is_compat: m.is_compat,
-                explicit_thinking: m.thinking.is_some(),
-                explicit_input_modalities: !m.input_modalities.is_empty(),
-                supported_input_modalities: normalize_modalities(&m.input_modalities),
-                supported_output_modalities: normalize_modalities(&m.output_modalities),
-                ..Spec::default()
-            })
-        })
-        .collect()
-}
 
 /// Go `applyOAuthModelAliasEntries`: aliases replace their source model unless an
 /// entry is a fork, which keeps both.
@@ -983,33 +880,7 @@ fn apply_prefix(models: Vec<Spec>, prefix: &str, force: bool) -> Vec<Spec> {
     out
 }
 
-/// Go `asyncProbeAntigravityCapabilities`: the upstream model IDs (lowercased) that each
-/// Antigravity credential's capability probe reported in `webSearchModelIds`, written by
-/// the Antigravity executor ([`set_web_search_hints`]). [`models_for`] marks those
-/// models, and so their aliases and prefixed copies, `supports_web_search`.
-static WEB_SEARCH_HINTS: std::sync::LazyLock<std::sync::RwLock<HashMap<String, std::collections::HashSet<String>>>> =
-    std::sync::LazyLock::new(Default::default);
 static HINTS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Replaces the web-search hints of one credential (empty clears them) and reports
-/// whether they changed; a change bumps [`capabilities_generation`].
-pub fn set_web_search_hints(credential: &str, ids: std::collections::HashSet<String>) -> bool {
-    let mut hints = WEB_SEARCH_HINTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let changed = if ids.is_empty() {
-        hints.remove(credential).is_some()
-    } else if hints.get(credential) == Some(&ids) {
-        false
-    } else {
-        hints.insert(credential.to_owned(), ids);
-        true
-    };
-    if changed {
-        HINTS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-    changed
-}
 
 /// Plugin-owned models (Go v8.0.35 `pluginHost.ModelsForProvider` and the executor model
 /// clients `plugin:<id>:<provider>:executor`), published by the server's plugin host.
@@ -1064,25 +935,10 @@ fn append_plugin_models(provider: &str, mut models: Vec<Spec>, excluded: &[Strin
     models
 }
 
-/// Bumped whenever [`set_web_search_hints`] changes a credential's hints or
-/// [`set_plugin_catalog`] the plugin catalog; registries derived from credentials key on it.
+/// Bumped whenever [`set_plugin_catalog`] changes the plugin catalog; registries derived
+/// from credentials key on it.
 pub fn capabilities_generation() -> u64 {
     HINTS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// `applyAntigravityFetchedModelCapabilities` with the credential's probe result.
-fn with_web_search_hints(credential: &str, mut models: Vec<Spec>) -> Vec<Spec> {
-    let hints = WEB_SEARCH_HINTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(ids) = hints.get(credential) {
-        for model in &mut models {
-            if ids.contains(&model.id.trim().go_lower()) {
-                model.supports_web_search = true;
-            }
-        }
-    }
-    models
 }
 
 /// The models one credential registers (Go `registerModelsForAuth`), or none.
@@ -1094,13 +950,6 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
     let configured = config_models(c);
     let api_key = is_api_key(c);
     let provider = c.provider.trim().go_lower();
-    if openai_compat(c) {
-        let owned_by = c.attributes.get("compat_name").cloned().unwrap_or_default();
-        // Go appends the provider's plugin models here too, without exclusions, and
-        // even when no models are configured.
-        let models = append_plugin_models(&provider_key(c), compat_models(&configured, &owned_by, now), &[]);
-        return apply_prefix(models, credential_prefix(c), cfg.routing.force_model_prefix);
-    }
     let with_config = |channel_models: Vec<Spec>, owned_by: &str, kind: &str, metadata: &str| {
         if configured.is_empty() {
             channel_models
@@ -1109,13 +958,6 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
         }
     };
     let models = match provider.as_str() {
-        "gemini" | "gemini-interactions" => with_config(channel("gemini"), "google", "gemini", "gemini"),
-        "vertex" if matches!(c.source, Source::Config { .. }) => {
-            with_config(channel("vertex"), "google", "vertex", "vertex")
-        }
-        "vertex" => vertex_service_account_models(aliases, c, channel("vertex"), now),
-        "aistudio" => channel("aistudio"),
-        "antigravity" => with_web_search_hints(&c.id, channel("antigravity")),
         "claude" => with_config(channel("claude"), "anthropic", "claude", "claude"),
         "codex" if api_key => {
             if configured.is_empty() {
@@ -1141,11 +983,8 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
                 _ => "codex-pro",
             })
         }
-        "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com" => channel("kimi"),
         "xai" => with_config(with_xai_builtins(channel("xai")), "xai", "xai", "xai"),
         "meta" => with_config(channel("meta"), "meta", "meta", "meta"),
-        // Go `registry.GetDevinModels()`: the live Devin catalog, never config models.
-        "devin" => super::devin::models().iter().map(Spec::from_static).collect(),
         _ => Vec::new(),
     };
     let models = apply_excluded(models, &excluded);
@@ -1153,90 +992,6 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
     let models = append_plugin_models(&provider, models, &excluded);
     // ponytail: oauth.settings max-context-length overrides are not applied yet.
     apply_prefix(models, credential_prefix(c), cfg.routing.force_model_prefix)
-}
-
-/// The model names an auth file lists (Go d9451cb6): a comma-separated string, an
-/// array of strings, or an array of entries with a string `name`.
-pub fn for_each_model_name(raw: &Value, mut f: impl FnMut(&str)) {
-    match raw {
-        Value::String(s) => s.split(',').for_each(f),
-        Value::Array(items) => {
-            for item in items {
-                match item {
-                    Value::String(s) => f(s),
-                    Value::Object(entry) => {
-                        if let Some(name) = entry.get("name").and_then(Value::as_str) {
-                            f(name);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Go `appendVertexServiceAccountModels` (d9451cb6): a Vertex file's catalog plus the
-/// partner and open models it names (the `openapi_models` attribute, the file's
-/// `openapi_models` and `models`) and the OAuth alias targets, each new one as a
-/// user-defined Vertex model owned by its publisher.
-fn vertex_service_account_models(
-    aliases: &HashMap<String, Vec<OAuthAlias>>,
-    c: &Credential,
-    mut models: Vec<Spec>,
-    now: i64,
-) -> Vec<Spec> {
-    let mut seen: std::collections::HashSet<String> = models.iter().map(|m| m.id.trim().go_lower()).collect();
-    let mut extra = Vec::new();
-    let mut add = |raw: &str| {
-        let name = raw.trim();
-        if !name.is_empty() && seen.insert(name.go_lower()) {
-            extra.push(name.to_owned());
-        }
-    };
-    if let Some(raw) = c.attributes.get("openapi_models") {
-        raw.split(',').for_each(&mut add);
-    }
-    for key in ["openapi_models", "openapi-models", "models"] {
-        if let Some(raw) = c.metadata.get(key) {
-            for_each_model_name(raw, &mut add);
-        }
-    }
-    for entry in oauth_aliases_for(aliases, c) {
-        add(&entry.name);
-    }
-    models.extend(extra.into_iter().map(|name| {
-        let owned_by = name
-            .split_once('/')
-            .map(|(publisher, _)| publisher.trim())
-            .filter(|p| !p.is_empty())
-            .unwrap_or("google")
-            .to_owned();
-        // `modelconfig.ResolveModelInfo`: the catalog's thinking for the base name.
-        let thinking = pinned()
-            .lookup(canonical_model(&name))
-            .and_then(|i| i.thinking.clone())
-            .or_else(|| {
-                Some(ThinkingSupport {
-                    levels: vec!["low".into(), "medium".into(), "high".into()],
-                    ..ThinkingSupport::default()
-                })
-            });
-        Spec {
-            id: name.clone(),
-            metadata_model_id: name.clone(),
-            object: "model".into(),
-            created: now,
-            owned_by,
-            kind: "vertex".into(),
-            display_name: name,
-            thinking,
-            user_defined: true,
-            ..Spec::default()
-        }
-    }));
-    models
 }
 
 struct Registration {
@@ -1668,14 +1423,15 @@ pub fn strip_prefix<'a>(model: &'a str, c: &Credential) -> &'a str {
 }
 
 /// Upstream model candidates for one credential (Go `executionModelCandidatesWithAlias`).
-/// More than one candidate is an OpenAI-compatible alias pool, tried in order.
+/// Go returns more than one only for an OpenAI-compatible alias pool, which this fork
+/// removed with that provider (issue #49).
 pub fn execution_models(
     cfg_aliases: &HashMap<String, Vec<OAuthAlias>>,
     c: &Credential,
     route_model: &str,
 ) -> (Vec<String>, AliasResult) {
     let requested = strip_prefix(route_model, c);
-    let configured = is_api_key(c) || openai_compat(c);
+    let configured = is_api_key(c);
     let models = config_models(c);
     let alias = if configured {
         if models.is_empty() {
@@ -1710,15 +1466,9 @@ pub fn execution_models(
     };
     if configured && !models.is_empty() {
         let pool = alias_pool(&upstream, &models);
-        // Go `executionModelCandidatesWithAlias`: a non-empty compat pool wins. Otherwise
-        // `applyAPIKeyModelAliasWithRouting` tries an API key's lowercase-keyed table
+        // Go `applyAPIKeyModelAliasWithRouting` tries an API key's lowercase-keyed table
         // before the `EqualFold` scan.
-        if openai_compat(c) && !pool.is_empty() {
-            return (pool, alias);
-        }
-        if is_api_key(c)
-            && let Some(upstream) = api_key_table_upstream(&upstream, &models)
-        {
+        if let Some(upstream) = api_key_table_upstream(&upstream, &models) {
             return (vec![upstream], alias);
         }
         if let Some(first) = pool.into_iter().next() {
@@ -1767,7 +1517,7 @@ fn alias_pool(requested: &str, models: &[ConfigModel]) -> Vec<String> {
 /// keyed by this when it equals the upstream model, else by the route model.
 pub fn selection_model(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credential, route_model: &str) -> String {
     let requested = strip_prefix(route_model, c);
-    if is_api_key(c) || openai_compat(c) {
+    if is_api_key(c) {
         return requested.to_owned();
     }
     let r = resolve_oauth(cfg_aliases, c, requested);
@@ -1819,13 +1569,9 @@ mod tests {
         let ids = |name: &str| static_channel(name).into_iter().map(|m| m.id).collect::<Vec<_>>();
         for (name, same_as) in [
             (" Claude ", "claude"),
-            ("gemini-interactions", "gemini"),
             ("x-ai", "xai"),
             ("GROK", "xai"),
             ("muse", "meta"),
-            ("kimi.com", "kimi"),
-            // KELVIN SIGN folds to `k` in Go's strings.ToLower too.
-            ("\u{212A}imi", "kimi"),
         ] {
             assert!(!ids(same_as).is_empty(), "{same_as}");
             assert_eq!(ids(name), ids(same_as), "{name}");
@@ -1835,21 +1581,17 @@ mod tests {
             "codex-team",
             "codex-free",
             "codex-plus",
-            "gemini-cli",
             "unknown",
+            // The removed providers' channels (issue #49).
+            "gemini",
+            "kimi",
+            "devin",
         ] {
             assert!(static_channel(raw).is_empty(), "{raw} is not a Go channel");
         }
         assert!(
             ids("codex").iter().any(|id| id == "gpt-image-2"),
             "codex keeps its built-ins"
-        );
-        assert_eq!(
-            ids("devin"),
-            super::super::devin::models()
-                .into_iter()
-                .map(|m| m.id)
-                .collect::<Vec<_>>()
         );
         let claude = static_channel("Claude");
         let found =
@@ -1864,11 +1606,9 @@ mod tests {
         );
         assert_eq!(found("claude", &claude, "  "), None);
         // The family fallback is Claude's alone.
-        let gemini = static_channel("gemini");
         let mut renamed = claude.clone();
         renamed.retain(|m| m.id == "claude-opus-5-5");
-        assert_eq!(found("gemini", &renamed, "claude-opus-5-5[1m]"), None);
-        assert!(found("gemini", &gemini, "claude-opus-5-5").is_none());
+        assert_eq!(found("xai", &renamed, "claude-opus-5-5[1m]"), None);
     }
 
     /// Go `Auth.AccountInfo` (sdk/cliproxy/auth/types.go): kind first, then the

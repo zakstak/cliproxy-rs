@@ -442,7 +442,7 @@ fn file_part(part: &Res<'_>) -> Option<Vec<u8>> {
     if &*source.get("type").bytes() != b"base64" {
         return None;
     }
-    let data = crate::gemini_responses::go_base64_decode(trim_space(&source.get("data").bytes()), true)?;
+    let data = crate::common::go_base64_decode(trim_space(&source.get("data").bytes()), true)?;
     if data.is_empty() {
         return None;
     }
@@ -451,7 +451,7 @@ fn file_part(part: &Res<'_>) -> Option<Vec<u8>> {
         media = b"application/octet-stream".to_vec();
     }
     let mut url = [&b"data:"[..], &media, b";base64,"].concat();
-    url.extend_from_slice(crate::gemini_responses::go_base64(true).encode(&data).as_bytes());
+    url.extend_from_slice(crate::common::go_base64(true).encode(&data).as_bytes());
     let mut item = br#"{"type":"file","file":{"filename":"","file_data":""}}"#.to_vec();
     gj::set_str(&mut item, "file.filename", part.get("filename").bytes());
     gj::set_str(&mut item, "file.file_data", url);

@@ -7,9 +7,8 @@
 //! for one request as Go's ensureAuth does when preparation did not run.
 //!
 //! Translation uses cpa-translate (the registered client <-> Codex pair), thinking
-//! cpa_common::thinking, JSON edits cpa_common::json, and the Codex and OpenAI-compatible
-//! executors' ports of the shared Responses helpers. Stages whose shared module has not
-//! landed go through adapters named after their owners (meta_codex, kimi_http, below).
+//! cpa_common::thinking, JSON edits cpa_common::json, and the shared Responses helpers
+//! (crate::openai_payload, crate::helpers).
 //! Translator apply_patch failures end streams with Go's 502. Go's apply_patch Responses
 //! bridge (cpa_translate::apply_patch_responses) runs around the Codex wire: a client's
 //! custom `apply_patch` tool goes upstream as a JSON function and its calls come back as
@@ -32,13 +31,13 @@ use serde_json::Value;
 
 use crate::codex_response::OutputItems;
 use crate::codex_tokens::count_input_tokens;
-use crate::kimi_http::{
+use crate::helpers::{
     DeferredUsage, UsageRule, credential_headers, defer_usage, payload_rules, read_all_strict, refresh_due,
     report_model, rfc3339_local_now,
 };
 use crate::meta_auth::{DEFAULT_API_BASE_URL, MetaAuth, MintedKey};
 use crate::meta_codex::go_trim_space;
-use crate::openai_compat_payload::{ensure_responses_usage_details, sanitize_reasoning_encrypted_content};
+use crate::openai_payload::{ensure_responses_usage_details, sanitize_reasoning_encrypted_content};
 use crate::proxy::{GoClients, GoHeaders, MAX_ERROR_BODY, Proxy, default_client, lines, read_all, send};
 use crate::tokenizer::Encoding;
 use cpa_common::codex_client::normalize_codex_instructions;
@@ -214,7 +213,7 @@ impl MetaExecutor {
         let body = Bytes::from(prepared.body);
         // Go: TrackHTTPClient for Execute; ExecuteStream uses TrackHTTPClientRoundTripOnly,
         // so its first body byte only records the first-packet fallback.
-        use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
+        use crate::helpers::{capture_chunk, capture_error, capture_metadata, capture_request};
         let capture = req.capture();
         let request_headers = headers(&enriched, &req, &token);
         // recordMetaRequest: the enriched credential's account info.
@@ -233,7 +232,7 @@ impl MetaExecutor {
             .await
             .inspect_err(|e| capture_error(capture, e))?;
         capture_metadata(capture, upstream.status, &upstream.headers);
-        upstream.body = crate::kimi_http::track_first_byte(upstream.body, &req.usage, req.stream);
+        upstream.body = crate::helpers::track_first_byte(upstream.body, &req.usage, req.stream);
         if !(200..300).contains(&upstream.status) {
             let headers = upstream.headers.clone();
             // Go returns a failed error-body read as is, never classified by status.
@@ -256,12 +255,12 @@ impl MetaExecutor {
             // Go publishes stream usage only through its buffer (no EnsurePublished).
             req.usage.usage_required();
             // Go observes `data:` lines: their response model, and usage once completed.
-            let lines = crate::kimi_http::capture_lines(lines(upstream.body, LINE_LIMIT), capture);
+            let lines = crate::helpers::capture_lines(lines(upstream.body, LINE_LIMIT), capture);
             let (tapped, usage) = defer_usage(lines, &req.usage, UsageRule::MetaResponses);
             ResponseBody::Stream(stream_events(
                 tapped,
                 crate::translate::stream(prepared.response, &ctx, &req),
-                crate::gemini_stream::ClaudeInputTokens::new(
+                crate::claude_input_tokens::ClaudeInputTokens::new(
                     req.source_format,
                     Format::Codex,
                     req.response_format,
@@ -662,7 +661,7 @@ fn collect_completed(
 fn stream_events(
     upstream: ExecStream,
     translator: Box<dyn StreamTranslator>,
-    claude: crate::gemini_stream::ClaudeInputTokens,
+    claude: crate::claude_input_tokens::ClaudeInputTokens,
     responses_client: bool,
     bridge: apply_patch_responses::State,
     usage: DeferredUsage,
@@ -672,7 +671,7 @@ fn stream_events(
         upstream: ExecStream,
         translator: Box<dyn StreamTranslator>,
         /// `TranslateStreamWithClaudeInputTokens`' estimate for a Claude client.
-        claude: crate::gemini_stream::ClaudeInputTokens,
+        claude: crate::claude_input_tokens::ClaudeInputTokens,
         bridge: apply_patch_responses::State,
         usage: DeferredUsage,
         capture: cpa_core::exec::CaptureSink,
@@ -747,7 +746,7 @@ fn stream_events(
                 return self.emit(line.to_vec());
             };
             if let Some(error) = stream_event_error(event) {
-                crate::kimi_http::capture_error(&self.capture, &error);
+                crate::helpers::capture_error(&self.capture, &error);
                 return self.fail(error);
             }
             let kind = gj::get(event, "type").bytes().into_owned();

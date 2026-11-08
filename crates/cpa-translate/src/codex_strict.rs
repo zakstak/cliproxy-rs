@@ -103,12 +103,6 @@ fn chat_response_format(v: &Res<'_>, out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// Gemini `service_tier`: `priority` and `fast` become `priority` (the converter);
-/// `standard` is the default.
-fn gemini_tier(v: &Res<'_>, _: &mut Vec<u8>) -> bool {
-    null(v) || string_in(v, &["priority", "fast", "standard"])
-}
-
 fn text_only(v: &Res<'_>) -> bool {
     null(v)
         || (v.is_array()
@@ -224,109 +218,6 @@ const CHAT_MESSAGE: &[(&str, Rule)] = &[
     ("refusal", Rule::DefaultOnly(empty)),
 ];
 
-/// Gemini `generateContent` request fields.
-const GEMINI: &[(&str, Rule)] = &[
-    ("model", Rule::Converted),
-    ("contents", Rule::Converted),
-    ("systemInstruction", Rule::Converted),
-    ("system_instruction", Rule::Converted),
-    ("tools", Rule::Converted),
-    ("toolConfig", Rule::Converted),
-    ("tool_config", Rule::Converted),
-    ("generationConfig", Rule::Converted),
-    ("generation_config", Rule::Converted),
-    ("service_tier", Rule::Values(gemini_tier)),
-];
-
-const GEMINI_GENERATION: &[(&str, Rule)] = &[
-    ("thinkingConfig", Rule::Converted),
-    ("thinking_config", Rule::Converted),
-    ("thinkingLevel", Rule::Converted),
-    ("thinking_level", Rule::Converted),
-    ("maxOutputTokens", Rule::Map("max_output_tokens")),
-    ("max_output_tokens", Rule::Map("max_output_tokens")),
-    ("temperature", Rule::Map("temperature")),
-    ("topP", Rule::Map("top_p")),
-    ("top_p", Rule::Map("top_p")),
-    ("candidateCount", Rule::DefaultOnly(one)),
-    ("candidate_count", Rule::DefaultOnly(one)),
-    ("stopSequences", Rule::DefaultOnly(empty)),
-    ("stop_sequences", Rule::DefaultOnly(empty)),
-    ("presencePenalty", Rule::DefaultOnly(zero)),
-    ("presence_penalty", Rule::DefaultOnly(zero)),
-    ("frequencyPenalty", Rule::DefaultOnly(zero)),
-    ("frequency_penalty", Rule::DefaultOnly(zero)),
-    ("responseLogprobs", Rule::DefaultOnly(falsy)),
-    ("response_logprobs", Rule::DefaultOnly(falsy)),
-    ("responseModalities", Rule::DefaultOnly(text_only)),
-    ("response_modalities", Rule::DefaultOnly(text_only)),
-    (
-        "responseMimeType",
-        Rule::DefaultOnly(|v| null(v) || v.s.eq_ignore_ascii_case(b"text/plain")),
-    ),
-    (
-        "response_mime_type",
-        Rule::DefaultOnly(|v| null(v) || v.s.eq_ignore_ascii_case(b"text/plain")),
-    ),
-];
-
-/// Gemini Interactions request fields the converter reads.
-const INTERACTIONS: &[(&str, Rule)] = &[
-    ("model", Rule::Converted),
-    ("input", Rule::Converted),
-    ("stream", Rule::Converted),
-    ("system_instruction", Rule::Converted),
-    ("systemInstruction", Rule::Converted),
-    ("tools", Rule::Converted),
-    ("tool_choice", Rule::Converted),
-    ("service_tier", Rule::Converted),
-    ("parallel_tool_calls", Rule::Converted),
-    ("store", Rule::DefaultOnly(falsy)),
-    ("metadata", Rule::Converted),
-    ("include", Rule::Converted),
-    ("truncation", Rule::Converted),
-    ("reasoning", Rule::Converted),
-    ("generation_config", Rule::Converted),
-    ("generationConfig", Rule::Converted),
-];
-
-const INTERACTIONS_GENERATION: &[(&str, Rule)] = &[
-    ("reasoning", Rule::Converted),
-    ("thinking_level", Rule::Converted),
-    ("thinkingLevel", Rule::Converted),
-    ("thinking_config", Rule::Converted),
-    ("thinkingConfig", Rule::Converted),
-    ("thinking_budget", Rule::Converted),
-    ("thinkingBudget", Rule::Converted),
-    ("thinking_summaries", Rule::Converted),
-    ("thinkingSummaries", Rule::Converted),
-    ("include_thoughts", Rule::Converted),
-    ("includeThoughts", Rule::Converted),
-    ("max_output_tokens", Rule::Converted),
-    ("maxOutputTokens", Rule::Converted),
-    ("max_tokens", Rule::Converted),
-    ("temperature", Rule::Converted),
-    ("top_p", Rule::Converted),
-    ("topP", Rule::Converted),
-    ("parallel_tool_calls", Rule::Converted),
-    ("parallelToolCalls", Rule::Converted),
-    ("response_format", Rule::DefaultOnly(null)),
-    ("responseFormat", Rule::DefaultOnly(null)),
-    ("text", Rule::Converted),
-    ("verbosity", Rule::Converted),
-    ("truncation", Rule::Converted),
-    ("tool_choice", Rule::Converted),
-    ("toolChoice", Rule::Converted),
-    ("service_tier", Rule::Converted),
-    ("serviceTier", Rule::Converted),
-    ("presence_penalty", Rule::DefaultOnly(zero)),
-    ("presencePenalty", Rule::DefaultOnly(zero)),
-    ("frequency_penalty", Rule::DefaultOnly(zero)),
-    ("frequencyPenalty", Rule::DefaultOnly(zero)),
-    ("stop_sequences", Rule::DefaultOnly(empty)),
-    ("stopSequences", Rule::DefaultOnly(empty)),
-];
-
 /// Checks `raw`, a `client` request, and adds its mapped controls to `out`, the
 /// converted Responses body.
 pub(crate) fn controls(client: Format, raw: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
@@ -345,18 +236,6 @@ pub(crate) fn controls(client: Format, raw: &[u8], out: &mut Vec<u8>) -> Result<
             apply(&root, CHAT, "", out)?;
             for message in root.get("messages").array() {
                 apply(&message, CHAT_MESSAGE, " in a message", out)?;
-            }
-        }
-        Format::Gemini => {
-            apply(&root, GEMINI, "", out)?;
-            for path in ["generationConfig", "generation_config"] {
-                apply(&root.get(path), GEMINI_GENERATION, &format!(" in `{path}`"), out)?;
-            }
-        }
-        Format::Interactions => {
-            apply(&root, INTERACTIONS, "", out)?;
-            for path in ["generation_config", "generationConfig"] {
-                apply(&root.get(path), INTERACTIONS_GENERATION, &format!(" in `{path}`"), out)?;
             }
         }
         _ => {}

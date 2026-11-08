@@ -1074,228 +1074,29 @@ pub fn sanitize_function_name(name: &[u8]) -> Vec<u8> {
     s
 }
 
-/// filepath.Ext: the suffix from the last dot of the final path element.
-pub(crate) fn file_ext(name: &[u8]) -> &[u8] {
-    for i in (0..name.len()).rev() {
-        match name[i] {
-            b'/' => break,
-            b'.' => return &name[i..],
-            _ => {}
-        }
-    }
-    b""
-}
-
-/// common.NormalizeOpenAIFileData: the MIME type and base64 payload of OpenAI file
-/// content, from a `data:` URL or (for raw base64) the filename's extension.
-pub fn normalize_openai_file_data(filename: &[u8], fallback: &[u8], data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    if data.is_empty() {
-        return None;
-    }
-    let mut fallback = fallback.to_vec();
-    if fallback.is_empty() {
-        let ext = file_ext(filename);
-        let ext = go_lower(ext.strip_prefix(b".").unwrap_or(ext));
-        fallback = crate::mime::mime_type(&ext).unwrap_or_default().as_bytes().to_vec();
-    }
-    if data.len() < 5 || !data[..5].eq_ignore_ascii_case(b"data:") {
-        return (!fallback.is_empty()).then(|| (fallback, data.to_vec()));
-    }
-    let rest = &data[5..];
-    let comma = rest.iter().position(|&c| c == b',')?;
-    let (metadata, payload) = (&rest[..comma], &rest[comma + 1..]);
-    if payload.is_empty() {
-        return None;
-    }
-    let mut fields = metadata.split(|&c| c == b';');
-    let mime = trim_space(fields.next().unwrap_or_default());
-    if mime.is_empty() {
-        return None;
-    }
-    use cpa_common::gostr::GoStr;
-    fields
-        .any(|f| String::from_utf8_lossy(trim_space(f)).go_eq_fold("base64"))
-        .then(|| (mime.to_vec(), payload.to_vec()))
-}
-
-/// strings.ToUpper (Go's simple case mapping; invalid bytes become U+FFFD once any rune
-/// is not ASCII).
-pub fn go_upper(s: &[u8]) -> Vec<u8> {
-    if s.is_ascii() {
-        return s.to_ascii_uppercase();
-    }
-    let mut out = Vec::with_capacity(s.len());
-    let mut buf = [0; 4];
-    for c in go_runes(s) {
-        out.extend_from_slice(cpa_common::gostr::to_upper_rune(c).encode_utf8(&mut buf).as_bytes());
-    }
-    out
-}
-
-/// util.SanitizedToolNameMap: sanitized name -> declared name for request tools (top-level
-/// `name`) whose names need sanitizing; the first declaration wins.
-pub fn sanitized_tool_name_map(raw: &[u8]) -> Option<HashMap<Vec<u8>, Vec<u8>>> {
-    if raw.is_empty() || !gj::valid(raw) {
-        return None;
-    }
-    let tools = gj::get(raw, "tools");
-    if !tools.is_array() {
-        return None;
-    }
-    let mut out = HashMap::new();
-    tools.each(|_, tool| {
-        let name = trim_space(&tool.get("name").bytes()).to_vec();
-        if !name.is_empty() {
-            let sanitized = sanitize_function_name(&name);
-            if sanitized != name {
-                out.entry(sanitized).or_insert(name);
-            }
-        }
-        true
-    });
-    (!out.is_empty()).then_some(out)
-}
-
-/// util.RestoreSanitizedToolName.
-pub fn restore_sanitized_tool_name(map: Option<&HashMap<Vec<u8>, Vec<u8>>>, name: &[u8]) -> Vec<u8> {
-    map.and_then(|m| m.get(name))
-        .filter(|_| !name.is_empty())
-        .cloned()
-        .unwrap_or_else(|| name.to_vec())
-}
-
-/// `time.Unix(secs, 0).Format(time.RFC3339Nano)` in UTC: `YYYY-MM-DDThh:mm:ssZ`.
-// ponytail: Go formats in the process's local zone; this assumes UTC, as Go runs in its
-// container image. Years beyond four digits print in full, as Go does.
-pub fn format_rfc3339_utc(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    // Howard Hinnant's civil_from_days (proleptic Gregorian, like Go).
-    let z = days as i128 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i128::from(month <= 2);
-    let year = if year < 0 {
-        format!("-{:04}", -year)
-    } else {
-        format!("{year:04}")
-    };
-    format!(
-        "{year}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
+pub(crate) fn go_base64(padded: bool) -> base64::engine::GeneralPurpose {
+    use base64::engine::{DecodePaddingMode, GeneralPurposeConfig};
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(padded)
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(if padded {
+                DecodePaddingMode::RequireCanonical
+            } else {
+                DecodePaddingMode::RequireNone
+            }),
     )
 }
 
-/// `time.Parse(time.RFC3339Nano, s).Unix()`: `YYYY-MM-DDThh:mm:ss[.frac]` with `Z` or
-/// `±hh:mm`. The hour may have one digit and the fraction may use a comma, as Go's general
-/// layout parser allows.
-pub fn parse_rfc3339_unix(s: &[u8]) -> Option<i64> {
-    fn num(s: &[u8], at: &mut usize, min: usize, max: usize) -> Option<i64> {
-        let start = *at;
-        while *at < s.len() && *at - start < max && s[*at].is_ascii_digit() {
-            *at += 1;
-        }
-        if *at - start < min {
-            return None;
-        }
-        std::str::from_utf8(&s[start..*at]).ok()?.parse().ok()
-    }
-    fn lit(s: &[u8], at: &mut usize, c: u8) -> Option<()> {
-        (s.get(*at) == Some(&c)).then(|| *at += 1)
-    }
-    let mut at = 0;
-    let year = num(s, &mut at, 4, 4)?;
-    lit(s, &mut at, b'-')?;
-    let month = num(s, &mut at, 2, 2)?;
-    lit(s, &mut at, b'-')?;
-    let day = num(s, &mut at, 2, 2)?;
-    lit(s, &mut at, b'T')?;
-    let hour = num(s, &mut at, 1, 2)?;
-    lit(s, &mut at, b':')?;
-    let min = num(s, &mut at, 2, 2)?;
-    lit(s, &mut at, b':')?;
-    let sec = num(s, &mut at, 2, 2)?;
-    if matches!(s.get(at), Some(b'.' | b',')) && s.get(at + 1).is_some_and(u8::is_ascii_digit) {
-        at += 1;
-        while s.get(at).is_some_and(u8::is_ascii_digit) {
-            at += 1;
-        }
-    }
-    let offset = match s.get(at) {
-        Some(b'Z') => {
-            at += 1;
-            0
-        }
-        Some(&sign @ (b'+' | b'-')) => {
-            at += 1;
-            let hh = num(s, &mut at, 2, 2)?;
-            lit(s, &mut at, b':')?;
-            let mm = num(s, &mut at, 2, 2)?;
-            // Go's fast path stops at 23; its general layout parser accepts 24.
-            if hh > 24 || mm > 59 {
-                return None;
-            }
-            let off = (hh * 60 + mm) * 60;
-            if sign == b'-' { -off } else { off }
-        }
-        _ => return None,
-    };
-    if at != s.len() || !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month as usize - 1];
-    if day < 1 || day > days_in {
-        return None;
-    }
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + min * 60 + sec - offset)
+pub(crate) fn go_base64_decode(input: &[u8], padded: bool) -> Option<Vec<u8>> {
+    let input: Vec<u8> = input.iter().copied().filter(|&c| c != b'\r' && c != b'\n').collect();
+    base64::Engine::decode(&go_base64(padded), input).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rfc3339_formats_like_go_in_utc() {
-        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(format_rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
-        assert_eq!(format_rfc3339_utc(-1), "1969-12-31T23:59:59Z");
-        assert_eq!(format_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(format_rfc3339_utc(253_402_300_800), "10000-01-01T00:00:00Z");
-        assert_eq!(format_rfc3339_utc(-62_167_219_201), "-0001-12-31T23:59:59Z");
-    }
-
-    #[test]
-    fn rfc3339_matches_go_unix_seconds() {
-        assert_eq!(parse_rfc3339_unix(b"1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            parse_rfc3339_unix(b"2025-01-01T00:00:00.123456789123Z"),
-            Some(1735689600)
-        );
-        assert_eq!(parse_rfc3339_unix(b"2024-02-29T23:59:59+01:30"), Some(1709245799));
-        assert_eq!(parse_rfc3339_unix(b"2025-01-01T00:00:00+24:00"), Some(1735603200));
-        assert_eq!(parse_rfc3339_unix(b"2025-01-01T00:00:00.Z"), None);
-        assert_eq!(parse_rfc3339_unix(b"0001-01-01T00:00:00Z"), Some(-62135596800));
-        assert_eq!(parse_rfc3339_unix(b"2023-02-29T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix(b"2025-01-01T1:02:03,5-00:00"), Some(1735693323));
-        assert_eq!(parse_rfc3339_unix(b"2025-01-01 00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix(b"2025-01-01T00:00:00"), None);
-    }
 
     #[test]
     fn is_http_url_follows_go_url_parse() {
@@ -1545,87 +1346,6 @@ impl UserTurnDrops {
             Some(t) => Err(crate::Error(format!("unsupported content part: {t}"))),
         }
     }
-}
-
-/// `UserRun`: consecutive user content a target merges into one user turn.
-#[derive(Default)]
-pub struct UserRun {
-    drops: UserTurnDrops,
-    sendable: usize,
-}
-
-impl UserRun {
-    pub fn add(&mut self) {
-        self.sendable += 1;
-    }
-
-    pub fn drop_part(&mut self, part_type: &str) {
-        self.drops.drop_part(part_type);
-    }
-
-    pub fn end(&mut self) {
-        self.drops.end_turn(self.sendable);
-        self.sendable = 0;
-    }
-
-    pub fn result(&self) -> Result<(), crate::Error> {
-        self.drops.result()
-    }
-}
-
-/// `IsInteractionsInstructionStep`: a developer or system step (or one inside such a
-/// wrapper, `inherited`) is sent as user content but is not the user's own turn.
-pub fn is_interactions_instruction_step(step: &Res<'_>, inherited: bool) -> bool {
-    let mut name = go_lower(trim_space(&step.get("role").bytes()));
-    if name.is_empty() {
-        name = go_lower(trim_space(&step.get("type").bytes()));
-    }
-    match name.as_slice() {
-        b"developer" | b"system" => true,
-        b"user" | b"assistant" | b"model" | b"model_output" | b"thought" => false,
-        _ => inherited,
-    }
-}
-
-/// `InteractionsAttachmentType`: the type reported when an Interactions attachment
-/// cannot be sent, or empty for text and parts that name nothing.
-pub fn interactions_attachment_type(part: &Res<'_>) -> String {
-    if !part.is_object() {
-        return String::new();
-    }
-    let kind = go_lower(trim_space(&part.get("type").bytes()));
-    if !kind.is_empty() {
-        return if kind == b"text" {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&kind).into_owned()
-        };
-    }
-    if part.get("inlineData").exists() || part.get("inline_data").exists() {
-        return "inlineData".into();
-    }
-    if part.get("fileData").exists() || part.get("file_data").exists() {
-        return "fileData".into();
-    }
-    String::new()
-}
-
-/// GeminiPartIsSendable: blank text is forwarded but gives the model nothing to read.
-pub fn gemini_part_is_sendable(part: &[u8]) -> bool {
-    let part = gj::parse(part);
-    let text = part.get("text");
-    !text.exists()
-        || !trim_space(&text.bytes()).is_empty()
-        || [
-            "functionCall",
-            "functionResponse",
-            "inlineData",
-            "inline_data",
-            "fileData",
-            "file_data",
-        ]
-        .iter()
-        .any(|key| part.get(key).exists())
 }
 
 /// `IsHTTPURL`: Go's `url.Parse` succeeds, the host is non-empty and the scheme is http(s).

@@ -78,54 +78,25 @@ macro_rules! registered {
     };
 }
 
-mod antigravity_chat;
-mod antigravity_claude;
-mod antigravity_claude_response;
-mod antigravity_gemini;
-mod antigravity_interactions;
-mod antigravity_responses;
 mod apply_patch;
 pub mod apply_patch_responses;
 mod claude_chat_request;
 mod claude_chat_response;
-mod claude_gemini;
-mod claude_interactions;
 mod claude_responses;
 mod claude_responses_response;
-mod claude_tool_args;
 mod codex_chat_request;
 mod codex_chat_response;
 mod codex_claude;
 mod codex_claude_response;
-mod codex_gemini;
-mod codex_interactions;
 mod codex_responses;
 mod codex_strict;
 mod common;
-mod gemini;
-mod gemini_chat_request;
-mod gemini_chat_response;
-mod gemini_claude;
-mod gemini_claude_response;
-mod gemini_interactions;
-mod gemini_interactions_response;
-mod gemini_responses;
-mod gemini_responses_response;
-mod gemini_web_search;
 pub mod hooks;
-mod interactions_claude;
-mod mime;
 mod openai;
 mod openai_claude;
 mod openai_claude_response;
-mod openai_gemini;
-mod openai_interactions;
-mod openai_interactions_response;
 mod openai_responses;
 mod openai_responses_response;
-mod replay_cache;
-mod responses_interactions;
-mod responses_interactions_response;
 mod responses_tools;
 pub mod sse;
 pub mod stream;
@@ -137,15 +108,6 @@ pub use codex_responses::{
     ResponsesClient as CodexResponsesClient, non_stream_with_bridge as codex_responses_non_stream_with_bridge,
     stream_with_bridge as codex_responses_stream_with_bridge,
 };
-/// translatorcommon.UserRun, for executors that refuse an emptied user turn (Devin).
-pub use common::UserRun;
-pub use replay_cache::set_signature_cache_config as set_antigravity_signature_cache_config;
-
-/// util.GeminiClaudeToolUseID: the Claude-facing provenance ID of a native Gemini call,
-/// which the Antigravity executor's replay ledger resolves back.
-pub fn gemini_claude_tool_use_id(call_id: &[u8], name: &[u8], args: &[u8]) -> Vec<u8> {
-    antigravity_claude_response::gemini_claude_tool_use_id(call_id, name, args)
-}
 
 /// util.SanitizedFunctionNameMap, for executors that key tool schemas like Go.
 pub fn sanitized_function_name_map(raw: &[u8]) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
@@ -155,12 +117,6 @@ pub fn sanitized_function_name_map(raw: &[u8]) -> std::collections::HashMap<Vec<
 /// util.MapSanitizedFunctionName.
 pub fn map_sanitized_function_name(map: &std::collections::HashMap<Vec<u8>, Vec<u8>>, name: &[u8]) -> Vec<u8> {
     responses_tools::map_sanitized_function_name(map, name)
-}
-
-/// StripInvalidGeminiSignatureThinkingBlocks (internal/translator/antigravity/claude):
-/// the Antigravity executor's cleanup of Claude requests for Gemini-family models.
-pub fn strip_invalid_gemini_signature_thinking_blocks(payload: &[u8]) -> Vec<u8> {
-    antigravity_claude::strip_invalid_gemini_signature_thinking_blocks(payload)
 }
 
 // Go's `...WithCompat` request converters, exported beside the registered pairs for
@@ -184,16 +140,6 @@ pub fn openai_to_claude_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result
 /// ConvertClaudeRequestToCodexWithCompat.
 pub fn claude_to_codex_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     deep_stack(levels(&[body]), || codex_claude::request_with_compat(ctx, body))
-}
-
-/// ConvertClaudeRequestToGeminiWithCompat.
-pub fn claude_to_gemini_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || gemini_claude::request_with_compat(ctx, body))
-}
-
-/// ConvertClaudeRequestToInteractionsWithCompat.
-pub fn claude_to_interactions_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || interactions_claude::request_with_compat(ctx, body))
 }
 
 /// ConvertClaudeRequestToOpenAIWithCompat.
@@ -316,31 +262,9 @@ fn registered(client: Format, upstream: Format) -> Option<&'static Registered> {
         (Format::OpenAIResponse, Format::Codex) => Some(&codex_responses::PAIR),
         (Format::OpenAIResponse, Format::Claude) => Some(&claude_responses_response::PAIR),
         (Format::Claude, Format::OpenAI) => Some(&openai_claude::PAIR),
-        (Format::Gemini, Format::Gemini) => Some(&gemini::PAIR),
-        (Format::OpenAI, Format::Gemini) => Some(&gemini_chat_request::PAIR),
-        (Format::Claude, Format::Gemini) => Some(&gemini_claude::PAIR),
         (Format::OpenAI, Format::Codex) => Some(&codex_chat_request::PAIR),
-        (Format::OpenAIResponse, Format::Gemini) => Some(&gemini_responses_response::PAIR),
         (Format::Claude, Format::Codex) => Some(&codex_claude::PAIR),
-        (Format::Gemini, Format::Codex) => Some(&codex_gemini::PAIR),
-        (Format::Interactions, Format::Codex) => Some(&codex_interactions::PAIR),
         (Format::OpenAIResponse, Format::OpenAI) => Some(&openai_responses_response::PAIR),
-        (Format::Gemini, Format::OpenAI) => Some(&openai_gemini::PAIR),
-        (Format::Interactions, Format::Interactions) => Some(&gemini_interactions::PASSTHROUGH),
-        (Format::Interactions, Format::Gemini) => Some(&gemini_interactions::INTERACTIONS_TO_GEMINI),
-        (Format::Gemini, Format::Interactions) => Some(&gemini_interactions::GEMINI_TO_INTERACTIONS),
-        (Format::OpenAI, Format::Interactions) => Some(&openai_interactions::OPENAI_TO_INTERACTIONS),
-        (Format::Interactions, Format::OpenAI) => Some(&openai_interactions::INTERACTIONS_TO_OPENAI),
-        (Format::OpenAIResponse, Format::Interactions) => Some(&responses_interactions::RESPONSES_TO_INTERACTIONS),
-        (Format::Interactions, Format::OpenAIResponse) => Some(&responses_interactions::INTERACTIONS_TO_RESPONSES),
-        (Format::Interactions, Format::Claude) => Some(&claude_interactions::PAIR),
-        (Format::Claude, Format::Interactions) => Some(&interactions_claude::PAIR),
-        (Format::Gemini, Format::Claude) => Some(&claude_gemini::PAIR),
-        (Format::Gemini, Format::Antigravity) => Some(&antigravity_gemini::PAIR),
-        (Format::OpenAI, Format::Antigravity) => Some(&antigravity_chat::PAIR),
-        (Format::OpenAIResponse, Format::Antigravity) => Some(&antigravity_responses::PAIR),
-        (Format::Interactions, Format::Antigravity) => Some(&antigravity_interactions::PAIR),
-        (Format::Claude, Format::Antigravity) => Some(&antigravity_claude::PAIR),
         _ => None,
     }
 }
@@ -426,8 +350,6 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
     let convert: RequestFn = match client {
         Format::Claude => codex_claude::codex_strict,
         Format::OpenAI => codex_chat_request::codex_strict,
-        Format::Gemini => codex_gemini::codex_strict,
-        Format::Interactions => codex_interactions::codex_strict,
         _ => return None,
     };
     let upstream = Format::Codex;
@@ -536,37 +458,6 @@ fn translate_fallback(from: &str, to: &str, ctx: &RequestCtx<'_>, body: &[u8]) -
         body: out,
         configuration_updates_changed: changed,
     }
-}
-
-/// sdk/translator TranslateRequestEnvelope: [`translate_request`] with the request-scoped
-/// model info Go's executors put in the envelope (`ResolvedModelInfo` of the selected
-/// credential). Only pairs Go registers with RegisterRequestEnvelope read it: OpenAI
-/// Responses -> Antigravity, whose native web-search capability decides between a
-/// dedicated web-search request and a normal one.
-pub fn translate_request_envelope(
-    client: Format,
-    upstream: Format,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-    model_info: Option<&cpa_core::registry::ModelInfo>,
-) -> Result<Vec<u8>, Error> {
-    translate_request_envelope_tracked(client, upstream, ctx, body, model_info).map(|t| t.body)
-}
-
-/// [`translate_request_envelope`] with [`Translated::configuration_updates_changed`].
-pub fn translate_request_envelope_tracked(
-    client: Format,
-    upstream: Format,
-    ctx: &RequestCtx<'_>,
-    body: &[u8],
-    model_info: Option<&cpa_core::registry::ModelInfo>,
-) -> Result<Translated, Error> {
-    if (client, upstream) != (Format::OpenAIResponse, Format::Antigravity) {
-        return translate_request_tracked(client, upstream, ctx, body);
-    }
-    translate_registered(client, upstream, ctx, body, |body| {
-        antigravity_responses::request_envelope(ctx, body, model_info)
-    })
 }
 
 /// The pair's Go-shaped stream translator with the plugin response hooks around it, for

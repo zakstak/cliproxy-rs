@@ -1,6 +1,6 @@
 //! Plugin translator hooks (sdk/translator plugin_hooks.go and the hook branches of
-//! registry.go). The registry entry points call them: [`crate::translate_request`],
-//! [`crate::translate_request_envelope`], and every registered pair's `non_stream` and
+//! registry.go). The registry entry points call them: [`crate::translate_request`] and
+//! every registered pair's `non_stream` and
 //! `stream` (so executors that hold a [`crate::Pair`] get them too). Executors that pass
 //! a response through without a registered pair use [`unregistered_non_stream`] and
 //! [`wrap_stream`], as Go's `TranslateNonStream` and `TranslateStream` run the hooks for

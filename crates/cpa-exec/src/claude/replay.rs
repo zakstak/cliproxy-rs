@@ -688,7 +688,7 @@ mod tests {
                 .iter()
                 .filter_map(|c| super::super::kv_test::as_go_call(c))
                 .map(|call| {
-                    serde_json::from_str(&crate::kimi_replay::tests::normalize_generations(&call.to_string())).unwrap()
+                    serde_json::from_str(&super::super::kv_test::normalize_generations(&call.to_string())).unwrap()
                 })
                 .collect();
             let new = all[seen..].to_vec();

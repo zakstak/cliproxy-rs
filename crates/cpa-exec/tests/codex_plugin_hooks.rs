@@ -300,12 +300,12 @@ async fn count_tokens_reads_the_unnormalized_body_and_is_marked_local() {
 /// `plugin_call` to its own number, so the body sent upstream shows which translation
 /// ran last. Go translates the original request before the working one, so the working
 /// body carries the higher number: the Meta executor translates both even when they are
-/// equal, and the Gemini executor's pair translates distinct payloads once each.
+/// equal.
 #[tokio::test]
 async fn executors_translate_the_original_request_before_the_working_one() {
     let claude = r#"{"model":"opaque-route","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
     let changed = r#"{"model":"opaque-route","max_tokens":64,"messages":[{"role":"user","content":"changed"}]}"#;
-    for (provider, original) in [("meta", claude), ("gemini", changed)] {
+    for (provider, original) in [("meta", claude), ("meta", changed)] {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let fake = Arc::new(Fake {
@@ -321,18 +321,9 @@ async fn executors_translate_the_original_request_before_the_working_one() {
         let req = request(Format::Claude, "opaque-route", claude, original, true);
         let credential = provider_credential(provider, &url);
         // Only the upstream request matters; the reply need not suit the provider.
-        let _ = match provider {
-            "meta" => {
-                cpa_exec::meta::MetaExecutor::with_client(wreq::Client::new())
-                    .execute(&credential, req, &Config::default())
-                    .await
-            }
-            _ => {
-                cpa_exec::gemini::GeminiExecutor::with_client(wreq::Client::new())
-                    .execute(&credential, req, &Config::default())
-                    .await
-            }
-        };
+        let _ = cpa_exec::meta::MetaExecutor::with_client(wreq::Client::new())
+            .execute(&credential, req, &Config::default())
+            .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "{provider}");
         let body = bodies.lock().unwrap().pop().expect("one upstream request");
         let body: Value = serde_json::from_slice(&body).unwrap();

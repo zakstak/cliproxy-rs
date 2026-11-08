@@ -1,6 +1,5 @@
-//! The Codex translated route (#27): a Claude Messages, Chat Completions, Gemini or
-//! Interactions request served by a Codex credential on a `chatgpt`, `api-key` or
-//! `compatible` profile (`docs/codex/CONTRACT.md` "Translated route").
+//! The Codex translated route (#27): a Claude Messages or Chat Completions request
+//! served by a Codex credential on a `chatgpt`, `api-key` or `compatible` profile (`docs/codex/CONTRACT.md` "Translated route").
 //!
 //! The request is converted into a Responses body by the built-in translator of its
 //! pair, and nothing else edits it. No plugin request normalizer or plugin translator
@@ -18,7 +17,7 @@
 use super::*;
 
 /// The source formats the route converts. Each has a registered built-in pair to Codex.
-const SOURCES: [Format; 4] = [Format::Claude, Format::OpenAI, Format::Gemini, Format::Interactions];
+const SOURCES: [Format; 2] = [Format::Claude, Format::OpenAI];
 
 /// Whether the executor serves `req` on the translated route: a generation from one of
 /// [`SOURCES`] on a native profile. A request whose server hooks read unframed stream

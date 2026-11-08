@@ -8,7 +8,7 @@ use cpa_core::format::Format;
 use cpa_translate::{Pair, RequestCtx, ResponseCtx, StreamTranslator};
 use futures_util::StreamExt;
 
-use crate::openai_compat_payload::ensure_responses_usage_details;
+use crate::openai_payload::ensure_responses_usage_details;
 
 /// Choose the output boundary once, before the stream and its interceptors run.
 pub(crate) fn stream(pair: &Pair, ctx: &ResponseCtx<'_>, req: &ExecRequest) -> Box<dyn StreamTranslator> {
@@ -71,7 +71,6 @@ pub(crate) fn original(
     let limits: &[&str] = match req.source_format {
         Format::OpenAI => &["max_tokens", "max_completion_tokens"],
         Format::OpenAIResponse => &["max_output_tokens"],
-        Format::Gemini => &["generationConfig.maxOutputTokens"],
         _ => return Ok(original),
     };
     if original.is_empty()

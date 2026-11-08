@@ -21,7 +21,7 @@ use http::HeaderMap;
 use crate::codex::CodexExecutor;
 use crate::codex_request::{self as request, View};
 use crate::meta_wire::{check_valid, fold, kind_name};
-use crate::openai_compat_multipart::{MediaType, parse_media_type};
+use crate::multipart::{MediaType, parse_media_type};
 use crate::proxy::{self, GoHeaders, Route, Upstream, canonical_header};
 
 /// `upstreamCallURL`.
@@ -1396,7 +1396,7 @@ mod form {
                 };
                 slot.get_or_insert_with(|| String::from_utf8_lossy(&value).into_owned());
             }
-            let name = match disposition.map(|d| crate::openai_compat_multipart::parse_media_type(&d)) {
+            let name = match disposition.map(|d| crate::multipart::parse_media_type(&d)) {
                 Some(MediaType::Ok(kind, params)) if kind == "form-data" => {
                     params.get("name").cloned().unwrap_or_default()
                 }

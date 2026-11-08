@@ -11,24 +11,15 @@
 //!
 //! [`Readiness`] separates the two reasons Go prepares a credential. Requests block only
 //! on [`Readiness::PrepareNow`] (Go `RequestAuthPreparer`: Claude identity, Meta API-key
-//! mint, Antigravity project ID; also an Antigravity token inside five minutes of
-//! expiry, which Go's executor refreshes inline). Token refresh is
+//! mint). Token refresh is
 //! [`Readiness::RefreshSoon`]: the
 //! background loop refreshes inside the provider's refresh lead while requests keep
 //! using the current token, and an upstream 401 triggers one refresh-and-retry (Go
 //! `tryRefreshAfterUnauthorized`). An already expired token is still `RefreshSoon`:
 //! Go sends it and recovers on 401.
 
-pub mod aistudio;
-pub mod antigravity;
-pub mod antigravity_auth;
-mod antigravity_compaction;
-pub mod antigravity_credits;
-mod antigravity_models;
-mod antigravity_replay;
-mod antigravity_request;
-pub mod antigravity_version;
 pub mod claude;
+mod claude_input_tokens;
 pub mod claude_login;
 pub mod codex;
 mod codex_capture;
@@ -52,36 +43,22 @@ mod codex_testkit;
 mod codex_tls;
 mod codex_tokens;
 mod codex_ws;
-pub mod devin;
-pub mod devin_auth;
-pub mod devin_models;
-mod devin_payload;
-mod devin_request;
-mod devin_wire;
-pub mod gemini;
-mod gemini_payload;
-mod gemini_stream;
-mod home_replay;
-pub mod kimi;
-pub mod kimi_auth;
+mod compaction_capsule;
 #[cfg(test)]
-mod kimi_fixture;
-mod kimi_http;
-mod kimi_replay;
+mod device_fixture;
+mod go_std;
+mod helpers;
+mod home_replay;
+mod login;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
 mod meta_wire;
+pub mod multipart;
 pub mod oauth;
-pub mod openai_compat;
-mod openai_compat_go;
-mod openai_compat_http;
-pub mod openai_compat_multipart;
-mod openai_compat_payload;
-#[cfg(test)]
-mod openai_compat_usage;
+mod openai_http;
+mod openai_payload;
 mod payload_barrier;
-mod payload_media;
 pub mod proxy;
 mod quota;
 mod rawjson;
@@ -93,13 +70,11 @@ mod tokenizer;
 mod tokens;
 mod translate;
 mod upstream;
-pub mod vertex;
-pub mod vertex_auth;
-mod vertex_openapi;
+#[cfg(test)]
+mod usage_testkit;
 mod wire;
 mod ws_cause;
 mod ws_observation;
-pub mod wsrelay;
 pub mod xai;
 pub mod xai_auth;
 mod xai_replay;
@@ -114,10 +89,10 @@ use cpa_core::exec::{ExecError, ExecRequest, ExecResponse, ExecSession, FailureS
 
 /// Go `Auth.ExpirationTime`, `authLastRefreshTimestamp` and `authPreferredInterval`, for
 /// the server's plugin refresh schedule (Go `shouldRefresh` for providers without a lead).
-pub use kimi_http::{expiration, last_refresh, preferred_interval};
+pub use helpers::{expiration, last_refresh, preferred_interval};
 /// Go `helps.EnsureResponsesUsageDetails`, for paths outside the executors (plugin
 /// executors' Responses payloads and stream chunks).
-pub use openai_compat_payload::ensure_responses_usage_details;
+pub use openai_payload::ensure_responses_usage_details;
 pub use xai_ws::websockets_enabled;
 
 /// What a credential needs before or around use. See the module docs.
@@ -134,42 +109,15 @@ pub enum Readiness {
 pub struct Executors {
     pub claude: claude::ClaudeExecutor,
     pub codex: codex::CodexExecutor,
-    /// Device-login providers (Kimi, Meta, Devin). `Default` builds production clients.
-    pub devices: DeviceExecutors,
-    /// API-key upstreams speaking OpenAI wire formats (OpenAI-compatible providers, xAI).
-    pub openai: OpenAIExecutors,
-    /// Google-family providers (Gemini API keys, native Interactions keys).
-    pub google: GoogleExecutors,
-}
-
-/// Google-family executors, grouped like [`DeviceExecutors`].
-#[derive(Default)]
-pub struct GoogleExecutors {
-    /// `gemini` and `gemini-interactions` API keys.
-    pub gemini: gemini::GeminiExecutor,
-    /// `vertex` service accounts and API keys.
-    pub vertex: vertex::VertexExecutor,
-    /// `aistudio` sessions on the `/v1/ws` relay, which the server route shares.
-    pub aistudio: aistudio::AiStudioExecutor,
-    /// `antigravity` OAuth credentials.
-    pub antigravity: antigravity::AntigravityExecutor,
-}
-
-/// OpenAI-wire executors, grouped like [`DeviceExecutors`].
-#[derive(Default)]
-pub struct OpenAIExecutors {
-    pub compat: openai_compat::OpenAICompatExecutor,
+    /// Meta Muse device logins and API keys.
+    pub meta: meta::MetaExecutor,
+    /// Grok (xAI) OAuth logins and API keys.
     pub xai: xai::XaiExecutor,
 }
 
-/// Executors for the device-login providers, grouped so adding one does not touch every
-/// [`Executors`] construction site.
-#[derive(Default)]
-pub struct DeviceExecutors {
-    pub kimi: kimi::KimiExecutor,
-    pub meta: meta::MetaExecutor,
-    pub devin: devin::DevinExecutor,
-}
+/// The built-in upstream providers. Every other provider name has no executor: its
+/// credentials never enter selection.
+pub const PROVIDERS: [&str; 4] = ["claude", "codex", meta::PROVIDER, xai::PROVIDER];
 
 impl Executors {
     pub async fn execute(
@@ -181,15 +129,8 @@ impl Executors {
         match credential.provider.as_str() {
             "claude" => self.claude.execute(credential, req, cfg).await,
             "codex" => self.codex.execute(credential, req, cfg).await,
-            p if kimi::PROVIDERS.contains(&p) => self.devices.kimi.execute(&self.claude, credential, req, cfg).await,
-            meta::PROVIDER => self.devices.meta.execute(credential, req, cfg).await,
-            devin::PROVIDER => self.devices.devin.execute(credential, req, cfg).await,
-            p if openai_compat::handles(p) => self.openai.compat.execute(credential, req, cfg).await,
-            p if gemini::handles(p) => self.google.gemini.execute(credential, req, cfg).await,
-            p if vertex::handles(p) => self.google.vertex.execute(credential, req, cfg).await,
-            p if aistudio::handles(p) => self.google.aistudio.execute(credential, req, cfg).await,
-            antigravity::PROVIDER => self.google.antigravity.execute(credential, req, cfg).await,
-            xai::PROVIDER => self.openai.xai.execute(credential, req, cfg, false).await,
+            meta::PROVIDER => self.meta.execute(credential, req, cfg).await,
+            xai::PROVIDER => self.xai.execute(credential, req, cfg, false).await,
             other => Err(no_executor(other)),
         }
     }
@@ -206,8 +147,7 @@ impl Executors {
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
             "codex" => self.codex.images(credential, req, request_path, cfg).await,
-            p if openai_compat::handles(p) => self.openai.compat.images(credential, req, request_path, cfg).await,
-            xai::PROVIDER => self.openai.xai.images(credential, req, request_path, cfg).await,
+            xai::PROVIDER => self.xai.images(credential, req, request_path, cfg).await,
             other => Err(no_executor(other)),
         }
     }
@@ -223,7 +163,7 @@ impl Executors {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.videos(credential, req, request_path, cfg).await,
+            xai::PROVIDER => self.xai.videos(credential, req, request_path, cfg).await,
             other => Err(no_executor(other)),
         }
     }
@@ -237,7 +177,7 @@ impl Executors {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
-            xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
+            xai::PROVIDER => self.xai.speech(credential, req, cfg).await,
             other => Err(no_executor(other)),
         }
     }
@@ -255,7 +195,7 @@ impl Executors {
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
             "codex" => self.codex.execute_in_session(credential, req, cfg, session).await,
-            xai::PROVIDER => self.openai.xai.execute_in_session(credential, req, cfg, session).await,
+            xai::PROVIDER => self.xai.execute_in_session(credential, req, cfg, session).await,
             _ if session.continuation => Err(ExecError::replay_required()),
             _ => self.execute(credential, req, cfg).await,
         }
@@ -275,7 +215,7 @@ impl Executors {
     /// when no executor holds one.
     pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
         let codex = self.codex.session_closed(id);
-        let xai = self.openai.xai.session_closed(id);
+        let xai = self.xai.session_closed(id);
         async move {
             tokio::select! {
                 error = codex => error,
@@ -287,7 +227,7 @@ impl Executors {
     /// Releases everything executors hold for session `id`.
     pub fn close_session(&self, id: &str) {
         self.codex.close_session(id);
-        self.openai.xai.close_session(id);
+        self.xai.close_session(id);
     }
 
     /// Go `CloseCodexWebsocketSessionsForAuthID` and `CloseXAIWebsocketSessionsForAuthID`
@@ -295,7 +235,7 @@ impl Executors {
     /// WebSocket sessions that credential serves.
     pub fn credential_session_closer(&self) -> impl Fn(&str) + Send + Sync + 'static {
         let codex = self.codex.ws.clone();
-        let xai = self.openai.xai.ws.clone();
+        let xai = self.xai.ws.clone();
         move |id| {
             codex.close_credential(id);
             xai.close_credential(id);
@@ -305,15 +245,7 @@ impl Executors {
     /// Whether an executor serves this provider. Credentials of other providers never
     /// enter selection (Go skips auths whose executor is not registered).
     pub fn supports(&self, provider: &str) -> bool {
-        matches!(
-            provider,
-            "claude" | "codex" | meta::PROVIDER | xai::PROVIDER | devin::PROVIDER
-        ) || kimi::PROVIDERS.contains(&provider)
-            || openai_compat::handles(provider)
-            || gemini::handles(provider)
-            || vertex::handles(provider)
-            || aistudio::handles(provider)
-            || antigravity::handles(provider)
+        PROVIDERS.contains(&provider)
     }
 
     /// Go `authHasRefreshCredential`: whether an upstream 401 on `credential` should be
@@ -345,8 +277,7 @@ impl Executors {
         }
         match credential.provider.as_str() {
             "claude" if oauth::needs_identity(credential) => Readiness::PrepareNow,
-            meta::PROVIDER if self.devices.meta.must_mint(credential) => Readiness::PrepareNow,
-            antigravity::PROVIDER if self.google.antigravity.must_prepare(credential) => Readiness::PrepareNow,
+            meta::PROVIDER if self.meta.must_mint(credential) => Readiness::PrepareNow,
             _ => Readiness::RefreshSoon,
         }
     }
@@ -365,11 +296,8 @@ impl Executors {
         match credential.provider.as_str() {
             "claude" => self.claude.needs_prepare_at(credential, cfg, now),
             "codex" => self.codex.needs_prepare_at(credential, cfg, now),
-            p if kimi::PROVIDERS.contains(&p) => self.devices.kimi.needs_prepare_at(credential, cfg, now),
-            meta::PROVIDER => self.devices.meta.needs_prepare_at(credential, cfg, now),
-            xai::PROVIDER => self.openai.xai.needs_prepare_at(credential, cfg, now),
-            devin::PROVIDER => self.devices.devin.needs_prepare_at(credential, cfg, now),
-            antigravity::PROVIDER => self.google.antigravity.needs_prepare_at(credential, cfg, now),
+            meta::PROVIDER => self.meta.needs_prepare_at(credential, cfg, now),
+            xai::PROVIDER => self.xai.needs_prepare_at(credential, cfg, now),
             _ => false,
         }
     }
@@ -404,16 +332,10 @@ impl Executors {
         Some(hi)
     }
 
-    /// The runtime registered models for `credentials` (Go `registerModelsForAuth`):
-    /// providers that probe capabilities after registration start here. Must not block.
-    pub fn models_registered(&self, credentials: &[std::sync::Arc<Credential>], cfg: &Config) {
-        self.google.antigravity.models_registered(credentials, cfg);
-    }
-
     /// [`Self::prepare`] for a credential whose access token an upstream rejected, or a
     /// management refresh: Codex refreshes even when not due (Go marks the token rejected
     /// or forces the refresh). Other providers prepare as usual; most of them (Claude
-    /// once its identity is known, Kimi, Meta, Devin) refresh whenever asked.
+    /// once its identity is known, Meta) refresh whenever asked.
     pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
         match credential.provider.as_str() {
             "codex" => self.codex.refresh_now(credential, cfg).await,
@@ -435,11 +357,8 @@ impl Executors {
         match credential.provider.as_str() {
             "claude" => self.claude.prepare(credential, cfg).await,
             "codex" => self.codex.prepare(credential, cfg).await,
-            p if kimi::PROVIDERS.contains(&p) => self.devices.kimi.prepare(credential, cfg).await,
-            meta::PROVIDER => self.devices.meta.prepare(credential, cfg).await,
-            xai::PROVIDER => self.openai.xai.prepare(credential, cfg).await,
-            devin::PROVIDER => self.devices.devin.prepare(credential, cfg).await,
-            antigravity::PROVIDER => self.google.antigravity.prepare(credential, cfg).await,
+            meta::PROVIDER => self.meta.prepare(credential, cfg).await,
+            xai::PROVIDER => self.xai.prepare(credential, cfg).await,
             other => Err(no_executor(other)),
         }
     }
@@ -481,9 +400,8 @@ mod readiness_tests {
         let executors = Executors {
             claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let cfg = Config::default();
         let pool = serde_json::json!(["a".repeat(64)]);
@@ -514,84 +432,6 @@ mod readiness_tests {
                 credential(serde_json::json!({"type": "claude", "access_token": "sk-ant-api03-fake"})),
                 Readiness::Ready,
             ),
-            (
-                credential(serde_json::json!({
-                    "type": "kimi",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(-chrono::Duration::hours(1)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            // Antigravity: requests wait for the project ID and for a token valid five
-            // more minutes (Go's inline refresh); otherwise the token refreshes 30
-            // minutes ahead in the background.
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::hours(5)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(20)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(6)),
-                })),
-                Readiness::RefreshSoon,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(4)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(40)),
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                })),
-                Readiness::PrepareNow,
-            ),
-            (
-                credential(serde_json::json!({
-                    "type": "antigravity",
-                    "project_id": "proj-1",
-                    "access_token": "fake-access",
-                    "refresh_token": "fake-refresh",
-                    "expired": rfc3339(chrono::Duration::minutes(40)),
-                })),
-                Readiness::Ready,
-            ),
         ];
         for (i, (c, expected)) in cases.iter().enumerate() {
             assert_eq!(executors.readiness(c, &cfg), *expected, "case {i}");
@@ -599,16 +439,15 @@ mod readiness_tests {
     }
 
     /// The refresh loop sleeps until `prepare_due`: each provider's own lead before
-    /// expiry (Claude 4 h, Kimi 5 min), to the second, `now` once due, and nothing past
+    /// expiry (Claude 4 h), to the second, `now` once due, and nothing past
     /// the horizon.
     #[test]
     fn prepare_due_finds_each_providers_deadline() {
         let executors = Executors {
             claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            devices: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let cfg = Config::default();
         let now = chrono::Utc::now();
@@ -628,8 +467,6 @@ mod readiness_tests {
         let offset = chrono::Duration::seconds(1337);
         let claude = with_expiry("claude", now + chrono::Duration::hours(4) + offset);
         near(executors.prepare_due(&claude, &cfg, now, horizon), now + offset);
-        let kimi = with_expiry("kimi", now + chrono::Duration::minutes(5) + offset);
-        near(executors.prepare_due(&kimi, &cfg, now, horizon), now + offset);
         let due = with_expiry("claude", now - chrono::Duration::hours(1));
         assert_eq!(executors.prepare_due(&due, &cfg, now, horizon), Some(now));
         let later = with_expiry("claude", now + chrono::Duration::hours(6));
@@ -644,13 +481,12 @@ mod readiness_tests {
         let executors = Executors {
             claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
-            openai: Default::default(),
-            google: Default::default(),
-            devices: Default::default(),
+            meta: Default::default(),
+            xai: Default::default(),
         };
         let has = |m: serde_json::Value| executors.has_refresh_credential(&credential(m));
         assert!(has(serde_json::json!({"type": "claude", "refresh_token": "fake"})));
-        assert!(has(serde_json::json!({"type": "kimi", "refreshToken": "fake"})));
+        assert!(has(serde_json::json!({"type": "xai", "refreshToken": "fake"})));
         assert!(!has(serde_json::json!({"type": "claude", "refresh_token": "  "})));
         // A Sign in with ChatGPT partition needs its refresh token and client ID.
         assert!(has(

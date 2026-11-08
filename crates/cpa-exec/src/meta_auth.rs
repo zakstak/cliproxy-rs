@@ -18,8 +18,8 @@ use futures_util::future::{BoxFuture, Shared};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::kimi_auth::{form, open_browser, write_private};
-use crate::kimi_http::rfc3339_utc;
+use crate::login::{form, open_browser, write_private};
+use crate::helpers::rfc3339_utc;
 use crate::meta_wire::{Slot, check_valid, unmarshal};
 use crate::proxy::{GoHeaders, MAX_ERROR_BODY, read_all, send};
 
@@ -994,7 +994,7 @@ mod tests {
         assert_eq!(metadata["email"], GoValue::String("new@x".into()));
         // Other providers keep the key material.
         let mut other = GoMap::new();
-        merge_existing(&mut other, &existing, "kimi");
+        merge_existing(&mut other, &existing, "xai");
         assert!(other.contains_key("api-key") && other.contains_key("dca_token"));
     }
 }

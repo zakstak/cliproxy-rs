@@ -1321,18 +1321,7 @@ pub fn derive_id(format: Format, payload: &[u8], caller_scope: &str) -> String {
         },
         None => return String::new(),
     };
-    let resource = if matches!(format, Format::Gemini | Format::Antigravity) {
-        let request = match body.get("request") {
-            Some(GoValue::Object(request)) => request,
-            _ => &body,
-        };
-        string_field(request, &["cachedContent", "cached_content"])
-    } else {
-        String::new()
-    };
     let (instructions, user) = match format {
-        Format::Gemini | Format::Antigravity => gemini_root(&body),
-        Format::Interactions => interactions_root(&body),
         Format::OpenAIResponse | Format::Codex => responses_root(&body),
         Format::Claude => messages_root(&body, true),
         Format::OpenAI => messages_root(&body, false),
@@ -1372,10 +1361,6 @@ pub fn derive_id(format: Format, payload: &[u8], caller_scope: &str) -> String {
         out.push(b'}');
     }
     out.push(b']');
-    if !resource.is_empty() {
-        out.extend_from_slice(b",\"resource\":");
-        string(&mut out, &resource);
-    }
     out.push(b'}');
     format!("ctx:v1:{}", hex(&Sha256::digest(&out)))
 }
@@ -1404,16 +1389,6 @@ fn string_field(object: &Object, keys: &[&str]) -> String {
     match first_field(object, keys) {
         Some(GoValue::String(s)) => s.trim().to_owned(),
         _ => String::new(),
-    }
-}
-
-fn content_value(value: &GoValue) -> &GoValue {
-    match value {
-        GoValue::Object(object) => ["content", "parts", "text"]
-            .iter()
-            .find_map(|k| object.get(*k))
-            .unwrap_or(value),
-        other => other,
     }
 }
 
@@ -1599,94 +1574,6 @@ fn responses_root(body: &Object) -> Root {
             (instructions, Vec::new())
         }
     }
-}
-
-fn gemini_root(body: &Object) -> Root {
-    let body = match body.get("request") {
-        Some(GoValue::Object(request)) => request,
-        _ => body,
-    };
-    let mut instructions = Vec::new();
-    if let Some(value) = first_field(body, &["systemInstruction", "system_instruction"]) {
-        append_instruction(&mut instructions, content_value(value));
-    }
-    for content in array(body.get("contents")) {
-        let GoValue::Object(object) = content else {
-            continue;
-        };
-        if lower(object.get("role")) != "user" {
-            continue;
-        }
-        let user = parts(content_value(content));
-        if !user.is_empty() {
-            return (instructions, user);
-        }
-    }
-    (instructions, Vec::new())
-}
-
-fn interactions_root(body: &Object) -> Root {
-    let mut instructions = Vec::new();
-    if let Some(value) = first_field(body, &["system_instruction", "systemInstruction"]) {
-        append_instruction(&mut instructions, content_value(value));
-    }
-    let Some(input) = body.get("input") else {
-        return (instructions, Vec::new());
-    };
-    if let GoValue::String(_) = input {
-        return (instructions, parts(input));
-    }
-    for entry in flatten_interaction_entries(input) {
-        let step = match &entry {
-            GoValue::String(_) => return (instructions, parts(&entry)),
-            GoValue::Object(step) => step,
-            _ => continue,
-        };
-        let role = lower(step.get("role"));
-        let kind = lower(step.get("type"));
-        if matches!(role.as_str(), "system" | "developer")
-            || matches!(kind.as_str(), "system_instruction" | "developer_instruction")
-        {
-            append_instruction(&mut instructions, content_value(&entry));
-            continue;
-        }
-        if role == "user" || kind == "user_input" || (matches!(kind.as_str(), "message" | "") && role.is_empty()) {
-            return (instructions, parts(content_value(&entry)));
-        }
-    }
-    (instructions, Vec::new())
-}
-
-/// Go `flattenInteractionEntries`: steps flattened depth-first, inheriting the role.
-fn flatten_interaction_entries(value: &GoValue) -> Vec<GoValue> {
-    fn walk(value: &GoValue, inherited: &str, out: &mut Vec<GoValue>) {
-        match value {
-            GoValue::Array(items) => items.iter().for_each(|item| walk(item, inherited, out)),
-            GoValue::Object(object) => {
-                let own = lower(object.get("role"));
-                let role = if own.is_empty() {
-                    inherited.to_owned()
-                } else {
-                    own.clone()
-                };
-                if let Some(GoValue::Array(steps)) = object.get("steps") {
-                    steps.iter().for_each(|step| walk(step, &role, out));
-                    return;
-                }
-                if !role.is_empty() && own.is_empty() {
-                    let mut cloned = object.clone();
-                    cloned.insert("role".into(), GoValue::String(role));
-                    out.push(GoValue::Object(cloned));
-                } else {
-                    out.push(value.clone());
-                }
-            }
-            other => out.push(other.clone()),
-        }
-    }
-    let mut out = Vec::new();
-    walk(value, "", &mut out);
-    out
 }
 
 /// Go `extractMessageHashIDs`: an FNV-64a hash of the system prompt and first user

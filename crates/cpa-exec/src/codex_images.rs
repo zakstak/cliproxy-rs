@@ -26,8 +26,8 @@ use crate::codex_capture::Wire;
 use crate::codex_json::{delete, set_bool_if_different, set_raw, set_str, set_str_if_different};
 use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response::{self as response, OutputItems};
-use crate::openai_compat::{plain_err, prepare_images_payload, status_err};
-use crate::openai_compat_multipart::{self as multipart, Form, MediaType, Part};
+use crate::multipart::{self as multipart, Form, MediaType, Part};
+use crate::openai_http::{plain_err, status_err};
 
 const GENERATIONS: &str = "/v1/images/generations";
 const EDITS: &str = "/v1/images/edits";
@@ -1048,6 +1048,36 @@ fn mime_type(output_format: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "image/png",
     }
+}
+
+/// `prepareOpenAICompatImagesPayload`.
+pub(crate) fn prepare_images_payload(
+    body: &[u8],
+    model: &str,
+    content_type: &str,
+    stream: bool,
+) -> Result<(Bytes, String), ExecError> {
+    if crate::go_std::json_valid(body) {
+        let mut body = body.to_vec();
+        if !model.is_empty() {
+            crate::openai_payload::set_str_if_different(&mut body, "model", model);
+        }
+        if stream {
+            crate::openai_payload::set_bool_if_different(&mut body, "stream", true);
+        } else {
+            cpa_common::json::delete(&mut body, "stream");
+        }
+        return Ok((Bytes::from(body), "application/json".into()));
+    }
+    let Some(boundary) = multipart::boundary(content_type) else {
+        return Ok((Bytes::copy_from_slice(body), content_type.to_owned()));
+    };
+    // Go returns a plain error here; the handler answers 500.
+    let boundary = boundary.map_err(plain_err)?;
+    let form =
+        multipart::read_form(body, &boundary).map_err(|e| plain_err(format!("read multipart form failed: {e}")))?;
+    let (out, content_type) = multipart::rewrite_images_form(&form, model, stream, false);
+    Ok((Bytes::from(out), content_type))
 }
 
 #[cfg(test)]

@@ -118,7 +118,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
     for case in captures["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let req = enrich(request(case));
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg, Default::default());
+        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
         ctx.today = "2026-10-02".into();
         let translated =
             translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
@@ -409,13 +409,9 @@ async fn messages_responses_record_the_quota_snapshot() {
             .is_err()
     );
     assert_eq!(signal(&executor), "undecodable");
-    // A custom origin counts locally; Delegation's upstream count still never observes.
-    let count = Delegation {
-        count_upstream: true,
-        ..Default::default()
-    };
+    // A custom origin counts locally and never observes.
     executor
-        .execute_delegated(&credential, request(Operation::CountTokens), &cfg, count)
+        .execute(&credential, request(Operation::CountTokens), &cfg)
         .await
         .unwrap();
     assert_eq!(signal(&executor), "undecodable");
@@ -981,11 +977,11 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             },
         };
         let mut req = enrich(req);
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg, Default::default());
+        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
         ctx.today = scenario["date"].as_str().unwrap().into();
         if let (true, true, Some(output)) = (count, scenario["upstream"].is_null(), scenario["output"].as_array()) {
             // Counted locally: Go answered without an upstream request.
-            let response = executor.count_tokens(ctx, req, false).await.unwrap();
+            let response = executor.count_tokens(ctx, req).await.unwrap();
             let ResponseBody::Buffered(body) = response.body else {
                 panic!("{name}: streamed count")
             };
@@ -1541,7 +1537,7 @@ async fn usage_reports_follow_go_reporter_calls() {
         .insert("api_key".into(), "fake-gateway-key".into());
     credential.attributes.insert("base_url".into(), base);
     let cfg = Config::parse("").unwrap();
-    let run = |source: Format, stream: bool, alt: Option<&str>, delegation: Delegation| {
+    let run = |source: Format, stream: bool, alt: Option<&str>| {
         let usage = Arc::new(Usage::default());
         let body = if source == Format::Claude {
             Bytes::from_static(
@@ -1576,7 +1572,7 @@ async fn usage_reports_follow_go_reporter_calls() {
         };
         let (executor, credential, cfg) = (&executor, &credential, &cfg);
         async move {
-            let response = executor.execute_delegated(credential, req, cfg, delegation).await;
+            let response = executor.execute(credential, req, cfg).await;
             if let Ok(ExecResponse {
                 body: ResponseBody::Stream(events),
                 ..
@@ -1589,13 +1585,13 @@ async fn usage_reports_follow_go_reporter_calls() {
     };
     let without_lines = |usage: &Usage| usage.kinds().into_iter().filter(|k| *k != "line").collect::<Vec<_>>();
     // Native Execute: reporter.Publish(ParseClaudeUsage(data)).
-    let usage = run(Format::Claude, false, None, Delegation::default()).await;
+    let usage = run(Format::Claude, false, None).await;
     assert_eq!(
         usage.kinds(),
         ["request", "round_trip_started", "first_byte", "body", "publish"]
     );
     // Translated Execute: streamUsage.Publish only, so usage is required.
-    let usage = run(Format::OpenAI, false, None, Delegation::default()).await;
+    let usage = run(Format::OpenAI, false, None).await;
     assert_eq!(
         without_lines(&usage),
         ["request", "round_trip_started", "first_byte", "usage_required"]
@@ -1603,30 +1599,16 @@ async fn usage_reports_follow_go_reporter_calls() {
     assert!(usage.kinds().contains(&"line"));
     // ExecuteStream, native and translated: deferred streamUsage.Publish only.
     for source in [Format::Claude, Format::OpenAI] {
-        let usage = run(source, true, None, Delegation::default()).await;
+        let usage = run(source, true, None).await;
         assert_eq!(
             without_lines(&usage),
             ["request", "round_trip_started", "first_byte", "usage_required"],
             "{source:?}"
         );
     }
-    // A delegation renaming the model: reporter.SetUpstreamModel.
-    let renamed = Delegation {
-        upstream_model: Some(|base| format!("{base}-upstream")),
-        ..Default::default()
-    };
-    let usage = run(Format::Claude, false, None, renamed).await;
-    assert_eq!(usage.kinds()[0], "upstream_model");
-    assert_eq!(usage.0.lock().unwrap()[0].2, "claude-sonnet-4-6-upstream");
     // responses/compact: executeClaudeCompaction returns before its own reporter and
     // the summary turn publishes like a native Execute.
-    let usage = run(
-        Format::OpenAIResponse,
-        false,
-        Some("responses/compact"),
-        Delegation::default(),
-    )
-    .await;
+    let usage = run(Format::OpenAIResponse, false, Some("responses/compact")).await;
     assert_eq!(
         usage.kinds(),
         ["request", "round_trip_started", "first_byte", "body", "publish"]
@@ -1722,7 +1704,7 @@ async fn request_logs_follow_go_capture_sites() {
         c
     };
     let cfg = Config::parse("").unwrap();
-    let run = |base_url: String, text: &'static str, operation: Operation, stream: bool, delegation: Delegation| {
+    let run = |base_url: String, text: &'static str, operation: Operation, stream: bool| {
         let captured = Arc::new(Captured::default());
         let body = Bytes::from(format!(
             r#"{{"model":"claude-sonnet-4-6","max_tokens":8,"stream":{stream},"messages":[{{"role":"user","content":"{text}"}}]}}"#
@@ -1758,7 +1740,7 @@ async fn request_logs_follow_go_capture_sites() {
             if let Ok(ExecResponse {
                 body: ResponseBody::Stream(events),
                 ..
-            }) = executor.execute_delegated(&credential, req, cfg, delegation).await
+            }) = executor.execute(&credential, req, cfg).await
             {
                 let _: Vec<_> = events.collect().await;
             }
@@ -1793,14 +1775,14 @@ async fn request_logs_follow_go_capture_sites() {
     };
     let metadata = "metadata 200 Content-Type,X-Dup,X-Dup,Content-Length,Date";
     // Execute: the whole decoded body as one chunk.
-    let events = run(base.clone(), "hi", Operation::Generate, false, Delegation::default()).await;
+    let events = run(base.clone(), "hi", Operation::Generate, false).await;
     assert_eq!(events.len(), 3, "{events:?}");
     assert!(events[0].starts_with(&request("v1/messages", "claude")), "{events:?}");
     logged_match_wire(&events[0]);
     assert_eq!(events[1], metadata);
     assert!(events[2].starts_with(r#"chunk {"id":"m""#), "{events:?}");
     // ExecuteStream: every scanner line, blank lines included, up to message_stop.
-    let events = run(base.clone(), "hi", Operation::Generate, true, Delegation::default()).await;
+    let events = run(base.clone(), "hi", Operation::Generate, true).await;
     assert!(events[0].starts_with(&request("v1/messages", "claude")), "{events:?}");
     logged_match_wire(&events[0]);
     assert!(events[1].starts_with("metadata 200 Content-Type"), "{events:?}");
@@ -1816,35 +1798,11 @@ async fn request_logs_follow_go_capture_sites() {
         ]
     );
     // An upstream error: its metadata, then the error body.
-    let events = run(
-        base.clone(),
-        "rate me",
-        Operation::Generate,
-        false,
-        Delegation::default(),
-    )
-    .await;
+    let events = run(base.clone(), "rate me", Operation::Generate, false).await;
     assert_eq!(events[1], metadata.replace("200", "429"));
     assert!(events[2].starts_with(r#"chunk {"type":"error""#), "{events:?}");
-    // Kimi's embedded executor counts upstream and logs provider kimi.
-    let kimi = Delegation {
-        count_upstream: true,
-        request_log_provider: Some("kimi"),
-        ..Default::default()
-    };
-    let events = run(base.clone(), "hi", Operation::CountTokens, false, kimi).await;
-    assert_eq!(events.len(), 3, "{events:?}");
-    assert!(
-        events[0].starts_with(&request("v1/messages/count_tokens", "kimi")),
-        "{events:?}"
-    );
-    logged_match_wire(&events[0]);
-    assert_eq!(
-        events[1..],
-        [metadata.to_owned(), r#"chunk {"input_tokens":4}"#.to_owned()]
-    );
     // A transport failure: the request, then the error.
-    let events = run(closed, "hi", Operation::Generate, false, Delegation::default()).await;
+    let events = run(closed, "hi", Operation::Generate, false).await;
     assert_eq!(events.len(), 2, "{events:?}");
     assert!(events[1].starts_with("error "), "{events:?}");
 }
@@ -2342,7 +2300,7 @@ async fn responses_compaction_matches_go() {
     let calls = r#"{"type":"function_call","call_id":"call_1","name":"check_build","arguments":"{\"target\":\"api\"}"},{"type":"function_call_output","call_id":"call_1","output":"build ok"}"#;
     let trigger = r#"{"type":"compaction_trigger"}"#;
     let capsule = |summary: &str| {
-        let sealed = crate::antigravity_compaction::seal(summary, "claude-haiku-4-5-20251001").unwrap();
+        let sealed = crate::compaction_capsule::seal(summary, "claude-haiku-4-5-20251001").unwrap();
         format!(r#"{{"type":"compaction","encrypted_content":"{sealed}"}}"#)
     };
     // The single compaction item, its capsule and the usage of the answer.
@@ -2352,7 +2310,7 @@ async fn responses_compaction_matches_go() {
         assert_eq!(items.len(), 1, "{payload}");
         assert_eq!(items[0].get("type").str(), "compaction");
         let sealed = items[0].get("encrypted_content").str().to_owned();
-        assert_eq!(crate::antigravity_compaction::unseal(&sealed).unwrap(), SUMMARY);
+        assert_eq!(crate::compaction_capsule::unseal(&sealed).unwrap(), SUMMARY);
         let got = rawjson::get(payload, "usage");
         assert_eq!(
             (

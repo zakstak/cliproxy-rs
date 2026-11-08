@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::kimi_fixture::{Captured, Mock, assert_same_request, fixture, request};
+use crate::device_fixture::{Captured, Mock, assert_same_request, fixture, request};
 use crate::meta_auth::{
     self, GoMap, MetaAuth, TokenStorage, credential_file_name, encode_token_file, go_map_from_json, login_with,
 };
@@ -96,8 +96,8 @@ fn meta_credential(fx: &Value, origin: &str, url: &str) -> Credential {
 }
 
 struct Run {
-    usage: std::sync::Arc<crate::kimi_fixture::UsageLog>,
-    capture: std::sync::Arc<crate::kimi_fixture::CaptureLog>,
+    usage: std::sync::Arc<crate::device_fixture::UsageLog>,
+    capture: std::sync::Arc<crate::device_fixture::CaptureLog>,
     fx: Value,
     origin: String,
     url: String,
@@ -116,8 +116,8 @@ async fn run(name: &str) -> Run {
     let exec = MetaExecutor::with_client(default_client()).with_mint_url(&format!("{}/muse-code/key", mock.url));
     let (mut body, mut chunks, mut error) = (None, Vec::new(), None);
     let cfg = Config::parse(fx["request"]["config"].as_str().unwrap_or_default()).unwrap();
-    let usage = std::sync::Arc::new(crate::kimi_fixture::UsageLog::default());
-    let capture = std::sync::Arc::new(crate::kimi_fixture::CaptureLog::default());
+    let usage = std::sync::Arc::new(crate::device_fixture::UsageLog::default());
+    let capture = std::sync::Arc::new(crate::device_fixture::CaptureLog::default());
     let mut req = request(&fx, "");
     req.usage = usage.sink().with_capture(capture.sink());
     match exec.execute(&credential, req, &cfg).await {
@@ -545,7 +545,7 @@ async fn failed_login_mint_logs_no_response_body() {
     responses[2]["body"] = json!(format!(r#"{{"error":"bad","api_key":"{secret}"}}"#));
     let mock = Mock::start(&responses).await;
     let dir = TempDir::new();
-    let capture = crate::kimi_fixture::LogCapture::default();
+    let capture = crate::device_fixture::LogCapture::default();
     let guard = capture.install();
     let outcome = login_with(login_auth(&mock.url), dir.path(), true).await;
     drop(guard);
@@ -633,7 +633,7 @@ async fn device_flow_errors_and_slow_down_follow_go() {
     ]))
     .await;
     let auth = login_auth(&mock.url);
-    crate::kimi_fixture::assert_go_message_without_body(
+    crate::device_fixture::assert_go_message_without_body(
         "device flow 400",
         &auth.start_device_flow().await.unwrap_err(),
         "meta device flow failed (HTTP 400): nope",
@@ -921,10 +921,10 @@ fn strict_error_body_read_surfaces_errors_past_the_kept_prefix() {
     ];
     let body = futures_util::stream::iter(chunks).boxed();
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-    let error = rt.block_on(crate::kimi_http::read_all_strict(body, 4)).unwrap_err();
+    let error = rt.block_on(crate::helpers::read_all_strict(body, 4)).unwrap_err();
     assert_eq!(error.scope, FailureScope::Transport);
     let ok = futures_util::stream::iter(vec![Ok(Bytes::from_static(b"0123456789"))]).boxed();
-    assert_eq!(rt.block_on(crate::kimi_http::read_all_strict(ok, 4)).unwrap(), "0123");
+    assert_eq!(rt.block_on(crate::helpers::read_all_strict(ok, 4)).unwrap(), "0123");
 }
 
 #[tokio::test]
@@ -950,7 +950,7 @@ async fn mint_errors_follow_go() {
     // Go: "meta auth: mint key failed (HTTP 403): denied"; the body is withheld, in every
     // formatting of the error.
     let e = auth.mint_api_key("dca:3").await.unwrap_err();
-    crate::kimi_fixture::assert_go_message_without_body(
+    crate::device_fixture::assert_go_message_without_body(
         "mint 403",
         &e.to_string(),
         "meta auth: mint key failed (HTTP 403): denied",
@@ -969,7 +969,7 @@ async fn apply_patch_failures_end_meta_streams_like_go() {
     // translator's flush (no FinalizeApplyPatchStream, no [DONE]).
     async fn run(lines: Vec<&'static str>, fail_on_finalize: bool) -> (Vec<String>, Vec<String>) {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let translator = Box::new(crate::kimi_fixture::PatchProbe {
+        let translator = Box::new(crate::device_fixture::PatchProbe {
             failed: false,
             fail_on_finalize,
             log: log.clone(),
@@ -980,7 +980,7 @@ async fn apply_patch_failures_end_meta_streams_like_go() {
         let out: Vec<String> = stream_events(
             upstream,
             translator,
-            crate::gemini_stream::ClaudeInputTokens::new(
+            crate::claude_input_tokens::ClaudeInputTokens::new(
                 Format::OpenAIResponse,
                 Format::Codex,
                 Format::OpenAIResponse,
@@ -1046,8 +1046,8 @@ async fn usage_reports_match_go_records() {
         "claude-stream-input-estimate",
     ] {
         let r = run(name).await;
-        let failure = r.error.as_ref().map(crate::kimi_fixture::go_failure);
-        crate::kimi_fixture::assert_usage_like_go(name, &r.fx, &r.usage, failure.as_ref());
+        let failure = r.error.as_ref().map(crate::device_fixture::go_failure);
+        crate::device_fixture::assert_usage_like_go(name, &r.fx, &r.usage, failure.as_ref());
     }
 }
 
@@ -1055,11 +1055,11 @@ async fn usage_reports_match_go_records() {
 async fn request_capture_matches_go() {
     // meta_executor_execute.go's recordMetaRequest site with its response metadata,
     // chunks and errors, rendered as Go's request log and compared with Go's text.
-    let names = crate::kimi_fixture::captured_fixtures("meta");
+    let names = crate::device_fixture::captured_fixtures("meta");
     assert!(names.len() >= 30, "{names:?}");
     for name in names.iter().filter(|n| n.as_str() != "refresh-direct") {
         let r = run(name).await;
-        crate::kimi_fixture::assert_capture_like_go(name, &r.fx, &r.capture, &r.url, &["Host"]);
+        crate::device_fixture::assert_capture_like_go(name, &r.fx, &r.capture, &r.url, &["Host"]);
     }
 }
 

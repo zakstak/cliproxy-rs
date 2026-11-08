@@ -309,8 +309,8 @@ fn image_tool_bodies(go: &str, rust: &[u8]) -> (Value, Value) {
     (go, serde_json::from_slice(rust).unwrap())
 }
 
-/// A recorded case the translated route serves (#27): a Claude, Chat Completions,
-/// Gemini or Interactions request on a native profile.
+/// A recorded case the translated route serves (#27): a Claude or Chat Completions
+/// request on a native profile.
 fn translated_case(case: &Value, base_url: &str) -> bool {
     case["resolved_compat"] != true
         && case["exec_metadata"]["execution_session_id"].as_str().is_none()

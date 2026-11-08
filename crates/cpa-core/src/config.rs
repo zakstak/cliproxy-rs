@@ -967,6 +967,8 @@ fn decode(text: &str, mode: Decode) -> anyhow::Result<(Mapping, ConfigDocument)>
     }
     let mut document = ConfigDocument::from_mapping(root.clone())?;
     document.coerce_typed_scalars();
+    // Before the field checks, so a removed provider's setting reads as a migration.
+    crate::removed::config(document.value())?;
     schema::validate(document.value(), false)
         .and_then(|()| validate::decoded(document.value()))
         .map_err(|e| {

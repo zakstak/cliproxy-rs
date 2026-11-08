@@ -79,3 +79,27 @@ pub(crate) fn as_go_call(args: &[String]) -> Option<serde_json::Value> {
         _ => None,
     }
 }
+
+/// Random generations read as `<gen>`, as in the Go golden.
+pub(crate) fn normalize_generations(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let shape = |i: usize| {
+        text.len() >= i + 36
+            && bytes[i..i + 36].iter().enumerate().all(|(j, b)| match j {
+                8 | 13 | 18 | 23 => *b == b'-',
+                _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+            })
+    };
+    let (mut out, mut i) = (String::new(), 0);
+    while i < text.len() {
+        if shape(i) {
+            out.push_str("<gen>");
+            i += 36;
+        } else {
+            let c = text[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}

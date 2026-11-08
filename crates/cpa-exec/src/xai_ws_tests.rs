@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use cpa_core::exec::{Caller, Operation};
 use serde_json::Value;
 
-use crate::openai_compat_usage::{Captured, published, sinks};
+use crate::usage_testkit::{Captured, published, sinks};
 
 /// Clock-derived timestamps (`created_at`/`completed_at` from now, when the compact reply
 /// has none) as `"<now>"`.
@@ -371,7 +371,7 @@ async fn turns_match_go() {
                     !recorded.http.is_empty() && turn["compact"]["body"].as_str().is_some_and(|b| !b.is_empty());
                 let sent = !recorded.frames.is_empty() || !recorded.http.is_empty();
                 if let Some(problem) =
-                    crate::openai_compat_usage::ttft_problem(&recorder.0.lock().unwrap(), sent, message || compact_body)
+                    crate::usage_testkit::ttft_problem(&recorder.0.lock().unwrap(), sent, message || compact_body)
                 {
                     diffs.push(problem);
                 }

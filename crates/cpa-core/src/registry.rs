@@ -1,5 +1,6 @@
 //! Pinned static model catalog: `internal/registry/models/models.json` from CLIProxyAPI
-//! v8.0.35, byte for byte.
+//! v8.0.35, byte for byte except that the sections of the providers this fork removed
+//! (Gemini, Vertex, Gemini CLI, AI Studio, Kimi and Antigravity; issue #49) are cut out.
 //!
 //! This is the static layer only. Go overlays a dynamic registry (per-credential
 //! registrations, config model definitions, remote catalog refresh) and consults it before
@@ -8,7 +9,6 @@
 
 use std::sync::LazyLock;
 
-pub mod devin;
 pub mod dynamic;
 
 use serde::Deserialize;
@@ -18,22 +18,10 @@ use serde_json::{Map, Value};
 pub static MODELS_JSON: &str = include_str!("registry/models.json");
 
 /// Channels searched by [`Catalog::lookup`], in Go's `LookupStaticModelInfo` order
-/// (internal/registry/model_definitions.go). `gemini-cli`, `codex-free`, `codex-team` and
-/// `codex-plus` are not searched; Go reaches them only through per-channel getters.
-/// After the `devin` section Go searches `staticDevinModels` ([`devin::static_models`]),
-/// not the `devin_models.json` catalog.
-const LOOKUP_ORDER: [&str; 10] = [
-    "claude",
-    "gemini",
-    "vertex",
-    "aistudio",
-    "codex-pro",
-    "kimi",
-    "antigravity",
-    "xai",
-    "devin",
-    "meta",
-];
+/// (internal/registry/model_definitions.go) without the removed providers' sections
+/// (issue #49). `codex-free`, `codex-team` and `codex-plus` are not searched; Go reaches
+/// them only through per-channel getters.
+const LOOKUP_ORDER: [&str; 4] = ["claude", "codex-pro", "xai", "meta"];
 
 /// Thinking budget and level support (`ThinkingSupport` in model_registry.go).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -123,22 +111,14 @@ impl Catalog {
     }
 
     /// First definition with this exact ID across channels, in Go's search order. The same
-    /// ID can mean different things per channel (`claude-sonnet-4-6` is also an
-    /// Antigravity model), so callers that know the provider should use [`Self::channel`].
+    /// ID can mean different things per channel, so callers that know the provider should use [`Self::channel`].
     pub fn lookup(&self, id: &str) -> Option<&ModelInfo> {
         if id.is_empty() {
             return None;
         }
         LOOKUP_ORDER
             .iter()
-            .flat_map(|channel| {
-                let statics: &[ModelInfo] = if *channel == "devin" {
-                    devin::static_models()
-                } else {
-                    &[]
-                };
-                self.channel(channel).iter().chain(statics)
-            })
+            .flat_map(|channel| self.channel(channel).iter())
             .find(|m| m.id == id)
             .or_else(|| {
                 let claude = self.channel("claude");
@@ -376,19 +356,13 @@ pub fn go_model_json(raw: &Map<String, Value>) -> Result<Value, String> {
 }
 
 /// `staticModelsJSON`'s sections.
-const SECTIONS: [&str; 13] = [
+const SECTIONS: [&str; 7] = [
     "claude",
-    "gemini",
-    "vertex",
-    "aistudio",
     "codex-free",
     "codex-team",
     "codex-plus",
     "codex-pro",
-    "kimi",
-    "antigravity",
     "xai",
-    "devin",
     "meta",
 ];
 
@@ -577,17 +551,12 @@ pub fn catalog_generation() -> u64 {
 /// Go `validateModelsCatalog`: in the required sections every model is an object with a
 /// non-empty, unique (trimmed) `id`. Empty or missing sections are allowed.
 fn validate_catalog(root: &Map<String, Value>) -> Result<(), String> {
-    const REQUIRED: [&str; 12] = [
+    const REQUIRED: [&str; 7] = [
         "claude",
-        "gemini",
-        "vertex",
-        "aistudio",
         "codex-free",
         "codex-team",
         "codex-plus",
         "codex-pro",
-        "kimi",
-        "antigravity",
         "xai",
         "meta",
     ];
@@ -616,26 +585,16 @@ fn validate_catalog(root: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// Go `detectChangedProviders`: the providers whose section differs. Gemini covers both
-/// Gemini protocols and the Codex tiers are one provider.
+/// Go `detectChangedProviders` for the retained providers: those whose section differs.
+/// The Codex tiers are one provider.
 fn changed_providers(old: &Catalog, new: &Catalog) -> Vec<String> {
-    const SECTIONS: [(&str, &str); 17] = [
+    const SECTIONS: [(&str, &str); 7] = [
         ("claude", "claude"),
-        ("gemini", "gemini"),
-        ("gemini-interactions", "gemini"),
-        ("vertex", "vertex"),
-        ("aistudio", "aistudio"),
         ("codex", "codex-free"),
         ("codex", "codex-team"),
         ("codex", "codex-plus"),
         ("codex", "codex-pro"),
-        ("kimi", "kimi"),
-        ("kimi-ai", "kimi"),
-        ("kimi.ai", "kimi"),
-        ("kimi.com", "kimi"),
-        ("antigravity", "antigravity"),
         ("xai", "xai"),
-        ("devin", "devin"),
         ("meta", "meta"),
     ];
     let mut changed: Vec<String> = Vec::new();

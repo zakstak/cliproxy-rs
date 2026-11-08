@@ -5,8 +5,6 @@
 //! (`b` also carries Go's nil), `json` a gjson.Result (`jb` its raw bytes), `bool`, `err`
 //! an error, `null` a nil interface.
 
-use std::collections::HashMap;
-
 use base64::Engine;
 use cpa_common::json as gj;
 use serde_json::Value;
@@ -28,12 +26,6 @@ fn bytes(v: &Value) -> Vec<u8> {
     }
 }
 
-fn names(v: &Value) -> HashMap<Vec<u8>, Vec<u8>> {
-    let map = v["map"].as_object().map(|m| m.iter()).into_iter().flatten();
-    map.map(|(k, v)| (k.as_bytes().to_vec(), v.as_str().unwrap().as_bytes().to_vec()))
-        .collect()
-}
-
 fn list(v: &Value) -> Vec<Vec<u8>> {
     v["list"].as_array().unwrap().iter().map(bytes).collect()
 }
@@ -48,13 +40,6 @@ fn list_out(items: &[Vec<u8>]) -> Vec<u8> {
         .concat()
 }
 
-/// Runs an in-place Rust transform on a copy of `raw`.
-fn edit(raw: Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    let mut raw = raw;
-    f(&mut raw);
-    raw
-}
-
 fn flag(v: &Value) -> Vec<u8> {
     bool_out(v["bool"].as_bool().unwrap())
 }
@@ -66,6 +51,38 @@ fn bool_out(b: bool) -> Vec<u8> {
 fn failed(v: &Value) -> bool {
     v.get("err").is_some()
 }
+
+/// Recorded helpers of the translators this fork removed (Gemini, Interactions, Antigravity
+/// and Devin; issue #49). Their calls stay in the Go fixture and are skipped.
+const REMOVED: &[&str] = &[
+    "ContainsJSONRef",
+    "AntigravityToolNameToUpstream",
+    "AntigravityUpstreamToolNameToClient",
+    "ObfuscateExecCommandDescription",
+    "ObfuscateWriteStdinDescription",
+    "IsDevinCodexAppAutomationUpdate",
+    "SanitizeDevinToolDescription",
+    "GeminiClaudeToolUseID",
+    "fixCLIToolResponse",
+    "removeEmptyGeminiFunctionTools",
+    "rewriteGeminiFunctionNames",
+    "rewriteInteractionsFunctionNames",
+    "normalizeAntigravityOpenAIThinkingConfig",
+    "normalizeClaudeToolSchema",
+    "lowercaseClaudeToolSchemaTypes",
+    "cleanGeminiCodexToolParameters",
+    "cleanedCodexToolParameters",
+    "setInteractionsCodexRawIfDifferent",
+    "MergeAdjacentGeminiContents",
+    "ContentHasGeminiFunctionResponse",
+    "ReorderGeminiUserParts",
+    "MergeAdjacentGeminiUserContents",
+    "SplitGeminiFunctionResponseTurns",
+    "SetGeminiFunctionResponseResult",
+    "restoreUsageMetadata",
+    "CleanClaudeToolArgumentsWithTranslated",
+    "NormalizeOpenAIFileData",
+];
 
 /// (got, want) for one recorded call; `None` for a function without a replay arm.
 fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -96,54 +113,10 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
         ),
         "SystemReminderText" => (crate::common::system_reminder_text(&arg(0)), want()),
         "RequestModelName" => (crate::common::request_model_name(&arg(0), &arg(1)), want()),
-        "ContainsJSONRef" => (
-            bool_out(crate::gemini::contains_json_ref(&gj::parse(&arg(0)))),
-            flag(&r[0]),
-        ),
         "BuildClaudeStructuredOutputInstruction" => (
             crate::common::claude_structured_output_instruction(&gj::parse(&arg(0))),
             want(),
         ),
-        "AntigravityToolNameToUpstream" => (
-            crate::openai_interactions::antigravity_name_to_upstream(&arg(0)),
-            want(),
-        ),
-        "AntigravityUpstreamToolNameToClient" => {
-            (crate::openai_interactions::antigravity_name_to_client(&arg(0)), want())
-        }
-        "ObfuscateExecCommandDescription" => (
-            crate::responses_interactions::obfuscate_exec_command_description(&arg(0)),
-            want(),
-        ),
-        "ObfuscateWriteStdinDescription" => (
-            crate::responses_interactions::obfuscate_write_stdin_description(&arg(0)),
-            want(),
-        ),
-        "IsDevinCodexAppAutomationUpdate" => (
-            bool_out(crate::responses_interactions::is_devin_automation_update(
-                &arg(0),
-                &arg(1),
-            )),
-            flag(&r[0]),
-        ),
-        "SanitizeDevinToolDescription" => (
-            crate::responses_interactions::sanitize_devin_description(&arg(0), arg(1)),
-            want(),
-        ),
-        "NormalizeOpenAIFileData" => {
-            let pair = |mime: Vec<u8>, data: Vec<u8>| [mime, b"\n".to_vec(), data].concat();
-            let got = crate::common::normalize_openai_file_data(&arg(0), &arg(1), &arg(2))
-                .map_or(ERR.to_vec(), |(mime, data)| pair(mime, data));
-            let ok = r[2]["bool"].as_bool().unwrap();
-            (
-                got,
-                if ok {
-                    pair(bytes(&r[0]), bytes(&r[1]))
-                } else {
-                    ERR.to_vec()
-                },
-            )
-        }
         "NormalizeClaudeToolInputSchema" => {
             let schema = arg(0);
             let nil = a[0]["nil"].as_bool().unwrap_or(false);
@@ -156,102 +129,10 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
             bool_out(crate::common::has_unsupported_unicode_property_escape(&arg(0))),
             flag(&r[0]),
         ),
-        "GeminiClaudeToolUseID" => (
-            crate::antigravity_claude_response::gemini_claude_tool_use_id(&arg(0), &arg(1), &arg(2)),
-            want(),
-        ),
-        "CleanClaudeToolArgumentsWithTranslated" => (
-            crate::claude_tool_args::clean_claude_tool_arguments_with_translated(&arg(0), &arg(1), &arg(2), &arg(3)),
-            want(),
-        ),
         "IsClaudeCodeAttributionSystemText" => (
             bool_out(crate::common::is_claude_code_attribution_text(&arg(0))),
             flag(&r[0]),
         ),
-        "fixCLIToolResponse" => (
-            crate::antigravity_gemini::fix_cli_tool_response(&arg(0)).unwrap_or_else(|| ERR.to_vec()),
-            if failed(&r[1]) { ERR.to_vec() } else { want() },
-        ),
-        "removeEmptyGeminiFunctionTools" => (
-            edit(arg(0), crate::antigravity_gemini::remove_empty_function_tools),
-            want(),
-        ),
-        "rewriteGeminiFunctionNames" => {
-            // The arguments of the Rust call site in antigravity_gemini::convert.
-            let got = edit(arg(0), |raw| {
-                crate::antigravity_gemini::rewrite_function_names(
-                    raw,
-                    &names(&a[1]),
-                    "request.contents",
-                    &crate::antigravity_gemini::NAME_FIELDS,
-                    &[
-                        "request.toolConfig.functionCallingConfig.allowedFunctionNames",
-                        "request.tool_config.function_calling_config.allowed_function_names",
-                    ],
-                )
-            });
-            (got, want())
-        }
-        "rewriteInteractionsFunctionNames" => {
-            // Rust rewrites before wrapping the request (`contents`); Go after (`request.contents`).
-            let got = edit(arg(0), |raw| {
-                crate::antigravity_gemini::rewrite_function_names(
-                    raw,
-                    &names(&a[1]),
-                    "request.contents",
-                    &crate::antigravity_interactions::NAME_FIELDS,
-                    &["request.toolConfig.functionCallingConfig.allowedFunctionNames"],
-                )
-            });
-            (got, want())
-        }
-        "normalizeAntigravityOpenAIThinkingConfig" => {
-            (edit(arg(0), crate::antigravity_chat::normalize_thinking_config), want())
-        }
-        "normalizeClaudeToolSchema" => (crate::claude_gemini::normalize_schema(&gj::parse(&arg(0))), want()),
-        "lowercaseClaudeToolSchemaTypes" => (crate::claude_gemini::lowercase_types(arg(0)), want()),
-        "cleanGeminiCodexToolParameters" => (crate::codex_gemini::clean_parameters(&gj::parse(&arg(0))), want()),
-        "cleanedCodexToolParameters" => (
-            crate::codex_interactions::cleaned_parameters(&gj::parse(&arg(0))),
-            want(),
-        ),
-        "setInteractionsCodexRawIfDifferent" => {
-            let path = String::from_utf8(arg(1)).unwrap();
-            let value = arg(2);
-            (
-                edit(arg(0), |raw| {
-                    crate::codex_interactions::set_raw_if_different(raw, &path, &gj::parse(&value))
-                }),
-                want(),
-            )
-        }
-        "MergeAdjacentGeminiContents" => (
-            list_out(&crate::gemini::merge_adjacent_contents(list(&a[0]))),
-            list_out(&list(&r[0])),
-        ),
-        "ContentHasGeminiFunctionResponse" => (bool_out(crate::gemini::has_function_response(&arg(0))), flag(&r[0])),
-        "ReorderGeminiUserParts" => (
-            list_out(&crate::gemini::reorder_user_parts(list(&a[0]))),
-            list_out(&list(&r[0])),
-        ),
-        "MergeAdjacentGeminiUserContents" => (
-            list_out(&crate::gemini_responses::merge_adjacent_user_contents(list(&a[0]))),
-            list_out(&list(&r[0])),
-        ),
-        "SplitGeminiFunctionResponseTurns" => (
-            list_out(&crate::antigravity_claude::split_function_response_turns(list(&a[0]))),
-            list_out(&list(&r[0])),
-        ),
-        "SetGeminiFunctionResponseResult" => {
-            let path = String::from_utf8(arg(1)).unwrap();
-            let value = arg(2);
-            (
-                edit(arg(0), |part| {
-                    crate::gemini::set_function_response_result(part, &path, &gj::parse(&value))
-                }),
-                want(),
-            )
-        }
         "AlignOpenAIToolCallMessages" => (
             list_out(&crate::common::align_openai_tool_call_messages_with(
                 list(&a[0]),
@@ -259,7 +140,6 @@ fn replay(fun: &str, a: &[Value], r: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
             )),
             list_out(&list(&r[0])),
         ),
-        "restoreUsageMetadata" => (crate::antigravity_gemini::restore_usage(arg(0)), want()),
         "normalizeToolParameters" => (crate::codex_claude::normalize_tool_parameters(&arg(0)), want()),
         _ => return None,
     })
@@ -274,6 +154,9 @@ fn go_helper_calls_match() {
     for call in calls {
         let name = call["name"].as_str().unwrap();
         let fun = call["fn"].as_str().unwrap().rsplit('.').next().unwrap();
+        if REMOVED.contains(&fun) {
+            continue;
+        }
         let (args, results) = (call["args"].as_array().unwrap(), call["results"].as_array().unwrap());
         match replay(fun, args, results) {
             Some((got, want)) if got != want => failures.push(format!(

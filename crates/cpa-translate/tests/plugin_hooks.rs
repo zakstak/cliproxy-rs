@@ -93,8 +93,8 @@ const RESPONSE_CTX: ResponseCtx<'static> = ResponseCtx {
     tool_search: false,
 };
 
-/// Go `TestTranslateRequest_PluginTranslatorOnlyWhenNativeMissing`: Codex to Gemini has
-/// no native translator, so the plugin translator answers; OpenAI to Claude has one, so
+/// Go `TestTranslateRequest_PluginTranslatorOnlyWhenNativeMissing`: Codex to Gemini (a
+/// format only a plugin knows here) has no native translator, so the plugin translator answers; OpenAI to Claude has one, so
 /// it is never asked.
 #[test]
 fn a_plugin_request_translator_runs_only_without_a_native_pair() {
@@ -104,7 +104,7 @@ fn a_plugin_request_translator_runs_only_without_a_native_pair() {
     });
     let _installed = install(fake.clone());
     let got =
-        cpa_translate::translate_request(Format::Codex, Format::Gemini, &ctx(false), br#"{"model":"p/x"}"#).unwrap();
+        cpa_translate::translate_request_named("codex", "gemini", &ctx(false), br#"{"model":"p/x"}"#).unwrap();
     assert_eq!(json(&got)["model"], "plugin-request");
     assert_eq!(
         fake.calls(),
@@ -263,7 +263,7 @@ fn plugin_normalizers_wrap_each_native_stream_chunk() {
 fn a_plugin_translator_miss_keeps_the_fallback_body() {
     let _installed = install(Arc::new(Fake::default()));
     let body = br#"{"model":"gemini-3.6-flash","reasoning":{"summary":"auto"},"input":"hi"}"#;
-    let got = cpa_translate::translate_request(Format::Codex, Format::Gemini, &ctx(false), body).unwrap();
+    let got = cpa_translate::translate_request_named("codex", "gemini", &ctx(false), body).unwrap();
     assert_eq!(got, body);
 }
 
@@ -295,35 +295,10 @@ fn summary_intent_comes_from_the_normalized_source_of_a_plugin_translation() {
             request_translate: Some(translated.clone()),
             ..Default::default()
         }));
-        let got = json(&cpa_translate::translate_request(Format::Codex, Format::Gemini, &ctx(false), source).unwrap());
+        let got = json(&cpa_translate::translate_request_named("codex", "gemini", &ctx(false), source).unwrap());
         let include = &got["generationConfig"]["thinkingConfig"]["includeThoughts"];
         assert_eq!(include.as_bool(), want, "{name}: {got}");
     }
-}
-
-/// Go `TestRegistryTranslateRequestNormalizerOwnsFinalSummaryField`: after a native
-/// translation the normalizer sees the applied summary and may remove it.
-#[test]
-fn the_request_normalizer_owns_the_final_summary_field() {
-    let _installed = install(Arc::new(Fake {
-        normalize_request: Some(Box::new(|body| {
-            let mut body = json(body);
-            let config = &mut body["generationConfig"]["thinkingConfig"];
-            assert_eq!(config["includeThoughts"], true, "{config}");
-            config.as_object_mut().unwrap().remove("includeThoughts");
-            serde_json::to_vec(&body).unwrap()
-        })),
-        ..Default::default()
-    }));
-    let body = br#"{"model":"gemini-3.6-flash","reasoning":{"effort":"high","summary":"auto"},"input":"hi"}"#;
-    let got =
-        json(&cpa_translate::translate_request(Format::OpenAIResponse, Format::Gemini, &ctx(false), body).unwrap());
-    assert!(
-        got["generationConfig"]["thinkingConfig"]
-            .get("includeThoughts")
-            .is_none(),
-        "{got}"
-    );
 }
 
 /// Go `ConfigurationUpdatesChanged`: set only when a normalizer changes the Responses
@@ -383,12 +358,12 @@ fn inactive_hooks_change_nothing() {
     let body = br#"{"model":"other","input":"hi"}"#;
     let installed = install(Arc::new(Inactive));
     hooks::set_plugin_hooks_active(false);
-    let with = cpa_translate::translate_request(Format::Codex, Format::Gemini, &ctx(false), body).unwrap();
+    let with = cpa_translate::translate_request_named("codex", "gemini", &ctx(false), body).unwrap();
     assert!(hooks::unregistered_non_stream("claude", "claude", &RESPONSE_CTX, b"{}").is_none());
     assert!(hooks::wrap_stream("claude", "claude", &RESPONSE_CTX, None).is_none());
     // Still serialized: another test's hooks must not see this translation.
     hooks::set_plugin_hooks(None);
-    let without = cpa_translate::translate_request(Format::Codex, Format::Gemini, &ctx(false), body).unwrap();
+    let without = cpa_translate::translate_request_named("codex", "gemini", &ctx(false), body).unwrap();
     drop(installed);
     assert_eq!(with, without);
     assert_eq!(json(&with)["model"], "gemini-3.6-flash", "the fallback's model rewrite");

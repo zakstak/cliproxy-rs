@@ -10,7 +10,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::json::{self as gj, Kind, Res};
 use cpa_core::exec::ExecError;
 
-use crate::openai_compat_payload::ensure_responses_usage_details;
+use crate::openai_payload::ensure_responses_usage_details;
 
 pub(crate) const FUNCTION: &str = "function";
 pub(crate) const CUSTOM: &str = "custom";
@@ -808,12 +808,12 @@ const FREE_USAGE_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 pub(crate) fn status_error(status: u16, body: &[u8]) -> ExecError {
     let message = String::from_utf8_lossy(body).into_owned();
     if body.is_empty() {
-        return crate::openai_compat::status_err(status, message);
+        return crate::openai_http::status_err(status, message);
     }
     if status == 403 && is_bad_credentials(body) {
-        return crate::openai_compat::status_err(401, message);
+        return crate::openai_http::status_err(401, message);
     }
-    let mut error = crate::openai_compat::status_err(status, message);
+    let mut error = crate::openai_http::status_err(status, message);
     if status != 429 {
         return error;
     }

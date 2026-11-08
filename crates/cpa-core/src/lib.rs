@@ -6,6 +6,7 @@
 //! - [`format`]: request/response wire formats.
 //! - [`gostr`]: Go's table-driven case and print rules (`strings.ToLower`, ...).
 //! - [`registry`]: the pinned static model catalog.
+//! - [`removed`]: the upstream providers this fork removed and their migration errors.
 
 // Every workspace crate depends on this one, so this is the single place the supported
 // build targets are enforced: a non-Linux build stops here, before any crate reaches
@@ -25,3 +26,4 @@ pub mod format;
 pub mod gostr;
 mod gostr_tables;
 pub mod registry;
+pub mod removed;

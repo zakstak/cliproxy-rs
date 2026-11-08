@@ -1,7 +1,6 @@
 //! The tiktoken encodings behind Go's `tokenizer.Get`, built on first use and shared by
 //! every local token count in the process: Claude count_tokens, the Claude
-//! `message_start` estimate for non-Claude upstreams, and the Codex, Meta, xAI and
-//! OpenAI-compatible counts.
+//! `message_start` estimate for non-Claude upstreams, and the Codex, Meta and xAI counts.
 //!
 //! Cost: the first count that needs an encoding builds it on its own request (about
 //! 0.15 s for o200k_base and 0.06 s for cl100k_base, release build), and the encoder
