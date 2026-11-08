@@ -70,8 +70,9 @@ impl StreamOutcome {
         self.on_drop = OnDrop::Settled;
     }
 
-    /// The upstream failed with `error`, now queued for the consumer: a drop before the
-    /// consumer takes it records this failure, not a cancellation.
+    /// The stream failed with `error` (the upstream's failure, or a failure to translate
+    /// the upstream's response), now queued for the consumer: a drop before the consumer
+    /// takes it records this failure, not a cancellation.
     pub(crate) fn failed(&mut self, error: &ExecError) {
         self.on_drop = OnDrop::Failed(Box::new(error.clone()));
     }

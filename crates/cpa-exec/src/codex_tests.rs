@@ -1630,7 +1630,7 @@ async fn direct_images_return_the_read_error_of_a_broken_error_body() {
 /// cases pin its line scanner. The native route forwards events unchanged instead
 /// (`codex_native_tests.rs`).
 async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<String>, Option<ExecError>), ExecError> {
-    use crate::codex_response::{Bootstrap, Processor, bootstrap, processed};
+    use crate::codex_response::{Bootstrap, Processor, Step, bootstrap, processed};
     let processor = Processor::new(false, false);
     if !stream {
         let mut processor = processor;
@@ -1646,17 +1646,23 @@ async fn through_sse(sse: &str, stream: bool, buffering: bool) -> Result<(Vec<St
     let mut body = if buffering {
         match bootstrap(upstream, processor, None, Instant::now()).await {
             Bootstrap::Reject(error) => return Err(error),
-            Bootstrap::Stream(stream) => stream,
+            Bootstrap::Stream { held, rest } => futures_util::stream::iter(held)
+                .chain(futures_util::stream::iter(rest).flatten())
+                .boxed(),
         }
     } else {
         processed(upstream, processor, 0)
     };
     let (mut frames, mut failure) = (Vec::new(), None);
-    while let Some(item) = body.next().await {
-        match item {
-            Ok(frame) => frames.push(String::from_utf8(frame.to_vec()).unwrap()),
-            Err(error) => failure = Some(error),
-        }
+    while let Some(step) = body.next().await {
+        let out = match step {
+            Step::Event(out) | Step::Terminal(out) => Some(out),
+            Step::Fail { error, before, .. } => {
+                failure = Some(error);
+                before
+            }
+        };
+        frames.extend(out.map(|out| String::from_utf8(out.to_vec()).unwrap()));
     }
     Ok((frames, failure))
 }
