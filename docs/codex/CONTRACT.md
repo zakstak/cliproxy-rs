@@ -353,8 +353,8 @@ built-in Codex credential on a native profile. Under Home the pool is remote and
 so every Responses HTTP request counts. The session, session affinity, the LCP prefix,
 Home dispatch headers and the executor's session metadata then come from the client's
 own request (`Call::selection_inputs`). When a native attempt is not possible (a model
-only Sign in with ChatGPT credentials or other providers serve), selection reads the
-rewritten request, as in Go. No translation, thinking suffix, payload rule, prompt-cache
+only other providers serve), selection reads the rewritten request, as in Go. Sign in with
+ChatGPT credentials are native too (#28). No translation, thinking suffix, payload rule, prompt-cache
 key, reasoning replay, or tool or namespace preparation runs on a native attempt. A model
 with a thinking suffix, such as `gpt-5.5(high)`, is refused with a 400, because the
 suffix would need a body change the contract does not permit.

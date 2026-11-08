@@ -171,8 +171,8 @@ impl CodexExecutor {
         native::creates(frame)
     }
 
-    /// Whether `credential` is on a native profile (`chatgpt`, `api-key`, `compatible`;
-    /// not `siwc`), whatever the request: the server's test of whether a pool can serve a
+    /// Whether `credential` is on a native profile (every profile is, `siwc` included since
+    /// #28), whatever the request: the server's test of whether a pool can serve a
     /// Responses request natively.
     pub fn native_profile(credential: &Credential) -> bool {
         native::Profile::of(&View::new(credential)).is_some()

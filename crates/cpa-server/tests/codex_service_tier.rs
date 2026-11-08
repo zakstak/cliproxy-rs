@@ -186,15 +186,16 @@ async fn native_codex_keeps_explicit_tiers_in_body_and_routing_hint() {
         (Some(r#""scale""#), Some(r#""scale""#), "model=gpt-5.5;tier=scale"),
         // Malformed: forwarded unchanged; the hint carries only a string tier, as in Go.
         (Some("42"), Some("42"), "model=gpt-5.5"),
+        // An explicit null is not an omission: it stays null, and names no tier.
+        (Some("null"), Some("null"), "model=gpt-5.5"),
     ] {
-        let (status, text, headers, body) = send(&proxy, "/v1/responses", &codex, responses_body(sent)).await;
+        let client = responses_body(sent);
+        let (status, text, headers, body) = send(&proxy, "/v1/responses", &codex, client.clone()).await;
         assert_eq!(status, 200, "{sent:?}: {text}");
         assert_eq!(tier(&body).as_deref(), want, "{sent:?}: {body}");
         assert_eq!(hint(&headers), Some(want_hint), "{sent:?}");
-        assert!(
-            body.contains(r#",  "text" : {"verbosity":"low"}"#),
-            "{sent:?}: other bytes kept: {body}"
-        );
+        // The native contract (#23): the whole body, not only the tier, as sent.
+        assert_eq!(body, client, "{sent:?}: the client's bytes");
         assert_eq!(headers["authorization"], "Bearer at-FAKE", "client key never forwarded");
     }
     // Codex identified by `originator` alone.
@@ -239,9 +240,11 @@ async fn translated_clients_keep_their_service_tier() {
         (r#""fast""#, Some(r#""fast""#), "model=gpt-5.5;tier=fast"),
         (r#""ultrafast""#, Some(r#""ultrafast""#), "model=gpt-5.5;tier=ultrafast"),
     ] {
-        let (status, text, headers, body) = send(&proxy, "/v1/responses", &python, responses_body(Some(sent))).await;
+        let client = responses_body(Some(sent));
+        let (status, text, headers, body) = send(&proxy, "/v1/responses", &python, client.clone()).await;
         assert_eq!(status, 200, "{text}");
         assert_eq!(tier(&body).as_deref(), want, "{sent}: {body}");
+        assert_eq!(body, client, "{sent}: the client's bytes");
         assert_eq!(hint(&headers), Some(want_hint), "{sent}");
     }
     // Chat Completions from a Codex user agent takes the translated route (#27), which
