@@ -318,11 +318,7 @@ impl CodexExecutor {
             (_, Err(error)) => return Err(error),
             (_, Ok(upstream)) => upstream,
         };
-        let sse = upstream
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
+        let (sse, upstream) = classify_response(upstream, upstream_stream, &wire).await?;
         let observer = Observer {
             usage: req.usage.clone(),
             wire,
@@ -417,6 +413,92 @@ impl CodexExecutor {
     }
 }
 
+/// Missing MIME is not evidence of a JSON aggregate: the ChatGPT backend can omit
+/// it on a valid event stream. Inspect only enough framing to choose the reader,
+/// then replay the original chunks. Explicit media types remain authoritative.
+async fn classify_response(
+    mut upstream: crate::proxy::Upstream,
+    expected_stream: bool,
+    wire: &Wire,
+) -> Result<(bool, crate::proxy::Upstream), ExecError> {
+    if let Some(mime) = upstream.headers.get(http::header::CONTENT_TYPE) {
+        let sse = mime.to_str().ok().is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+        return Ok((sse, upstream));
+    }
+    if !expected_stream {
+        return Ok((false, upstream));
+    }
+    // ponytail: at most 64 KiB of leading empty lines before a standard SSE field.
+    // An upstream needing more should declare text/event-stream instead.
+    const PREFIX_LIMIT: usize = 64 * 1024;
+    let mut prefix = Vec::new();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let sse = loop {
+        if let Some(sse) = sse_prefix(&prefix, &mut start) {
+            break sse;
+        }
+        if prefix.len() == PREFIX_LIMIT {
+            break false;
+        }
+        match upstream.body.next().await {
+            Some(Ok(chunk)) => {
+                if !chunk.is_empty() {
+                    prefix.extend_from_slice(&chunk[..chunk.len().min(PREFIX_LIMIT - prefix.len())]);
+                    chunks.push(chunk);
+                }
+            }
+            Some(Err(error)) => {
+                for chunk in &chunks {
+                    wire.chunk(chunk);
+                }
+                wire.exec_error(&error);
+                return Err(error);
+            }
+            None => break false,
+        }
+    };
+    upstream.body = futures_util::stream::iter(chunks.into_iter().map(Ok))
+        .chain(upstream.body)
+        .boxed();
+    Ok((sse, upstream))
+}
+
+/// Only framing is inspected; event payloads are never parsed or rewritten here.
+/// The cursor makes incremental inspection linear even with one-byte chunks.
+fn sse_prefix(prefix: &[u8], start: &mut usize) -> Option<bool> {
+    if *start == 0 && prefix.first() == Some(&0xef) {
+        if prefix.len() < 3 {
+            return None;
+        }
+        if !prefix.starts_with(b"\xef\xbb\xbf") {
+            return Some(false);
+        }
+        *start = 3;
+    }
+    while prefix.get(*start).is_some_and(|b| matches!(b, b'\r' | b'\n')) {
+        *start += 1;
+    }
+    let head = &prefix[*start..];
+    if head.is_empty() {
+        return None;
+    }
+    let fields: &[&[u8]] = &[b"data:", b"event:", b"id:", b"retry:", b":"];
+    if fields.iter().any(|field| head.starts_with(field)) {
+        Some(true)
+    } else if fields.iter().any(|field| field.starts_with(head)) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// What one upstream event means for delivery.
 enum Seen {
     /// A leading event with no content yet (`response.created` and the like).
@@ -472,6 +554,9 @@ fn sse_lines(frame: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// The `event:` name and `data` payload of one framed SSE event. Several `data:` lines
 /// join with newlines, as SSE defines, in one growing buffer.
 fn parse_frame(frame: &[u8]) -> (Option<&str>, Option<Cow<'_, str>>) {
+    // A leading UTF-8 BOM belongs to SSE framing, not the first field name.
+    // Strip it only from this parsing view; the original frame still passes through.
+    let frame = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
     let mut name = None;
     let mut data: Option<Cow<'_, str>> = None;
     for line in sse_lines(frame) {
