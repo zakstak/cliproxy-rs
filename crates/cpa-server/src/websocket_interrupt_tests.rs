@@ -113,7 +113,7 @@ impl Proxy {
 
     async fn read_kind(&mut self) -> String {
         let text = self.read().await;
-        gjson::get(&text, "type").str().to_owned()
+        cpa_common::rawjson::get(&text, "type").str().to_owned()
     }
 }
 
@@ -220,11 +220,11 @@ async fn an_http_turn_acknowledges_its_local_interrupt() {
     assert_eq!(client.read().await, ACCEPTED_R1, "accepted before the terminal event");
     let incomplete = client.read().await;
     assert_eq!(
-        gjson::get(&incomplete, "type").str(),
+        cpa_common::rawjson::get(&incomplete, "type").str(),
         "response.incomplete",
         "{incomplete}"
     );
-    assert_eq!(gjson::get(&incomplete, "response.id").str(), "r1");
+    assert_eq!(cpa_common::rawjson::get(&incomplete, "response.id").str(), "r1");
     client.send(INTERRUPT_R1).await;
     assert_eq!(client.read().await, ACCEPTED_R1, "the finished response's interrupt");
     // Without an upstream socket, the next turn carries the full input: a continuation

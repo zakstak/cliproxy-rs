@@ -1,8 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# Patched third-party crates (see vendor/README.md); not workspace members.
-exclude = ["vendor"]
 
 [workspace.package]
 version = "0.4.1-zak.2"
@@ -54,8 +52,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# gjson 0.8.1 with SIMD string scanning; behaviour unchanged (vendor/README.md). A patch
-# applies to this workspace only.
-[patch.crates-io]
-gjson = { path = "vendor/gjson" }

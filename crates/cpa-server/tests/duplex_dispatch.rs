@@ -288,7 +288,7 @@ async fn next(stream: &mut ExecStream) -> Option<Result<String, ExecError>> {
 }
 
 fn get(payload: &str, path: &str) -> String {
-    gjson::get(payload, path).str().to_owned()
+    cpa_common::rawjson::get(payload, path).str().to_owned()
 }
 
 /// `TestCodexDuplexInitialFailure` with failover: the rejected account is cooled with

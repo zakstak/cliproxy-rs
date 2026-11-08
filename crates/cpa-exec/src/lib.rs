@@ -61,7 +61,7 @@ mod openai_payload;
 mod payload_barrier;
 pub mod proxy;
 mod quota;
-mod rawjson;
+pub(crate) use cpa_common::rawjson;
 mod replay;
 #[cfg(feature = "test-support")]
 pub mod test_support;

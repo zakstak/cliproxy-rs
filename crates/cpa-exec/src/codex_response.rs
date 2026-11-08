@@ -5,10 +5,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::rawjson::{self, Kind};
 use bytes::Bytes;
 use cpa_core::exec::{ExecError, ExecStream, FailureScope};
 use futures_util::StreamExt;
-use gjson::Kind;
 use http::HeaderMap;
 
 use crate::codex_json::{set_raw, set_str};
@@ -21,18 +21,18 @@ pub(crate) const EMPTY_INCOMPLETE_MESSAGE: &str =
 pub(crate) const BOOTSTRAP_MAX_FRAMES: usize = 48;
 pub(crate) const BOOTSTRAP_MAX_BYTES: usize = 1 << 20;
 
-fn lower(v: &gjson::Value<'_>) -> String {
+fn lower(v: &rawjson::Value<'_>) -> String {
     v.str().trim().to_ascii_lowercase()
 }
 
 fn text(body: &str, path: &str) -> String {
-    gjson::get(body, path).str().to_owned()
+    rawjson::get(body, path).str().to_owned()
 }
 
 /// `isCodexUsageLimitError`.
 pub(crate) fn is_usage_limit(body: &str) -> bool {
     ["error.type", "type"].iter().any(|p| {
-        gjson::get(body, p)
+        rawjson::get(body, p)
             .str()
             .trim()
             .eq_ignore_ascii_case("usage_limit_reached")
@@ -55,13 +55,13 @@ pub(crate) fn is_capacity(body: &str) -> bool {
 
 /// `codexStatusErrorClassification`.
 pub(crate) fn classification(status: u16, body: &str) -> Option<(&'static str, &'static str)> {
-    let mut message = lower(&gjson::get(body, "error.message"));
+    let mut message = lower(&rawjson::get(body, "error.message"));
     if message.is_empty() {
-        message = lower(&gjson::get(body, "message"));
+        message = lower(&rawjson::get(body, "message"));
     }
     let all = body.trim().to_ascii_lowercase();
-    let code = lower(&gjson::get(body, "error.code"));
-    let kind = lower(&gjson::get(body, "error.type"));
+    let code = lower(&rawjson::get(body, "error.code"));
+    let kind = lower(&rawjson::get(body, "error.type"));
     let invalid = kind.is_empty() || kind == "invalid_request_error";
     if status == 413
         || code == "context_length_exceeded"
@@ -122,8 +122,8 @@ fn usage_retry_after(status: u16, body: &str, now: SystemTime) -> Option<Duratio
     if status != 429 || body.is_empty() {
         return None;
     }
-    let root = gjson::parse(body);
-    for quota in [root.get("error"), gjson::parse(body)] {
+    let root = rawjson::parse(body);
+    for quota in [root.get("error"), rawjson::parse(body)] {
         if !quota
             .get("type")
             .str()
@@ -157,10 +157,10 @@ pub(crate) fn request_fault(status: u16, body: &str) -> bool {
     let field = |paths: &[&str]| {
         paths
             .iter()
-            .map(|p| gjson::get(body, p).str().trim().to_ascii_lowercase())
+            .map(|p| rawjson::get(body, p).str().trim().to_ascii_lowercase())
             .collect::<Vec<_>>()
     };
-    let valid = gjson::valid(body.trim());
+    let valid = rawjson::valid(body.trim());
     let types = if valid {
         field(&["error.type", "type", "response.error.type", "body.error.type"])
     } else {
@@ -261,7 +261,7 @@ pub(crate) fn request_scoped(status: u16, message: &str) -> ExecError {
 }
 
 fn error_body(event: &str, path: &str) -> Option<String> {
-    let found = gjson::get(event, path);
+    let found = rawjson::get(event, path);
     if !found.exists() {
         return None;
     }
@@ -271,7 +271,7 @@ fn error_body(event: &str, path: &str) -> Option<String> {
     } else if !found.str().trim().is_empty() {
         body = set_str(&body, "error.message", found.str().trim());
     }
-    let missing = |b: &str| gjson::get(b, "error.message").str().trim().is_empty();
+    let missing = |b: &str| rawjson::get(b, "error.message").str().trim().is_empty();
     if missing(&body) {
         let m = text(event, "response.error.message");
         if !m.trim().is_empty() {
@@ -318,7 +318,7 @@ fn top_level_error_body(event: &str) -> Option<String> {
 
 /// `codexTerminalFailureBody`: the error object of an `error` or `response.failed` event.
 pub(crate) fn terminal_failure_body(event: &str) -> Option<String> {
-    let body = match gjson::get(event, "type").str() {
+    let body = match rawjson::get(event, "type").str() {
         "error" => error_body(event, "error").or_else(|| top_level_error_body(event)),
         "response.failed" => error_body(event, "response.error").or_else(|| error_body(event, "error")),
         _ => return None,
@@ -326,7 +326,7 @@ pub(crate) fn terminal_failure_body(event: &str) -> Option<String> {
     let mut body = body
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| r#"{"error":{"message":"upstream stream failed without error details"}}"#.into());
-    let seq = gjson::get(event, "sequence_number");
+    let seq = rawjson::get(event, "sequence_number");
     if seq.exists() {
         body = set_raw(&body, "sequence_number", &seq.i64().to_string());
     }
@@ -334,8 +334,8 @@ pub(crate) fn terminal_failure_body(event: &str) -> Option<String> {
 }
 
 fn context_length(body: &str) -> bool {
-    let code = lower(&gjson::get(body, "error.code"));
-    let message = lower(&gjson::get(body, "error.message"));
+    let code = lower(&rawjson::get(body, "error.code"));
+    let message = lower(&rawjson::get(body, "error.message"));
     code == "context_length_exceeded"
         || code == "context_too_large"
         || ["context window", "context length", "too many tokens"]
@@ -346,13 +346,13 @@ fn context_length(body: &str) -> bool {
 /// `codexTerminalFailureStatus`.
 fn terminal_status(body: &str) -> u16 {
     for path in ["error.status_code", "error.status"] {
-        let status = gjson::get(body, path).i64();
+        let status = rawjson::get(body, path).i64();
         if (400..=599).contains(&status) {
             return status as u16;
         }
     }
-    let kind = lower(&gjson::get(body, "error.type"));
-    let code = lower(&gjson::get(body, "error.code"));
+    let kind = lower(&rawjson::get(body, "error.type"));
+    let code = lower(&rawjson::get(body, "error.code"));
     match () {
         _ if code == "cyber_policy" => 400,
         _ if kind == "not_found_error" || code == "not_found" || code == "model_not_found" => 404,
@@ -384,11 +384,11 @@ pub(crate) fn is_overload(body: &str) -> bool {
     if is_capacity(body) {
         return true;
     }
-    let kind = lower(&gjson::get(body, "error.type"));
-    let code = lower(&gjson::get(body, "error.code"));
-    let mut message = lower(&gjson::get(body, "error.message"));
+    let kind = lower(&rawjson::get(body, "error.type"));
+    let code = lower(&rawjson::get(body, "error.code"));
+    let mut message = lower(&rawjson::get(body, "error.message"));
     if message.is_empty() {
-        message = lower(&gjson::get(body, "message"));
+        message = lower(&rawjson::get(body, "message"));
     }
     kind == "service_unavailable_error"
         || code == "server_is_overloaded"
@@ -405,12 +405,12 @@ pub(crate) fn bootstrap_overload(body: &str) -> ExecError {
 /// `HasMeaningfulCodexOutputDelta`.
 pub(crate) fn meaningful_delta(payload: &str) -> bool {
     matches!(
-        gjson::get(payload, "type").str(),
+        rawjson::get(payload, "type").str(),
         "response.output_text.delta"
             | "response.reasoning_text.delta"
             | "response.reasoning_summary_text.delta"
             | "response.function_call_arguments.delta"
-    ) && !gjson::get(payload, "delta").str().trim().is_empty()
+    ) && !rawjson::get(payload, "delta").str().trim().is_empty()
 }
 
 /// `IsCodexTerminalEmptyIncomplete`: `response.incomplete` with literally zero output,
@@ -419,20 +419,20 @@ pub(crate) fn meaningful_delta(payload: &str) -> bool {
 /// abort: a cancellation before the first token produces exactly this shape, and current
 /// Codex reads those reasons itself (docs/DIFFERENCES-FROM-GO.md).
 pub(crate) fn empty_incomplete(payload: &str, items: usize, saw_delta: bool) -> bool {
-    if gjson::get(payload, "type").str() != "response.incomplete" || saw_delta || items > 0 {
+    if rawjson::get(payload, "type").str() != "response.incomplete" || saw_delta || items > 0 {
         return false;
     }
     if matches!(
-        gjson::get(payload, "response.incomplete_details.reason").str(),
+        rawjson::get(payload, "response.incomplete_details.reason").str(),
         "interrupted" | "content_filter" | "max_output_tokens"
     ) {
         return false;
     }
-    let output = gjson::get(payload, "response.output");
-    if output.kind() == Kind::Array && !output.array().is_empty() {
+    let output = rawjson::get(payload, "response.output");
+    if output.kind() == Kind::Array && !output.items().is_empty() {
         return false;
     }
-    let tokens = gjson::get(payload, "response.usage.output_tokens");
+    let tokens = rawjson::get(payload, "response.usage.output_tokens");
     tokens.kind() == Kind::Number && tokens.json().trim() == "0"
 }
 
@@ -441,27 +441,27 @@ pub(crate) fn bufferable(payload: &str) -> bool {
     if payload.trim().is_empty() {
         return true;
     }
-    let empty_list = |list: gjson::Value<'_>| {
-        list.array().iter().all(|entry| match entry.get("type").str() {
+    let empty_list = |list: rawjson::Value<'_>| {
+        list.items().iter().all(|entry| match entry.get("type").str() {
             "output_text" | "summary_text" | "text" | "reasoning_text" => entry.get("text").str().is_empty(),
             "refusal" => entry.get("refusal").str().is_empty(),
             _ => false,
         })
     };
     let empty_part = |payload: &str| {
-        let part = gjson::get(payload, "part");
+        let part = rawjson::get(payload, "part");
         match part.get("type").str() {
             "output_text" | "summary_text" | "text" | "reasoning_text" => part.get("text").str().is_empty(),
             "refusal" => part.get("refusal").str().is_empty(),
             _ => false,
         }
     };
-    match gjson::get(payload, "type").str() {
+    match rawjson::get(payload, "type").str() {
         "response.created" | "response.in_progress" | "codex.rate_limits" | "codex.response.metadata" | "keepalive" => {
             true
         }
         "response.output_item.added" => {
-            let item = gjson::get(payload, "item");
+            let item = rawjson::get(payload, "item");
             match item.get("type").str() {
                 "message" => empty_list(item.get("content")),
                 "reasoning" => {
@@ -481,7 +481,7 @@ pub(crate) fn bufferable(payload: &str) -> bool {
 
 /// `normalizeCodexWebsocketCompletion`: `response.done` is reported as `response.completed`.
 pub(crate) fn normalize_completion(payload: String) -> String {
-    if gjson::get(&payload, "type").str().trim() == "response.done" {
+    if rawjson::get(&payload, "type").str().trim() == "response.done" {
         set_str(&payload, "type", "response.completed")
     } else {
         payload
@@ -520,11 +520,11 @@ impl OutputItems {
     }
 
     pub fn collect(&mut self, payload: &str) {
-        let item = gjson::get(payload, "item");
+        let item = rawjson::get(payload, "item");
         if !matches!(item.kind(), Kind::Object | Kind::Array) {
             return;
         }
-        let index = gjson::get(payload, "output_index");
+        let index = rawjson::get(payload, "output_index");
         if index.exists() {
             self.by_index.insert(index.i64(), item.json().to_owned());
         } else {
@@ -533,8 +533,8 @@ impl OutputItems {
     }
 
     pub fn patch(&self, payload: String) -> String {
-        let output = gjson::get(&payload, "response.output");
-        let outputs = output.array();
+        let output = rawjson::get(&payload, "response.output");
+        let outputs = output.items();
         if output.kind() == Kind::Array && !outputs.is_empty() {
             // hydrateCodexCompletedOutputItemIDs: fill missing ids from done items.
             let mut patched = payload.clone();
@@ -549,7 +549,7 @@ impl OutputItems {
                 let Some(done) = self.by_index.get(&(i as i64)) else {
                     continue;
                 };
-                let done_id = gjson::get(done, "id");
+                let done_id = rawjson::get(done, "id");
                 if done_id.kind() == Kind::String && !done_id.str().trim().is_empty() {
                     patched = set_raw(&patched, &format!("response.output.{i}.id"), done_id.json());
                 }
@@ -724,7 +724,7 @@ impl Processor {
                     }
                     let handshake = bufferable(payload);
                     let mut payload = payload.to_owned();
-                    match gjson::get(&payload, "type").str() {
+                    match rawjson::get(&payload, "type").str() {
                         "response.output_item.done" => self.items.collect(&payload),
                         "response.completed" | "response.incomplete" | "response.done" => {
                             terminal = true;
@@ -794,7 +794,7 @@ impl Processor {
                 if let Some((error, _)) = terminal_failure(payload, self.model_level_cooling) {
                     return Err(error);
                 }
-                match gjson::get(payload, "type").str() {
+                match rawjson::get(payload, "type").str() {
                     "response.output_item.done" => self.items.collect(payload),
                     "response.completed" | "response.incomplete" => {
                         if empty_incomplete(payload, self.items.len(), self.saw_delta) {

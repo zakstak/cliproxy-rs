@@ -13,6 +13,8 @@
 //!   references copied from the client request; owner: server).
 //! - `json`: Go-exact tidwall/gjson, tidwall/sjson and encoding/json behaviour, used by
 //!   every crate that edits JSON on the wire (owner: translators).
+//! - `rawjson`: the same port behind `&str` signatures, for the executors and the
+//!   Responses WebSocket handler (owner: translators).
 //! - `codex_client`: executor/helps/codex_multi_agent_v2.go (Codex-client request rewrites
 //!   shared by every executor that serves Codex clients; owner: Codex).
 //! - `codex_catalog`: the Codex client model catalog and store (client/codex/models,
@@ -37,6 +39,7 @@ pub mod json;
 #[cfg(test)]
 mod json_go_vectors;
 pub mod payload;
+pub mod rawjson;
 pub mod schema;
 pub mod schema_refs;
 pub mod session;

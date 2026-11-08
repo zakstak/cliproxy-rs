@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use axum::http::HeaderMap;
-use gjson::Kind;
+use cpa_common::rawjson::{self, Kind};
 
 use crate::websocket_requests::{Item, dedupe_ids, is_complete_tool_call, is_tool_call, is_tool_output, marshal};
 
@@ -67,7 +67,7 @@ pub(crate) fn session_key(headers: &HeaderMap) -> String {
     }
     let metadata = header(headers, "x-codex-turn-metadata");
     if !metadata.is_empty() {
-        let id = gjson::get(metadata, "session_id");
+        let id = rawjson::get(metadata, "session_id");
         let id = id.str().trim();
         if !id.is_empty() {
             return id.to_owned();
@@ -168,23 +168,23 @@ impl TurnCache {
 /// Complete tool calls in a `response.completed` output or an `output_item` event, as
 /// `(type, call_id, raw item)`.
 fn response_tool_calls(payload: &str) -> Vec<(String, String, String)> {
-    let items = match gjson::get(payload, "type").str().trim() {
+    let items = match rawjson::get(payload, "type").str().trim() {
         "response.completed" => {
-            let output = gjson::get(payload, "response.output");
+            let output = rawjson::get(payload, "response.output");
             if output.kind() != Kind::Array {
                 return Vec::new();
             }
-            output.array().iter().map(|v| v.json().to_owned()).collect()
+            output.items().iter().map(|v| v.json().to_owned()).collect()
         }
         "response.output_item.added" | "response.output_item.done" => {
-            vec![gjson::get(payload, "item").json().to_owned()]
+            vec![rawjson::get(payload, "item").json().to_owned()]
         }
         _ => return Vec::new(),
     };
     items
         .into_iter()
         .filter_map(|raw| {
-            let item = gjson::parse(&raw);
+            let item = rawjson::parse(&raw);
             is_complete_tool_call(&item).then(|| {
                 (
                     item.get("type").str().trim().to_owned(),
@@ -232,7 +232,7 @@ fn metadata_string(raw: &str) -> String {
         return String::new();
     }
     if raw.starts_with('"') {
-        return gjson::parse(raw).str().trim().to_owned();
+        return rawjson::parse(raw).str().trim().to_owned();
     }
     raw.to_owned()
 }
@@ -240,10 +240,10 @@ fn metadata_string(raw: &str) -> String {
 /// `repairResponsesWebsocketToolCallsWithCachesMode` without recording. `None` when the
 /// payload stays unchanged.
 fn repair(key: &str, payload: &str, turn: Option<&mut TurnCache>) -> Option<String> {
-    if !gjson::valid(payload) {
+    if !rawjson::valid(payload) {
         return None;
     }
-    let root = gjson::parse(payload);
+    let root = rawjson::parse(payload);
     if root.kind() != Kind::Object {
         return None;
     }
@@ -262,7 +262,7 @@ fn repair(key: &str, payload: &str, turn: Option<&mut TurnCache>) -> Option<Stri
         true
     });
     let input = input.filter(|_| valid)?;
-    let items: Vec<Item> = crate::websocket_requests::parse_items(&gjson::parse(&input));
+    let items: Vec<Item> = crate::websocket_requests::parse_items(&rawjson::parse(&input));
     let enabled = !key.is_empty();
     let updated = if enabled {
         let caches = caches();
@@ -307,7 +307,7 @@ fn repair_items(
         if is_tool_output(&item.kind) {
             if item.call_id.is_empty() {
                 // Codex sends standalone named results (heartbeats, delegation input).
-                let name = gjson::get(&item.raw, "name");
+                let name = rawjson::get(&item.raw, "name");
                 if item.kind == "function_call_output" && name.kind() == Kind::String && !name.str().trim().is_empty() {
                     filtered.push(item.clone());
                 }
@@ -319,7 +319,7 @@ fn repair_items(
             }
             if let Some(raw) = cached(&caches.calls, &item.call_id) {
                 if inserted.insert(item.call_id.clone()) {
-                    filtered.push(Item::parse(&gjson::parse(&raw)));
+                    filtered.push(Item::parse(&rawjson::parse(&raw)));
                     call_present.insert(item.call_id.clone());
                 }
                 filtered.push(item.clone());
@@ -339,7 +339,7 @@ fn repair_items(
         }
         if let Some(raw) = cached(&caches.outputs, &item.call_id) {
             filtered.push(item.clone());
-            filtered.push(Item::parse(&gjson::parse(&raw)));
+            filtered.push(Item::parse(&rawjson::parse(&raw)));
             output_present.insert(item.call_id.clone());
         }
     }

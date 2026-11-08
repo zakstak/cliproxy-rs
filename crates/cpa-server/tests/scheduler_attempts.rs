@@ -507,7 +507,7 @@ async fn context_window_failure_reaches_the_client_as_its_own_code() {
             .iter()
             .map(|e| {
                 if named {
-                    format!("event: {}\ndata: {e}\n\n", gjson::get(e, "type").str())
+                    format!("event: {}\ndata: {e}\n\n", cpa_common::rawjson::get(e, "type").str())
                 } else {
                     format!("data: {e}\n\n")
                 }

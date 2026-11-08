@@ -552,6 +552,23 @@ fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, 
 
 const GO_EXECUTOR: &str = include_str!("testdata/go_executor.json");
 
+/// sjson edits recorded from Go, through the shared `rawjson` editor the executor uses.
+#[test]
+fn sjson_cases_generated_by_go_match() {
+    use crate::rawjson::{delete, set_raw, set_str};
+    let fixture: Value = serde_json::from_str(GO_EXECUTOR).unwrap();
+    for case in fixture["sjson"].as_array().unwrap() {
+        let (json, path) = (case["json"].as_str().unwrap(), case["path"].as_str().unwrap());
+        let value = case["value"].as_str().unwrap_or_default();
+        let out = match case["op"].as_str().unwrap() {
+            "raw" => set_raw(json, path, value),
+            "delete" => delete(json, path),
+            _ => set_str(json, path, value),
+        };
+        assert_eq!(out, case["out"].as_str().unwrap(), "{case}");
+    }
+}
+
 #[tokio::test]
 async fn executor_scenarios_match_go() {
     // Sequenced through execute(): compat_replay_sequence_matches_go; config keys:

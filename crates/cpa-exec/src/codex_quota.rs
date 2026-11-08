@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use gjson::Kind;
+use crate::rawjson::{self, Kind};
 use http::HeaderMap;
 
 const MAX_ADDITIONAL: usize = 8;
@@ -37,7 +37,7 @@ fn set(out: &mut Headers, name: String, value: String) {
 }
 
 /// `codexQuotaScalarValue`: strings trimmed, numbers and booleans raw.
-fn scalar(v: &gjson::Value<'_>) -> String {
+fn scalar(v: &rawjson::Value<'_>) -> String {
     match v.kind() {
         Kind::String => v.str().trim().to_owned(),
         Kind::Number | Kind::True | Kind::False => v.json().trim().to_owned(),
@@ -45,17 +45,17 @@ fn scalar(v: &gjson::Value<'_>) -> String {
     }
 }
 
-fn first<'a>(object: &'a gjson::Value<'a>, paths: &[&'a str]) -> gjson::Value<'a> {
+fn first<'a>(object: &'a rawjson::Value<'a>, paths: &[&'a str]) -> rawjson::Value<'a> {
     for path in paths {
         let v = object.get(path);
         if v.exists() && v.kind() != Kind::Null {
             return v;
         }
     }
-    gjson::Value::default()
+    rawjson::Value::default()
 }
 
-fn first_string(object: &gjson::Value<'_>, paths: &[&str]) -> String {
+fn first_string(object: &rawjson::Value<'_>, paths: &[&str]) -> String {
     paths
         .iter()
         .map(|p| scalar(&first(object, &[p])))
@@ -63,7 +63,7 @@ fn first_string(object: &gjson::Value<'_>, paths: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn set_scalar(out: &mut Headers, name: &str, object: &gjson::Value<'_>, paths: &[&str]) -> bool {
+fn set_scalar(out: &mut Headers, name: &str, object: &rawjson::Value<'_>, paths: &[&str]) -> bool {
     let value = scalar(&first(object, paths));
     if value.is_empty() {
         return false;
@@ -106,7 +106,7 @@ fn header_identifier(value: &str) -> Option<String> {
     valid_identifier(&id).then_some(id)
 }
 
-fn add_rate_limit(out: &mut Headers, prefix: &str, info: &gjson::Value<'_>) -> bool {
+fn add_rate_limit(out: &mut Headers, prefix: &str, info: &rawjson::Value<'_>) -> bool {
     if info.kind() != Kind::Object {
         return false;
     }
@@ -195,7 +195,7 @@ fn is_quota_header(name: &str) -> bool {
 /// `ParseCodexQuotaEventHeaders`: headers from a `codex.rate_limits` event, or the quota
 /// headers carried by an `error` frame. `None` for any other payload.
 pub fn event_headers(payload: &str) -> Option<Headers> {
-    let root = gjson::parse(payload);
+    let root = rawjson::parse(payload);
     let kind = event_kind(payload.as_bytes())?;
     let mut out = Headers::new();
     if kind == EventKind::Error {

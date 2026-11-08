@@ -23,7 +23,6 @@ cpa-core.workspace = true
 cpa-exec.workspace = true
 cpa-translate.workspace = true
 futures-util.workspace = true
-gjson = "0.8.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"

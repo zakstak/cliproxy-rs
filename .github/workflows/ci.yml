@@ -91,18 +91,16 @@ jobs:
       - name: Fetch dependencies
         run: |
           cargo fetch --locked
-          cargo fetch --locked --manifest-path vendor/gjson/Cargo.toml
       - name: Test, with external network denied
         # A loopback-only network namespace, as the project's merge gates use, so a test
         # that tries to reach a real provider fails instead of sending anything. The tests
         # run as the runner user inside it, so file-permission tests behave as usual.
         # Nextest runs the test binaries in parallel; .config/nextest.toml runs the memory
         # gate (crates/cpa-server/tests/alloc_budget.rs) and the tests with wall-clock
-        # bounds alone. Nextest skips doc tests, so cargo test runs those, then the tests
-        # of the patched gjson in vendor/, which is outside the workspace.
+        # bounds alone. Nextest skips doc tests, so cargo test runs those.
         # CPA_TEST_NO_SKIP makes a test that would skip for a missing PostgreSQL (or
         # unenforced file permissions) fail instead: a passing test's output is captured, so a printed skip
-        # line never reaches the log. The doc tests, the gjson tests and the cache replay
+        # line never reaches the log. The doc tests and the cache replay
         # script's tests run in shard 2, which has less nextest work. The nextest list of
         # this shard's partition goes to the counts job.
         env:
@@ -116,7 +114,6 @@ jobs:
           if [ "$SHARD" = 2 ]; then
             tests+='
               cargo test --workspace --doc --locked 2>&1 | tee -a test.log
-              cargo test --locked --manifest-path vendor/gjson/Cargo.toml --target-dir target 2>&1 | tee -a test.log
               python3 bench/test-claude-cache-replay.py 2>&1 | tee -a test.log
             '
           fi

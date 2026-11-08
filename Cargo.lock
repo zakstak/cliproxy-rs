@@ -878,7 +878,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.3.4",
- "gjson",
  "http",
  "http-body",
  "http2",
@@ -944,7 +943,6 @@ dependencies = [
  "cpa-translate",
  "futures-util",
  "getrandom 0.3.4",
- "gjson",
  "http-body",
  "hyper",
  "hyper-util",
@@ -1599,13 +1597,6 @@ name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
-
-[[package]]
-name = "gjson"
-version = "0.8.1"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "glob"

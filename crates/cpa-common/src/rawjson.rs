@@ -1,19 +1,25 @@
-//! Byte-preserving JSON edits for the Claude executor: tidwall/sjson v1.2.5, gjson
-//! v1.18.0 and Go encoding/json through the shared `cpa_common::json` port, behind
-//! `&str` signatures.
+//! The Go-compatible JSON reader and editor behind `&str` signatures: tidwall/gjson
+//! v1.18.0, tidwall/sjson v1.2.5 and Go encoding/json through [`crate::json`].
 //!
 //! Claude request rewriting must reproduce Go's bytes exactly: CCH signs the final
-//! body, and prompt caching keys on it. Lookups go through the Go port too: Go's gjson
-//! moves on to a later member when a duplicate key's path is missing, formats numbers
-//! as Go's `Result.String()` does, and reads `Bool()` and `Int()` Go's way.
+//! body, and prompt caching keys on it. The Codex observers (failure classification,
+//! quota headers, WebSocket bookkeeping, the Images adapter and Alpha Search) and the
+//! shared Responses WebSocket handler read through it too. Reading never changes the
+//! document: callers forward the bytes they inspected.
+//!
+//! Lookups follow Go's gjson: a path that is missing under the first of duplicate keys
+//! moves on to a later member, a lookup into text that does not start with JSON finds
+//! the first `{` or `[`, numbers format as Go's `Result.String()` does, and `Bool()`,
+//! `Int()` and `Float()` coerce Go's way. [`Value::array`] is Go's `Array()`;
+//! [`Value::items`] is the elements of an array and nothing otherwise.
 
 use std::borrow::Cow;
 
-use cpa_common::json::{self, Res};
+use crate::json::{self, Res};
 /// JSON kinds exposed by the Go-compatible reader. This adapter does not use the
 /// third-party gjson crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     Null,
     False,
     True,
@@ -23,9 +29,9 @@ pub(crate) enum Kind {
     Object,
 }
 
-/// A gjson `Result` with the method names the Claude executor reads it by.
+/// A gjson `Result` with `&str` accessors.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Value<'a> {
+pub struct Value<'a> {
     res: Res<'a>,
     raw: Cow<'a, str>,
     /// `Result.String()` when it is not the unescaped string `res.s` already holds
@@ -67,15 +73,15 @@ impl<'a> Value<'a> {
     }
 
     /// `Result.Get`.
-    pub(crate) fn get(&self, path: &str) -> Value<'a> {
+    pub fn get(&self, path: &str) -> Value<'a> {
         Value::new(self.src(), self.res.get(path))
     }
 
-    pub(crate) fn exists(&self) -> bool {
+    pub fn exists(&self) -> bool {
         self.res.exists()
     }
 
-    pub(crate) fn kind(&self) -> Kind {
+    pub fn kind(&self) -> Kind {
         match self.res.kind {
             json::Kind::Null => Kind::Null,
             json::Kind::False => Kind::False,
@@ -88,12 +94,12 @@ impl<'a> Value<'a> {
     }
 
     /// The raw JSON.
-    pub(crate) fn json(&self) -> &str {
+    pub fn json(&self) -> &str {
         &self.raw
     }
 
     /// `Result.String()`.
-    pub(crate) fn str(&self) -> &str {
+    pub fn str(&self) -> &str {
         match &self.s {
             Some(s) => s,
             // Unescaped from valid UTF-8 (lone surrogates become U+FFFD), so this holds.
@@ -102,29 +108,29 @@ impl<'a> Value<'a> {
     }
 
     /// `Result.Int()`.
-    pub(crate) fn i64(&self) -> i64 {
+    pub fn i64(&self) -> i64 {
         self.res.int()
     }
 
     /// `Result.Float()`.
-    pub(crate) fn f64(&self) -> f64 {
+    pub fn f64(&self) -> f64 {
         self.res.float()
     }
 
     /// `Result.Bool()`.
-    pub(crate) fn bool(&self) -> bool {
+    pub fn bool(&self) -> bool {
         self.res.bool()
     }
 
     /// `Result.ForEach`.
-    pub(crate) fn each(&self, mut f: impl FnMut(Value<'a>, Value<'a>) -> bool) {
+    pub fn each(&self, mut f: impl FnMut(Value<'a>, Value<'a>) -> bool) {
         let src = self.src();
         self.res.each(|k, v| f(Value::new(src, k), Value::new(src, v)));
     }
 
     /// `Result.Array()`: one allocation, as the gjson crate made, rather than one for
     /// the port's results and another for these.
-    pub(crate) fn array(&self) -> Vec<Value<'a>> {
+    pub fn array(&self) -> Vec<Value<'a>> {
         let src = self.src();
         if self.kind() != Kind::Array {
             // Go: nothing for null, else the value itself.
@@ -144,7 +150,7 @@ impl<'a> Value<'a> {
     }
 
     /// `if v.IsArray() { range v.Array() }`: the elements of an array, else nothing.
-    pub(crate) fn items(&self) -> Vec<Value<'a>> {
+    pub fn items(&self) -> Vec<Value<'a>> {
         if self.kind() == Kind::Array {
             self.array()
         } else {
@@ -154,7 +160,7 @@ impl<'a> Value<'a> {
 
     /// The values `Result.ForEach` visits: array elements, an object's member values
     /// (duplicates included), a scalar itself, nothing when missing.
-    pub(crate) fn values(&self) -> Vec<Value<'a>> {
+    pub fn values(&self) -> Vec<Value<'a>> {
         if self.kind() == Kind::Array {
             return self.array();
         }
@@ -167,40 +173,40 @@ impl<'a> Value<'a> {
     }
 
     /// `len(Result.Map())`: distinct member keys of an object, else 0.
-    pub(crate) fn map_len(&self) -> usize {
+    pub fn map_len(&self) -> usize {
         self.res.map().len()
     }
 }
 
 /// `gjson.Get`.
-pub(crate) fn get<'a>(json: &'a str, path: &str) -> Value<'a> {
+pub fn get<'a>(json: &'a str, path: &str) -> Value<'a> {
     Value::new(json, json::get(json.as_bytes(), path))
 }
 
 /// `gjson.Parse`.
-pub(crate) fn parse(json: &str) -> Value<'_> {
+pub fn parse(json: &str) -> Value<'_> {
     Value::new(json, json::parse(json.as_bytes()))
 }
 
 /// `gjson.Valid`.
-pub(crate) fn valid(json: &str) -> bool {
+pub fn valid(json: &str) -> bool {
     json::valid(json.as_bytes())
 }
 
 /// Byte offset of a value that `get` borrowed from `json`.
-pub(crate) fn offset(json: &str, value: &Value<'_>) -> Option<usize> {
+pub fn offset(json: &str, value: &Value<'_>) -> Option<usize> {
     let raw = value.json();
     let start = (raw.as_ptr() as usize).checked_sub(json.as_ptr() as usize)?;
     (!raw.is_empty() && start + raw.len() <= json.len() && &json[start..start + raw.len()] == raw).then_some(start)
 }
 
 /// Go's `encoding/json` string marshalling (HTML-escaping, U+2028/9 escaped).
-pub(crate) fn go_string(s: &str) -> String {
+pub fn go_string(s: &str) -> String {
     marshal(s, true)
 }
 
 /// `json.Encoder` with `SetEscapeHTML(false)`, i.e. `JSON.stringify` for these inputs.
-pub(crate) fn js_string(s: &str) -> String {
+pub fn js_string(s: &str) -> String {
     marshal(s, false)
 }
 
@@ -216,28 +222,28 @@ fn text(bytes: Vec<u8>) -> String {
 }
 
 /// `sjson.SetRawBytes`; an sjson error leaves the document unchanged.
-pub(crate) fn set_raw(json: &str, path: &str, raw: &str) -> String {
+pub fn set_raw(json: &str, path: &str, raw: &str) -> String {
     json::try_set_raw(json.as_bytes(), path, raw).map_or_else(|_| json.to_owned(), text)
 }
 
 /// `sjson.SetBytes` with a Go string value.
-pub(crate) fn set_str(json: &str, path: &str, value: &str) -> String {
+pub fn set_str(json: &str, path: &str, value: &str) -> String {
     json::try_set_str(json.as_bytes(), path, value).map_or_else(|_| json.to_owned(), text)
 }
 
 /// `sjson.DeleteBytes`.
-pub(crate) fn delete(json: &str, path: &str) -> String {
+pub fn delete(json: &str, path: &str) -> String {
     json::try_delete(json.as_bytes(), path).map_or_else(|_| json.to_owned(), text)
 }
 
 /// [`delete`] of an owned document, which comes back as it was, not copied, when
 /// nothing changes.
-pub(crate) fn delete_owned(json: String, path: &str) -> String {
+pub fn delete_owned(json: String, path: &str) -> String {
     json::delete_changed(json.as_bytes(), path).map_or(json, text)
 }
 
 /// `gjson.Result.String()` on a lookup, owned.
-pub(crate) fn string(json: &str, path: &str) -> String {
+pub fn string(json: &str, path: &str) -> String {
     get(json, path).str().to_owned()
 }
 
@@ -245,20 +251,48 @@ pub(crate) fn string(json: &str, path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The reader semantics the executors and the Responses WebSocket handler rely on
+    /// since the third-party gjson crate was removed (docs/GJSON-MIGRATION.md).
     #[test]
-    fn sjson_cases_generated_by_go_match() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("claude/testdata/go_executor.json")).unwrap();
-        for case in fixture["sjson"].as_array().unwrap() {
-            let (json, path) = (case["json"].as_str().unwrap(), case["path"].as_str().unwrap());
-            let value = case["value"].as_str().unwrap_or_default();
-            let out = match case["op"].as_str().unwrap() {
-                "raw" => set_raw(json, path, value),
-                "delete" => delete(json, path),
-                _ => set_str(json, path, value),
-            };
-            assert_eq!(out, case["out"].as_str().unwrap(), "{case}");
-        }
+    fn reads_follow_go_gjson() {
+        // The first of duplicate keys wins; a path missing under it moves on to a later
+        // member, as Go's gjson does.
+        let dup = r#"{"type":"a","type":"b","error":{"x":1},"error":{"message":"second"}}"#;
+        assert_eq!(get(dup, "type").str(), "a");
+        assert_eq!(get(dup, "error").json(), r#"{"x":1}"#);
+        assert_eq!(get(dup, "error.message").str(), "second");
+        // Raw spelling survives in `json()`; `str()` is Go's `Result.String()`.
+        let nums = r#"{"a":12.50,"b":1e400,"c":123456789012345678901234567890,"d":7}"#;
+        assert_eq!(get(nums, "a").json(), "12.50");
+        assert_eq!(get(nums, "a").str(), "12.5");
+        assert_eq!(get(nums, "b").json(), "1e400");
+        assert_eq!(get(nums, "c").json(), "123456789012345678901234567890");
+        assert_eq!(get(nums, "c").kind(), Kind::Number);
+        assert_eq!(get(nums, "d").str(), "7");
+        // Go `Int()`: integer strings parse, other strings read 0, numbers truncate.
+        let ints = r#"{"s":"429","f":"429.5","n":429.9}"#;
+        assert_eq!(get(ints, "s").i64(), 429);
+        assert_eq!(get(ints, "f").i64(), 0);
+        assert_eq!(get(ints, "n").i64(), 429);
+        // `items()` is the elements of an array and nothing else; `array()` is Go's.
+        let doc = r#"{"list":[1,{"k":2}],"obj":{"k":1},"null":null}"#;
+        let items = get(doc, "list").items();
+        assert_eq!(items.iter().map(Value::json).collect::<Vec<_>>(), ["1", r#"{"k":2}"#]);
+        assert!(get(doc, "obj").items().is_empty());
+        assert_eq!(get(doc, "obj").array().len(), 1);
+        assert!(get(doc, "missing").items().is_empty());
+        assert!(get(doc, "null").array().is_empty());
+        // Escapes decode in `str()` only; a lone surrogate becomes U+FFFD; an escaped key
+        // matches its decoded name.
+        let esc = r#"{"k\u0065y":"a\ud800b","t":"\u0068i"}"#;
+        assert_eq!(get(esc, "key").str(), "a\u{fffd}b");
+        assert_eq!(get(esc, "t").str(), "hi");
+        assert_eq!(get(esc, "t").json(), r#""\u0068i""#);
+        // Go's lookup starts at the first `{` or `[`, also after leading text.
+        assert_eq!(
+            get(r#"upstream: {"error":{"message":"m"}}"#, "error.message").str(),
+            "m"
+        );
     }
 
     #[test]

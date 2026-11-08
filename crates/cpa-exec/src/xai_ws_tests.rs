@@ -138,7 +138,9 @@ async fn handler(State(shared): State<Shared>, req: axum::extract::Request) -> R
 async fn serve_socket(mut socket: AxSocket, shared: Shared) {
     while let Some(Ok(message)) = socket.recv().await {
         let AxMessage::Text(text) = message else { continue };
-        let previous = gjson::get(text.as_str(), "previous_response_id").str().to_owned();
+        let previous = crate::rawjson::get(text.as_str(), "previous_response_id")
+            .str()
+            .to_owned();
         let act = {
             let mut script = shared.lock().unwrap();
             script.recorded.frames.push(text.as_str().to_owned());
@@ -505,7 +507,7 @@ fn capture_problems(
         let acts = turn["acts"].as_array().cloned().unwrap_or_default();
         let mut stage = None;
         for (frame, act) in recorded.frames.iter().zip(&acts) {
-            let previous = gjson::get(frame, "previous_response_id").str().to_owned();
+            let previous = crate::rawjson::get(frame, "previous_response_id").str().to_owned();
             let quoted = serde_json::to_string(&previous).unwrap();
             for message in act["send"].as_array().into_iter().flatten() {
                 let message = message.as_str().unwrap().replace("\"PREVIOUS_ID\"", &quoted);
@@ -1217,7 +1219,7 @@ fn upstream_previous(shared: &Shared) -> Vec<String> {
         .recorded
         .frames
         .iter()
-        .map(|f| gjson::get(f, "previous_response_id").str().to_owned())
+        .map(|f| crate::rawjson::get(f, "previous_response_id").str().to_owned())
         .collect()
 }
 

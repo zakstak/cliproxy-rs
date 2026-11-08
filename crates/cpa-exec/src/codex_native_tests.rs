@@ -159,6 +159,52 @@ async fn streaming_requests_and_events_pass_unchanged() {
     }
 }
 
+/// Every native event passes through the observers (usage, output-item bookkeeping,
+/// failure classification), which read through `cpa_common::rawjson` since the third-party
+/// gjson crate was removed. Observation reads a copy: duplicate keys, number spellings the
+/// reader formats differently (`1.0`, `2.50`, `1e400`, a 30-digit integer), escapes and
+/// unknown members reach the client as sent, streamed and buffered alike. The terminal
+/// event has no duplicate key: the native route finds its type with the strict
+/// `CodexBody` parser, which refuses one.
+#[tokio::test]
+async fn observed_events_keep_duplicates_number_spellings_and_escapes() {
+    let created = r#"{"type":"response.created","type":"ignored","sequence_number":1.0,"response":{"id":"resp_\u0031","created_at":1e400,"future":{"n":123456789012345678901234567890,"s":"\ud83d\ude00\u00e9"}}}"#;
+    let done = r#"{"type":"response.output_item.done","output_index":0.0,"item":{"type":"message","id":"msg_1","id":"msg_dup","content":[{"type":"output_text","text":"h\u0069"}]}}"#;
+    let response = r#"{"id":"resp_1","output":[{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":5,"output_tokens":2.50,"total_tokens":7.0e0},"x":[1E+2,-0.0]}"#;
+    let completed = format!(r#"{{"type":"response.completed","sequence_number":3,"response":{response}}}"#);
+    let events = format!(
+        "event: response.created\ndata: {created}\n\nevent: response.output_item.done\ndata: {done}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
+    let mock = Mock::start().await;
+    let body = fixture("http-request-full").bytes();
+    for kind in [Kind::OAuth, Kind::Key] {
+        mock.script("/responses", vec![sse_text(&events)]);
+        let streamed = executor()
+            .execute(
+                &credential(kind, &mock.url),
+                request(body.clone(), "gpt-test", true, None),
+                &Config::default(),
+            )
+            .await
+            .unwrap();
+        let (out, error) = drain(streamed).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(text(&out), events, "streamed events");
+        mock.take();
+    }
+    let full = text(&body).replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    mock.script("/responses", vec![sse_text(&events)]);
+    let buffered_answer = executor()
+        .execute(
+            &credential(Kind::OAuth, &mock.url),
+            request(full, "gpt-test", false, None),
+            &Config::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text(&buffered(buffered_answer)), response, "buffered terminal object");
+}
+
 /// Routing to an alias's upstream model changes the `model` value and nothing else.
 #[tokio::test]
 async fn an_alias_changes_only_the_model_value() {
