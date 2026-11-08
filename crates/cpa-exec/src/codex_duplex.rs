@@ -26,7 +26,7 @@ use cpa_core::exec::{ExecError, ExecRequest, ExecStream, FailureScope};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Turn, Upstream, model_kept, transport, ws_error};
+use super::{Read, Turn, Upstream, transport, ws_error};
 use crate::codex_request::View;
 use crate::codex_response as response;
 use crate::rawjson;
@@ -556,19 +556,17 @@ impl Duplex {
         } else {
             self.req.model.trim().to_owned()
         };
-        // Judged for this create: its own client model against the model sent upstream.
-        let (frame, kept) = match body.routed(&upstream, false) {
-            std::borrow::Cow::Borrowed(_) => {
-                let kept = model_kept(payload.as_bytes(), &payload);
-                (payload, kept)
-            }
-            std::borrow::Cow::Owned(bytes) => {
-                let frame = String::from_utf8(bytes).expect("Codex boundary validated UTF-8");
-                let kept = model_kept(payload.as_bytes(), &frame);
-                (frame, kept)
-            }
-        };
+        // Judged for this create: the model it named against the model sent upstream,
+        // ignoring ASCII case as Codex does (the rule of `model_kept`).
+        let kept = body
+            .get("model")
+            .and_then(|m| m.text())
+            .is_some_and(|named| named.eq_ignore_ascii_case(&upstream));
         let announce = super::handshake_metadata_event(&self.turn.conn.later_metadata(&upstream, kept));
+        let frame = match body.routed(&upstream, false) {
+            std::borrow::Cow::Borrowed(_) => payload,
+            std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).expect("Codex boundary validated UTF-8"),
+        };
         let prepared = Prepared {
             native: self.initial.native,
             announce,

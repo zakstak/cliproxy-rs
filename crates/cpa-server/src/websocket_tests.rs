@@ -1935,9 +1935,12 @@ async fn a_failed_attempt_never_donates_its_model_to_later_requests() {
             ],
             "steering={steering}"
         );
+        // The scheduler picks either key first; each socket uses one, never the client's.
+        let mut used: Vec<String> = auths.lock().unwrap().iter().map(|(_, auth)| auth.clone()).collect();
+        used.sort();
         assert_eq!(
-            *auths.lock().unwrap(),
-            [(0, "Bearer sk-FAKE-1".to_owned()), (1, "Bearer sk-FAKE-2".to_owned())],
+            used,
+            ["Bearer sk-FAKE-1", "Bearer sk-FAKE-2"],
             "steering={steering}: each socket its own credential, never the client key"
         );
         assert_eq!(

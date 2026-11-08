@@ -246,8 +246,7 @@ pub(crate) struct Upstream {
 }
 
 /// A socket's upgrade `openai-model` and the upstream model the upgrade was sent for.
-#[derive(Debug)]
-pub(crate) struct UpgradeModel {
+struct UpgradeModel {
     /// The routed upstream model of the request that dialed the socket.
     requested: String,
     /// The upgrade's `openai-model`, trimmed and not empty.
