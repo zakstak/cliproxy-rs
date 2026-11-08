@@ -958,3 +958,43 @@ async fn missing_mime_keeps_native_http_streaming_and_chatgpt_buffered_aggregati
         }
     }
 }
+
+#[tokio::test]
+async fn initial_bom_is_framing_for_http_delivery_and_aggregation() {
+    let mock = Mock::start().await;
+    let terminal = fixture("sse-completed").frames().pop().unwrap();
+    let terminal = text(&terminal);
+    let object = &terminal[terminal.find(r#""response":"#).unwrap() + 11..terminal.len() - 1];
+    for mime in [None, Some("text/event-stream")] {
+        for event_line in ["", "event: response.completed\n"] {
+            let wire = format!("\u{feff}{event_line}data: {terminal}\n\n");
+            for stream in [true, false] {
+                mock.script(
+                    "/responses",
+                    vec![Reply {
+                        status: 200,
+                        headers: mime
+                            .map(|mime| vec![("content-type".into(), mime.into())])
+                            .unwrap_or_default(),
+                        body: wire.clone(),
+                    }],
+                );
+                let response = executor()
+                    .execute(
+                        &credential(Kind::OAuth, &mock.url),
+                        request(fixture("http-request-full").bytes(), "gpt-test", stream, None),
+                        &Config::default(),
+                    )
+                    .await
+                    .unwrap();
+                if stream {
+                    let (bytes, error) = drain(response).await;
+                    assert!(error.is_none(), "MIME={mime:?} event_line={event_line:?}: {error:?}");
+                    assert_eq!(bytes, wire.as_bytes(), "the BOM and wire bytes pass through unchanged");
+                } else {
+                    assert_eq!(text(&buffered(response)), object);
+                }
+            }
+        }
+    }
+}

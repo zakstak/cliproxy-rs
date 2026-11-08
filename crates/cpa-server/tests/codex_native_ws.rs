@@ -1485,3 +1485,42 @@ async fn valid_sse_without_content_type_reaches_websocket_client() {
         }
     }
 }
+
+#[tokio::test]
+async fn initial_bom_does_not_hide_the_only_terminal_event_on_websocket_fallback() {
+    let terminal = fixture("sse-completed").frames().pop().unwrap();
+    for profile in [Profile::Chatgpt, Profile::Compatible] {
+        for mime in [None, Some("text/event-stream")] {
+            for event_line in ["", "event: response.completed\n"] {
+                let mut reply = cpa_server::testing::codex_capture::Reply::sse(format!(
+                    "\u{feff}{event_line}data: {}\n\n",
+                    std::str::from_utf8(&terminal).unwrap()
+                ));
+                reply.headers = mime
+                    .map(|mime| vec![("content-type".into(), mime.into())])
+                    .unwrap_or_default();
+                let proxy = proxy_with(
+                    Script {
+                        http: vec![reply],
+                        ..Script::default()
+                    },
+                    "",
+                    |url| vec![credential(profile, url, false)],
+                )
+                .await;
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                let turn = read(&mut socket, &TERMINAL).await;
+                assert_eq!(
+                    turn.frames,
+                    vec![std::str::from_utf8(&terminal).unwrap().to_owned()],
+                    "{profile:?} MIME={mime:?} event_line={event_line:?}"
+                );
+                assert_eq!(turn.closed, None);
+            }
+        }
+    }
+}

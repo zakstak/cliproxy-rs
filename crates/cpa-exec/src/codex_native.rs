@@ -560,6 +560,9 @@ fn sse_lines(frame: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// The `event:` name and `data` payload of one framed SSE event. Several `data:` lines
 /// join with newlines, as SSE defines, in one growing buffer.
 fn parse_frame(frame: &[u8]) -> (Option<&str>, Option<Cow<'_, str>>) {
+    // A leading UTF-8 BOM belongs to SSE framing, not the first field name.
+    // Strip it only from this parsing view; the original frame still passes through.
+    let frame = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
     let mut name = None;
     let mut data: Option<Cow<'_, str>> = None;
     for line in sse_lines(frame) {
