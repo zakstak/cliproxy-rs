@@ -746,7 +746,8 @@ mod config_writes {
     /// Scenarios whose file cliproxy-rs refuses to load where Go loads it
     /// (docs/DIFFERENCES-FROM-GO.md), with the refusal.
     /// Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): Go's
-    /// scenarios that start from a `plugins` section are refused at load.
+    /// scenarios that start from a `plugins` section are refused at load. The mixed
+    /// float-valued routing scenario then replays with only that section removed.
     const REFUSED_LOADS: &[(&str, &str)] = &[
         ("binary_plugin_pin", cpa_core::config::PLUGINS_REMOVED),
         ("plugin_entries_and_float_ints", cpa_core::config::PLUGINS_REMOVED),
@@ -834,8 +835,14 @@ mod config_writes {
             if let Some((_, refusal)) = REFUSED_LOADS.iter().find(|(n, _)| *n == name) {
                 let e = Config::load(&path).err().map(|e| format!("{e:#}"));
                 assert_eq!(e.as_deref(), Some(*refusal), "{name}");
-                let _ = std::fs::remove_dir_all(&dir);
-                continue;
+                if name != "plugin_entries_and_float_ints" {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+                // Keep the unrelated routing PATCH and its recorded file assertion,
+                // including request-retry: 2.9, after proving the original refusal.
+                let yaml = plugins_removed::without_plugins_yaml(scenario["yaml"].as_str().unwrap());
+                std::fs::write(&path, yaml.replace("$HASH", &hash)).unwrap();
             }
             let mut cfg = Config::load(&path).unwrap();
             cfg.auth_dir = auth.clone();
@@ -977,11 +984,11 @@ mod config_writes {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-        // 186 recorded steps: 9 in the two scenarios refused at load, and 6 plugin
-        // section reads and writes refused here.
-        assert_eq!((compared, retired), (171, 6));
+        // 186 recorded steps: 4 in binary_plugin_pin refused at load, 10 plugin
+        // section reads/writes refused here, and 172 retained comparisons.
+        assert_eq!((compared, retired), (172, 10));
         eprintln!("config writes: {bytes_compared} of {compared} steps compared byte for byte");
-        assert_eq!(bytes_compared, 135, "steps compared byte for byte");
+        assert_eq!(bytes_compared, 136, "steps compared byte for byte");
     }
 }
 
