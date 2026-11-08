@@ -18,10 +18,10 @@ On a new server, the Overview shows a short Get started card with three steps: c
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/connect-dark.png">
-  <img src="img/connect-light.png" alt="The Connect account page: sign in to Claude, ChatGPT, Kimi, Meta, xAI or Devin, or add a provider API key" width="880">
+  <img src="img/connect-light.png" alt="The Connect account page: sign in to Claude, ChatGPT, Meta or xAI, or add a provider API key" width="880">
 </picture>
 
-In the dashboard, choose Connect account and pick a provider. Claude and ChatGPT (Codex) open the provider's own sign-in page; Kimi, Meta, xAI and Devin show a device code to enter on their site. The proxy stores the sign-in token in `auth-dir`. It never sees your password.
+In the dashboard, choose Connect account and pick a provider. Claude and ChatGPT (Codex) open the provider's own sign-in page; Meta and xAI show a device code to enter on their site. The proxy stores the sign-in token in `auth-dir`. It never sees your password.
 
 You can also sign in from a terminal, which helps on a server without a browser:
 
@@ -29,7 +29,7 @@ You can also sign in from a terminal, which helps on a server without a browser:
 cliproxy --config ~/.cliproxy-rs/config.yaml --claude-login --no-browser
 ```
 
-The other sign-in flags are `--codex-login`, `--codex-device-login`, `--kimi-login`, `--meta-login`, `--xai-login` and `--devin-login`. API keys for Claude, Codex, Gemini, Vertex AI, xAI and OpenAI-compatible services go on the dashboard's Provider keys page.
+The other sign-in flags are `--codex-login`, `--codex-device-login`, `--meta-login` and `--xai-login`. API keys for Claude, Codex, xAI and Meta go on the dashboard's Provider keys page.
 
 Read [Accounts and provider terms](../README.md#accounts-and-provider-terms) before using a subscription. This setup is for one person using their own accounts on their own machines. Use provider-sanctioned integrations or API keys where available.
 
@@ -48,7 +48,7 @@ export ANTHROPIC_AUTH_TOKEN=PASTE-YOUR-CLIENT-KEY
 claude
 ```
 
-[CLIENTS.md](CLIENTS.md) has the setup for Codex CLI, Gemini CLI, Amp, OpenCode, Cursor, Cline, Zed, Aider, the SDKs and more.
+[CLIENTS.md](CLIENTS.md) has the setup for Codex CLI, Amp, OpenCode, Cursor, Cline, Zed, Aider, the SDKs and more.
 
 ## Running it safely
 

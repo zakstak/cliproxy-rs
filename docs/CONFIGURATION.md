@@ -80,26 +80,20 @@ Older files spell these as `oauth.providers.codex.*`, `oauth.providers.claude.*`
 
 ## api-keys
 
-Provider API keys, as opposed to account sign-ins, go here, grouped by provider: `claude`, `codex`, `gemini`, `vertex`, `xai` and `openai-compatibility` for any service that speaks the OpenAI API. The dashboard's Provider keys page edits them. An OpenAI-compatible service, for example:
+Provider API keys, as opposed to account sign-ins, go here, grouped by provider: `claude`, `codex`, `xai` and `meta`. The dashboard's Provider keys page edits them. For example:
 
 ```yaml
 api-keys:
-  openai-compatibility:
-    - name: openrouter
-      base-url: "https://openrouter.ai/api/v1"
+  claude:
+    - base-url: "https://api.anthropic.com"
       keys:
-        - api-key: "sk-or-..."
+        - api-key: "sk-ant-..."
       models:
-        - name: "moonshotai/kimi-k2"
-          alias: "kimi-k2"
+        - name: "claude-sonnet-5-5"
+          alias: "sonnet"
 ```
 
-A `vertex` key with `interactions: true` sends Interactions clients (`/v1beta/interactions`) to Vertex's native Interactions API (`/v1beta1/interactions`) instead of translating them to `generateContent`. A Vertex service-account file opts in the same way with `"interactions": true` or `"native_interactions": true` at the top level. When the credential names a project (a service account's `project_id`, or a file's `project_id` next to its `access_token`), the path is `/v1beta1/projects/<project>/locations/global/interactions`; the credential's `location` is ignored, and the host is the configured `base-url` or `https://aiplatform.googleapis.com`.
-
-Vertex partner and open models (MaaS), named `<publisher>/<model>` such as `deepseek-ai/deepseek-v4.1-flash-maas` or `publishers/<publisher>/models/<model>`, go to Vertex's OpenAI-compatible `endpoints/openapi` route as Chat Completions requests, for every client format and before the Interactions opt-in; the upstream model is `<publisher>/<model>`. Two setups reach the route:
-
-- A `vertex` API-key entry whose `models` list names a partner model, with a third-party relay `base-url`. The request goes to `<base-url>/v1/endpoints/openapi/chat/completions` with `Authorization: Bearer <key>`. A base that already names a version segment (`/v1/`, `/v1beta1/` or a last segment such as `v1`) gets only `/endpoints/openapi` appended; a base that already ends in `/endpoints/openapi` is used as given, one that names `projects/<project>/locations/<location>` gets `/endpoints/openapi` appended, and one containing `/publishers/` is cut there before `/endpoints/openapi` is appended. On Google's own hosts (no `base-url`, or an `aiplatform.googleapis.com` one) the key is not sent and the route answers 400, since those hosts need a service account. A `base-url` that Go's URL parser rejects, such as one with a percent-escaped host like `https://%61iplatform.googleapis.com`, answers 500 without sending a request. So does a `base-url` that Go parses without a host, such as `https:relay.example` or `https:///v1`, or without an `http` or `https` scheme, such as `relay.example`. The same applies to a service account's `base_url`, after its token exchange.
-- A Vertex service-account file with `"openapi": true`, which sends the catalog's Gemini models as `google/<model>` (Imagen models excepted; `"openapi": false` turns the route off). It calls `https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/endpoints/openapi/chat/completions` (`global` uses `aiplatform.googleapis.com`) with a fresh access token; a file's `openapi_location` overrides the location. A file `base_url` takes the place of that scheme and host and may carry a path: the version segment and the project route are appended to it under the same rules as above. Any Vertex auth file (not only a service-account one, and whatever its `openapi` setting) lists, besides the Vertex catalog, the models named in its `openapi_models` (a list, or a comma-separated string) or `models` (names, or `{name, alias}` entries), and the targets of the `oauth-model-alias.vertex` aliases. A listed partner model takes the `endpoints/openapi` route unless the file sets `"openapi": false`, in which case it goes to the native `generateContent` route. As for every OAuth alias, an alias without `fork: true` then replaces its target in the model list, so clients select the model by the alias name.
+The `gemini`, `interactions`, `vertex` and `openai-compatibility` groups (and their legacy `gemini-api-key`, `interactions-api-key`, `vertex-api-key` and `openai-compatibility` spellings) belong to providers this build removed. A config that fills one of them does not load, a reload that adds one keeps the running config, and a Management API write that sets one is refused, each with a message naming the setting. The same applies to `oauth.providers.antigravity`, `devin`, `aistudio` (`ws-auth`), `kimi`, `gemini`, `gemini-cli` and `vertex`, to `models.devin-catalog`, and to a removed provider's entry under `oauth.model-alias` or `oauth.excluded-models`. Empty values, as in CLIProxyAPI's example config, load. See [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#removed-providers).
 
 A `models` entry with an `alias` is a per-file model alias in any auth file, like `model_aliases`.
 
@@ -187,7 +181,7 @@ service-name ports such as `:http` are not accepted.
 
 | Setting | What it does |
 |---|---|
-| `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cliproxy-rs checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
+| `catalog`, `codex-catalog` | Where the model catalog (`models.json`) and the Codex client catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cliproxy-rs checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
 
 ## worker-threads
 

@@ -74,23 +74,23 @@ The server must be able to write to `/data`: it saves the hashed management key 
 
 A browser sign-in ends with a redirect to a callback port on `127.0.0.1`. How that redirect reaches the proxy depends on where you start the sign-in.
 
-**From the dashboard (recommended).** For Claude, Codex and Antigravity, the server starts a callback forwarder on the provider's port, listening on all of the container's interfaces. It redirects the browser on to `http://127.0.0.1:<server.port>/<provider>/callback`. For that to work:
+**From the dashboard (recommended).** For Claude and Codex, the server starts a callback forwarder on the provider's port, listening on all of the container's interfaces. It redirects the browser on to `http://127.0.0.1:<server.port>/<provider>/callback`. For that to work:
 
-- Publish each callback port with the same number on the host: 54545 (Claude), 1455 (Codex) and 51121 (Antigravity).
+- Publish each callback port with the same number on the host: 54545 (Claude) and 1455 (Codex).
 - Publish the server port with the same number too (`-p 127.0.0.1:8317:8317` for the default `server.port: 8317`), because the redirect names `server.port`.
 
 ```sh
 docker run -d --name cliproxy \
-  -p 127.0.0.1:8317:8317 -p 127.0.0.1:54545:54545 -p 127.0.0.1:1455:1455 -p 127.0.0.1:51121:51121 \
+  -p 127.0.0.1:8317:8317 -p 127.0.0.1:54545:54545 -p 127.0.0.1:1455:1455 \
   -v "$PWD/data:/data" cliproxy-rs
 ```
 
 **From the command line inside the container.** These logins run their own callback listener instead of the forwarder:
 
-- `--claude-login` (port 54545) and `--antigravity-login` (port 51121) listen on all interfaces, so the published ports above reach them. Add `--no-browser` and open the printed URL on the host.
-- `--codex-login` (port 1455), `-siwc-bind` (port 1455) and `--devin-login` listen only on the container's own `127.0.0.1`, which a published port cannot reach. Sign in from the dashboard or use a device-code login instead. `--devin-login` also offers to paste the redirect URL after five seconds.
+- `--claude-login` (port 54545) listens on all interfaces, so the published ports above reach them. Add `--no-browser` and open the printed URL on the host.
+- `--codex-login` (port 1455) and `-siwc-bind` (port 1455) listen only on the container's own `127.0.0.1`, which a published port cannot reach. Sign in from the dashboard or use a device-code login instead.
 
-Device-code logins need no callback port: `--codex-device-login`, Kimi, Meta and xAI. If you cannot publish the callback ports, use one of those, or paste the final callback URL into the dashboard:
+Device-code logins need no callback port: `--codex-device-login`, Meta and xAI. If you cannot publish the callback ports, use one of those, or paste the final callback URL into the dashboard:
 
 ```sh
 docker exec -it cliproxy cliproxy --config /data/config.yaml --codex-device-login
@@ -168,9 +168,9 @@ After building the binary, set it up by hand:
      auth-dir: "~/.cliproxy-rs/auth"     # where account sign-ins are saved
    ```
 
-   Keep a copy of the management key: on first start the server replaces it in `config.yaml` with a bcrypt hash. Every setting in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/main/config.example.yaml) is accepted, although settings for features listed as not yet supported have no effect; [CONFIGURATION.md](CONFIGURATION.md) explains the common ones.
+   Keep a copy of the management key: on first start the server replaces it in `config.yaml` with a bcrypt hash. Settings in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/main/config.example.yaml) are accepted, except those that configure a removed provider ([DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#removed-providers)), and settings for features listed as not yet supported have no effect; [CONFIGURATION.md](CONFIGURATION.md) explains the common ones.
 2. Start the server: `cliproxy --config config.yaml`. With no `--config`, it reads `config.yaml` in the current directory. Check it with `curl http://127.0.0.1:8317/healthz`, which answers `{"status":"ok"}`.
-3. Connect accounts with `--claude-login`, `--codex-login`, `--codex-device-login`, `--antigravity-login`, `--kimi-login`, `--kimi-ai-login`, `--meta-login`, `--xai-login` or `--devin-login`, import a Vertex AI service account with `--vertex-import key.json`, or connect accounts from the dashboard at `/management.html`. Add `--no-browser` on a machine without a browser.
+3. Connect accounts with `--claude-login`, `--codex-login`, `--codex-device-login`, `--meta-login` or `--xai-login`, or connect accounts from the dashboard at `/management.html`. Add `--no-browser` on a machine without a browser.
 
 Go-style single-dash flags such as `-config config.yaml` work too.
 

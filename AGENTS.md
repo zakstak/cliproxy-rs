@@ -2,21 +2,21 @@
 
 If you are an agent installing cliproxy-rs for a user rather than developing it, stop here and follow [docs/AI-SETUP.md](docs/AI-SETUP.md).
 
-A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) targeting full parity and drop-in compatibility: same `config.yaml`, same auth JSON files in `auth-dir`, same HTTP routes and response shapes, same v8 Management API.
+A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), compatible with its `config.yaml`, auth JSON files in `auth-dir`, HTTP routes and response shapes and v8 Management API for the providers it keeps. This fork has four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Clients use Anthropic Messages, OpenAI Chat Completions or OpenAI Responses. Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and the generic OpenAI-compatible upstreams were removed (issue #49); their settings, routes, logins and imports fail with a migration error (`cpa_core::removed`), and their saved logins stay on disk unread. Do not add them back, migrate their code or keep compatibility layers for them.
 
 ## Reference
 
 - The reference is frozen at CLIProxyAPI **v8.0.35**, commit `ae3ee3be303fb07fb8173279923413005bf32177`: clone https://github.com/router-for-me/CLIProxyAPI, check out that commit and treat the clone as read-only. Cite Go file paths in comments only where behaviour is non-obvious. Existing goldens keep their recorded versions; they do not prove later Go changes. `docs/parity-audit/checklist.md` tracks the target contracts; `docs/parity-audit/upstream-v8.0.35.md` lists the commits since the previous reference, `6fecc6e`.
-- When Go behaviour and documentation disagree, the Go code wins. Port behaviour, not structure: idiomatic Rust over transliterated Go.
-- A deliberate difference from Go is listed in `docs/DIFFERENCES-FROM-GO.md`, and tests that compare against Go goldens encode it explicitly.
-- Codex is the exception. For Codex request and response payloads, transports and identity, [docs/codex/CONTRACT.md](docs/codex/CONTRACT.md) is the authority: first-party `openai/codex` at `44ccf394573c` and OpenAI's API documentation, per endpoint profile. Go behaviour, Go goldens and Go parser quirks do not decide the Codex contract, and an unknown in that document stays unknown until a source covers it. Codex goldens stay labelled with their Go version as historical evidence for behaviour not yet migrated. A Codex PR that changes behaviour visible to an operator coming from Go still lists it in `docs/DIFFERENCES-FROM-GO.md`, justified by the contract. Every other provider keeps the Go v8.0.35 rule above.
+- Provider correctness comes first: provider documentation, first-party clients and verified wire behaviour take precedence over Go CLIProxyAPI quirks. Go goldens stay as regression evidence, and Go-compatible behaviour is kept where a real client or provider needs it. Where neither a provider source nor a client need decides, Go v8.0.35 is the default; when Go behaviour and Go documentation disagree, the Go code wins. Port behaviour, not structure: idiomatic Rust over transliterated Go.
+- A deliberate difference from Go is listed in `docs/DIFFERENCES-FROM-GO.md`, and tests that compare against Go goldens encode it explicitly. Golden cases of a removed provider are skipped or filtered with a comment naming issue #49, never re-recorded to match.
+- Codex is the exception. For Codex request and response payloads, transports and identity, [docs/codex/CONTRACT.md](docs/codex/CONTRACT.md) is the authority: first-party `openai/codex` at `44ccf394573c` and OpenAI's API documentation, per endpoint profile. Go behaviour, Go goldens and Go parser quirks do not decide the Codex contract, and an unknown in that document stays unknown until a source covers it. Codex goldens stay labelled with their Go version as historical evidence for behaviour not yet migrated. A Codex PR that changes behaviour visible to an operator coming from Go still lists it in `docs/DIFFERENCES-FROM-GO.md`, justified by the contract. Every other provider follows the provider-first rule above.
 
 ## Layout
 
 - `crates/cpa-core`: config and credential file formats. No networking.
 - `crates/cpa-common`: provider-neutral, Go-exact helpers shared by translators and executors.
-- `crates/cpa-translate`: format translation between the Anthropic, OpenAI and Gemini APIs.
-- `crates/cpa-exec`: one module per upstream provider (wire format, auth headers, HTTP client profile).
+- `crates/cpa-translate`: format translation between the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses (Codex) formats.
+- `crates/cpa-exec`: one module group per upstream provider (Claude, Codex, xAI, Meta: wire format, auth headers, HTTP client profile), with shared helpers in provider-neutral modules (`helpers`, `login`, `openai_http`, `openai_payload`, `multipart`, `compaction_capsule`, `claude_input_tokens`).
 - `crates/cpa-server`: axum routes, client auth, credential selection, management API.
 - `crates/cpa-plugin`, `crates/cpa-store`, `crates/cpa-home`: the plugin host, the remote config and auth stores, and Home mode.
 - `crates/cliproxy`: the binary. Go-style single-dash flags are accepted.
@@ -24,7 +24,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI) tar
 
 ## Rules
 
-- The full test suite is slow and memory-heavy (the BoringSSL build and the release link). While iterating, run the affected crate or a filter, for example `cargo test -p cpa-exec kimi`; CI runs fmt, `clippy -D warnings` and the whole suite. On a shared or small machine, add `CARGO_BUILD_JOBS=2 nice -n 19`.
+- The full test suite is slow and memory-heavy (the BoringSSL build and the release link). While iterating, run the affected crate or a filter, for example `cargo test -p cpa-exec xai`; CI runs fmt, `clippy -D warnings` and the whole suite. On a shared or small machine, add `CARGO_BUILD_JOBS=2 nice -n 19`.
 - The Go and PostgreSQL comparison tests in `cargo test` run fully only in CI, inside a network-denied namespace. For a local Go/Rust differential run on Linux, use `./harness/run` (see `harness/README.md`).
 - Port Go's `strings.ToLower`, `strings.ToUpper` and `strings.EqualFold` with `cpa_core::gostr::GoStr` (`go_lower`, `go_upper`, `go_eq_fold`). Rust's full case mappings differ on non-ASCII input, so `clippy.toml` disallows `str::to_lowercase` and `str::to_uppercase`; keep `eq_ignore_ascii_case` only where the input is ASCII by definition (header names, protocol tokens) or the comparison is explicitly ASCII. An ASCII literal alone is not enough: Go's `EqualFold` also matches `ſ` to `s` and the Kelvin sign `K` to `k`.
 - Request bodies are forwarded byte for byte unless a ported rule rewrites them. Never re-serialize JSON just to pass it through.

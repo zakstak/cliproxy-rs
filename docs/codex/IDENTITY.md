@@ -29,7 +29,7 @@ A *native exchange* is a request whose source and response formats are both Resp
 (`codex` or `openai-response`). The formats decide, not what the caller claims to be:
 an OpenAI SDK posting `/v1/responses` keeps its own `User-Agent`, exactly as a Codex
 client does. Everything else is formulated by the proxy and carries the proxy's identity:
-cross-API translations (Chat Completions, Claude and Gemini into Codex), the Images API,
+cross-API translations (Chat Completions and Claude into Codex), the Images API,
 live calls and token grants.
 
 `crates/cpa-exec/src/codex_identity.rs` implements the policy, and every Codex call site

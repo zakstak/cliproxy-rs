@@ -179,13 +179,14 @@ async fn go_v0_routes_replay_byte_for_byte() {
     let hash = bcrypt::hash("fake-secret", 4).unwrap();
     let client = wreq::Client::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut compared = 0;
+    let (mut compared, mut skipped) = (0, 0);
     for scenario in fixture()["scenarios"].as_array().unwrap() {
         let name = scenario["name"].as_str().unwrap();
         let dir = std::env::temp_dir().join(format!("cpa-legacy-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        let yaml = scenario["yaml"].as_str().unwrap().replace("$HASH", &hash);
+        // The removed providers' settings go (issue #49).
+        let yaml = cpa_core::removed::strip_settings(&scenario["yaml"].as_str().unwrap().replace("$HASH", &hash));
         std::fs::write(&path, with_auth_dir(&yaml, &dir)).unwrap();
         // routing.strategy in Go's state, from the fixture alone.
         let mut go_strategy = yaml_strategy(&yaml);
@@ -200,6 +201,11 @@ async fn go_v0_routes_replay_byte_for_byte() {
         };
         for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
             let (method, route) = (step["method"].as_str().unwrap(), step["path"].as_str().unwrap());
+            // The removed providers' v0 routes answer 410 (issue #49).
+            if removed_route(route) {
+                skipped += 1;
+                continue;
+            }
             let at = format!(
                 "{name}[{i}] {method} {route} {}",
                 step["body"].as_str().unwrap_or_default()
@@ -222,6 +228,11 @@ async fn go_v0_routes_replay_byte_for_byte() {
             let res = send(method, route, sent).await.unwrap();
             let status = res.status().as_u16();
             let body = res.text().await.unwrap();
+            // A write that configures a removed provider is refused (issue #49); the rest
+            // of the scenario builds on it.
+            if body.contains("is no longer supported") {
+                break;
+            }
             compared += 1;
             if let Some(before) = file_before {
                 assert_eq!(std::fs::read(&path).unwrap(), before, "{at}: the read wrote the config");
@@ -230,7 +241,9 @@ async fn go_v0_routes_replay_byte_for_byte() {
                 failures.push(format!("{at}: status {status}, Go {}: {body}", step["status"]));
                 continue;
             }
-            let mut want = step["raw_response"].as_str().unwrap();
+            let want_owned = without_removed(step["raw_response"].as_str().unwrap());
+            let body = without_removed(&body);
+            let mut want = want_owned.as_str();
             // docs/DIFFERENCES-FROM-GO.md "Default routing strategy": for an unset strategy
             // Go answers round-robin, cliproxy-rs the effective soonest-reset.
             if strategy_read && unset {
@@ -253,8 +266,8 @@ async fn go_v0_routes_replay_byte_for_byte() {
             }
             if let Some(go_cfg) = step["config"].as_str() {
                 let res = send("GET", "/config", String::new()).await.unwrap();
-                let got = res.text().await.unwrap();
-                if let Some(d) = first_difference(&got, go_cfg) {
+                let got = without_removed(&res.text().await.unwrap());
+                if let Some(d) = first_difference(&got, &without_removed(go_cfg)) {
                     failures.push(format!("{at}: config after write: {d}"));
                 }
             }
@@ -274,6 +287,7 @@ async fn go_v0_routes_replay_byte_for_byte() {
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
+    eprintln!("v0 replay: {compared} steps compared, {skipped} removed-provider steps skipped");
     assert!(compared >= 816, "{compared}");
     assert!(
         failures.is_empty(),
@@ -281,6 +295,47 @@ async fn go_v0_routes_replay_byte_for_byte() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A v0 route of a removed provider (issue #49).
+fn removed_route(route: &str) -> bool {
+    let route = route.split('?').next().unwrap_or_default();
+    [
+        "/gemini-api-key",
+        "/interactions-api-key",
+        "/vertex-api-key",
+        "/openai-compatibility",
+        "/vertex/import",
+        "/antigravity-auth-url",
+        "/kimi-auth-url",
+        "/kimi-ai-auth-url",
+        "/devin-auth-url",
+    ]
+    .contains(&route)
+}
+
+/// A management answer without the removed providers' keys (issue #49): their v0 key
+/// lists and their entries in the per-channel OAuth maps. Other bytes stay as they were.
+fn without_removed(text: &str) -> String {
+    if !text.trim_start().starts_with('{') {
+        return cpa_core::removed::strip_settings(text);
+    }
+    let mut out = text.as_bytes().to_vec();
+    for key in [
+        "gemini-api-key",
+        "interactions-api-key",
+        "vertex-api-key",
+        "openai-compatibility",
+        "ws-auth",
+    ] {
+        cpa_common::json::delete(&mut out, key);
+    }
+    for map in ["oauth-excluded-models", "oauth-model-alias", "oauth-request-scoped-errors"] {
+        for channel in ["gemini", "gemini-cli", "vertex", "aistudio", "antigravity", "kimi", "devin"] {
+            cpa_common::json::delete(&mut out, &format!("{map}.{channel}"));
+        }
+    }
+    String::from_utf8(out).unwrap()
 }
 
 /// v0 aliases must answer exactly like the v8 routes they wrap, and list entries carry

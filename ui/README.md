@@ -52,7 +52,7 @@ All paths are under `/v8/management`. Every screen also uses `GET /config` and `
 | --- | --- |
 | Overview | `GET /credentials` every 10 s while visible |
 | Accounts | `GET /credentials` every 10 s while visible, `POST /credentials` (upload), `DELETE /credentials`, `GET /credentials/download`, `GET /credentials/models`, `PATCH /credentials/status`, `PATCH /credentials/fields`, `POST /credentials/refresh`, `POST /routing/cooldown/reset`; quota checks by button only, one at a time and at most once per account every 2 minutes: `POST /requests/api-call` (Claude, Codex, Kimi usage), `POST /plugins/<id>/quota`. Batch actions send one request per account, except one `DELETE /credentials` for all. |
-| Connect | `GET /oauth/auth-url`, `GET /oauth/status` every 2 s while waiting, `POST /oauth/callback`, `DELETE /oauth/session`, `POST /oauth/import?provider=vertex`, `GET /plugins` |
+| Connect | `GET /oauth/auth-url`, `GET /oauth/status` every 2 s while waiting, `POST /oauth/callback`, `DELETE /oauth/session`, `GET /plugins` |
 | Providers | `GET /observability/usage/api-keys`; `PUT /config/api-keys/<family>` |
 | Client keys | `PUT /config/access/api-keys` |
 | Models | `GET /routing/model-definitions/<channel>`; `PUT /config/oauth/model-alias/<channel>`, `PUT /config/oauth/excluded-models/<channel>` |
