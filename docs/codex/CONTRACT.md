@@ -513,7 +513,14 @@ the conversion removes `type`, routes `model`, and sends `stream: true` when the
 omits `stream` or sets it to `false`: a WebSocket turn always delivers events, so the HTTP
 request asks for the event stream. Nothing else changes. An upstream that answers with a
 success that is not an event stream fails the turn with a credential-scoped 502 before
-anything reaches the client; the proxy delivers no aggregate and invents no event. The upstream's
+anything reaches the client; the proxy delivers no aggregate and invents no event. When a requested HTTP event stream has no Content-Type header, the proxy inspects
+at most 64 KiB of its initial framing (an optional UTF-8 BOM, empty lines, then a
+standard SSE field or comment). It replays every inspected byte unchanged. A
+missing MIME header alone does not establish a non-stream response. Explicit
+media types remain authoritative. This also applies to native HTTP streaming
+and the ChatGPT buffered-to-stream adaptation. This is a transport compatibility
+rule based on the fork deployment captures, not a new endpoint guarantee.
+The upstream's
 SSE events reach the client unchanged, one event's `data` payload per text frame, with
 the connection as prompt-cache identity in the headers. Failures follow the native
 WebSocket rule: a Codex client's context-window event goes ahead of the error (#5), any
