@@ -239,6 +239,29 @@ pub(crate) struct Upstream {
     /// shut down, after which no pick binds.
     lease: Mutex<(bool, Option<SessionLease>)>,
     write: WriteLimit,
+    /// The `openai-model` this socket's own upgrade returned, set once by the Codex
+    /// executor before the socket is published. Later requests on this socket repeat
+    /// it ([`Upstream::later_metadata`]); no other socket's value can reach them.
+    upgrade_model: std::sync::OnceLock<UpgradeModel>,
+}
+
+/// A socket's upgrade `openai-model` and the upstream model the upgrade was sent for.
+struct UpgradeModel {
+    /// The routed upstream model of the request that dialed the socket.
+    requested: String,
+    /// The upgrade's `openai-model`, trimmed and not empty.
+    served: String,
+}
+
+impl UpgradeModel {
+    /// `None` when the upgrade has no usable `openai-model`.
+    fn from_handshake(requested: &str, handshake: &HeaderMap) -> Option<Self> {
+        let served = metadata_value(handshake, OPENAI_MODEL)?;
+        Some(Self {
+            requested: requested.to_owned(),
+            served: served.to_owned(),
+        })
+    }
 }
 
 impl Upstream {
@@ -251,7 +274,37 @@ impl Upstream {
             link: Mutex::default(),
             reader: Mutex::default(),
             lease: Mutex::default(),
+            upgrade_model: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Metadata for a request served on this socket after the request that opened it:
+    /// only `openai-model` from this socket's own upgrade. The pinned client re-emits its
+    /// socket's upgrade model as `ServerModel` on every request
+    /// (`codex-api/src/endpoint/responses_websocket.rs:302-303`), and its startup
+    /// prewarm drains the opening request's notifications (`core/src/client.rs:2550-2557`)
+    /// before the real request reuses the socket. Turn state is never repeated: it
+    /// belongs to the turn that opened the socket, and a later turn's lock is first-wins
+    /// (`responses_websocket.rs:934-938`).
+    ///
+    /// Empty when this request's model was changed by the proxy (`model_kept`), when
+    /// the socket was opened for another upstream model, or when the upgrade returned
+    /// no model. The model-switch omission is an additional proxy policy: the pinned
+    /// client repeats unconditionally. Backend applicability after a switch is unknown,
+    /// so omission can hide a still-applicable reroute notice. See CONTRACT.md's
+    /// "Handshake metadata" policy and tradeoff.
+    pub(crate) fn later_metadata(&self, model: &str, model_kept: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let Some(upgrade) = self.upgrade_model.get() else {
+            return headers;
+        };
+        if !model_kept || !upgrade.requested.eq_ignore_ascii_case(model) {
+            return headers;
+        }
+        if let Ok(value) = http::HeaderValue::from_str(&upgrade.served) {
+            headers.insert(OPENAI_MODEL, value);
+        }
+        headers
     }
 
     /// The read channel for the next turn. `preserves`: see [`Link::preserves`].
@@ -1384,6 +1437,9 @@ impl CodexExecutor {
         let (socket, handshake) = self.dial(target, headers, model, model_level_cooling, wire).await?;
         let (sink, stream) = socket.split();
         let conn = Upstream::new(target.clone(), sink, self.ws.write);
+        if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
+            let _ = conn.upgrade_model.set(upgrade);
+        }
         // Publish before the reader runs, so a reader that fails at once still finds its
         // socket current and invalidates it; holding the handle slot keeps a concurrent
         // shutdown from missing the abort handle.
@@ -1588,6 +1644,11 @@ impl CodexExecutor {
         if !observed.is_empty() {
             self.quota_observe(&view.credential.id, &model, &observed);
         }
+        // Read from the socket that serves the turn, after any retry replaced it.
+        let returned = match handshake {
+            Some(handshake) => returned_handshake(handshake, model_kept),
+            None => conn.later_metadata(&model, model_kept),
+        };
         let turn = Turn {
             rx,
             conn,
@@ -1613,7 +1674,7 @@ impl CodexExecutor {
             let stream = duplex::Duplex::start(turn, input, initial, req, view, settings.image_generation).await;
             return Ok(ExecResponse {
                 status: 200,
-                headers: returned_handshake(handshake, model_kept),
+                headers: returned,
                 body: ResponseBody::Stream(stream),
             });
         }
@@ -1624,7 +1685,7 @@ impl CodexExecutor {
         };
         Ok(ExecResponse {
             status: 200,
-            headers: returned_handshake(handshake, model_kept),
+            headers: returned,
             body: ResponseBody::Stream(stream),
         })
     }
@@ -1645,32 +1706,29 @@ fn model_kept(original: &[u8], upstream: &str) -> bool {
 
 /// The handshake of a turn that opened its socket, as the server sees it. Codex treats
 /// an `openai-model` that differs from the model it sent as a reroute and warns the user
-/// that the account was flagged. When this proxy changed the model (alias, payload rule,
-/// thinking suffix), upstream's answer describes that change, so it is dropped. A reused
-/// socket has no handshake.
-fn returned_handshake(handshake: Option<HeaderMap>, model_kept: bool) -> HeaderMap {
-    let mut handshake = handshake.unwrap_or_default();
+/// that the account was flagged. When this proxy changed the model (an alias or a
+/// payload rule), upstream's answer describes that change, so it is dropped. A turn on a
+/// reused socket gets [`Upstream::later_metadata`] instead.
+fn returned_handshake(mut handshake: HeaderMap, model_kept: bool) -> HeaderMap {
     if !model_kept {
         handshake.remove(OPENAI_MODEL);
     }
     handshake
 }
 
-/// Handshake metadata from a newly opened upstream socket, as a `response.metadata` event
-/// that a Codex client reads: `x-codex-turn-state` and `openai-model` from its `headers`.
-/// The downstream socket was upgraded before the first request chose a credential and a
-/// model, so these headers cannot go into its handshake. Codex reads
-/// `x-reasoning-included` only from a handshake, so it is not carried. Only the
-/// headers named here are carried; `None` when the handshake has none of them.
+/// Upstream handshake metadata as a `response.metadata` event that a Codex client reads
+/// from its `headers` (`codex-api/src/sse/responses.rs:193-222`). The downstream socket
+/// was upgraded before the first request chose a credential and a model, so these headers
+/// cannot go into its handshake. `headers` is what the executor returned for the turn:
+/// the opening upgrade's headers on the turn that opened the socket, which may carry
+/// `x-codex-turn-state` and `openai-model`, or only `openai-model` on a later request
+/// ([`Upstream::later_metadata`]). Codex reads `x-reasoning-included` only from a
+/// handshake, so it is not carried. Only the headers named here are carried; `None`
+/// when `headers` has none of them.
 pub fn handshake_metadata_event(handshake: &HeaderMap) -> Option<String> {
     let mut headers = serde_json::Map::new();
     for name in [TURN_STATE, OPENAI_MODEL] {
-        let value = handshake
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-        if let Some(value) = value {
+        if let Some(value) = metadata_value(handshake, name) {
             headers.insert(name.to_owned(), value.into());
         }
     }
@@ -1679,6 +1737,15 @@ pub fn handshake_metadata_event(handshake: &HeaderMap) -> Option<String> {
     }
     let event = serde_json::json!({"type": "response.metadata", "headers": headers});
     Some(event.to_string())
+}
+
+/// A metadata header's value as the event carries it: valid text, trimmed, not empty.
+fn metadata_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// tungstenite's reports of a peer that went away without a close frame, which

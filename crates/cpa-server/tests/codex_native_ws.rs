@@ -688,16 +688,18 @@ async fn the_exhausted_failure_reaches_the_client_as_sent() {
     }
 }
 
-/// Handshake metadata (#3). The downstream socket was upgraded before the first request
-/// chose a credential, so `x-codex-turn-state` and `openai-model` from the upstream
-/// handshake arrive as a `response.metadata` event the pinned client reads
-/// (`sse/responses.rs:198-222`), ahead of the opening turn's first event only.
+/// Handshake metadata (#3, #24). The downstream socket was upgraded before the first
+/// request chose a credential, so `x-codex-turn-state` and `openai-model` from the
+/// upstream handshake arrive as a `response.metadata` event the pinned client reads
+/// (`sse/responses.rs:193-222`), ahead of the opening turn's first event. A later turn on
+/// the reused socket gets `openai-model` alone the same way, as the directly connected
+/// client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`).
 /// `x-reasoning-included` cannot travel this way: the client reads it from a handshake
 /// alone (`responses_websocket.rs:617`), so it is not sent. Metadata that arrives in
-/// events (`headers` on an event) reaches the client inside that event, unchanged, on
-/// every turn.
+/// events (`headers` on an event) reaches the client inside that event, unchanged and
+/// after the proxy's event, on every turn.
 #[tokio::test]
-async fn handshake_metadata_reaches_the_opening_turn_and_event_metadata_every_turn() {
+async fn handshake_metadata_reaches_each_turn_and_event_metadata_passes_unchanged() {
     let with_headers =
         r#"{"type":"response.created","response":{"id":"resp_fixture_1"},"headers":{"openai-model":"gpt-5.5-event"}}"#;
     let mut first = fixture("sse-completed").frames();
@@ -735,7 +737,167 @@ async fn handshake_metadata_reaches_the_opening_turn_and_event_metadata_every_tu
         .await
         .unwrap();
     let reused = read(&mut socket, &TERMINAL).await;
-    assert_eq!(reused.frames, upstream, "a reused socket has no handshake to report");
+    assert_eq!(
+        reused.frames[0], r#"{"type":"response.metadata","headers":{"openai-model":"gpt-5.5"}}"#,
+        "the reused socket's model alone, never its turn state"
+    );
+    assert_eq!(reused.frames[1..], upstream, "then the events as sent");
+}
+
+/// The upgrade headers of every metadata test: two the client reads and three that must
+/// never travel.
+fn metadata_handshake(model: &str) -> Vec<(String, String)> {
+    [
+        ("x-codex-turn-state", "ts-FAKE"),
+        ("openai-model", model),
+        ("x-reasoning-included", "true"),
+        ("set-cookie", "session=SECRET"),
+        ("x-request-id", "req-SECRET"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect()
+}
+
+/// #24 (refs #3). The pinned client's startup prewarm (`generate: false`) opens the
+/// socket and drains its notifications, keeping only the completion
+/// (`core/src/client.rs:2550-2557`), then hands that session to the real request
+/// (`core/src/tasks/regular.rs:100-131`). A directly connected client still reports its
+/// upgrade model on that request, because it re-emits it on every request
+/// (`responses_websocket.rs:302-303`). Through the proxy, the real request, its
+/// continuation and a later logical turn on the same socket each get a
+/// `response.metadata` holding only `openai-model`. The turn state reached the prewarm,
+/// which opened the socket; repeating it would seed a later turn's first-wins lock with
+/// a stale value. The upgrade names another model than requested, a reroute that stays
+/// visible on every request. With and without response steering, the upstream receives
+/// exactly the client's three frames.
+#[tokio::test]
+async fn a_prewarmed_socket_reports_its_model_on_every_later_request() {
+    const OPENING: &str =
+        r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-FAKE","openai-model":"gpt-5.5-served"}}"#;
+    const LATER: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-5.5-served"}}"#;
+    let prewarm_created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
+    let prewarm_done = r#"{"type":"response.completed","response":{"id":"resp_fixture_1","usage":null}}"#;
+    for steering in [false, true] {
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws_handshake: metadata_handshake("gpt-5.5-served"),
+                ws: vec![
+                    vec![
+                        Bytes::from_static(prewarm_created.as_bytes()),
+                        Bytes::from_static(prewarm_done.as_bytes()),
+                    ],
+                    fixture("sse-completed").frames(),
+                    fixture("sse-completed").frames(),
+                ],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let prewarm = client_frame("ws-create-prewarm", "gpt-5.5");
+        socket.send(Message::text(prewarm.clone())).await.unwrap();
+        let warm = read(&mut socket, &TERMINAL).await;
+        assert_eq!(
+            warm.frames,
+            [OPENING, prewarm_created, prewarm_done],
+            "steering={steering}"
+        );
+        let mut later = vec![LATER.to_owned()];
+        later.extend(events("sse-completed"));
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        let real = read(&mut socket, &TERMINAL).await;
+        assert_eq!(real.frames, later, "steering={steering}: the real request");
+        let next = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(next.clone())).await.unwrap();
+        let turn = read(&mut socket, &TERMINAL).await;
+        assert_eq!(turn.frames, later, "steering={steering}: a later logical turn");
+        let sockets = proxy.upstream.sockets();
+        assert_eq!(sockets.len(), 1, "steering={steering}");
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            [prewarm, continuation, next],
+            "steering={steering}: nothing else was sent"
+        );
+        assert_eq!(sockets[0].headers["authorization"], "Bearer at-FAKE");
+        let delivered = [warm.frames, real.frames, turn.frames].concat();
+        assert!(
+            delivered
+                .iter()
+                .all(|f| !f.contains("SECRET") && !f.contains("x-reasoning-included") && !f.contains("client-key")),
+            "steering={steering}: {delivered:?}"
+        );
+    }
+}
+
+/// #24: the alias rule is judged on each request. Codex reports any `openai-model` that
+/// differs from the model it sent as a cyber-safety reroute, so a request whose model the
+/// proxy rewrote never gets the upgrade's model, and a request on the same socket that
+/// named the upstream model does. With and without response steering.
+#[tokio::test]
+async fn each_request_on_a_reused_socket_judges_the_alias_rule_itself() {
+    for steering in [false, true] {
+        let upstream = CaptureUpstream::start(Script {
+            ws_handshake: metadata_handshake("gpt-upstream"),
+            ws: replies(&["sse-completed", "sse-completed", "sse-completed"]),
+            ..Script::default()
+        })
+        .await;
+        let auth_dir = AuthDir::new();
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\naccess:\n  api-keys: [client-key]\n{}codex-api-key:\n  - api-key: key-FAKE\n    base-url: {}\n    websockets: true\n    models:\n      - name: gpt-upstream\n      - name: gpt-upstream\n        alias: gpt-alias\n",
+            auth_dir.0.display(),
+            if steering { STEERING } else { "" },
+            upstream.base_url
+        ))
+        .unwrap();
+        let credentials = cpa_core::config::credentials::from_config(&cfg);
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
+        let proxy = Proxy {
+            addr: serve(cpa_server::router(rt)).await,
+            upstream,
+            _auth_dir: auth_dir,
+        };
+        let mut socket = connect(&proxy).await;
+        let routed = |frame: &str| frame.replacen(r#""model":"gpt-alias""#, r#""model":"gpt-upstream""#, 1);
+        let with_metadata = |metadata: &str| {
+            let mut frames = vec![metadata.to_owned()];
+            frames.extend(events("sse-completed"));
+            frames
+        };
+        let turns = [
+            (
+                client_frame("ws-create-first", "gpt-alias"),
+                with_metadata(r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-FAKE"}}"#),
+            ),
+            (
+                client_frame("ws-create-continuation", "gpt-upstream"),
+                with_metadata(r#"{"type":"response.metadata","headers":{"openai-model":"gpt-upstream"}}"#),
+            ),
+            (
+                client_frame("ws-create-continuation", "gpt-alias"),
+                events("sse-completed"),
+            ),
+        ];
+        let mut sent = Vec::new();
+        for (i, (frame, want)) in turns.into_iter().enumerate() {
+            socket.send(Message::text(frame.clone())).await.unwrap();
+            let read = read(&mut socket, &TERMINAL).await;
+            assert_eq!(read.frames, want, "steering={steering}: turn {i}");
+            sent.push(routed(&frame));
+        }
+        assert_eq!(proxy.upstream.sockets().len(), 1, "steering={steering}");
+        assert_eq!(upstream_frames(&proxy, 0), sent, "steering={steering}");
+    }
 }
 
 // Home (`remote_dispatch`): the pool is remote, and the local store holds no credential.
