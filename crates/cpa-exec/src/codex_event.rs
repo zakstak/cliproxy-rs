@@ -900,7 +900,12 @@ const WRAPPED_ERROR_MEMBERS: [&str; 3] = ["code", "message", "headers"];
 /// `sequence_number` or other member outside its struct. That object, and every other
 /// frame, is then read as [`pinned_view`] reads it: the last of a repeated key, private
 /// values resolved. Members are not read further than the pinned reader reads them: a
-/// `Value` member that is an array stays one.
+/// `Value` member that is an array stays one. One reading is wider than the struct's: a
+/// wrapped error's `error` is a struct, not a `Value`, so the pinned reader ignores a
+/// private token there as an unknown member, while this view resolves it as it does in
+/// every object frame's `error`; that only adds members a failure reading can find, so
+/// account safety reads it conservatively, and a positional frame reads as its object
+/// form.
 ///
 /// Classification only: the client receives the frame as sent. One extra decoding, and
 /// only for a frame that starts with `[`.

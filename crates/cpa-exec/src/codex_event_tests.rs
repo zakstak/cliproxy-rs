@@ -844,15 +844,11 @@ fn positional_frames_are_classified_by_their_members() {
         let want: Value = serde_json::from_str(&pinned_view(&object)).unwrap();
         assert_eq!(view, want, "{positional}");
     }
-    // A positional event has no member outside its struct: no status to read.
+    // A positional event has no member outside its struct: no status to read. (The
+    // failure readings of these views are in `codex_ws_tests.rs`: this file stays free of
+    // other modules, so `codex_event.rs` can be compiled on its own.)
     let view = classification_view(&failed);
     assert!(!view.contains("status"), "{view}");
-    let (error, _) = crate::codex_response::terminal_failure(&view, false).unwrap();
-    assert_eq!(error.status, 429);
-    assert_eq!(
-        crate::codex_ws::ws_error(&classification_view(r#"["error",429,{"code":"x"}]"#), false).map(|e| e.status),
-        Some(429)
-    );
     // Neither struct: classification reads nothing new. An object frame keeps its view.
     for frame in [
         r#"["response.failed",null,null,{"error":{"type":"rate_limit_error"}}]"#,

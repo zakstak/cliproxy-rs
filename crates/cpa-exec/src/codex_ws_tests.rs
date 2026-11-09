@@ -2192,3 +2192,30 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     assert!(received[1].len() > 32 << 20);
     assert!(received[2].contains(r#""previous_response_id":"r1""#));
 }
+
+/// #25 and #6: the failure readings of a frame written as a JSON array read the members
+/// the pinned client decodes it to (`codex_event::classification_view`). A positional
+/// `response.failed` is the rate limit its `response.error` says; a positional wrapped
+/// status error fails by its status; a positional event has no status, so its status-frame
+/// reading finds none. The frame as sent reads as neither.
+#[test]
+fn positional_frames_read_by_their_decoded_members() {
+    let failed = r#"["response.failed",null,null,{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited"}},null,null,null,null,null,null,null,null,null,null]"#;
+    let event = crate::codex_event::decode(failed).unwrap();
+    let view = crate::codex_event::classification_view(failed);
+    let (error, _) = response::terminal_failure(&view, false).unwrap();
+    assert_eq!(error.status, 429);
+    assert!(ws_error(&view, false).is_none());
+    assert!(response::terminal_failure(failed, false).is_none());
+    assert!(matches!(reading(failed, Some(&event), false), Reading::Failure { ref error, .. } if error.status == 429));
+    assert!(account_shaped(failed, true));
+    let wrapped = r#"["error",429,{"code":"rate_limit_exceeded","message":"limited"}]"#;
+    assert!(crate::codex_event::decode(wrapped).is_none());
+    assert_eq!(
+        ws_error(&crate::codex_event::classification_view(wrapped), false).map(|e| e.status),
+        Some(429)
+    );
+    assert!(ws_error(wrapped, false).is_none());
+    assert!(matches!(reading(wrapped, None, false), Reading::Failure { ref error, body: None } if error.status == 429));
+    assert!(account_shaped(wrapped, false));
+}
