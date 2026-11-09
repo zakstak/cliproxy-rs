@@ -175,3 +175,18 @@ fn non_direct_handshake_headers_are_guarded_before_limit_rendering() {
         assert_eq!(guarded.confidential(), token == "at-FAKE");
     }
 }
+
+#[test]
+fn cookie_quotes_are_syntax_and_an_empty_quoted_cookie_matches_nothing() {
+    let cookies = |value: &'static str| {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", HeaderValue::from_static(value));
+        Secrets::from_request(&h, "http://127.0.0.1/x")
+    };
+    let s = cookies(r#"sid="cookie-QUOTED"; empty=""; other=unquoted-TOKEN"#);
+    assert!(s.exposes(b"echo cookie-QUOTED"));
+    assert!(s.exposes(br#"{"echo":"cookie\u002dQUOTED"}"#));
+    assert!(s.exposes(b"echo unquoted-TOKEN"));
+    assert!(!s.exposes(br#"{"empty":"","safe":"cookie-OTHER"}"#));
+    assert!(!cookies(r#"sid="""#).exposes(br#"{"empty":""}"#));
+}

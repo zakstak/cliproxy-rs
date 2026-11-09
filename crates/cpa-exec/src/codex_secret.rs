@@ -57,6 +57,8 @@ const AUTH_HEADERS: [&str; 6] = [
 /// a JSON string, and so on. Each round halves a run of backslashes, so a value hidden
 /// under more rounds than this needs a run of 65,536 backslashes; such bytes count as
 /// carrying a value ([`Secrets::exposes`]).
+// ponytail: at most 16 unescape rounds bound allocation and work; deeper encodings
+// fail closed. Raise this ceiling only with an updated work bound and nested-escape tests.
 const ROUNDS: usize = 16;
 
 /// The text a buffered answer that carried an upstream authentication value fails with.
@@ -91,7 +93,13 @@ impl Secrets {
                 match name {
                     "cookie" => {
                         for pair in value.split(';') {
-                            add(pair.split_once('=').map_or(pair, |(_, v)| v));
+                            let value = pair.split_once('=').map_or(pair, |(_, v)| v).trim();
+                            // RFC 6265 cookie-value permits surrounding quotes; they are
+                            // syntax, not part of the authentication value (including "").
+                            add(value
+                                .strip_prefix('"')
+                                .and_then(|v| v.strip_suffix('"'))
+                                .unwrap_or(value));
                         }
                     }
                     // `Bearer <token>`: the token; `Bearer ` alone carries none.

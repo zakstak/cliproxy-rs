@@ -5307,3 +5307,48 @@ async fn ambiguous_body_errors_do_not_expose_a_pooled_account() {
         );
     }
 }
+
+#[tokio::test]
+async fn quoted_cookie_values_are_guarded_but_empty_cookies_preserve_events() {
+    const END: &str = r#"{"type":"response.completed","response":{"id":"real","status":"completed","output":[]}}"#;
+    for (cookie, event, withheld) in [
+        (
+            r#"sid="cookie-QUOTED""#,
+            r#"{"type":"response.future","echo":"echo cookie-QUOTED"}"#,
+            true,
+        ),
+        (r#"sid="""#, r#"{"type":"response.future","empty":""}"#, false),
+    ] {
+        for (config, websockets) in [("", true), (STEERING, true), ("", false)] {
+            use cpa_server::testing::codex_capture::Reply;
+            let proxy = proxy_with(
+                Script {
+                    ws: vec![vec![
+                        Bytes::copy_from_slice(event.as_bytes()),
+                        Bytes::from_static(END.as_bytes()),
+                    ]],
+                    http: vec![Reply::sse(format!("data: {event}\n\ndata: {END}\n\n"))],
+                    ..Script::default()
+                },
+                config,
+                |url| {
+                    let mut c = credential(Profile::Chatgpt, url, websockets);
+                    c.attributes.insert("header:cookie".into(), cookie.into());
+                    vec![c]
+                },
+            )
+            .await;
+            let mut socket = connect(&proxy).await;
+            let got = first_turn(&mut socket).await;
+            let expected = if withheld { vec![END] } else { vec![event, END] };
+            assert_eq!(got, expected, "{cookie}, websockets={websockets}, {config}");
+            let headers = if websockets {
+                proxy.upstream.sockets()[0].headers.clone()
+            } else {
+                proxy.upstream.http()[0].headers.clone()
+            };
+            assert_eq!(headers["cookie"], cookie);
+            assert_eq!(headers["authorization"], "Bearer at-FAKE");
+        }
+    }
+}
