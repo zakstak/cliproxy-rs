@@ -1448,7 +1448,7 @@ impl Connection {
         // A duplex stream takes the client's later frames from the shared queue and owns
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
-        let mut response_started = false;
+        let mut duplex_established = false;
         // The last payload sent was an upstream context-window `response.failed`, which
         // the executor follows with its own classified error (`preserved_failure`).
         let mut preserved_event = false;
@@ -1538,7 +1538,7 @@ impl Connection {
                     rawjson::get(&payload, "type").str().to_owned()
                 };
                 if kind == "response.created" {
-                    response_started = true;
+                    duplex_established = duplex;
                     completed = false;
                     turn.reset();
                 }
@@ -1552,10 +1552,10 @@ impl Connection {
                     None => tools::record_calls(&self.tool_key, &payload),
                 }
                 turn.track_pending(&payload);
-                // In duplex mode an error event after `response.created` is recoverable:
-                // the client may correct the request on this socket. Stream errors still
-                // close it.
-                if kind == "error" && !(response_started && duplex) {
+                // Once the duplex's first response starts or ends, an error event is
+                // recoverable: the client may correct the request on this socket.
+                // Stream errors still close it.
+                if kind == "error" && !duplex_established {
                     // `responsesWebsocketErrorMessageFromPayload`.
                     let mut status = rawjson::get(&payload, "status").i64();
                     if status <= 0 {
@@ -1572,6 +1572,10 @@ impl Connection {
                 // Codex acknowledges `response.interrupt` with an interrupted
                 // `response.incomplete`; the connection stays open for the next request.
                 if completion || kind == "response.incomplete" {
+                    // The executor also admits later frames after a first terminal
+                    // without `response.created` (`Duplex::first_terminal`). Keep the
+                    // relay's recoverable-error state in step with it.
+                    duplex_established = duplex;
                     completed = true;
                     completed_output = turn.completed_output(&payload);
                     completed_id = field(&payload, "response.id");

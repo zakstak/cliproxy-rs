@@ -2367,6 +2367,113 @@ fn tokens(record: &serde_json::Value) -> [i64; 3] {
     ["input_tokens", "output_tokens", "total_tokens"].map(|k| record["tokens"][k].as_i64().unwrap_or(-1))
 }
 
+/// Once the steering bootstrap ended, a local refusal or an upstream rejection before
+/// the next `response.created` is recoverable, even if the bootstrap had no created
+/// event either. The valid successor proves the relay kept the socket open, not just
+/// that it delivered the error before closing. The after-created cases are controls.
+#[tokio::test]
+async fn a_first_terminal_keeps_local_refusals_recoverable() {
+    first_terminal_error_recovery(false).await;
+}
+
+#[tokio::test]
+async fn a_first_terminal_keeps_upstream_rejections_recoverable() {
+    first_terminal_error_recovery(true).await;
+}
+
+async fn first_terminal_error_recovery(reject_upstream: bool) {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"relay_first","output":[]}}"#;
+    const INCOMPLETE: &str = r#"{"type":"response.incomplete","response":{"id":"relay_first","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"relay_first","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const APPEND: &str = r#"{"type":"response.append","input":[]}"#;
+    const REJECTED: &str = r#"{"type":"error","status":400,"response_id":"rejected","error":{"type":"invalid_request_error","message":"correct this create","future":null}}"#;
+    const CREATED_NEXT: &str = r#"{"type":"response.created","response":{"id":"relay_next","output":[]}}"#;
+    const DONE_NEXT: &str = r#"{"type":"response.completed","response":{"id":"relay_next","output":[],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#;
+    const METADATA: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-5.5"}}"#;
+    let owned = |frames: &[&str]| frames.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>();
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"relay_first","input":[],"service_tier":"flex"}"#;
+    for end in [INCOMPLETE, COMPLETED] {
+        for created in [false, true] {
+            let case = format!("created={created} upstream={reject_upstream}: {end}");
+            let first = if created { owned(&[CREATED, end]) } else { owned(&[end]) };
+            let mut replies = vec![first.clone()];
+            if reject_upstream {
+                replies.push(owned(&[REJECTED]));
+            }
+            replies.push(owned(&[CREATED_NEXT, DONE_NEXT]));
+            let mut upstream = Gated::start(replies).await;
+            let proxy = proxy_with(Script::default(), STEERING, |_| {
+                vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket.send(Message::text(create.clone())).await.unwrap();
+            assert_eq!(upstream.read(1).await, std::slice::from_ref(&create), "{case}");
+            upstream.release.notify_one();
+            let got = read(&mut socket, &TERMINAL).await;
+            let mut want = owned(&[METADATA]);
+            want.extend(first);
+            assert_eq!(got.frames, want, "{case}");
+            assert_eq!(got.closed, None, "{case}");
+            let first_record = records(&proxy, 1).await;
+            assert_eq!(first_record.len(), 1, "{case}");
+            assert_eq!(first_record[0]["failed"], false, "{case}");
+            assert_eq!(tokens(&first_record[0]), [3, 0, 3], "{case}");
+
+            socket
+                .send(Message::text(if reject_upstream { next } else { APPEND }))
+                .await
+                .unwrap();
+            let error = read(&mut socket, &["error"]).await;
+            assert_eq!(error.closed, None, "{case}: {error:?}");
+            assert_eq!(error.frames.len(), 1, "{case}: {error:?}");
+            if reject_upstream {
+                assert_eq!(error.frames, [REJECTED], "{case}");
+                assert_eq!(upstream.read(2).await, [create.clone(), next.to_owned()], "{case}");
+                let rejected = records(&proxy, 1).await;
+                assert_eq!(rejected.len(), 1, "{case}");
+                assert_eq!(rejected[0]["failed"], true, "{case}");
+            } else {
+                let refusal: serde_json::Value = serde_json::from_str(&error.frames[0]).unwrap();
+                assert_eq!(refusal["status"], 400, "{case}");
+                assert_eq!(refusal["error"]["message"], cpa_exec::codex::APPEND_REFUSED, "{case}");
+                assert_eq!(
+                    *upstream.frames.lock().unwrap(),
+                    std::slice::from_ref(&create),
+                    "{case}"
+                );
+            }
+            socket.send(Message::text(next)).await.unwrap();
+            let count = if reject_upstream { 3 } else { 2 };
+            let sent = upstream.read(count).await;
+            assert_eq!(sent[0], create, "{case}");
+            assert!(sent[1..].iter().all(|frame| frame == next), "{case}: {sent:?}");
+            let successor = read(&mut socket, &TERMINAL).await;
+            assert_eq!(successor.frames, owned(&[METADATA, CREATED_NEXT, DONE_NEXT]), "{case}");
+            assert_eq!(successor.closed, None, "{case}");
+            let final_record = records(&proxy, 1).await;
+            assert_eq!(final_record.len(), 1, "{case}");
+            assert_eq!(final_record[0]["failed"], false, "{case}");
+            assert_eq!(tokens(&final_record[0]), [5, 2, 7], "{case}");
+            socket.send(Message::Close(None)).await.unwrap();
+            assert!(read(&mut socket, &[]).await.closed.is_some(), "{case}");
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no extra record"
+            );
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            assert!(proxy.upstream.sockets().is_empty(), "{case}: no other upstream socket");
+            assert!(proxy.upstream.http().is_empty(), "{case}: no HTTP fallback");
+        }
+    }
+}
+
 /// #25 and #7, on a `codex.response-steering` connection: upstream ends the first
 /// response with its terminal event and no `response.created` (an interrupted
 /// `response.incomplete` with usage 3/0/3, or a `response.completed`). The client gets
