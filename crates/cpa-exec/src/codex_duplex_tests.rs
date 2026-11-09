@@ -1984,12 +1984,10 @@ async fn outstanding_and_held_creates_stay_bounded() {
                 .unwrap_or_else(|_| panic!("held={held}: the outstanding creates never reached upstream"));
         }
         client.send(&create(BOUND)).await;
-        let error = loop {
-            match next(&mut stream).await {
-                Some(Ok(event)) => panic!("held={held}: unexpected event {event}"),
-                Some(Err(error)) => break error,
-                None => panic!("held={held}: the stream ended without the bound's error"),
-            }
+        let error = match next(&mut stream).await {
+            Some(Ok(event)) => panic!("held={held}: unexpected event {event}"),
+            Some(Err(error)) => error,
+            None => panic!("held={held}: the stream ended without the bound's error"),
         };
         assert!(
             error
