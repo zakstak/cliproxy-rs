@@ -68,9 +68,9 @@ const OUTBOX: usize = 16;
 /// by their successor's `response.created` or a `response.steer.failed`. Their pinned
 /// settings are at most one per such steer. A local resource ceiling, not a provider
 /// limit: no first-party or documented source bounds steering, and Go keeps both
-/// collections without one. It is well above the write queue plus the frame in the
-/// writer, so an upstream that stops reading meets write backpressure first; this
-/// ceiling stops an upstream that reads every steer and never releases one.
+/// collections without one. This ceiling is separate from write backpressure: socket
+/// buffers and frame sizes determine which limit a stalled upstream reaches first.
+/// It also stops an upstream that reads every steer and never releases one.
 const MAX_STEERS: usize = 64;
 const _: () = assert!(MAX_STEERS > WRITE_QUEUE + 1);
 

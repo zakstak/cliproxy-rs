@@ -493,15 +493,15 @@ bounded:
 The proxy reads client frames only while the write queue has room, so a stalled
 upstream backpressures the client. A full queue ends the connection with a local error.
 
-A steer is in flight from the moment it is written until upstream releases it: a
+A steer is in flight from admission to the upstream writer until upstream releases it: a
 `response.steer.failed` for it, or, once accepted, the `response.created` of its
 parent's successor or a `response.steer.failed` that names its ID. The settings that
 steering pins for an automatic successor stay only while a steer in flight names their
 parent. The ceiling of 64 is the proxy's own resource policy. No first-party or
 documented source sets a limit, and the pinned client sends no `response.steer`. The
-ceiling is well above the write queue plus the frame being written, so an upstream that
-stops reading meets write backpressure first. It stops an upstream that reads every
-steer and releases none.
+ceiling is separate from write backpressure. Socket buffers and frame sizes determine
+which limit a stalled upstream reaches first. It also stops an upstream that reads
+every steer and releases none.
 
 - A client steer that would be the 65th ends the connection with a local,
   request-scoped error before it is written. The credential is not cooled, and nothing
