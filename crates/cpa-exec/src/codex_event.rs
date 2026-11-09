@@ -23,8 +23,11 @@
 //! a byte that reaches the client, and nothing is re-serialized for delivery.
 //!
 //! A decoded event ends the response only when the pinned reader ends it on that event
-//! ([`Event::terminal`]); a decoded `response.completed` without a `response`, or a
-//! `response.done`, which the pinned reader does not handle, ends nothing.
+//! ([`Event::outcome`]); a decoded `response.completed` without a `response`, or a
+//! `response.done`, which the pinned reader does not handle, ends nothing. The two
+//! pinned readers part on a processing error, such as a `response` that does not read as
+//! `ResponseCompleted` or a content filter ([`Outcome::Recorded`]): the SSE reader reads
+//! on, the WebSocket reader ends the turn. Each route follows the reader of its client.
 //!
 //! The WebSocket reader has one more reading (`endpoint/responses_websocket.rs:864-884`).
 //! A text frame that does not decode, or whose `type` is `error`, can still be a wrapped
@@ -51,42 +54,78 @@ pub struct Event<'a> {
     pub error: Option<&'a str>,
 }
 
+/// What the pinned readers do on a decoded event (`process_responses_event`,
+/// `sse/responses.rs:375-562` at 44ccf394573c, and its two callers). Only a
+/// `response.completed` or a `response.incomplete` can end a response; failures
+/// (`response.failed`, `error`) are classified separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The reader goes on: no event, or one that ends nothing. A `response.completed`
+    /// without a `response` (missing or `null`), any other kind, and `response.done`,
+    /// which the reader does not handle.
+    Continues,
+    /// Both readers end the response here: a `response` that reads as
+    /// `ResponseCompleted` ([`completes`]) on a `response.completed` or an interrupted
+    /// `response.incomplete` (`Completed`), or a `response.incomplete` with any reason
+    /// but those two, `unknown` when there is none (a `ResponseIncomplete` error, which
+    /// the SSE reader returns at once, lines 680-688).
+    Ends,
+    /// A processing error: a `response` that does not read as `ResponseCompleted` on a
+    /// `response.completed` or an interrupted `response.incomplete` (`Stream`, lines
+    /// 515-519), or a content filter (`ContentFilter`, lines 461-463). The two readers
+    /// part here. The SSE reader records it and reads on (lines 677-690): a later
+    /// terminal event ends the response, and at the end of the stream it reports the
+    /// last error it recorded (lines 616-621). The WebSocket reader returns it, which
+    /// ends the turn and retires the socket (`endpoint/responses_websocket.rs:968-978`
+    /// and 387-395).
+    Recorded,
+}
+
+impl Outcome {
+    /// Whether a WebSocket client's turn ends on the event: on a terminal event and on a
+    /// processing error alike.
+    pub fn ends_turn(self) -> bool {
+        self != Self::Continues
+    }
+}
+
 impl Event<'_> {
-    /// Whether the response ends on this event (`process_responses_event`,
-    /// `sse/responses.rs:375-562`, and the readers that call it, lines 645-692 and
-    /// `endpoint/responses_websocket.rs:946-995`):
-    ///
-    /// - `response.completed` with a `response`. Without one (missing or `null`) the
-    ///   pinned reader returns no event and keeps reading.
-    /// - Every `response.incomplete`, which the contract keeps as the provider's terminal
-    ///   event (#25): an interrupted one completes the turn, a content filter is its own
-    ///   error, and any other reason, `unknown` when there is no `response`, is a
-    ///   terminal `ResponseIncomplete`.
-    ///
-    /// `response.done` is not among them: the pinned reader does not handle it.
-    /// Failures (`response.failed`, `error`) are classified separately.
-    ///
-    /// ponytail: a `response` the pinned reader cannot read as `ResponseCompleted` (no
-    /// string `id`, a malformed `usage`), and a content-filter or unreadable interrupted
-    /// `response.incomplete`, end the WebSocket reader's turn with an error; the SSE
-    /// reader records that error and reads on until the stream ends. The proxy ends the
-    /// response on them on both transports, so a further terminal event after one is not
-    /// forwarded over HTTP. Matching it needs the SSE route to hold a recorded error until
-    /// the upstream closes, and copies of `ResponseCompleted`'s nested types.
-    pub fn terminal(&self) -> bool {
+    /// What the pinned readers do on this event ([`Outcome`]). The members it reads are
+    /// read as the pinned `Value` holds them: the last of a repeated key, with the
+    /// private tokens resolved ([`resolved`]).
+    pub fn outcome(&self) -> Outcome {
+        let completion = |response: Option<&str>| match response {
+            None => Outcome::Continues,
+            Some(response) if completes(response) => Outcome::Ends,
+            Some(_) => Outcome::Recorded,
+        };
         match self.kind.as_ref() {
-            "response.completed" => self.response.is_some(),
-            "response.incomplete" => true,
-            _ => false,
+            "response.completed" => completion(self.response),
+            "response.incomplete" => {
+                let reason = self
+                    .response
+                    .and_then(|response| get(response, "incomplete_details"))
+                    .and_then(|details| get(&details, "reason"))
+                    .and_then(|reason| serde_json::from_str::<String>(&reason).ok());
+                match reason.as_deref().unwrap_or("unknown") {
+                    "content_filter" => Outcome::Recorded,
+                    // The reason came from the `response`, so there is one.
+                    "interrupted" => completion(self.response),
+                    _ => Outcome::Ends,
+                }
+            }
+            _ => Outcome::Continues,
         }
     }
 
     /// Whether usage observation reads this event. The shared usage reader takes the
     /// first `response.completed`, `response.incomplete` or `response.done` as the
     /// response's end (Go's Codex executor publishes that event's usage). Two of those
-    /// end nothing for the pinned reader ([`Event::terminal`]): `response.done` and a
+    /// end nothing for the pinned reader ([`Outcome::Continues`]): `response.done` and a
     /// `response.completed` without a `response`. Usage skips them, so the record keeps
-    /// the usage of the event the response does end on.
+    /// the usage of the event the response does end on. A route whose client reads past
+    /// a processing error ([`Outcome::Recorded`]) holds that event's usage until it knows
+    /// no later terminal event follows (`codex_native.rs`).
     pub fn accounted(&self) -> bool {
         match self.kind.as_ref() {
             "response.done" => false,
@@ -387,6 +426,233 @@ fn private_object(raw: &str, start: usize) -> Private {
         Private::Accepted(close + 1)
     } else {
         Private::Refused
+    }
+}
+
+/// `raw`, one JSON value of a decoded event, as the first-party `Value` holds it: an
+/// object that is a private number (`arbitrary_precision`) is that number, and one that
+/// is a private raw value (`raw_value`) is the JSON text it holds, read in turn
+/// (`KeyClassifier`, `value/de.rs`). [`decode`] already refused every malformed one, so
+/// an object whose first key is a private token is exactly one of them. `raw` itself,
+/// trimmed, for any other value.
+fn resolved(raw: &str) -> Cow<'_, str> {
+    let mut text = Cow::Borrowed(raw.trim());
+    while let Some(inner) = private_text(&text) {
+        text = Cow::Owned(inner.trim().to_owned());
+    }
+    text
+}
+
+/// The string a private-token object holds: the number's digits, or the raw value's
+/// JSON text. `None` for any other value.
+fn private_text(raw: &str) -> Option<String> {
+    let b = raw.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let key_at = skip_space(b, 1);
+    if b.get(key_at) != Some(&b'"') {
+        return None;
+    }
+    let key_end = string_end(b, key_at + 1)?;
+    if !matches!(
+        unescape(&raw[key_at..=key_end]).as_deref(),
+        Some(NUMBER_TOKEN | RAW_VALUE_TOKEN)
+    ) {
+        return None;
+    }
+    let value_at = skip_space(b, skip_space(b, key_end + 1) + 1);
+    let value_end = string_end(b, value_at + 1)?;
+    unescape(&raw[value_at..=value_end]).map(Cow::into_owned)
+}
+
+/// The member `key` of the object `raw` as the pinned `Value::get` reads it: the last
+/// one, with the private tokens of both resolved. `None` when `raw` is no object or has
+/// no such member.
+fn get(raw: &str, key: &str) -> Option<String> {
+    let object = resolved(raw);
+    member(&object, key).map(|value| resolved(value).into_owned())
+}
+
+/// Whether the pinned reader reads `response`, a decoded event's raw `response` member,
+/// as `ResponseCompleted` (`sse/responses.rs:494-520`).
+pub(crate) fn completes(response: &str) -> bool {
+    Completed::reads(&resolved(response))
+}
+
+/// One first-party type, reading one JSON value: `text`, with its own private tokens
+/// already resolved ([`resolved`]).
+trait Reads {
+    fn reads(text: &str) -> bool;
+}
+
+/// A derived struct, as `serde_json::from_value` reads it from the pinned `Value`: an
+/// object with the last of a repeated key ([`last_wins`]; `from_str` refuses a repeated
+/// field, the `Value` keeps the last), unknown members ignored, a missing `Option` as
+/// `None`, and a JSON array by position. The members are checked by [`Member`] and
+/// [`Optional`].
+fn struct_reads<T: serde::de::DeserializeOwned>(text: &str) -> bool {
+    serde_json::from_str::<T>(&last_wins(text)).is_ok()
+}
+
+/// `ResponseCompleted` (`sse/responses.rs:109-118`).
+#[derive(Deserialize)]
+#[allow(dead_code)] // Members are decoded for their acceptance, not read.
+struct Completed {
+    id: Member<Str>,
+    #[serde(default)]
+    usage: Optional<Usage>,
+    usage_metadata: Optional<UsageMetadata>,
+    #[serde(default)]
+    end_turn: Optional<Bool>,
+}
+
+/// `ResponseCompletedUsage` (lines 120-129).
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Usage {
+    input_tokens: Member<I64>,
+    input_tokens_details: Optional<InputDetails>,
+    output_tokens: Member<I64>,
+    output_tokens_details: Optional<OutputDetails>,
+    total_tokens: Member<I64>,
+    #[serde(default)]
+    codex_rollout_budget_units: Optional<Number>,
+}
+
+/// `ResponseCompletedInputTokensDetails` (lines 149-154).
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct InputDetails {
+    cached_tokens: Member<I64>,
+    #[serde(default)]
+    cache_write_tokens: Member<I64>,
+}
+
+/// `ResponseCompletedOutputTokensDetails` (lines 156-159).
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct OutputDetails {
+    reasoning_tokens: Member<I64>,
+}
+
+/// `ResponseUsageMetadata` (`protocol/src/response_usage.rs:10-14`).
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct UsageMetadata {
+    amount: Optional<Str>,
+    metadata: Optional<AnyValue>,
+}
+
+macro_rules! struct_reads {
+    ($($t:ty),*) => {$(
+        impl Reads for $t {
+            fn reads(text: &str) -> bool {
+                struct_reads::<$t>(text)
+            }
+        }
+    )*};
+}
+struct_reads!(Completed, Usage, InputDetails, OutputDetails, UsageMetadata);
+
+/// A `String`.
+struct Str;
+impl Reads for Str {
+    fn reads(text: &str) -> bool {
+        serde_json::from_str::<String>(text).is_ok()
+    }
+}
+
+/// An `i64`. The pinned `Number` keeps its digits and visits an `i64` exactly when they
+/// parse as one (`number.rs`, `deserialize_any` with `arbitrary_precision`): `-0` does,
+/// a fraction, an exponent or anything out of range does not.
+struct I64;
+impl Reads for I64 {
+    fn reads(text: &str) -> bool {
+        text.parse::<i64>().is_ok()
+    }
+}
+
+/// A `bool`.
+struct Bool;
+impl Reads for Bool {
+    fn reads(text: &str) -> bool {
+        matches!(text, "true" | "false")
+    }
+}
+
+/// A `serde_json::Number`: any JSON number, of any size (`arbitrary_precision`).
+struct Number;
+impl Reads for Number {
+    fn reads(text: &str) -> bool {
+        text.starts_with(|c: char| c == '-' || c.is_ascii_digit())
+    }
+}
+
+/// A `serde_json::Value`: anything that decoded.
+struct AnyValue;
+impl Reads for AnyValue {
+    fn reads(_: &str) -> bool {
+        true
+    }
+}
+
+/// A member of type `T` that must be present (or that `#[serde(default)]` fills in).
+struct Member<T>(std::marker::PhantomData<T>);
+
+impl<T> Default for Member<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<'de, T: Reads> Deserialize<'de> for Member<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <&RawValue>::deserialize(deserializer)?;
+        if T::reads(&resolved(raw.get())) {
+            Ok(Self::default())
+        } else {
+            Err(serde::de::Error::custom("unreadable member"))
+        }
+    }
+}
+
+/// An `Option<T>` member: missing from an object, or `null`, it is `None`
+/// (`deserialize_option`, as serde's derive asks of a missing `Option`).
+struct Optional<T>(std::marker::PhantomData<T>);
+
+impl<T> Default for Optional<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<'de, T: Reads> Deserialize<'de> for Optional<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Present<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Reads> Visitor<'de> for Present<T> {
+            type Value = Optional<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an optional value")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Optional::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Optional::default())
+            }
+            fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+                let raw = <&RawValue>::deserialize(deserializer)?;
+                // A private raw value holding `null` is a `null` in the pinned `Value`.
+                let text = resolved(raw.get());
+                if text == "null" || T::reads(&text) {
+                    Ok(Optional::default())
+                } else {
+                    Err(serde::de::Error::custom("unreadable member"))
+                }
+            }
+        }
+        deserializer.deserialize_option(Present(std::marker::PhantomData))
     }
 }
 

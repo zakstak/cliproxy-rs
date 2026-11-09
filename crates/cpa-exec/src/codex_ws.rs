@@ -1074,7 +1074,7 @@ impl Turn {
             _ => None,
         };
         match reading {
-            Reading::Passed => passed(text, raw_len),
+            Reading::Passed { decoded } => passed(text, raw_len, decoded),
             Reading::Failure { mut error, body: None } => {
                 self.wire.ws_exec_error("upstream_error", &error);
                 self.deliver_as_sent(&mut error, &text);
@@ -1106,13 +1106,14 @@ impl Turn {
                     event,
                 }
             }
-            // Every `response.incomplete` is the provider's terminal event, whatever its
-            // reason, output or usage, and whether or not anything reached the client
-            // yet: first-party Codex classifies its reason as an interrupted end, a
+            // Every `response.incomplete` is delivered as sent, whatever its reason,
+            // output or usage, and whether or not anything reached the client yet:
+            // first-party Codex classifies its reason as an interrupted end, a
             // content-filter error or a terminal `ResponseIncomplete`
-            // (`sse/responses.rs:451-506` at 44ccf394573c). It is delivered as sent (#25).
-            // A decoded `response.completed` without a `response` ends nothing
-            // (`codex_event::Event::terminal`).
+            // (`sse/responses.rs:451-506` at 44ccf394573c) (#25). The turn ends where the
+            // WebSocket reader ends it (`codex_event::Outcome::ends_turn`): on a terminal
+            // event and on a processing error alike, never on a decoded
+            // `response.completed` without a `response`.
             Reading::Event { terminal } => {
                 let bufferable = response::bufferable(payload);
                 let ack = acknowledged_id(payload);
@@ -1365,33 +1366,40 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         (Some(event), Some(Wrapped::Notice)) if terminal_provider_error(event) => {
             terminal(&crate::codex_event::last_wins(payload))
         }
-        (_, Some(Wrapped::Notice)) | (None, _) => return Reading::Passed,
+        (_, Some(Wrapped::Notice)) | (None, _) => {
+            return Reading::Passed {
+                decoded: event.is_some(),
+            };
+        }
         (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => {
             let view = crate::codex_event::last_wins(payload);
             status_frame(&view).or_else(|| terminal(&view))
         }
         (Some(event), _) => {
             return Reading::Event {
-                terminal: event.terminal(),
+                terminal: event.outcome().ends_turn(),
             };
         }
     };
     // Both failure kinds always classify; a wrapped frame always carries `type: error`.
-    failure.unwrap_or(Reading::Passed)
+    failure.unwrap_or(Reading::Passed {
+        decoded: event.is_some(),
+    })
 }
 
 /// What [`reading`] decided for one frame.
 pub(super) enum Reading {
-    /// A decoded event that is not a failure; `terminal` when the response ends on it
-    /// (`crate::codex_event::Event::terminal`).
+    /// A decoded event that is not a failure; `terminal` when the WebSocket reader ends
+    /// the turn on it (`crate::codex_event::Outcome::ends_turn`).
     Event { terminal: bool },
     /// A failure. `body` is what `response::terminal_failure` classified, or `None` for a
     /// status frame.
     Failure { error: ExecError, body: Option<String> },
     /// The pinned reader skips the frame (it does not decode and is no wrapped error) or
     /// ignores it (a wrapped notice): delivered as sent, as content, never as a terminal
-    /// event, failure or acknowledgement, unless it is [`account_shaped`].
-    Passed,
+    /// event, failure or acknowledgement, unless it is [`account_shaped`]. `decoded` when
+    /// it decodes as a `ResponsesStreamEvent` (a wrapped notice can).
+    Passed { decoded: bool },
 }
 
 /// Whether the pinned `error` branch fails the response on a decoded `error` event
@@ -1420,8 +1428,8 @@ fn terminal_provider_error(event: &crate::codex_event::Event<'_>) -> bool {
 
 /// A frame [`reading`] passes: delivered as sent, as content. A frame that would read as
 /// an account failure is withheld instead ([`account_shaped`]).
-fn passed(text: String, raw_len: usize) -> Frame {
-    if account_shaped(text.trim()) {
+fn passed(text: String, raw_len: usize, decoded: bool) -> Frame {
+    if account_shaped(text.trim(), decoded) {
         return Frame::Skip;
     }
     Frame::Event {
@@ -1437,12 +1445,16 @@ fn passed(text: String, raw_len: usize) -> Frame {
 /// Whether a frame the pinned reader skips or ignores would be an account failure under
 /// any reading a client could give it: the status frame reading ([`ws_error`]) and the
 /// terminal failure reading (`response::terminal_failure`), each with the first and with
-/// the last of a repeated key (a JSON reader keeps one or the other). A native WebSocket
-/// client never receives such a frame as sent, because it can name the pooled account
-/// (#6). That is all the result decides: the frame is not classified, the credential does
-/// not cool and the response goes on. The pinned reader acts on none of these frames, so
-/// withholding one changes nothing it does.
-pub(crate) fn account_shaped(payload: &str) -> bool {
+/// the last of a repeated key (a JSON reader keeps one or the other). A frame the pinned
+/// client cannot decode (`decoded` false) is also read with every other occurrence of a
+/// repeated key that those readings read (`crate::codex_ambiguous`), since a reader that
+/// acts on members as they stream past can take any of them. A decoded frame (a wrapped
+/// notice) keeps the first and last readings: the pinned `Value` reads it with the last.
+/// A native WebSocket client never receives such a frame as sent, because it can name the
+/// pooled account (#6). That is all the result decides: the frame is not classified, the
+/// credential does not cool and the response goes on. The pinned reader acts on none of
+/// these frames, so withholding one changes nothing it does.
+pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
     let readings = |text: &str| {
         [
             ws_error(text, false).map(|error| error.status),
@@ -1457,6 +1469,7 @@ pub(crate) fn account_shaped(payload: &str) -> bool {
             std::borrow::Cow::Owned(view) => readings(&view),
             std::borrow::Cow::Borrowed(_) => false,
         }
+        || (!decoded && crate::codex_ambiguous::ambiguous_account(payload))
 }
 
 /// Whether the session reader hands its turn a frame the turn gives a Codex client as

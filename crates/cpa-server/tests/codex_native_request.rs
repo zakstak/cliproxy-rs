@@ -1418,3 +1418,228 @@ async fn http_failures_are_classified_with_the_last_repeated_key() {
     let credential = proxy.rt.store().snapshot()[0].id.clone();
     assert!(proxy.rt.store().cooldowns(&credential).is_empty());
 }
+
+/// Decoded terminal-shaped events the pinned SSE reader records as an error and reads past
+/// (`codex-api/src/sse/responses.rs:667-690` at 44ccf394573c): a `response` that does not
+/// read as `ResponseCompleted` (lines 109-159 and 494-520: no string `id`, a malformed
+/// `usage`, `usage_metadata` or `end_turn`), on a `response.completed` or an interrupted
+/// `response.incomplete`, and a content-filter `response.incomplete` (lines 461-463). Each
+/// reports usage of 9 + 9 = 18 where its `usage` reads.
+const READ_ON: [(&str, &str); 10] = [
+    (
+        "completed without an id",
+        r#"{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a numeric id",
+        r#"{"type":"response.completed","response":{"id":7,"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a null id",
+        r#"{"type":"response.completed","response":{"id":null,"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a string token count",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":"9","output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed without total_tokens",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9}}}"#,
+    ),
+    (
+        "completed with a null cached_tokens",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":null},"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a numeric usage_metadata amount",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage_metadata":{"amount":5},"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a string end_turn",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","end_turn":"yes","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "content filter",
+        r#"{"type":"response.incomplete","response":{"id":"resp_early","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "interrupted without an id",
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+];
+
+/// #25 (E4, read-on): none of [`READ_ON`] ends a native HTTP response, because the pinned
+/// SSE reader reads on after each and ends on the real completion that follows. As the
+/// first event, after `response.created` and after output, with and without bootstrap
+/// buffering: a streaming client receives every event as sent, the candidate and the real
+/// completion included; a buffered client receives the real completion's `response`
+/// object byte for byte; each answer is one attempt with one record that is not failed
+/// and carries the real completion's usage (5), not the candidate's (18); nothing cools.
+#[tokio::test]
+async fn read_on_events_leave_http_responses_to_the_real_completion() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let output = concat!(
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"partial"}"#,
+        "\n\n"
+    );
+    let real = format!("event: response.completed\ndata: {REAL_END}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (name, event) in READ_ON {
+        for (stage, leading) in [
+            ("first event", ""),
+            ("after response.created", created),
+            ("after output", output),
+        ] {
+            for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+                let case = format!("{name}, {stage}, {config:?}");
+                let stream = format!("{leading}data: {event}\n\n{real}");
+                let proxy = native(
+                    false,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(REAL_END)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                for record in &records {
+                    assert_eq!(record["failed"], false, "{case}: {records:?}");
+                    assert_eq!(record["tokens"]["total_tokens"], 5, "{case}: {records:?}");
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// #25 (read-on) at the end of the upstream stream: when no usable terminal event follows
+/// a [`READ_ON`] event, the response ends where the upstream ended it, on the last such
+/// event, which is the provider's own end. The pinned SSE reader then reports the error it
+/// recorded for that event (`sse/responses.rs:616-621`), which the client reads from the
+/// event itself, so nothing is added: a streaming client gets the events as sent and a
+/// clean end, a buffered client gets the last such event's `response` object, and the one
+/// record carries that event's reported usage. Two in a row keep the last (the reader
+/// keeps the last recorded error). Controls: a stream that ends after
+/// `response.created` alone still fails, with the request-scoped 408, and each event the
+/// pinned reader ends on (a readable completion with missing, null or empty usage
+/// details, a readable interruption, and any other incomplete reason, even with an
+/// unreadable `usage`) still ends the response there, so a later completion is not read.
+#[tokio::test]
+async fn read_on_events_end_http_responses_only_at_the_upstream_end() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let later = r#"{"type":"response.incomplete","response":{"id":"resp_later","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}"#;
+    let cases = [
+        (READ_ON[0].1, None, 18),
+        (READ_ON[8].1, None, 18),
+        (READ_ON[9].1, None, 18),
+        (READ_ON[0].1, Some(later), 30),
+    ];
+    for (event, second, total) in cases {
+        let last = second.unwrap_or(event);
+        let stream = match second {
+            None => format!("{created}data: {event}\n\n"),
+            Some(second) => format!("{created}data: {event}\n\ndata: {second}\n\n"),
+        };
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{last}: streamed");
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!(
+            (status, answer.as_str()),
+            (200, last_response_object(last)),
+            "{last}: buffered"
+        );
+        let records = usage_records(&proxy, 2).await;
+        assert_eq!(records.len(), 2, "{last}: {records:?}");
+        for record in &records {
+            assert_eq!(record["failed"], false, "{last}: {records:?}");
+            assert_eq!(record["tokens"]["total_tokens"], total, "{last}: {records:?}");
+        }
+    }
+    // Nothing the client could read as an end: the truncated response still fails.
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(created.to_owned())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+    assert_eq!(status, 408, "{answer}");
+    assert!(answer.contains("stream closed before response.completed"), "{answer}");
+    // The pinned reader ends on these: the completion after them is not read.
+    let real = format!("data: {REAL_END}\n\n");
+    for end in [
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[],"usage":null}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[],"usage":{"input_tokens":1,"input_tokens_details":null,"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2,"codex_rollout_budget_units":1e400},"end_turn":null}}"#,
+        r#"{"type":"response.incomplete","response":{"id":"resp_ok","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[]}}"#,
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":"bad"}}}"#,
+    ] {
+        let stream = format!("{created}data: {end}\n\n{real}");
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.clone()), Reply::sse(stream)],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(
+            (status, answer),
+            (200, format!("{created}data: {end}\n\n")),
+            "{end}: streamed"
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!(
+            (status, answer.as_str()),
+            (200, last_response_object(end)),
+            "{end}: buffered"
+        );
+    }
+}

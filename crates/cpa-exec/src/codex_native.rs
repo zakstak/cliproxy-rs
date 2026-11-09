@@ -25,10 +25,14 @@
 //! buffered `chatgpt` answer is the `response` object of the terminal event, byte for
 //! byte. One exception stays (`docs/DIFFERENCES-FROM-GO.md`): a Codex client gets the
 //! backend's status-less context-window `error` event as `response.failed` (#5). Every
-//! `response.incomplete` is the provider's terminal event, whatever its reason, output or
+//! `response.incomplete` reaches the client as sent, whatever its reason, output or
 //! usage, before or after delivery (#25). The pinned client classifies its reason as an
 //! interrupted end, a content-filter error or a terminal `ResponseIncomplete`
-//! (`codex-api/src/sse/responses.rs:451-506`).
+//! (`codex-api/src/sse/responses.rs:451-506`). The response ends where the client's
+//! reader ends it ([`codex_event::Outcome`]): an SSE client reads past a processing error
+//! (a content filter, or a `response` that does not read as `ResponseCompleted`) to a
+//! later terminal event, and ends on it only when the stream ends; a WebSocket turn served
+//! over HTTP ends on it, as the WebSocket reader does.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -503,11 +507,18 @@ enum Seen {
     /// A leading event with no content yet (`response.created` and the like).
     Handshake,
     Content,
-    /// The provider's terminal event, delivered as sent: a `response.completed` with a
-    /// `response`, or any `response.incomplete`, whatever its reason, output or usage
-    /// ([`codex_event::Event::terminal`]). A `response.completed` without a `response`
-    /// and a `response.done` end nothing: the pinned reader reads on after them.
+    /// The provider's terminal event, delivered as sent: one both pinned readers end the
+    /// response on ([`codex_event::Outcome::Ends`]), a readable completion or a
+    /// `response.incomplete` with any reason but interrupted and content filter. A
+    /// `response.completed` without a `response` and a `response.done` end nothing: the
+    /// pinned reader reads on after them.
     Terminal,
+    /// A `response.incomplete` or `response.completed` the pinned readers take as a
+    /// processing error ([`codex_event::Outcome::Recorded`]): a content filter, or a
+    /// `response` that does not read as `ResponseCompleted`. Delivered as sent, as the
+    /// provider's event. Its usage is not observed yet: whether the response ends on it
+    /// depends on the client's reader ([`Passthrough::take`], [`Observer::aggregate`]).
+    Recorded,
     /// An event the pinned client does not decode ([`codex_event::decode`]): invalid
     /// JSON, a repeated known member, or a known member of the wrong type. The pinned
     /// client skips it, so it never ends, fails or converts the response and feeds no
@@ -674,7 +685,8 @@ impl Observer {
             return Seen::Undecoded;
         };
         let payload = data.trim();
-        if self.usage.enabled() && event.accounted() {
+        let outcome = event.outcome();
+        if self.usage.enabled() && event.accounted() && outcome != codex_event::Outcome::Recorded {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
         // Classification reads a copy, as the pinned `Value` holds it: the last of a
@@ -699,37 +711,60 @@ impl Observer {
             let body = delivered_failure(&event, payload);
             return Seen::Failure { error, body, deliver };
         }
-        match event.kind.as_ref() {
-            "response.output_item.done" => Seen::Content,
-            _ if event.terminal() => Seen::Terminal,
+        match (event.kind.as_ref(), outcome) {
+            ("response.output_item.done", _) => Seen::Content,
+            (_, codex_event::Outcome::Ends) => Seen::Terminal,
+            (_, codex_event::Outcome::Recorded) => Seen::Recorded,
             _ if response::bufferable(payload) => Seen::Handshake,
             _ => Seen::Content,
         }
     }
 
+    /// Usage of a [`Seen::Recorded`] event the response ends on after all.
+    fn account(&self, frame: &Bytes) {
+        if self.usage.enabled()
+            && let Some(data) = parse_frame(frame).1
+        {
+            self.usage.response_line(Format::Codex, data.trim().as_bytes());
+        }
+    }
+
     /// A buffered answer from an SSE body: the terminal event's `response` object, byte
-    /// for byte.
+    /// for byte. A buffered client reads the SSE upstream as the pinned SSE reader does:
+    /// past a processing error ([`Seen::Recorded`]) to a later terminal event, and on
+    /// the last such error when the stream ends without one.
     fn aggregate(mut self, data: &[u8]) -> Result<Bytes, ExecError> {
         let mut framer = cpa_translate::sse::Framer::with_limit(data.len() + 1);
         let mut frames = framer.push(data).unwrap_or_default();
         frames.extend(framer.finish());
+        let mut recorded = None;
         for frame in frames {
             match self.see(&frame) {
-                Seen::Terminal => {
-                    // `see` decoded this terminal event; its `response` member is unique.
-                    let (_, data) = parse_frame(&frame);
-                    let data = data.unwrap_or_default();
-                    let response = codex_event::decode(&data).and_then(|event| event.response);
-                    return match response.filter(|r| r.starts_with('{')) {
-                        Some(object) => Ok(Bytes::copy_from_slice(object.as_bytes())),
-                        None => Err(response_unreadable()),
-                    };
-                }
+                Seen::Terminal => return response_object(&frame),
+                Seen::Recorded => recorded = Some(frame),
                 Seen::Failure { error, body, .. } => return Err(direct(error, body)),
                 Seen::Handshake | Seen::Content | Seen::Undecoded => {}
             }
         }
-        Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
+        match recorded {
+            Some(frame) => {
+                self.account(&frame);
+                response_object(&frame)
+            }
+            None => Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+        }
+    }
+}
+
+/// The `response` object of a terminal event [`Observer::see`] decoded (its `response`
+/// member is unique), byte for byte.
+fn response_object(frame: &Bytes) -> Result<Bytes, ExecError> {
+    let (_, data) = parse_frame(frame);
+    let data = data.unwrap_or_default();
+    let response = codex_event::decode(&data).and_then(|event| event.response);
+    match response.filter(|r| r.starts_with('{')) {
+        Some(object) => Ok(Bytes::copy_from_slice(object.as_bytes())),
+        None => Err(response_unreadable()),
     }
 }
 
@@ -770,6 +805,10 @@ struct Passthrough {
     websocket: bool,
     out: VecDeque<Result<Bytes, ExecError>>,
     done: bool,
+    /// The last [`Seen::Recorded`] event delivered to an SSE client, whose reader reads
+    /// past it: the response ends on it, with its usage, only if the upstream ends without
+    /// a later terminal event or failure.
+    recorded: Option<Bytes>,
     /// The attempt's record if the consumer drops the stream: canceled until the
     /// upstream completes or the consumer takes the failure that ends it.
     outcome: crate::cancel::StreamOutcome,
@@ -801,6 +840,22 @@ impl Passthrough {
                 self.commit();
                 self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
+            }
+            // A WebSocket client's reader returns the processing error: its turn ends on
+            // the event (docs/codex/CONTRACT.md "Responses and failures").
+            Seen::Recorded if self.websocket => {
+                self.observer.account(&frame);
+                self.commit();
+                self.out.push_back(Ok(terminated(frame)));
+                self.done = true;
+            }
+            // An SSE client's reader records it and reads on, to a later terminal event or
+            // the end of the stream (`sse/responses.rs:616-621` and 677-690). An event the
+            // upstream left open can only be its last.
+            Seen::Recorded => {
+                self.commit();
+                self.out.push_back(Ok(terminated(frame.clone())));
+                self.recorded = Some(frame);
             }
             Seen::Failure { error, deliver, .. } if self.websocket => {
                 self.observer.wire.exec_error(&error);
@@ -871,7 +926,7 @@ impl Passthrough {
         if self.websocket
             && parse_frame(&frame)
                 .1
-                .is_some_and(|data| crate::codex_ws::account_shaped(data.trim()))
+                .is_some_and(|data| crate::codex_ws::account_shaped(data.trim(), false))
         {
             return;
         }
@@ -938,6 +993,7 @@ fn passthrough(
         websocket,
         out: VecDeque::new(),
         done: false,
+        recorded: None,
         outcome,
     };
     futures_util::stream::unfold(state, |mut st| async move {
@@ -964,9 +1020,25 @@ fn passthrough(
             };
             match next {
                 Some(Ok(frame)) => st.take(frame),
-                Some(Err(error)) => st.end(error),
-                // A clean end without a terminal event: a truncated response.
-                None => st.end(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+                Some(Err(error)) => {
+                    // The client has the provider's last processing error; its usage is
+                    // the provider's report, and the read failure still ends the attempt.
+                    if let Some(frame) = st.recorded.take() {
+                        st.observer.account(&frame);
+                    }
+                    st.end(error)
+                }
+                // A clean end after a processing error the client recorded: the response
+                // ended on it, as the pinned SSE reader reports at the end of the stream.
+                // Nothing is added: the client reads that end from the event it has.
+                None => match st.recorded.take() {
+                    Some(frame) => {
+                        st.observer.account(&frame);
+                        st.done = true;
+                    }
+                    // A clean end without a terminal event: a truncated response.
+                    None => st.end(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+                },
             }
             if st.done {
                 // The upstream response ended: a terminal event (its usage is observed),

@@ -2761,7 +2761,7 @@ async fn pinned_readings_decide_websocket_turns() {
     // The credential's own token (`credential`), standing in for a leaked secret.
     const TOKEN: &str = "at-FAKE";
     const ACCOUNT: &str = "acct-PRIVATE";
-    let cases: [(&str, Outcome, bool); 22] = [
+    let cases: [(&str, Outcome, bool); 23] = [
         // E1.
         (
             r#"{"type":"response.completed","response":{"id":"bad","future":{"$serde_json::private::Number":"bad"}}}"#,
@@ -2866,6 +2866,15 @@ async fn pinned_readings_decide_websocket_turns() {
             r#"{"type":"error","type":"response.future","status":429,"error":{"type":"usage_limit_reached","private_account":"acct-PRIVATE","token":"at-FAKE"}}"#,
             Withheld,
             false,
+        ),
+        // A decoded wrapped notice keeps the pinned last-key reading: an account `type`
+        // only in the middle of a repeated key does not withhold it (the any-occurrence
+        // rule is for frames the pinned client cannot decode). Socket only: over HTTP it
+        // is a decoded `error` the SSE route classifies.
+        (
+            r#"{"type":"error","status":200,"error":{"code":"other","type":"x","type":"rate_limit_error","type":"x","message":"notice"}}"#,
+            Passes,
+            true,
         ),
         // A safe control: the undecodable envelope with no account reading passes.
         (
@@ -3008,6 +3017,199 @@ async fn non_terminal_events_leave_the_record_to_the_real_completion() {
             assert_eq!(records.len(), 1, "{case}: {records:?}");
             assert_eq!(records[0]["failed"], false, "{case}: {records:?}");
             assert_eq!(tokens(&records[0]), [4, 1, 5], "{case}: {records:?}");
+        }
+    }
+}
+
+/// #25 (read-on) on WebSocket turns: an event the pinned SSE reader records and reads past
+/// (a `response` that does not read as `ResponseCompleted`, or a content filter) is a
+/// processing error the pinned WebSocket reader returns at once, ending the turn and
+/// retiring its socket (`endpoint/responses_websocket.rs:968-978` and 387-395 at
+/// 44ccf394573c). A WebSocket client is that reader, whatever carries the turn upstream,
+/// so the turn ends on the event as sent: on an upstream socket with and without
+/// bootstrap buffering, and on a turn served over HTTP with and without buffering, where
+/// the SSE upstream would have more to read. The completion after it is not delivered to
+/// the turn, and the turn's one record carries the event's reported usage (18), not
+/// failed. On a steering connection every frame is relayed (the client's reader decides),
+/// so the event and the completion both arrive, and the first response's record settles
+/// on the event.
+#[tokio::test]
+async fn read_on_events_end_websocket_turns_as_the_websocket_reader_does() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    for event in [
+        r#"{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18,"output_tokens_details":{}}}}"#,
+        r#"{"type":"response.incomplete","response":{"id":"resp_real","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ] {
+        for (transport, config, websockets) in [
+            ("socket", "", true),
+            ("socket, buffering", BUFFERING, true),
+            ("steering", STEERING, true),
+            ("http", "", false),
+            ("http, buffering", BUFFERING, false),
+        ] {
+            let case = format!("{transport}: {event}");
+            let frames = [CREATED, event, REAL_END];
+            let script = if websockets {
+                Script {
+                    ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+                    ..Script::default()
+                }
+            } else {
+                let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                Script {
+                    http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, config, |url| {
+                vec![credential(Profile::Chatgpt, url, websockets)]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let mut got = read(&mut socket, &["response.completed", "response.incomplete"]).await;
+            assert_eq!(got.frames, [CREATED, event], "{case}");
+            // Whatever else reaches the client before it goes quiet.
+            while let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_millis(300), socket.next()).await {
+                if let Message::Text(text) = message {
+                    got.frames.push(text.as_str().to_owned());
+                }
+            }
+            if transport == "steering" {
+                assert_eq!(got.frames, frames, "{case}");
+            } else {
+                assert_eq!(got.frames, [CREATED, event], "{case}: the turn ended on the event");
+            }
+            let records = records(&proxy, 1).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let more = proxy.rt.usage_queue().pop_oldest(10);
+            assert!(more.is_empty(), "{case}: one record: {records:?} {more:?}");
+            assert_eq!(records[0]["failed"], false, "{case}: {records:?}");
+            assert_eq!(tokens(&records[0]), [9, 9, 18], "{case}: {records:?}");
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+        }
+    }
+}
+
+/// #25 (E2) and #6, every duplicate reading: a frame the pinned client cannot decode is
+/// withheld when any occurrence of a repeated key, not only its first or last, could make
+/// it an account failure, because some client reading could act on that occurrence and
+/// the frame can name the pooled account or carry the credential's own token. Three and
+/// more occurrences with the account reading only in the middle: `type`, `status`,
+/// `status_code`, a nested `error.type` and `error.code`, a whole `error` object, an
+/// escaped key, a `response.failed` with a nested `response.error`, and invalid JSON.
+/// Each is withheld without cooling, usage, acknowledgement or ownership effects: the
+/// real completion after it still arrives, the turn's one record carries its usage, and
+/// neither the token nor the account marker reaches the client. The safe controls pass as
+/// sent: undecodable frames whose no occurrence reads as an account failure, including an
+/// account-looking status under an unknown type, failure words inside a string value, and
+/// account fields in an unrelated nested object. On an upstream socket with and without
+/// bootstrap buffering, on a steering connection, and on a turn served over HTTP with and
+/// without buffering.
+#[tokio::test]
+async fn ambiguous_account_frames_are_withheld_under_every_duplicate_reading() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    // The credential's own token (`credential`), standing in for a leaked secret; the
+    // client authenticates with `client-key`.
+    const TOKEN: &str = "at-FAKE";
+    const ACCOUNT: &str = "acct-PRIVATE";
+    let withheld = [
+        r#"{"type":"response.future","type":"error","type":"response.future","status":429,"error":{"type":"rate_limit_error","message":"limited","private_account":"acct-PRIVATE","token":"at-FAKE"}}"#,
+        r#"{"type":"response.future","type":"error","status":400,"status":429,"status":400,"error":{"code":"other","message":"acct-PRIVATE at-FAKE"}}"#,
+        r#"{"type":"response.future","type":"error","status_code":400,"status_code":401,"status_code":400,"error":{"code":"other","message":"acct-PRIVATE at-FAKE"}}"#,
+        r#"{"type":"error","type":"response.future","error":{"type":"invalid_request_error","type":"authentication_error","type":"invalid_request_error","message":"acct-PRIVATE","token":"at-FAKE"}}"#,
+        r#"{"type":"error","type":"response.future","error":{"code":"other","code":"invalid_api_key","code":"other","message":"acct-PRIVATE","token":"at-FAKE"}}"#,
+        r#"{"type":"error","type":"response.future","error":{"code":"other","message":"m"},"error":{"type":"usage_limit_reached","message":"acct-PRIVATE","token":"at-FAKE"},"error":{"code":"other","message":"m"}}"#,
+        r#"{"type":"response.future","\u0074ype":"error","type":"response.future","status":429,"error":{"message":"acct-PRIVATE","token":"at-FAKE"}}"#,
+        r#"{"type":"a","\u0074\u0079\u0070\u0065":"error","type":"b","type":"c","s\u0074atus":403,"error":{"message":"acct-PRIVATE","token":"at-FAKE"}}"#,
+        r#"{"type":"response.future","type":"response.failed","type":"response.future","response":{"error":{"code":"rate_limit_exceeded","message":"acct-PRIVATE","token":"at-FAKE"}}}"#,
+        r#"{"type":"response.future","type":"error","type":"response.future","status":429,"error":{"type":"rate_limit_error","message":"acct-PRIVATE","token":"at-FAKE"}"#,
+    ];
+    let passes = [
+        r#"{"type":"response.future","delta":5,"status":429,"error":{"type":"rate_limit_error","message":"limited"}}"#,
+        r#"{"type":"response.future","type":"error","status":400,"error":{"code":"other","message":"bad input"}}"#,
+        r#"{"type":"a","type":"b","type":"c","status":429,"error":{"type":"rate_limit_error","message":"limited"}}"#,
+        r#"{"type":"response.future","type":"response.future","note":"\"type\":\"error\",\"status\":429","error":{"type":"rate_limit_error","message":"limited"}}"#,
+        r#"{"type":"response.future","type":"error","status":400,"meta":{"status":429,"error":{"type":"rate_limit_error"}},"error":{"code":"other","message":"bad input"}}"#,
+    ];
+    let cases = withheld
+        .iter()
+        .map(|e| (*e, true))
+        .chain(passes.iter().map(|e| (*e, false)));
+    for (event, withhold) in cases {
+        for (transport, config, websockets) in [
+            ("socket", "", true),
+            ("socket, buffering", BUFFERING, true),
+            ("steering", STEERING, true),
+            ("http", "", false),
+            ("http, buffering", BUFFERING, false),
+        ] {
+            let case = format!("{transport}: {event}");
+            let frames = [event, REAL_END];
+            let script = if websockets {
+                Script {
+                    ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+                    ..Script::default()
+                }
+            } else {
+                let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                Script {
+                    http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, config, |url| {
+                vec![credential(Profile::Chatgpt, url, websockets)]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let mut got = Read::default();
+            while got.closed.is_none() && got.frames.last().map(String::as_str) != Some(REAL_END) {
+                let more = read(&mut socket, &["response.completed"]).await;
+                got.frames.extend(more.frames);
+                got.closed = more.closed;
+            }
+            assert!(
+                !got.frames.iter().any(|f| f.contains(TOKEN) || f.contains(ACCOUNT)),
+                "{case}: the credential's token or the account reached the client: {got:?}"
+            );
+            if withhold {
+                assert_eq!(got.frames, [REAL_END], "{case}");
+            } else {
+                assert_eq!(got.frames, frames, "{case}");
+            }
+            assert_eq!(got.closed, None, "{case}");
+            let records = records(&proxy, 1).await;
+            assert_eq!(records[0]["failed"], false, "{case}: {records:?}");
+            assert_eq!(tokens(&records[0]), [4, 1, 5], "{case}: {records:?}");
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            if websockets {
+                assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: one socket");
+            } else {
+                assert_eq!(proxy.upstream.http().len(), 1, "{case}: one attempt");
+            }
         }
     }
 }

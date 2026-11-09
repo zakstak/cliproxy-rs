@@ -23,6 +23,7 @@ pub mod claude;
 mod claude_input_tokens;
 pub mod claude_login;
 pub mod codex;
+mod codex_ambiguous;
 mod codex_capture;
 mod codex_client;
 #[cfg(any(test, feature = "test-support"))]

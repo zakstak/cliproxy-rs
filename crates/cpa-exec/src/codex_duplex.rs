@@ -638,8 +638,9 @@ impl Duplex {
                 }
             }
         }
-        // Only an event the response ends on (`codex_event::Event::terminal`): a
-        // `response.completed` without a `response`, or a `response.done`, ends nothing.
+        // Only an event the WebSocket reader ends the response on
+        // (`codex_event::Outcome::ends_turn`): a `response.completed` without a
+        // `response`, or a `response.done`, ends nothing.
         if matches!(reading, Reading::Event { terminal: true }) {
             self.response_active = false;
             self.automatic_active = false;
@@ -1053,10 +1054,10 @@ impl Duplex {
             }
             return;
         }
-        if matches!(reading, Reading::Passed) {
+        if let Reading::Passed { decoded } = reading {
             // The pinned reader skips or ignores this frame. It settles nothing and
             // reaches the client as sent, unless it would read as an account failure (#6).
-            if !super::account_shaped(payload) {
+            if !super::account_shaped(payload, decoded) {
                 self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             }
             return;
@@ -1090,7 +1091,7 @@ impl Duplex {
         // later ones are events the client may correct on this socket.
         let terminal = match reading {
             Reading::Failure { error, .. } => Some(error),
-            Reading::Event { .. } | Reading::Passed => None,
+            Reading::Event { .. } | Reading::Passed { .. } => None,
         };
         if let Some(error) = &terminal {
             self.turn.wire.ws_exec_error("upstream_error", error);

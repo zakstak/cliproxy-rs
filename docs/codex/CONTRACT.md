@@ -422,19 +422,38 @@ The response reaches the client as the upstream sent it:
   JSON, a repeated `type` or `response`, a known member of the wrong type, or an
   invalid private token, passes as sent. It counts as delivered content, and the
   stream goes on to the next event.
-- A decoded event ends the response only when the pinned reader ends it
-  (`process_responses_event`, `sse/responses.rs:375-562`): a `response.completed` with
-  a `response`, or any `response.incomplete`. A `response.completed` whose `response`
-  is missing or `null` returns no event there, and `response.done` is not handled, so
-  both pass as sent and the stream goes on; usage skips them, so the record keeps the
-  usage of the event the response does end on. A buffered answer takes its `response`
-  object from the event the response ends on. One boundary stays: a `response` the
-  pinned reader cannot read as `ResponseCompleted` (no string `id`, a malformed
-  `usage`), a content-filter `response.incomplete` and an interrupted one with such a
-  `response` end the WebSocket reader's turn with an error, while its SSE reader
-  records that error and reads on until the stream ends. The proxy ends the response
-  on them on both transports, so over HTTP a further terminal event after one is not
-  forwarded.
+- A decoded event ends the response only where the pinned reader of the client ends it
+  (`process_responses_event`, `sse/responses.rs:375-562`, and its callers). Both
+  readers end on a `response` that reads as `ResponseCompleted` (lines 109-159: a
+  string `id`, and a `usage`, `usage_metadata` and `end_turn` of their types or
+  absent) on a `response.completed` or an interrupted `response.incomplete`, and on a
+  `response.incomplete` with any other reason but `content_filter`, which is a
+  `ResponseIncomplete` the SSE reader returns at once (lines 680-688). A
+  `response.completed` whose `response` is missing or `null` returns no event, and
+  `response.done` is not handled, so both pass as sent and the stream goes on; usage
+  skips them. The readers part on a processing error: a `response` that does not read
+  as `ResponseCompleted`, on a `response.completed` or an interrupted
+  `response.incomplete`, and a content-filter `response.incomplete`. The SSE reader
+  records it and reads on (lines 677-690); the WebSocket reader returns it, ending the
+  turn and retiring its socket (`endpoint/responses_websocket.rs:968-978`, 387-395).
+  `crates/cpa-exec/src/codex_event.rs` reads `ResponseCompleted` with the pinned
+  struct's shape (positional arrays, missing `Option`s and defaults included), the last
+  of a repeated key and the first-party `Value`'s private tokens; a 355-case
+  differential against the pinned code built with serde_json 1.0.149 and its features
+  matches every outcome.
+- Over HTTP the client is an SSE reader, so such an event passes as sent and the
+  response goes on. A later terminal event ends it and decides it: a streaming client
+  receives every event, a buffered answer is that later event's `response` object, and
+  usage is that event's, never the earlier one's. When the upstream ends cleanly
+  without one, the response ends on the last such event: the pinned SSE reader then
+  reports the error it recorded (lines 616-621), which the client reads from the event
+  it has, so nothing is added to the stream. A buffered answer is that event's
+  `response` object, and the one record carries its reported usage, not failed. A read
+  failure after it still fails the attempt, with that event's reported usage. A failure
+  event after it ends the response as any failure does. A stream that ends with no
+  terminal event and no such event still fails with the request-scoped 408. A
+  WebSocket turn served over HTTP is read by a WebSocket client, so it ends on such an
+  event, as on an upstream socket ([Native WebSocket route](#native-websocket-route)).
 - A failure is classified as the pinned `Value` holds it: each object keeps the last of
   a repeated key, compared after unescaping. That reading decides the status, scope,
   retry hint, usage-limit, capacity and overload checks, the #5 context-window
@@ -624,9 +643,17 @@ receives (`ExecError::delivered_event`).
   (`responses_websocket.rs:684-709`, 864-884), decided as the next item describes. The SSE reader has no such reading, so over HTTP
   it is a frame that does not decode. A frame that does not decode passes as sent and
   ends, fails and settles nothing, with one exception. When its failure reading would
-  be an account failure, with the first or the last of a repeated key (a JSON reader
-  keeps one or the other), it is withheld, because it can name the pooled account. It
-  is not classified either, so the credential does not cool and the turn goes on.
+  be an account failure, it is withheld, because it can name the pooled account. That
+  reading takes the first and the last of a repeated key (a JSON reader keeps one or
+  the other) and, when a member the failure readings read repeats (`type`, `status`,
+  `status_code`, `error`, `code`, `message`, `error_type`, `response.error`, and the
+  `type`, `code`, `status`, `status_code` and `message` of either error object), every
+  other occurrence too, since a reader that acts on members as they stream past can
+  take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`). Each occurrence is
+  checked on its own, in one pass, so an ambiguous frame can be withheld that no single
+  reading classifies as an account failure; the pinned client skips it either way. It
+  is not classified either, so the credential does not cool and the turn goes on. A
+  decoded frame keeps the pinned last-key classification.
 - On an upstream socket a wrapped frame (a frame that does not decode, or a decoded
   `error`, that decodes as `WrappedWebsocketErrorEvent`) is decided by the pinned
   mapping (`responses_websocket.rs:712-764`). `previous_response_not_found` and
@@ -643,7 +670,13 @@ receives (`ExecError::delivered_event`).
 - Every `response.incomplete` reaches the client as received, on an ordinary turn, a
   steering connection and a turn served over HTTP, at any stage: as the turn's first
   event, after events held for bootstrap, or after output. The socket stays for the next
-  turn, and the credential does not cool. Passive accounting records the response once,
+  turn, and the credential does not cool. A WebSocket client's turn ends on a
+  processing error as on a terminal event (a content filter, or a `response` that does
+  not read as `ResponseCompleted`), because the pinned WebSocket reader returns that
+  error and retires its socket; on a turn served over HTTP too, although the SSE
+  upstream would have more to read. Its record carries the event's reported usage, not
+  failed. A steering connection relays every frame, so a later completion also reaches
+  the client, which decides. Passive accounting records the response once,
   as it records any terminal event the provider sends. An upstream socket that closes or
   fails before the terminal event still ends the turn with that failure, and the proxy
   invents no terminal event for it.

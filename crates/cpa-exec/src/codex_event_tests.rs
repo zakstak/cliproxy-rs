@@ -443,21 +443,164 @@ fn member_reads_the_last_key_as_value_get_does() {
     assert_eq!(member("null", "id"), None);
 }
 
+/// `ResponseCompleted` (`sse/responses.rs:109-159` at 44ccf394573c) as the pinned
+/// reader reads a `response`: a derived struct, from the first-party `Value`
+/// (`arbitrary_precision`, `raw_value`), with the last of a repeated key.
 #[test]
-fn terminal_and_accounted_follow_the_pinned_reader() {
-    for (event, terminal, accounted) in [
-        (r#"{"type":"response.completed","response":{"id":"r"}}"#, true, true),
-        (r#"{"type":"response.completed","response":[]}"#, true, true),
-        (r#"{"type":"response.completed","response":null}"#, false, false),
-        (r#"{"type":"response.completed"}"#, false, false),
-        (r#"{"type":"response.incomplete"}"#, true, true),
-        (r#"{"type":"response.incomplete","response":null}"#, true, true),
-        (r#"{"type":"response.done","response":{"id":"r"}}"#, false, false),
-        (r#"{"type":"response.failed","response":{"id":"r"}}"#, false, true),
-        (r#"{"type":"response.output_text.delta","delta":"x"}"#, false, true),
+fn completed_reads_as_the_pinned_struct_does() {
+    let usage = |u: &str| format!(r#"{{"id":"r","usage":{u}}}"#);
+    let ok = [
+        r#"{"id":"r"}"#.to_owned(),
+        r#"{"id":"r","usage":null,"usage_metadata":null,"end_turn":null,"extra":[1]}"#.to_owned(),
+        r#"{"id":5,"id":"r"}"#.to_owned(),
+        r#"["r",null,null]"#.to_owned(),
+        r#"["r",{"input_tokens":1,"output_tokens":2,"total_tokens":3},{"amount":"a"},false]"#.to_owned(),
+        r#"{"id":{"$serde_json::private::RawValue":"\"r\""}}"#.to_owned(),
+        r#"{"id":"r","usage":{"$serde_json::private::RawValue":"null"}}"#.to_owned(),
+        r#"{"id":"r","usage_metadata":{"amount":"0.1","metadata":{"a":[1e400]}},"end_turn":true}"#.to_owned(),
+        r#"{"id":"r","usage_metadata":{}}"#.to_owned(),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":-0,"output_tokens":0,"total_tokens":9223372036854775807}"#),
+        usage(
+            r#"{"input_tokens":1,"input_tokens_details":{"cached_tokens":1},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}"#,
+        ),
+        usage(
+            r#"{"input_tokens":1,"input_tokens_details":{"cached_tokens":1,"cache_write_tokens":2},"output_tokens":2,"total_tokens":3}"#,
+        ),
+        usage(
+            r#"{"input_tokens":1,"input_tokens_details":null,"output_tokens":2,"output_tokens_details":null,"total_tokens":3}"#,
+        ),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3,"codex_rollout_budget_units":1e400}"#),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3,"codex_rollout_budget_units":-1.5e-3}"#),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3,"codex_rollout_budget_units":null}"#),
+        usage(r#"{"input_tokens":{"$serde_json::private::Number":"5"},"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":"x","input_tokens":1,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"[1,null,2,null,3]"#),
+    ];
+    let unreadable = [
+        r#"{}"#.to_owned(),
+        r#"{"id":5}"#.to_owned(),
+        r#"{"id":null}"#.to_owned(),
+        r#"{"id":"r","id":5}"#.to_owned(),
+        r#"[]"#.to_owned(),
+        r#"["r"]"#.to_owned(),
+        r#"["r",null,null,null,1]"#.to_owned(),
+        r#""r""#.to_owned(),
+        r#"5"#.to_owned(),
+        r#"{"id":{"$serde_json::private::Number":"5"}}"#.to_owned(),
+        r#"{"id":"r","usage_metadata":{"amount":5}}"#.to_owned(),
+        r#"{"id":"r","usage_metadata":[]}"#.to_owned(),
+        r#"{"id":"r","end_turn":"yes"}"#.to_owned(),
+        r#"{"id":"r","end_turn":1}"#.to_owned(),
+        usage(r#"{}"#),
+        usage(r#"[]"#),
+        usage(r#""x""#),
+        usage(r#"{"input_tokens":"1","output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1.0,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1e2,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":9223372036854775808,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1,"output_tokens":2}"#),
+        usage(r#"{"input_tokens":null,"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1,"input_tokens_details":{},"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1,"input_tokens_details":{"cached_tokens":null},"output_tokens":2,"total_tokens":3}"#),
+        usage(
+            r#"{"input_tokens":1,"input_tokens_details":{"cached_tokens":1,"cache_write_tokens":null},"output_tokens":2,"total_tokens":3}"#,
+        ),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"output_tokens_details":{},"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3,"codex_rollout_budget_units":"1"}"#),
+        usage(r#"{"input_tokens":{"$serde_json::private::Number":"5.0"},"output_tokens":2,"total_tokens":3}"#),
+        usage(r#"{"input_tokens":1,"input_tokens":"x","output_tokens":2,"total_tokens":3}"#),
+    ];
+    for response in ok {
+        let event = format!(r#"{{"type":"response.completed","response":{response}}}"#);
+        assert!(decode(&event).is_some(), "{event}");
+        assert!(completes(&response), "{response}");
+    }
+    for response in unreadable {
+        let event = format!(r#"{{"type":"response.completed","response":{response}}}"#);
+        assert!(decode(&event).is_some(), "{event}");
+        assert!(!completes(&response), "{response}");
+    }
+}
+
+#[test]
+fn outcome_and_accounted_follow_the_pinned_reader() {
+    use Outcome::*;
+    for (event, outcome, accounted) in [
+        (r#"{"type":"response.completed","response":{"id":"r"}}"#, Ends, true),
+        (
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            Recorded,
+            true,
+        ),
+        (r#"{"type":"response.completed","response":[]}"#, Recorded, true),
+        (r#"{"type":"response.completed","response":null}"#, Continues, false),
+        (r#"{"type":"response.completed"}"#, Continues, false),
+        (r#"{"type":"response.incomplete"}"#, Ends, true),
+        (r#"{"type":"response.incomplete","response":null}"#, Ends, true),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":"x"}}}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":5}}}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":null}}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":[{"incomplete_details":{"reason":"content_filter"}}]}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"interrupted"}}}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"interrupted"}}}"#,
+            Recorded,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"content_filter"}}}"#,
+            Recorded,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"content<BS>u005ffilter"}}}"#,
+            Recorded,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"content_filter","reason":"interrupted"}}}"#,
+            Ends,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"interrupted"},"incomplete_details":{"reason":"content_filter"}}}"#,
+            Recorded,
+            true,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"$serde_json::private::RawValue":"{\"reason\":\"content_filter\"}"}}}"#,
+            Recorded,
+            true,
+        ),
+        (r#"{"type":"response.done","response":{"id":"r"}}"#, Continues, false),
+        (r#"{"type":"response.failed","response":{"id":"r"}}"#, Continues, true),
+        (r#"{"type":"response.output_text.delta","delta":"x"}"#, Continues, true),
     ] {
-        let decoded = decode(event).expect("decodes");
-        assert_eq!(decoded.terminal(), terminal, "{event}");
+        let event = event.replace("<BS>", "\\");
+        let decoded = decode(&event).expect("decodes");
+        assert_eq!(decoded.outcome(), outcome, "{event}");
+        assert_eq!(decoded.outcome().ends_turn(), outcome != Continues, "{event}");
         assert_eq!(decoded.accounted(), accounted, "{event}");
     }
     let event = decode(r#"{"type":"response.completed","response":{"id":"a","id":"b"}}"#).unwrap();

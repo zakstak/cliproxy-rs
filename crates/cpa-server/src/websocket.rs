@@ -1517,8 +1517,8 @@ impl Connection {
             for mut payload in payloads {
                 // A native turn's executor already decided what each frame does: whether
                 // the response ends on it and whether it fails the turn (`codex_ws`). A
-                // decoded event ends the turn here only when the pinned reader ends it
-                // (`cpa_exec::codex_event::Event::terminal`).
+                // decoded event ends the turn here only when the pinned WebSocket reader
+                // ends it (`cpa_exec::codex_event::Outcome::ends_turn`).
                 let mut native_terminal = None;
                 let kind = if ctx.native_served {
                     // The upstream event boundary (`cpa_exec::codex_event`): a frame the
@@ -1526,7 +1526,7 @@ impl Connection {
                     // no type, completion, failure or tool call (#25).
                     match cpa_exec::codex_event::decode(&payload) {
                         Some(event) => {
-                            native_terminal = Some(event.terminal());
+                            native_terminal = Some(event.outcome().ends_turn());
                             event.kind.into_owned()
                         }
                         None => {
