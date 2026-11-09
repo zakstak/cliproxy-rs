@@ -3707,3 +3707,340 @@ async fn positional_completions_settle_their_own_response() {
         socket.close(1000, "done").await.unwrap();
     }
 }
+
+/// The 14 members of a positional `ResponsesStreamEvent`, `null` but for the given ones.
+fn positional(members: &[(usize, &str)]) -> String {
+    let mut all = vec!["null"; 14];
+    for (i, raw) in members {
+        all[*i] = raw;
+    }
+    format!("[{}]", all.join(","))
+}
+
+/// What a client gets for one of [`positional_events_classify_as_their_object_form`]'s
+/// events.
+#[derive(Clone, Copy, PartialEq)]
+enum Expect {
+    /// An account failure: withheld, the credential cools.
+    Withheld,
+    /// Any other failure: the frame as sent.
+    AsSent,
+    /// The #5 context-window `response.failed`, built from the event's members.
+    Converted,
+    /// A completion: the frame as sent, the turn ends.
+    Completes,
+}
+
+/// #25 and #6, an event written as a JSON array: serde reads a derived struct from an
+/// array by position, so the pinned client decodes `["response.failed",null,null,{…}]`
+/// as a `response.failed` whose `response` is the fourth element
+/// (`codex-api/src/sse/responses.rs:161-179` at 44ccf394573c). Failure classification
+/// reads the members it decodes to (`codex_event::classification_view`), so each
+/// positional event takes the same turn, record and cooldowns as its object form on the
+/// five native paths: an account failure never reaches the client as sent (neither the
+/// credential's `at-FAKE` nor the account's `acct-PRIVATE`, while the client's key is
+/// `client-key`), cools the credential and fails the record with zero tokens; a
+/// non-account failure reaches the client as sent; a status-less context-window `error`
+/// becomes the #5 `response.failed` built from its members' bytes; a positional
+/// completion ends the turn as its object form does. The real completion after a
+/// failure is never accepted, and nothing is replayed (one attempt each).
+#[tokio::test]
+async fn positional_events_classify_as_their_object_form() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const LIMITED: &str = r#"{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
+    let limited_response = format!(r#"{{"id":"r1","error":{LIMITED}}}"#);
+    let wrapped_response = format!(
+        r#"{{"$serde_json::private::RawValue":{}}}"#,
+        serde_json::to_string(&limited_response).unwrap()
+    );
+    let context = r#"{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model.","param":"input"}"#;
+    // (positional, object form, what the client gets)
+    let cases = [
+        // The review witness.
+        (
+            positional(&[(0, r#""response.failed""#), (3, &limited_response)]),
+            format!(r#"{{"type":"response.failed","response":{limited_response}}}"#),
+            Expect::Withheld,
+        ),
+        (
+            positional(&[(0, r#""error""#), (5, LIMITED)]),
+            format!(r#"{{"type":"error","error":{LIMITED}}}"#),
+            Expect::Withheld,
+        ),
+        (
+            positional(&[(0, r#""response.failed""#), (3, &wrapped_response)]),
+            format!(r#"{{"type":"response.failed","response":{wrapped_response}}}"#),
+            Expect::Withheld,
+        ),
+        (
+            positional(&[
+                (0, r#""response.failed""#),
+                (3, r#"{"id":"r1","error":{"code":"server_error","message":"boom"}}"#),
+            ]),
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"server_error","message":"boom"}}}"#
+                .to_owned(),
+            Expect::AsSent,
+        ),
+        (
+            positional(&[(0, r#""error""#), (4, r#""resp_ctx""#), (5, context)]),
+            format!(r#"{{"type":"error","response_id":"resp_ctx","error":{context}}}"#),
+            Expect::Converted,
+        ),
+        (
+            positional(&[(0, r#""response.completed""#), (3, r#"{"id":"r1","end_turn":true}"#)]),
+            r#"{"type":"response.completed","response":{"id":"r1","end_turn":true}}"#.to_owned(),
+            Expect::Completes,
+        ),
+    ];
+    for (array, object, expect) in cases {
+        assert!(cpa_exec::codex_event::decode(&array).is_some(), "{array}");
+        for path in NATIVE_PATHS {
+            let case = format!("{}: {array}", path.0);
+            let got = native_turn(path, &[&array, REAL_END], REAL_END).await;
+            let want = native_turn(path, &[&object, REAL_END], REAL_END).await;
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+                "{case}: the credential's token or the account reached the client: {got:?}"
+            );
+            let as_sent = |t: &Turned, raw: &str| -> Vec<String> {
+                t.frames
+                    .iter()
+                    .map(|f| if f == raw { "EVENT".to_owned() } else { f.clone() })
+                    .collect()
+            };
+            assert_eq!(as_sent(&got, &array), as_sent(&want, &object), "{case}");
+            assert_eq!(got.closed, want.closed, "{case}");
+            assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+            assert_eq!(got.attempts, 1, "{case}");
+            assert_eq!(want.attempts, 1, "{case}");
+            for key in ["failed", "fail"] {
+                assert_eq!(got.records[0][key], want.records[0][key], "{case}: {got:?} {want:?}");
+            }
+            assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+            let delivered = as_sent(&got, &array).iter().any(|f| f == "EVENT");
+            if expect == Expect::Completes {
+                // A steering connection relays the later frame too, as for the object form.
+                assert_eq!(got.frames[0], array, "{case}");
+                assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                assert_eq!(got.cooldowns, 0, "{case}");
+                continue;
+            }
+            assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+            assert_eq!(tokens(&got.records[0]), [0, 0, 0], "{case}");
+            assert!(!got.frames.iter().any(|f| f == REAL_END), "{case}: {got:?}");
+            assert_eq!(delivered, expect == Expect::AsSent, "{case}: {got:?}");
+            if expect == Expect::Converted {
+                assert!(
+                    got.frames[0].starts_with(r#"{"type":"response.failed","response":{"id":"resp_ctx""#),
+                    "{case}: {got:?}"
+                );
+            }
+            if expect == Expect::Withheld {
+                // Bootstrap buffering records its overload policy's 503.
+                let status = &got.records[0]["fail"]["status_code"];
+                assert!(*status == 429 || *status == 503, "{case}: {got:?}");
+                assert!(got.cooldowns > 0, "{case}");
+            }
+        }
+    }
+}
+
+/// #25 and #6, a wrapped status error written as a JSON array: the pinned WebSocket
+/// reader decodes `["error",429,{…}]` as `WrappedWebsocketErrorEvent` by position
+/// (`endpoint/responses_websocket.rs:684-709` at 44ccf394573c, `error` itself possibly an
+/// array) and fails the turn with its status, as for the object form; the SSE reader
+/// cannot decode it and skips it. On the socket paths the frame takes its object form's
+/// turn, record and cooldown; over HTTP it is an undecodable frame that would read as an
+/// account failure, so it is withheld and the real completion follows. Neither path
+/// delivers the credential's token or the account.
+#[tokio::test]
+async fn positional_wrapped_status_errors_classify_as_their_object_form() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    for (array, object) in [
+        (
+            r#"["error",429,{"code":"rate_limit_exceeded","message":"limited at-FAKE acct-PRIVATE"}]"#,
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"limited at-FAKE acct-PRIVATE"}}"#,
+        ),
+        (
+            r#"["error",401,["invalid_api_key","bad key at-FAKE acct-PRIVATE"],{"x-request-id":"req_1"}]"#,
+            r#"{"type":"error","status":401,"error":{"code":"invalid_api_key","message":"bad key at-FAKE acct-PRIVATE"},"headers":{"x-request-id":"req_1"}}"#,
+        ),
+    ] {
+        assert!(cpa_exec::codex_event::decode(array).is_none(), "{array}");
+        for path in NATIVE_PATHS {
+            let case = format!("{}: {array}", path.0);
+            let got = native_turn(path, &[array, REAL_END], REAL_END).await;
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+                "{case}: the credential's token or the account reached the client: {got:?}"
+            );
+            assert_eq!(got.attempts, 1, "{case}");
+            if path.2 {
+                let want = native_turn(path, &[object, REAL_END], REAL_END).await;
+                assert_eq!(got.frames, want.frames, "{case}");
+                assert_eq!(got.closed, want.closed, "{case}");
+                assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+                assert!(got.cooldowns > 0, "{case}");
+                for key in ["failed", "fail"] {
+                    assert_eq!(got.records[0][key], want.records[0][key], "{case}: {got:?} {want:?}");
+                }
+                assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+            } else {
+                assert_eq!(got.frames, [REAL_END], "{case}");
+                assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                assert_eq!(got.cooldowns, 0, "{case}");
+            }
+        }
+    }
+}
+
+/// #25 (E2) and #6, a safe unique frame: every key is unique within its object, so a
+/// frame naming `error.type` and `response.error.type` once each repeats nothing, and is
+/// read by its first and last readings alone (the root error, a 400). The pinned client
+/// cannot decode it (`item_id` is no string) and skips it; it reaches the client as sent
+/// on the five native paths, followed by the real completion, one successful record with
+/// its usage and no cooldown. A frame that really repeats a member on the same path
+/// stays withheld.
+#[tokio::test]
+async fn unique_frames_reach_the_client_on_every_native_path() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let cases = [
+        (
+            r#"{"type":"error","item_id":23,"error":{"type":"invalid_request_error","message":"bad input"},"response":{"error":{"type":"model_at_capacity"}}}"#,
+            false,
+        ),
+        (
+            r#"{"type":"error","item_id":23,"error":{"code":"other","message":"bad input"},"response":{"error":{"code":"rate_limit_exceeded","status":429}}}"#,
+            false,
+        ),
+        (
+            r#"{"type":"error","item_id":23,"error":{"type":"invalid_request_error","message":"bad input"},"error":{"type":"invalid_request_error","message":"bad input"},"response":{"error":{"type":"model_at_capacity","token":"at-FAKE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","item_id":23,"response":{"id":"a"},"response":{"error":{"code":"rate_limit_exceeded","token":"at-FAKE"}},"response":{"id":"b"}}"#,
+            true,
+        ),
+    ];
+    for (frame, withheld) in cases {
+        assert!(cpa_exec::codex_event::decode(frame).is_none(), "{frame}");
+        for path in NATIVE_PATHS {
+            let case = format!("{}: {frame}", path.0);
+            let got = native_turn(path, &[frame, REAL_END], REAL_END).await;
+            if withheld {
+                assert_eq!(got.frames, [REAL_END], "{case}");
+            } else {
+                assert_eq!(got.frames, [frame, REAL_END], "{case}");
+            }
+            assert_eq!(got.closed, None, "{case}");
+            assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+            assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}: {got:?}");
+            assert_eq!(got.cooldowns, 0, "{case}");
+            assert_eq!(got.attempts, 1, "{case}");
+        }
+    }
+}
+
+/// #25 and #6, a terminal provider code the pinned `error` branch reads through private
+/// values (`parse_terminal_provider_error`, `codex-api/src/error.rs:79-127` at
+/// 44ccf394573c, reading the `Value`): `budget_reached` beside a rate-limit type, sent
+/// resolved, as a raw value holding the whole error object, and as a raw value holding
+/// the code alone. A status-200 wrapped notice still fails the turn on it. Each wrapped
+/// form takes the resolved form's turn, record and cooldowns on the five native paths:
+/// the account failure is withheld, the credential cools, the record fails with zero
+/// tokens and the later completion is never accepted.
+#[tokio::test]
+async fn private_terminal_provider_codes_classify_as_resolved() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let resolved = r#"{"type":"error","status":200,"error":{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
+    let wrapped_object = r#"{"type":"error","status":200,"error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\",\"code\":\"budget_reached\",\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}"}}"#;
+    let wrapped_code = r#"{"type":"error","status":200,"error":{"type":"rate_limit_error","code":{"$serde_json::private::RawValue":"\"budget_reached\""},"message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
+    for path in NATIVE_PATHS {
+        let want = native_turn(path, &[resolved, REAL_END], REAL_END).await;
+        assert_eq!(want.records[0]["failed"], true, "{}: {want:?}", path.0);
+        assert!(want.cooldowns > 0, "{}: {want:?}", path.0);
+        for wrapped in [wrapped_object, wrapped_code] {
+            assert!(cpa_exec::codex_event::decode(wrapped).is_some(), "{wrapped}");
+            let case = format!("{}: {wrapped}", path.0);
+            let got = native_turn(path, &[wrapped, REAL_END], REAL_END).await;
+            for t in [&got, &want] {
+                assert!(
+                    !t.frames
+                        .iter()
+                        .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+                    "{case}: the credential's token or the account reached the client: {t:?}"
+                );
+                assert!(!t.frames.iter().any(|f| f == REAL_END), "{case}: {t:?}");
+            }
+            assert_eq!(got.frames, want.frames, "{case}");
+            assert_eq!(got.closed, want.closed, "{case}");
+            assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+            assert_eq!(got.attempts, want.attempts, "{case}");
+            for key in ["failed", "fail"] {
+                assert_eq!(got.records[0][key], want.records[0][key], "{case}: {got:?} {want:?}");
+            }
+            assert_eq!(tokens(&got.records[0]), [0, 0, 0], "{case}");
+        }
+    }
+}
+
+/// #25 and #7, a positional event that is a positional completion: the event is the
+/// `ResponsesStreamEvent` written as an array, its `response` the `ResponseCompleted`
+/// written as one. A steering connection settles the response the pinned reader
+/// completes (r1, `priority`), not the latest open one (r2, `flex`), while the socket
+/// stays open; r2 then settles with its own usage. One upstream socket; each frame as
+/// sent.
+#[tokio::test]
+async fn positional_completion_events_settle_their_own_response() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    const CREATED_2: &str = r#"{"type":"response.created","response":{"id":"r2"}}"#;
+    const DONE_2: &str = r#"{"type":"response.completed","response":{"id":"r2","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}"#;
+    const FIRST: &str = r#"{"type":"response.create","model":"gpt-5.5","input":[],"service_tier":"priority"}"#;
+    const SECOND: &str = r#"{"type":"response.create","model":"gpt-5.5","input":[],"service_tier":"flex"}"#;
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r2","input":[]}"#;
+    let completed = positional(&[(0, r#""response.completed""#), (3, r#"["r1",null,null,false]"#)]);
+    let batch = |frames: &[&str]| frames.iter().map(|f| Bytes::from((*f).to_owned())).collect();
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: vec![batch(&[CREATED]), batch(&[CREATED_2, &completed]), batch(&[DONE_2])],
+            ..Script::default()
+        },
+        STEERING,
+    )
+    .await;
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+    let mut socket = connect(&proxy).await;
+    socket.send(Message::text(FIRST)).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [CREATED]);
+    socket.send(Message::text(SECOND)).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [CREATED_2]);
+    let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(next, Some(Ok(Message::Text(ref t))) if t.as_str() == completed),
+        "{next:?}"
+    );
+    let first = records(&proxy, 1).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0]["service_tier"], "priority", "{first:?}");
+    assert_eq!(first[0]["failed"], false, "{first:?}");
+    socket.send(Message::text(STEER)).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.completed"]).await.frames, [DONE_2]);
+    let second = records(&proxy, 1).await;
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0]["service_tier"], "flex", "{second:?}");
+    assert_eq!(tokens(&second[0]), [7, 1, 8]);
+    assert_eq!(upstream_frames(&proxy, 0), [FIRST, SECOND, STEER]);
+    assert_eq!(proxy.upstream.sockets().len(), 1);
+    socket.close(1000, "done").await.unwrap();
+}

@@ -725,3 +725,171 @@ fn response_ids_read_as_the_pinned_value_reads_them() {
     .unwrap();
     assert_eq!(created.response_str("previous_response_id").as_deref(), Some("r1"));
 }
+
+/// #25 and #7, completed identity: a `response.completed` names the response its pinned
+/// `Completed` event carries, `ResponseCompleted.id` from the one reading that decides
+/// the outcome: by position when the `response` is the struct written as an array, with
+/// private values resolved around the array and around its first element. A completion
+/// that does not read as `ResponseCompleted`, and every other kind (`response.created`,
+/// a `response.incomplete` whose array has no `incomplete_details` and so is no
+/// interrupted completion), keep the `Value::get` reading, which finds no `id` in an
+/// array.
+#[test]
+fn completed_identity_follows_the_completed_reading() {
+    let completed = |response: &str| format!(r#"{{"type":"response.completed","response":{response}}}"#);
+    for (event, id) in [
+        (completed(r#"["r1",null,null,false]"#), Some("r1")),
+        (completed(r#"["r1",null,null]"#), Some("r1")),
+        (
+            completed(r#"["r1",{"input_tokens":1,"output_tokens":2,"total_tokens":3},{"amount":"a"},true]"#),
+            Some("r1"),
+        ),
+        (
+            completed(r#"{"$serde_json::private::RawValue":"[\"r1\",null,null,false]"}"#),
+            Some("r1"),
+        ),
+        (
+            completed(r#"[{"$serde_json::private::RawValue":"\"r1\""},null,null]"#),
+            Some("r1"),
+        ),
+        (completed(r#" [ "r1" , null , null ] "#), Some("r1")),
+        // The object form: the last `id`, as before.
+        (completed(r#"{"id":"stale","id":"r1","end_turn":false}"#), Some("r1")),
+        // Not a `ResponseCompleted`: a processing error, which names nothing by position.
+        (completed(r#"["r1"]"#), None),
+        (completed(r#"[5,null,null]"#), None),
+        (completed(r#"["r1",null,null,null,1]"#), None),
+        // An unreadable object still names its `id` as `Value::get` reads it.
+        (completed(r#"{"id":"r1","end_turn":"yes"}"#), Some("r1")),
+        (
+            r#"{"type":"response.created","response":["r1",null,null,false]}"#.to_owned(),
+            None,
+        ),
+        (
+            r#"{"type":"response.incomplete","response":["r1",null,null,false]}"#.to_owned(),
+            None,
+        ),
+        (
+            r#"{"type":"response.failed","response":["r1",null,null,false]}"#.to_owned(),
+            None,
+        ),
+    ] {
+        let decoded = decode(&event).expect("decodes");
+        assert_eq!(decoded.response_id().as_deref(), id, "{event}");
+    }
+    // A positional event whose `response` is a positional completion: both readings by
+    // position, the event's and the completion's.
+    let mut positional = vec!["null"; 14];
+    positional[0] = r#""response.completed""#;
+    positional[3] = r#"["r1",null,null,false]"#;
+    let event = format!("[{}]", positional.join(","));
+    let decoded = decode(&event).expect("decodes");
+    assert_eq!(decoded.outcome(), Outcome::Ends);
+    assert_eq!(decoded.response_id().as_deref(), Some("r1"));
+}
+
+/// The 14 members of a positional event, `null` but for the given ones.
+fn positional_event(members: &[(usize, &str)]) -> String {
+    let mut all = vec!["null"; 14];
+    for (i, raw) in members {
+        all[*i] = raw;
+    }
+    format!("[{}]", all.join(","))
+}
+
+/// #25 and #6, a struct written as a JSON array: serde reads a derived struct from an
+/// array by position, so the pinned client decodes such an event, and the WebSocket
+/// reader such a wrapped status error. Failure classification reads the members they
+/// decode to, as the object form with the same members ([`classification_view`]), with
+/// private values resolved and the last of a repeated key. Nothing outside the struct is
+/// added: a positional event has no `status`. An array that decodes as neither stays as
+/// sent, and so does every object frame's own [`pinned_view`].
+#[test]
+fn positional_frames_are_classified_by_their_members() {
+    let failed_error =
+        r#"{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited","token":"at-FAKE"}"#;
+    let failed = positional_event(&[
+        (0, r#""response.failed""#),
+        (3, &format!(r#"{{"id":"r1","error":{failed_error}}}"#)),
+    ]);
+    for (positional, object) in [
+        (
+            failed.clone(),
+            format!(r#"{{"type":"response.failed","response":{{"id":"r1","error":{failed_error}}}}}"#),
+        ),
+        // 13 elements: `safety_buffering` defaults.
+        (
+            r#"["error",{"h":"v"},null,null,"r1",{"code":"x","code":"rate_limit_exceeded"},null,"i",null,null,null,1,2]"#.to_owned(),
+            r#"{"type":"error","headers":{"h":"v"},"response_id":"r1","error":{"code":"rate_limit_exceeded"},"item_id":"i","summary_index":1,"content_index":2}"#.to_owned(),
+        ),
+        (
+            positional_event(&[
+                (0, r#""response.failed""#),
+                (3, r#"{"$serde_json::private::RawValue":"{\"error\":{\"type\":\"permission_error\"}}"}"#),
+            ]),
+            r#"{"type":"response.failed","response":{"error":{"type":"permission_error"}}}"#.to_owned(),
+        ),
+        (
+            r#"["error",429,{"code":"rate_limit_exceeded","message":"limited"},{"retry-after":"1"}]"#.to_owned(),
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"limited"},"headers":{"retry-after":"1"}}"#.to_owned(),
+        ),
+        (
+            r#"["error",401,["invalid_api_key","bad key",{"x":1}]]"#.to_owned(),
+            r#"{"type":"error","status":401,"error":{"code":"invalid_api_key","message":"bad key","headers":{"x":1}}}"#.to_owned(),
+        ),
+        (r#"["error",null,[null,null]]"#.to_owned(), r#"{"type":"error","error":{}}"#.to_owned()),
+    ] {
+        assert!(decode(&positional).is_some() || wrapped(&positional).is_some(), "{positional}");
+        let view: Value = serde_json::from_str(&classification_view(&positional)).unwrap();
+        let want: Value = serde_json::from_str(&pinned_view(&object)).unwrap();
+        assert_eq!(view, want, "{positional}");
+    }
+    // A positional event has no member outside its struct: no status to read.
+    let view = classification_view(&failed);
+    assert!(!view.contains("status"), "{view}");
+    let (error, _) = crate::codex_response::terminal_failure(&view, false).unwrap();
+    assert_eq!(error.status, 429);
+    assert_eq!(
+        crate::codex_ws::ws_error(&classification_view(r#"["error",429,{"code":"x"}]"#), false).map(|e| e.status),
+        Some(429)
+    );
+    // Neither struct: classification reads nothing new. An object frame keeps its view.
+    for frame in [
+        r#"["response.failed",null,null,{"error":{"type":"rate_limit_error"}}]"#,
+        r#"["error","429",{"code":"x"}]"#,
+        r#"["error",429,{"code":"x"},null,null]"#,
+        r#"["warning",429,{"code":"x"}]"#,
+        r#"[{"type":"error","status":429}]"#,
+    ] {
+        assert!(decode(frame).is_none() && wrapped(frame).is_none(), "{frame}");
+        assert_eq!(classification_view(frame), frame);
+    }
+    let object = r#"{"type":"error","error":{"code":"a","code":"b"},"x":{"$serde_json::private::Number":"5"}}"#;
+    assert_eq!(classification_view(object), pinned_view(object));
+    // Linear in the frame: a positional event with a large member is viewed at once.
+    let big = positional_event(&[
+        (0, r#""response.failed""#),
+        (3, &format!(r#"{{"output":"{}"}}"#, "x".repeat(4 << 20))),
+    ]);
+    assert!(classification_view(&big).len() > 4 << 20);
+}
+
+/// #5 for a positional event: a status-less context-window `error` becomes the
+/// `response.failed` built from the bytes of the members it decodes to, as for its object
+/// form, and a context-window `response.failed` is the frame as sent.
+#[test]
+fn positional_context_window_events_are_preserved_as_their_object_form() {
+    let error = r#"{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model.","param":"input","n":1.50}"#;
+    let positional = positional_event(&[(0, r#""error""#), (4, r#""resp_1""#), (5, error)]);
+    let object = format!(r#"{{"type":"error","response_id":"resp_1","error":{error}}}"#);
+    let converted = context_window_event(&positional).expect("context window");
+    assert_eq!(converted, context_window_event(&object).unwrap());
+    assert!(converted.contains(r#""n":1.50"#), "{converted}");
+    let failed = positional_event(&[
+        (0, r#""response.failed""#),
+        (3, r#"{"id":"r1","error":{"code":"context_length_exceeded"}}"#),
+    ]);
+    assert!(matches!(context_window_event(&failed), Some(Cow::Borrowed(f)) if f == failed));
+    assert!(context_window_event(r#"["error",400,{"code":"context_length_exceeded"}]"#).is_none());
+    assert!(context_window_event(&positional_event(&[(0, r#""error""#), (5, r#"{"code":"other"}"#)])).is_none());
+}

@@ -35,8 +35,12 @@
 //! error or to nothing (lines 712-764). [`wrapped`] makes both decisions.
 //!
 //! Failure classification and response identity read a decoded event as the pinned
-//! `Value` does: with the last of a repeated key and its private numbers and raw values
-//! resolved ([`pinned_view`], [`Event::response_id`]). The client still receives the
+//! reader does. Serde reads a derived struct from a JSON array by position, so an event
+//! (or a wrapped status error) written as an array is read by the members it decodes to;
+//! every member is read as the pinned `Value` holds it, with the last of a repeated key
+//! and its private numbers and raw values resolved ([`classification_view`]). A readable
+//! `response.completed` names the response its `ResponseCompleted` reading carries,
+//! positional form included ([`Event::response_id`]). The client still receives the
 //! bytes as sent.
 
 use std::borrow::Cow;
@@ -136,20 +140,22 @@ impl Event<'_> {
         }
     }
 
-    /// The `response.id` the pinned reader reads (`Value::get`, the last `id`, with the
-    /// private values of the `response` and of the `id` resolved), when it is a string.
-    /// Every native route names a response by it: settlement, usage ownership and
+    /// The ID of the response the pinned reader says this event is about, when it is a
+    /// string. Every native route names a response by it: settlement, usage ownership and
     /// interrupt tracking.
+    ///
+    /// A `response.completed` whose `response` reads as `ResponseCompleted` names the
+    /// response its `Completed` event carries: `ResponseCompleted.id` as that same reading
+    /// decodes it ([`completed`]), so also from the struct's positional form, a JSON array
+    /// whose first element is the ID (`sse/responses.rs:109-118` and 494-520). Every other
+    /// event, `response.created` among them, names the `response.id` its `Value::get`
+    /// reads: the last `id`, with the private values of the `response` and of the `id`
+    /// resolved, and none in an array.
     pub fn response_id(&self) -> Option<String> {
-        if self.kind == "response.completed" {
-            let response = resolved(self.response?);
-            if response.trim_start().starts_with('[') && completes(&response) {
-                // ResponseCompleted is a serde struct: its positional form names the
-                // completed response in the first element, unlike response.created's
-                // object-member reading (sse/responses.rs:109-118,494-520).
-                let fields: Vec<&RawValue> = serde_json::from_str(&response).ok()?;
-                return serde_json::from_str::<String>(&resolved(fields.first()?.get())).ok();
-            }
+        if self.kind == "response.completed"
+            && let Some(completed) = self.response.and_then(completed)
+        {
+            return Some(completed.id.0);
         }
         self.response_str("id")
     }
@@ -516,7 +522,14 @@ fn get(raw: &str, key: &str) -> Option<String> {
 /// Whether the pinned reader reads `response`, a decoded event's raw `response` member,
 /// as `ResponseCompleted` (`sse/responses.rs:494-520`).
 pub(crate) fn completes(response: &str) -> bool {
-    Completed::reads(&resolved(response))
+    completed(response).is_some()
+}
+
+/// `response`, a decoded event's raw `response` member, as the pinned reader reads it
+/// into `ResponseCompleted` (`serde_json::from_value`, lines 494-520): `None` when that
+/// fails. One reading decides both whether the event completes a response and which.
+fn completed(response: &str) -> Option<Completed> {
+    serde_json::from_str::<Completed>(&pinned_view(&resolved(response))).ok()
 }
 
 /// One first-party type, reading one JSON value: `text`, with its own private tokens
@@ -534,11 +547,12 @@ fn struct_reads<T: serde::de::DeserializeOwned>(text: &str) -> bool {
     serde_json::from_str::<T>(&pinned_view(text)).is_ok()
 }
 
-/// `ResponseCompleted` (`sse/responses.rs:109-118`).
+/// `ResponseCompleted` (`sse/responses.rs:109-118`), as [`struct_reads`] reads a struct.
+/// Only its `id` is kept.
 #[derive(Deserialize)]
-#[allow(dead_code)] // Members are decoded for their acceptance, not read.
+#[allow(dead_code)] // The other members are decoded for their acceptance, not read.
 struct Completed {
-    id: Member<Str>,
+    id: Id,
     #[serde(default)]
     usage: Optional<Usage>,
     usage_metadata: Optional<UsageMetadata>,
@@ -592,7 +606,20 @@ macro_rules! struct_reads {
         }
     )*};
 }
-struct_reads!(Completed, Usage, InputDetails, OutputDetails, UsageMetadata);
+struct_reads!(Usage, InputDetails, OutputDetails, UsageMetadata);
+
+/// `ResponseCompleted.id`: a `String`, kept, read from a value whose private tokens are
+/// resolved as [`Member`] resolves them.
+struct Id(String);
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <&RawValue>::deserialize(deserializer)?;
+        serde_json::from_str::<String>(&resolved(raw.get()))
+            .map(Id)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// A `String`.
 struct Str;
@@ -835,6 +862,118 @@ pub(crate) fn pinned_view(payload: &str) -> Cow<'_, str> {
         return Cow::Borrowed(payload);
     }
     view(payload, false, false, true)
+}
+
+/// `ResponsesStreamEvent`'s members in the order serde reads them from a JSON array
+/// ([`Shape`], `sse/responses.rs:161-179`).
+const EVENT_MEMBERS: [&str; 14] = [
+    "type",
+    "headers",
+    "metadata",
+    "response",
+    "response_id",
+    "error",
+    "item",
+    "item_id",
+    "call_id",
+    "delta",
+    "text",
+    "summary_index",
+    "content_index",
+    "safety_buffering",
+];
+
+/// `WrappedWebsocketErrorEvent`'s members in order ([`WrappedShape`],
+/// `endpoint/responses_websocket.rs:692-702`).
+const WRAPPED_MEMBERS: [&str; 4] = ["type", "status", "error", "headers"];
+
+/// `WrappedWebsocketError`'s members in order ([`WrappedErrorShape`], lines 684-690).
+const WRAPPED_ERROR_MEMBERS: [&str; 3] = ["code", "message", "headers"];
+
+/// The frame `payload` as failure classification reads it, for every native route (#25,
+/// #6). A frame the pinned client reads as a struct written as a JSON array (serde reads
+/// a derived struct from an array by position) is read as the object of the members it
+/// decodes to: a decoded `ResponsesStreamEvent` ([`decode`]), or else a frame the
+/// WebSocket reader reads as a wrapped status error ([`wrapped`]), whose `error` may be an
+/// array in turn. Each member keeps its value as sent; a `null` member is absent, as the
+/// struct's `None` is; nothing else is added, so such an event has no `status`,
+/// `sequence_number` or other member outside its struct. That object, and every other
+/// frame, is then read as [`pinned_view`] reads it: the last of a repeated key, private
+/// values resolved. Members are not read further than the pinned reader reads them: a
+/// `Value` member that is an array stays one.
+///
+/// Classification only: the client receives the frame as sent. One extra decoding, and
+/// only for a frame that starts with `[`.
+pub(crate) fn classification_view(payload: &str) -> Cow<'_, str> {
+    match positional_object(payload) {
+        Some(object) => Cow::Owned(pinned_view(&object).into_owned()),
+        None => pinned_view(payload),
+    }
+}
+
+/// The object a frame written as a JSON array stands for ([`classification_view`]),
+/// with each member's value as sent; `None` for any other frame. A decoded event and a
+/// wrapped status error never share an array: the event needs at least 13 elements, the
+/// wrapped error at most 4.
+fn positional_object(payload: &str) -> Option<String> {
+    let payload = payload.trim();
+    if !payload.starts_with('[') {
+        return None;
+    }
+    if decode(payload).is_some() {
+        return named(payload, &EVENT_MEMBERS, |_, _| None);
+    }
+    wrapped(payload)?;
+    named(payload, &WRAPPED_MEMBERS, |name, raw| {
+        (name == "error" && raw.starts_with('['))
+            .then(|| named(raw, &WRAPPED_ERROR_MEMBERS, |_, _| None))
+            .flatten()
+    })
+}
+
+/// The JSON array `array`, a struct written by position that serde already accepted, as
+/// an object: element `i` is the member `names[i]`, as sent, unless `nested` gives the
+/// member's value (`nested(name, element)`); `null` elements are left out.
+fn named(array: &str, names: &[&str], nested: impl Fn(&str, &str) -> Option<String>) -> Option<String> {
+    let elements: Vec<&RawValue> = serde_json::from_str(array).ok()?;
+    if elements.len() > names.len() {
+        return None;
+    }
+    let mut out = String::with_capacity(array.len() + 24 * elements.len());
+    out.push('{');
+    for (name, element) in names.iter().zip(&elements) {
+        let raw = element.get();
+        if raw == "null" {
+            continue;
+        }
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(name);
+        out.push_str("\":");
+        match nested(name, raw) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(raw),
+        }
+    }
+    out.push('}');
+    Some(out)
+}
+
+/// The #5 event a Codex client receives for the upstream event `payload`
+/// (`cpa_common::codex_client::context_window_failure_event`), deciding on the
+/// [`classification_view`]: `payload` itself for a context-window `response.failed`, as
+/// sent; for a status-less context-window `error`, the `response.failed` built from the
+/// bytes of its own members (the members a positional event decodes to, for one written
+/// as an array). `None` for any other event.
+pub(crate) fn context_window_event(payload: &str) -> Option<Cow<'_, str>> {
+    let members = positional_object(payload).map_or(Cow::Borrowed(payload), Cow::Owned);
+    let view = pinned_view(&members);
+    match cpa_common::codex_client::context_window_failure_event(&members, &view)? {
+        Cow::Borrowed(_) => Some(Cow::Borrowed(payload)),
+        Cow::Owned(built) => Some(Cow::Owned(built)),
+    }
 }
 
 /// `payload` with only the private values [`pinned_view`] resolves resolved: every

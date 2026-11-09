@@ -10,6 +10,12 @@
 //! when a member the failure readings read repeats, every occurrence counts: the frame is
 //! withheld when any occurrence of any of those members could make it an account failure.
 //!
+//! A member repeats when its path repeats: the same key twice in one object, or in two
+//! occurrences of a repeated ancestor (two `error` objects of the frame, say). The same
+//! name in two different objects is no repeat: `error.type` and `response.error.type`
+//! are two members, and a frame with each once is read by its first and last readings
+//! alone. Once some member repeats, every occurrence of every member counts.
+//!
 //! The analysis is one tolerant pass that collects the occurrences of those members,
 //! then one check of each occurrence on its own, for the checks that read one member. The
 //! capacity check reads the error body a failure reading composes from several members
@@ -38,15 +44,29 @@ enum Object {
     Other,
 }
 
-/// A member a failure reading reads. `Top` is a member of the frame
-/// (`codex_ws::ws_error`, and `response::terminal_failure` for `type` and the status-less
-/// fallbacks); `ResponseError` is `response.error`; `Field` is a member of either error
-/// object, which `response::terminal_failure` classifies.
+/// A member a failure reading reads, by its path from the frame. `Top` is a member of the
+/// frame (`codex_ws::ws_error`, and `response::terminal_failure` for `type` and the
+/// status-less fallbacks); `Response` is the frame's `response`, which no reading
+/// classifies itself but which holds `ResponseError`, `response.error`; `Field` is a
+/// member of one of the two error objects ([`Object::Error`] or
+/// [`Object::ResponseError`]), which `response::terminal_failure` classifies. A slot
+/// occurs more than once exactly when a key on its path repeats within one object.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Top(&'static str),
+    Response,
     ResponseError,
-    Field(&'static str),
+    Field(Object, &'static str),
+}
+
+impl Slot {
+    /// A member of either error object, whichever object it is in.
+    fn field(self) -> Option<&'static str> {
+        match self {
+            Self::Field(_, name) => Some(name),
+            Self::Top(_) | Self::Response | Self::ResponseError => None,
+        }
+    }
 }
 
 const TOP: [&str; 8] = [
@@ -68,11 +88,11 @@ fn member(object: Object, key: &str) -> (Option<Slot>, Object) {
     match object {
         Object::Root => match key {
             "error" => (Some(Slot::Top("error")), Object::Error),
-            "response" => (None, Object::Response),
+            "response" => (Some(Slot::Response), Object::Response),
             _ => (named(&TOP).map(Slot::Top), Object::Other),
         },
         Object::Response if key == "error" => (Some(Slot::ResponseError), Object::ResponseError),
-        Object::Error | Object::ResponseError => (named(&FIELDS).map(Slot::Field), Object::Other),
+        Object::Error | Object::ResponseError => (named(&FIELDS).map(|name| Slot::Field(object, name)), Object::Other),
         Object::Response | Object::Other => (None, Object::Other),
     }
 }
@@ -250,7 +270,7 @@ impl Capacity {
 
 fn ambiguous(payload: &str) -> bool {
     let found = occurrences(payload);
-    // At most 14 distinct slots, so this stays linear in the occurrences.
+    // At most 20 distinct slots, so this stays linear in the occurrences.
     let mut seen: Vec<Slot> = Vec::new();
     let repeated = found.iter().any(|(slot, _)| {
         let again = seen.contains(slot);
@@ -262,10 +282,12 @@ fn ambiguous(payload: &str) -> bool {
     if !repeated {
         return false;
     }
-    let values = |slots: &[Slot]| -> Vec<&str> {
+    // The values of the given frame members and of the given fields of either error
+    // object: a conservative union once anything repeats.
+    let values = |slots: &[Slot], fields: &[&str]| -> Vec<&str> {
         found
             .iter()
-            .filter(|(slot, _)| slots.contains(slot))
+            .filter(|(slot, _)| slots.contains(slot) || slot.field().is_some_and(|f| fields.contains(&f)))
             .map(|(_, range)| &payload[range.clone()])
             .collect()
     };
@@ -274,39 +296,31 @@ fn ambiguous(payload: &str) -> bool {
         let status = rawjson::parse(raw).i64();
         matches!(status, 401 | 402 | 403 | 429)
     };
-    let kinds: Vec<String> = values(&[Slot::Top("type")]).into_iter().map(lower).collect();
+    let kinds: Vec<String> = values(&[Slot::Top("type")], &[]).into_iter().map(lower).collect();
     let error = kinds.iter().any(|k| k == "error");
     if !error && !kinds.iter().any(|k| k == "response.failed") {
         return false;
     }
     // The status frame reading of an `error` frame.
     if error
-        && values(&[Slot::Top("status"), Slot::Top("status_code")])
+        && values(&[Slot::Top("status"), Slot::Top("status_code")], &[])
             .into_iter()
             .any(account)
     {
         return true;
     }
     // The terminal failure reading of the error object, or of the status-less fallback.
-    values(&[Slot::Field("type"), Slot::Top("error_type")])
-        .into_iter()
-        .any(|raw| {
-            matches!(
-                lower(raw).as_str(),
-                "usage_limit_reached" | "authentication_error" | "permission_error" | "rate_limit_error"
-            )
-        })
-        || values(&[Slot::Field("code"), Slot::Top("code")])
-            .into_iter()
-            .any(|raw| {
-                matches!(
-                    lower(raw).as_str(),
-                    "invalid_api_key" | "unauthorized" | "forbidden" | "permission_denied" | "rate_limit_exceeded"
-                )
-            })
-        || values(&[Slot::Field("status"), Slot::Field("status_code")])
-            .into_iter()
-            .any(account)
+    values(&[Slot::Top("error_type")], &["type"]).into_iter().any(|raw| {
+        matches!(
+            lower(raw).as_str(),
+            "usage_limit_reached" | "authentication_error" | "permission_error" | "rate_limit_error"
+        )
+    }) || values(&[Slot::Top("code")], &["code"]).into_iter().any(|raw| {
+        matches!(
+            lower(raw).as_str(),
+            "invalid_api_key" | "unauthorized" | "forbidden" | "permission_denied" | "rate_limit_exceeded"
+        )
+    }) || values(&[], &["status", "status_code"]).into_iter().any(account)
         || {
             let mut capacity = Capacity::default();
             for (slot, range) in &found {
@@ -316,7 +330,7 @@ fn ambiguous(payload: &str) -> bool {
                     Slot::Top("error") | Slot::ResponseError if raw.starts_with(['{', '[']) => capacity.note(raw),
                     Slot::Top("error" | "message" | "code" | "error_type" | "param")
                     | Slot::ResponseError
-                    | Slot::Field("message" | "code" | "type") => capacity.note(rawjson::parse(raw).str()),
+                    | Slot::Field(_, "message" | "code" | "type") => capacity.note(rawjson::parse(raw).str()),
                     _ => {}
                 }
             }

@@ -689,18 +689,19 @@ impl Observer {
         if self.usage.enabled() && event.accounted() && outcome != codex_event::Outcome::Recorded {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
-        // Classification reads a copy, as the pinned `Value` holds it: the last of a
-        // repeated key and the private values resolved (`codex_event::pinned_view`). The
-        // client receives `delivered_failure`.
+        // Classification reads a copy, as the pinned reader decodes the event: a struct
+        // written as a JSON array by its members, the last of a repeated key and the
+        // private values resolved (`codex_event::classification_view`). The client
+        // receives `delivered_failure`.
         let view = match event.kind.as_ref() {
-            "error" | "response.failed" => codex_event::pinned_view(payload),
+            "error" | "response.failed" => codex_event::classification_view(payload),
             _ => Cow::Borrowed(payload),
         };
         if let Some((error, _classified)) = response::terminal_failure(&view, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload, &view))
+                .then(|| codex_event::context_window_event(payload))
                 .flatten()
                 .and_then(|event| match event {
                     Cow::Owned(event) => Some(Bytes::from(match name {
@@ -903,11 +904,9 @@ impl Passthrough {
         // event ahead of the error, renamed when it was the status-less `error`.
         let preserved = deliver.or_else(|| {
             let context = self.observer.codex_client
-                && parse_frame(&frame).1.is_some_and(|data| {
-                    let payload = data.trim();
-                    let view = codex_event::pinned_view(payload);
-                    cpa_common::codex_client::context_window_failure_event(payload, &view).is_some()
-                });
+                && parse_frame(&frame)
+                    .1
+                    .is_some_and(|data| codex_event::context_window_event(data.trim()).is_some());
             context.then(|| frame.clone())
         });
         match preserved {

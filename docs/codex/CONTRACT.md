@@ -614,7 +614,16 @@ Leading events are held under `stream-bootstrap-buffering`, but they are never c
 
 Every upstream failure frame keeps two readings: the scheduler's classification, which
 drives failover and credential health, and the frame itself, which is what the client
-receives (`ExecError::delivered_event`).
+receives (`ExecError::delivered_event`). Classification reads the frame as the pinned
+reader decodes it (`codex_event::classification_view`), on every native path: serde
+reads a derived struct from a JSON array by position, so a `ResponsesStreamEvent` such
+as `["response.failed",null,null,{"id":"r1","error":{…}},null,…]` or a wrapped status
+error such as `["error",429,{"code":…}]` is read as the object of the members it
+decodes to, each value as sent, a `null` member absent and nothing outside the struct
+added (a positional event has no `status`). Members are then read with the last of a
+repeated key and private values resolved. A `Value` member that is an array stays one.
+A status-less context-window `error` written that way becomes the #5 `response.failed`
+built from the bytes of its members.
 
 - A failure that is not an account failure reaches the client as the upstream sent it.
   This covers `response.failed`, a status-less `error` and the wrapped status `error`
@@ -638,6 +647,11 @@ receives (`ExecError::delivered_event`).
   no FIFO ownership rule for steering failures.
 - A decoded event names its response by the `response.id` the pinned `Value` reads: the
   last of a repeated `id`, with private values resolved (`Event::response_id`). A
+  `response.completed` whose `response` reads as `ResponseCompleted` names the
+  response that reading carries, the same decoding that decides it ends the response:
+  `ResponseCompleted` written as a JSON array (serde's positional struct form) names
+  its first element, which `Value::get` would not find; `response.created` and every
+  other event keep the `Value::get` reading. A
   steering connection binds a `response.created` to that ID, feeds usage to and settles
   the response it names, and an ordinary turn and the interrupt bookkeeping end that
   response. Delivery keeps the event as sent.
@@ -663,7 +677,9 @@ receives (`ExecError::delivered_event`).
   `type`, `code`, `status`, `status_code` and `message` of either error object), every
   other occurrence too, since a reader that acts on members as they stream past can
   take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`), and the frame's `param`,
-  which a status-less reading copies. Each occurrence is checked on its own, in one pass,
+  which a status-less reading copies. A member repeats when its path does: the same key
+  twice in one object, or inside a repeated ancestor such as the frame's `response`.
+  `error.type` and `response.error.type`, once each, repeat nothing. Each occurrence is checked on its own, in one pass,
   except the capacity check, which reads the error body a reading composes from several
   members (the error object as sent, the frame's `message`, `code`, `error_type` and
   `param`, and a message taken from the other error object): one summary of every piece
@@ -683,9 +699,12 @@ receives (`ExecError::delivered_event`).
   read as an account failure), ends nothing and cools nothing. A decoded notice still
   fails the turn when the pinned `error` branch raises its logical code (including
   an error object or code represented by a private raw value)
-  (`parse_terminal_provider_error`, `error.rs:79-127`). A decoded `error` without a
-  status, or one that is not a wrapped frame, keeps the status-less failure reading
-  above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
+  (`parse_terminal_provider_error`, `error.rs:79-127`). A decoded `error` that is not
+  a wrapped frame (for example because its `error.code` is a private raw value, which
+  `WrappedWebsocketError` cannot read as a `String`) is read by the `status` the
+  status-frame reading finds: an error status fails the turn by that status, a status
+  that maps to no error makes it a notice as above, and a decoded `error` without a
+  status keeps the status-less failure reading above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
   stays as described for the native HTTP route.
 - Every `response.incomplete` reaches the client as received, on an ordinary turn, a
   steering connection and a turn served over HTTP, at any stage: as the turn's first

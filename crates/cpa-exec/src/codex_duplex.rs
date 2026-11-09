@@ -693,9 +693,9 @@ impl Duplex {
     // A failure reusing a retained settled ID cannot be told from that old response;
     // only a new response.created binds a fresh record to that ID.
     fn failure_owner(&self, payload: &str) -> Owner {
-        // As the pinned `Value` holds the failure: the last of a repeated key, private
-        // values resolved.
-        let view = crate::codex_event::pinned_view(payload);
+        // As the pinned reader decodes the failure: a struct written as a JSON array by
+        // its members, the last of a repeated key, private values resolved.
+        let view = crate::codex_event::classification_view(payload);
         let mut failed = rawjson::get(&view, "response.id").str().to_owned();
         if failed.is_empty() {
             failed = rawjson::get(&view, "response_id").str().to_owned();
@@ -1122,11 +1122,10 @@ impl Duplex {
             // context-window failure does too, so Codex can compact and retry (#5). On a
             // native connection any other initial failure travels on the error as the
             // upstream sent it, for delivery once failover is decided.
-            let view = crate::codex_event::pinned_view(payload);
             match self
                 .turn
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload, &view))
+                .then(|| crate::codex_event::context_window_event(payload))
                 .flatten()
             {
                 Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),

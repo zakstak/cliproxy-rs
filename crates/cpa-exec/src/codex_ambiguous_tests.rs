@@ -6,8 +6,10 @@ fn slots(payload: &str) -> Vec<(String, &str)> {
         .map(|(slot, range)| {
             let name = match slot {
                 Slot::Top(n) => n.to_owned(),
+                Slot::Response => "response".to_owned(),
                 Slot::ResponseError => "response.error".to_owned(),
-                Slot::Field(n) => format!("error.{n}"),
+                Slot::Field(Object::ResponseError, n) => format!("response.error.{n}"),
+                Slot::Field(_, n) => format!("error.{n}"),
             };
             (name, &payload[range])
         })
@@ -28,6 +30,7 @@ fn occurrences_are_the_members_the_failure_readings_read() {
             ("error.message".to_owned(), r#"{"m":1}"#),
             ("error".to_owned(), r#"{"code":"d","type":"e","message":{"m":1}}"#),
             ("response.error".to_owned(), r#""f""#),
+            ("response".to_owned(), r#"{"error":"f","id":"g"}"#),
             ("status".to_owned(), "429"),
         ]
     );
@@ -382,4 +385,34 @@ fn many_composed_pieces_are_checked_in_linear_time() {
     frame.truncate(frame.len() - r#""type":"error","message":"at capacity"}"#.len());
     frame.push_str(r#""type":"error","message":"busy"}"#);
     assert!(!ambiguous_account(&frame));
+}
+
+/// A member repeats only when its path does: the same key twice in one object, or in two
+/// occurrences of a repeated ancestor. The same name in distinct objects is two members,
+/// so a frame with each once is read by its first and last readings alone and reaches
+/// the client when those classify no account failure (#25 review, safe unique frame:
+/// its first and last readings select the root error, a 400). A repeated ancestor still
+/// counts, with every occurrence: two `error` objects, two `response` objects (the
+/// middle one carrying the only `response.error`), or two `error`s inside one `response`.
+#[test]
+fn only_a_repeated_path_is_a_repeated_member() {
+    let unique = r#"{"type":"error","item_id":23,"error":{"type":"invalid_request_error","message":"bad input"},"response":{"error":{"type":"model_at_capacity"}}}"#;
+    for frame in [
+        unique,
+        r#"{"type":"error","error":{"code":"other","status":400},"response":{"error":{"code":"rate_limit_exceeded","status":429}}}"#,
+        r#"{"type":"response.failed","error":{"type":"invalid_request_error"},"response":{"error":{"message":"bad"},"id":"r1"},"meta":{"type":"rate_limit_error"}}"#,
+    ] {
+        assert!(!ambiguous_account(frame), "{frame}");
+    }
+    assert!(!crate::codex_ws::account_shaped(unique, false));
+    for frame in [
+        r#"{"type":"error","error":{"type":"invalid_request_error"},"error":{"type":"invalid_request_error"},"response":{"error":{"type":"model_at_capacity"}}}"#,
+        r#"{"type":"response.failed","response":{"id":"a"},"response":{"error":{"code":"rate_limit_exceeded"}},"response":{"id":"b"}}"#,
+        r#"{"type":"response.failed","response":{"error":{"code":"other"},"error":{"type":"permission_error"},"error":{"code":"other"}}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","type":"invalid_request_error"},"response":{"error":{"type":"rate_limit_error"}}}"#,
+    ] {
+        assert!(ambiguous_account(frame), "{frame}");
+    }
+    let middle = r#"{"type":"response.failed","response":{"id":"a"},"response":{"error":{"code":"rate_limit_exceeded"}},"response":{"id":"b"}}"#;
+    assert!(crate::codex_ws::account_shaped(middle, false));
 }

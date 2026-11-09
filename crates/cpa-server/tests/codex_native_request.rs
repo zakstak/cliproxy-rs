@@ -1867,3 +1867,102 @@ async fn buffered_answers_end_on_a_processing_error_only_at_a_clean_end() {
         assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
     }
 }
+
+/// #25 and #6 on the native HTTP route, an event written as a JSON array: the pinned SSE
+/// reader decodes `["response.failed",null,null,{…}]` by position
+/// (`codex-api/src/sse/responses.rs:161-179` at 44ccf394573c), and failure classification
+/// reads the members it decodes to (`codex_event::classification_view`). Each positional
+/// event takes its object form's answer, status, cooldown and record, for a streaming and
+/// a buffered client: an account failure is that status with the provider's error object
+/// (the route's established answer) and cools the credential; another failure keeps its
+/// classification; a Codex client gets the #5 `response.failed` built from a status-less
+/// context-window `error`'s members; a positional completion ends the response. The real
+/// completion after a failure is never the answer. One attempt each.
+#[tokio::test]
+async fn positional_events_classify_as_their_object_form_on_http() {
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    let limited = r#"{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
+    let context = r#"{"code":"context_length_exceeded","message":"too long","param":"input"}"#;
+    let positional = |members: &[(usize, &str)]| {
+        let mut all = vec!["null"; 14];
+        for (i, raw) in members {
+            all[*i] = raw;
+        }
+        format!("[{}]", all.join(","))
+    };
+    let limited_response = format!(r#"{{"id":"r1","error":{limited}}}"#);
+    // (positional, object form, the streaming client's status)
+    let cases = [
+        (
+            positional(&[(0, r#""response.failed""#), (3, &limited_response)]),
+            format!(r#"{{"type":"response.failed","response":{limited_response}}}"#),
+            429,
+        ),
+        (
+            positional(&[(0, r#""error""#), (5, limited)]),
+            format!(r#"{{"type":"error","error":{limited}}}"#),
+            429,
+        ),
+        (
+            positional(&[
+                (0, r#""response.failed""#),
+                (3, r#"{"id":"r1","error":{"type":"invalid_request_error","code":"other","message":"bad input"}}"#),
+            ]),
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","code":"other","message":"bad input"}}}"#.to_owned(),
+            200,
+        ),
+        (
+            positional(&[(0, r#""error""#), (4, r#""resp_ctx""#), (5, context)]),
+            format!(r#"{{"type":"error","response_id":"resp_ctx","error":{context}}}"#),
+            200,
+        ),
+        (
+            positional(&[(0, r#""response.completed""#), (3, r#"{"id":"r1","end_turn":true}"#)]),
+            r#"{"type":"response.completed","response":{"id":"r1","end_turn":true}}"#.to_owned(),
+            200,
+        ),
+    ];
+    let answer = |event: &str, body: &str| {
+        let event = event.to_owned();
+        let body = body.to_owned();
+        async move {
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(format!("data: {event}\n\ndata: {REAL_END}\n\n"))],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, body).await;
+            let records = usage_records(&proxy, 1).await;
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            let cooled = !proxy.rt.store().cooldowns(&credential).is_empty();
+            assert_eq!(proxy.upstream.http().len(), 1, "{event}");
+            assert_eq!(records.len(), 1, "{event}: {records:?}");
+            let record = (records[0]["failed"].clone(), records[0]["fail"]["status_code"].clone());
+            (status, answer.replace(&event, "EVENT"), cooled, record)
+        }
+    };
+    for (array, object, streaming_status) in cases {
+        assert!(cpa_exec::codex_event::decode(&array).is_some(), "{array}");
+        for (stream, body) in [(true, &full), (false, &buffered)] {
+            let case = format!("stream {stream}: {array}");
+            let got = answer(&array, body).await;
+            let want = answer(&object, body).await;
+            assert_eq!(got, want, "{case}");
+            assert!(!got.1.contains("resp_real"), "{case}: {got:?}");
+            if stream {
+                assert_eq!(got.0, streaming_status, "{case}: {got:?}");
+            }
+            assert_eq!(got.2, streaming_status == 429, "{case}: {got:?}");
+        }
+    }
+}
