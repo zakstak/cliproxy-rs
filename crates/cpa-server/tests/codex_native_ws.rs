@@ -580,6 +580,91 @@ async fn http_fallback_is_a_separate_explicit_conversion() {
 
 const STEERING: &str = "codex:\n  response-steering: true\n";
 
+/// A positional handshake is still a handshake: hold it for bootstrap failover until
+/// content is delivered, just as its object representation is held. No replay after a
+/// delta, on either the socket or HTTP upstream path.
+#[tokio::test]
+async fn positional_handshakes_keep_bootstrap_failover_before_delivery() {
+    const OBJECT: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    const POSITIONAL: &str =
+        r#"["response.created",null,null,{"id":"r1"},null,null,null,null,null,null,null,null,null,null]"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","delta":"started"}"#;
+    const FAILED: &str = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"server_is_overloaded","message":"try next"}}}"#;
+    const GOOD: &str = r#"{"type":"response.completed","response":{"id":"healthy","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#;
+    for created in [OBJECT, POSITIONAL] {
+        for content in [false, true] {
+            for (sockets, ws_client) in [(true, true), (false, true), (false, false)] {
+                let case = format!("sockets={sockets}, ws_client={ws_client}, content={content}: {created}");
+                let mut leading = vec![created];
+                if content {
+                    leading.push(DELTA);
+                }
+                leading.push(FAILED);
+                let batch = |frames: &[&str]| frames.iter().map(|f| Bytes::from((*f).to_owned())).collect();
+                let sse = |frames: &[&str]| frames.iter().map(|f| format!("data: {f}\n\n")).collect::<String>();
+                let script = if sockets {
+                    Script {
+                        ws: vec![batch(&leading), batch(&[GOOD])],
+                        ..Script::default()
+                    }
+                } else {
+                    Script {
+                        http: vec![
+                            cpa_server::testing::codex_capture::Reply::sse(sse(&leading)),
+                            cpa_server::testing::codex_capture::Reply::sse(sse(&[GOOD])),
+                        ],
+                        ..Script::default()
+                    }
+                };
+                let proxy = proxy_with(script, "codex:\n  stream-bootstrap-buffering: true\n", |url| {
+                    let mut second = credential(Profile::Chatgpt, url, sockets);
+                    second.id = "codex-second.json".into();
+                    second.metadata.insert("access_token".into(), "at-SECOND".into());
+                    vec![credential(Profile::Chatgpt, url, sockets), second]
+                })
+                .await;
+                let got = if ws_client {
+                    let mut socket = connect(&proxy).await;
+                    socket
+                        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                        .await
+                        .unwrap();
+                    let got = read(&mut socket, &["response.completed"]).await;
+                    if !content {
+                        assert_eq!(got.frames, [GOOD], "{case}: {got:?}");
+                    }
+                    let _ = socket.close(1000, "done").await;
+                    got.frames.join("\n")
+                } else {
+                    wreq::Client::new()
+                        .post(format!("http://{}/v1/responses", proxy.addr))
+                        .bearer_auth("client-key")
+                        .header("content-type", "application/json")
+                        .body(r#"{"model":"gpt-5.5","input":[],"stream":true}"#)
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap()
+                };
+                let attempts = if sockets {
+                    proxy.upstream.sockets().len()
+                } else {
+                    proxy.upstream.http().len()
+                };
+                assert_eq!(attempts, if content { 1 } else { 2 }, "{case}: {got}");
+                assert_eq!(got.contains(GOOD), !content, "{case}: {got}");
+                if content {
+                    assert!(got.contains(created) && got.contains(DELTA), "{case}: {got}");
+                } else {
+                    assert!(!got.contains(created) && !got.contains(FAILED), "{case}: {got}");
+                }
+            }
+        }
+    }
+}
+
 /// A wrapped status error that fails the request (a request fault: no failover).
 const WRAPPED_400: &str = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":null,"param":"input","future_error_field":{"n":1.50}},"future_frame_field":[1e3,-0.0]}"#;
 /// A server failure after the response started.

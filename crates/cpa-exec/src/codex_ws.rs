@@ -1126,7 +1126,7 @@ impl Turn {
             // event and on a processing error alike, never on a decoded
             // `response.completed` without a `response`.
             Reading::Event { terminal } => {
-                let bufferable = response::bufferable(payload);
+                let bufferable = response::bufferable(&crate::codex_event::classification_view(payload));
                 let ack = acknowledged_id(payload);
                 // Observation above read a copy; the client gets the frame as it arrived.
                 Frame::Event {

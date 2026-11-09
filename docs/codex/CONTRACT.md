@@ -386,7 +386,8 @@ The response reaches the client as the upstream sent it:
   with no event renamed, no output repaired and no usage added. Usage, capture and
   failure classification read a copy. The observer splits lines as the shared SSE
   framer does (`\r\n`, `\r` or `\n`) and joins a multiline `data` field in one pass.
-- Leading handshake events are held under `stream-bootstrap-buffering`. A failure that
+- Leading handshake events are held under `stream-bootstrap-buffering`, using their
+  decoded classification view; positional and object envelopes are held alike. A failure that
   arrives before anything was delivered fails over to another credential when its scope
   allows it; otherwise the provider's event is delivered. After something was delivered,
   a failure ends the stream after its event and is never replayed on another credential.

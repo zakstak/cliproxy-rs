@@ -717,7 +717,7 @@ impl Observer {
             ("response.output_item.done", _) => Seen::Content,
             (_, codex_event::Outcome::Ends) => Seen::Terminal,
             (_, codex_event::Outcome::Recorded) => Seen::Recorded,
-            _ if response::bufferable(payload) => Seen::Handshake,
+            _ if response::bufferable(&codex_event::classification_view(payload)) => Seen::Handshake,
             _ => Seen::Content,
         }
     }
