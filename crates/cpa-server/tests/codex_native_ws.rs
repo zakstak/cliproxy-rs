@@ -1998,3 +1998,74 @@ async fn an_http_turn_answers_an_interrupt_without_inventing_output() {
     );
     assert!(proxy.upstream.sockets().is_empty(), "no upstream socket");
 }
+
+/// Waits until upstream socket `socket` read `count` client frames: the barrier on what
+/// upstream actually received, not a quiet period.
+async fn upstream_read(proxy: &Proxy, socket: usize, count: usize) {
+    let started = std::time::Instant::now();
+    while proxy.upstream.sockets()[socket].frames.len() < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "upstream read {} of {count} frames",
+            proxy.upstream.sockets()[socket].frames.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// #24: a `codex.response-steering` connection keeps at most 64 steers in flight, a local
+/// resource ceiling (`docs/codex/CONTRACT.md` "Socket and account ownership"). Through
+/// the public router, an upstream that reads every steer and acknowledges none receives
+/// exactly 64, each as the client sent it, while the test waits for each read. The 65th
+/// ends the client connection and never goes upstream. The end is request-scoped: the
+/// credential is not cooled, so the next connection's create is served by it on a fresh
+/// socket, and no steer is replayed there.
+#[tokio::test]
+async fn steering_stops_forwarding_steers_at_the_ceiling() {
+    const CEILING: usize = 64;
+    let created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
+    let mut ws = vec![vec![Bytes::from_static(created.as_bytes())]];
+    ws.extend((0..CEILING).map(|_| Vec::new()));
+    ws.push(fixture("sse-completed").frames());
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws,
+            ..Script::default()
+        },
+        STEERING,
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [created]);
+    let steer = |n: usize| {
+        format!(r#"{{"type":"response.steer","previous_response_id":"resp_fixture_1","input":"{n}","future":1.50}}"#)
+    };
+    let mut want = vec![first.clone()];
+    for n in 0..CEILING {
+        socket.send(Message::text(steer(n))).await.unwrap();
+        want.push(steer(n));
+        upstream_read(&proxy, 0, want.len()).await;
+    }
+    socket.send(Message::text(steer(CEILING))).await.unwrap();
+    let ended = tokio::select! {
+        ended = read(&mut socket, &[]) => ended,
+        () = upstream_read(&proxy, 0, want.len() + 1) => panic!("the 65th steer went upstream"),
+    };
+    assert!(ended.frames.is_empty(), "no event after the ceiling: {ended:?}");
+    assert!(ended.closed.is_some(), "the connection ends: {ended:?}");
+    assert_eq!(
+        upstream_frames(&proxy, 0),
+        want,
+        "the create and 64 steers as sent; the 65th never went upstream"
+    );
+
+    let mut again = connect(&proxy).await;
+    again.send(Message::text(first.clone())).await.unwrap();
+    let served = read(&mut again, &TERMINAL).await;
+    assert_eq!(served.frames, events("sse-completed"), "the credential still serves");
+    assert_eq!(proxy.upstream.sockets().len(), 2, "one fresh socket");
+    assert_eq!(upstream_frames(&proxy, 1), [first], "nothing replayed on it");
+}

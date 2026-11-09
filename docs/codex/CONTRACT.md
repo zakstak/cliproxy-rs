@@ -487,10 +487,29 @@ bounded:
 
 - at most 16 outstanding creates;
 - a write queue of 16 frames;
-- 16 local items waiting for the client.
+- 16 local items waiting for the client;
+- at most 64 steers in flight on a `codex.response-steering` connection.
 
 The proxy reads client frames only while the write queue has room, so a stalled
 upstream backpressures the client. A full queue ends the connection with a local error.
+
+A steer is in flight from the moment it is written until upstream releases it: a
+`response.steer.failed` for it, or, once accepted, the `response.created` of its
+parent's successor or a `response.steer.failed` that names its ID. The settings that
+steering pins for an automatic successor stay only while a steer in flight names their
+parent. The ceiling of 64 is the proxy's own resource policy. No first-party or
+documented source sets a limit, and the pinned client sends no `response.steer`. The
+ceiling is well above the write queue plus the frame being written, so an upstream that
+stops reading meets write backpressure first. It stops an upstream that reads every
+steer and releases none.
+
+- A client steer that would be the 65th ends the connection with a local,
+  request-scoped error before it is written. The credential is not cooled, and nothing
+  is replayed. Records still open fail with that error, as for the create bound.
+- An acceptance that names no steer in flight, under a new ID, still counts, as in Go.
+  A repeated ID replaces its entry, so it does not count again. An acceptance that
+  would be the 65th reaches the client as sent, and the connection then ends with a
+  local, request-scoped error. That makes no claim about what the upstream meant.
 
 ### Responses and failures
 
