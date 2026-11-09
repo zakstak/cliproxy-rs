@@ -2,7 +2,8 @@
 //!
 //! With `response-steering` on, a downstream Responses WebSocket whose turn runs on a
 //! Codex credential in WebSocket mode keeps that upstream socket for the rest of the
-//! connection. Once the first `response.created` reached the client, the client's later
+//! connection. Once the first `response.created` reached the client (or the first
+//! response's terminal event, when upstream ends it without one), the client's later
 //! frames go straight to the socket: `response.steer` raw and `response.create` with
 //! only its model routed. `response.append` is refused. A response terminal is not a
 //! stream terminal: accepted steering may start an automatic successor or wait for tool results. The
@@ -247,7 +248,19 @@ struct Observing {
     observation: futures_util::future::BoxFuture<'static, ()>,
     payload: String,
     kind: String,
-    establishing: bool,
+    reading: Reading,
+}
+
+/// How the pinned WebSocket reader decodes an upstream frame (`crate::codex_event`,
+/// `endpoint/responses_websocket.rs:864-884` at 44ccf394573c).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// A `ResponsesStreamEvent`.
+    Event,
+    /// Not that, but a wrapped status `error`: only its status classification applies.
+    Wrapped,
+    /// Neither: the reader skips the frame.
+    Skipped,
 }
 
 pub(super) struct Duplex {
@@ -305,7 +318,8 @@ pub(super) struct Duplex {
     deferred_steer: Option<(String, String)>,
     /// The metadata of the explicit create whose `response.created` is being handled.
     announce: Option<String>,
-    /// Client frames are read only after the first `response.created` was delivered.
+    /// Client frames are read only once the first response's `response.created`, or its
+    /// terminal event when it has none, was delivered.
     input_ready: bool,
     first_response: bool,
     response_active: bool,
@@ -457,7 +471,7 @@ impl Duplex {
             // Nobody reads the stream any more, but the upstream outcome that message
             // carries is known: it settles the records it settles while the client is
             // there (a terminal, a failure, a rejection), and nothing is delivered.
-            let terminal = self.classify(&observing.payload);
+            let terminal = self.failure(&observing.payload, observing.reading);
             self.settle(&observing.payload, &observing.kind, terminal.as_ref());
         }
         // Records still open settle as the client's cancellation when `self` drops.
@@ -504,12 +518,9 @@ impl Duplex {
                 Step::Upstream(read) => self.upstream(read),
                 Step::Observed => {
                     let Observing {
-                        payload,
-                        kind,
-                        establishing,
-                        ..
+                        payload, kind, reading, ..
                     } = self.observing.take().expect("an observation finished");
-                    self.observed(&payload, &kind, establishing);
+                    self.observed(&payload, &kind, reading);
                     // The deferred failure follows the message, unless the message
                     // itself ended the stream.
                     if let Some(error) = self.failing.take()
@@ -611,10 +622,16 @@ impl Duplex {
         self.open.iter().rposition(|open| open.id == id.str())
     }
 
-    /// An upstream message's classified failure, if it is one.
-    fn classify(&self, payload: &str) -> Option<ExecError> {
+    /// An upstream message's classified failure, if it is one, as its [`Reading`] allows.
+    fn failure(&self, payload: &str, reading: Reading) -> Option<ExecError> {
         let cooling = self.turn.cooling;
-        ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
+        match reading {
+            Reading::Event => {
+                ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
+            }
+            Reading::Wrapped => ws_error(payload, cooling),
+            Reading::Skipped => None,
+        }
     }
 
     /// What an upstream message settles, apart from its delivery: a terminal event its
@@ -662,9 +679,31 @@ impl Duplex {
         if response_terminal(kind) {
             self.response_active = false;
             self.automatic_active = false;
-            self.settle_terminal(payload, kind);
+            if self.first_response {
+                self.first_terminal();
+            } else {
+                self.settle_terminal(payload, kind);
+            }
         }
         Settlement::Settled
+    }
+
+    /// The first response ended without a `response.created`: upstream answered the
+    /// bootstrap create with its terminal event alone. That create was the only one
+    /// upstream had, because no client frame is read before the first response ends or
+    /// starts, so the terminal is its outcome. Its record settles now with what the
+    /// terminal reported, detached as `response.created` would have detached it, so the
+    /// attempt publishes nothing more and later creates get records of their own. The
+    /// connection then goes on as after a first response that started: client frames are
+    /// read, and the next create runs on this socket with the bootstrap's settings.
+    /// Nothing is invented: no `response.created`, and the terminal's response ID binds
+    /// no settings, so a later event naming it is read as any unmatched ID.
+    fn first_terminal(&mut self) {
+        let bootstrap = self.pending.pop_front().and_then(|p| p.accounting);
+        if let Some(accounting) = bootstrap.or_else(|| self.detach()) {
+            accounting.complete();
+        }
+        self.first_response = false;
     }
 
     /// [`Owner`] of a failure after the first response. A response the socket saw start
@@ -1003,28 +1042,33 @@ impl Duplex {
         }
         // A native connection hands each frame on as it arrived.
         let payload = text.as_str();
-        let kind = rawjson::get(payload, "type").str().to_owned();
-        let establishing = self.first_response && kind == "response.created";
-        if kind == "response.created" && !self.response_created(payload) {
-            return;
+        let (reading, kind) = match crate::codex_event::decode(payload) {
+            Some(event) => (Reading::Event, event.kind.into_owned()),
+            None if crate::codex_event::wrapped_error(payload) => (Reading::Wrapped, "error".to_owned()),
+            None => (Reading::Skipped, String::new()),
+        };
+        if reading != Reading::Skipped {
+            if kind == "response.created" && !self.response_created(payload) {
+                return;
+            }
+            self.turn.signals(payload);
+            self.account(payload, &kind);
         }
-        self.turn.signals(payload);
-        self.account(payload, &kind);
         match self.turn.wire.ws_response_observation(payload) {
             Some(observation) => {
                 self.observing = Some(Observing {
                     observation,
                     payload: payload.to_owned(),
                     kind,
-                    establishing,
+                    reading,
                 });
             }
-            None => self.observed(payload, &kind, establishing),
+            None => self.observed(payload, &kind, reading),
         }
     }
 
     /// The rest of an upstream message's handling, once observers saw it.
-    fn observed(&mut self, payload: &str, kind: &str, establishing: bool) {
+    fn observed(&mut self, payload: &str, kind: &str, reading: Reading) {
         // Steering acknowledgements, pending notices and failures are opaque: IDs, input,
         // sequence numbers and event types reach the client byte for byte.
         if kind.starts_with("response.steer.") {
@@ -1038,7 +1082,15 @@ impl Duplex {
             }
             return;
         }
-        let terminal = self.classify(payload);
+        let terminal = self.failure(payload, reading);
+        if reading != Reading::Event && terminal.is_none() {
+            // The pinned reader skips this frame. It settles nothing and reaches the client
+            // as sent, unless it would read as an account failure (#6).
+            if !super::account_shaped(payload) {
+                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            }
+            return;
+        }
         // Records settle before the event is delivered: a record does not depend on
         // whether the client is still there to receive it.
         match self.settle(payload, kind, terminal.as_ref()) {
@@ -1098,9 +1150,10 @@ impl Duplex {
             self.outbox.push_back(Ok(Bytes::from(announce)));
         }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
-        if establishing {
-            // Delivered before any locally generated error, so the handler also sees the
-            // bootstrap succeed first.
+        if !self.first_response {
+            // The first response started (`response_created`) or ended without starting
+            // ([`Duplex::first_terminal`]). Delivered before any locally generated
+            // error, so the handler also sees the bootstrap succeed first.
             self.input_ready = true;
         }
     }

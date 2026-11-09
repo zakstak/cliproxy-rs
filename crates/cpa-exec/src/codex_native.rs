@@ -18,7 +18,8 @@
 //!
 //! The response reaches the client as the upstream sent it. A stream's events are
 //! forwarded byte for byte; observation (usage, capture, failure classification) reads
-//! a copy. Leading handshake events are held, never changed, so that a failure before
+//! a copy. Only an event the pinned client decodes ([`codex_event`]) can end, fail or
+//! convert the response or feed usage. Leading handshake events are held, never changed, so that a failure before
 //! any content can still fail over to another credential. Once anything is delivered,
 //! a failure ends the stream after its event and is never replayed elsewhere. A
 //! buffered `chatgpt` answer is the `response` object of the terminal event, byte for
@@ -36,6 +37,7 @@ use std::time::Duration;
 use cpa_common::codex_body::{CodexBody, Kind};
 
 use super::*;
+use crate::codex_event;
 
 /// The endpoint profiles. Every profile takes the native and translated routes (#28).
 /// Only `chatgpt` gets the buffered `stream: true` adaptation; the others pass the
@@ -504,6 +506,11 @@ enum Seen {
     /// `response.completed`, `response.incomplete` or `response.done`, whatever its
     /// reason, output or usage: the provider's terminal event, delivered as sent.
     Terminal,
+    /// An event the pinned client does not decode ([`codex_event::decode`]): invalid
+    /// JSON, a repeated known member, or a known member of the wrong type. The pinned
+    /// client skips it, so it never ends, fails or converts the response and feeds no
+    /// usage. It passes as sent, except where [`Passthrough::undecoded`] withholds it.
+    Undecoded,
     /// A failure event, classified on a copy. `deliver` replaces the event only for the
     /// #5 context-window conversion.
     Failure {
@@ -597,19 +604,31 @@ fn unframed(item: Result<Bytes, ExecError>) -> Option<Result<Bytes, ExecError>> 
 /// What the client receives for a failure it does not see as an event (a buffered
 /// answer, or a failure before anything was delivered): the provider's error object in
 /// the API's error envelope, byte for byte, with the event's `sequence_number` as
-/// spelled; the whole event when it carries no error object. Nothing is filled in. The
-/// event is read as an upstream event ([`event_type`]), not through the client request
-/// boundary.
-fn delivered_failure(payload: &str) -> Bytes {
+/// spelled; the whole event when it carries no single error object. Nothing is filled
+/// in. `event` is the decoded event ([`codex_event::decode`]), so its `response` and
+/// `error` members are unique; a `response` with more than one `error` member is
+/// delivered whole rather than one of them picked.
+fn delivered_failure(event: &codex_event::Event<'_>, payload: &str) -> Bytes {
     let whole = || Bytes::copy_from_slice(payload.as_bytes());
-    if !rawjson::valid(payload) {
-        return whole();
+    let mut nested = None;
+    if let Some(response) = event.response.filter(|r| r.starts_with('{')) {
+        let mut repeated = false;
+        rawjson::parse(response).each(|key, value| {
+            if key.str() == "error" {
+                repeated |= nested.is_some();
+                nested = Some(value);
+            }
+            !repeated
+        });
+        if repeated {
+            return whole();
+        }
     }
-    let object = |path: &str| Some(rawjson::get(payload, path)).filter(|v| v.kind() == rawjson::Kind::Object);
-    let Some(error) = object("response.error").or_else(|| object("error")) else {
+    let nested = nested.filter(|v| v.kind() == rawjson::Kind::Object);
+    let top = event.error.filter(|e| e.starts_with('{'));
+    let Some(error) = nested.as_ref().map(rawjson::Value::json).or(top) else {
         return whole();
     };
-    let error = error.json();
     let mut out = Vec::with_capacity(error.len() + 48);
     out.extend_from_slice(b"{\"error\":");
     out.extend_from_slice(error.as_bytes());
@@ -620,22 +639,6 @@ fn delivered_failure(payload: &str) -> Bytes {
     }
     out.push(b'}');
     Bytes::from(out)
-}
-
-/// The `type` of an upstream event, read as the provider sent it: any valid JSON object
-/// counts, duplicate keys and unknown member types included. The client request
-/// boundary (`CodexBody`) never applies to upstream events (docs/codex/CONTRACT.md
-/// "Native HTTP route"). An event that is not valid JSON has no type, and the pinned
-/// client skips it (`codex-api/src/sse/responses.rs:633-643` at 44ccf394573c).
-fn event_type(payload: &str) -> Cow<'_, str> {
-    if !rawjson::valid(payload) {
-        return Cow::Borrowed("");
-    }
-    let kind = rawjson::get(payload, "type");
-    if kind.kind() != rawjson::Kind::String {
-        return Cow::Borrowed("");
-    }
-    Cow::Owned(kind.str().to_owned())
 }
 
 impl Observer {
@@ -656,14 +659,19 @@ impl Observer {
     }
 
     fn classify(&mut self, frame: &Bytes) -> Seen {
-        let (name, payload) = parse_frame(frame);
-        let Some(payload) = payload else {
+        let (name, data) = parse_frame(frame);
+        let Some(data) = data else {
             return Seen::Handshake;
         };
-        let payload = payload.trim();
-        if payload.is_empty() {
+        if data.trim().is_empty() {
             return Seen::Handshake;
         }
+        // The upstream event boundary comes first: an event the pinned client skips
+        // ends, fails, converts and accounts for nothing here either.
+        let Some(event) = codex_event::decode(&data) else {
+            return Seen::Undecoded;
+        };
+        let payload = data.trim();
         if self.usage.enabled() {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
@@ -681,11 +689,10 @@ impl Observer {
                     })),
                     Cow::Borrowed(_) => None,
                 });
-            let body = delivered_failure(payload);
+            let body = delivered_failure(&event, payload);
             return Seen::Failure { error, body, deliver };
         }
-        let kind = event_type(payload);
-        match kind.as_ref() {
+        match event.kind.as_ref() {
             "response.output_item.done" => Seen::Content,
             "response.completed" | "response.incomplete" | "response.done" => Seen::Terminal,
             _ if response::bufferable(payload) => Seen::Handshake,
@@ -702,17 +709,17 @@ impl Observer {
         for frame in frames {
             match self.see(&frame) {
                 Seen::Terminal => {
-                    let (_, payload) = parse_frame(&frame);
-                    let payload = payload.unwrap_or_default();
-                    // `see` classified it as a terminal event, so it is valid JSON.
-                    let object = rawjson::get(payload.trim(), "response");
-                    if object.kind() != rawjson::Kind::Object {
-                        return Err(response_unreadable());
-                    }
-                    return Ok(Bytes::copy_from_slice(object.json().as_bytes()));
+                    // `see` decoded this terminal event; its `response` member is unique.
+                    let (_, data) = parse_frame(&frame);
+                    let data = data.unwrap_or_default();
+                    let response = codex_event::decode(&data).and_then(|event| event.response);
+                    return match response.filter(|r| r.starts_with('{')) {
+                        Some(object) => Ok(Bytes::copy_from_slice(object.as_bytes())),
+                        None => Err(response_unreadable()),
+                    };
                 }
                 Seen::Failure { error, body, .. } => return Err(direct(error, body)),
-                Seen::Handshake | Seen::Content => {}
+                Seen::Handshake | Seen::Content | Seen::Undecoded => {}
             }
         }
         Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
@@ -782,6 +789,7 @@ impl Passthrough {
                 self.commit();
                 self.out.push_back(Ok(frame));
             }
+            Seen::Undecoded => self.undecoded(frame),
             Seen::Terminal => {
                 self.commit();
                 self.out.push_back(Ok(terminated(frame)));
@@ -844,6 +852,22 @@ impl Passthrough {
         }
         self.out.push_back(Err(error));
         self.done = true;
+    }
+
+    /// An event the pinned client does not decode. It is delivered as sent, and it
+    /// counts as delivered content: the client may show it, so nothing fails over after
+    /// it. A WebSocket client never gets one that would be an account failure if it
+    /// decoded (`codex_ws::account_shaped`), and the shared capture still records it.
+    fn undecoded(&mut self, frame: Bytes) {
+        if self.websocket
+            && parse_frame(&frame)
+                .1
+                .is_some_and(|data| crate::codex_ws::account_shaped(data.trim()))
+        {
+            return;
+        }
+        self.commit();
+        self.out.push_back(Ok(frame));
     }
 
     fn end(&mut self, error: ExecError) {

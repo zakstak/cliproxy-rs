@@ -529,17 +529,32 @@ fn observer() -> Observer {
 /// `chunks` through the shared framer and the native stream: what the client receives
 /// and the error that ended it.
 async fn through(chunks: &[&[u8]], hold: Option<Option<Duration>>) -> (Vec<u8>, Option<ExecError>) {
+    let (items, error) = through_with(observer(), chunks, hold, false).await;
+    (items.concat(), error)
+}
+
+/// `chunks` through the native stream with `observer`; with `websocket`, as a turn
+/// served over HTTP delivers it (one payload per item).
+async fn through_with(
+    observer: Observer,
+    chunks: &[&[u8]],
+    hold: Option<Option<Duration>>,
+    websocket: bool,
+) -> (Vec<Vec<u8>>, Option<ExecError>) {
     let upstream = futures_util::stream::iter(
         chunks
             .iter()
             .map(|c| Ok::<_, ExecError>(Bytes::copy_from_slice(c)))
             .collect::<Vec<_>>(),
     );
-    let mut stream = passthrough(crate::upstream::framed(upstream), observer(), hold, false);
+    let mut stream = passthrough(crate::upstream::framed(upstream), observer, hold, websocket);
+    if websocket {
+        stream = stream.filter_map(|item| async move { unframed(item) }).boxed();
+    }
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
-            Ok(bytes) => out.extend_from_slice(&bytes),
+            Ok(bytes) => out.push(bytes.to_vec()),
             Err(error) => return (out, Some(error)),
         }
     }
@@ -1234,4 +1249,97 @@ async fn an_upstream_failure_is_never_recorded_as_a_cancellation() {
     let expected = (error.status, String::from_utf8_lossy(&error.body).into_owned());
     assert_ne!(expected.0, 499);
     assert_eq!(settled(&record), [expected]);
+}
+
+/// Upstream events the pinned client does not decode (`codex_event::decode`): repeated
+/// known members in either order, a known member of the wrong type, and invalid JSON
+/// that reads as a failure, a context-window `error`, an account failure or a
+/// completion carrying usage.
+const UNDECODABLE: [&str; 10] = [
+    r#"{"type":"response.completed","type":"response.future","response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.future","type":"response.completed","response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.completed","response":{"id":"old","output":[]},"response":{"id":"new","output":[]}}"#,
+    r#"{"type":"response.failed","type":"x","response":{"error":{"code":"server_error","message":"m"}}}"#,
+    r#"{"type":"error","error":{"code":"context_length_exceeded"},"error":{"code":"context_length_exceeded"}}"#,
+    r#"{"type":"response.completed","item_id":7,"response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"broken"}}"#,
+    r#"{"type":"error","error":{"code":"context_length_exceeded","message":"broken"}"#,
+    r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"acct"}}"#,
+    r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":90,"output_tokens":9,"total_tokens":99}}"#,
+];
+
+/// #25 (F1, F3): an undecodable event passes as sent and the stream goes on to the real
+/// terminal event, on a held and an unheld stream, for a Codex client (which would get
+/// #5's conversion) and any other. A buffered answer is the real terminal's `response`.
+/// Usage reads only the decoded events. On a turn served over HTTP, each reaches the
+/// client as a frame, except invalid JSON that reads as an account failure, which is
+/// withheld and still not classified.
+#[tokio::test]
+async fn undecodable_events_never_end_fail_or_convert_the_response() {
+    let end = r#"{"type":"response.completed","response":{"id":"r2","output":[]}}"#;
+    let account = UNDECODABLE[8];
+    for event in UNDECODABLE {
+        let sse = format!("data: {event}\n\nevent: response.completed\ndata: {end}\n\n");
+        for codex_client in [false, true] {
+            for hold in [None, Some(None)] {
+                let recorder = std::sync::Arc::new(crate::usage_testkit::Recorder::default());
+                let recorded = Observer {
+                    codex_client,
+                    usage: cpa_core::exec::UsageSink::new(recorder.clone()),
+                    ..observer()
+                };
+                let (out, error) = through_with(recorded, &[sse.as_bytes()], hold, false).await;
+                assert!(error.is_none(), "{event}: {error:?}");
+                assert_eq!(text(&out.concat()), sse, "{event}");
+                let lines: Vec<String> = recorder
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|r| match r {
+                        crate::usage_testkit::Report::Line(_, line) => Some(String::from_utf8_lossy(line).into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(lines, [end], "{event}: usage reads only the decoded event");
+                let client = Observer {
+                    codex_client,
+                    ..observer()
+                };
+                let (frames, error) = through_with(client, &[sse.as_bytes()], hold, true).await;
+                assert!(error.is_none(), "{event}: {error:?}");
+                let frames: Vec<String> = frames.iter().map(|f| text(f)).collect();
+                let want: &[&str] = if event == account { &[end] } else { &[event, end] };
+                assert_eq!(frames, want, "{event}: served over HTTP");
+            }
+        }
+        let answer = observer().aggregate(sse.as_bytes()).unwrap();
+        assert_eq!(text(&answer), r#"{"id":"r2","output":[]}"#, "{event}");
+    }
+}
+
+/// Decodable events with repeats the pinned client ignores still end the response:
+/// unknown members, and keys repeated inside `response`, whose object a buffered client
+/// gets as sent. A failure whose `response` repeats `error` is delivered whole rather
+/// than one of them picked.
+#[tokio::test]
+async fn harmless_repeats_keep_the_decoded_outcome() {
+    let end = r#"{"type":"response.completed","x":1,"x":[2],"response":{"id":"a","id":"b","output":[],"output":null}}"#;
+    let sse = format!("data: {end}\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"late\"}}\n\n");
+    let (out, error) = through(&[sse.as_bytes()], None).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&out), format!("data: {end}\n\n"));
+    let answer = observer().aggregate(sse.as_bytes()).unwrap();
+    assert_eq!(text(&answer), r#"{"id":"a","id":"b","output":[],"output":null}"#);
+    let failed = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"r","error":{"code":"a"},"error":{"code":"b"}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {failed}\n\n").as_bytes())
+        .unwrap_err();
+    assert_eq!(text(&error.body), failed);
+    let single =
+        r#"{"type":"response.failed","x":1,"x":2,"response":{"id":"r","id":"s","error":{"code":"a","code":"b"}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {single}\n\n").as_bytes())
+        .unwrap_err();
+    assert_eq!(text(&error.body), r#"{"error":{"code":"a","code":"b"}}"#);
 }

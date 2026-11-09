@@ -1515,7 +1515,28 @@ impl Connection {
                 payloads_from_chunk(&chunk)
             };
             for mut payload in payloads {
-                let kind = rawjson::get(&payload, "type").str().to_owned();
+                let kind = if ctx.native_served {
+                    // The upstream event boundary (`cpa_exec::codex_event`): a frame the
+                    // pinned client skips is relayed as sent, and nothing here reads it:
+                    // no type, completion, failure or tool call (#25).
+                    match cpa_exec::codex_event::decode(&payload) {
+                        Some(event) => event.kind.into_owned(),
+                        None => {
+                            preserved_event = false;
+                            if let Some(metadata) = metadata.take()
+                                && !send_text(socket, metadata).await
+                            {
+                                return Forwarded::End;
+                            }
+                            if !send_text(socket, payload).await {
+                                return Forwarded::End;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    rawjson::get(&payload, "type").str().to_owned()
+                };
                 if kind == "response.created" {
                     response_started = true;
                     completed = false;

@@ -398,11 +398,23 @@ The response reaches the client as the upstream sent it:
   event. The proxy invents neither a `response.incomplete` nor a completion for it. The
   attempt records a request-scoped 408. A final event the upstream left open gets the
   line endings that close it.
-- The observer reads upstream events as the provider sent them, not through the client
-  [request boundary](#request-boundary). Any valid JSON event counts, with duplicate
-  keys or member types a request could not have. An event that is not valid JSON has
-  no type, so it never ends the response, and it still passes as sent. The pinned client
-  skips such an event (`sse/responses.rs:633-643`).
+- The observer reads upstream events as the pinned client decodes them, not through the
+  client [request boundary](#request-boundary). The pinned client decodes each event
+  into `ResponsesStreamEvent` and skips an event that does not decode
+  (`sse/responses.rs:161-179`, 633-643). An event decodes when it is one JSON value
+  whose known members (`type`, `headers`, `metadata`, `response`, `response_id`,
+  `error`, `item`, `item_id`, `call_id`, `delta`, `text`, `summary_index`,
+  `content_index`, `safety_buffering`) each appear at most once, with the struct's
+  types, and whose `type` is a string. Unknown members are ignored, repeated or not.
+  A key repeated inside a known member's value is ignored too, and the client's
+  `serde_json::Value` keeps the last one. A number of any size counts, because the
+  first-party build enables serde_json's `arbitrary_precision`
+  (`exec-server-protocol/Cargo.toml:25`). `crates/cpa-exec/src/codex_event.rs` makes
+  the same decision with the same serde-derived shape. Only a decoded event ends the
+  response, fails it, is converted (#5) or feeds usage. An event that does not decode,
+  such as invalid JSON, a repeated `type` or `response`, or a known member of the wrong
+  type, passes as sent. It counts as delivered content, and the stream goes on to the
+  next event.
 - An upstream HTTP error keeps its classification for the scheduler, and the client
   receives the upstream's status, body and filtered headers unchanged
   (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit
@@ -415,8 +427,9 @@ The response reaches the client as the upstream sent it:
 - A failure event the client does not receive as an event (a buffered answer, or a
   failure before anything was delivered that the scheduler fails over) is delivered as
   `{"error":<the provider's error object>,"sequence_number":<as sent>}`, byte for byte
-  from the event, or as the whole event when it has no error object. Nothing is filled
-  in. It arrived on an HTTP 200, so its status is the classified one.
+  from the event, or as the whole event when it has no error object or its `response`
+  repeats `error`. Nothing is filled in. It arrived on an HTTP 200, so its status is
+  the classified one.
 - The alias `force-mapping` model rewrite does not run.
 
 [Settings](#settings) lists the final outcome of every Codex rewrite and impersonation
@@ -579,6 +592,16 @@ receives (`ExecError::delivered_event`).
   classification, so the credential cools as before.
 - One exception stays: a Codex client gets the status-less context-window `error` as
   `response.failed` (#5).
+- Every frame passes the upstream event boundary of the
+  [native HTTP route](#native-http-route), on an upstream socket, a steering connection
+  and a turn served over HTTP. The WebSocket reader has one more reading. A frame that
+  is not a `ResponsesStreamEvent` can still be a wrapped status `error`
+  (`responses_websocket.rs:684-709`, 864-884), and on an upstream socket such a frame
+  still fails the turn by its status. The SSE reader has no such reading, so over HTTP
+  it is a frame that does not decode. A frame that does not decode passes as sent and
+  ends, fails and settles nothing, with one exception. When its failure reading would
+  be an account failure, it is withheld, because it can name the pooled account. It is
+  not classified either, so the credential does not cool and the turn goes on.
 - Every `response.incomplete` reaches the client as received, on an ordinary turn, a
   steering connection and a turn served over HTTP, at any stage: as the turn's first
   event, after events held for bootstrap, or after output. The socket stays for the next
@@ -586,13 +609,17 @@ receives (`ExecError::delivered_event`).
   as it records any terminal event the provider sends. An upstream socket that closes or
   fails before the terminal event still ends the turn with that failure, and the proxy
   invents no terminal event for it.
-- One limit is inherited on a steering connection. Its duplex reads the client's later
-  frames only after the first `response.created`, as Go's does
-  (`codex_websockets_duplex.go:391`, 601-605). If the first response ends without
-  `response.created`, as a `response.incomplete` or any other terminal event, the end
-  reaches the client as sent, but the connection takes no further client frame. Whether
-  a provider sends that shape is unknown. The pinned client does not use the steering
-  transport.
+- A steering connection's duplex reads the client's later frames once the first
+  response's `response.created` has reached the client. When upstream ends the first
+  response without one, the duplex starts reading once that terminal event has reached
+  the client. Only the bootstrap create was outstanding, so that terminal event settles
+  it. Its usage record is published once, with what the terminal reported, and later
+  creates get records of their own. The next create runs on the same socket with the
+  bootstrap's settings. The proxy invents no `response.created`, and the terminal's
+  response ID binds no retained settings. Go reads later frames only after a
+  `response.created` (`codex_websockets_duplex.go:391`, 601-605), so a create sent on
+  such a connection waits there with no answer. Whether a provider sends that shape is
+  unknown. The pinned client does not use the steering transport.
 - The interrupt regressions stay. An interrupt acknowledgement that arrives after the
   terminal event is still delivered. A late interrupt does not poison the next turn. An
   interrupted `response.incomplete` passes unchanged.

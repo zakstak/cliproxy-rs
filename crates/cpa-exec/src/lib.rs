@@ -27,6 +27,7 @@ mod codex_capture;
 mod codex_client;
 #[cfg(any(test, feature = "test-support"))]
 pub mod codex_contract;
+pub mod codex_event;
 pub mod codex_identity;
 pub mod codex_images;
 mod codex_json;

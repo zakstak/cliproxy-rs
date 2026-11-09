@@ -1060,9 +1060,29 @@ impl Turn {
         if payload.is_empty() {
             return Frame::Skip;
         }
-        self.observe(payload);
+        // The upstream event boundary (`crate::codex_event`): a frame the pinned reader
+        // cannot decode is skipped there, unless it is a wrapped status `error`.
+        let event = crate::codex_event::decode(&text);
+        let wrapped = event.is_none() && crate::codex_event::wrapped_error(&text);
+        if event.is_some() || wrapped {
+            self.observe(payload);
+        }
         crate::ws_observation::observe(&mut self.observing, self.wire.ws_response_observation(payload)).await;
         let raw_len = payload.len();
+        let Some(event) = event else {
+            if wrapped && let Some(mut error) = ws_error(payload, self.cooling) {
+                self.wire.ws_exec_error("upstream_error", &error);
+                self.deliver_as_sent(&mut error, &text);
+                return Frame::Failed {
+                    error,
+                    overload: false,
+                    read: false,
+                    status_frame: true,
+                    event: None,
+                };
+            }
+            return undecoded(text, raw_len);
+        };
         if let Some(mut error) = ws_error(payload, self.cooling) {
             self.wire.ws_exec_error("upstream_error", &error);
             self.deliver_as_sent(&mut error, &text);
@@ -1091,8 +1111,7 @@ impl Turn {
                 event,
             };
         }
-        let kind = rawjson::get(payload, "type");
-        let kind = kind.str().to_owned();
+        let kind = event.kind.into_owned();
         // Every `response.incomplete` is the provider's terminal event, whatever its
         // reason, output or usage, and whether or not anything reached the client yet:
         // first-party Codex classifies its reason as an interrupted end, a content-filter
@@ -1306,6 +1325,36 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
     } else {
         turn.invalidate(error, true);
     }
+}
+
+/// An upstream frame the pinned reader skips (`crate::codex_event`): delivered as sent,
+/// as content, never as a terminal event, failure or acknowledgement. A frame that would
+/// read as an account failure is withheld instead ([`account_shaped`]).
+fn undecoded(text: String, raw_len: usize) -> Frame {
+    if account_shaped(text.trim()) {
+        return Frame::Skip;
+    }
+    Frame::Event {
+        raw_len,
+        out: Bytes::from(text),
+        bufferable: false,
+        terminal: false,
+        terminal_id: None,
+        ack: None,
+    }
+}
+
+/// Whether an undecodable upstream event would be an account failure if it decoded, by
+/// the readings a native WebSocket failure gets ([`ws_error`], then
+/// `response::terminal_failure`). A native WebSocket client never receives such a frame
+/// as sent, because it can name the pooled account (#6). An undecodable frame can name
+/// it too, so it is withheld. That is all the result decides: the frame is not
+/// classified, the credential does not cool and the response goes on.
+pub(crate) fn account_shaped(payload: &str) -> bool {
+    ws_error(payload, false)
+        .map(|error| error.status)
+        .or_else(|| response::terminal_failure(payload, false).map(|(error, _)| error.status))
+        .is_some_and(account_failure)
 }
 
 /// An account failure: 401, 402, 403 or 429 as classified. Its frame can name the pooled

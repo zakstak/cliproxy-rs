@@ -93,6 +93,7 @@ fn credential(profile: Profile, base_url: &str, websockets: bool) -> Credential 
 struct Proxy {
     addr: String,
     upstream: CaptureUpstream,
+    rt: Arc<cpa_server::runtime::Runtime>,
     _auth_dir: AuthDir,
 }
 
@@ -116,8 +117,9 @@ async fn proxy_with(script: Script, extra_config: &str, credentials: impl FnOnce
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, all, executors));
     Proxy {
-        addr: serve(cpa_server::router(rt)).await,
+        addr: serve(cpa_server::router(rt.clone())).await,
         upstream,
+        rt,
         _auth_dir: auth_dir,
     }
 }
@@ -294,7 +296,8 @@ async fn an_alias_routes_only_the_model() {
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
     let proxy = Proxy {
-        addr: serve(cpa_server::router(rt)).await,
+        addr: serve(cpa_server::router(rt.clone())).await,
+        rt,
         upstream,
         _auth_dir: auth_dir,
     };
@@ -863,7 +866,8 @@ async fn each_request_on_a_reused_socket_judges_the_alias_rule_itself() {
         };
         let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
         let proxy = Proxy {
-            addr: serve(cpa_server::router(rt)).await,
+            addr: serve(cpa_server::router(rt.clone())).await,
+            rt,
             upstream,
             _auth_dir: auth_dir,
         };
@@ -1006,7 +1010,8 @@ async fn home_proxy(script: Script, extra_config: &str, picks: impl FnOnce(&str)
     })));
     HomeProxy {
         proxy: Proxy {
-            addr: serve(cpa_server::router(rt)).await,
+            addr: serve(cpa_server::router(rt.clone())).await,
+            rt,
             upstream,
             _auth_dir: auth_dir,
         },
@@ -2218,24 +2223,16 @@ async fn every_incomplete_reaches_websocket_clients_as_sent() {
                 .await;
                 let mut socket = connect(&proxy).await;
                 let create = client_frame("ws-create-first", "gpt-5.5");
-                // Inherited steering limit (docs/codex/CONTRACT.md "Native WebSocket
-                // route"): the duplex reads later client frames only after a first
-                // `response.created`, so a first response that ends without one is
-                // checked for that end alone.
-                let turns: &[&Vec<String>] = if transport == "steering" && leading.is_empty() {
-                    &[&first]
-                } else {
-                    &[&first, &next]
-                };
-                for want in turns {
+                // On a steering connection a first response that ends without
+                // `response.created` still lets the next create through
+                // (`first_response_ends_without_created_on_a_steering_connection`).
+                for want in [&first, &next] {
                     socket.send(Message::text(create.clone())).await.unwrap();
                     let got = read(&mut socket, &TERMINAL).await;
-                    assert_eq!(&got.frames, *want, "{case}: as upstream sent them");
+                    assert_eq!(&got.frames, want, "{case}: as upstream sent them");
                     assert_eq!(got.closed, None, "{case}");
                 }
-                if turns.len() == 1 {
-                    assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create), "{case}");
-                } else if websockets {
+                if websockets {
                     assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: one upstream socket");
                     assert_eq!(upstream_frames(&proxy, 0), [create.clone(), create], "{case}");
                     assert!(proxy.upstream.http().is_empty(), "{case}");
@@ -2284,6 +2281,313 @@ async fn compaction_v2_answers_pass_unchanged_on_websocket_turns() {
                 } else {
                     assert_eq!(proxy.upstream.http().len(), 1, "{case}");
                 }
+            }
+        }
+    }
+}
+
+/// An upstream WebSocket the first-terminal tests drive: it answers the first client
+/// frame only once the test releases it, and each later frame at once, with `replies`
+/// in order. Its handshake names `openai-model`, so the proxy's metadata event shows
+/// which request each response belongs to. `seen` counts the client frames it read.
+struct Gated {
+    base_url: String,
+    frames: Arc<std::sync::Mutex<Vec<String>>>,
+    seen: tokio::sync::watch::Receiver<usize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Gated {
+    async fn start(replies: Vec<Vec<String>>) -> Self {
+        use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (count, seen) = tokio::sync::watch::channel(0usize);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let shared = (frames.clone(), Arc::new(count), release.clone(), Arc::new(replies));
+        let app = axum::Router::new().fallback(move |upgrade: WebSocketUpgrade| {
+            let (frames, count, release, replies) = shared.clone();
+            async move {
+                let mut response = upgrade.on_upgrade(move |mut socket| async move {
+                    let mut n = 0;
+                    while let Some(Ok(message)) = socket.recv().await {
+                        let Upstream::Text(text) = message else { continue };
+                        frames.lock().unwrap().push(text.as_str().to_owned());
+                        count.send_replace(n + 1);
+                        if n == 0 {
+                            release.notified().await;
+                        }
+                        for reply in replies.get(n).into_iter().flatten() {
+                            if socket.send(Upstream::Text(reply.clone().into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        n += 1;
+                    }
+                });
+                response
+                    .headers_mut()
+                    .insert("openai-model", axum::http::HeaderValue::from_static("gpt-5.5"));
+                response
+            }
+        });
+        Self {
+            base_url: format!("http://{}", serve(app).await),
+            frames,
+            seen,
+            release,
+        }
+    }
+
+    /// Waits until the upstream read `n` client frames, and returns them.
+    async fn read(&mut self, n: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(5), self.seen.wait_for(|seen| *seen >= n))
+            .await
+            .unwrap_or_else(|_| panic!("upstream read {:?}, not {n} frames", self.frames.lock().unwrap()))
+            .unwrap();
+        self.frames.lock().unwrap().clone()
+    }
+}
+
+/// Waits until `n` usage records were published, and returns them.
+async fn records(proxy: &Proxy, n: usize) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while records.len() < n {
+            let queue = proxy.rt.usage_queue();
+            records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} of {n} usage records: {records:?}", records.len()));
+    records
+}
+
+fn tokens(record: &serde_json::Value) -> [i64; 3] {
+    ["input_tokens", "output_tokens", "total_tokens"].map(|k| record["tokens"][k].as_i64().unwrap_or(-1))
+}
+
+/// #25 and #7, on a `codex.response-steering` connection: upstream ends the first
+/// response with its terminal event and no `response.created` (an interrupted
+/// `response.incomplete` with usage 3/0/3, or a `response.completed`). The client gets
+/// that event as sent. The duplex then settles the bootstrap create with it and reads
+/// the client's next frames, as after a first response that started. A next create runs
+/// on the same upstream socket, whether the client sent it after the terminal or while
+/// the first response still ran. An interrupt and a graceful close still work. With
+/// usage on, the first response's record is published once, with the usage its terminal
+/// reported, before anything else happens. The next create gets a record of its own.
+/// Without usage, nothing is published. Nothing is invented: no `response.created`, no
+/// replay and no second socket. The proxy's metadata event goes before the opening
+/// request's first event and before the next create's `response.created`. The same
+/// cases with a `response.created` before the terminal are the control.
+#[tokio::test]
+async fn first_response_ends_without_created_on_a_steering_connection() {
+    const CREATED: &str =
+        r#"{"type":"response.created","response":{"id":"resp_ft_1","status":"in_progress","output":[]}}"#;
+    const INTERRUPTED: &str = r#"{"type":"response.incomplete","response":{"id":"resp_ft_1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"resp_ft_1","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const INTERRUPT: &str = r#"{"type":"response.interrupt","response_id":"resp_ft_1","mode":"discard_partial_items"}"#;
+    const ACK: &str = r#"{"type":"response.interrupt.accepted","response_id":"resp_ft_1"}"#;
+    const CREATED_2: &str =
+        r#"{"type":"response.created","response":{"id":"resp_ft_2","status":"in_progress","output":[]}}"#;
+    const DONE_2: &str = r#"{"type":"response.completed","response":{"id":"resp_ft_2","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#;
+    const METADATA: &str = r#"{"type":"response.metadata","headers":{"openai-model":"gpt-5.5"}}"#;
+    let owned = |frames: &[&str]| frames.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>();
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = client_frame("ws-create-continuation", "gpt-5.5");
+    for end in [INTERRUPTED, COMPLETED] {
+        for created in [false, true] {
+            for usage in [false, true] {
+                for action in ["create after", "create before", "interrupt", "close"] {
+                    let case = format!("created={created} usage={usage} {action}: {end}");
+                    let first = if created { owned(&[CREATED, end]) } else { owned(&[end]) };
+                    let second = if action == "interrupt" {
+                        owned(&[ACK])
+                    } else {
+                        owned(&[CREATED_2, DONE_2])
+                    };
+                    let mut upstream = Gated::start(vec![first.clone(), second.clone()]).await;
+                    let proxy = proxy_with(Script::default(), STEERING, |_| {
+                        vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+                    })
+                    .await;
+                    if usage {
+                        proxy.rt.usage_queue().configure(
+                            true,
+                            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                        );
+                    }
+                    let mut socket = connect(&proxy).await;
+                    socket.send(Message::text(create.clone())).await.unwrap();
+                    assert_eq!(upstream.read(1).await, std::slice::from_ref(&create), "{case}");
+                    if action == "create before" {
+                        // Sent while the first response still runs: the duplex holds it.
+                        socket.send(Message::text(next.clone())).await.unwrap();
+                    }
+                    upstream.release.notify_one();
+                    // Barrier: the client has the first response's terminal event.
+                    let got = read(&mut socket, &TERMINAL).await;
+                    let mut want = vec![METADATA.to_owned()];
+                    want.extend(first);
+                    assert_eq!(got.frames, want, "{case}: the first response as sent");
+                    assert_eq!(got.closed, None, "{case}");
+                    if usage {
+                        // Settled at the terminal, before any further client frame.
+                        let first = records(&proxy, 1).await;
+                        assert_eq!(first.len(), 1, "{case}: {first:?}");
+                        assert_eq!(first[0]["failed"], false, "{case}: {first:?}");
+                        assert_eq!(tokens(&first[0]), [3, 0, 3], "{case}: {first:?}");
+                    }
+                    match action {
+                        "create after" | "create before" => {
+                            if action == "create after" {
+                                socket.send(Message::text(next.clone())).await.unwrap();
+                            }
+                            assert_eq!(
+                                upstream.read(2).await,
+                                [create.clone(), next.clone()],
+                                "{case}: the next create on the same socket, as sent"
+                            );
+                            let got = read(&mut socket, &TERMINAL).await;
+                            assert_eq!(got.frames, owned(&[METADATA, CREATED_2, DONE_2]), "{case}");
+                            assert_eq!(got.closed, None, "{case}");
+                            if usage {
+                                let second = records(&proxy, 1).await;
+                                assert_eq!(second.len(), 1, "{case}: {second:?}");
+                                assert_eq!(second[0]["failed"], false, "{case}: {second:?}");
+                                assert_eq!(tokens(&second[0]), [5, 2, 7], "{case}: {second:?}");
+                            }
+                        }
+                        "interrupt" => {
+                            socket.send(Message::text(INTERRUPT)).await.unwrap();
+                            assert_eq!(upstream.read(2).await, [create.clone(), INTERRUPT.to_owned()], "{case}");
+                            let got = read(&mut socket, &["response.interrupt.accepted"]).await;
+                            assert_eq!(got.frames, [ACK], "{case}");
+                            assert_eq!(got.closed, None, "{case}");
+                        }
+                        _ => {}
+                    }
+                    socket.send(Message::Close(None)).await.unwrap();
+                    // Barrier: the proxy ended the connection, and with it the duplex.
+                    let got = read(&mut socket, &[]).await;
+                    assert!(got.frames.is_empty(), "{case}: {got:?}");
+                    assert!(got.closed.is_some(), "{case}: {got:?}");
+                    assert_eq!(
+                        proxy.upstream.sockets().len(),
+                        0,
+                        "{case}: the capture upstream is unused"
+                    );
+                    assert_eq!(
+                        upstream.seen.borrow().to_owned(),
+                        if action == "close" { 1 } else { 2 },
+                        "{case}"
+                    );
+                    let rest = proxy.rt.usage_queue().pop_oldest(10);
+                    assert!(rest.is_empty(), "{case}: no record after the close: {rest:?}");
+                }
+            }
+        }
+    }
+}
+
+/// #25 (F1, F3) on every WebSocket transport: upstream events the pinned client does not
+/// decode (a repeated known member in either order, a known member of the wrong type,
+/// invalid JSON that would read as a failure, a context-window `error` or a completion)
+/// reach the client as sent, one text frame each, and never end or fail the turn. The
+/// real completion after them follows, the connection stays open and the credential
+/// does not cool. Invalid JSON whose failure reading would be an account failure is
+/// withheld, because such a frame can name the pooled account (#6). It is not
+/// classified either, so the turn still ends with the completion. A frame that is not a
+/// `ResponsesStreamEvent` but is the WebSocket reader's wrapped status `error`
+/// (`endpoint/responses_websocket.rs:864-884` at 44ccf394573c) still fails a socket
+/// turn as that status; the SSE reader has no such reading, so over HTTP it is an
+/// undecodable event. As the first event and after `response.created`, on an upstream
+/// socket with and without bootstrap buffering, on a steering connection, and on a turn
+/// served over HTTP with and without buffering.
+#[tokio::test]
+async fn undecodable_events_never_end_or_fail_websocket_turns() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const REAL_END: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[]}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    let account = r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"limit for acct-FAKE"}}"#;
+    let wrapped = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"limit for acct-FAKE"},"delta":5}"#;
+    let cases = [
+        r#"{"type":"response.completed","type":"response.future","response":{"id":"resp_dup","output":[]}}"#,
+        r#"{"type":"response.future","type":"response.completed","response":{"id":"resp_dup","output":[]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_old","output":[]},"response":{"id":"resp_new","output":[]}}"#,
+        r#"{"type":"response.failed","type":"response.future","response":{"error":{"code":"server_error","message":"m"}}}"#,
+        r#"{"type":"response.completed","delta":5,"response":{"id":"resp_typed","output":[]}}"#,
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"broken"}}"#,
+        r#"{"type":"error","error":{"code":"context_length_exceeded","message":"broken"}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_bad","output":[]}"#,
+        account,
+        wrapped,
+    ];
+    for event in cases {
+        for leading in [&[][..], &[CREATED][..]] {
+            for (transport, config, websockets) in [
+                ("socket", "", true),
+                ("socket, buffering", BUFFERING, true),
+                ("steering", STEERING, true),
+                ("http", "", false),
+                ("http, buffering", BUFFERING, false),
+            ] {
+                let case = format!("{transport} after {} events: {event}", leading.len());
+                let frames: Vec<&str> = leading.iter().copied().chain([event, REAL_END]).collect();
+                let script = if websockets {
+                    Script {
+                        ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+                        ..Script::default()
+                    }
+                } else {
+                    let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                    Script {
+                        http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+                        ..Script::default()
+                    }
+                };
+                let proxy = proxy_with(script, config, |url| {
+                    vec![credential(Profile::Chatgpt, url, websockets)]
+                })
+                .await;
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                // The reader's own `type` lookup takes a repeated key's first value, so
+                // it reads on until the real completion or a close.
+                let mut got = Read::default();
+                while got.closed.is_none() && got.frames.last().map(String::as_str) != Some(REAL_END) {
+                    let more = read(&mut socket, &["response.completed"]).await;
+                    got.frames.extend(more.frames);
+                    got.closed = more.closed;
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                if event == wrapped && websockets {
+                    // The wrapped 429 is an account failure: never delivered as sent, and it
+                    // ends the turn; the completion after it is not read.
+                    assert!(
+                        !got.frames.iter().any(|f| f == wrapped || f == REAL_END),
+                        "{case}: {got:?}"
+                    );
+                    assert!(got.closed.is_some(), "{case}: {got:?}");
+                    continue;
+                }
+                let mut want: Vec<String> = leading.iter().map(|f| (*f).to_owned()).collect();
+                if event != account && event != wrapped {
+                    want.push(event.to_owned());
+                }
+                want.push(REAL_END.to_owned());
+                assert_eq!(got.frames, want, "{case}");
+                assert_eq!(got.closed, None, "{case}");
+                if websockets {
+                    assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: one socket");
+                } else {
+                    assert_eq!(proxy.upstream.http().len(), 1, "{case}: one attempt");
+                }
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
             }
         }
     }

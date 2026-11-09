@@ -1036,3 +1036,187 @@ async fn compaction_v2_answers_pass_unchanged() {
         }
     }
 }
+
+/// The upstream completion each undecodable event is followed by.
+const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+
+/// Upstream events the pinned client does not decode into `ResponsesStreamEvent`
+/// (`codex-api/src/sse/responses.rs:161-179` and 633-643 at 44ccf394573c), so it skips
+/// them: a repeated known member in either order, a known member of the wrong type, and
+/// invalid JSON that would otherwise read as a failure, a context-window `error`, an
+/// account failure or a completion.
+const UNDECODABLE: [(&str, &str); 10] = [
+    (
+        "repeated type, terminal first",
+        r#"{"type":"response.completed","type":"response.future","response":{"id":"resp_dup","output":[]}}"#,
+    ),
+    (
+        "repeated type, terminal last",
+        r#"{"type":"response.future","type":"response.completed","response":{"id":"resp_dup","output":[]}}"#,
+    ),
+    (
+        "repeated response",
+        r#"{"type":"response.completed","response":{"id":"resp_old","output":[]},"response":{"id":"resp_new","output":[]}}"#,
+    ),
+    (
+        "repeated type on a failure",
+        r#"{"type":"response.failed","type":"response.future","response":{"error":{"code":"server_error","message":"m"}}}"#,
+    ),
+    (
+        "repeated error",
+        r#"{"type":"error","error":{"code":"context_length_exceeded","message":"a"},"error":{"code":"context_length_exceeded","message":"b"}}"#,
+    ),
+    (
+        "known member of the wrong type",
+        r#"{"type":"response.completed","delta":5,"response":{"id":"resp_typed","output":[]}}"#,
+    ),
+    (
+        "malformed failure",
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"broken"}}"#,
+    ),
+    (
+        "malformed context window",
+        r#"{"type":"error","error":{"code":"context_length_exceeded","message":"broken"}"#,
+    ),
+    (
+        "malformed account failure",
+        r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"limit for acct-FAKE"}}"#,
+    ),
+    (
+        "malformed completion",
+        r#"{"type":"response.completed","response":{"id":"resp_bad","output":[]}"#,
+    ),
+];
+
+/// #25 (F1, F3): an upstream event the pinned client cannot decode never ends, fails or
+/// converts a native HTTP response, and it feeds no usage. It reaches a streaming client
+/// as sent, and the later real completion follows it. A buffered client gets that
+/// completion's `response` object. This holds as the first event and after
+/// `response.created`, with and without bootstrap buffering, for a Codex client (which
+/// would get #5's conversion). Each request is one attempt, recorded once with the
+/// completion's usage, and the credential does not cool.
+#[tokio::test]
+async fn undecodable_upstream_events_never_end_or_fail_http_responses() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let real = format!("event: response.completed\ndata: {REAL_END}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (name, event) in UNDECODABLE {
+        for (stage, leading) in [("first event", ""), ("after response.created", created)] {
+            for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+                let case = format!("{name}, {stage}, {config:?}");
+                let stream = format!("{leading}data: {event}\n\n{real}");
+                let proxy = native(
+                    false,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(REAL_END)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                for record in &records {
+                    assert_eq!(record["failed"], false, "{case}: {records:?}");
+                    assert_eq!(record["tokens"]["total_tokens"], 5, "{case}: {records:?}");
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// The controls for the boundary above, through the same route. Decodable events with
+/// repeated members the pinned client ignores (unknown members, and keys repeated inside
+/// `response`, where its `Value` keeps the last) still end the response: the stream ends
+/// with that terminal event, and nothing the upstream sends after it is read. A buffered
+/// client gets the `response` object as sent, repeats included. A valid status-less
+/// context-window `error` still reaches a Codex client as `response.failed` (#5), and a
+/// valid account failure still cools the credential (#6).
+#[tokio::test]
+async fn decodable_events_keep_their_outcomes_on_http_responses() {
+    let end = r#"{"type":"response.completed","future":1,"future":{"n":1.50},"response":{"id":"resp_rep","id":"resp_rep_last","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5},"usage":null}}"#;
+    let after =
+        r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"late"}"#;
+    let terminal = format!("event: response.completed\ndata: {end}\n\n");
+    let stream = format!("{terminal}data: {after}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(stream.clone()), Reply::sse(stream)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+    assert_eq!((status, answer.as_str()), (200, terminal.as_str()));
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered).await;
+    assert_eq!((status, answer.as_str()), (200, last_response_object(end)));
+
+    // #5: the valid status-less context-window `error`, renamed for a Codex client.
+    let context = r#"{"type":"error","error":{"code":"context_length_exceeded","message":"too long"},"response_id":"resp_ctx","sequence_number":2}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(format!("data: {context}\n\ndata: {REAL_END}\n\n"))],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, full.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        answer,
+        r#"data: {"type":"response.failed","sequence_number":2,"response":{"id":"resp_ctx","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#
+            .to_owned()
+            + "\n\n"
+    );
+
+    // #6: a valid account failure before anything was delivered is classified, cools the
+    // only credential and reaches the client as the provider's error object.
+    let limit = r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"limit"}}}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(format!("data: {limit}\n\ndata: {REAL_END}\n\n"))],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full).await;
+    assert_eq!(
+        (status, answer.as_str()),
+        (429, r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#)
+    );
+    let credential = proxy.rt.store().snapshot()[0].id.clone();
+    assert!(
+        !proxy.rt.store().cooldowns(&credential).is_empty(),
+        "the account failure cools"
+    );
+}
