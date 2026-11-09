@@ -1912,3 +1912,474 @@ async fn an_outcome_observed_when_the_consumer_leaves_still_settles() {
         up.finish().await;
     }
 }
+
+// ------------------------------------------------------------------ bounded queues (#24)
+
+/// #24, `docs/codex/CONTRACT.md` "Socket and account ownership": the duplex keeps at most
+/// 16 creates outstanding upstream, and holds at most 16 creates back while a steer is
+/// unacknowledged. One more ends the connection with a local, request-scoped error
+/// instead of growing a queue. That create never reaches upstream, and neither does a
+/// held create. Barriers on what upstream read, not quiet periods, order each step.
+#[tokio::test]
+async fn outstanding_and_held_creates_stay_bounded() {
+    const BOUND: usize = 16;
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r1","input":"hold"}"#;
+    let create = |n: usize| {
+        format!(
+            r#"{{"type":"response.create","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"turn {n}"}}]}}]}}"#
+        )
+    };
+    for held in [false, true] {
+        let received: Arc<Mutex<Vec<String>>> = Arc::default();
+        let read_all = Arc::new(tokio::sync::Notify::new());
+        let (log, signal) = (received.clone(), read_all.clone());
+        let up = Scripted::start(move |mut c: Peer| {
+            let (log, signal) = (log.clone(), signal.clone());
+            async move {
+                c.read().await;
+                c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                    .await;
+                if !held {
+                    c.write(r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#)
+                        .await;
+                }
+                // Outstanding: the 16 creates. Held: only the steer, never acknowledged.
+                let expected = if held { 1 } else { BOUND };
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), c.socket.recv()).await {
+                        Ok(Some(Ok(AxMessage::Text(text)))) => {
+                            let mut log = log.lock().unwrap();
+                            log.push(text.as_str().to_owned());
+                            if log.len() == expected {
+                                signal.notify_one();
+                            }
+                        }
+                        Ok(Some(Ok(AxMessage::Ping(_) | AxMessage::Pong(_)))) => {}
+                        _ => break,
+                    }
+                }
+            }
+        })
+        .await;
+        let client = Client::new(&format!("duplex-bounded-{held}"));
+        let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+        let created = next(&mut stream).await.unwrap().unwrap();
+        assert_eq!(get(&created, "type"), "response.created", "held={held}");
+        if held {
+            client.send(STEER).await;
+            tokio::time::timeout(Duration::from_secs(5), read_all.notified())
+                .await
+                .unwrap_or_else(|_| panic!("held={held}: the steer never reached upstream"));
+            for n in 0..BOUND {
+                client.send(&create(n)).await;
+            }
+        } else {
+            let completed = next(&mut stream).await.unwrap().unwrap();
+            assert_eq!(get(&completed, "type"), "response.completed");
+            for n in 0..BOUND {
+                client.send(&create(n)).await;
+            }
+            tokio::time::timeout(Duration::from_secs(5), read_all.notified())
+                .await
+                .unwrap_or_else(|_| panic!("held={held}: the outstanding creates never reached upstream"));
+        }
+        client.send(&create(BOUND)).await;
+        let error = match next(&mut stream).await {
+            Some(Ok(event)) => panic!("held={held}: unexpected event {event}"),
+            Some(Err(error)) => error,
+            None => panic!("held={held}: the stream ended without the bound's error"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("too many outstanding response.create requests"),
+            "held={held}: {error}"
+        );
+        assert_eq!(error.scope, FailureScope::Request, "held={held}: {error}");
+        assert!(next(&mut stream).await.is_none(), "held={held}: the stream ends");
+        drop(stream);
+        up.finish().await;
+        let routed = |n: usize| format!(r#"{{"model":"{MODEL}",{}"#, &create(n)[1..]);
+        let want: Vec<String> = if held {
+            vec![STEER.to_owned()]
+        } else {
+            (0..BOUND).map(routed).collect()
+        };
+        assert_eq!(
+            *received.lock().unwrap(),
+            want,
+            "held={held}: nothing past the bound, and no held create, went upstream"
+        );
+    }
+}
+
+/// #24, `docs/codex/CONTRACT.md` "Socket and account ownership": the duplex reads client
+/// frames only while its write queue has room, so an upstream that stops reading
+/// backpressures the client. The frames wait in the client's own bounded queue; the duplex
+/// neither fails with a full write queue nor buffers them without bound. Once upstream reads
+/// again, every frame arrives, in order and unchanged, and the stream reports no error.
+/// The 64 steers of 256 KiB (16 MiB) exceed the 16-frame write queue plus the loopback
+/// socket buffers, so the client must block before it has sent them all. None is
+/// acknowledged: 64 is also the ceiling on steers in flight, which admits every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_upstream_backpressures_client_frames() {
+    const STEERS: usize = 64;
+    let pad = "x".repeat(256 * 1024);
+    let steer =
+        move |n: usize| format!(r#"{{"type":"response.steer","previous_response_id":"r1","input":"{n:03} {pad}"}}"#);
+    let received: Arc<Mutex<Vec<String>>> = Arc::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let all_read = Arc::new(tokio::sync::Notify::new());
+    let (log, resume, done) = (received.clone(), release.clone(), all_read.clone());
+    let up = Scripted::start(move |mut c: Peer| {
+        let (log, resume, done) = (log.clone(), resume.clone(), done.clone());
+        async move {
+            c.read().await;
+            c.write(r#"{"type":"response.created","response":{"id":"r1","output":[]}}"#)
+                .await;
+            // Stop reading: the proxy's writes fill the socket buffers, then its queue.
+            resume.notified().await;
+            for _ in 0..STEERS {
+                let frame = c.read().await;
+                log.lock().unwrap().push(frame);
+            }
+            done.notify_one();
+            c.idle().await;
+        }
+    })
+    .await;
+    let client = Client::new("duplex-backpressure");
+    let mut stream = client.start(&up.url, r#"{"input":[]}"#, Format::Codex).await;
+    let created = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(get(&created, "type"), "response.created");
+
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (input, counter, frames) = (client.input.clone(), sent.clone(), steer.clone());
+    let sender = tokio::spawn(async move {
+        for n in 0..STEERS {
+            input.send(Bytes::from(frames(n))).await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    // The client blocks while upstream does not read: its progress stops short of the end.
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = sent.load(Ordering::SeqCst);
+        assert!(now < STEERS, "the duplex took every frame while upstream was stalled");
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), all_read.notified())
+        .await
+        .expect("upstream read again");
+    let want: Vec<String> = (0..STEERS).map(steer).collect();
+    assert!(
+        *received.lock().unwrap() == want,
+        "the client's steers, in order and unchanged"
+    );
+    tokio::time::timeout(Duration::from_secs(10), sender)
+        .await
+        .expect("the client's blocked sends complete")
+        .unwrap();
+    // Nothing failed meanwhile: no full write queue, no local error waits on the stream.
+    assert!(
+        futures_util::FutureExt::now_or_never(stream.next()).is_none(),
+        "the stream stays open with nothing to deliver"
+    );
+    drop(stream);
+    up.finish().await;
+}
+
+// ------------------------------------------------------------------ steers in flight (#24)
+
+/// The duplex's ceiling on steers in flight: unacknowledged plus accepted and not yet
+/// released. A local resource policy (`docs/codex/CONTRACT.md` "Socket and account
+/// ownership"), not a provider limit.
+const STEERS_IN_FLIGHT: usize = 64;
+
+fn steer_to(parent: &str, n: usize) -> String {
+    format!(r#"{{"type":"response.steer","previous_response_id":"{parent}","input":"{n}"}}"#)
+}
+
+fn steer_event(kind: &str, id: &str, parent: &str) -> String {
+    format!(r#"{{"type":"{kind}","sequence_number":1.50,"steer":{{"id":"{id}","previous_response_id":"{parent}"}}}}"#)
+}
+
+/// A steering upstream the test drives: it starts `r1`, reports every client frame it
+/// reads, in order, and writes only what the test hands it. It acknowledges nothing on
+/// its own. Its conversation ends when the proxy closes the socket.
+struct Puppet {
+    up: Scripted,
+    reads: tokio::sync::mpsc::Receiver<String>,
+    writes: tokio::sync::mpsc::Sender<String>,
+    client: Client,
+    stream: BoxStream<'static, Result<Bytes, ExecError>>,
+    ledger: Ledger,
+}
+
+impl Puppet {
+    async fn start(session: &str) -> Self {
+        let (read_tx, reads) = tokio::sync::mpsc::channel(512);
+        let (writes, write_rx) = tokio::sync::mpsc::channel::<String>(512);
+        let slot = Arc::new(Mutex::new(Some((read_tx, write_rx))));
+        let up = Scripted::start(move |mut c: Peer| {
+            let slot = slot.clone();
+            async move {
+                let (reads, mut writes) = slot.lock().unwrap().take().expect("a single dial");
+                let create = c.read().await;
+                reads.send(create).await.unwrap();
+                c.write(&event("response.created", "r1")).await;
+                loop {
+                    tokio::select! {
+                        frame = c.socket.recv() => match frame {
+                            Some(Ok(AxMessage::Text(text))) => reads.send(text.as_str().to_owned()).await.unwrap(),
+                            Some(Ok(AxMessage::Ping(_) | AxMessage::Pong(_))) => {}
+                            _ => break,
+                        },
+                        Some(frame) = writes.recv() => c.write(&frame).await,
+                    }
+                }
+            }
+        })
+        .await;
+        let client = Client::new(session);
+        let ledger = Ledger::attempt();
+        let usage = cpa_core::exec::UsageSink::new(Arc::new(ledger.clone()));
+        let mut stream = client.start_with(&up.url, &tiered("auto"), Format::Codex, usage).await;
+        assert_eq!(
+            next(&mut stream).await.unwrap().unwrap(),
+            event("response.created", "r1")
+        );
+        let mut puppet = Self {
+            up,
+            reads,
+            writes,
+            client,
+            stream,
+            ledger,
+        };
+        let bootstrap = puppet.read().await;
+        assert_eq!(
+            get(&bootstrap, "type"),
+            "response.create",
+            "the bootstrap create: {bootstrap}"
+        );
+        puppet
+    }
+
+    /// The next client frame upstream read: the barrier after each send.
+    async fn read(&mut self) -> String {
+        tokio::time::timeout(Duration::from_secs(5), self.reads.recv())
+            .await
+            .expect("upstream read a frame")
+            .expect("the upstream conversation runs")
+    }
+
+    /// Sends `frame` from the client and waits until upstream read it unchanged.
+    async fn forward(&mut self, frame: &str) {
+        self.client.send(frame).await;
+        assert_eq!(self.read().await, frame, "upstream reads the client's frame as sent");
+    }
+
+    /// Upstream writes `frame`; the client receives it unchanged, after the duplex's
+    /// bookkeeping for it ran.
+    async fn deliver(&mut self, frame: &str) {
+        self.writes.send(frame.to_owned()).await.unwrap();
+        let got = next(&mut self.stream)
+            .await
+            .expect("the stream runs")
+            .expect("an event");
+        assert_eq!(got, frame, "the client receives the upstream event as sent");
+    }
+
+    /// The stream's next item is a request-scoped local error containing `message`, and
+    /// then the stream ends; upstream read no frame after the last barrier, and the
+    /// records settled exactly as `settled`. No second socket was dialed. A frame that
+    /// upstream reads instead of the error fails at once.
+    async fn ends_with(mut self, message: &str, settled: &[(&str, u16)]) {
+        let error = tokio::select! {
+            item = tokio::time::timeout(Duration::from_secs(5), self.stream.next()) => match item {
+                Ok(Some(Err(error))) => error,
+                Ok(other) => panic!("expected the local error, got {other:?}"),
+                Err(_) => panic!("no local error: the connection stayed open"),
+            },
+            Some(frame) = self.reads.recv() => panic!("upstream read a frame past the ceiling: {frame}"),
+        };
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            error.scope,
+            FailureScope::Request,
+            "{error}: the credential is not cooled"
+        );
+        assert!(next(&mut self.stream).await.is_none(), "the stream ends");
+        drop(self.stream);
+        duplex_gone(&self.client).await;
+        drop(self.writes);
+        self.up.finish().await;
+        assert_eq!(self.up.dials.load(Ordering::SeqCst), 1, "no replay on another socket");
+        assert!(
+            self.reads.try_recv().is_err(),
+            "nothing past the ceiling reached upstream"
+        );
+        let mut want: Vec<(String, u16)> = settled.iter().map(|(l, s)| ((*l).to_owned(), *s)).collect();
+        want.sort();
+        assert_eq!(self.ledger.sorted(), want, "each record settles once");
+    }
+}
+
+const STEERS_EXCEEDED: &str = "too many response.steer requests in flight";
+const ACCEPTED_EXCEEDED: &str = "upstream accepted more response.steer requests than";
+
+/// #24: an upstream that reads every steer and acknowledges none. After each send the
+/// test waits for upstream's read, so the write queue and socket buffers stay drained
+/// and only the duplex's own state could grow. The steers name the running response and
+/// a response the socket never started: the ceiling counts steers, not parents. The
+/// 64th steer still goes upstream as sent; the 65th ends the connection with a local,
+/// request-scoped error before it is written. The open response's record fails once with
+/// that error, and nothing is replayed.
+#[tokio::test]
+async fn unacknowledged_steers_stop_at_the_ceiling() {
+    let mut up = Puppet::start("steer-ceiling-unacknowledged").await;
+    for n in 0..STEERS_IN_FLIGHT {
+        up.forward(&steer_to(if n % 2 == 0 { "r1" } else { "elsewhere" }, n))
+            .await;
+    }
+    up.client.send(&steer_to("r1", STEERS_IN_FLIGHT)).await;
+    up.ends_with(STEERS_EXCEEDED, &[("bootstrap", 502)]).await;
+}
+
+/// #24: accepted steers stay in flight until their successor starts or they fail, so they
+/// count toward the same ceiling as unacknowledged ones. Half the steers are accepted,
+/// their response then completes without a successor, and the other half are never
+/// acknowledged: the next steer is refused before it is written. Every acknowledgement
+/// and the terminal event reach the client as sent.
+#[tokio::test]
+async fn accepted_steers_awaiting_their_successor_count_toward_the_ceiling() {
+    let mut up = Puppet::start("steer-ceiling-accepted").await;
+    let half = STEERS_IN_FLIGHT / 2;
+    for n in 0..half {
+        up.forward(&steer_to("r1", n)).await;
+        up.deliver(&steer_event("response.steer.accepted", &format!("s{n}"), "r1"))
+            .await;
+    }
+    up.deliver(&event("response.completed", "r1")).await;
+    for n in half..STEERS_IN_FLIGHT {
+        up.forward(&steer_to("r1", n)).await;
+    }
+    up.client.send(&steer_to("r1", STEERS_IN_FLIGHT)).await;
+    up.ends_with(STEERS_EXCEEDED, &[("bootstrap", 200)]).await;
+}
+
+/// #24: what releases a steer frees its room under the ceiling, one for one: a
+/// `response.steer.failed` for an unacknowledged steer, a `response.steer.failed` naming
+/// an accepted steer's ID, and the automatic successor's `response.created`, which
+/// releases every steer accepted for its parent. After the successor, all 64 steers fit
+/// again, and the 65th is still refused. Acceptances move a steer without growing the
+/// count. The successor's record is the one that fails with the ceiling's error.
+#[tokio::test]
+async fn released_steers_free_their_room() {
+    let mut up = Puppet::start("steer-ceiling-release").await;
+    let mut n = 0;
+    for _ in 0..STEERS_IN_FLIGHT {
+        up.forward(&steer_to("r1", n)).await;
+        n += 1;
+    }
+    up.deliver(&steer_event("response.steer.failed", "f0", "r1")).await;
+    up.forward(&steer_to("r1", n)).await;
+    n += 1;
+    for id in 0..STEERS_IN_FLIGHT {
+        up.deliver(&steer_event("response.steer.accepted", &format!("a{id}"), "r1"))
+            .await;
+    }
+    up.deliver(&steer_event("response.steer.failed", "a0", "r1")).await;
+    up.forward(&steer_to("r1", n)).await;
+    n += 1;
+    up.deliver(&steer_event("response.steer.accepted", "a64", "r1")).await;
+    up.deliver(&event("response.completed", "r1")).await;
+    up.deliver(r#"{"type":"response.created","response":{"id":"r2","previous_response_id":"r1","output":[]}}"#)
+        .await;
+    for _ in 0..STEERS_IN_FLIGHT {
+        up.forward(&steer_to("r2", n)).await;
+        n += 1;
+    }
+    up.client.send(&steer_to("r2", n)).await;
+    up.ends_with(STEERS_EXCEEDED, &[("bootstrap", 200), ("bootstrap+auto", 502)])
+        .await;
+}
+
+/// #24: acknowledgements upstream sends for no steer in flight are kept as Go keeps them,
+/// up to the same ceiling. A repeated ID replaces its entry and an unmatched failure
+/// releases nothing, so neither grows the count. Distinct unsolicited acceptances fill
+/// it: one more ends the connection after the client received that event as sent, or a
+/// client steer is refused before it is written. Upstream read only the bootstrap create.
+#[tokio::test]
+async fn unsolicited_acceptances_stay_under_the_ceiling() {
+    for client_steers in [false, true] {
+        let mut up = Puppet::start(&format!("steer-ceiling-unsolicited-{client_steers}")).await;
+        for _ in 0..3 {
+            up.deliver(&steer_event("response.steer.accepted", "dup", "r1")).await;
+        }
+        up.deliver(&steer_event("response.steer.failed", "unknown", "nowhere"))
+            .await;
+        for id in 1..STEERS_IN_FLIGHT {
+            up.deliver(&steer_event("response.steer.accepted", &format!("u{id}"), "r1"))
+                .await;
+        }
+        if client_steers {
+            up.client.send(&steer_to("r1", 0)).await;
+            up.ends_with(STEERS_EXCEEDED, &[("bootstrap", 502)]).await;
+        } else {
+            up.deliver(&steer_event("response.steer.accepted", "overflow", "r1"))
+                .await;
+            up.ends_with(ACCEPTED_EXCEEDED, &[("bootstrap", 502)]).await;
+        }
+    }
+}
+
+/// #24: the settings steering pins for an automatic successor stay only while a steer in
+/// flight names their parent, so they are bounded with the steers. Here upstream accepts
+/// a steer for `r1` and then fails that steer's ID naming another parent. Go releases
+/// only the parent the failure names, and later only the parent a start names; no later
+/// start names `r1` (an explicit create's start names `r0`), so Go keeps `r1`'s settings
+/// for the rest of the connection. Once 16 later starts evicted `r1` from the retained
+/// history, a successor of `r1` has no settings, and the connection ends as for any
+/// successor without them.
+#[tokio::test]
+async fn pinned_settings_last_only_while_a_steer_names_their_parent() {
+    let mut up = Puppet::start("steer-settings-release").await;
+    up.forward(&steer_to("r1", 0)).await;
+    up.deliver(&steer_event("response.steer.accepted", "a", "r1")).await;
+    up.deliver(&steer_event("response.steer.failed", "a", "elsewhere"))
+        .await;
+    up.deliver(&event("response.completed", "r1")).await;
+    up.forward(&tiered("flex")).await;
+    up.deliver(r#"{"type":"response.created","response":{"id":"r2","previous_response_id":"r0","output":[]}}"#)
+        .await;
+    up.deliver(&event("response.completed", "r2")).await;
+    let mut settled = vec![("bootstrap".to_owned(), 200), ("flex".to_owned(), 200)];
+    let mut label = "flex".to_owned();
+    for k in 3..=17 {
+        up.deliver(&format!(
+            r#"{{"type":"response.created","response":{{"id":"r{k}","previous_response_id":"r{}","output":[]}}}}"#,
+            k - 1
+        ))
+        .await;
+        up.deliver(&event("response.completed", &format!("r{k}"))).await;
+        label.push_str("+auto");
+        settled.push((label.clone(), 200));
+    }
+    up.writes
+        .send(
+            r#"{"type":"response.created","response":{"id":"late","previous_response_id":"r1","output":[]}}"#
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let settled: Vec<(&str, u16)> = settled.iter().map(|(l, s)| (l.as_str(), *s)).collect();
+    up.ends_with("automatic successor has no retained parent settings", &settled)
+        .await;
+}

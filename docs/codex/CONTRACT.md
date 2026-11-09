@@ -145,6 +145,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
+| Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
 | Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
@@ -316,7 +317,7 @@ reader semantics.
 | `crates/cpa-server/src/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | xAI keeps Go's ingress. A Codex model's original JSON and form pass the adapter's rules before the handler reads `prompt` or rewrites `model` and `stream`; the handler's Go reads then see a body without repeated keys and with typed routing members |
 | `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | A Responses body passes the boundary first and is read in place. The counter's text reads stay on `cpa_common::json` over that validated body or the strict conversion; they read each item in place, never from the root |
 | `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads; #25 |
-| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `cpa_common::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue (#24) |
+| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `cpa_common::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue. The copy keeps the client's bytes, and the work stays linear in the frame size |
 | `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A Codex attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the frame for other providers | Other providers |
 | `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A Codex attempt gets the client's bytes from `NativeRequest` instead | Other providers |
 | `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers |
@@ -486,10 +487,29 @@ bounded:
 
 - at most 16 outstanding creates;
 - a write queue of 16 frames;
-- 16 local items waiting for the client.
+- 16 local items waiting for the client;
+- at most 64 steers in flight on a `codex.response-steering` connection.
 
 The proxy reads client frames only while the write queue has room, so a stalled
 upstream backpressures the client. A full queue ends the connection with a local error.
+
+A steer is in flight from admission to the upstream writer until upstream releases it: a
+`response.steer.failed` for it, or, once accepted, the `response.created` of its
+parent's successor or a `response.steer.failed` that names its ID. The settings that
+steering pins for an automatic successor stay only while a steer in flight names their
+parent. The ceiling of 64 is the proxy's own resource policy. No first-party or
+documented source sets a limit, and the pinned client sends no `response.steer`. The
+ceiling is separate from write backpressure. Socket buffers and frame sizes determine
+which limit a stalled upstream reaches first. It also stops an upstream that reads
+every steer and releases none.
+
+- A client steer that would be the 65th ends the connection with a local,
+  request-scoped error before it is written. The credential is not cooled, and nothing
+  is replayed. Records still open fail with that error, as for the create bound.
+- An acceptance that names no steer in flight, under a new ID, still counts, as in Go.
+  A repeated ID replaces its entry, so it does not count again. An acceptance that
+  would be the 65th reaches the client as sent, and the connection then ends with a
+  local, request-scoped error. That makes no claim about what the upstream meant.
 
 ### Responses and failures
 
@@ -636,6 +656,18 @@ client as sent ([Responses and failures](#responses-and-failures)).
   pick, with a message that says so. After a pick on an upstream socket, a prewarm goes
   to the provider on that socket. Go answers such a prewarm locally with a made-up
   `resp_prewarm_` response; other providers keep that behaviour.
+- An interrupt (`response.interrupt`) has no upstream socket to go to. For the running
+  response, the proxy cancels the HTTP request, sends
+  `{"type":"response.interrupt.accepted","response_id":...}` with the interrupt's ID, and
+  then sends a `response.incomplete` with that ID, `status: "incomplete"`, the reason
+  `interrupted` and the output items the provider already delivered. The proxy adds no
+  usage and no text, and never sends a successful completion. An interrupt for the
+  response the connection just finished gets the acknowledgement alone. The pinned
+  client reads only the ID, the reason and the usage of an interrupted response
+  (`sse/responses.rs:451-518`), and ends the turn with `end_turn: false`. These events
+  answer the client's cancel handshake. They are not provider output, and nothing
+  further reaches the upstream (#1,
+  [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md)).
 
 The server's transcript merge, tool-call repair and Codex-client preparation still build
 the frame that other providers receive; no Codex attempt sees it.
@@ -914,7 +946,9 @@ Passive accounting reads a copy and changes nothing.
 - The proxy forwards a client's prewarm and never sends its own. It sends no inference
   keepalive. A prewarm that only the [HTTP fallback](#websocket-http-fallback) could
   serve is refused, never answered locally.
-- The proxy forwards `response.interrupt` and its acknowledgements unchanged.
+- The proxy forwards `response.interrupt` and its acknowledgements unchanged. On a turn
+  served over HTTP, which has no upstream socket, the proxy answers the interrupt
+  itself, as described in [WebSocket HTTP fallback](#websocket-http-fallback).
 - A 426 handshake fails the turn with that status. The only proxy-side HTTP conversion
   is the [WebSocket HTTP fallback](#websocket-http-fallback) for credentials without
   `websockets`, which removes only the frame's `type`.

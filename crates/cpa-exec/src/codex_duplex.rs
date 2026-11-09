@@ -16,6 +16,11 @@
 //! stops upstream events (Go's writer blocking in `writeCodexWebsocketMessage`). Writer
 //! waits (`waitFor`, queued creates) become state the task re-checks after every step.
 //!
+//! Go keeps steers in flight without a bound. Here at most [`MAX_STEERS`] are
+//! unacknowledged, or accepted and awaiting release. A client steer past it ends the
+//! connection before it is written; so does an upstream acceptance past it, after the
+//! client received that event.
+//!
 //! Usage is recorded per upstream response, not per connection (#25). The attempt that
 //! opened the socket accounts for the bootstrap create until its `response.created`; then
 //! its accounting moves to that response's own record (`UsageSink::detach`), and the
@@ -59,6 +64,15 @@ const WRITE_QUEUE: usize = 16;
 /// Local items (events, rejections) waiting for the consumer. Upstream is read only when
 /// none wait, as Go's reader blocks on its unbuffered `out`.
 const OUTBOX: usize = 16;
+/// Steers in flight: written and not yet acknowledged, or accepted and not yet released
+/// by their successor's `response.created` or a `response.steer.failed`. Their pinned
+/// settings are at most one per such steer. A local resource ceiling, not a provider
+/// limit: no first-party or documented source bounds steering, and Go keeps both
+/// collections without one. This ceiling is separate from write backpressure: socket
+/// buffers and frame sizes determine which limit a stalled upstream reaches first.
+/// It also stops an upstream that reads every steer and never releases one.
+const MAX_STEERS: usize = 64;
+const _: () = assert!(MAX_STEERS > WRITE_QUEUE + 1);
 
 type Enabled = dyn Fn(&str) -> bool + Send + Sync;
 
@@ -266,7 +280,8 @@ pub(super) struct Duplex {
     detached: bool,
     /// The client's frames ended: what still runs is canceled, not failed.
     client_gone: bool,
-    /// Parents of steers written and not yet acknowledged.
+    /// Parents of steers written and not yet acknowledged. With `accepted`, at most
+    /// [`MAX_STEERS`] entries ([`Duplex::steer_room`]).
     unacknowledged: Vec<String>,
     /// Accepted steer id to parent response.
     accepted: HashMap<String, String>,
@@ -277,7 +292,8 @@ pub(super) struct Duplex {
     /// A started response has left the retained history. An unmatched failure ID may
     /// now name that response instead of rejecting a pending create.
     response_history_evicted: bool,
-    /// Settings pinned by in-flight steering, independent of the retention window.
+    /// Settings pinned by in-flight steering, independent of the retention window. Only
+    /// a parent of `unacknowledged` or `accepted` keeps its entry.
     steering_settings: HashMap<String, Prepared>,
     /// The response waiting for required input (`response.steer.pending`).
     waiting_parent: String,
@@ -845,6 +861,14 @@ impl Duplex {
         if !self.image_tool_allowed(&payload) {
             return;
         }
+        if !self.steer_room() {
+            // Upstream read the earlier steers but released none of them. Like the
+            // create bound: a local, request-scoped end, and this frame is not sent.
+            self.fail(local(&format!(
+                "too many response.steer requests in flight: {MAX_STEERS} await upstream acknowledgement or their successor"
+            )));
+            return;
+        }
         if let Some(settings) = self.response_settings.get(&parent).cloned() {
             self.steering_settings.insert(parent.clone(), settings);
         }
@@ -940,12 +964,21 @@ impl Duplex {
         self.write(frame);
     }
 
-    /// `releaseSteeringSettings`.
-    fn release_steering_settings(&mut self, parent: &str) {
-        let in_flight = self.unacknowledged.iter().any(|p| p == parent) || self.accepted.values().any(|p| p == parent);
-        if !in_flight {
-            self.steering_settings.remove(parent);
-        }
+    /// Whether one more steer fits under [`MAX_STEERS`]. Every insertion into
+    /// `unacknowledged` or `accepted` that can grow them checks it first.
+    fn steer_room(&self) -> bool {
+        self.unacknowledged.len() + self.accepted.len() < MAX_STEERS
+    }
+
+    /// `releaseSteeringSettings`, for every parent at once: settings stay pinned only
+    /// while a steer in flight names their parent. Go releases only the parent the event
+    /// names, so an acknowledgement naming another parent than its steer left Go's
+    /// entry pinned for the rest of the connection.
+    // At most MAX_STEERS entries, each checked against at most MAX_STEERS parents.
+    fn release_steering_settings(&mut self) {
+        let (unacknowledged, accepted) = (&self.unacknowledged, &self.accepted);
+        self.steering_settings
+            .retain(|parent, _| unacknowledged.contains(parent) || accepted.values().any(|p| p == parent));
     }
 
     /// One upstream frame (the reader goroutine).
@@ -995,8 +1028,14 @@ impl Duplex {
         // Steering acknowledgements, pending notices and failures are opaque: IDs, input,
         // sequence numbers and event types reach the client byte for byte.
         if kind.starts_with("response.steer.") {
-            self.steer_event(kind, payload);
+            let recorded = self.steer_event(kind, payload);
             self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            if !recorded {
+                // As for an ambiguous failure: keep the event, end the socket.
+                self.fail(local(&format!(
+                    "upstream accepted more response.steer requests than the {MAX_STEERS} a connection keeps in flight"
+                )));
+            }
             return;
         }
         let terminal = self.classify(payload);
@@ -1127,7 +1166,7 @@ impl Duplex {
             self.response_settings.remove(&oldest);
             self.response_history_evicted = true;
         }
-        self.release_steering_settings(&parent);
+        self.release_steering_settings();
         self.first_response = false;
         self.response_active = true;
         self.turn.items = Default::default();
@@ -1145,8 +1184,9 @@ impl Duplex {
         Some(Accounting::new(usage))
     }
 
-    /// `response.steer.*`: acknowledgement bookkeeping.
-    fn steer_event(&mut self, kind: &str, payload: &str) {
+    /// `response.steer.*`: acknowledgement bookkeeping. False when an acceptance would
+    /// take the steers in flight past [`MAX_STEERS`]; nothing is recorded then.
+    fn steer_event(&mut self, kind: &str, payload: &str) -> bool {
         let id = rawjson::get(payload, "steer.id").str().to_owned();
         let mut parent = rawjson::get(payload, "steer.previous_response_id").str().to_owned();
         if parent.is_empty() {
@@ -1160,18 +1200,24 @@ impl Duplex {
         match kind {
             "response.steer.accepted" => {
                 consume(&mut self.unacknowledged);
+                // Acknowledging a steer in flight moves it, and a repeated ID replaces
+                // its entry; only an acceptance of no steer in flight adds one.
+                if !self.accepted.contains_key(&id) && !self.steer_room() {
+                    return false;
+                }
                 self.accepted.insert(id, parent);
             }
             "response.steer.failed" => {
                 if self.accepted.remove(&id).is_none() {
                     consume(&mut self.unacknowledged);
                 }
-                self.release_steering_settings(&parent);
             }
             // Tool results may already wait in the queue; no automatic successor can start
             // until an explicit continuation supplies them.
             "response.steer.pending" => self.waiting_parent = parent,
             _ => {}
         }
+        self.release_steering_settings();
+        true
     }
 }

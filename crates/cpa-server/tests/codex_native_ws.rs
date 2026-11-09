@@ -1683,3 +1683,389 @@ async fn initial_bom_does_not_hide_the_only_terminal_event_on_websocket_fallback
         }
     }
 }
+
+// #24: the response-steering path, keepalive and continuation ownership, captured as the
+// upstream received them through the public router.
+
+/// Every Codex rewrite control Go had, with response steering on: none may reach a frame.
+const STEERING_WITH_REWRITES: &str = "payload:\n  default:\n    - models: [{name: \"*\"}]\n      params: {max_output_tokens: 7}\n  override:\n    - models: [{name: \"*\", protocol: codex}]\n      params: {instructions: injected, parallel_tool_calls: true, service_tier: priority}\n  filter:\n    - models: [{name: \"*\"}]\n      params: [include, prompt_cache_key, prompt_cache_options, service_tier, previous_response_id]\ncodex:\n  response-steering: true\n  optimize-multi-agent-v2: true\n  orphan-delegation-compatibility: true\n";
+
+/// Contract probe, from the multi-agent body of `codex_settings.rs`: a create each Go
+/// rewrite would have changed (the `collaboration` namespace, an orphan delegation output,
+/// a replayed web search call, `parallel_tool_calls: false`, output replay in `include`, a
+/// cache key and the `flex` tier), as a continuation.
+const MULTI_AGENT_CREATE: &str = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_fixture_1","input":[{"type":"function_call_output","call_id":"orphan","name":"create_thread","namespace":"codex_app","output":"thread ok"},{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"q"}},{"type":"message","role":"user","content":[{"type":"input_text","text":"delegate"}]}],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent.","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}]}],"parallel_tool_calls":false,"include":["reasoning.encrypted_content","output.encrypted_content"],"prompt_cache_key":"pck-1","service_tier":"flex","store":false}"#;
+
+/// Contract probe: `ws-steer-api-docs` with unknown members, raw number spellings, `null`
+/// and `false`. The upstream decides whether it accepts a steer; the proxy adds nothing.
+const STEER_PROBE: &str = r#"{"type":"response.steer","previous_response_id":"resp_probe_4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep the scope small."}]}],"future_steer_field":{"n":1.50,"e":1e3,"z":null,"f":false}}"#;
+
+/// #24: on a `codex.response-steering` connection, every frame after the first goes
+/// through the duplex queue, not the turn path, and still reaches the one upstream socket
+/// as the client sent it, with every rewrite control on and a multi-agent Codex client:
+/// a client prewarm and its continuation (incremental input, `previous_response_id`),
+/// encrypted reasoning with a namespaced call, unknown members and item kinds with raw
+/// numbers, `null` and `flex`, the multi-agent probe as a binary frame, and a steer. The
+/// provider's prewarm answer reaches the client as sent; the proxy answers nothing itself.
+#[tokio::test]
+async fn steering_later_frames_reach_the_socket_as_sent() {
+    let warm_created = r#"{"type":"response.created","response":{"id":"resp_warm"}}"#;
+    let warm_done = r#"{"type":"response.completed","response":{"id":"resp_warm","usage":null}}"#;
+    let probe_created = r#"{"type":"response.created","response":{"id":"resp_probe_4"}}"#;
+    let steered =
+        r#"{"type":"response.steer.accepted","steer":{"id":"steer_probe_1","previous_response_id":"resp_probe_4"}}"#;
+    let probe_done = r#"{"type":"response.completed","response":{"id":"resp_probe_4","output":[]}}"#;
+    let replies = vec![
+        vec![
+            Bytes::from_static(warm_created.as_bytes()),
+            Bytes::from_static(warm_done.as_bytes()),
+        ],
+        fixture("sse-completed").frames(),
+        fixture("sse-completed").frames(),
+        fixture("sse-completed").frames(),
+        vec![Bytes::from_static(probe_created.as_bytes())],
+        vec![
+            Bytes::from_static(steered.as_bytes()),
+            Bytes::from_static(probe_done.as_bytes()),
+        ],
+    ];
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: replies,
+            ..Script::default()
+        },
+        STEERING_WITH_REWRITES,
+    )
+    .await;
+    let mut socket = wreq::Client::new()
+        .websocket(format!("ws://{}/v1/responses", proxy.addr))
+        .header("authorization", "Bearer client-key")
+        .header("user-agent", CODEX_UA)
+        .header("originator", "codex_cli_rs")
+        .header("x-openai-subagent", "collab_spawn")
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+
+    let prewarm = client_frame("ws-create-prewarm", "gpt-5.5");
+    socket.send(Message::text(prewarm.clone())).await.unwrap();
+    let warm = read(&mut socket, &TERMINAL).await;
+    assert_eq!(warm.frames, [warm_created, warm_done], "the provider's prewarm answer");
+
+    let later = [
+        client_frame("ws-create-continuation", "gpt-5.5"),
+        as_create("http-request-full", "gpt-5.5"),
+        as_create("probe-request-unknown-fields", "gpt-5.5"),
+    ];
+    for frame in &later {
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        let turn = read(&mut socket, &TERMINAL).await;
+        assert_eq!(turn.frames, events("sse-completed"), "{frame}");
+        assert_eq!(turn.closed, None);
+    }
+    socket
+        .send(Message::binary(MULTI_AGENT_CREATE.as_bytes().to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [probe_created]);
+    socket.send(Message::text(STEER_PROBE)).await.unwrap();
+    let steering = read(&mut socket, &TERMINAL).await;
+    assert_eq!(steering.frames, [steered, probe_done], "as upstream sent them");
+    assert_eq!(steering.closed, None);
+
+    let mut want = vec![prewarm];
+    want.extend(later);
+    want.extend([MULTI_AGENT_CREATE.to_owned(), STEER_PROBE.to_owned()]);
+    assert_eq!(proxy.upstream.sockets().len(), 1, "one upstream socket");
+    assert_eq!(upstream_frames(&proxy, 0), want, "the client's frames, byte for byte");
+    assert!(proxy.upstream.http().is_empty(), "no HTTP request");
+}
+
+/// What the client read while a turn was idle: ping control frames until `pings`
+/// arrived. Any text frame meanwhile fails the test.
+async fn pings(socket: &mut WebSocket, pings: usize) {
+    let mut seen = 0;
+    while seen < pings {
+        let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no keepalive ping after {seen}"));
+        match next {
+            Some(Ok(Message::Ping(_))) => seen += 1,
+            Some(Ok(Message::Pong(_))) => {}
+            other => panic!("only pings while the turn is idle: {other:?}"),
+        }
+    }
+}
+
+/// #24: the proxy sends no inference keepalive. With
+/// `requests.streaming.keepalive-seconds`, an idle native turn gets WebSocket ping control
+/// frames to the client, and nothing reaches the upstream socket: the provider sees only
+/// the client's create, then the client's interrupt. Ordinary and steering connections.
+#[tokio::test]
+async fn keepalive_pings_only_the_client() {
+    for steering in [false, true] {
+        let interrupt_events = events("ws-events-interrupt");
+        let config = format!(
+            "requests:\n  streaming:\n    keepalive-seconds: 1\n{}",
+            if steering { STEERING } else { "" }
+        );
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: vec![
+                    vec![Bytes::from(interrupt_events[0].clone())],
+                    interrupt_events[1..].iter().cloned().map(Bytes::from).collect(),
+                ],
+                ..Script::default()
+            },
+            &config,
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let first = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(first.clone())).await.unwrap();
+        let started = read(&mut socket, &["response.created"]).await;
+        assert_eq!(started.frames, interrupt_events[..1], "steering={steering}");
+        pings(&mut socket, 2).await;
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            std::slice::from_ref(&first),
+            "steering={steering}: the keepalive sent nothing upstream"
+        );
+        let interrupt = text(fixture("ws-interrupt").bytes());
+        socket.send(Message::text(interrupt.clone())).await.unwrap();
+        let ended = read(&mut socket, &["response.incomplete"]).await;
+        assert_eq!(ended.frames, interrupt_events[1..], "steering={steering}");
+        assert_eq!(proxy.upstream.sockets().len(), 1, "steering={steering}");
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            [first, interrupt],
+            "steering={steering}: the client's frames only"
+        );
+    }
+}
+
+/// #24: a continuation never moves to another account. Two credentials serve the model,
+/// and the continuation's socket answers a retryable status error, which fails a first
+/// create over to the other credential (`the_exhausted_failure_reaches_the_client_as_sent`).
+/// A continuation stays on its socket: the client gets the provider's frame, and no second
+/// socket or account receives the continuation. With and without response steering.
+#[tokio::test]
+async fn a_failed_continuation_never_fails_over() {
+    let retryable = r#"{"type":"error","status":503,"error":{"type":"server_error","message":null,"x":1.50}}"#;
+    for steering in [false, true] {
+        let proxy = proxy_with(
+            Script {
+                ws: vec![
+                    fixture("sse-completed").frames(),
+                    vec![Bytes::from_static(retryable.as_bytes())],
+                ],
+                ..Script::default()
+            },
+            if steering { STEERING } else { "" },
+            |url| {
+                let mut second = credential(Profile::Chatgpt, url, true);
+                second.id = "codex-second.json".into();
+                second.metadata.insert("access_token".into(), "at-FAKE-second".into());
+                vec![credential(Profile::Chatgpt, url, true), second]
+            },
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let first = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(first.clone())).await.unwrap();
+        assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        let failed = read(&mut socket, &["error"]).await;
+        assert_eq!(failed.frames, [retryable], "steering={steering}: the provider's frame");
+        let sockets = proxy.upstream.sockets();
+        assert_eq!(sockets.len(), 1, "steering={steering}: no second socket");
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            [first, continuation],
+            "steering={steering}: the continuation went upstream once"
+        );
+    }
+}
+
+/// Fires its `Notify` when dropped: the upstream's streamed body was dropped.
+struct OnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// An HTTP Responses upstream that streams `head`, then only SSE comments, so the
+/// response never ends on its own and a dropped connection fails its next write. It
+/// records each body, and the `Notify` fires once the proxy dropped the response.
+async fn unending_upstream(head: String) -> (String, Arc<std::sync::Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let cancelled = Arc::new(tokio::sync::Notify::new());
+    let (bodies, dropped) = (seen.clone(), cancelled.clone());
+    let app = axum::Router::new().fallback(move |body: Bytes| {
+        let (bodies, dropped, head) = (bodies.clone(), dropped.clone(), head.clone());
+        async move {
+            bodies.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+            let guard = OnDrop(dropped);
+            let comments = futures_util::stream::unfold((), |()| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some((Bytes::from_static(b": idle\n\n"), ()))
+            });
+            let stream = futures_util::stream::once(async move { Bytes::from(head) })
+                .chain(comments)
+                .map(move |chunk| {
+                    let _held = &guard;
+                    Ok::<_, std::io::Error>(chunk)
+                });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(stream),
+            )
+        }
+    });
+    let addr = serve(app).await;
+    (format!("http://{addr}"), seen, cancelled)
+}
+
+/// #24 with #1: a Codex turn served over HTTP has no upstream socket for the client's
+/// `response.interrupt`. The pinned client waits, after a cancel, for both an
+/// acknowledgement and the response's terminal event (`responses_websocket.rs:310-333`,
+/// 824-839, 886-913), and reads only the ID, the reason and the usage of an interrupted
+/// `response.incomplete` (`sse/responses.rs:451-518`). The proxy cancels the upstream
+/// request and answers that handshake itself. Its two events are local transport answers,
+/// not provider output: the acknowledgement names the interrupt's response, and the
+/// interrupted end carries only the output items the provider already delivered, with no
+/// usage and no text of its own. Nothing else reaches the upstream.
+#[tokio::test]
+async fn an_http_turn_answers_an_interrupt_without_inventing_output() {
+    let frames = events("sse-completed");
+    let delivered = &frames[..2];
+    let head: String = delivered.iter().map(|data| format!("data: {data}\n\n")).collect();
+    let (base, bodies, cancelled) = unending_upstream(head).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &base, false)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(create.clone())).await.unwrap();
+    let started = read(&mut socket, &["response.output_item.done"]).await;
+    assert_eq!(started.frames, delivered, "the provider's events, unchanged");
+
+    socket
+        .send(Message::text(text(fixture("ws-interrupt").bytes())))
+        .await
+        .unwrap();
+    let ended = read(&mut socket, &["response.incomplete"]).await;
+    assert_eq!(ended.closed, None, "{ended:?}");
+    assert_eq!(
+        ended.frames[0], r#"{"type":"response.interrupt.accepted","response_id":"resp_fixture_1"}"#,
+        "the local acknowledgement"
+    );
+    assert_eq!(ended.frames.len(), 2, "{ended:?}");
+    let incomplete: serde_json::Value = serde_json::from_str(&ended.frames[1]).unwrap();
+    let item: serde_json::Value = serde_json::from_str(&delivered[1]).unwrap();
+    assert_eq!(
+        incomplete,
+        serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_fixture_1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "interrupted"},
+                "output": [item["item"]],
+            },
+        }),
+        "an interrupted end with the delivered items only, and no usage"
+    );
+    tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("the proxy cancels the upstream request");
+    let untagged = cpa_common::codex_body::CodexBody::parse(create.as_bytes())
+        .unwrap()
+        .without_member("type");
+    assert_eq!(
+        *bodies.lock().unwrap(),
+        [String::from_utf8(untagged).unwrap()],
+        "one upstream request: the create, without its tag"
+    );
+    assert!(proxy.upstream.sockets().is_empty(), "no upstream socket");
+}
+
+/// Waits until upstream socket `socket` read `count` client frames: the barrier on what
+/// upstream actually received, not a quiet period.
+async fn upstream_read(proxy: &Proxy, socket: usize, count: usize) {
+    let started = std::time::Instant::now();
+    while proxy.upstream.sockets()[socket].frames.len() < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "upstream read {} of {count} frames",
+            proxy.upstream.sockets()[socket].frames.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// #24: a `codex.response-steering` connection keeps at most 64 steers in flight, a local
+/// resource ceiling (`docs/codex/CONTRACT.md` "Socket and account ownership"). Through
+/// the public router, an upstream that reads every steer and acknowledges none receives
+/// exactly 64, each as the client sent it, while the test waits for each read. The 65th
+/// ends the client connection and never goes upstream. The end is request-scoped: the
+/// credential is not cooled, so the next connection's create is served by it on a fresh
+/// socket, and no steer is replayed there.
+#[tokio::test]
+async fn steering_stops_forwarding_steers_at_the_ceiling() {
+    const CEILING: usize = 64;
+    let created = r#"{"type":"response.created","response":{"id":"resp_fixture_1"}}"#;
+    let mut ws = vec![vec![Bytes::from_static(created.as_bytes())]];
+    ws.extend((0..CEILING).map(|_| Vec::new()));
+    ws.push(fixture("sse-completed").frames());
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws,
+            ..Script::default()
+        },
+        STEERING,
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [created]);
+    let steer = |n: usize| {
+        format!(r#"{{"type":"response.steer","previous_response_id":"resp_fixture_1","input":"{n}","future":1.50}}"#)
+    };
+    let mut want = vec![first.clone()];
+    for n in 0..CEILING {
+        socket.send(Message::text(steer(n))).await.unwrap();
+        want.push(steer(n));
+        upstream_read(&proxy, 0, want.len()).await;
+    }
+    socket.send(Message::text(steer(CEILING))).await.unwrap();
+    let ended = tokio::select! {
+        ended = read(&mut socket, &[]) => ended,
+        () = upstream_read(&proxy, 0, want.len() + 1) => panic!("the 65th steer went upstream"),
+    };
+    assert!(ended.frames.is_empty(), "no event after the ceiling: {ended:?}");
+    assert!(ended.closed.is_some(), "the connection ends: {ended:?}");
+    assert_eq!(
+        upstream_frames(&proxy, 0),
+        want,
+        "the create and 64 steers as sent; the 65th never went upstream"
+    );
+
+    let mut again = connect(&proxy).await;
+    again.send(Message::text(first.clone())).await.unwrap();
+    let served = read(&mut again, &TERMINAL).await;
+    assert_eq!(served.frames, events("sse-completed"), "the credential still serves");
+    assert_eq!(proxy.upstream.sockets().len(), 2, "one fresh socket");
+    assert_eq!(upstream_frames(&proxy, 1), [first], "nothing replayed on it");
+}
