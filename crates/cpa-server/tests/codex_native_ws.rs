@@ -4361,7 +4361,16 @@ async fn nested_positional_failed_errors_classify_as_their_object_form() {
                         serde_json::from_str::<serde_json::Value>(&body).ok(),
                     )
                 };
-                assert_eq!(fail(&got), fail(&want), "{case}: {got:?} {want:?}");
+                // The record keeps no spelling of the sent token (#25, AGENTS.md): written
+                // as sent it becomes `[REDACTED]` in place, so the body still says what the
+                // object form's says; escaped, the body keeps only its length.
+                if event.contains(r"at-\u0046AKE") {
+                    let body = got.records[0]["fail"]["body"].as_str().unwrap_or_default();
+                    assert_eq!(fail(&got).0, fail(&want).0, "{case}");
+                    assert!(body.starts_with("[REDACTED: "), "{case}: {body}");
+                } else {
+                    assert_eq!(fail(&got), fail(&want), "{case}: {got:?} {want:?}");
+                }
                 assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
             }
             let short =
