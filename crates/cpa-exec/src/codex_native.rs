@@ -25,8 +25,9 @@
 //! byte. One exception stays (`docs/DIFFERENCES-FROM-GO.md`): a Codex client gets the
 //! backend's status-less context-window `error` event as `response.failed` (#5). Every
 //! `response.incomplete` is the provider's terminal event, whatever its reason, output or
-//! usage, before or after delivery (#25): the pinned client reads it as a terminal,
-//! non-retryable `ResponseIncomplete` (`codex-api/src/sse/responses.rs:451-506`).
+//! usage, before or after delivery (#25). The pinned client classifies its reason as an
+//! interrupted end, a content-filter error or a terminal `ResponseIncomplete`
+//! (`codex-api/src/sse/responses.rs:451-506`).
 
 use std::borrow::Cow;
 use std::collections::VecDeque;

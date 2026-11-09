@@ -1095,8 +1095,8 @@ impl Turn {
         let kind = kind.str().to_owned();
         // Every `response.incomplete` is the provider's terminal event, whatever its
         // reason, output or usage, and whether or not anything reached the client yet:
-        // first-party Codex reads it as a terminal, non-retryable `ResponseIncomplete`
-        // with its reason, ID, usage and partial output (`sse/responses.rs:451-506` at
+        // first-party Codex classifies its reason as an interrupted end, a content-filter
+        // error or a terminal `ResponseIncomplete` (`sse/responses.rs:451-506` at
         // 44ccf394573c). It is delivered as sent (#25).
         let bufferable = response::bufferable(payload);
         let terminal = matches!(
