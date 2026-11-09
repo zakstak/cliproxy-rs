@@ -243,6 +243,9 @@ impl std::fmt::Display for InterruptError {
 }
 
 pub(crate) struct Upstream {
+    /// This socket among the session's sockets ([`Session::begin_socket`]): its loss is
+    /// its own, never a later socket's.
+    pub(crate) id: u64,
     pub(crate) target: Target,
     pub(crate) sink: tokio::sync::Mutex<SplitSink<WebSocket, Message>>,
     pub(crate) link: Mutex<Link>,
@@ -281,14 +284,17 @@ impl UpgradeModel {
 }
 
 impl Upstream {
-    /// A socket for `target`, not yet published to a session and without a reader.
+    /// A socket for `target`, not yet published to a session and without a reader. `id`
+    /// comes from [`Session::begin_socket`].
     pub(crate) fn new(
         target: Target,
         sink: SplitSink<WebSocket, Message>,
         write: WriteLimit,
         secrets: cpa_core::exec::SentCredentials,
+        id: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
+            id,
             secrets,
             target,
             write,
@@ -495,8 +501,11 @@ pub(crate) struct Session {
     /// Serialises turns (`reqMu`).
     pub(crate) turn: Arc<tokio::sync::Mutex<()>>,
     pub(crate) conn: Mutex<Option<Arc<Upstream>>>,
-    /// Set once when the session's socket is lost (`notifyUpstreamDisconnect`).
-    closed: watch::Sender<Option<ExecError>>,
+    /// The session's latest socket and why it was lost, if it was
+    /// (`notifyUpstreamDisconnect`, with Go's per-connection `upstreamDisconnectErr`).
+    closed: watch::Sender<SocketLoss>,
+    /// Counts the sockets dialed for the session ([`Session::begin_socket`]).
+    sockets: std::sync::atomic::AtomicU64,
     /// The downstream connection's client frames when response steering is configured.
     steering: Mutex<Option<Arc<SteeringInput>>>,
     /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
@@ -504,7 +513,25 @@ pub(crate) struct Session {
     credential: Mutex<String>,
 }
 
+/// The session's latest socket ([`Upstream::id`]) and its loss. A loss belongs to one
+/// socket: a new dial supersedes the previous socket's loss, and a socket that is no
+/// longer the latest cannot report one. So a replacement starts without a loss, and a
+/// late notice from a replaced socket's reader cannot become the replacement's.
+#[derive(Clone, Default)]
+pub(crate) struct SocketLoss {
+    socket: u64,
+    lost: Option<ExecError>,
+}
+
 impl Session {
+    /// A socket is about to be dialed for the session: its id, now the latest. The loss
+    /// of the socket it replaces is superseded (Go `resetUpstreamDisconnectError`).
+    pub(crate) fn begin_socket(&self) -> u64 {
+        let id = self.sockets.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.closed.send_replace(SocketLoss { socket: id, lost: None });
+        id
+    }
+
     /// Makes `conn` the session's socket.
     pub(crate) fn publish(&self, conn: Arc<Upstream>) {
         let mut slot = self.conn.lock().expect("session conn");
@@ -534,19 +561,20 @@ impl Session {
         }
         if notify {
             // The loss reaches the downstream handler, which can render it.
-            self.notify(&conn.secrets.guarded(error.clone()));
+            self.notify(conn.id, &conn.secrets.guarded(error.clone()));
         }
         conn.shutdown();
     }
 
-    /// `notifyUpstreamDisconnect`: the first loss is the one reported.
-    fn notify(&self, error: &ExecError) {
-        self.closed.send_if_modified(|slot| {
-            let first = slot.is_none();
-            if first {
-                *slot = Some(error.clone());
+    /// `notifyUpstreamDisconnect`: socket `socket` was lost. Only the latest socket's first
+    /// loss is reported (Go `setUpstreamDisconnectError`); a replaced socket's is not.
+    fn notify(&self, socket: u64, error: &ExecError) {
+        self.closed.send_if_modified(|state| {
+            let report = state.socket == socket && state.lost.is_none();
+            if report {
+                state.lost = Some(error.clone());
             }
-            first
+            report
         });
     }
 }
@@ -606,7 +634,8 @@ impl Pool {
                 Arc::new(Session {
                     turn: Arc::default(),
                     conn: Mutex::default(),
-                    closed: watch::channel(None).0,
+                    closed: watch::channel(SocketLoss::default()).0,
+                    sockets: Default::default(),
                     steering: Mutex::default(),
                     credential: Mutex::default(),
                 })
@@ -670,12 +699,6 @@ impl Pool {
                 conn.shutdown();
             }
         }
-    }
-
-    /// The error that lost the session's upstream socket, if it was lost.
-    pub fn loss(&self, id: &str) -> Option<ExecError> {
-        let session = self.get(id)?;
-        session.closed.borrow().clone()
     }
 
     /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
@@ -774,24 +797,56 @@ impl Pool {
         }
     }
 
-    /// Resolves with the error that lost the session's upstream socket.
-    pub fn closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let mut rx = self.session(id).closed.subscribe();
-        async move {
-            loop {
-                if let Some(error) = rx.borrow_and_update().clone() {
-                    return error;
-                }
-                if rx.changed().await.is_err() {
-                    return std::future::pending().await;
-                }
-            }
+    /// The losses of the session's sockets, for its downstream handler.
+    pub fn losses(&self, id: &str) -> SessionLosses {
+        SessionLosses {
+            rx: self.session(id).closed.subscribe(),
+            taken: Default::default(),
         }
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.sessions.lock().expect("sessions").len()
+    }
+}
+
+/// The losses of one session's upstream sockets, as its downstream handler takes them
+/// (#25 R3). Each socket's loss is taken at most once: one the handler let pass, while a
+/// turn failed over to another socket, never fires again, and the replacement's own loss
+/// still does. Clones share what was taken.
+#[derive(Clone)]
+pub struct SessionLosses {
+    rx: watch::Receiver<SocketLoss>,
+    /// The socket whose loss was taken (0: none; socket ids start at 1).
+    taken: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SessionLosses {
+    /// The latest socket's loss, unless it was taken.
+    pub fn pending(&self) -> Option<ExecError> {
+        let state = self.rx.borrow();
+        let taken = self.taken.load(std::sync::atomic::Ordering::Acquire);
+        state.lost.clone().filter(|_| state.socket != taken)
+    }
+
+    /// Resolves with the next socket loss not taken yet, and takes it. Cancel safe: a
+    /// loss is taken only as it is returned.
+    pub async fn next(&mut self) -> ExecError {
+        loop {
+            {
+                let state = self.rx.borrow_and_update();
+                if let Some(error) = &state.lost
+                    && state.socket != self.taken.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.taken.store(state.socket, std::sync::atomic::Ordering::Release);
+                    return error.clone();
+                }
+            }
+            if self.rx.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
     }
 }
 
@@ -1236,7 +1291,7 @@ impl Turn {
             link.deferred.take()
         };
         if let Some(error) = deferred {
-            self.session.notify(&error);
+            self.session.notify(self.conn.id, &error);
         }
     }
 
@@ -1249,10 +1304,10 @@ impl Turn {
         crate::codex_event::context_window_event(payload).map(|e| Bytes::from(e.into_owned()))
     }
 
-    /// The raw error that lost the session's socket, as the reader recorded it (the
-    /// duplex wraps gorilla's close error unmapped).
+    /// The raw error that lost this turn's socket, as its reader recorded it (the duplex
+    /// wraps gorilla's close error unmapped). Never another socket's loss.
     fn loss(&self) -> Option<ExecError> {
-        self.session.closed.borrow().clone()
+        self.conn.link.lock().expect("link").lost.clone()
     }
 }
 
@@ -1748,10 +1803,13 @@ impl CodexExecutor {
             drop(slot);
             current.shutdown();
         }
+        // The socket this dial makes supersedes any earlier one's loss, also when the
+        // dial itself fails.
+        let socket_id = session.begin_socket();
         let (socket, handshake) = self.dial(target, headers, model, model_level_cooling, wire).await?;
         let (sink, stream) = socket.split();
         let secrets = crate::codex_secret::from_request(headers, &target.url);
-        let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets);
+        let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets, socket_id);
         if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
             let _ = conn.upgrade_model.set(upgrade);
         }

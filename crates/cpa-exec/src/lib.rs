@@ -119,6 +119,31 @@ pub struct Executors {
 /// credentials never enter selection.
 pub const PROVIDERS: [&str; 4] = ["claude", "codex", meta::PROVIDER, xai::PROVIDER];
 
+/// The losses of the upstream sockets the executors hold for one downstream session
+/// ([`Executors::session_losses`]). Each socket's loss is taken once: a loss the handler
+/// let pass while a turn moved to another socket never fires again, and the new socket's
+/// own loss still does.
+pub struct SessionLosses {
+    codex: codex::SessionLosses,
+    xai: codex::SessionLosses,
+}
+
+impl SessionLosses {
+    /// Resolves with the next socket loss not taken yet, and takes it; pending while no
+    /// socket is lost. Cancel safe.
+    pub async fn next(&mut self) -> ExecError {
+        tokio::select! {
+            error = self.codex.next() => error,
+            error = self.xai.next() => error,
+        }
+    }
+
+    /// The Codex session's losses, sharing what this subscription took.
+    pub fn codex(&self) -> &codex::SessionLosses {
+        &self.codex
+    }
+}
+
 impl Executors {
     pub async fn execute(
         &self,
@@ -211,16 +236,11 @@ impl Executors {
         }
     }
 
-    /// Resolves when an upstream socket held for session `id` is lost; pending forever
-    /// when no executor holds one.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let codex = self.codex.session_closed(id);
-        let xai = self.xai.session_closed(id);
-        async move {
-            tokio::select! {
-                error = codex => error,
-                error = xai => error,
-            }
+    /// The losses of the upstream sockets the executors hold for session `id`.
+    pub fn session_losses(&self, id: &str) -> SessionLosses {
+        SessionLosses {
+            codex: self.codex.session_losses(id),
+            xai: self.xai.session_losses(id),
         }
     }
 

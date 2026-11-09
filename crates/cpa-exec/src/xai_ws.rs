@@ -122,9 +122,9 @@ impl Ws {
         }
     }
 
-    /// `UpstreamDisconnectChan`.
-    pub(crate) fn closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.pool.closed(id.trim())
+    /// `UpstreamDisconnectChan`, one loss per socket ([`codex_ws::SessionLosses`]).
+    pub(crate) fn losses(&self, id: &str) -> codex_ws::SessionLosses {
+        self.pool.losses(id.trim())
     }
 }
 
@@ -1092,8 +1092,9 @@ impl XaiExecutor {
         websockets_enabled(credential)
     }
 
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.ws.closed(id)
+    /// The losses of the session's upstream sockets, each taken once.
+    pub fn session_losses(&self, id: &str) -> crate::codex_ws::SessionLosses {
+        self.ws.losses(id)
     }
 
     pub fn close_session(&self, id: &str) {
@@ -1306,6 +1307,8 @@ impl XaiExecutor {
             current.shutdown();
         }
         let client = self.clients.for_credential(credential, cfg);
+        // The new socket supersedes any earlier one's loss, as for Codex.
+        let socket_id = session.begin_socket();
         let (socket, handshake) = dial(&client, target, headers, capture, retry).await?;
         let (sink, stream) = socket.split();
         let conn = Upstream::new(
@@ -1314,6 +1317,7 @@ impl XaiExecutor {
             self.ws.pool.write,
             // xAI keeps its own delivery rules; the guard covers the native Codex routes.
             cpa_core::exec::SentCredentials::default(),
+            socket_id,
         );
         // Publish before the reader runs, as the Codex executor does.
         let mut reader = conn.reader.lock().expect("reader handle");

@@ -6116,3 +6116,283 @@ async fn an_initial_account_failure_fails_over_while_its_socket_loss_is_reported
         }
     }
 }
+
+/// #25 R3: each upstream socket owns its loss. On an ordinary socket the turn fails over
+/// from the accounts that reject it (none, a safe 429 with a subscription reset, a 401,
+/// or a 401 then that 429) to the next one, whose handshake waits until the rejected
+/// socket's loss was reported. The serving socket completes a response; then, idle after
+/// a `previous_response_id` continuation completed, or active after the next response's
+/// `response.created` and a real delta, it closes 1011 with its own bearer in the reason.
+/// The client is closed promptly in both cases: the rejected socket's loss, which the
+/// turn let pass while failing over, does not hide the serving socket's. An active loss
+/// carries the serving socket's credential, so it is Confidential: the client gets no
+/// subscription-limit event (not the rejected account's either) and no frame after the
+/// delta. Dials go to each account in order; the records are each rejection, the
+/// completed responses with 4/1/5 tokens, and for an active loss a failed record
+/// without tokens. No bearer reaches the client.
+#[tokio::test]
+async fn a_replacement_socket_owns_its_loss_after_failover() {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    use std::sync::Mutex;
+    const TOKENS: [&str; 3] = [SELECTED, SECOND, "at-THIRD"];
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"real"}}"#;
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"real","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const NEXT_CREATED: &str = r#"{"type":"response.created","response":{"id":"next"}}"#;
+    const NEXT_DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"next","delta":"visible"}"#;
+    const NEXT_DONE: &str = r#"{"type":"response.completed","response":{"id":"next","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const LIMITED: &str = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000}}"#;
+    const UNAUTHORIZED: &str =
+        r#"{"type":"error","status":401,"error":{"code":"invalid_api_key","message":"safe-account-rejection"}}"#;
+    let continuation = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"real","input":[]}"#;
+    let sequences: [&[(&str, i64)]; 4] = [
+        &[],
+        &[(LIMITED, 429)],
+        &[(UNAUTHORIZED, 401)],
+        &[(UNAUTHORIZED, 401), (LIMITED, 429)],
+    ];
+    for buffering in [false, true] {
+        for rejections in sequences {
+            for active in [false, true] {
+                let case = format!(
+                    "buffering={buffering} rejections={:?} active={active}",
+                    rejections.iter().map(|(_, s)| s).collect::<Vec<_>>()
+                );
+                let serving = rejections.len();
+                let auths = Arc::new(Mutex::new(Vec::<String>::new()));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let app = {
+                    let (auths, release) = (auths.clone(), release.clone());
+                    let rejected: Vec<String> = rejections.iter().map(|(f, _)| f.to_string()).collect();
+                    axum::Router::new().route(
+                        "/responses",
+                        axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                            let (auths, release, rejected) = (auths.clone(), release.clone(), rejected.clone());
+                            async move {
+                                let authorization = headers["authorization"].to_str().unwrap().to_owned();
+                                auths.lock().unwrap().push(authorization.clone());
+                                let account = TOKENS
+                                    .iter()
+                                    .position(|t| authorization == format!("Bearer {t}"))
+                                    .unwrap();
+                                if account > 0 && account == rejected.len() {
+                                    // The rejected socket's loss is reported meanwhile.
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                }
+                                upgrade.on_upgrade(move |mut socket| async move {
+                                    let _ = socket.recv().await;
+                                    if let Some(rejection) = rejected.get(account) {
+                                        let _ = socket.send(Upstream::Text(rejection.clone().into())).await;
+                                        while let Some(Ok(_)) = socket.recv().await {}
+                                        return;
+                                    }
+                                    for frame in [CREATED, DONE] {
+                                        let _ = socket.send(Upstream::Text(frame.into())).await;
+                                    }
+                                    let _ = socket.recv().await;
+                                    let next = if active { NEXT_DELTA } else { NEXT_DONE };
+                                    for frame in [NEXT_CREATED, next] {
+                                        let _ = socket.send(Upstream::Text(frame.into())).await;
+                                    }
+                                    release.acquire().await.unwrap().forget();
+                                    let reason = format!("lost Bearer {}", TOKENS[account]);
+                                    let _ = socket
+                                        .send(Upstream::Close(Some(CloseFrame {
+                                            code: 1011,
+                                            reason: reason.into(),
+                                        })))
+                                        .await;
+                                    while let Some(Ok(_)) = socket.recv().await {}
+                                })
+                            }
+                        }),
+                    )
+                };
+                let upstream = format!("http://{}", serve(app).await);
+                let config = if buffering {
+                    "codex:\n  stream-bootstrap-buffering: true\n"
+                } else {
+                    ""
+                };
+                let proxy = proxy_with(Script::default(), config, |_| {
+                    TOKENS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, token)| {
+                            let mut c = credential(Profile::Chatgpt, &upstream, true);
+                            if i > 0 {
+                                c.id = format!("codex-{i}.json");
+                                c.metadata.insert("access_token".into(), serde_json::json!(token));
+                            }
+                            c.attributes.insert("priority".into(), (9 - i).to_string());
+                            c
+                        })
+                        .collect()
+                })
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                let first = read(&mut socket, &TERMINAL).await;
+                assert_eq!(
+                    (first.frames, first.closed),
+                    (vec![CREATED.to_owned(), DONE.to_owned()], None),
+                    "{case}"
+                );
+                socket.send(Message::text(continuation)).await.unwrap();
+                let until: &[&str] = if active {
+                    &["response.output_text.delta"]
+                } else {
+                    &TERMINAL
+                };
+                let next = read(&mut socket, until).await;
+                let expected = if active { NEXT_DELTA } else { NEXT_DONE };
+                assert_eq!(next.frames, [NEXT_CREATED, expected], "{case}");
+                release.add_permits(1);
+                let end = tokio::time::timeout(Duration::from_secs(2), read(&mut socket, &[]))
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the serving socket's loss did not close the client"));
+                assert!(end.closed.is_some(), "{case}: {end:?}");
+                assert!(
+                    end.frames.is_empty(),
+                    "{case}: no event after the loss, not the rejected account's limit: {end:?}"
+                );
+                let records = records(&proxy, serving + 2).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(
+                    proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                    "{case}: no other record"
+                );
+                let auths = auths.lock().unwrap().clone();
+                let dialed: Vec<String> = TOKENS[..=serving].iter().map(|t| format!("Bearer {t}")).collect();
+                assert_eq!(auths, dialed, "{case}: one dial per account, in order");
+                for (record, (_, status)) in records.iter().zip(rejections.iter()) {
+                    assert_eq!(record["failed"], true, "{case}: {record}");
+                    assert_eq!(record["fail"]["status_code"], *status, "{case}");
+                    assert_eq!(tokens(record), [0, 0, 0], "{case}");
+                }
+                let served = &records[serving..];
+                assert_eq!(served[0]["failed"], false, "{case}: {served:?}");
+                assert_eq!(tokens(&served[0]), [4, 1, 5], "{case}");
+                if active {
+                    assert_eq!(served[1]["failed"], true, "{case}: {served:?}");
+                    assert_eq!(tokens(&served[1]), [0, 0, 0], "{case}");
+                } else {
+                    assert_eq!(served[1]["failed"], false, "{case}: {served:?}");
+                    assert_eq!(tokens(&served[1]), [4, 1, 5], "{case}");
+                }
+                let seen = format!("{:?}{:?}{:?}", next.frames, end, records);
+                for token in TOKENS {
+                    assert!(!seen.contains(&format!("Bearer {token}")), "{case}: {seen}");
+                }
+                for record in served {
+                    assert!(!carries_token(&record.to_string(), TOKENS[serving]), "{case}: {record}");
+                }
+            }
+        }
+    }
+}
+
+/// #25 R3: a failover that ends without a serving socket renders its own last failure.
+/// The first account answers a safe 429 with a subscription reset and loses its socket.
+/// When a second account is available, its handshake is refused (400): the turn ends with
+/// that refusal, and the client never gets the first account's limit event, whose socket
+/// no longer serves the session. With the first account alone, its limit is the turn's
+/// own last failure, and the client gets that event. Records: the 429, then the 400.
+#[tokio::test]
+async fn a_failover_that_ends_without_a_socket_renders_its_last_failure() {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
+    const LIMITED: &str = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000}}"#;
+    for buffering in [false, true] {
+        for second in [true, false] {
+            let case = format!("buffering={buffering} second account={second}");
+            let auths = Arc::new(Mutex::new(Vec::<String>::new()));
+            let app = {
+                let auths = auths.clone();
+                axum::Router::new().route(
+                    "/responses",
+                    axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                        let auths = auths.clone();
+                        async move {
+                            let authorization = headers["authorization"].to_str().unwrap().to_owned();
+                            auths.lock().unwrap().push(authorization.clone());
+                            if authorization != format!("Bearer {SELECTED}") {
+                                // The first socket's loss is reported meanwhile.
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                return (axum::http::StatusCode::BAD_REQUEST, "safe-second-rejection").into_response();
+                            }
+                            upgrade.on_upgrade(|mut socket| async move {
+                                let _ = socket.recv().await;
+                                let _ = socket.send(Upstream::Text(LIMITED.into())).await;
+                                while let Some(Ok(_)) = socket.recv().await {}
+                            })
+                        }
+                    }),
+                )
+            };
+            let upstream = format!("http://{}", serve(app).await);
+            let config = if buffering {
+                "codex:\n  stream-bootstrap-buffering: true\n"
+            } else {
+                ""
+            };
+            let proxy = proxy_with(Script::default(), config, |_| {
+                let mut accounts = vec![credential(Profile::Chatgpt, &upstream, true)];
+                accounts[0].attributes.insert("priority".into(), "9".into());
+                if second {
+                    let mut c = credential(Profile::Chatgpt, &upstream, true);
+                    c.id = "codex-1.json".into();
+                    c.metadata.insert("access_token".into(), serde_json::json!(SECOND));
+                    c.attributes.insert("priority".into(), "8".into());
+                    accounts.push(c);
+                }
+                accounts
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &[]).await;
+            assert!(got.closed.is_some(), "{case}: {got:?}");
+            let records = records(&proxy, if second { 2 } else { 1 }).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no other record"
+            );
+            let auths = auths.lock().unwrap().clone();
+            assert_eq!(auths.len(), if second { 2 } else { 1 }, "{case}: {auths:?}");
+            assert_eq!(records[0]["fail"]["status_code"], 429, "{case}");
+            let limited = got.frames.iter().any(|f| f.contains("usage_limit_reached"));
+            if second {
+                assert_eq!(records[1]["failed"], true, "{case}");
+                assert_eq!(records[1]["fail"]["status_code"], 400, "{case}");
+                assert!(
+                    !limited,
+                    "{case}: the first account's limit is not the turn's failure: {got:?}"
+                );
+            } else {
+                assert!(
+                    limited && got.frames.iter().any(|f| f.contains("2000000000")),
+                    "{case}: the account's own limit: {got:?}"
+                );
+            }
+            for record in &records {
+                assert_eq!(tokens(record), [0, 0, 0], "{case}");
+            }
+        }
+    }
+}

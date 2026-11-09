@@ -580,7 +580,10 @@ and the continuation never moves to another socket or account. When the upstream
 is lost, the client connection closes, and the client recovers on its own. A loss reported
 while the turn's request has not been served yet is the loss of a socket its own attempt
 already failed on: it does not close the connection, and the turn fails over to another
-credential or delivers that failure itself. On a new
+credential or delivers that failure itself. Each socket's loss is its own. The loss of the
+socket that then serves closes the connection like any other, idle or during a response,
+and a failure on that socket renders its own error, never the loss let pass during
+failover. A replaced socket's late loss reports nothing. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:

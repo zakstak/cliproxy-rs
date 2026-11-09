@@ -612,9 +612,11 @@ async fn bootstrap_overload_fails_over_without_disconnect_notice() {
         .err()
         .expect("overload fails the attempt");
     assert_ne!(error.scope, FailureScope::Request, "another credential may serve it");
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), closed).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(200), closed.next())
+            .await
+            .is_err(),
         "overload must not close the downstream session"
     );
 }
@@ -626,7 +628,7 @@ async fn bootstrap_overload_fails_over_without_disconnect_notice() {
 async fn close_1009_is_a_request_scoped_413_and_notifies() {
     let (_up, url) = upstream(vec![Act::SendClose(vec![CREATED], 1009)]).await;
     let executor = CodexExecutor::new().unwrap();
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     let response = executor
         .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
         .await
@@ -638,7 +640,7 @@ async fn close_1009_is_a_request_scoped_413_and_notifies() {
         String::from_utf8_lossy(&error.body),
         r#"{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}"#
     );
-    let notified = tokio::time::timeout(Duration::from_secs(2), closed)
+    let notified = tokio::time::timeout(Duration::from_secs(2), closed.next())
         .await
         .expect("session notified");
     assert_eq!(notified.status, 413);
@@ -646,7 +648,10 @@ async fn close_1009_is_a_request_scoped_413_and_notifies() {
         crate::rawjson::get(&String::from_utf8_lossy(&notified.body), "error.message").str(),
         "bye"
     );
-    assert_eq!(executor.session_loss("conn-1").map(|e| e.body), Some(notified.body));
+    assert_eq!(
+        executor.session_losses("conn-1").pending().map(|e| e.body),
+        Some(notified.body)
+    );
 }
 
 /// gorilla/websocket reads a peer that vanishes without a close frame as close 1006,
@@ -965,13 +970,13 @@ async fn close_1009_on_a_full_turn_channel_keeps_the_413() {
     events.extend(std::iter::repeat_n(DELTA, TURN_BUFFER - 1));
     let (_up, url) = upstream(vec![Act::SendClose(events, 1009)]).await;
     let executor = CodexExecutor::new().unwrap();
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     let response = executor
         .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
         .await
         .unwrap();
     // Nothing reads the turn until the reader has filled the channel and seen the close.
-    tokio::time::timeout(Duration::from_secs(5), closed)
+    tokio::time::timeout(Duration::from_secs(5), closed.next())
         .await
         .expect("session notified");
     let events = collect(response).await;
@@ -1604,7 +1609,7 @@ async fn late_interrupts_for_finished_responses() {
             "{terminal}: r1 never reached upstream while r2 ran"
         );
         conn.send("bye".into()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
+        tokio::time::timeout(Duration::from_secs(5), executor.ws.losses("conn-1").next())
             .await
             .unwrap_or_else(|_| panic!("{terminal}: the disconnect was not reported"));
         assert_eq!(
@@ -1641,7 +1646,7 @@ async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() 
             matches!(after, Ok(Some(Read::Failed(_)))),
             "{preserves} {last}: no read error"
         );
-        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.closed("conn-1"))
+        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.losses("conn-1").next())
             .await
             .is_ok();
         assert_eq!(reported, !deferred, "{preserves} {last}: loss reported by the reader");
@@ -1743,9 +1748,9 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
         // reported, not even a close right after the event.
         if codex_client {
             assert!(
-                executor.ws.loss("conn-1").is_none(),
+                executor.ws.losses("conn-1").pending().is_none(),
                 "{name}: a loss was reported: {:?}",
-                executor.ws.loss("conn-1").map(|l| code(&l))
+                executor.ws.losses("conn-1").pending().map(|l| code(&l))
             );
         } else {
             assert_eq!(
@@ -1819,7 +1824,7 @@ async fn an_abandoned_preserving_turn_leaves_no_loss_unreported() {
             "{rejection}: the abandoned turn released its read channel during the observation"
         );
         close.notify_one();
-        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1")).await;
+        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_losses("conn-1").next()).await;
         let deferred = conn.link.lock().expect("link").deferred.is_some();
         observer.release.add_permits(100);
         assert!(
@@ -2641,4 +2646,52 @@ fn pinned_account_kinds_follow_the_slots_each_frame_type_reads() {
         let frame = format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#);
         assert!(!super::pinned_account_kind(&frame), "{frame}");
     }
+}
+
+/// #25 R3: a loss belongs to one socket, and the downstream handler takes each socket's
+/// loss once. A loss it took never fires again, nor counts as pending; a replacement
+/// socket starts without a loss and reports its own; a late notice from a replaced
+/// socket's reader reports nothing; and a dial that starts supersedes the earlier loss
+/// even when that dial fails. A subscription made later still finds the latest
+/// socket's loss.
+#[tokio::test]
+async fn each_socket_reports_its_own_loss_once() {
+    async fn quiet(losses: &mut SessionLosses) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), losses.next())
+            .await
+            .is_err()
+    }
+    let lost = |text: &str| transport(text);
+    let pool = Pool::default();
+    let session = pool.session("s");
+    let mut losses = pool.losses("s");
+    let shadow = losses.clone();
+    let a = session.begin_socket();
+    assert!(shadow.pending().is_none());
+    session.notify(a, &lost("a lost"));
+    assert_eq!(&shadow.pending().unwrap().body[..], b"a lost", "pending until taken");
+    assert_eq!(&losses.next().await.body[..], b"a lost");
+    assert!(shadow.pending().is_none(), "a taken loss is not pending");
+    session.notify(a, &lost("a again"));
+    assert!(quiet(&mut losses).await, "a socket reports one loss");
+    // A replacement socket: a replaced socket's late notice is nobody's loss.
+    let b = session.begin_socket();
+    session.notify(a, &lost("a late"));
+    assert!(quiet(&mut losses).await, "a replaced socket reports nothing");
+    assert!(shadow.pending().is_none());
+    session.notify(b, &lost("b lost"));
+    assert_eq!(&shadow.pending().unwrap().body[..], b"b lost");
+    assert_eq!(&losses.next().await.body[..], b"b lost", "the replacement's loss fires");
+    // A loss nobody took is superseded by the next dial, whether or not it succeeds.
+    let c = session.begin_socket();
+    session.notify(c, &lost("c lost"));
+    let _d = session.begin_socket();
+    assert!(shadow.pending().is_none(), "the dial superseded the earlier loss");
+    assert!(quiet(&mut losses).await);
+    // A new subscription finds the latest socket's loss, taken or not by another one.
+    let e = session.begin_socket();
+    session.notify(e, &lost("e lost"));
+    let mut later = pool.losses("s");
+    assert_eq!(&later.next().await.body[..], b"e lost");
+    assert_eq!(&losses.next().await.body[..], b"e lost");
 }

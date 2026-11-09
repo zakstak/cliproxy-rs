@@ -241,7 +241,7 @@ async fn a_socket_lost_while_waiting_for_the_acknowledgement_ends_the_turn_clean
     interrupt_r1(&executor).await;
     let events = rest_of(stream).await;
     assert_eq!(kinds(&events), ["response.incomplete"], "{events:?}");
-    tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
+    tokio::time::timeout(Duration::from_secs(5), executor.ws.losses("conn-1").next())
         .await
         .expect("the loss was not reported");
 }
@@ -373,7 +373,10 @@ async fn a_zero_token_interrupted_response_is_a_normal_end() {
         crate::rawjson::get(incomplete, "response.incomplete_details.reason").str(),
         "interrupted"
     );
-    assert!(executor.ws.loss("conn-1").is_none(), "the socket was not dropped");
+    assert!(
+        executor.ws.losses("conn-1").pending().is_none(),
+        "the socket was not dropped"
+    );
     follow_up_is_clean(&executor, &url, &up).await;
 }
 
@@ -419,7 +422,10 @@ async fn an_unexplained_zero_output_incomplete_passes_unchanged_at_every_stage()
         let events = rest_of(stream).await;
         assert!(events.iter().all(Result::is_ok), "{case}: no error: {events:?}");
         assert_eq!(texts(&events), first, "{case}: the events as upstream sent them");
-        assert!(executor.ws.loss("conn-1").is_none(), "{case}: the socket was kept");
+        assert!(
+            executor.ws.losses("conn-1").pending().is_none(),
+            "{case}: the socket was kept"
+        );
         follow_up_is_clean(&executor, &url, &up).await;
     }
 }

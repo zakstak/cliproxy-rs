@@ -435,6 +435,10 @@ struct Connection {
     /// belongs to a socket the turn's own attempt already gave up (its failure is the
     /// turn's to fail over or to deliver), and it does not end the turn.
     serving: Arc<AtomicBool>,
+    /// The Codex session's socket losses ([`cpa_exec::codex::SessionLosses`]), sharing
+    /// what the connection's loss watch took: a turn's failure renders only a loss of the
+    /// latest socket that nobody took yet. Set when the connection runs.
+    losses: Option<cpa_exec::codex::SessionLosses>,
     /// The upgrade request's log: upstream capture for every turn and its middleware ID.
     capture: cpa_core::exec::CaptureSink,
     request_id: Option<String>,
@@ -843,6 +847,7 @@ impl Connection {
             duplex: Arc::default(),
             replays: Arc::default(),
             serving: Arc::default(),
+            losses: None,
             capture: Default::default(),
             request_id: None,
             timeline: None,
@@ -882,12 +887,15 @@ impl Connection {
             self.steering = true;
         }
         let (duplex, replays, serving) = (self.duplex.clone(), self.replays.clone(), self.serving.clone());
-        // Fused: a loss ignored during a duplex turn never fires again.
-        let mut lost = Box::pin(self.rt.executors.session_closed(&self.session).fuse());
+        // Each socket's loss fires once. One a duplex or replaying turn owns, or one of a
+        // socket a bootstrapping turn already gave up, is taken and never fires again; a
+        // later socket's loss still does.
+        let mut lost = self.rt.executors.session_losses(&self.session);
+        self.losses = Some(lost.codex().clone());
         loop {
             let frame = tokio::select! {
                 frame = client.next() => frame,
-                error = &mut lost => {
+                error = lost.next() => {
                     close_for_upstream_loss(&mut sink, &error, self.codex_client).await;
                     break;
                 }
@@ -910,7 +918,7 @@ impl Connection {
                 tokio::select! {
                     biased;
                     flow = &mut turn => Ok(flow),
-                    error = &mut lost => {
+                    error = lost.next() => {
                         // A pinned continuation's own 401/429 lost the socket: the turn
                         // sends the replay close (1012), or the final limit, instead.
                         let replay = replays.load(Ordering::Acquire) && matches!(error.status, 401 | 429);
@@ -1249,11 +1257,15 @@ impl Connection {
     /// Go's disconnect notifier closes the client as soon as the session's upstream socket
     /// is lost, ahead of the turn's own error (whose 1009 body is a fixed message rather
     /// than the upstream's close reason). A duplex stream owns its closure instead.
+    ///
+    /// Only the latest socket's loss counts, and only one the connection did not take
+    /// already: a loss let pass while a turn failed over belongs to a socket that serves
+    /// nothing any more, so a later failure renders its own error (#25 R3).
     fn upstream_loss(&self) -> Option<ExecError> {
         if self.duplex.load(Ordering::Acquire) {
             return None;
         }
-        self.rt.executors.codex.session_loss(&self.session)
+        self.losses.as_ref()?.pending()
     }
 
     /// A pinned continuation reached a subscription limit and no other credential can
