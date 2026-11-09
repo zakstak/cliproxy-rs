@@ -2069,3 +2069,85 @@ async fn steering_stops_forwarding_steers_at_the_ceiling() {
     assert_eq!(proxy.upstream.sockets().len(), 2, "one fresh socket");
     assert_eq!(upstream_frames(&proxy, 1), [first], "nothing replayed on it");
 }
+
+/// #25: on a `codex.response-steering` connection, every upstream frame reaches the
+/// client as it arrived, with a steer before and a steer after the first output delta:
+/// private and unknown events with raw number spellings, steer acknowledgements, a
+/// namespaced tool call, an incomplete end with a reason the proxy does not know, an
+/// automatic successor whose completion has no usage, an explicit create whose usage
+/// is reported as zero, and an incomplete end with zero output and no reason, which no
+/// steering connection answers locally (docs/codex/CONTRACT.md "Permitted
+/// transformations"). Nothing is renamed, repaired, filled in or replaced, the client's
+/// frames reach the one upstream socket as sent, and the connection stays open. Each
+/// batch ends with an event the proxy does not model, so the client has every event of
+/// the batch before the next frame goes out.
+#[tokio::test]
+async fn steering_responses_pass_unchanged_before_and_after_the_first_delta() {
+    const CREATED_1: &str =
+        r#"{"type":"response.created","response":{"id":"resp_st_1","status":"in_progress","output":[]}}"#;
+    const RATE_LIMITS: &str =
+        r#"{"type":"codex.rate_limits","primary":{"used_percent":1.50,"window_minutes":300},"secondary":null}"#;
+    const BARRIER_1: &str = r#"{"type":"test.delivery_barrier","n":1}"#;
+    const STEER_1: &str = r#"{"type":"response.steer","previous_response_id":"resp_st_1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"before the first delta"}]}],"future":{"n":1e3}}"#;
+    const ACCEPTED_1: &str = r#"{"type":"response.steer.accepted","steer":{"id":"steer_st_1","previous_response_id":"resp_st_1"},"sequence_number":4}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","item_id":"msg_st_1","output_index":0,"content_index":0,"delta":"Hel"}"#;
+    const BARRIER_2: &str = r#"{"type":"test.delivery_barrier","n":2,"x":-0.0}"#;
+    const STEER_2: &str =
+        r#"{"type":"response.steer","previous_response_id":"resp_st_1","input":"after the first delta"}"#;
+    const ACCEPTED_2: &str =
+        r#"{"type":"response.steer.accepted","steer":{"id":"steer_st_2","previous_response_id":"resp_st_1"}}"#;
+    const CALL: &str = r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_st_1","status":"completed","name":"spawn_agent","namespace":"collaboration","arguments":"{}","call_id":"call_st_1"}}"#;
+    const ENDED_1: &str = r#"{"type":"response.incomplete","response":{"id":"resp_st_1","status":"incomplete","incomplete_details":{"reason":"future_reason"},"output":[]}}"#;
+    const CREATED_2: &str =
+        r#"{"type":"response.created","response":{"id":"resp_st_2","status":"in_progress","output":[]}}"#;
+    const DONE_2: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_st_2","status":"completed","output":[]}}"#;
+    const BARRIER_3: &str = r#"{"type":"test.delivery_barrier","n":3}"#;
+    const CREATED_3: &str =
+        r#"{"type":"response.created","response":{"id":"resp_st_3","status":"in_progress","output":[]}}"#;
+    const DONE_3: &str = r#"{"type":"response.completed","response":{"id":"resp_st_3","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"total_tokens":0}}}"#;
+    const CREATED_4: &str =
+        r#"{"type":"response.created","response":{"id":"resp_st_4","status":"in_progress","output":[]}}"#;
+    const EMPTY_4: &str = r#"{"type":"response.incomplete","response":{"id":"resp_st_4","status":"incomplete","output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}"#;
+    let batch = |frames: &[&'static str]| frames.iter().map(|f| Bytes::from_static(f.as_bytes())).collect();
+    let batches: [&[&'static str]; 5] = [
+        &[CREATED_1, RATE_LIMITS, BARRIER_1],
+        &[ACCEPTED_1, DELTA, BARRIER_2],
+        &[ACCEPTED_2, CALL, ENDED_1, CREATED_2, DONE_2, BARRIER_3],
+        &[CREATED_3, DONE_3],
+        &[CREATED_4, EMPTY_4],
+    ];
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: batches.iter().map(|b| batch(b)).collect(),
+            ..Script::default()
+        },
+        STEERING,
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    let sent = [
+        client_frame("ws-create-first", "gpt-5.5"),
+        STEER_1.to_owned(),
+        STEER_2.to_owned(),
+        client_frame("ws-create-continuation", "gpt-5.5"),
+        client_frame("ws-create-first", "gpt-5.5"),
+    ];
+    let until: [&[&str]; 5] = [
+        &["test.delivery_barrier"],
+        &["test.delivery_barrier"],
+        &["test.delivery_barrier"],
+        &TERMINAL,
+        &TERMINAL,
+    ];
+    for ((frame, want), until) in sent.iter().zip(batches).zip(until) {
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        let got = read(&mut socket, until).await;
+        assert_eq!(got.frames, want, "after {frame}: as upstream sent them");
+        assert_eq!(got.closed, None, "after {frame}");
+    }
+    assert_eq!(proxy.upstream.sockets().len(), 1, "one upstream socket");
+    assert_eq!(upstream_frames(&proxy, 0), sent, "the client's frames, byte for byte");
+    assert!(proxy.upstream.http().is_empty(), "no HTTP request");
+}

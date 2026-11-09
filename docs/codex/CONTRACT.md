@@ -144,7 +144,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
-| Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
+| Answer an empty `response.incomplete` (no output item, no output delta, `usage.output_tokens` written as `0`) whose reason is missing or is not `interrupted`, `content_filter` or `max_output_tokens`, while nothing of that request was delivered, with a request-scoped 502. Leading events held under `stream-bootstrap-buffering` are dropped with it. Once any upstream event was delivered, the event passes unchanged | Native HTTP streaming and buffered answers, ordinary native WebSocket turns and WebSocket turns over HTTP, on every profile. Never on a `codex.response-steering` connection | Failure classification of an upstream silent abort: proxy policy inherited from Go (`IsCodexTerminalEmptyIncomplete`), whose comment calls it a ChatGPT Codex silent abort. No first-party or provider source confirms that the backend sends this shape as an abort. The pinned client reads the event itself as a terminal, non-retryable `ResponseIncomplete` with its reason (`unknown` when missing), response ID and usage (`sse/responses.rs:451-506`; `protocol/src/error.rs` `retry_delay`). So the proxy replaces the event only while it still owns the whole answer, and never replaces a response that the client has seen start. Reasons `interrupted`, `content_filter` and `max_output_tokens` always pass unchanged. |
 | Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
@@ -549,8 +549,12 @@ receives (`ExecError::delivered_event`).
   official Codex client (#6), or else a silent close. The scheduler still receives the
   classification, so the credential cools as before.
 - Two exceptions stay. A Codex client gets the status-less context-window `error` as
-  `response.failed` (#5). An empty `response.incomplete` before any content is a
-  request-scoped 502 (#7).
+  `response.failed` (#5). An empty `response.incomplete` that arrives before anything
+  of the turn was delivered is a request-scoped 502 (#7), and leading events held for
+  bootstrap go with it. Once an event reached the client, `response.created` included,
+  the empty `response.incomplete` reaches the client as sent and the socket stays. A
+  steering connection never replaces it. The
+  [permitted transformation](#permitted-transformations) defines its scope.
 - The interrupt regressions stay. An interrupt acknowledgement that arrives after the
   terminal event is still delivered. A late interrupt does not poison the next turn. An
   interrupted `response.incomplete` passes unchanged.

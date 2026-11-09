@@ -258,6 +258,7 @@ use cpa_server::testing::codex_capture::{CaptureUpstream, Reply, Script};
 struct Native {
     url: String,
     upstream: CaptureUpstream,
+    rt: Arc<cpa_server::runtime::Runtime>,
     _auth_dir: AuthDir,
 }
 
@@ -283,8 +284,9 @@ async fn native(api_key: bool, script: Script, extra_config: &str) -> Native {
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, vec![credential], executors));
     Native {
-        url: serve(cpa_server::router(rt)).await,
+        url: serve(cpa_server::router(rt.clone())).await,
         upstream,
+        rt,
         _auth_dir: auth_dir,
     }
 }
@@ -792,4 +794,102 @@ async fn issue2_parallelism_and_output_replay_pass_unchanged_for_every_client() 
             assert_eq!(sent, client, "siwc {headers:?} {parallel:?}");
         }
     }
+}
+
+/// #25: first-party Codex derives its retry delay from a `rate_limit_exceeded` failure's
+/// message text (`codex-api/src/sse/responses_error.rs:93-128` at 44ccf394573c), so the
+/// fixture's message, irregular spacing included, must arrive unchanged. After the
+/// response started the client gets the provider's event as sent. Before anything was
+/// delivered the scheduler classifies it as a 429 (the credential cools, and with one
+/// credential nothing else can serve it), and the streaming and the buffered client alike
+/// get the provider's error object and sequence number as sent, under that status.
+#[tokio::test]
+async fn a_rate_limit_failure_keeps_the_message_codex_reads_its_delay_from() {
+    let failed = text_of("sse-failed-rate-limit");
+    let data = text(fixture("sse-failed-rate-limit").frames()[0].clone());
+    let started = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_rl\"}}}}\n\n{failed}"
+    );
+    let proxy = native(
+        true,
+        Script {
+            http: vec![Reply::sse(started.clone())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((status, answer.as_str()), (200, started.as_str()), "after the start");
+
+    // The provider's error object, sliced from the fixture's own bytes.
+    let error = &data[data.find(r#""error":"#).unwrap() + 8..data.find(r#", "usage""#).unwrap()];
+    let delivered = format!(r#"{{"error":{error},"sequence_number":3}}"#);
+    let full = routed("http-request-full");
+    for body in [full.clone(), full.replacen(r#""stream":true"#, r#""stream":false"#, 1)] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(failed.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], body).await;
+        assert_eq!((status, answer.as_str()), (429, delivered.as_str()), "before the start");
+        assert_eq!(proxy.upstream.http().len(), 1, "one attempt, no replay");
+    }
+}
+
+/// #25: usage that the upstream reports as zero stays zero, with its own spelling, in a
+/// stream and in the buffered answer, and missing usage stays missing. Passive usage
+/// accounting is on: it records each answer as a success from a copy and changes no byte.
+#[tokio::test]
+async fn reported_zero_and_missing_usage_pass_unchanged() {
+    let zero = r#"{"type":"response.completed","response":{"id":"resp_z","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}}"#;
+    let zero_stream = format!("event: response.completed\ndata: {zero}\n\n");
+    let zero_object = &zero[zero.find(r#""response":"#).unwrap() + 11..zero.len() - 1];
+    let none_stream = text_of("sse-completed-no-usage");
+    let none_data = text(fixture("sse-completed-no-usage").frames().pop().unwrap());
+    let none_object = &none_data[none_data.find(r#""response":"#).unwrap() + 11..none_data.len() - 1];
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (stream, object) in [(zero_stream.as_str(), zero_object), (none_stream.as_str(), none_object)] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.to_owned()), Reply::sse(stream.to_owned())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let queue = proxy.rt.usage_queue();
+        queue.configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, stream), "streamed");
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, object), "buffered");
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while records.len() < 2 {
+                records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        for record in &records {
+            assert_eq!(record["failed"], false, "{record}");
+            assert_eq!(record["tokens"]["total_tokens"], 0, "{record}");
+        }
+    }
+}
+
+fn text(bytes: Bytes) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap()
 }

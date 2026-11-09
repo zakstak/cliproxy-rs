@@ -377,20 +377,68 @@ async fn a_zero_token_interrupted_response_is_a_normal_end() {
     follow_up_is_clean(&executor, &url, &up).await;
 }
 
-/// The same shape without a reason is still an upstream abort: a request-scoped 502.
+const UNEXPLAINED_R1: &str =
+    r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#;
+
+/// The same shape without a reason, before anything reached the client, is still an
+/// upstream abort: a request-scoped 502 in its place, and the socket is dropped. With
+/// bootstrap buffering the held `response.created` goes with it, as on the HTTP route.
 #[tokio::test]
-async fn an_unexplained_zero_output_incomplete_still_fails() {
-    let (_up, url) = upstream(vec![Act::Send(vec![
-        CREATED,
-        r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
-    ])])
-    .await;
+async fn an_unexplained_zero_output_incomplete_still_fails_before_delivery() {
+    let (_up, url) = upstream(vec![Act::Send(vec![UNEXPLAINED_R1])]).await;
     let executor = CodexExecutor::new().unwrap();
     let events = rest_of(start(&executor, &url, false).await).await;
-    let error = events
-        .last()
-        .and_then(|e| e.as_ref().err())
-        .unwrap_or_else(|| panic!("{events:?}"));
-    assert_eq!(error.status, 502, "{error}");
-    assert_eq!(error.scope, FailureScope::Request);
+    let [Err(error)] = &events[..] else {
+        panic!("only the abort, nothing delivered: {events:?}");
+    };
+    assert_eq!((error.status, error.scope), (502, FailureScope::Request), "{error}");
+    assert!(executor.ws.loss("conn-1").is_some(), "the socket was dropped");
+
+    let (_up, url) = upstream(vec![Act::Send(vec![CREATED, UNEXPLAINED_R1])]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let cfg = Config::parse("codex:\n  stream-bootstrap-buffering: true\n").unwrap();
+    let error = executor
+        .execute_in_session(&credential(&url), request(BODY), &cfg, &session(false))
+        .await
+        .err()
+        .expect("the held events go with the abort");
+    assert_eq!((error.status, error.scope), (502, FailureScope::Request), "{error}");
+    assert!(executor.ws.loss("conn-1").is_some(), "the socket was dropped");
+}
+
+/// Once an event reached the client, the response has started: the unexplained end is
+/// the upstream's terminal event, and first-party Codex reads it as an incomplete
+/// response with its ID and usage (`codex-api/src/sse/responses.rs:451-506` at
+/// 44ccf394573c). It passes byte for byte, with no error after it, and the socket serves
+/// the next turn. With bootstrap buffering, an event the window does not hold (here one
+/// the proxy does not model) delivers what was held, so the same holds there.
+#[tokio::test]
+async fn an_unexplained_zero_output_incomplete_after_delivery_passes_unchanged() {
+    const UNKNOWN: &str = r#"{"type":"response.future_event","n":1.50}"#;
+    for (config, sent) in [
+        ("", vec![CREATED]),
+        ("codex:\n  stream-bootstrap-buffering: true\n", vec![CREATED, UNKNOWN]),
+    ] {
+        let mut first = sent.clone();
+        first.push(UNEXPLAINED_R1);
+        let (up, url) = upstream(vec![
+            Act::Send(first.clone()),
+            Act::Send(vec![CREATED_R2, COMPLETED_R2]),
+        ])
+        .await;
+        let executor = CodexExecutor::new().unwrap();
+        let cfg = Config::parse(config).unwrap();
+        let response = executor
+            .execute_in_session(&credential(&url), request(BODY), &cfg, &session(false))
+            .await
+            .unwrap();
+        let ResponseBody::Stream(stream) = response.body else {
+            panic!("websocket turns stream");
+        };
+        let events = rest_of(stream).await;
+        assert!(events.iter().all(Result::is_ok), "{config:?}: no error: {events:?}");
+        assert_eq!(texts(&events), first, "{config:?}: the events as upstream sent them");
+        assert!(executor.ws.loss("conn-1").is_none(), "{config:?}: the socket was kept");
+        follow_up_is_clean(&executor, &url, &up).await;
+    }
 }

@@ -342,13 +342,15 @@ mod zero_output_ends {
         }
     }
 
-    /// The silent abort: the connection ends without the incomplete event, the attempt is
-    /// recorded once as a 502, and the request-scoped failure cools nothing.
+    /// The silent abort: the connection ends with the proxy's error alone, without the
+    /// incomplete event or any event held before it, the attempt is recorded once as a
+    /// 502, and the request-scoped failure cools nothing.
     async fn aborted(client: &mut Proxy, rt: &crate::Runtime, credential: &str, case: &str) {
         loop {
             match tokio::time::timeout(Duration::from_secs(3), client.socket.next()).await {
                 Ok(Some(Ok(WsMessage::Text(text)))) => {
-                    assert!(!text.as_str().contains("response.incomplete"), "{case}: {text:?}");
+                    let kind = cpa_common::rawjson::get(text.as_str(), "type").str().to_owned();
+                    assert_eq!(kind, "error", "{case}: nothing upstream sent is delivered: {text:?}");
                 }
                 Ok(Some(Ok(WsMessage::Close(_)) | Err(_)) | None) => break,
                 Ok(Some(Ok(_))) => {}
@@ -420,13 +422,16 @@ mod zero_output_ends {
 
     /// `content_filter` and `max_output_tokens` with zero output are the provider's
     /// answer: they reach the client unchanged, with their own reason, and the socket and
-    /// the credential stay. An unexplained end sent before any event is delivered is
-    /// an upstream silent abort: the client never gets it, the attempt is a request-scoped
-    /// 502 that cools nothing, and the socket is gone.
+    /// the credential stay. So does an end without a reason once `response.created` was
+    /// delivered (#25): the response has started, and the pinned client reads that end as
+    /// an incomplete response with its ID and usage (`sse/responses.rs:451-506`). An
+    /// unexplained end before anything is delivered is an upstream silent abort: the
+    /// client never gets it, the attempt is a request-scoped 502 that cools nothing, and
+    /// the socket is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn named_reasons_stay_distinct_and_an_unexplained_end_stays_an_abort() {
         for steering in [false, true] {
-            for terminal in [CONTENT_FILTER, MAX_OUTPUT] {
+            for terminal in [CONTENT_FILTER, MAX_OUTPUT, UNEXPLAINED] {
                 let case = format!("steering={steering} reason={}", reason(terminal));
                 let (upstream, frames, dials) =
                     ws_upstream(vec![vec![CREATED_R1, terminal], vec![CREATED_R2, COMPLETED_R2]]).await;
@@ -461,14 +466,34 @@ mod zero_output_ends {
         assert_eq!(frames.lock().unwrap().len(), 1);
     }
 
+    /// With bootstrap buffering, `response.created` is held, not delivered, when the
+    /// unexplained end arrives: the abort takes the held event with it, as on the HTTP
+    /// route, so the client gets the proxy's error alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_response_created_goes_with_the_abort() {
+        let (upstream, frames, _) = ws_upstream(vec![vec![CREATED_R1, UNEXPLAINED]]).await;
+        let (mut client, rt, credential) =
+            proxy_with(&upstream, true, "codex:\n  stream-bootstrap-buffering: true\n").await;
+        client.send(CREATE).await;
+        aborted(&mut client, &rt, &credential, "no reason after a held response.created").await;
+        assert_eq!(frames.lock().unwrap().len(), 1);
+    }
+
     /// A WebSocket turn served over HTTP (a credential without `websockets`), with
     /// bootstrap buffering holding `response.created` so the end arrives before anything
     /// was delivered: a zero-output end that names its reason reaches the client unchanged
-    /// and the next request runs; without a reason it is the 502.
+    /// and the next request runs; without a reason it is the 502. Without buffering,
+    /// `response.created` is delivered first, and the unexplained end passes unchanged too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_turn_over_http_keeps_named_zero_output_ends() {
-        for terminal in [INTERRUPTED, CONTENT_FILTER, MAX_OUTPUT, UNEXPLAINED] {
-            let case = format!("reason={}", reason(terminal));
+        for (terminal, hold) in [
+            (INTERRUPTED, true),
+            (CONTENT_FILTER, true),
+            (MAX_OUTPUT, true),
+            (UNEXPLAINED, true),
+            (UNEXPLAINED, false),
+        ] {
+            let case = format!("reason={} hold={hold}", reason(terminal));
             let calls: Arc<Mutex<usize>> = Arc::default();
             let counter = calls.clone();
             let upstream = serve(axum::Router::new().fallback(move || {
@@ -489,10 +514,14 @@ mod zero_output_ends {
                 }
             }))
             .await;
-            let (mut client, rt, credential) =
-                proxy_with(&upstream, false, "codex:\n  stream-bootstrap-buffering: true\n").await;
+            let config = if hold {
+                "codex:\n  stream-bootstrap-buffering: true\n"
+            } else {
+                ""
+            };
+            let (mut client, rt, credential) = proxy_with(&upstream, false, config).await;
             client.send(CREATE).await;
-            if terminal == UNEXPLAINED {
+            if terminal == UNEXPLAINED && hold {
                 aborted(&mut client, &rt, &credential, &case).await;
                 assert_eq!(*calls.lock().unwrap(), 1, "{case}");
                 continue;

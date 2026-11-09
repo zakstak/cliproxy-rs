@@ -976,6 +976,12 @@ enum Frame {
         status_frame: bool,
         event: Option<Bytes>,
     },
+    /// An empty `response.incomplete` without an exempt reason
+    /// ([`response::empty_incomplete`]) before anything reached the client: an upstream
+    /// silent abort, answered with this request-scoped 502 in its place
+    /// (docs/codex/CONTRACT.md, "Permitted transformations"). Leading events held for
+    /// bootstrap go with it.
+    Abort(ExecError),
 }
 
 /// One turn on a pooled socket. Dropping it releases the turn lock and the reader.
@@ -1005,6 +1011,9 @@ struct Turn {
     /// Inside the bootstrap window, where Go records an empty incomplete as a
     /// WebSocket error rather than a response error.
     bootstrapping: bool,
+    /// An upstream event was handed to the client stream: from here on no event is
+    /// replaced ([`Frame::Abort`]).
+    delivered: bool,
     /// Bound on waiting for an interrupt acknowledgement after the response ended.
     ack_wait: Duration,
     /// After the terminal event: the interrupted response whose acknowledgement the turn
@@ -1101,20 +1110,17 @@ impl Turn {
         if response::meaningful_delta(payload) {
             self.saw_delta = true;
         }
-        if response::empty_incomplete(payload, self.items.len(), self.saw_delta) {
+        // Only while nothing reached the client: once an event did, the upstream's
+        // terminal event is the response, and first-party Codex reads it as one
+        // (`sse/responses.rs:451-506`: an incomplete response with its ID and usage).
+        if !self.delivered && response::empty_incomplete(payload, self.items.len(), self.saw_delta) {
             let error = response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE);
             if self.bootstrapping {
                 self.wire.ws_exec_error("upstream_error", &error);
             } else {
                 self.wire.exec_error(&error);
             }
-            return Frame::Failed {
-                error,
-                overload: false,
-                read: false,
-                status_frame: false,
-                event: None,
-            };
+            return Frame::Abort(error);
         }
         let bufferable = response::bufferable(payload);
         let terminal = matches!(
@@ -1287,8 +1293,13 @@ fn rest(turn: Turn) -> ExecStream {
                     } else {
                         !terminal || turn.settle(terminal_id.as_deref())
                     };
+                    turn.delivered = true;
                     let next = if more { State::Reading(turn) } else { State::Done };
                     return Some((Ok(out), next));
+                }
+                Frame::Abort(error) => {
+                    turn.invalidate(&error, true);
+                    return Some((Err(error), State::Done));
                 }
                 Frame::Failed { error, read, event, .. } => {
                     // `event` comes only with an upstream failure event, never with a
@@ -1350,6 +1361,12 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
             Frame::Skip if window_open => continue,
             Frame::Skip => break,
             Frame::Failed { error, read: true, .. } => return Err(error),
+            // Nothing reached the client yet: the held events go with the abort, as on
+            // the HTTP route (`codex_native.rs` `Passthrough::take`).
+            Frame::Abort(error) => {
+                turn.invalidate(&error, true);
+                return Err(error);
+            }
             Frame::Failed {
                 error,
                 status_frame: true,
@@ -1402,6 +1419,7 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     if turn.settle(terminal_id.as_deref()) {
                         // An interrupt acknowledgement still follows the terminal event.
                         turn.bootstrapping = false;
+                        turn.delivered = true;
                         return Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed());
                     }
                     return Ok(futures_util::stream::iter(held).boxed());
@@ -1411,6 +1429,8 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
         }
     }
     turn.bootstrapping = false;
+    // The held events reach the client before `rest` reads another frame.
+    turn.delivered = !held.is_empty();
     Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed())
 }
 
@@ -1672,6 +1692,7 @@ impl CodexExecutor {
             model: model.clone(),
             wire,
             bootstrapping: false,
+            delivered: false,
             ack_wait: self.ws.ack_wait,
             drain: None,
         };

@@ -682,6 +682,16 @@ async fn empty_incomplete_keeps_its_narrow_exception() {
     let (out, error) = through(&[sse.as_bytes()], None).await;
     assert!(error.is_none(), "{error:?}");
     assert_eq!(text(&out), sse);
+    // A held `response.created` goes with the abort: nothing was delivered yet.
+    let held = format!("data: {CREATED}\n\ndata: {empty}\n\n");
+    let (out, error) = through(&[held.as_bytes()], Some(None)).await;
+    assert!(out.is_empty(), "{}", text(&out));
+    assert_eq!(error.unwrap().status, 502);
+    // Once an event was delivered, the unexplained end is the provider's terminal event:
+    // it passes unchanged, with no error after it.
+    let (out, error) = through(&[held.as_bytes()], None).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&out), held);
 }
 
 /// An API key on api.openai.com is the `api-key` profile. The request is captured as it
