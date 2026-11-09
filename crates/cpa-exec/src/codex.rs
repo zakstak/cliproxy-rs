@@ -212,6 +212,12 @@ impl CodexExecutor {
         self.ws.interrupt(session, payload, enabled).await
     }
 
+    /// An attempt of session `id` will not run on its socket: a lost socket's loss is
+    /// superseded ([`Executors::session_attempt`](crate::Executors::session_attempt)).
+    pub fn release_lost_socket(&self, id: &str) {
+        self.ws.release_lost(id);
+    }
+
     /// The losses of the session's upstream sockets (what Go's disconnect notifier hands
     /// the downstream handler), each socket's taken once ([`SessionLosses`]).
     pub fn session_losses(&self, id: &str) -> SessionLosses {

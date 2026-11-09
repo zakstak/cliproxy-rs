@@ -583,7 +583,10 @@ already failed on: it does not close the connection, and the turn fails over to 
 credential or delivers that failure itself. Each socket's loss is its own. The loss of the
 socket that then serves closes the connection like any other, idle or during a response,
 and a failure on that socket renders its own error, never the loss let pass during
-failover. A replaced socket's late loss reports nothing. On a new
+failover. A replaced socket's late loss reports nothing. A loss renders only in place of a
+failure of the attempt that ran on that socket: an attempt over HTTP or on another
+provider fails with its own error, and once such an attempt is chosen, a socket already
+lost reports nothing more, while a live socket keeps its own loss. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:

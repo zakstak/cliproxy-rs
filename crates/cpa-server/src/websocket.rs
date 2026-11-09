@@ -1164,7 +1164,7 @@ impl Connection {
                 // socket; the client still needs the replay signal, not the loss close.
                 if ctx.suppress(failure.status) {
                     Forwarded::Suppressed(failure)
-                } else if let Some(loss) = self.upstream_loss() {
+                } else if let Some(loss) = self.upstream_loss(&ctx) {
                     close_for_upstream_loss(socket, &loss, self.codex_client).await;
                     Forwarded::End
                 } else {
@@ -1258,11 +1258,14 @@ impl Connection {
     /// is lost, ahead of the turn's own error (whose 1009 body is a fixed message rather
     /// than the upstream's close reason). A duplex stream owns its closure instead.
     ///
-    /// Only the latest socket's loss counts, and only one the connection did not take
-    /// already: a loss let pass while a turn failed over belongs to a socket that serves
-    /// nothing any more, so a later failure renders its own error (#25 R3).
-    fn upstream_loss(&self) -> Option<ExecError> {
-        if self.duplex.load(Ordering::Acquire) {
+    /// The loss replaces the failure only when the turn's last attempt ran on the Codex
+    /// session socket (`ctx.codex_socket`): an attempt over HTTP or on another provider
+    /// fails with its own error, whatever an earlier attempt's socket reported. And only
+    /// the latest socket's loss counts, one the connection did not take already: a loss
+    /// let pass while a turn failed over belongs to a socket that serves nothing any
+    /// more, so a later failure renders its own error (#25 R3).
+    fn upstream_loss(&self, ctx: &TurnCtx) -> Option<ExecError> {
+        if self.duplex.load(Ordering::Acquire) || !ctx.codex_socket {
             return None;
         }
         self.losses.as_ref()?.pending()
@@ -1416,11 +1419,15 @@ impl Connection {
         self.serving.store(false, Ordering::Release);
         let on_selected: dispatch::OnSelected = {
             let (selected, rt, pinned) = (selected.clone(), self.rt.clone(), self.pinned.clone());
+            let session = self.session.clone();
             let native_request = ctx.native_request;
             let continuation = ctx.native && ctx.requires_current;
             let (duplex, replays, steering) = (self.duplex.clone(), self.replays.clone(), self.steering);
             Box::new(move |credential: &Credential| {
                 let mut s = selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A socket that cannot serve this attempt, and that an earlier attempt
+                // already lost, reports nothing more (#25 R3).
+                rt.executors.session_attempt(&session, credential);
                 s.last.clone_from(&credential.id);
                 s.pinned_attempted |= !pinned.is_empty() && credential.id == pinned;
                 replays.store(continuation && s.pinned_attempted, Ordering::Release);
@@ -1718,7 +1725,7 @@ impl Connection {
             socket.terminate(CLOSE_SENT);
             return Forwarded::End;
         }
-        if let Some(loss) = self.upstream_loss() {
+        if let Some(loss) = self.upstream_loss(ctx) {
             close_for_upstream_loss(socket, &loss, self.codex_client).await;
             return Forwarded::End;
         }

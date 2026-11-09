@@ -6396,3 +6396,115 @@ async fn a_failover_that_ends_without_a_socket_renders_its_last_failure() {
         }
     }
 }
+
+/// #25 R1: a lost socket's failure belongs to the attempt that ran on it. The first
+/// account's socket answers a safe 429 with a subscription reset and is lost; the turn
+/// fails over to an account served over HTTP, which fails too: synchronously, with the
+/// request-scoped 500 of an invalid configured URL (a Codex client then gets a silent
+/// close), or with a real HTTP 400. The client gets that second failure's own rendering,
+/// never the first account's limit event. One socket was dialed; the records are the 429
+/// and the second failure, without tokens; with and without bootstrap buffering.
+#[tokio::test]
+async fn an_http_attempt_after_a_lost_socket_fails_with_its_own_error() {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const LIMITED: &str = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000}}"#;
+    const REJECTED: &str =
+        r#"{"error":{"type":"invalid_request_error","code":"bad_input","message":"safe second rejection"}}"#;
+    for buffering in [false, true] {
+        for valid in [false, true] {
+            let case = format!("buffering={buffering} valid http url={valid}");
+            let (dials, posts) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let app = {
+                let (dials, posts) = (dials.clone(), posts.clone());
+                axum::Router::new().route(
+                    "/responses",
+                    axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                        dials.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            upgrade.on_upgrade(|mut socket| async move {
+                                let _ = socket.recv().await;
+                                let _ = socket.send(Upstream::Text(LIMITED.into())).await;
+                                while let Some(Ok(_)) = socket.recv().await {}
+                            })
+                        }
+                    })
+                    .post(move || {
+                        posts.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                [("content-type", "application/json")],
+                                REJECTED,
+                            )
+                        }
+                    }),
+                )
+            };
+            let upstream = format!("http://{}", serve(app).await);
+            let config = if buffering {
+                "codex:\n  stream-bootstrap-buffering: true\n"
+            } else {
+                ""
+            };
+            let proxy = proxy_with(Script::default(), config, |_| {
+                let mut first = credential(Profile::Chatgpt, &upstream, true);
+                first.attributes.insert("priority".into(), "9".into());
+                let http = if valid { upstream.as_str() } else { "http://[invalid" };
+                let mut second = credential(Profile::Chatgpt, http, false);
+                second.id = "codex-1.json".into();
+                second.metadata.insert("access_token".into(), serde_json::json!(SECOND));
+                second.attributes.insert("priority".into(), "0".into());
+                vec![first, second]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &[]).await;
+            let records = records(&proxy, 2).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no other record"
+            );
+            assert!(got.closed.is_some(), "{case}: {got:?}");
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("usage_limit_reached") || f.contains("2000000000")),
+                "{case}: the first account's limit is not the turn's failure: {got:?}"
+            );
+            assert_eq!(dials.load(Ordering::SeqCst), 1, "{case}: one socket");
+            assert_eq!(
+                posts.load(Ordering::SeqCst),
+                usize::from(valid),
+                "{case}: HTTP requests"
+            );
+            assert_eq!(records[0]["fail"]["status_code"], 429, "{case}");
+            assert_eq!(records[1]["failed"], true, "{case}: {records:?}");
+            assert_eq!(
+                records[1]["fail"]["status_code"],
+                if valid { 400 } else { 500 },
+                "{case}"
+            );
+            for record in &records {
+                assert_eq!(tokens(record), [0, 0, 0], "{case}");
+            }
+            if valid {
+                assert!(
+                    got.frames.iter().any(|f| f.contains("safe second rejection")),
+                    "{case}: the HTTP attempt's own failure: {got:?}"
+                );
+            } else {
+                assert!(got.frames.is_empty(), "{case}: a silent close: {got:?}");
+            }
+        }
+    }
+}

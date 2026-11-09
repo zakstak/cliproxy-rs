@@ -1097,6 +1097,12 @@ impl XaiExecutor {
         self.ws.losses(id)
     }
 
+    /// An attempt of session `id` will not run on its socket: a lost socket's loss is
+    /// superseded ([`crate::Executors::session_attempt`]).
+    pub fn release_lost_socket(&self, id: &str) {
+        self.ws.pool.release_lost(id.trim());
+    }
+
     pub fn close_session(&self, id: &str) {
         self.ws.close(id);
     }

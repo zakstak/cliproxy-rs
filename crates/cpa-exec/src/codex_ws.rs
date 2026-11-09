@@ -532,6 +532,18 @@ impl Session {
         id
     }
 
+    /// An attempt will not run on this session's socket. When the session holds no live
+    /// socket (the last one was lost and detached), that socket's loss is superseded as by
+    /// a new dial, so a late notice from its reader reports nothing. A live socket keeps
+    /// its loss: it may still serve a later turn.
+    fn release_lost(&self) {
+        // Held across the check, so a dial's publication cannot come in between.
+        let conn = self.conn.lock().expect("session conn");
+        if conn.is_none() {
+            self.begin_socket();
+        }
+    }
+
     /// Makes `conn` the session's socket.
     pub(crate) fn publish(&self, conn: Arc<Upstream>) {
         let mut slot = self.conn.lock().expect("session conn");
@@ -794,6 +806,13 @@ impl Pool {
                 None => Ok(None),
             },
             Err(_) => Ok(None),
+        }
+    }
+
+    /// [`Session::release_lost`] for session `id`, when it exists.
+    pub fn release_lost(&self, id: &str) {
+        if let Some(session) = self.get(id) {
+            session.release_lost();
         }
     }
 
