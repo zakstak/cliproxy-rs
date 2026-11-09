@@ -237,8 +237,10 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
         let usage = req.usage.clone();
-        let send = self.native_send(view, settings, req, profile, call, model, body, None);
-        crate::cancel::fail_if_canceled(&usage, send).await
+        let mut secrets = crate::codex_secret::Secrets::default();
+        let send = self.native_send(view, settings, req, profile, call, model, body, None, &mut secrets);
+        let answer = crate::cancel::fail_if_canceled(&usage, send).await;
+        secrets.guard_response(answer)
     }
 
     /// A WebSocket turn on a credential without `websockets`: the client's
@@ -255,14 +257,27 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = ws_http_body(&req.body, &model)?;
         let usage = req.usage.clone();
-        let send = self.native_send(view, settings, req, profile, Call::Stream, model, body, Some(session));
-        crate::cancel::fail_if_canceled(&usage, send).await
+        let mut secrets = crate::codex_secret::Secrets::default();
+        let send = self.native_send(
+            view,
+            settings,
+            req,
+            profile,
+            Call::Stream,
+            model,
+            body,
+            Some(session),
+            &mut secrets,
+        );
+        let answer = crate::cancel::fail_if_canceled(&usage, send).await;
+        secrets.guard_response(answer)
     }
 
     /// The exchange up to the response: the upstream send, then either the stream, or the
     /// whole body for a buffered client. The callers record the attempt as canceled when
     /// the client leaves before this returns ([`crate::cancel`]); a stream settles its own
-    /// outcome ([`passthrough`]).
+    /// outcome ([`passthrough`]). `secrets` receives the authentication values the request
+    /// carries, which the callers guard the answer with ([`crate::codex_secret`]).
     #[allow(clippy::too_many_arguments)]
     async fn native_send(
         &self,
@@ -274,6 +289,7 @@ impl CodexExecutor {
         model: String,
         body: Bytes,
         ws_session: Option<&str>,
+        secrets: &mut crate::codex_secret::Secrets,
     ) -> Result<ExecResponse, ExecError> {
         settings.refuse_image_tool(&req.request_path, &body)?;
         // The body passed the boundary, so this never fails.
@@ -304,6 +320,9 @@ impl CodexExecutor {
             Call::Compact => format!("{}/responses/compact", view.base_url),
             _ => format!("{}/responses", view.base_url),
         };
+        // The outbound credential guard (`crate::codex_secret`): bound to what this
+        // request carries, the caller checks everything the response delivers with it.
+        *secrets = crate::codex_secret::Secrets::from_request(&headers, &url);
         let wire = Wire::new(req.capture(), view.credential);
         let error_body = if call == Call::Stream {
             ErrorBody::Strict

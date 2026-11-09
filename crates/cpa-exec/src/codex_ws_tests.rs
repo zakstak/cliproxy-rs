@@ -2601,3 +2601,44 @@ fn explicit_zero_status_is_a_notice() {
         assert_eq!(read(&frame(status, "x")), Some(502), "{status}: status-less");
     }
 }
+
+/// #6 by the pinned client's failure kinds (`sse/responses_error.rs:48-103`,
+/// `api_bridge.rs:136-140,212-255` at 44ccf394573c): each account code or type is read in
+/// the error objects a reading of the frame's type reads, and nowhere else. Generated
+/// frames.
+#[test]
+fn pinned_account_kinds_follow_the_slots_each_frame_type_reads() {
+    for code in super::PINNED_ACCOUNT_CODES {
+        for frame in [
+            format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#),
+            format!(r#"{{"type":"response.failed","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"error","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"error","status":503,"body":{{"error":{{"code":"{code}"}}}}}}"#),
+        ] {
+            assert!(super::pinned_account_kind(&frame), "{frame}");
+            assert!(super::account_sensitive(502, &frame), "{frame}");
+        }
+        for frame in [
+            // A slot no reading of that type reads, or no failure frame at all.
+            format!(r#"{{"type":"error","response":{{"error":{{"code":"{code}"}}}}}}"#),
+            format!(r#"{{"type":"response.output_text.delta","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"response.failed","response":{{"error":{{"message":"{code}"}}}}}}"#),
+        ] {
+            assert!(!super::pinned_account_kind(&frame), "{frame}");
+        }
+    }
+    for kind in super::PINNED_ACCOUNT_TYPES {
+        let frame = format!(r#"{{"type":"error","status":429,"error":{{"type":"{kind}"}}}}"#);
+        assert!(super::pinned_account_kind(&frame), "{frame}");
+    }
+    for code in [
+        "invalid_prompt",
+        "context_length_exceeded",
+        "server_is_overloaded",
+        "x",
+        "budget_reached",
+    ] {
+        let frame = format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#);
+        assert!(!super::pinned_account_kind(&frame), "{frame}");
+    }
+}

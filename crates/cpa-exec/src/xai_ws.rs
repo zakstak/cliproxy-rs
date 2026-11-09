@@ -1307,7 +1307,13 @@ impl XaiExecutor {
         let client = self.clients.for_credential(credential, cfg);
         let (socket, handshake) = dial(&client, target, headers, capture, retry).await?;
         let (sink, stream) = socket.split();
-        let conn = Upstream::new(target.clone(), sink, self.ws.pool.write);
+        let conn = Upstream::new(
+            target.clone(),
+            sink,
+            self.ws.pool.write,
+            // xAI keeps its own delivery rules; the guard covers the native Codex routes.
+            crate::codex_secret::Secrets::default(),
+        );
         // Publish before the reader runs, as the Codex executor does.
         let mut reader = conn.reader.lock().expect("reader handle");
         session.publish(conn.clone());

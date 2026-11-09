@@ -1232,13 +1232,17 @@ async fn removal_closes_only_its_sockets(section: &str) {
                         .trim_start_matches("Bearer ")
                         .to_owned();
                     dials.lock().unwrap().push(key.clone());
+                    // The response ID names the socket's key without spelling it: a
+                    // native Codex client never receives a frame that carries the
+                    // credential its socket's handshake sent (`cpa_exec::codex_secret`).
+                    let id = key.to_ascii_uppercase();
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(message)) = socket.recv().await {
                             if !matches!(message, AxMessage::Text(_)) {
                                 continue;
                             }
                             let completed = format!(
-                                r#"{{"type":"response.completed","response":{{"id":"resp-{key}","output":[],"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}}}"#
+                                r#"{{"type":"response.completed","response":{{"id":"resp-{id}","output":[],"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}}}"#
                             );
                             if socket.send(AxMessage::Text(completed.into())).await.is_err() {
                                 break;
@@ -1322,7 +1326,7 @@ async fn removal_closes_only_its_sockets(section: &str) {
         "{section}: only the removed key's socket closed"
     );
 
-    turn(&mut kept, "keep", "resp-keep").await;
+    turn(&mut kept, "keep", "resp-KEEP").await;
     assert_eq!(
         *dials.lock().unwrap(),
         ["keep", "drop"],

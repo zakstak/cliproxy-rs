@@ -54,7 +54,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::rawjson;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
-use cpa_core::exec::{Caller, Delivery, ExecError, ExecSession, ExecStream, Operation};
+use cpa_core::exec::{Caller, ExecError, ExecSession, ExecStream, Operation};
 use cpa_core::format::Format;
 use cpa_exec::codex::{CodexExecutor, InterruptError, SteeringInput};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -256,7 +256,9 @@ struct Failure {
     /// ([`ExecError::delivered_event`]); never set for an account failure.
     delivered: Option<String>,
     /// A native Codex failure whose frame, and so its `text`, can name the pooled account
-    /// ([`Delivery::Withheld`]): the client gets `limit` or a silent close, nothing else.
+    /// ([`cpa_core::exec::Delivery::Withheld`]) or carries the upstream credential
+    /// ([`cpa_core::exec::Delivery::Confidential`]): the client gets `limit` (never for a
+    /// confidential failure) or a silent close, nothing else.
     withheld: bool,
 }
 
@@ -346,12 +348,17 @@ fn delivered(e: &ExecError) -> Option<String> {
 }
 
 fn withheld(e: &ExecError) -> bool {
-    e.delivery == Delivery::Withheld
+    e.withheld()
 }
 
 /// The limit event for an executor error: the frame's headers (addon) first, then the
-/// upstream response's.
+/// upstream response's. None for a failure that carries an upstream authentication value
+/// ([`cpa_core::exec::Delivery::Confidential`]): its allowlisted fields come from that
+/// failure too.
 fn exec_limit(status: u16, text: &str, e: &ExecError) -> Option<String> {
+    if e.confidential() {
+        return None;
+    }
     let maps: Vec<&HeaderMap> = e.addon.as_deref().into_iter().chain([&*e.headers]).collect();
     crate::websocket_limit::event(status, text, &crate::websocket_limit::Headers::Maps(&maps), unix_now())
 }

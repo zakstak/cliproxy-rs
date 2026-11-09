@@ -1966,3 +1966,252 @@ async fn positional_events_classify_as_their_object_form_on_http() {
         }
     }
 }
+
+// #25 acceptance criterion 7 on the native HTTP route, the outbound credential guard
+// (`cpa_exec::codex_secret`): the selected credential's token is the fixture's `at-FAKE`,
+// sent upstream as `Bearer at-FAKE`; the client's key is `client-key`. Every case also
+// runs with `at-OTHER`, text no request carried, which keeps every byte. Generated
+// frames, no recorded provider traffic.
+
+const SELECTED: &str = "at-FAKE";
+const LOOKALIKE: &str = "at-OTHER";
+
+fn with_token(frame: &str, token: &str) -> String {
+    let escaped: String = token.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect();
+    frame.replace("{T}", token).replace("{E}", &escaped)
+}
+
+fn carries_token(text: &str, token: &str) -> bool {
+    let escaped: String = token.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect();
+    text.contains(token) || text.contains(&escaped)
+}
+
+/// Usage records on, for the assertions on them.
+fn counted(proxy: &Native) {
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+}
+
+/// The attempt carried the selected credential, never the client's key.
+fn selected_upstream(proxy: &Native) {
+    for exchange in proxy.upstream.http() {
+        assert_eq!(exchange.headers["authorization"], format!("Bearer {SELECTED}"));
+        assert!(!format!("{:?}", exchange.headers).contains("client-key"));
+    }
+}
+
+/// Streaming: an event the pinned reader skips or reads as content that carries the
+/// token is dropped and the real completion follows, one successful record with its
+/// usage; a failure after content that carries it ends the stream without it (the record
+/// and its status as the control's); one before content is a status-only error with the
+/// control's status.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_a_streaming_http_client() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","output":[]}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"hello"}"#;
+    let sse = |events: &[&str]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+    for (name, frame) in [
+        (
+            "malformed JSON",
+            r#"{"type":"response.failed","response":{"error":{"message":"{T}"}}"#,
+        ),
+        ("unknown event", r#"{"type":"response.future","note":["{T}",1.50]}"#),
+        (
+            "escaped delta",
+            r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"{E}"}"#,
+        ),
+        (
+            "repeated member",
+            r#"{"type":"error","error":{"message":"{T}"},"error":{"code":"x"}}"#,
+        ),
+    ] {
+        for token in [SELECTED, LOOKALIKE] {
+            let event = with_token(frame, token);
+            let upstream = sse(&[CREATED, &event, REAL_END]);
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(upstream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            counted(&proxy);
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            assert_eq!(status, 200, "{name} {token}");
+            if token == SELECTED {
+                assert_eq!(answer, sse(&[CREATED, REAL_END]), "{name}: dropped, completion follows");
+            } else {
+                assert_eq!(answer, upstream, "{name}: the control as sent");
+            }
+            let records = usage_records(&proxy, 1).await;
+            assert_eq!(records.len(), 1, "{name} {token}");
+            assert_eq!(records[0]["failed"], false, "{name} {token}");
+            assert_eq!(records[0]["tokens"]["total_tokens"], 5, "{name} {token}");
+            selected_upstream(&proxy);
+        }
+    }
+    let failure = r#"{"type":"response.failed","response":{"id":"resp_real","error":{"code":"x","message":"retry {T}"},"error":{"code":"x","message":"safe"}}}"#;
+    for leading in [&[CREATED, DELTA][..], &[][..]] {
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let event = with_token(failure, token);
+            let mut events = leading.to_vec();
+            events.push(&event);
+            let upstream = sse(&events);
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(upstream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            counted(&proxy);
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+            if leading.is_empty() {
+                if token == LOOKALIKE {
+                    assert!(answer.contains(LOOKALIKE), "the control's own error: {answer}");
+                }
+            } else if token == SELECTED {
+                assert_eq!(answer, sse(leading), "the stream ends without the failure");
+            } else {
+                assert_eq!(answer, upstream, "the control as sent");
+            }
+            let records = usage_records(&proxy, 1).await;
+            seen.push((
+                status,
+                records[0]["failed"].clone(),
+                records[0]["fail"]["status_code"].clone(),
+            ));
+            selected_upstream(&proxy);
+        }
+        assert_eq!(seen[0], seen[1], "privacy changes delivery only: {seen:?}");
+        assert_eq!(seen[0].1, true);
+    }
+}
+
+/// An upstream HTTP error, a buffered answer and a compaction answer that carry the
+/// token: a status-only error instead of the upstream's body (the error keeps its
+/// classified status; a buffered or compaction answer, which has no stream to end, is a
+/// request-scoped 502 that neither fails over nor cools). A usage limit that carries the
+/// token still cools the credential, and the cooldown's later "last error" carries only
+/// its status. The controls keep their bytes.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_an_http_answer() {
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let compaction = routed("http-request-compaction").replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let error = r#"{"error":{"type":"invalid_request_error","code":"x","message":"bad {T}"}}"#;
+    let completed = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"note":"{E}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let compacted = r#"{"id":"cmp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"ENC {T}"}]}"#;
+    for token in [SELECTED, LOOKALIKE] {
+        let selected = token == SELECTED;
+        // An upstream 400.
+        let body = with_token(error, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(400, body.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 400, "{token}");
+        if selected {
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+            assert!(!answer.contains("bad"), "status-only: {answer}");
+        } else {
+            assert_eq!(answer, body);
+        }
+        selected_upstream(&proxy);
+        // A buffered answer.
+        let event = with_token(completed, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(format!("data: {event}\n\n"))],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        if selected {
+            assert_eq!(status, 502, "{answer}");
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!((status, answer.as_str()), (200, last_response_object(&event)));
+        }
+        assert_eq!(
+            proxy.upstream.http().len(),
+            1,
+            "no failover after the upstream served it"
+        );
+        let cooled: usize = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .map(|c| proxy.rt.store().cooldowns(&c.id).len())
+            .sum();
+        assert_eq!(cooled, 0, "{token}");
+        selected_upstream(&proxy);
+        // A compaction answer.
+        let answer_body = with_token(compacted, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(200, answer_body.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses/compact", &[], compaction.clone()).await;
+        if selected {
+            assert_eq!(status, 502, "{answer}");
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!((status, answer.as_str()), (200, answer_body.as_str()));
+        }
+        selected_upstream(&proxy);
+        // A usage limit cools the credential; the cooldown's answer names its last error.
+        let limit = with_token(
+            r#"{"error":{"type":"usage_limit_reached","message":"limit for {T}","resets_in_seconds":600}}"#,
+            token,
+        );
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(429, limit.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 429, "{token}: {answer}");
+        if selected {
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!(answer, limit);
+        }
+        let (status, _, later) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 429, "{later}");
+        assert_eq!(proxy.upstream.http().len(), 1, "cooled");
+        if selected {
+            assert!(!carries_token(&later, SELECTED), "{later}");
+        } else {
+            assert!(later.contains(LOOKALIKE), "the control's last error is shown: {later}");
+        }
+        selected_upstream(&proxy);
+    }
+}

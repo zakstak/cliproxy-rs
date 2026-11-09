@@ -630,7 +630,7 @@ impl Duplex {
             // reads as one under another reading (an explicit `status: 400` beside a
             // rate-limit error, say): neither may reach the client as an event, so the
             // stream ends on it, as on any account failure. Its classified status stays.
-            if error.delivery == cpa_core::exec::Delivery::Withheld {
+            if error.withheld() {
                 self.fail_records(error);
                 return Settlement::Account(error.clone());
             }
@@ -1066,11 +1066,19 @@ impl Duplex {
 
     /// The rest of an upstream message's handling, once observers saw it.
     fn observed(&mut self, payload: &str, kind: &str, response_id: Option<&str>, reading: Reading) {
+        // The outbound credential guard (`crate::codex_secret`): a message that carries
+        // the socket's credential is never delivered, whatever it does. What it does is
+        // decided as for any other message: it settles, cools and accounts as read. The
+        // stream also drops it ([`super::CodexExecutor::stream_ws`]); this connection only
+        // has to end where the client would otherwise wait for a response that ended.
+        let confidential = self.turn.conn.secrets.exposes(payload.as_bytes());
         // Steering acknowledgements, pending notices and failures are opaque: IDs, input,
         // sequence numbers and event types reach the client byte for byte.
         if kind.starts_with("response.steer.") {
             let recorded = self.steer_event(kind, payload);
-            self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            if !confidential {
+                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            }
             if !recorded {
                 // As for an ambiguous failure: keep the event, end the socket.
                 self.fail(local(&format!(
@@ -1082,7 +1090,7 @@ impl Duplex {
         if let Reading::Passed { decoded } = reading {
             // The pinned reader skips or ignores this frame. It settles nothing and
             // reaches the client as sent, unless it would read as an account failure (#6).
-            if !super::account_shaped(payload, decoded) {
+            if !confidential && !super::account_shaped(payload, decoded) {
                 self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             }
             return;
@@ -1104,7 +1112,9 @@ impl Duplex {
             }
             Settlement::Ambiguous => {
                 // Guessing could corrupt either request: keep the event, end the socket.
-                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+                if !confidential {
+                    self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+                }
                 self.fail(local(
                     "cannot associate websocket failure with a response or pending create",
                 ));
@@ -1115,6 +1125,7 @@ impl Duplex {
         // restored.
         // Only the first rejection fails the stream (and can enter bootstrap retry);
         // later ones are events the client may correct on this socket.
+        let reading_ended = matches!(reading, Reading::Event { terminal: true });
         let terminal = match reading {
             Reading::Failure { error, .. } => Some(error),
             Reading::Event { .. } | Reading::Passed { .. } => None,
@@ -1147,6 +1158,27 @@ impl Duplex {
             && let Some(announce) = self.announce.take()
         {
             self.outbox.push_back(Ok(Bytes::from(announce)));
+        }
+        if confidential {
+            // A later failure, or an event the client's reader ends a response on, that
+            // the client cannot get: the connection ends here, as after an account
+            // failure, so the client does not wait for a response that already ended.
+            // Its own record settled above; every other one fails with the connection.
+            // Any other event is only dropped.
+            let ends = match &terminal {
+                Some(error) => Some(crate::codex_secret::confidential(error.clone())),
+                None if reading_ended => Some(crate::codex_secret::confidential(local(
+                    crate::codex_secret::WITHHELD_FRAME,
+                ))),
+                None => None,
+            };
+            if !self.first_response {
+                self.input_ready = true;
+            }
+            if let Some(error) = ends {
+                self.fail(error);
+            }
+            return;
         }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
         if !self.first_response {

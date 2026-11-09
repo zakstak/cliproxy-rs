@@ -286,6 +286,9 @@ impl Failure {
     /// Go `err.Error()`: what route error writers render.
     pub fn text(&self) -> String {
         match self {
+            // A failure that carries an upstream authentication value
+            // (`Delivery::Confidential`) renders by its status alone.
+            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.confidential() => String::new(),
             Failure::Exec(e) | Failure::Remote { error: e, .. } => classify::error_text(e),
             Failure::UnknownModel(model) => {
                 let message = gojson::sjson_string(&format!("unknown provider for model {model}"));
@@ -359,7 +362,7 @@ impl Failure {
     pub fn direct(&self) -> Option<&ExecError> {
         // Go finds the direct response through any wrapper, a Home round marker included.
         match self {
-            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.direct => Some(e),
+            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.direct && !e.confidential() => Some(e),
             _ => None,
         }
     }

@@ -484,6 +484,8 @@ The response reaches the client as the upstream sent it:
   repeats `error`. Nothing is filled in. It arrived on an HTTP 200, so its status is
   the classified one.
 - The alias `force-mapping` model rewrite does not run.
+- Nothing above delivers an authentication value the request carried
+  ([Credential isolation](#credential-isolation)).
 
 [Settings](#settings) lists the final outcome of every Codex rewrite and impersonation
 control on every route.
@@ -686,7 +688,19 @@ built from the bytes of its members.
   explicit `status: 400` beside a rate-limit error, so the scheduler records that 400 and
   cools nothing, while the frame is withheld; a `response.failed` whose refused
   `response.error` array reads as a rate limit by position keeps the generic 502 and its
-  cooldown, while the frame is withheld. A decoded failure whose first repeated
+  cooldown, while the frame is withheld. A failure whose error is one of the pinned
+  client's account kinds is withheld too, whatever status Go's table gives it
+  (`codex_ws::pinned_account_kind`): `RateLimitExceeded` (`rate_limit_exceeded`,
+  `slow_down`), `QuotaExceeded` (`insufficient_quota`, `credit_balance_exhausted`,
+  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, and
+  `organization_usage_limit_exceeded` on a 429) and `UsageNotIncluded`
+  (`usage_not_included`), read from a `response.failed`'s `response.error` or own `error`
+  and an `error` frame's `error` or `body.error` (`sse/responses_error.rs:48-103`,
+  `api_bridge.rs:136-140,212-255`); the types `usage_limit_reached`,
+  `usage_not_included` and `insufficient_quota` count the same. Their message, plan and
+  reset describe the pooled account. Only delivery changes: Go's table still classifies
+  `slow_down` and `insufficient_quota` as 502 and `usage_not_included` as it did, so
+  cooldowns and failover are unchanged. A decoded failure whose first repeated
   `type` is a rate limit but whose last is not is no account failure, as the pinned
   `Value` reads it, and reaches the client as sent. Withheld
   means the client also gets no rendering of the frame's error (the error the server would
@@ -901,6 +915,66 @@ the frame that other providers receive; no Codex attempt sees it.
 An upstream handshake that answers 426 fails the turn with that status. No proxy-side
 HTTP conversion follows. The pinned client's own HTTP fallback runs only for its own
 upgrade, and the proxy's downstream upgrade has already succeeded.
+
+## Credential isolation
+
+An upstream can write the authentication value it received into its answer: an error
+message that quotes the bearer token, a close reason, a header. The native routes deliver
+the upstream's own bytes, so they check every delivery against the values the request
+that produced it actually carried (`crates/cpa-exec/src/codex_secret.rs`, #25 acceptance
+criterion 7). This is a backstop for the selected credential. It is not the #6 account
+reading above, which decides by what a failure means.
+
+- **Which values.** The values are the credential of each `Authorization` header (the
+  token after `Bearer`), each cookie value, each API-key header, and a password in the
+  URL, taken from the request as sent upstream: the HTTP request, or the handshake of the
+  socket that reads the frame. A reused socket keeps its own handshake's values, even
+  after the credential was refreshed. A fresh dial, a refreshed HTTP request and a
+  failover attempt each get their own. Routing, account, session and cache identities
+  (`chatgpt-account-id`, `session_id`) are no authentication values. Neither is the same
+  text from another account, a saved login or a configured credential that this
+  request did not carry. Empty values match nothing.
+- **Which spellings.** The check reads the original bytes, whatever a parser makes of
+  them. It covers a frame the pinned client cannot decode, a repeated member that a
+  last-key reader drops, an array, an opaque or refused failure slot, a private raw value
+  and invalid JSON. A value counts as written and under up to 16 rounds of JSON
+  unescaping over every byte (`\"`, `\\`, `\/`, the control escapes and `\uXXXX`, surrogate
+  pairs included), so an escaped spelling and a raw value's string inside a string count
+  too. Bytes still unescaping after the last round count as carrying a value. An HTTP
+  stream is checked event by event, after the shared SSE framer has joined its chunks.
+- **What it changes.** Delivery only. Eligibility, classification, settlement, cooldown,
+  usage and the pinned outcome are decided before the check and stay as they are.
+  - A frame that carries a value is not delivered, and the response goes on as the
+    processing decided. For a frame the pinned reader skips, or a notice, the real
+    completion follows and nothing cools. For an ordinary event, only that event is
+    missing. For an event a WebSocket turn ends on, the turn ends without it: an upstream
+    socket's turn closes silently (the server's "stream closed before
+    `response.completed`" close), with its record and usage as processed. An HTTP stream
+    ends without the event, so the client reads a stream that closed before completion.
+    On a steering connection, such an event, or a later failure that carries a value,
+    ends the connection with a silent close, because the client would otherwise wait for a
+    response that already ended. The response's own record is settled as processed, and
+    every other open record and queued create fails with the connection.
+  - A failure that carries a value, in its body, the frame it would deliver as sent, or
+    a header it hands the client, becomes `Delivery::Confidential`. Its classified status
+    and scope stay the scheduler's (no conversion to 429). The client gets no frame, no
+    rendering of the body, no subscription-limit event, no close reason and no
+    passthrough headers: a WebSocket client gets a silent close, and an HTTP client gets
+    an error rendered from the classified status alone. This also holds when the failure
+    ends the connection after bootstrap failover, as the session's loss, or as an
+    interrupt's rejection. A cooldown that such a failure starts keeps only its status as
+    the "last error" that a later request's cooldown answer shows.
+  - A buffered or compaction answer that carries a value fails with a request-scoped
+    502 (`codex upstream response withheld: it carried the upstream credential`). It does
+    not fail over, because the upstream served it, and it does not cool the credential.
+    Its record is a failure without tokens. A buffered client has no stream to end.
+  - An upstream response header that carries a value is dropped. An interrupt
+    acknowledgement that carries one is not delivered.
+- **What stays.** A frame without such a value keeps every byte: spacing, number
+  spellings, duplicate members, unknown fields and opaque arrays.
+- **What it does not cover.** Request logs and usage records are operator-side. They keep
+  the shared capture sink's redaction policy (`crates/cpa-server/src/request_logging.rs`)
+  and are unchanged. The translated route (#27) and other providers have no such guard.
 
 ## Translated route
 

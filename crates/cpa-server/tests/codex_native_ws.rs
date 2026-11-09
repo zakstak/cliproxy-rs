@@ -4745,3 +4745,442 @@ async fn invalid_status_notices_keep_the_real_completion() {
         }
     }
 }
+
+// #25 acceptance criterion 7, the outbound credential guard (`cpa_exec::codex_secret`):
+// the selected credential is the fixture's `at-FAKE`, which every attempt sends upstream
+// as `Bearer at-FAKE`, while the client's own key is `client-key`. Generated frames, no
+// recorded provider traffic.
+
+/// The selected credential's token, as every attempt of [`native_turn`] carries it.
+const SELECTED: &str = "at-FAKE";
+/// The same shape of text that is no credential this proxy sent: the control.
+const LOOKALIKE: &str = "at-OTHER";
+
+/// `text` with each character of its token written as a JSON `\u` escape.
+fn unicode_escaped(token: &str) -> String {
+    token.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect()
+}
+
+/// Whether `text` carries `token` as written or in a spelling the guard cases use.
+fn carries_token(text: &str, token: &str) -> bool {
+    let escaped_dash = token.replacen('-', "\\u002d", 1);
+    text.contains(token) || text.contains(&unicode_escaped(token)) || text.contains(&escaped_dash)
+}
+
+/// The cases of the 115 residual conversations and their neighbours. `{T}` is the token.
+/// `account` marks a pinned account kind, which a native WebSocket client never gets as
+/// sent, token or not (`codex_ws::pinned_account_kind`).
+const FAILURES: [(&str, &str, bool); 9] = [
+    (
+        "accepted Error, slow_down (pinned RateLimitExceeded)",
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","slow_down","limited {T}",null,null]}}"#,
+        true,
+    ),
+    (
+        "accepted Error, insufficient_quota (pinned QuotaExceeded)",
+        r#"{"type":"response.failed","response":{"id":"r1","error":["insufficient_quota","insufficient_quota","quota {T}",null,null,null]}}"#,
+        true,
+    ),
+    (
+        "object usage_not_included (pinned UsageNotIncluded)",
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"usage_not_included","message":"plan {T}"}}}"#,
+        true,
+    ),
+    (
+        "accepted Error, invalid_prompt",
+        r#"{"type":"response.failed","response":{"id":"r1","error":["invalid_request_error","invalid_prompt","bad {T}",null,null]}}"#,
+        false,
+    ),
+    (
+        "generic Retryable",
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"x","message":"retry {T}"}}}"#,
+        false,
+    ),
+    (
+        "earlier duplicate error, last one safe",
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"x","message":"{T}"},"error":{"code":"x","message":"safe"}}}"#,
+        false,
+    ),
+    (
+        "response is an array",
+        r#"{"type":"response.failed","response":["r1",{"message":"{T}"}]}"#,
+        false,
+    ),
+    (
+        "escaped token",
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"x","message":"{E}"}}}"#,
+        false,
+    ),
+    (
+        "private raw value",
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"code\":\"x\",\"message\":\"{T}\"}"}}}"#,
+        false,
+    ),
+];
+
+/// Frames the pinned reader skips, ignores or reads as content: the real completion
+/// follows each.
+const PASSED: [(&str, &str); 5] = [
+    (
+        "malformed JSON",
+        r#"{"type":"error","error":{"code":"x","message":"{T}""#,
+    ),
+    (
+        "wrapped notice",
+        r#"{"type":"error","status":200,"error":{"code":"x","message":"notice {T}"}}"#,
+    ),
+    ("unknown event", r#"{"type":"response.future","note":["{T}",1.50]}"#),
+    (
+        "escaped delta",
+        r#"{"type":"response.output_text.delta","response_id":"r1","delta":"{E}"}"#,
+    ),
+    (
+        "repeated member, earlier one carries it",
+        r#"{"type":"error","status":200,"error":{"message":"{T}"},"error":{"code":"x","message":"safe"}}"#,
+    ),
+];
+
+fn with_token(frame: &str, token: &str) -> String {
+    frame.replace("{T}", token).replace("{E}", &unicode_escaped(token))
+}
+
+/// #25 criterion 7 on every native WebSocket path, first and after content: no frame or
+/// close carries the selected credential. Each case also runs with [`LOOKALIKE`], text no
+/// request carried, and the two runs differ only in what the client receives: the same
+/// record (failed or not, status, tokens), cooldowns and attempts. The control keeps its
+/// bytes: a failure that is no pinned account kind reaches the client as sent, and a
+/// passed frame reaches it before the real completion. A failure that carries the token
+/// is withheld (silent close, its classified status kept); a passed frame that carries
+/// it is dropped and, on an upstream socket, the real completion follows, with no
+/// cooldown.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_a_websocket_client() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"r1","delta":"hello"}"#;
+    for path in NATIVE_PATHS {
+        for after in [false, true] {
+            let prefix: Vec<&str> = if after { vec![DELTA] } else { vec![] };
+            for (name, frame, account) in FAILURES {
+                let case = format!("{} {after} {name}", path.0);
+                let selected = with_token(frame, SELECTED);
+                let control = with_token(frame, LOOKALIKE);
+                let run = |frame: String| {
+                    let mut frames: Vec<String> = prefix.iter().map(|f| f.to_string()).collect();
+                    frames.push(frame);
+                    frames.push(REAL_END.to_owned());
+                    async move {
+                        let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+                        native_turn(path, &frames, REAL_END).await
+                    }
+                };
+                let got = run(selected.clone()).await;
+                let want = run(control.clone()).await;
+                assert_eq!(got.authorization, [format!("Bearer {SELECTED}")], "{case}");
+                assert!(
+                    !got.frames.iter().any(|f| carries_token(f, SELECTED)),
+                    "{case}: {got:?}"
+                );
+                assert_eq!(got.frames, prefix, "{case}: withheld");
+                assert!(got.closed.is_some(), "{case}: the turn ends");
+                let mut sent = prefix.clone();
+                if !account {
+                    sent.push(&control);
+                }
+                assert_eq!(want.frames, sent, "{case}: the control as sent");
+                assert_eq!(got.records[0]["failed"], want.records[0]["failed"], "{case}");
+                assert_eq!(
+                    got.records[0]["fail"]["status_code"], want.records[0]["fail"]["status_code"],
+                    "{case}"
+                );
+                assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+                assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+                assert_eq!((got.cooldowns, got.attempts), (want.cooldowns, want.attempts), "{case}");
+            }
+            for (name, frame) in PASSED {
+                let case = format!("{} {after} {name}", path.0);
+                let selected = with_token(frame, SELECTED);
+                let control = with_token(frame, LOOKALIKE);
+                let mut frames = prefix.clone();
+                frames.extend([selected.as_str(), REAL_END]);
+                let got = native_turn(path, &frames, REAL_END).await;
+                let mut frames = prefix.clone();
+                frames.extend([control.as_str(), REAL_END]);
+                let want = native_turn(path, &frames, REAL_END).await;
+                assert_eq!(got.authorization, [format!("Bearer {SELECTED}")], "{case}");
+                // Privacy changes delivery only: the control's frames without the control
+                // frame, and the same record, cooldowns, attempts and end.
+                let mut expected = want.frames.clone();
+                expected.retain(|f| *f != control);
+                assert_eq!(got.frames, expected, "{case}");
+                assert!(want.frames.contains(&control), "{case}: the control as sent: {want:?}");
+                assert_eq!(got.closed.is_some(), want.closed.is_some(), "{case}");
+                assert_eq!(got.records[0]["failed"], want.records[0]["failed"], "{case}");
+                assert_eq!(
+                    got.records[0]["fail"]["status_code"], want.records[0]["fail"]["status_code"],
+                    "{case}"
+                );
+                assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+                assert_eq!((got.cooldowns, got.attempts), (want.cooldowns, want.attempts), "{case}");
+                // On an upstream socket the pinned reader skips or ignores each of them: the
+                // real completion follows. A turn over HTTP keeps its eager failure policy
+                // for a decoded `error` that carries a status.
+                if path.2 {
+                    let mut kept = prefix.clone();
+                    kept.push(REAL_END);
+                    assert_eq!(got.frames, kept, "{case}: dropped, completion follows");
+                    assert_eq!(got.closed, None, "{case}");
+                    assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                    assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                    assert_eq!(got.cooldowns, 0, "{case}");
+                    assert_eq!(got.attempts, 1, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// #6 by the pinned client's own failure kinds (`codex-api/src/sse/responses_error.rs`
+/// and `api_bridge.rs` at 44ccf394573c): a `response.failed` whose error is
+/// `RateLimitExceeded`, `QuotaExceeded` or `UsageNotIncluded` describes the pooled
+/// account, whatever status Go's table gives it, so a native WebSocket client never gets
+/// it as sent, with no token in it. The scheduler keeps Go's classification (the same
+/// status and cooldowns as a safe request fault of that status would get is not asserted;
+/// only that withholding changes nothing but delivery). Safe request faults (an invalid
+/// prompt, a context window, a generic retryable error) reach the client as sent.
+#[tokio::test]
+async fn pinned_account_kinds_are_withheld_without_a_token() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let failed = |code: &str| {
+        format!(
+            r#"{{"type":"response.failed","response":{{"id":"r1","error":{{"code":"{code}","message":"limit reached for org-PUBLIC","plan_type":"plus"}}}}}}"#
+        )
+    };
+    for path in NATIVE_PATHS {
+        for code in [
+            "slow_down",
+            "rate_limit_exceeded",
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "usage_not_included",
+        ] {
+            let frame = failed(code);
+            let got = native_turn(path, &[&frame, REAL_END], REAL_END).await;
+            assert!(got.frames.is_empty(), "{} {code}: {got:?}", path.0);
+            assert!(got.closed.is_some(), "{} {code}", path.0);
+            assert_eq!(got.records[0]["failed"], true, "{} {code}", path.0);
+        }
+        for code in ["invalid_prompt", "x", "server_error"] {
+            let frame = failed(code);
+            let got = native_turn(path, &[&frame, REAL_END], REAL_END).await;
+            assert_eq!(got.frames, [frame.as_str()], "{} {code}: as sent", path.0);
+            assert_eq!(got.records[0]["failed"], true, "{} {code}", path.0);
+        }
+    }
+}
+
+/// #25 criterion 7 on a steering connection's later responses: after a first response
+/// that completes, the next create's failure carries the selected credential. The
+/// response's record fails with its classified status, and the connection ends without
+/// the frame (the client would otherwise wait for a response that ended). A later
+/// skipped notice that carries it is dropped and that response's real completion
+/// follows. The lookalike controls reach the client as sent: the recoverable failure
+/// keeps the connection open.
+#[tokio::test]
+async fn later_steering_responses_never_carry_the_selected_credential() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_first","output":[]}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_first","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const NEXT_CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_second","output":[]}}"#;
+    const NEXT_COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_second","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"steer_first","input":[]}"#;
+    let failure = r#"{"type":"response.failed","response":{"id":"steer_second","error":{"code":"x","message":"retry {T}"},"error":{"code":"x","message":"safe"}}}"#;
+    let notice = r#"{"type":"error","status":200,"error":{"code":"x","message":"{E}"}}"#;
+    let terminal = r#"{"type":"response.completed","response":{"id":"steer_second","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5},"note":"{T}"}}"#;
+    for (name, frame, kind) in [
+        ("failure", failure, 0),
+        ("notice", notice, 1),
+        ("terminal", terminal, 2),
+    ] {
+        for token in [SELECTED, LOOKALIKE] {
+            let case = format!("{name} {token}");
+            let event = with_token(frame, token);
+            let second = match kind {
+                0 => vec![NEXT_CREATED.to_owned(), event.clone()],
+                1 => vec![NEXT_CREATED.to_owned(), event.clone(), NEXT_COMPLETED.to_owned()],
+                _ => vec![NEXT_CREATED.to_owned(), event.clone()],
+            };
+            let mut upstream = Gated::start(vec![vec![CREATED.to_owned(), COMPLETED.to_owned()], second], false).await;
+            let proxy = proxy_with(Script::default(), STEERING, |_| {
+                vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket.send(Message::text(create.clone())).await.unwrap();
+            upstream.read(1).await;
+            upstream.release.notify_one();
+            let first = read(&mut socket, &TERMINAL).await;
+            assert_eq!(first.frames.last().map(String::as_str), Some(COMPLETED), "{case}");
+            assert_eq!(records(&proxy, 1).await[0]["failed"], false, "{case}");
+            socket.send(Message::text(next)).await.unwrap();
+            upstream.read(2).await;
+            let mut got = read(&mut socket, &TERMINAL).await;
+            assert!(
+                !got.frames.iter().any(|f| carries_token(f, SELECTED)),
+                "{case}: {got:?}"
+            );
+            assert_eq!(
+                got.frames
+                    .first()
+                    .map(|f| cpa_common::rawjson::get(f, "type").str().to_owned()),
+                Some("response.metadata".to_owned()),
+                "{case}: {got:?}"
+            );
+            got.frames.remove(0);
+            let settled = records(&proxy, 1).await;
+            let selected = token == SELECTED;
+            match (kind, selected) {
+                (0, true) => {
+                    assert_eq!(got.frames, [NEXT_CREATED], "{case}: withheld");
+                    assert!(got.closed.is_some(), "{case}: the connection ends");
+                    assert_eq!(settled[0]["failed"], true, "{case}");
+                    assert_eq!(settled[0]["fail"]["status_code"], 502, "{case}");
+                }
+                (0, false) => {
+                    assert_eq!(got.frames, [NEXT_CREATED, event.as_str()], "{case}: as sent");
+                    assert_eq!(got.closed, None, "{case}: recoverable");
+                    assert_eq!(settled[0]["failed"], true, "{case}");
+                    assert_eq!(settled[0]["fail"]["status_code"], 502, "{case}");
+                }
+                (1, _) => {
+                    let want: Vec<&str> = if selected {
+                        vec![NEXT_CREATED, NEXT_COMPLETED]
+                    } else {
+                        vec![NEXT_CREATED, event.as_str(), NEXT_COMPLETED]
+                    };
+                    assert_eq!(got.frames, want, "{case}");
+                    assert_eq!(got.closed, None, "{case}");
+                    assert_eq!(settled[0]["failed"], false, "{case}");
+                    assert_eq!(tokens(&settled[0]), [4, 1, 5], "{case}");
+                }
+                (_, true) => {
+                    // The response completed upstream: its record keeps its usage; the
+                    // client gets no completion that carries the token, and the connection
+                    // ends instead of leaving it waiting.
+                    assert_eq!(got.frames, [NEXT_CREATED], "{case}: withheld");
+                    assert!(got.closed.is_some(), "{case}: the connection ends");
+                    assert_eq!(settled[0]["failed"], false, "{case}");
+                    assert_eq!(tokens(&settled[0]), [4, 1, 5], "{case}");
+                }
+                (_, false) => {
+                    assert_eq!(got.frames, [NEXT_CREATED, event.as_str()], "{case}: as sent");
+                    assert_eq!(got.closed, None, "{case}");
+                    assert_eq!(settled[0]["failed"], false, "{case}");
+                }
+            }
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            let cooled = proxy.rt.store().cooldowns(&credential).len();
+            assert_eq!(cooled, 0, "{case}: generic 502 and success never cool here");
+        }
+    }
+}
+
+/// One `ws-create-first` turn on `socket`: the frames up to its terminal event.
+async fn first_turn(socket: &mut WebSocket) -> Vec<String> {
+    let frame = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(frame)).await.unwrap();
+    read(socket, &TERMINAL).await.frames
+}
+
+/// The guard follows the values each socket's own handshake carried. A config-backed API
+/// key serves a turn on socket A (`key-OLD`); the key then changes in memory (as a
+/// refresh would). The next turn reuses socket A, whose upstream only knows `key-OLD`:
+/// a frame quoting it is withheld. Socket A closes; the next turn dials socket B with
+/// `key-NEW`: a frame quoting `key-NEW` is withheld there, while one quoting `key-OLD`,
+/// which socket B never carried, reaches the client as sent. No other account's or
+/// configured value is a secret of either socket.
+#[tokio::test]
+async fn each_socket_guards_the_values_its_handshake_carried() {
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let notice =
+        |text: &str| format!(r#"{{"type":"error","status":200,"error":{{"code":"x","message":"echo {text}"}}}}"#);
+    let (old_a, old_b, new_b) = (notice("key-OLD"), notice("key-OLD"), notice("key-NEW"));
+    let upstream = CaptureUpstream::start(Script {
+        ws: vec![
+            vec![Bytes::from(old_a.clone()), Bytes::from(DONE)],
+            vec![Bytes::from(old_a.clone()), Bytes::from(DONE)],
+            vec![
+                Bytes::from(old_b.clone()),
+                Bytes::from(new_b.clone()),
+                Bytes::from(DONE),
+            ],
+        ],
+        ws_close: vec![1],
+        ..Script::default()
+    })
+    .await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\ncodex-api-key:\n  - api-key: key-OLD\n    base-url: {}\n    websockets: true\n",
+        auth_dir.0.display(),
+        upstream.base_url
+    ))
+    .unwrap();
+    let all = cpa_core::config::credentials::from_config(&cfg);
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        meta: Default::default(),
+        xai: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, all, executors));
+    let proxy = Proxy {
+        addr: serve(cpa_server::router(rt.clone())).await,
+        upstream,
+        rt,
+        _auth_dir: auth_dir,
+    };
+    let mut socket = connect(&proxy).await;
+    assert_eq!(first_turn(&mut socket).await, [DONE], "socket A, its own key withheld");
+    for credential in proxy.rt.store().snapshot() {
+        let mut changed = Credential::clone(&credential);
+        changed.attributes.insert("api_key".into(), "key-NEW".into());
+        proxy
+            .rt
+            .store()
+            .replace_config_backed(changed, credential.revision)
+            .unwrap();
+    }
+    assert_eq!(
+        first_turn(&mut socket).await,
+        [DONE],
+        "socket A reused: its own key withheld"
+    );
+    assert!(
+        read(&mut socket, &[]).await.closed.is_some(),
+        "socket A closed upstream"
+    );
+    let mut socket = connect(&proxy).await;
+    assert_eq!(
+        first_turn(&mut socket).await,
+        [old_b.as_str(), DONE],
+        "socket B: the old key is no value it carried; the new one is withheld"
+    );
+    let sockets = proxy.upstream.sockets();
+    assert_eq!(sockets.len(), 2);
+    let auth = |i: usize| sockets[i].headers["authorization"].to_str().unwrap().to_owned();
+    assert_eq!(
+        (auth(0), auth(1)),
+        ("Bearer key-OLD".to_owned(), "Bearer key-NEW".to_owned())
+    );
+    assert!(
+        sockets
+            .iter()
+            .all(|s| !format!("{:?}", s.headers).contains("client-key"))
+    );
+}

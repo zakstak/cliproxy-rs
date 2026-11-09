@@ -310,16 +310,19 @@ fn ambiguous(payload: &str) -> bool {
         return true;
     }
     // The terminal failure reading of the error object, or of the status-less fallback.
+    // The pinned account kinds too (`crate::codex_ws::pinned_account_kind`).
     values(&[Slot::Top("error_type")], &["type"]).into_iter().any(|raw| {
+        let kind = lower(raw);
         matches!(
-            lower(raw).as_str(),
+            kind.as_str(),
             "usage_limit_reached" | "authentication_error" | "permission_error" | "rate_limit_error"
-        )
+        ) || crate::codex_ws::PINNED_ACCOUNT_TYPES.contains(&kind.as_str())
     }) || values(&[Slot::Top("code")], &["code"]).into_iter().any(|raw| {
+        let code = lower(raw);
         matches!(
-            lower(raw).as_str(),
+            code.as_str(),
             "invalid_api_key" | "unauthorized" | "forbidden" | "permission_denied" | "rate_limit_exceeded"
-        )
+        ) || crate::codex_ws::PINNED_ACCOUNT_CODES.contains(&code.as_str())
     }) || values(&[], &["status", "status_code"]).into_iter().any(account)
         || {
             let mut capacity = Capacity::default();

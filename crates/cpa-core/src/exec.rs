@@ -707,6 +707,13 @@ pub enum Delivery {
     /// `body`: the client gets only the allowlisted subscription-limit event or a silent
     /// close, never a rendering of the frame or of `body`.
     Withheld,
+    /// The failure, or the frame it would deliver, carries an authentication value the
+    /// upstream request or socket that produced it used (the native Codex routes' outbound
+    /// credential guard). Nothing derived from it reaches the client: no frame, no
+    /// rendering of `body`, no subscription-limit event, no close reason, no passthrough
+    /// headers. A WebSocket client gets a silent close, an HTTP client a status-only
+    /// error. `status`, `scope` and `body` stay the scheduler's classification.
+    Confidential,
 }
 
 #[derive(Debug, Clone)]
@@ -760,8 +767,20 @@ impl ExecError {
     pub fn delivered_event(&self) -> Option<&Bytes> {
         match &self.delivery {
             Delivery::AsSent(frame) => Some(frame),
-            Delivery::Classified | Delivery::Withheld => None,
+            Delivery::Classified | Delivery::Withheld | Delivery::Confidential => None,
         }
+    }
+
+    /// Whether the client must get nothing of this failure but a fixed rendering
+    /// ([`Delivery::Withheld`] or [`Delivery::Confidential`]).
+    pub fn withheld(&self) -> bool {
+        matches!(self.delivery, Delivery::Withheld | Delivery::Confidential)
+    }
+
+    /// Whether this failure carries an upstream authentication value
+    /// ([`Delivery::Confidential`]).
+    pub fn confidential(&self) -> bool {
+        self.delivery == Delivery::Confidential
     }
 
     pub fn with_diagnostic(mut self, diagnostic: Diagnostic) -> Self {

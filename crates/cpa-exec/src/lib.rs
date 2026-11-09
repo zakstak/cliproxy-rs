@@ -38,6 +38,7 @@ pub mod codex_quota;
 pub mod codex_refresh;
 mod codex_request;
 mod codex_response;
+mod codex_secret;
 pub mod codex_siwc;
 pub mod codex_siwc_bind;
 mod codex_sse;
