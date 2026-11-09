@@ -431,6 +431,10 @@ struct Connection {
     /// The turn is a native continuation that attempted its pinned credential, so a
     /// 401/429 makes the client replay over HTTP (1012) rather than close on the loss.
     replays: Arc<AtomicBool>,
+    /// The turn's request got its stream: an attempt was served. Until then a session loss
+    /// belongs to a socket the turn's own attempt already gave up (its failure is the
+    /// turn's to fail over or to deliver), and it does not end the turn.
+    serving: Arc<AtomicBool>,
     /// The upgrade request's log: upstream capture for every turn and its middleware ID.
     capture: cpa_core::exec::CaptureSink,
     request_id: Option<String>,
@@ -838,6 +842,7 @@ impl Connection {
             steering: false,
             duplex: Arc::default(),
             replays: Arc::default(),
+            serving: Arc::default(),
             capture: Default::default(),
             request_id: None,
             timeline: None,
@@ -876,7 +881,7 @@ impl Connection {
                 .attach_steering(&self.session, SteeringInput::new(client.frames.clone(), enabled));
             self.steering = true;
         }
-        let (duplex, replays) = (self.duplex.clone(), self.replays.clone());
+        let (duplex, replays, serving) = (self.duplex.clone(), self.replays.clone(), self.serving.clone());
         // Fused: a loss ignored during a duplex turn never fires again.
         let mut lost = Box::pin(self.rt.executors.session_closed(&self.session).fuse());
         loop {
@@ -909,7 +914,12 @@ impl Connection {
                         // A pinned continuation's own 401/429 lost the socket: the turn
                         // sends the replay close (1012), or the final limit, instead.
                         let replay = replays.load(Ordering::Acquire) && matches!(error.status, 401 | 429);
-                        if duplex.load(Ordering::Acquire) || replay {
+                        // Before an attempt served the request, the loss is of a socket the
+                        // turn's attempt already failed on: the turn fails over to another
+                        // credential or delivers that failure itself. Ending it here would
+                        // drop an unserved request mid-failover (#25).
+                        let bootstrapping = !serving.load(Ordering::Acquire);
+                        if duplex.load(Ordering::Acquire) || replay || bootstrapping {
                             tokio::select! {
                                 biased;
                                 flow = &mut turn => Ok(flow),
@@ -1391,6 +1401,7 @@ impl Connection {
         }));
         self.duplex.store(false, Ordering::Release);
         self.replays.store(false, Ordering::Release);
+        self.serving.store(false, Ordering::Release);
         let on_selected: dispatch::OnSelected = {
             let (selected, rt, pinned) = (selected.clone(), self.rt.clone(), self.pinned.clone());
             let native_request = ctx.native_request;
@@ -1457,7 +1468,9 @@ impl Connection {
             ctx.preserve_output = s.preserve_output || ctx.native_served;
             ctx.codex_socket = s.codex_socket;
         }
-        match result? {
+        let done = result?;
+        self.serving.store(true, Ordering::Release);
+        match done {
             dispatch::Done::Stream { headers, first, rest } => Ok(Started {
                 first,
                 stream: rest,

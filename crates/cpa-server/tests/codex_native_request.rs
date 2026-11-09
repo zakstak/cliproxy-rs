@@ -2332,7 +2332,7 @@ fn cooldowns(proxy: &Native) -> usize {
 async fn a_withheld_stream_keeps_the_served_outcome_without_a_replay() {
     const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","note":"{T}"}}"#;
     const SAFE_CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
-    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {T}","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {T}","service_tier":"echo {T}","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
     const SECOND_END: &str = r#"{"type":"response.completed","response":{"id":"resp_second","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
     let sse = |events: &[String]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
     let cases = [
@@ -2374,14 +2374,18 @@ async fn a_withheld_stream_keeps_the_served_outcome_without_a_replay() {
                 "{name}: {}",
                 records[0]
             );
-            let model = records[0]["response_model"]
-                .as_str()
-                .map(|m| m.replace(token, "[REDACTED]"));
-            seen.push((records[0]["auth_index"].clone(), records[0]["tokens"].clone(), model));
+            let scrubbed = |field: &str| records[0][field].as_str().map(|m| m.replace(token, "[REDACTED]"));
+            seen.push((
+                records[0]["auth_index"].clone(),
+                records[0]["tokens"].clone(),
+                scrubbed("response_model"),
+                scrubbed("response_service_tier"),
+            ));
         }
         assert_eq!(seen[0], seen[1], "{name}: privacy changes delivery only");
-        // The record keeps the model the withheld completion reported, scrubbed.
+        // The record keeps the model and the tier the withheld completion reported, scrubbed.
         assert_eq!(seen[0].2.as_deref(), Some("gpt-5.5 [REDACTED]"), "{name}");
+        assert_eq!(seen[0].3.as_deref(), Some("echo [REDACTED]"), "{name}");
     }
 }
 
@@ -2467,6 +2471,55 @@ async fn http_logs_and_usage_records_never_keep_the_selected_credential() {
             assert_eq!(seen[1].0, 200, "{name}: {seen:?}");
         } else {
             assert_eq!(seen[0], seen[1], "{name}: the record is the control's, scrubbed");
+        }
+    }
+}
+
+/// #25 (`Delivery::Confidential`): a failure that carried the selected credential hands the
+/// client no upstream headers, even safe ones and even when `passthrough-headers` is on. A
+/// streaming request whose upstream answers HTTP 200 with a safe `x-upstream-trace` header
+/// and then an initial usage-limit `response.failed` quoting the token fails as a stream
+/// bootstrap error. Its status-only 429 carries neither the token nor that header. The
+/// `at-OTHER` control is the same classified failure, rendered from the upstream's body as
+/// before.
+#[tokio::test]
+async fn a_confidential_bootstrap_failure_hands_the_client_no_upstream_headers() {
+    let failed = r#"{"type":"response.failed","response":{"id":"real","error":{"type":"usage_limit_reached","message":"limited {T}","resets_in_seconds":600}}}"#;
+    for (case, body) in [
+        ("selected", format!("data: {}\n\n", with_token(failed, SELECTED))),
+        ("unsent", format!("data: {}\n\n", with_token(failed, LOOKALIKE))),
+    ] {
+        let mut reply = Reply::sse(body);
+        reply
+            .headers
+            .push(("x-upstream-trace".into(), "safe-never-sent-marker".into()));
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![reply],
+                ..Script::default()
+            },
+            &[SELECTED],
+            "requests:\n  passthrough-headers: true\n",
+            false,
+        )
+        .await;
+        let (status, headers, body) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        let records = usage_records(&proxy, 1).await;
+        selected_upstream(&proxy);
+        assert!(!carries_token(&body, SELECTED), "{case}: {body}");
+        assert!(!carries_token(&format!("{headers:?}"), SELECTED), "{case}: {headers:?}");
+        assert_eq!(records[0]["failed"], true, "{case}");
+        assert_eq!(status, 429, "{case}: {body}");
+        if case == "selected" {
+            assert!(
+                headers.get("x-upstream-trace").is_none(),
+                "a Confidential failure kept a passthrough header: {headers:?}"
+            );
+        } else {
+            assert!(
+                body.contains(LOOKALIKE),
+                "the classified control keeps its body: {body}"
+            );
         }
     }
 }

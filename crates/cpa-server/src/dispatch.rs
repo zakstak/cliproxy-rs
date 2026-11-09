@@ -2160,11 +2160,15 @@ async fn attempt(
         let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
         // Go returns a stopping bootstrap failure as is: an error, not a stream, so the
         // handler's bootstrap retries never see it. Any other one goes on as a
-        // `streamBootstrapError`, whose `Headers()` are the stream's.
+        // `streamBootstrapError`, whose `Headers()` are the stream's. A failure that
+        // carried an upstream credential hands the client no upstream headers at all
+        // (`Delivery::Confidential`, #25), so it gets none here either.
         let mut fault = fault;
         if stop {
             fault.bootstrap = None;
-        } else if let Some(headers) = &fault.bootstrap {
+        } else if let Some(headers) = &fault.bootstrap
+            && !fault.error.confidential()
+        {
             fault.error.addon = Some(headers.clone());
         }
         if last_here {

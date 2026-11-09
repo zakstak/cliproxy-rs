@@ -577,7 +577,10 @@ reconnect. A pick that is lost or released, a credential that Home's snapshot ma
 unavailable, or a continuation for another model drops the pin, and the continuation
 closes with 1012. When it cannot, the connection closes with 1012,
 and the continuation never moves to another socket or account. When the upstream socket
-is lost, the client connection closes, and the client recovers on its own. On a new
+is lost, the client connection closes, and the client recovers on its own. A loss reported
+while the turn's request has not been served yet is the loss of a socket its own attempt
+already failed on: it does not close the connection, and the turn fails over to another
+credential or delivers that failure itself. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:
@@ -962,7 +965,10 @@ reading above, which decides by what a failure means.
     with the usage the upstream reported (none when it reported none), no cooldown. It
     is not Go's empty stream (`empty_stream`), which cools the credential and runs the
     request again on another one. A failure or a truncation after a withheld frame stays
-    a failure after delivery, as after a delivered one.
+    a failure after delivery, as after a delivered one, an account failure included: it
+    fails the request and is never retried on another account. A steering connection
+    processes its frames before the stream does, and hands the stream every frame it
+    processed, so the stream's guard alone leaves one out and records it.
   - A failure that carries a value, in its body, the frame it would deliver as sent, or
     a header it hands the client, becomes `Delivery::Confidential`. Its classified status
     and scope stay the scheduler's (no conversion to 429). The client gets no frame, no
@@ -985,12 +991,15 @@ reading above, which decides by what a failure means.
   (`cpa_core::sent::SentCredentials::scrub`): each value as written becomes `[REDACTED]`,
   and an entry that still carries one in an escaped spelling keeps only its length. This
   covers every log section and its spool file, the `api.websocket.*` events, the
-  WebSocket timeline's disconnect entry, and a record's `fail.body`, `response_headers`
-  and `response_model`. The values are bound as delivery binds them: the request's until a
-  socket serves the turn, then that socket's handshake values; a fresh dial, a refreshed
-  request and a failover attempt bring their own. A record's status, tokens, account and
-  every other field stay as processed. The request body is the client's own bytes and is
-  logged as sent.
+  WebSocket timeline's disconnect entry, and every text of the upstream's answer a record
+  keeps: `fail.body`, `response_headers`, `response_model` and `response_service_tier`
+  (`usage_record::Record::upstream_text`). The values are bound as delivery binds them:
+  the request's until a socket serves the turn, then that socket's handshake values; a
+  fresh dial, a refreshed request and a failover attempt bring their own. The binding
+  belongs to the connection, so every record on it, a steering connection's later
+  responses included, is scrubbed of its socket's values whichever publishes first. A
+  record's status, tokens, account and every other field stay as processed. The request
+  body is the client's own bytes and is logged as sent.
 - **What it does not cover.** The translated route (#27) and other providers have no
   such guard.
 

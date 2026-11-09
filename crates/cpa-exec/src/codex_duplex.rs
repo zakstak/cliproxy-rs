@@ -1068,17 +1068,18 @@ impl Duplex {
     fn observed(&mut self, payload: &str, kind: &str, response_id: Option<&str>, reading: Reading) {
         // The outbound credential guard (`crate::codex_secret`): a message that carries
         // the socket's credential is never delivered, whatever it does. What it does is
-        // decided as for any other message: it settles, cools and accounts as read. The
-        // stream also drops it ([`super::CodexExecutor::stream_ws`]); this connection only
-        // has to end where the client would otherwise wait for a response that ended.
+        // decided as for any other message: it settles, cools and accounts as read. Only
+        // the stream's guard leaves it out ([`super::CodexExecutor::stream_ws`]), which
+        // records that it was served (`ExecResponse::omitted`), so a later failure cannot
+        // fail over a response that already ran (#25). Every message processed here goes
+        // to the stream; this connection only has to end where the client would
+        // otherwise wait for a response that ended.
         let confidential = self.turn.conn.secrets.exposes(payload.as_bytes());
         // Steering acknowledgements, pending notices and failures are opaque: IDs, input,
         // sequence numbers and event types reach the client byte for byte.
         if kind.starts_with("response.steer.") {
             let recorded = self.steer_event(kind, payload);
-            if !confidential {
-                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
-            }
+            self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             if !recorded {
                 // As for an ambiguous failure: keep the event, end the socket.
                 self.fail(local(&format!(
@@ -1090,7 +1091,7 @@ impl Duplex {
         if let Reading::Passed { decoded } = reading {
             // The pinned reader skips or ignores this frame. It settles nothing and
             // reaches the client as sent, unless it would read as an account failure (#6).
-            if !confidential && !super::account_shaped(payload, decoded) {
+            if !super::account_shaped(payload, decoded) {
                 self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             }
             return;
@@ -1112,9 +1113,7 @@ impl Duplex {
             }
             Settlement::Ambiguous => {
                 // Guessing could corrupt either request: keep the event, end the socket.
-                if !confidential {
-                    self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
-                }
+                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
                 self.fail(local(
                     "cannot associate websocket failure with a response or pending create",
                 ));
@@ -1160,11 +1159,13 @@ impl Duplex {
             self.outbox.push_back(Ok(Bytes::from(announce)));
         }
         if confidential {
+            // The stream's guard leaves it out, and records it as served.
+            self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             // A later failure, or an event the client's reader ends a response on, that
             // the client cannot get: the connection ends here, as after an account
             // failure, so the client does not wait for a response that already ended.
             // Its own record settled above; every other one fails with the connection.
-            // Any other event is only dropped.
+            // Any other event is only left out.
             let ends = match &terminal {
                 Some(error) => Some(crate::codex_secret::confidential(
                     error.clone(),
