@@ -2933,11 +2933,15 @@ async fn pinned_readings_decide_websocket_turns() {
             AccountFailure,
             false,
         ),
-        // A repeated `status` is no wrapped frame; the decoded `error` keeps the socket's
-        // status reading, with the last status. SSE has no status frame to read.
+        // A repeated `status` is a duplicate field `WrappedWebsocketErrorEvent` refuses
+        // (`responses_websocket.rs:692-709`), so it is no wrapped frame, and the pinned
+        // `error` branch reads no status (`sse/responses.rs:375-385`): `other` is no
+        // terminal provider code, so the reader goes on (review finding 3). The last status
+        // reads as an account failure, so the frame is withheld; nothing cools. SSE has no
+        // status frame to read.
         (
             r#"{"type":"error","status":400,"status":429,"error":{"code":"other","message":"acct-PRIVATE"}}"#,
-            AccountFailure,
+            Withheld,
             true,
         ),
         (
@@ -3386,6 +3390,8 @@ struct Turned {
     records: Vec<serde_json::Value>,
     cooldowns: usize,
     attempts: usize,
+    /// The `Authorization` each upstream attempt received: the selected credential's.
+    authorization: Vec<String>,
 }
 
 /// One turn on `path` ([`NATIVE_PATHS`]): the upstream sends `frames` (as socket frames or
@@ -3450,17 +3456,27 @@ async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> 
         .iter()
         .map(|c| proxy.rt.store().cooldowns(&c.id).len())
         .sum();
-    let attempts = if websockets {
-        proxy.upstream.sockets().len()
+    let headers: Vec<axum::http::HeaderMap> = if websockets {
+        proxy.upstream.sockets().into_iter().map(|s| s.headers).collect()
     } else {
-        proxy.upstream.http().len()
+        proxy.upstream.http().into_iter().map(|e| e.headers).collect()
     };
+    let authorization = headers
+        .iter()
+        .map(|h| {
+            h.get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
     Turned {
         frames: got.frames,
         closed: got.closed,
         records,
         cooldowns,
-        attempts,
+        attempts: headers.len(),
+        authorization,
     }
 }
 
@@ -4137,11 +4153,27 @@ const NESTED_END: &str = r#"{"type":"response.completed","response":{"id":"resp_
 const NESTED_DELTA: &str =
     r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"partial"}"#;
 
-/// Whether any frame the client got carries the fake credential's token or the account.
+/// Whether any frame the client got carries the fake credential's token or the account
+/// ([`carries_secret`]).
 fn discloses(t: &Turned) -> bool {
-    t.frames
-        .iter()
-        .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE"))
+    t.frames.iter().any(|f| carries_secret(f))
+}
+
+/// Whether `text` carries the fake credential's token `at-FAKE` or the account
+/// `acct-PRIVATE`: as sent, or in any JSON string or key once unescaped, the JSON text a
+/// string or private raw value holds included (`at-FAKE` is the token too).
+fn carries_secret(text: &str) -> bool {
+    fn walk(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => carries_secret(s),
+            serde_json::Value::Array(items) => items.iter().any(walk),
+            serde_json::Value::Object(map) => map.iter().any(|(k, v)| carries_secret(k) || walk(v)),
+            _ => false,
+        }
+    }
+    text.contains("at-FAKE")
+        || text.contains("acct-PRIVATE")
+        || serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| walk(&v))
 }
 
 /// #25 and #6 (review finding 1): `parse_failed_response` reads a decoded
@@ -4154,7 +4186,9 @@ fn discloses(t: &Turned) -> bool {
 /// six members, five, a private raw value holding the array, escapes, a private raw value
 /// as the code, the whole event positional, and the whole `response` a raw value. A
 /// four-member array is no `Error`: the pinned reader has its generic stream error, which
-/// names no code, so it is no account failure and reaches the client as sent.
+/// names no code, so it is no account failure; a safe one reaches the client as sent
+/// (one that reads as an account failure by position is withheld:
+/// `refused_failure_slots_never_reach_the_client`).
 #[tokio::test]
 async fn nested_positional_failed_errors_classify_as_their_object_form() {
     const OBJECT: &str = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited at-FAKE acct-PRIVATE"}}}"#;
@@ -4244,8 +4278,8 @@ async fn nested_positional_failed_errors_classify_as_their_object_form() {
 /// alone, a 429, and withholds it too. The wrapped arrays an SSE reader cannot decode are
 /// withheld as account-shaped frames and the real completion follows. Resolved, raw error
 /// object and raw code; first and after content. (A wrapped array whose code is a private
-/// raw value decodes as neither pinned struct; it is the review's retained decoder-rejected
-/// limitation, outside this test.)
+/// raw value decodes as neither pinned struct, so the pinned reader skips it:
+/// `refused_failure_slots_never_reach_the_client` covers it.)
 #[tokio::test]
 async fn explicit_status_account_errors_are_withheld_on_every_native_path() {
     let error = r#"{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
@@ -4449,6 +4483,265 @@ async fn explicit_zero_status_notices_keep_the_real_completion() {
                 "{} {stage}: status-less: {got:?}",
                 path.0
             );
+        }
+    }
+}
+
+/// The pinned readings of `group` in the exec fixture `codex_pinned_notice_readings.json`
+/// (its `provenance` names the oracle): (name, frame, the pinned WebSocket decision).
+fn notice_readings(group: &str) -> Vec<(String, String, String)> {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../cpa-exec/tests/fixtures/codex_pinned_notice_readings.json"
+    ))
+    .unwrap();
+    fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["group"] == group)
+        .map(|c| {
+            let field = |k: &str| c[k].as_str().unwrap().to_owned();
+            (field("name"), field("raw"), field("ws"))
+        })
+        .collect()
+}
+
+/// Whether a `refused` fixture frame reads as an account failure by position: all but
+/// the safe, empty and opaque controls.
+fn refused_account(name: &str) -> bool {
+    !name.contains("safe") && !name.contains("empty") && !name.starts_with("opaque")
+}
+
+/// A turn on `path` whose upstream sends `lead`, `event` and the real completion.
+async fn turn_with(path: (&str, &str, bool), lead: &[String], event: &str) -> Turned {
+    let frames: Vec<&str> = lead.iter().map(String::as_str).chain([event, NESTED_END]).collect();
+    native_turn(path, &frames, NESTED_END).await
+}
+
+/// #25 criterion 7 and #6 (review findings 1 and 2, every frame of the `refused` group
+/// of the pinned notice readings). A failure slot the pinned reader refuses to decode
+/// still carries what the upstream wrote, and the client (whose key is `client-key`)
+/// never receives the selected credential's token `at-FAKE` or the account in it, as
+/// sent, escaped, or inside a private raw value; the upstream received `Bearer at-FAKE`.
+///
+/// - A `response.failed` whose `response.error` array the `Error` struct refuses (three,
+///   four or seven members, a string `resets_at`, an escaped token, a private raw value
+///   as its message), or whose own `error` is such an array, is the pinned generic stream
+///   error, and an `error` event whose `error` is such an array keeps the status-less
+///   failure reading: each fails as the safe refused array does (502, the same close,
+///   cooldowns, attempts and usage), but the client gets nothing of it, and no rendering
+///   of its error.
+/// - A wrapped array neither pinned struct accepts (a private raw value as its code or
+///   status, five members) is skipped, as the pinned reader skips it: it never reaches the
+///   client, the real completion follows, the turn succeeds with its usage and nothing
+///   cools.
+/// - The safe refused array, the safe wrapped array and opaque arrays reach the client as
+///   sent, with their own outcomes.
+///
+/// Five native paths, first and after content.
+#[tokio::test]
+async fn refused_failure_slots_never_reach_the_client() {
+    let cases = notice_readings("refused");
+    assert_eq!(cases.len(), 21);
+    let safe = cases.iter().find(|c| c.0 == "refused-nested-safe").unwrap().1.clone();
+    for (stage, before) in [("first", None), ("after content", Some(NESTED_DELTA))] {
+        for path in NATIVE_PATHS {
+            let lead: Vec<String> = before.iter().map(|d| (*d).to_owned()).collect();
+            let control = turn_with(path, &lead, &safe).await;
+            let mut want = lead.clone();
+            want.push(safe.clone());
+            assert_eq!(control.frames, want, "{} {stage}: the safe failure as sent", path.0);
+            assert_eq!(control.records[0]["failed"], true, "{} {stage}", path.0);
+            assert_eq!(control.records[0]["fail"]["status_code"], 502, "{} {stage}", path.0);
+            for (name, raw, ws) in &cases {
+                let case = format!("{} {stage}, {name}: {raw}", path.0);
+                let got = turn_with(path, &lead, raw).await;
+                assert!(
+                    !discloses(&got),
+                    "{case}: the token or account reached the client: {got:?}"
+                );
+                assert_eq!(got.authorization, ["Bearer at-FAKE"], "{case}: the selected credential");
+                // The group's read-on frames are decoded `error` events without a status,
+                // which the proxy's documented status-less reading fails.
+                if ws == "read-on" {
+                    assert!(raw.starts_with(r#"{"type":"error","error":"#), "{case}");
+                }
+                let ws = if ws == "read-on" { "fail" } else { ws.as_str() };
+                match (ws, refused_account(name)) {
+                    ("fail", account) => {
+                        let mut want = lead.clone();
+                        if !account {
+                            want.push(raw.clone());
+                        }
+                        assert_eq!(got.frames, want, "{case}");
+                        assert_eq!(got.closed, control.closed, "{case}");
+                        assert_eq!(got.cooldowns, control.cooldowns, "{case}");
+                        assert_eq!(got.attempts, control.attempts, "{case}");
+                        assert_eq!(got.records[0]["failed"], true, "{case}");
+                        assert_eq!(got.records[0]["fail"]["status_code"], 502, "{case}: {got:?}");
+                        assert_eq!(tokens(&got.records[0]), tokens(&control.records[0]), "{case}");
+                    }
+                    ("skip", account) => {
+                        let mut want = lead.clone();
+                        if !account {
+                            want.push(raw.clone());
+                        }
+                        want.push(NESTED_END.to_owned());
+                        assert_eq!(got.frames, want, "{case}");
+                        assert_eq!(got.closed, None, "{case}");
+                        assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                        assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                        assert_eq!(got.cooldowns, 0, "{case}");
+                        assert_eq!(got.attempts, 1, "{case}");
+                    }
+                    (ws, _) => panic!("{case}: pinned {ws}"),
+                }
+            }
+        }
+    }
+}
+
+/// #25 criterion 7 and #6 on a later response of a steering connection: after a first
+/// response that completes, the next create is answered with a refused failure slot. The
+/// refused `response.failed` array that reads as a rate limit by position is withheld:
+/// the connection ends, the create's record fails with the generic 502, and the client
+/// gets neither the frame nor the token. The refused wrapped array is skipped: the real
+/// completion of that response follows and succeeds. The safe refused array is the
+/// recoverable event the client may correct (the control).
+#[tokio::test]
+async fn later_steering_responses_keep_refused_slots_from_the_client() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_first","output":[]}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_first","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const NEXT_CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_second","output":[]}}"#;
+    const NEXT_COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_second","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let refused = notice_readings("refused");
+    let raw = |name: &str| refused.iter().find(|c| c.0 == name).unwrap().1.clone();
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"steer_first","input":[]}"#;
+    for name in [
+        "refused-nested-three",
+        "refused-nested-bad-resets",
+        "refused-nested-escaped",
+        "refused-wrapped-private-code-message",
+        "refused-wrapped-escaped",
+        "refused-nested-safe",
+    ] {
+        let event = raw(name);
+        let skipped = name.starts_with("refused-wrapped");
+        let second = if skipped {
+            vec![NEXT_CREATED.to_owned(), event.clone(), NEXT_COMPLETED.to_owned()]
+        } else {
+            vec![NEXT_CREATED.to_owned(), event.clone()]
+        };
+        let mut upstream = Gated::start(vec![vec![CREATED.to_owned(), COMPLETED.to_owned()], second], false).await;
+        let proxy = proxy_with(Script::default(), STEERING, |_| {
+            vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+        })
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket.send(Message::text(create.clone())).await.unwrap();
+        upstream.read(1).await;
+        upstream.release.notify_one();
+        let first = read(&mut socket, &TERMINAL).await;
+        assert_eq!(first.frames.last().map(String::as_str), Some(COMPLETED), "{name}");
+        assert_eq!(records(&proxy, 1).await[0]["failed"], false, "{name}");
+        socket.send(Message::text(next)).await.unwrap();
+        upstream.read(2).await;
+        let mut got = read(&mut socket, &TERMINAL).await;
+        assert!(!got.frames.iter().any(|f| carries_secret(f)), "{name}: {got:?}");
+        // A later create's model-only metadata comes ahead of its first event (the duplex's
+        // own frame, not the upstream's).
+        assert_eq!(
+            got.frames
+                .first()
+                .map(|f| cpa_common::rawjson::get(f, "type").str().to_owned()),
+            Some("response.metadata".to_owned()),
+            "{name}: {got:?}"
+        );
+        got.frames.remove(0);
+        let settled = records(&proxy, 1).await;
+        if skipped {
+            assert_eq!(got.frames, [NEXT_CREATED, NEXT_COMPLETED], "{name}");
+            assert_eq!(got.closed, None, "{name}");
+            assert_eq!(settled[0]["failed"], false, "{name}: {settled:?}");
+            assert_eq!(tokens(&settled[0]), [4, 1, 5], "{name}");
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{name}");
+        } else if refused_account(name) {
+            assert_eq!(got.frames, [NEXT_CREATED], "{name}: withheld");
+            assert!(got.closed.is_some(), "{name}: the connection ends");
+            assert_eq!(settled[0]["failed"], true, "{name}");
+            assert_eq!(settled[0]["fail"]["status_code"], 502, "{name}");
+        } else {
+            assert_eq!(got.frames, [NEXT_CREATED, event.as_str()], "{name}: as sent");
+            assert_eq!(got.closed, None, "{name}: recoverable");
+            assert_eq!(settled[0]["failed"], true, "{name}");
+            assert_eq!(settled[0]["fail"]["status_code"], 502, "{name}");
+        }
+        assert_eq!(proxy.upstream.sockets().len(), 0, "{name}: the gated upstream alone");
+    }
+}
+
+/// #25 (review finding 3, the `status` group of the pinned notice readings): a status
+/// the wrapped struct does not read as a `u16`, or a status the struct refuses as a
+/// duplicate field, makes no wrapped status, and the pinned `error` branch reads no
+/// status: with a code that is no terminal provider code the reader goes on. On the three
+/// upstream-socket paths, first and after content, the turn goes on to the real
+/// completion, succeeds with its usage, makes one attempt and cools nothing, whether or
+/// not Go's integer reading takes the status as 429 (`"429"`, `" 429"`, `"+429"`,
+/// `429.0`, `4.29e2`, `429e0`, a private number or raw value, `status_code` so spelled,
+/// both members, a repeated `status`). The notice itself reaches the client as sent, or
+/// is withheld when a reading of it is an account failure: it is never changed. A
+/// wrapped status the struct reads (`"status":429`, an escaped `status` key) still fails
+/// the turn by it (the controls). A turn served over HTTP keeps its own eager reading.
+#[tokio::test]
+async fn invalid_status_notices_keep_the_real_completion() {
+    let cases = notice_readings("status");
+    let mut checked = [0usize; 2];
+    for (name, raw, ws) in &cases {
+        // Every spelling with the safe code `x` and with a logical rate limit, plain and
+        // private; the terminal provider codes fail, as `codex_ws_tests` checks per frame.
+        let code = ["-x-", "-rate_limit_exceeded-"].iter().any(|c| name.contains(c));
+        if !code || ws != "read-on" || name.contains("dup-null-null") {
+            continue;
+        }
+        for (stage, before) in [("first", None), ("after content", Some(NESTED_DELTA))] {
+            for path in NATIVE_PATHS.iter().filter(|p| p.2) {
+                let lead: Vec<String> = before.iter().map(|d| (*d).to_owned()).collect();
+                let case = format!("{} {stage}, {name}: {raw}", path.0);
+                let got = turn_with(*path, &lead, raw).await;
+                let mut withheld = lead.clone();
+                withheld.push(NESTED_END.to_owned());
+                let mut delivered = lead.clone();
+                delivered.extend([raw.clone(), NESTED_END.to_owned()]);
+                assert!(got.frames == withheld || got.frames == delivered, "{case}: {got:?}");
+                checked[usize::from(got.frames == withheld)] += 1;
+                assert_eq!(got.closed, None, "{case}");
+                assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                assert_eq!(got.cooldowns, 0, "{case}");
+                assert_eq!(got.attempts, 1, "{case}");
+            }
+        }
+    }
+    // Both outcomes occur: `"status":" 429"` is no integer to Go either, `"429"` is.
+    assert!(checked[0] > 50 && checked[1] > 50, "{checked:?}");
+    for raw in [
+        r#"{"type":"error","status":429,"error":{"code":"x","message":"notice"}}"#.to_owned(),
+        format!(
+            r#"{{"type":"error","st{}u0061tus":429,"error":{{"code":"x","message":"notice"}}}}"#,
+            '\\'
+        ),
+    ] {
+        for path in NATIVE_PATHS.iter().filter(|p| p.2) {
+            let got = turn_with(*path, &[], &raw).await;
+            assert_eq!(got.records[0]["failed"], true, "{} {raw}: {got:?}", path.0);
+            assert_eq!(got.records[0]["fail"]["status_code"], 429, "{} {raw}", path.0);
+            assert!(!got.frames.iter().any(|f| f == NESTED_END), "{} {raw}", path.0);
         }
     }
 }

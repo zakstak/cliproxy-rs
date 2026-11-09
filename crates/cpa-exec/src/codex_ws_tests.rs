@@ -2228,48 +2228,114 @@ fn pinned_readings() -> Vec<Value> {
     fixture["cases"].as_array().unwrap().clone()
 }
 
-/// #25, #6 and #7 against the pinned readers. A frame the pinned WebSocket reader fails
-/// fails the turn. A frame it reads on or skips fails only by one of the proxy's two
-/// documented readings beyond it: a decoded `error` without a status keeps the
-/// status-less failure reading, and a decoded `error` whose status Go's reader takes as
-/// an HTTP error status (`gjson` `Int`, `status` then `status_code`, so also `"429"` or
-/// `429.0`) fails by it. Every other status is a notice, zero, negative, too large and
-/// type-wrong ones included, whether or not a private value keeps the frame from reading
-/// as the pinned wrapped event.
+/// The pinned first-party readers' outcome for each frame of
+/// `tests/fixtures/codex_pinned_notice_readings.json`, recorded by the same oracle as
+/// [`pinned_readings`] (its `provenance` names the evidence): status spellings the first
+/// fixture does not hold (group `status`), and failure slots a pinned struct refuses
+/// (group `refused`).
+fn notice_readings() -> Vec<Value> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/codex_pinned_notice_readings.json")).unwrap();
+    fixture["cases"].as_array().unwrap().clone()
+}
+
+/// Whether the frame `raw` has no status at all: each `status` and `status_code` member
+/// of its root object, every occurrence, is missing or `null` (a private raw value
+/// holding `null` is `null` to this build's `Value` too). The proxy's one documented
+/// reading beyond the pinned WebSocket reader keys on it: a decoded `error` without a
+/// status keeps the status-less failure reading (`reading`).
+fn statusless(raw: &str) -> bool {
+    struct Members;
+    impl<'de> serde::de::Visitor<'de> for Members {
+        type Value = Vec<(String, Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut out = Vec::new();
+            while let Some(entry) = map.next_entry::<String, Value>()? {
+                out.push(entry);
+            }
+            Ok(out)
+        }
+    }
+    use serde::Deserializer as _;
+    serde_json::Deserializer::from_str(raw)
+        .deserialize_map(Members)
+        .unwrap_or_default()
+        .iter()
+        .filter(|(key, _)| key == "status" || key == "status_code")
+        .all(|(_, value)| value.is_null())
+}
+
+/// The pinned WebSocket reader's decision on `case` against the proxy's [`reading`]: a
+/// frame it fails fails the turn; a frame it reads on or skips fails only by the one
+/// documented reading beyond it, a decoded `error` without any status ([`statusless`]).
+/// Go's integer reading of a status (`gjson` `Int`, which also takes `"429"` or `429.0`)
+/// decides nothing: a status the wrapped struct does not read is no wrapped status, and
+/// the pinned `error` branch reads no status at all.
+fn assert_pinned_reading(case: &Value) -> bool {
+    let name = case["name"].as_str().unwrap();
+    let raw = case["raw"].as_str().unwrap();
+    let event = crate::codex_event::decode(raw);
+    assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
+    let failed = matches!(reading(raw, event.as_ref(), false), Reading::Failure { .. });
+    if case["ws"] == "fail" {
+        assert!(failed, "{name}: the pinned reader fails it ({})", case["pinned"]);
+        return true;
+    }
+    let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
+    assert_eq!(
+        failed,
+        decoded_error && statusless(raw),
+        "{name}: the pinned reader goes on ({})",
+        case["pinned"]
+    );
+    false
+}
+
+/// #25, #6 and #7 against the pinned readers ([`assert_pinned_reading`]): every status
+/// that is present is a notice unless the wrapped struct reads it as an error status,
+/// zero, negative, too large and type-wrong ones included, whether or not a private
+/// value keeps the frame from reading as the pinned wrapped event.
 #[test]
 fn readings_follow_the_pinned_readers() {
     let mut checked = [0usize; 2];
     for case in pinned_readings() {
-        let name = case["name"].as_str().unwrap();
-        let raw = case["raw"].as_str().unwrap();
-        let event = crate::codex_event::decode(raw);
-        assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
-        let failed = matches!(reading(raw, event.as_ref(), false), Reading::Failure { .. });
-        if case["ws"] == "fail" {
-            assert!(failed, "{name}: the pinned reader fails it ({})", case["pinned"]);
-            checked[0] += 1;
-            continue;
-        }
-        let view = crate::codex_event::classification_view(raw);
-        let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
-        let members: Value = serde_json::from_str(&view).unwrap_or(Value::Null);
-        let statusless = ["status", "status_code"]
-            .iter()
-            .all(|key| members.get(key).is_none_or(Value::is_null));
-        let mut go = cpa_common::json::get(view.as_bytes(), "status").int();
-        if go == 0 {
-            go = cpa_common::json::get(view.as_bytes(), "status_code").int();
-        }
-        let go_error = u16::try_from(go).is_ok_and(crate::codex_event::error_status);
-        assert_eq!(
-            failed,
-            decoded_error && (statusless || go_error),
-            "{name}: the pinned reader goes on ({})",
-            case["pinned"]
-        );
-        checked[1] += 1;
+        checked[usize::from(!assert_pinned_reading(&case))] += 1;
     }
     assert!(checked[0] > 150 && checked[1] > 150, "{checked:?}");
+}
+
+/// #25 (review finding 3): the status spellings Go's integer reading takes as an error
+/// status and the pinned wrapped struct does not read as a `u16` (`"429"`, `" 429"`,
+/// `"+429"`, `429.0`, `4.29e2`, `429e0`, a private number or raw value, `status_code`
+/// spelled so) and the frames the wrapped struct refuses as a duplicate field (`status`
+/// beside `status_code`, a repeated `status`) are notices when the pinned `error` branch
+/// reads on: the turn goes on to the real completion and nothing cools. A terminal
+/// provider code still fails; an escaped `status` key is the wrapped status it unescapes
+/// to. Only a frame with no status at all (`null` in every occurrence) keeps the
+/// status-less failure reading.
+#[test]
+fn notice_readings_follow_the_pinned_readers() {
+    let mut checked = [0usize; 3];
+    for case in notice_readings().iter().filter(|c| c["group"] == "status") {
+        let raw = case["raw"].as_str().unwrap();
+        if assert_pinned_reading(case) {
+            checked[0] += 1;
+        } else if statusless(raw) {
+            checked[2] += 1;
+        } else {
+            let event = crate::codex_event::decode(raw).unwrap();
+            assert!(
+                matches!(reading(raw, Some(&event), false), Reading::Passed { decoded: true }),
+                "{}: a notice",
+                case["name"]
+            );
+            checked[1] += 1;
+        }
+    }
+    assert!(checked[0] > 150 && checked[1] > 300 && checked[2] > 5, "{checked:?}");
 }
 
 /// #25 and #6: a decoded `response.failed`'s `response.error` is read as
@@ -2353,13 +2419,82 @@ fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
         panic!("a failure");
     };
     assert_eq!(error.status, 400);
-    // A four-member array is no `Error`: no context window, no account failure.
+    // A four-member array is no `Error`: no context window, and no classification. It is
+    // still read by position for account safety (`codex_event::safety_views`).
     let short = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null]}}"#;
     assert!(!crate::codex_event::decode(short).unwrap().is_context_window_failure());
-    assert!(!account_shaped(
+    assert!(account_shaped(
         r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited"]}}"#,
         true
     ));
+}
+
+/// #25 criterion 7 and #6 (review findings 1 and 2): a failure slot a pinned reader reads
+/// by position keeps what the upstream wrote in it when the typed decode refuses it.
+/// Processing and safety are separate facts. A `response.failed` whose `response.error`
+/// array the `Error` struct refuses stays the pinned generic stream error, classified 502
+/// as before, and is withheld when that array reads as an account failure by position. A
+/// wrapped array neither pinned struct accepts stays skipped: it is passed, never a
+/// failure, and withheld when it reads as one. Safe refused arrays and opaque arrays reach
+/// the client as sent, and their classification does not change.
+#[test]
+fn refused_failure_slots_are_read_for_account_safety() {
+    let account = |name: &str| !name.contains("safe") && !name.contains("empty") && !name.starts_with("opaque");
+    let mut checked = [0usize; 4];
+    for case in notice_readings().iter().filter(|c| c["group"] == "refused") {
+        let name = case["name"].as_str().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+        let event = crate::codex_event::decode(raw);
+        assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
+        let ws = case["ws"].as_str().unwrap();
+        // The group's read-on frames are decoded `error` events without a status, which
+        // the proxy's documented status-less reading fails (`assert_pinned_reading`).
+        let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
+        let fails = ws == "fail" || (ws == "read-on" && decoded_error && statusless(raw));
+        match (fails, ws, reading(raw, event.as_ref(), false)) {
+            (true, _, Reading::Failure { mut error, .. }) => {
+                if ws == "fail" {
+                    assert_eq!(case["pinned"], "fail Stream", "{name}");
+                }
+                assert_eq!(error.status, 502, "{name}: the generic failure keeps its status");
+                if account(name) {
+                    assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                    deliver_as_sent(&mut error, raw);
+                    assert_eq!(error.delivery, Delivery::Withheld, "{name}: never as sent");
+                    checked[0] += 1;
+                } else {
+                    assert_eq!(error.delivery, Delivery::Classified, "{name}");
+                    deliver_as_sent(&mut error, raw);
+                    assert_eq!(
+                        error.delivered_event().map(|b| b.as_ref()),
+                        Some(raw.as_bytes()),
+                        "{name}"
+                    );
+                    checked[1] += 1;
+                }
+            }
+            (false, "skip", Reading::Passed { decoded: false }) => {
+                assert_eq!(account_shaped(raw, false), account(name), "{name}");
+                checked[if account(name) { 2 } else { 3 }] += 1;
+            }
+            (_, ws, _) => panic!("{name}: pinned {ws}, read otherwise"),
+        }
+    }
+    assert_eq!(checked, [9, 4, 5, 3]);
+    // The projections are read, never delivered: the frame itself is unchanged, and an
+    // accepted slot keeps the classification view's reading alone.
+    let accepted = r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited",null,null,null]}}"#;
+    assert!(crate::codex_event::safety_views(accepted).is_empty());
+    assert!(crate::codex_event::safety_views(r#"{"type":"response.completed","response":{"id":"r"}}"#).is_empty());
+    let views = crate::codex_event::safety_views(
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error",{"$serde_json::private::RawValue":"\"rate_limit_exceeded\""},"m"]}}"#,
+    );
+    assert_eq!(
+        views,
+        [
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"m"}}}"#
+        ]
+    );
 }
 
 /// #6 (review finding 2): the pinned wrapped mapping keeps an explicit `status: 400` for
@@ -2371,15 +2506,23 @@ fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
 fn explicit_status_account_errors_keep_their_status_and_are_withheld() {
     for case in pinned_readings() {
         let name = case["name"].as_str().unwrap();
-        // The wrapped array whose code is a private raw value decodes as neither pinned
-        // struct, so the pinned reader skips it; like any frame it cannot decode, it is
-        // read for account safety only as sent and by repeated keys (the review's retained
-        // decoder-rejected limitation, outside this finding).
-        if !name.starts_with("conflict-") || name == "conflict-raw-code-array" {
+        if !name.starts_with("conflict-") {
             continue;
         }
         let raw = case["raw"].as_str().unwrap();
         let event = crate::codex_event::decode(raw);
+        if name == "conflict-raw-code-array" {
+            // Neither pinned struct reads it (its `error.code` is a private raw value), so
+            // the pinned reader skips it (review finding 2): it stays skipped, and its
+            // wrapped slots, read by position, withhold it.
+            assert_eq!(case["ws"], "skip");
+            assert!(
+                matches!(reading(raw, None, false), Reading::Passed { decoded: false }),
+                "{name}"
+            );
+            assert!(account_shaped(raw, false), "{name}");
+            continue;
+        }
         match reading(raw, event.as_ref(), false) {
             Reading::Failure { mut error, .. } => {
                 assert_eq!(error.status, 400, "{name}");

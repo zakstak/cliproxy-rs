@@ -1336,12 +1336,13 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
 ///   failure reading ([`ws_error`], then `response::terminal_failure`), and an
 ///   undecoded frame is passed.
 ///
-/// A decoded `error` that is not a wrapped frame keeps the same readings: a status that
-/// [`ws_error`] reads and the pinned mapping would turn into an error fails it by that
-/// status, any other status the frame carries (zero included,
-/// `crate::codex_event::status_present`) makes it a notice, and only without a status
-/// does it keep the status-less reading. A decoded `response.failed` is classified by
-/// `response::terminal_failure`. Every failure reading reads the frame as the pinned
+/// A decoded `error` that is not a wrapped frame but carries a status anyway
+/// (`crate::codex_event::status_present`: any non-`null` `status` or `status_code`) is a
+/// notice, whatever Go's integer reading of that status ([`ws_error`]) makes of it: the
+/// pinned `error` branch reads no status. It fails only on a terminal provider code,
+/// keeping the status [`ws_error`] reads for the scheduler when that is an error status.
+/// Only without any status does it keep the status-less reading. A decoded
+/// `response.failed` is classified by `response::terminal_failure`. Every failure reading reads the frame as the pinned
 /// reader decodes it (`crate::codex_event::classification_view`): a struct written as a
 /// JSON array as the members it decodes to, the last of a repeated key, and the value a
 /// private number or raw value stands for, decide the classification, while the client
@@ -1377,28 +1378,33 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         (_, Some(Wrapped::Retryable(None))) => terminal(&view()),
         (Some(event), Some(Wrapped::Notice)) => notice(event),
         (None, _) => return Reading::Passed { decoded: false },
-        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => {
-            let view = view();
-            match status_frame(&view) {
-                // A status the pinned mapping turns into no error, on a decoded `error`
-                // that is no wrapped frame (a private value in `error.code`, say, which
-                // `WrappedWebsocketError` cannot read as a `String`): a notice too, as
-                // the same frame with the value resolved is.
-                Some(Reading::Failure { error, .. }) if !crate::codex_event::error_status(error.status) => {
-                    notice(event)
+        // A decoded `error` with a status that is no wrapped frame: the status did not
+        // read as the wrapped struct's `u16` (zero, negative, past `u16`, a fraction or
+        // exponent, a string, a private number, a container), or the frame is refused for
+        // another member (`status` beside `status_code`, a repeated `status`, a private
+        // value in `error.code`, which `WrappedWebsocketError` cannot read as a
+        // `String`). The pinned reader then reads the `error` branch, which reads no
+        // status (`process_responses_event`, `sse/responses.rs:375-385`): a notice
+        // unless its logical code is a terminal provider code. Go's integer reading of
+        // the status ([`ws_error`]) decides nothing here; it only keeps the scheduler's
+        // status for a terminal provider failure the pinned reader raises anyway.
+        (Some(event), _) if event.kind == "error" && crate::codex_event::status_present(payload) => {
+            if terminal_provider_error(event) {
+                let view = view();
+                match status_frame(&view) {
+                    Some(Reading::Failure { error, body }) if crate::codex_event::error_status(error.status) => {
+                        Some(Reading::Failure { error, body })
+                    }
+                    _ => terminal(&view),
                 }
-                Some(failure) => Some(failure),
-                // A status the status-frame reading does not take (it reads only a
-                // positive one, as Go does) is still a status: zero, a negative number,
-                // one past `u16`, or no number at all. The pinned mapping turns none of
-                // them into an error (`StatusCode::from_u16` refuses zero, and the others
-                // do not read as `WrappedWebsocketErrorEvent` at all), so the frame is a
-                // notice as well. Only a missing or `null` status keeps the status-less
-                // reading.
-                None if event.kind == "error" && crate::codex_event::status_present(&view) => notice(event),
-                None => terminal(&view),
+            } else {
+                None
             }
         }
+        // Only a decoded `error` without any status keeps the status-less failure
+        // reading (the status-frame reading finds no status in it either); a decoded
+        // `response.failed` is classified by its own reading.
+        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(&view()),
         (Some(event), _) => {
             return Reading::Event {
                 terminal: event.outcome().ends_turn(),
@@ -1487,7 +1493,21 @@ pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
             std::borrow::Cow::Owned(view) => account_reading(&view),
             std::borrow::Cow::Borrowed(_) => false,
         }
+        || refused_slot_account(payload)
         || (!decoded && crate::codex_ambiguous::ambiguous_account(payload))
+}
+
+/// Whether a failure slot a failure reading reads as an error object, named by position
+/// although its typed decode refuses it (`crate::codex_event::safety_views`), reads as an
+/// account failure. A wrapped error array whose `error.code` is a private raw value, which
+/// the pinned reader skips, or a `response.failed` whose `response.error` array the
+/// `Error` struct refuses, which it reports only as its generic stream error, still
+/// carries what the upstream wrote. Safety only: the frame keeps its classification, or
+/// its skip.
+fn refused_slot_account(payload: &str) -> bool {
+    crate::codex_event::safety_views(payload)
+        .iter()
+        .any(|view| account_reading(view))
 }
 
 /// Whether the status-frame reading ([`ws_error`]) or the terminal failure reading
@@ -1527,9 +1547,16 @@ pub(super) fn account_failure(status: u16) -> bool {
 /// part: the pinned wrapped mapping keeps an explicit `status: 400` for the scheduler
 /// while the frame's own error reads as a rate limit. The classification is not changed
 /// here; only what the client receives is. Unlike [`account_shaped`], which judges frames
-/// the pinned reader skips or ignores, a failure keeps the pinned last-key reading.
+/// the pinned reader skips or ignores, a failure keeps the pinned last-key reading. A
+/// failure slot the pinned reader refuses to decode is read by position as well
+/// ([`refused_slot_account`]): a `response.failed` whose `response.error` array the
+/// `Error` struct refuses keeps its generic 502 for the scheduler and is withheld when
+/// that array reads as an account failure.
 pub(super) fn account_sensitive(status: u16, frame: &str) -> bool {
-    account_failure(status) || account_reading(&crate::codex_event::classification_view(frame.trim()))
+    let frame = frame.trim();
+    account_failure(status)
+        || account_reading(&crate::codex_event::classification_view(frame))
+        || refused_slot_account(frame)
 }
 
 /// Marks `error`, the classification of the upstream failure `frame`, as

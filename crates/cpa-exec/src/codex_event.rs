@@ -849,20 +849,39 @@ fn members<'a, const N: usize>(object: &'a str, names: [&str; N]) -> [Option<&'a
         .map_or([None; N], |found| found.map(|raw| raw.map(RawValue::get)))
 }
 
-/// Whether the `error` frame `view`, read as [`classification_view`] reads it, carries a
-/// status: a `status` or `status_code` member (the pinned wrapped event's `status` and
-/// its alias, `endpoint/responses_websocket.rs:692-702`) that is not `null`, whatever its
-/// value. A missing or `null` one is the struct's `None`. Any other value is a status
-/// the pinned mapping turns into no error unless it is one `http::StatusCode` accepts
-/// outside 2xx: zero (`StatusCode::from_u16` refuses it), and a value that does not
-/// read as a `u16` at all (negative, too large, a fraction, a string, a container), in
-/// which case the frame is not a wrapped event and the reader goes on to the `error`
-/// branch.
-pub(crate) fn status_present(view: &str) -> bool {
-    members(view, ["status", "status_code"])
-        .into_iter()
-        .flatten()
-        .any(|value| value.trim() != "null")
+/// Whether the `error` frame `payload`, as sent, carries a status: any occurrence of a
+/// `status` or `status_code` member (the pinned wrapped event's `status` and its alias,
+/// `endpoint/responses_websocket.rs:692-702`) whose value is not `null`, a private raw
+/// value holding `null` included ([`resolved`]). Every occurrence counts, not only the
+/// last: both members together, or one repeated, are a duplicate field the wrapped
+/// struct refuses, so the pinned reader has no wrapped event and goes on to the `error`
+/// branch, which reads no status at all (`process_responses_event`,
+/// `sse/responses.rs:375-385`). A status that is present therefore never classifies a
+/// frame the wrapped mapping did not take ([`wrapped`]); only a frame with no status at
+/// all keeps the proxy's status-less failure reading. `false` for anything but an object.
+pub(crate) fn status_present(payload: &str) -> bool {
+    struct Present;
+    impl<'de> Visitor<'de> for Present {
+        type Value = bool;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<bool, M::Error> {
+            let mut present = false;
+            while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                if matches!(key.as_ref(), "status" | "status_code") {
+                    let value = map.next_value::<&'de RawValue>()?;
+                    present |= resolved(value.get()) != "null";
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(present)
+        }
+    }
+    serde_json::Deserializer::from_str(payload.trim())
+        .deserialize_map(Present)
+        .unwrap_or(false)
 }
 
 /// `payload`, an event, as the pinned client's `serde_json::Value` holds it, for
@@ -1041,6 +1060,125 @@ fn positional_object(payload: &str) -> Option<String> {
     })
 }
 
+/// The frame `payload` for account safety only (#6, #25 criterion 7): each failure slot
+/// a failure reading reads as an error object, named by position as the struct that
+/// reads it names its members, whether or not the typed decode accepts the value.
+/// Processing eligibility and account safety are separate facts: a struct the pinned
+/// reader refuses still carries what the upstream wrote in it, and a frame that names the
+/// pooled account, or carries its tokens, must not reach the client because a decoder
+/// refused one of its members. Nothing here classifies, settles or cools;
+/// [`classification_view`] alone does that.
+///
+/// The slots, each read with the last of a repeated key and private values resolved
+/// ([`pinned_view`]):
+///
+/// - A frame written as a JSON array that neither `ResponsesStreamEvent` nor
+///   `WrappedWebsocketErrorEvent` accepts ([`positional_object`] is `None`): its leading
+///   elements named as each struct names them ([`EVENT_MEMBERS`], [`WRAPPED_MEMBERS`]).
+/// - A `response.failed`'s `response.error` written as an array the `Error` struct
+///   refuses (too short, too long, a member of the wrong type): its leading elements
+///   named as `Error` names them ([`FAILED_ERROR_MEMBERS`]). The pinned reader reports
+///   only its generic stream error, and the scheduler keeps that classification. The
+///   frame's own `error`, which the proxy's failure reading falls back to
+///   (`codex_response::terminal_failure_body`), is read the same way.
+/// - An `error` frame's `error` written as an array: named as `WrappedWebsocketError`
+///   names them ([`WRAPPED_ERROR_MEMBERS`]), the one pinned struct that reads it by
+///   position, and as `Error` names them, the struct of a failure's error object.
+///
+/// Empty when none of them applies, which is every frame without such an array: an
+/// object frame costs one pass for its `type`, `response` and `error`, and each
+/// projection one [`pinned_view`] more. The frame itself is never changed.
+pub(crate) fn safety_views(payload: &str) -> Vec<String> {
+    let payload = payload.trim();
+    let mut out = Vec::new();
+    if payload.starts_with('[') {
+        match positional_object(payload) {
+            Some(object) => out.extend(refused_slots(&members_view(&object))),
+            None => {
+                for names in [&EVENT_MEMBERS[..], &WRAPPED_MEMBERS[..]] {
+                    let Some(object) = leading(payload, names) else {
+                        continue;
+                    };
+                    let view = members_view(&object);
+                    out.extend(refused_slots(&view));
+                    out.push(view.into_owned());
+                }
+            }
+        }
+    } else if payload.starts_with('{') {
+        out.extend(refused_slots(&members_view(payload)));
+    }
+    out
+}
+
+/// In `view`, a [`members_view`]: each failure slot [`safety_views`] names by position
+/// that is still an array, replaced by the object of its leading elements, one view per
+/// slot and naming. Empty when the frame has no such slot.
+fn refused_slots(view: &str) -> Vec<String> {
+    let [kind, response, error] = members(view, ["type", "response", "error"]);
+    let Some(kind) = kind.and_then(|kind| serde_json::from_str::<Cow<'_, str>>(kind).ok()) else {
+        return Vec::new();
+    };
+    let slots: Vec<(&str, &[&str])> = match kind.as_ref() {
+        "response.failed" => [response.and_then(|r| member(r, "error")), error]
+            .into_iter()
+            .flatten()
+            .map(|slot| (slot, &FAILED_ERROR_MEMBERS[..]))
+            .collect(),
+        "error" => error
+            .into_iter()
+            .flat_map(|slot| [(slot, &WRAPPED_ERROR_MEMBERS[..]), (slot, &FAILED_ERROR_MEMBERS[..])])
+            .collect(),
+        _ => Vec::new(),
+    };
+    slots
+        .into_iter()
+        .filter_map(|(slot, names)| {
+            let array = slot.trim();
+            if !array.starts_with('[') {
+                return None;
+            }
+            let object = leading(array, names)?;
+            // `members` and `member` borrow from their input, which borrows from `view`.
+            let start = array.as_ptr() as usize - view.as_ptr() as usize;
+            let mut out = String::with_capacity(view.len() + 48);
+            out.push_str(&view[..start]);
+            out.push_str(&object);
+            out.push_str(&view[start + array.len()..]);
+            Some(out)
+        })
+        .collect()
+}
+
+/// [`named`] for account safety: the JSON array `array` as the object of its first
+/// `names.len()` elements, whether or not a struct accepts it. Extra elements are left
+/// out, as are `null` ones.
+fn leading(array: &str, names: &[&str]) -> Option<String> {
+    let elements: Vec<&RawValue> = serde_json::from_str(array).ok()?;
+    let kept = elements.len().min(names.len());
+    let mut out = String::with_capacity(array.len() + 24 * kept);
+    out.push('{');
+    for (name, element) in names.iter().zip(&elements[..kept]) {
+        push_member(&mut out, name, element.get());
+    }
+    out.push('}');
+    Some(out)
+}
+
+/// Appends `"name":raw` to the object `out` is building, unless `raw` is `null`.
+fn push_member(out: &mut String, name: &str, raw: &str) {
+    if raw == "null" {
+        return;
+    }
+    if out.len() > 1 {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\":");
+    out.push_str(raw);
+}
+
 /// The JSON array `array`, a struct written by position that serde already accepted, as
 /// an object: element `i` is the member `names[i]`, as sent, unless `nested` gives the
 /// member's value (`nested(name, element)`); `null` elements are left out.
@@ -1053,18 +1191,9 @@ fn named(array: &str, names: &[&str], nested: impl Fn(&str, &str) -> Option<Stri
     out.push('{');
     for (name, element) in names.iter().zip(&elements) {
         let raw = element.get();
-        if raw == "null" {
-            continue;
-        }
-        if out.len() > 1 {
-            out.push(',');
-        }
-        out.push('"');
-        out.push_str(name);
-        out.push_str("\":");
         match nested(name, raw) {
-            Some(value) => out.push_str(&value),
-            None => out.push_str(raw),
+            Some(value) => push_member(&mut out, name, &value),
+            None => push_member(&mut out, name, raw),
         }
     }
     out.push('}');
