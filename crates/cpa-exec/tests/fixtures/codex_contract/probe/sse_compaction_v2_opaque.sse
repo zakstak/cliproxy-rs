@@ -1,0 +1,9 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_cmp_probe","status":"in_progress","output":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{"type":"compaction","id":"cmp_probe_1","encrypted_content":"ENCRYPTED-COMPACTION-PROBE+/=","x_future":{"n":1.50,"e":1e3,"z":-0.0,"big":12345678901234567890,"s":"caf\u00e9"}}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":2,"x_event":null,"response":{"id":"resp_cmp_probe","object":"response","status":"completed","output":[{"type":"compaction","id":"cmp_probe_1","encrypted_content":"ENCRYPTED-COMPACTION-PROBE+/=","x_future":{"n":1.50}}],"usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1024},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1200},"x_response":[1.0,-0]}}
+

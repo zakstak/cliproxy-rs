@@ -1,0 +1,33 @@
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_absent","status":"incomplete","output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_null_details","status":"incomplete","incomplete_details":null,"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_null_reason","status":"incomplete","incomplete_details":{"reason":null},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_empty_reason","status":"incomplete","incomplete_details":{"reason":""},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_unknown_reason","status":"incomplete","incomplete_details":{"reason":"future_reason"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_interrupted","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_content_filter","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_max_output","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_no_usage","status":"incomplete","output":[]}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":7,"x_event":[],"response":{"id":"resp_inc_opaque","object":"response","status":"incomplete","incomplete_details":{"x_detail":1.50},"output":[],"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":null,"total_tokens":5},"metadata":null,"future":{"n":1e3,"z":-0.0,"big":12345678901234567890,"s":"caf\u00e9","dup":1,"dup":2}}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc_partial","status":"incomplete","incomplete_details":{"reason":"future_reason"},"output":[{"type":"message","id":"msg_inc_1","status":"incomplete","role":"assistant","content":[{"type":"output_text","text":"Hel","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}
+

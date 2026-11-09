@@ -2151,3 +2151,140 @@ async fn steering_responses_pass_unchanged_before_and_after_the_first_delta() {
     assert_eq!(upstream_frames(&proxy, 0), sent, "the client's frames, byte for byte");
     assert!(proxy.upstream.http().is_empty(), "no HTTP request");
 }
+
+/// Each event as an SSE event, for a turn served over HTTP.
+fn as_sse(frames: &[String]) -> String {
+    frames
+        .iter()
+        .map(|f| format!("event: {}\ndata: {f}\n\n", cpa_common::rawjson::get(f, "type").str()))
+        .collect()
+}
+
+/// #25 and #7: every `response.incomplete` the provider sends (the hand-written probe:
+/// absent, null, empty, unknown and named reasons with zero output, missing usage, opaque
+/// members and raw spellings, partial output with partial usage) reaches the client as
+/// sent, at every stage of the response: as the turn's first event, after a delivered
+/// `response.created`, and after output. It does on an ordinary upstream socket, with
+/// bootstrap buffering holding the leading events, on a `codex.response-steering`
+/// connection, and on a turn served over HTTP with and without buffering. The pinned
+/// client reads each end itself (`codex-api/src/sse/responses.rs:451-506` at
+/// 44ccf394573c), so the proxy invents no failure, completion, usage or output for it.
+/// The connection stays open, the next create runs on the same upstream socket (or a
+/// second HTTP request), and nothing is replayed.
+#[tokio::test]
+async fn every_incomplete_reaches_websocket_clients_as_sent() {
+    const CREATED: &str =
+        r#"{"type":"response.created","response":{"id":"resp_inc","status":"in_progress","output":[]}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","item_id":"msg_inc_1","output_index":0,"content_index":0,"delta":"Hel"}"#;
+    const CREATED_2: &str =
+        r#"{"type":"response.created","response":{"id":"resp_next","status":"in_progress","output":[]}}"#;
+    const DONE_2: &str = r#"{"type":"response.completed","response":{"id":"resp_next","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    let next = vec![CREATED_2.to_owned(), DONE_2.to_owned()];
+    let ends = events("probe-sse-incomplete-ends");
+    assert_eq!(ends.len(), 11);
+    for end in &ends {
+        for leading in [&[][..], &[CREATED][..], &[CREATED, DELTA][..]] {
+            let mut first: Vec<String> = leading.iter().map(|f| (*f).to_owned()).collect();
+            first.push(end.clone());
+            for (transport, config, websockets) in [
+                ("socket", "", true),
+                ("socket, buffering", BUFFERING, true),
+                ("steering", STEERING, true),
+                ("http", "", false),
+                ("http, buffering", BUFFERING, false),
+            ] {
+                let case = format!("{transport} after {} events: {end}", leading.len());
+                let script = if websockets {
+                    Script {
+                        ws: [&first, &next]
+                            .iter()
+                            .map(|batch| batch.iter().map(|f| Bytes::from(f.clone())).collect())
+                            .collect(),
+                        ..Script::default()
+                    }
+                } else {
+                    Script {
+                        http: [&first, &next]
+                            .iter()
+                            .map(|batch| cpa_server::testing::codex_capture::Reply::sse(as_sse(batch)))
+                            .collect(),
+                        ..Script::default()
+                    }
+                };
+                let proxy = proxy_with(script, config, |url| {
+                    vec![credential(Profile::Chatgpt, url, websockets)]
+                })
+                .await;
+                let mut socket = connect(&proxy).await;
+                let create = client_frame("ws-create-first", "gpt-5.5");
+                // Inherited steering limit (docs/codex/CONTRACT.md "Native WebSocket
+                // route"): the duplex reads later client frames only after a first
+                // `response.created`, so a first response that ends without one is
+                // checked for that end alone.
+                let turns: &[&Vec<String>] = if transport == "steering" && leading.is_empty() {
+                    &[&first]
+                } else {
+                    &[&first, &next]
+                };
+                for want in turns {
+                    socket.send(Message::text(create.clone())).await.unwrap();
+                    let got = read(&mut socket, &TERMINAL).await;
+                    assert_eq!(&got.frames, *want, "{case}: as upstream sent them");
+                    assert_eq!(got.closed, None, "{case}");
+                }
+                if turns.len() == 1 {
+                    assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create), "{case}");
+                } else if websockets {
+                    assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: one upstream socket");
+                    assert_eq!(upstream_frames(&proxy, 0), [create.clone(), create], "{case}");
+                    assert!(proxy.upstream.http().is_empty(), "{case}");
+                } else {
+                    assert_eq!(proxy.upstream.http().len(), 2, "{case}: one request per turn");
+                    assert!(proxy.upstream.sockets().is_empty(), "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// #25: a remote compaction v2 answer on a WebSocket turn. The pinned client sends the
+/// `compaction_trigger` request through its ordinary Responses stream, WebSocket
+/// included, and requires one `compaction` output item before `response.completed`
+/// (`core/src/compact_remote_v2.rs:291-492` at 44ccf394573c). The first-party test's
+/// answer and the opaque probe reach the client frame for frame, on an upstream socket
+/// and over HTTP, and the request frame reaches the socket as sent.
+#[tokio::test]
+async fn compaction_v2_answers_pass_unchanged_on_websocket_turns() {
+    let create = as_create("http-request-compaction", "gpt-5.5");
+    for name in ["sse-compaction-v2", "probe-sse-compaction-v2-opaque"] {
+        let answer = events(name);
+        for profile in [Profile::Chatgpt, Profile::Compatible] {
+            for websockets in [true, false] {
+                let case = format!("{name} {profile:?} websockets={websockets}");
+                let script = if websockets {
+                    Script {
+                        ws: replies(&[name]),
+                        ..Script::default()
+                    }
+                } else {
+                    Script {
+                        http: vec![cpa_server::testing::codex_capture::Reply::sse(fixture(name).bytes())],
+                        ..Script::default()
+                    }
+                };
+                let proxy = proxy_with(script, "", |url| vec![credential(profile, url, websockets)]).await;
+                let mut socket = connect(&proxy).await;
+                socket.send(Message::text(create.clone())).await.unwrap();
+                let got = read(&mut socket, &TERMINAL).await;
+                assert_eq!(got.frames, answer, "{case}");
+                assert_eq!(got.closed, None, "{case}");
+                if websockets {
+                    assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create), "{case}");
+                } else {
+                    assert_eq!(proxy.upstream.http().len(), 1, "{case}");
+                }
+            }
+        }
+    }
+}

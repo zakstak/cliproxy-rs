@@ -22,10 +22,11 @@
 //! any content can still fail over to another credential. Once anything is delivered,
 //! a failure ends the stream after its event and is never replayed elsewhere. A
 //! buffered `chatgpt` answer is the `response` object of the terminal event, byte for
-//! byte. Two existing exceptions stay (`docs/DIFFERENCES-FROM-GO.md`): a Codex client
-//! gets the backend's status-less context-window `error` event as `response.failed`
-//! (#5), and an empty `response.incomplete` without a client-side reason before any
-//! content is a request-scoped 502.
+//! byte. One exception stays (`docs/DIFFERENCES-FROM-GO.md`): a Codex client gets the
+//! backend's status-less context-window `error` event as `response.failed` (#5). Every
+//! `response.incomplete` is the provider's terminal event, whatever its reason, output or
+//! usage, before or after delivery (#25): the pinned client reads it as a terminal,
+//! non-retryable `ResponseIncomplete` (`codex-api/src/sse/responses.rs:451-506`).
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -327,8 +328,6 @@ impl CodexExecutor {
             capture_lines: call == Call::Stream,
             model_level_cooling: settings.model_level_cooling,
             codex_client: request::codex_client(&req),
-            items: 0,
-            saw_delta: false,
         };
         let (status, headers) = (upstream.status, upstream.headers);
         if ws_session.is_some() && !sse {
@@ -501,10 +500,9 @@ enum Seen {
     /// A leading event with no content yet (`response.created` and the like).
     Handshake,
     Content,
-    /// `response.completed`, `response.incomplete` or `response.done`.
+    /// `response.completed`, `response.incomplete` or `response.done`, whatever its
+    /// reason, output or usage: the provider's terminal event, delivered as sent.
     Terminal,
-    /// An empty `response.incomplete` that counts as a silent upstream abort.
-    EmptyIncomplete,
     /// A failure event, classified on a copy. `deliver` replaces the event only for the
     /// #5 context-window conversion.
     Failure {
@@ -524,8 +522,6 @@ struct Observer {
     capture_lines: bool,
     model_level_cooling: bool,
     codex_client: bool,
-    items: usize,
-    saw_delta: bool,
 }
 
 /// The lines of one framed event, split as the shared SSE framer splits them: `\r\n`,
@@ -600,33 +596,45 @@ fn unframed(item: Result<Bytes, ExecError>) -> Option<Result<Bytes, ExecError>> 
 /// What the client receives for a failure it does not see as an event (a buffered
 /// answer, or a failure before anything was delivered): the provider's error object in
 /// the API's error envelope, byte for byte, with the event's `sequence_number` as
-/// spelled; the whole event when it carries no error object. Nothing is filled in.
+/// spelled; the whole event when it carries no error object. Nothing is filled in. The
+/// event is read as an upstream event ([`event_type`]), not through the client request
+/// boundary.
 fn delivered_failure(payload: &str) -> Bytes {
     let whole = || Bytes::copy_from_slice(payload.as_bytes());
-    let Ok(event) = CodexBody::parse(payload.as_bytes()) else {
+    if !rawjson::valid(payload) {
+        return whole();
+    }
+    let object = |path: &str| Some(rawjson::get(payload, path)).filter(|v| v.kind() == rawjson::Kind::Object);
+    let Some(error) = object("response.error").or_else(|| object("error")) else {
         return whole();
     };
-    fn object<'a>(m: Option<&cpa_common::codex_body::Member<'a>>) -> Option<&'a [u8]> {
-        m.filter(|m| m.kind == Kind::Object).map(|m| m.raw)
-    }
-    let mut error = None;
-    if let Some(response) = object(event.get("response"))
-        && let Ok(response) = CodexBody::parse(response)
-    {
-        error = object(response.get("error"));
-    }
-    let Some(error) = error.or_else(|| object(event.get("error"))) else {
-        return whole();
-    };
+    let error = error.json();
     let mut out = Vec::with_capacity(error.len() + 48);
     out.extend_from_slice(b"{\"error\":");
-    out.extend_from_slice(error);
-    if let Some(sequence) = event.get("sequence_number") {
+    out.extend_from_slice(error.as_bytes());
+    let sequence = rawjson::get(payload, "sequence_number");
+    if sequence.exists() {
         out.extend_from_slice(b",\"sequence_number\":");
-        out.extend_from_slice(sequence.raw);
+        out.extend_from_slice(sequence.json().as_bytes());
     }
     out.push(b'}');
     Bytes::from(out)
+}
+
+/// The `type` of an upstream event, read as the provider sent it: any valid JSON object
+/// counts, duplicate keys and unknown member types included. The client request
+/// boundary (`CodexBody`) never applies to upstream events (docs/codex/CONTRACT.md
+/// "Native HTTP route"). An event that is not valid JSON has no type, and the pinned
+/// client skips it (`codex-api/src/sse/responses.rs:633-643` at 44ccf394573c).
+fn event_type(payload: &str) -> Cow<'_, str> {
+    if !rawjson::valid(payload) {
+        return Cow::Borrowed("");
+    }
+    let kind = rawjson::get(payload, "type");
+    if kind.kind() != rawjson::Kind::String {
+        return Cow::Borrowed("");
+    }
+    Cow::Owned(kind.str().to_owned())
 }
 
 impl Observer {
@@ -635,7 +643,7 @@ impl Observer {
         if self.capture_lines {
             // Each physical line as scanned, and none after the event that ends the
             // response.
-            let last = matches!(seen, Seen::Terminal | Seen::EmptyIncomplete | Seen::Failure { .. });
+            let last = matches!(seen, Seen::Terminal | Seen::Failure { .. });
             for line in sse_lines(frame) {
                 self.wire.chunk(line);
                 if last && line.starts_with(b"data:") {
@@ -675,21 +683,9 @@ impl Observer {
             let body = delivered_failure(payload);
             return Seen::Failure { error, body, deliver };
         }
-        if response::meaningful_delta(payload) {
-            self.saw_delta = true;
-        }
-        let kind = CodexBody::parse(payload.as_bytes())
-            .ok()
-            .and_then(|event| event.get("type").and_then(|t| t.text()).map(Cow::into_owned))
-            .unwrap_or_default();
-        match kind.as_str() {
-            "response.output_item.done" => {
-                self.items += 1;
-                Seen::Content
-            }
-            "response.incomplete" if response::empty_incomplete(payload, self.items, self.saw_delta) => {
-                Seen::EmptyIncomplete
-            }
+        let kind = event_type(payload);
+        match kind.as_ref() {
+            "response.output_item.done" => Seen::Content,
             "response.completed" | "response.incomplete" | "response.done" => Seen::Terminal,
             _ if response::bufferable(payload) => Seen::Handshake,
             _ => Seen::Content,
@@ -707,14 +703,12 @@ impl Observer {
                 Seen::Terminal => {
                     let (_, payload) = parse_frame(&frame);
                     let payload = payload.unwrap_or_default();
-                    let event = CodexBody::parse(payload.trim().as_bytes()).map_err(|_| response_unreadable())?;
-                    let object = event.get("response").filter(|r| r.kind == Kind::Object);
-                    return object
-                        .map(|r| Bytes::copy_from_slice(r.raw))
-                        .ok_or_else(response_unreadable);
-                }
-                Seen::EmptyIncomplete => {
-                    return Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE));
+                    // `see` classified it as a terminal event, so it is valid JSON.
+                    let object = rawjson::get(payload.trim(), "response");
+                    if object.kind() != rawjson::Kind::Object {
+                        return Err(response_unreadable());
+                    }
+                    return Ok(Bytes::copy_from_slice(object.json().as_bytes()));
                 }
                 Seen::Failure { error, body, .. } => return Err(direct(error, body)),
                 Seen::Handshake | Seen::Content => {}
@@ -789,16 +783,6 @@ impl Passthrough {
             }
             Seen::Terminal => {
                 self.commit();
-                self.out.push_back(Ok(terminated(frame)));
-                self.done = true;
-            }
-            Seen::EmptyIncomplete if !self.committed => {
-                self.held.clear();
-                self.out
-                    .push_back(Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE)));
-                self.done = true;
-            }
-            Seen::EmptyIncomplete => {
                 self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
             }

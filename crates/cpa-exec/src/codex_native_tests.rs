@@ -523,8 +523,6 @@ fn observer() -> Observer {
         capture_lines: true,
         model_level_cooling: false,
         codex_client: false,
-        items: 0,
-        saw_delta: false,
     }
 }
 
@@ -669,29 +667,102 @@ async fn upstream_http_status_is_delivered_apart_from_classification() {
     }
 }
 
-/// The two narrow exceptions stay: an empty `response.incomplete` without a client-side
-/// reason before any delivery is a 502; with `interrupted` it passes unchanged.
+/// The buffered answer for an event whose `response` is its last member: that object,
+/// sliced from the event's own bytes.
+fn last_response_object(event: &str) -> &str {
+    &event[event.find(r#""response":"#).unwrap() + 11..event.len() - 1]
+}
+
+/// #25 and #7: every `response.incomplete` is the provider's terminal event, whatever its
+/// reason (absent, null, empty, unknown or named), output or usage, and however much of
+/// the response was delivered before it. The pinned client reads it as a terminal,
+/// non-retryable `ResponseIncomplete`, or `interrupted` as the end of the turn
+/// (`codex-api/src/sse/responses.rs:451-506` at 44ccf394573c). It reaches a streaming
+/// client byte for byte, with no error after it, whether bootstrap buffering holds the
+/// leading events or not; a buffered client gets its `response` object byte for byte.
 #[tokio::test]
-async fn empty_incomplete_keeps_its_narrow_exception() {
-    let empty = r#"{"type":"response.incomplete","response":{"id":"r","output":[],"usage":{"output_tokens":0}}}"#;
-    let (out, error) = through(&[format!("data: {empty}\n\n").as_bytes()], None).await;
-    assert!(out.is_empty());
-    assert_eq!(error.unwrap().status, 502);
-    let interrupted = r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"output_tokens":0}}}"#;
-    let sse = format!("data: {interrupted}\n\n");
-    let (out, error) = through(&[sse.as_bytes()], None).await;
-    assert!(error.is_none(), "{error:?}");
-    assert_eq!(text(&out), sse);
-    // A held `response.created` goes with the abort: nothing was delivered yet.
-    let held = format!("data: {CREATED}\n\ndata: {empty}\n\n");
-    let (out, error) = through(&[held.as_bytes()], Some(None)).await;
-    assert!(out.is_empty(), "{}", text(&out));
-    assert_eq!(error.unwrap().status, 502);
-    // Once an event was delivered, the unexplained end is the provider's terminal event:
-    // it passes unchanged, with no error after it.
-    let (out, error) = through(&[held.as_bytes()], None).await;
-    assert!(error.is_none(), "{error:?}");
-    assert_eq!(text(&out), held);
+async fn every_incomplete_passes_unchanged_at_every_stage() {
+    let created = format!("event: response.created\ndata: {CREATED}\n\n");
+    let output = concat!(
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_inc_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+        "\n\n",
+    );
+    let ends = fixture("probe-sse-incomplete-ends").frames();
+    assert_eq!(ends.len(), 11);
+    for end in ends {
+        let end = text(&end);
+        let terminal = format!("event: response.incomplete\ndata: {end}\n\n");
+        for (stage, sse) in [
+            ("first event", terminal.clone()),
+            ("after response.created", format!("{created}{terminal}")),
+            ("after output", format!("{created}{output}{terminal}")),
+        ] {
+            for hold in [None, Some(None), Some(Some(Duration::from_secs(30)))] {
+                let (out, error) = through(&[sse.as_bytes()], hold).await;
+                assert!(error.is_none(), "{stage} hold={hold:?} {end}: {error:?}");
+                assert_eq!(text(&out), sse, "{stage} hold={hold:?}");
+            }
+            let object = observer().aggregate(sse.as_bytes()).unwrap();
+            assert_eq!(text(&object), last_response_object(&end), "{stage}: buffered");
+        }
+    }
+}
+
+/// Upstream events are read as the provider sent them, not through the client request
+/// boundary: a terminal event with a duplicate key or a top-level member whose type a
+/// request could not have still ends the response, and a failure event with a duplicate
+/// key still delivers its error object. An event that is not valid JSON has no type (the
+/// pinned client skips it, `sse/responses.rs:633-643`), so it never ends the response;
+/// it passes as sent like any other event.
+#[tokio::test]
+async fn upstream_events_skip_the_request_boundary() {
+    let completed =
+        r#"{"type":"response.completed","model":1,"stream":"x","response":{"id":"r","output":[],"dup":1,"dup":2}}"#;
+    let broken = r#"{"type":"response.completed","response":{"id":"r""#;
+    for sse in [
+        format!("data: {completed}\n\n"),
+        format!("data: {CREATED}\n\ndata: {broken}\n\ndata: {completed}\n\n"),
+    ] {
+        for hold in [None, Some(None)] {
+            let (out, error) = through(&[sse.as_bytes()], hold).await;
+            assert!(error.is_none(), "hold={hold:?}: {error:?}");
+            assert_eq!(text(&out), sse);
+        }
+        let object = observer().aggregate(sse.as_bytes()).unwrap();
+        assert_eq!(text(&object), last_response_object(completed));
+    }
+    let failed = r#"{"type":"response.failed","sequence_number":7,"response":{"id":"r","dup":1,"dup":2,"error":{"code":"server_error","message":"m","x":1.50}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {failed}\n\n").as_bytes())
+        .unwrap_err();
+    assert_eq!(
+        text(&error.body),
+        r#"{"error":{"code":"server_error","message":"m","x":1.50},"sequence_number":7}"#
+    );
+}
+
+/// A stream that ends without a terminal event is still a truncation: an
+/// `incomplete` event is never invented for it, and the attempt ends with the
+/// request-scoped 408 after the events that arrived (`docs/codex/CONTRACT.md` "Native
+/// HTTP route").
+#[tokio::test]
+async fn a_stream_without_its_terminal_event_stays_truncated() {
+    let sse = format!("data: {CREATED}\n\n");
+    for hold in [None, Some(None)] {
+        let (out, error) = through(&[sse.as_bytes()], hold).await;
+        let error = error.expect("a truncated stream fails");
+        assert_eq!(
+            (error.status, error.scope),
+            (408, FailureScope::Request),
+            "hold={hold:?}"
+        );
+        if hold.is_none() {
+            assert_eq!(text(&out), sse, "what arrived, unchanged");
+        }
+    }
+    let error = observer().aggregate(sse.as_bytes()).unwrap_err();
+    assert_eq!((error.status, error.scope), (408, FailureScope::Request));
 }
 
 /// An API key on api.openai.com is the `api-key` profile. The request is captured as it

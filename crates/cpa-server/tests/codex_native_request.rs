@@ -893,3 +893,146 @@ async fn reported_zero_and_missing_usage_pass_unchanged() {
 fn text(bytes: Bytes) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
+
+/// The buffered answer for an event whose `response` is its last member: that object,
+/// sliced from the event's own bytes.
+fn last_response_object(event: &str) -> &str {
+    &event[event.find(r#""response":"#).unwrap() + 11..event.len() - 1]
+}
+
+/// The usage records published for `count` answers.
+async fn usage_records(proxy: &Native, count: usize) -> Vec<serde_json::Value> {
+    let queue = proxy.rt.usage_queue();
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while records.len() < count {
+            records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+    records
+}
+
+/// #25 and #7: every `response.incomplete` the provider sends (the hand-written probe:
+/// absent, null, empty, unknown and named reasons with zero output, missing usage, opaque
+/// members, raw spellings and a duplicate key, partial output with partial usage)
+/// reaches the client as sent at every stage: as the first event, after
+/// `response.created`, and after output, with and without bootstrap buffering. A
+/// streaming client gets the upstream's bytes; a buffered client gets the event's
+/// `response` object byte for byte. The pinned client reads each end itself
+/// (`codex-api/src/sse/responses.rs:451-506` at 44ccf394573c), so no 502, completion,
+/// usage or output is invented. Each answer is one attempt, recorded once by passive
+/// accounting as the provider's terminal event, and the credential does not cool.
+#[tokio::test]
+async fn every_incomplete_reaches_http_clients_as_sent() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_inc"}}"#,
+        "\n\n"
+    );
+    let output = concat!(
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_inc_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+        "\n\n"
+    );
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let ends: Vec<String> = fixture("probe-sse-incomplete-ends")
+        .frames()
+        .into_iter()
+        .map(text)
+        .collect();
+    assert_eq!(ends.len(), 11);
+    for end in &ends {
+        let terminal = format!("event: response.incomplete\ndata: {end}\n\n");
+        for (stage, stream) in [
+            ("first event", terminal.clone()),
+            ("after response.created", format!("{created}{terminal}")),
+            ("after output", format!("{created}{output}{terminal}")),
+        ] {
+            for (api_key, config) in [
+                (false, ""),
+                (false, "codex:\n  stream-bootstrap-buffering: true\n"),
+                (true, ""),
+            ] {
+                let case = format!("{stage} api_key={api_key} {config:?}: {end}");
+                let proxy = native(
+                    api_key,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(end)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                assert!(records.iter().all(|r| r["failed"] == false), "{case}: {records:?}");
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// #25: a remote compaction v2 answer. The pinned client sends a `compaction_trigger`
+/// request through its ordinary Responses stream on `/responses` and requires one
+/// `compaction` output item before `response.completed`
+/// (`core/src/compact_remote_v2.rs:291-492` at 44ccf394573c). The first-party test's
+/// answer (`sse-compaction-v2`) and the opaque probe reach a streaming client byte for
+/// byte; a buffered client gets the completion's `response` object byte for byte (the
+/// destination contract; `chatgpt` acceptance of `stream: false` is unknown). The
+/// request reaches the upstream as sent. Both native profiles a loopback can stand for.
+#[tokio::test]
+async fn compaction_v2_answers_pass_unchanged() {
+    let request = routed("http-request-compaction");
+    let buffered = request.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for name in ["sse-compaction-v2", "probe-sse-compaction-v2-opaque"] {
+        let stream = text_of(name);
+        let completed = text(fixture(name).frames().pop().unwrap());
+        for api_key in [false, true] {
+            let case = format!("{name} api_key={api_key}");
+            let proxy = native(
+                api_key,
+                Script {
+                    http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], request.clone()).await;
+            assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+            assert_eq!(
+                (status, answer.as_str()),
+                (200, last_response_object(&completed)),
+                "{case}: buffered"
+            );
+            let sent = proxy.upstream.http();
+            assert_eq!(sent.len(), 2, "{case}");
+            assert_eq!(sent[0].uri.path(), "/responses", "{case}");
+            assert_eq!(
+                String::from_utf8_lossy(&sent[0].body),
+                request,
+                "{case}: the request as sent"
+            );
+        }
+    }
+}

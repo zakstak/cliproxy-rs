@@ -1091,9 +1091,6 @@ impl Duplex {
             self.done = true;
             return;
         }
-        if kind == "response.output_item.done" {
-            self.turn.items.collect(payload);
-        }
         // An explicit later create's model-only metadata, ahead of its first event.
         if kind == "response.created"
             && let Some(announce) = self.announce.take()
@@ -1169,7 +1166,6 @@ impl Duplex {
         self.release_steering_settings();
         self.first_response = false;
         self.response_active = true;
-        self.turn.items = Default::default();
         true
     }
 

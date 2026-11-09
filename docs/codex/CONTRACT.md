@@ -144,12 +144,29 @@ discretionary mutation, and a migrated route must not perform it.
 | Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
-| Answer an empty `response.incomplete` (no output item, no output delta, `usage.output_tokens` written as `0`) whose reason is missing or is not `interrupted`, `content_filter` or `max_output_tokens`, while nothing of that request was delivered, with a request-scoped 502. Leading events held under `stream-bootstrap-buffering` are dropped with it. Once any upstream event was delivered, the event passes unchanged | Native HTTP streaming and buffered answers, ordinary native WebSocket turns and WebSocket turns over HTTP, on every profile. Never on a `codex.response-steering` connection | Failure classification of an upstream silent abort: proxy policy inherited from Go (`IsCodexTerminalEmptyIncomplete`), whose comment calls it a ChatGPT Codex silent abort. No first-party or provider source confirms that the backend sends this shape as an abort. The pinned client reads the event itself as a terminal, non-retryable `ResponseIncomplete` with its reason (`unknown` when missing), response ID and usage (`sse/responses.rs:451-506`; `protocol/src/error.rs` `retry_delay`). So the proxy replaces the event only while it still owns the whole answer, and never replaces a response that the client has seen start. Reasons `interrupted`, `content_filter` and `max_output_tokens` always pass unchanged. |
 | Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
 | Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
+
+No row replaces a provider's `response.incomplete` on a native route. Every one
+reaches the client as received, whatever its reason (absent, `null`, empty, unknown or
+named), output or usage, and however much of the response was delivered before it
+(#25, #7). The earlier row that answered a zero-output end without an exempt reason
+with a request-scoped 502, Go's `IsCodexTerminalEmptyIncomplete`, is removed. No
+first-party or provider source shows that the backend sends that shape as a silent
+abort. The pinned client classifies the event itself
+(`codex-api/src/sse/responses.rs:451-506`): `interrupted` ends the turn with
+`end_turn: false`, `content_filter` is its own error, and any other reason, `unknown`
+when missing or not a string, is a terminal `ResponseIncomplete` carrying the reason,
+response ID, usage and incomplete output items. That error has no retry delay
+(`protocol/src/error.rs:428-442`), so the client neither retries it nor reads it as a
+success. A replacement 502 would drop the ID, usage and partial output and change that
+classification. A stream that ends without any terminal event is a different case and
+still fails ([Native HTTP route](#native-http-route), [Native WebSocket
+route](#native-websocket-route)). The translated route keeps Go's rule until #27
+([Translated route](#translated-route)).
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
 Until it lands, header behaviour stays as it is; see
@@ -373,14 +390,26 @@ The response reaches the client as the upstream sent it:
   arrives before anything was delivered fails over to another credential when its scope
   allows it; otherwise the provider's event is delivered. After something was delivered,
   a failure ends the stream after its event and is never replayed on another credential.
+- Every `response.incomplete` is a terminal event and reaches the client as received, at
+  any stage, including as the first event and after events held for bootstrap.
+  [Permitted transformations](#permitted-transformations) explains why nothing replaces
+  it.
 - A stream that ends without a terminal event ends for the client too, without a local
-  event. The attempt records a request-scoped 408. A final event the upstream left open
-  gets the line endings that close it.
+  event. The proxy invents neither a `response.incomplete` nor a completion for it. The
+  attempt records a request-scoped 408. A final event the upstream left open gets the
+  line endings that close it.
+- The observer reads upstream events as the provider sent them, not through the client
+  [request boundary](#request-boundary). Any valid JSON event counts, with duplicate
+  keys or member types a request could not have. An event that is not valid JSON has
+  no type, so it never ends the response, and it still passes as sent. The pinned client
+  skips such an event (`sse/responses.rs:633-643`).
 - An upstream HTTP error keeps its classification for the scheduler, and the client
   receives the upstream's status, body and filtered headers unchanged
   (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit
   as 429 while the client still gets the upstream's 400 or 503.
 - A buffered `chatgpt` answer is the terminal event's `response` object, byte for byte.
+  For a `response.incomplete` that is the incomplete response, `status` and
+  `incomplete_details` included, under HTTP 200, as the upstream reported it.
   On `api-key` and `compatible`, a JSON answer passes unchanged. Compaction answers pass
   unchanged.
 - A failure event the client does not receive as an event (a buffered answer, or a
@@ -548,13 +577,22 @@ receives (`ExecError::delivered_event`).
   carry its tokens. The client gets the allowlisted subscription-limit event when it is an
   official Codex client (#6), or else a silent close. The scheduler still receives the
   classification, so the credential cools as before.
-- Two exceptions stay. A Codex client gets the status-less context-window `error` as
-  `response.failed` (#5). An empty `response.incomplete` that arrives before anything
-  of the turn was delivered is a request-scoped 502 (#7), and leading events held for
-  bootstrap go with it. Once an event reached the client, `response.created` included,
-  the empty `response.incomplete` reaches the client as sent and the socket stays. A
-  steering connection never replaces it. The
-  [permitted transformation](#permitted-transformations) defines its scope.
+- One exception stays: a Codex client gets the status-less context-window `error` as
+  `response.failed` (#5).
+- Every `response.incomplete` reaches the client as received, on an ordinary turn, a
+  steering connection and a turn served over HTTP, at any stage: as the turn's first
+  event, after events held for bootstrap, or after output. The socket stays for the next
+  turn, and the credential does not cool. Passive accounting records the response once,
+  as it records any terminal event the provider sends. An upstream socket that closes or
+  fails before the terminal event still ends the turn with that failure, and the proxy
+  invents no terminal event for it.
+- One limit is inherited on a steering connection. Its duplex reads the client's later
+  frames only after the first `response.created`, as Go's does
+  (`codex_websockets_duplex.go:391`, 601-605). If the first response ends without
+  `response.created`, as a `response.incomplete` or any other terminal event, the end
+  reaches the client as sent, but the connection takes no further client frame. Whether
+  a provider sends that shape is unknown. The pinned client does not use the steering
+  transport.
 - The interrupt regressions stay. An interrupt acknowledgement that arrives after the
   terminal event is still delivered. A late interrupt does not poison the next turn. An
   interrupted `response.incomplete` passes unchanged.
@@ -804,7 +842,11 @@ the translation of the aggregated terminal event. Usage is the provider's. A Cla
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
 provider's counts. Upstream errors keep their classification and reach the client in
-its own error format.
+its own error format. Until #27 replaces it, the translator keeps Go's empty-incomplete
+rule: a `response.incomplete` with no output item, no output delta and
+`output_tokens` 0, whose reason is missing or is not `interrupted`, `content_filter` or
+`max_output_tokens`, becomes a request-scoped 502. The native routes no longer apply it
+([Permitted transformations](#permitted-transformations)).
 
 ### Token counts and images
 
@@ -937,9 +979,13 @@ Passive accounting reads a copy and changes nothing.
   event (`responses_websocket.rs:919-933`). [Handshake metadata](#handshake-metadata) has the details.
 - Interrupted and incomplete responses. `response.incomplete` with reason `interrupted`
   ends the turn with `end_turn: false`. `content_filter` is its own error. Any other
-  reason is an error that keeps the partial output and usage (`sse/responses.rs:451-512`).
-  The proxy forwards all three as received, and it never turns an incomplete or
-  disconnected response into a successful completion.
+  reason, `unknown` when missing, is a terminal `ResponseIncomplete` that keeps the
+  reason, response ID, partial output and usage, with no retry delay
+  (`sse/responses.rs:451-506`, `protocol/src/error.rs:428-442`). It needs no preceding
+  `response.created`. The proxy forwards every native `response.incomplete` as
+  received, zero-output ends included, before or after anything was delivered. It never
+  turns an incomplete or disconnected response into a successful completion, and never
+  replaces an incomplete with a local failure.
 
 ## WebSocket state
 
