@@ -1412,10 +1412,7 @@ pub(super) enum Reading {
 /// without a status (`parse_terminal_provider_error`, `codex-api/src/error.rs:79-127`):
 /// its last `error.code` is a terminal provider code.
 fn terminal_provider_error(event: &crate::codex_event::Event<'_>) -> bool {
-    let code = event
-        .error
-        .and_then(|error| crate::codex_event::member(error, "code"))
-        .and_then(|code| serde_json::from_str::<String>(code).ok());
+    let code = event.error_str("code");
     matches!(
         code.as_deref(),
         Some(

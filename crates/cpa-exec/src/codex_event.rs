@@ -149,6 +149,26 @@ impl Event<'_> {
         let value = get(self.response?, key)?;
         serde_json::from_str::<String>(&value).ok()
     }
+
+    /// The string member of `error` as the pinned `Value` reads it, including private
+    /// values. A wrapped status notice can still carry a terminal provider error.
+    pub(crate) fn error_str(&self, key: &str) -> Option<String> {
+        let value = get(self.error?, key)?;
+        serde_json::from_str::<String>(&value).ok()
+    }
+
+    /// A context failure preserved by the executor. The relay must use the same
+    /// logical reading before delivering it and consuming its classified stream error.
+    pub fn is_context_window_failure(&self) -> bool {
+        self.kind == "response.failed"
+            && self
+                .response
+                .and_then(|response| get(response, "error"))
+                .and_then(|error| get(&error, "code"))
+                .and_then(|code| serde_json::from_str::<String>(&code).ok())
+                .as_deref()
+                == Some("context_length_exceeded")
+    }
 }
 
 /// `ResponsesStreamEvent`'s members, in its order and with its types. Serde also decodes

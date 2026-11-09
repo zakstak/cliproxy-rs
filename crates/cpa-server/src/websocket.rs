@@ -1523,6 +1523,7 @@ impl Connection {
                 // A decoded native event's `response.id` as the pinned `Value` reads it
                 // (the last of a repeated `id`), the response the executor settles.
                 let mut native_id = None;
+                let mut native_context_failure = false;
                 let kind = if ctx.native_served {
                     // The upstream event boundary (`cpa_exec::codex_event`): a frame the
                     // pinned client skips is relayed as sent, and nothing here reads it:
@@ -1531,6 +1532,7 @@ impl Connection {
                         Some(event) => {
                             native_terminal = Some(event.outcome().ends_turn());
                             native_id = Some(event.response_id().unwrap_or_default());
+                            native_context_failure = event.is_context_window_failure();
                             event.kind.into_owned()
                         }
                         None => {
@@ -1594,7 +1596,11 @@ impl Connection {
                     completed_output = turn.completed_output(&payload);
                     completed_id = native_id.take().unwrap_or_else(|| field(&payload, "response.id"));
                 }
-                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
+                preserved_event = if ctx.native_served {
+                    native_context_failure
+                } else {
+                    cpa_common::codex_client::is_context_window_failure(payload.as_bytes())
+                };
                 // The executor follows such an event with its classified error at once
                 // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
                 // scheduler even when the client interrupts or leaves during the write,

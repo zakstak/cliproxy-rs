@@ -2726,6 +2726,8 @@ enum Outcome {
     /// A request-scoped failure: the frame reaches the client as sent and ends the turn;
     /// nothing cools and the completion after it is not read.
     FailsAsSent,
+    /// A terminal provider failure reaches the client as sent and cools the model.
+    CooledProviderFailure,
     /// An account failure: the frame never reaches the client, the turn ends and the
     /// credential cools.
     AccountFailure,
@@ -2761,7 +2763,7 @@ async fn pinned_readings_decide_websocket_turns() {
     // The credential's own token (`credential`), standing in for a leaked secret.
     const TOKEN: &str = "at-FAKE";
     const ACCOUNT: &str = "acct-PRIVATE";
-    let cases: [(&str, Outcome, bool); 23] = [
+    let cases: [(&str, Outcome, bool); 25] = [
         // E1.
         (
             r#"{"type":"response.completed","response":{"id":"bad","future":{"$serde_json::private::Number":"bad"}}}"#,
@@ -2801,6 +2803,18 @@ async fn pinned_readings_decide_websocket_turns() {
         (
             r#"{"type":"error","status":204,"error":{"code":"other","message":"notice"}}"#,
             Passes,
+            true,
+        ),
+        // A successful wrapped status does not override a terminal provider code
+        // decoded from the pinned Value's private raw-value representation.
+        (
+            r#"{"type":"error","status":200,"error":{"$serde_json::private::RawValue":"{\"code\":\"model_not_found\"}"}}"#,
+            CooledProviderFailure,
+            true,
+        ),
+        (
+            r#"{"type":"error","status":200,"error":{"code":"model_not_found"}}"#,
+            CooledProviderFailure,
             true,
         ),
         (
@@ -2938,7 +2952,7 @@ async fn pinned_readings_decide_websocket_turns() {
                     assert_eq!(got.frames, [REAL_END], "{case}");
                     assert_eq!(got.closed, None, "{case}");
                 }
-                FailsAsSent => {
+                FailsAsSent | CooledProviderFailure => {
                     assert!(got.frames.iter().any(|f| f == event), "{case}: {got:?}");
                     assert!(!got.frames.iter().any(|f| f == REAL_END), "{case}: {got:?}");
                     assert!(got.closed.is_some(), "{case}: {got:?}");
@@ -2953,7 +2967,57 @@ async fn pinned_readings_decide_websocket_turns() {
                     assert!(got.closed.is_some(), "{case}: {got:?}");
                 }
             }
-            assert_eq!(cooled, outcome == AccountFailure, "{case}: cooldown");
+            assert_eq!(
+                cooled,
+                matches!(outcome, AccountFailure | CooledProviderFailure),
+                "{case}: cooldown"
+            );
+        }
+    }
+}
+
+/// The relay must recognize the same logical context failure as the executor, including
+/// a last duplicate code and a private raw value. The one upstream failure is the only
+/// error the client receives; the classified stream error cannot add a local error.
+#[tokio::test]
+async fn logical_context_failures_are_preserved_without_an_extra_error() {
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    for event in [
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"other","code":"context_length_exceeded","message":"too long"}}}"#,
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}"}}}"#,
+    ] {
+        for (transport, config, websockets) in [
+            ("socket", "", true),
+            ("socket, buffering", BUFFERING, true),
+            ("steering", STEERING, true),
+            ("http", "", false),
+            ("http, buffering", BUFFERING, false),
+        ] {
+            let script = if websockets {
+                Script {
+                    ws: vec![vec![Bytes::from(event.to_owned())]],
+                    ..Script::default()
+                }
+            } else {
+                Script {
+                    http: vec![cpa_server::testing::codex_capture::Reply::sse(format!(
+                        "data: {event}\n\n"
+                    ))],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, config, |url| {
+                vec![credential(Profile::Chatgpt, url, websockets)]
+            })
+            .await;
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &[]).await;
+            assert_eq!(got.frames, [event], "{transport}: {got:?}");
+            assert!(got.closed.is_some(), "{transport}: {got:?}");
         }
     }
 }

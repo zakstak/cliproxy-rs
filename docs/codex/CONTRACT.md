@@ -681,7 +681,8 @@ receives (`ExecError::delivered_event`).
   success fails it by that status. A success status, or one outside 100 to 999, maps
   to no error: the frame is a notice that passes as sent (or is withheld when it would
   read as an account failure), ends nothing and cools nothing. A decoded notice still
-  fails the turn when the pinned `error` branch raises its code
+  fails the turn when the pinned `error` branch raises its logical code (including
+  an error object or code represented by a private raw value)
   (`parse_terminal_provider_error`, `error.rs:79-127`). A decoded `error` without a
   status, or one that is not a wrapped frame, keeps the status-less failure reading
   above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
