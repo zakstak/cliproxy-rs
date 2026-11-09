@@ -6086,9 +6086,9 @@ async fn an_initial_account_failure_fails_over_while_its_socket_loss_is_reported
                 assert!(proxy.rt.usage_queue().pop_oldest(10).is_empty(), "{case}: two records");
                 let auths = auths.lock().unwrap().clone();
                 assert_eq!(
-                    auths[..2],
-                    [format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")],
-                    "{case}"
+                    auths.get(..2),
+                    Some(&[format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")][..]),
+                    "{case}: the failover dials the second account: {auths:?}"
                 );
                 let (rejected, second) = (&records[0], &records[1]);
                 assert_eq!(rejected["failed"], true, "{case}: {rejected}");
