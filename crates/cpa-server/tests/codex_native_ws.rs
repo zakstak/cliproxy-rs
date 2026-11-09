@@ -2295,17 +2295,25 @@ struct Gated {
     frames: Arc<std::sync::Mutex<Vec<String>>>,
     seen: tokio::sync::watch::Receiver<usize>,
     release: Arc<tokio::sync::Notify>,
+    release_second: Arc<tokio::sync::Notify>,
 }
 
 impl Gated {
-    async fn start(replies: Vec<Vec<String>>) -> Self {
+    async fn start(replies: Vec<Vec<String>>, hold_second: bool) -> Self {
         use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (count, seen) = tokio::sync::watch::channel(0usize);
         let release = Arc::new(tokio::sync::Notify::new());
-        let shared = (frames.clone(), Arc::new(count), release.clone(), Arc::new(replies));
+        let release_second = Arc::new(tokio::sync::Notify::new());
+        let shared = (
+            frames.clone(),
+            Arc::new(count),
+            release.clone(),
+            release_second.clone(),
+            Arc::new(replies),
+        );
         let app = axum::Router::new().fallback(move |upgrade: WebSocketUpgrade| {
-            let (frames, count, release, replies) = shared.clone();
+            let (frames, count, release, release_second, replies) = shared.clone();
             async move {
                 let mut response = upgrade.on_upgrade(move |mut socket| async move {
                     let mut n = 0;
@@ -2315,6 +2323,8 @@ impl Gated {
                         count.send_replace(n + 1);
                         if n == 0 {
                             release.notified().await;
+                        } else if n == 1 && hold_second {
+                            release_second.notified().await;
                         }
                         for reply in replies.get(n).into_iter().flatten() {
                             if socket.send(Upstream::Text(reply.clone().into())).await.is_err() {
@@ -2335,6 +2345,7 @@ impl Gated {
             frames,
             seen,
             release,
+            release_second,
         }
     }
 
@@ -2402,7 +2413,7 @@ async fn first_terminal_error_recovery(reject_upstream: bool) {
                 replies.push(owned(&[REJECTED]));
             }
             replies.push(owned(&[CREATED_NEXT, DONE_NEXT]));
-            let mut upstream = Gated::start(replies).await;
+            let mut upstream = Gated::start(replies, false).await;
             let proxy = proxy_with(Script::default(), STEERING, |_| {
                 vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
             })
@@ -2513,7 +2524,11 @@ async fn first_response_ends_without_created_on_a_steering_connection() {
                     } else {
                         owned(&[CREATED_2, DONE_2])
                     };
-                    let mut upstream = Gated::start(vec![first.clone(), second.clone()]).await;
+                    // The early next create may already reach upstream. Hold its reply
+                    // until the first record has been checked, so that draining the
+                    // queue cannot race two valid response records against an expected one.
+                    let mut upstream =
+                        Gated::start(vec![first.clone(), second.clone()], action.starts_with("create")).await;
                     let proxy = proxy_with(Script::default(), STEERING, |_| {
                         vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
                     })
@@ -2555,6 +2570,7 @@ async fn first_response_ends_without_created_on_a_steering_connection() {
                                 [create.clone(), next.clone()],
                                 "{case}: the next create on the same socket, as sent"
                             );
+                            upstream.release_second.notify_one();
                             let got = read(&mut socket, &TERMINAL).await;
                             assert_eq!(got.frames, owned(&[METADATA, CREATED_2, DONE_2]), "{case}");
                             assert_eq!(got.closed, None, "{case}");
