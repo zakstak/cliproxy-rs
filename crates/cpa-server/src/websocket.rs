@@ -1520,6 +1520,9 @@ impl Connection {
                 // decoded event ends the turn here only when the pinned WebSocket reader
                 // ends it (`cpa_exec::codex_event::Outcome::ends_turn`).
                 let mut native_terminal = None;
+                // A decoded native event's `response.id` as the pinned `Value` reads it
+                // (the last of a repeated `id`), the response the executor settles.
+                let mut native_id = None;
                 let kind = if ctx.native_served {
                     // The upstream event boundary (`cpa_exec::codex_event`): a frame the
                     // pinned client skips is relayed as sent, and nothing here reads it:
@@ -1527,6 +1530,7 @@ impl Connection {
                     match cpa_exec::codex_event::decode(&payload) {
                         Some(event) => {
                             native_terminal = Some(event.outcome().ends_turn());
+                            native_id = Some(event.response_id().unwrap_or_default());
                             event.kind.into_owned()
                         }
                         None => {
@@ -1588,7 +1592,7 @@ impl Connection {
                     duplex_established = duplex;
                     completed = true;
                     completed_output = turn.completed_output(&payload);
-                    completed_id = field(&payload, "response.id");
+                    completed_id = native_id.take().unwrap_or_else(|| field(&payload, "response.id"));
                 }
                 preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
                 // The executor follows such an event with its classified error at once

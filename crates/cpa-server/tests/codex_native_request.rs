@@ -1643,3 +1643,227 @@ async fn read_on_events_end_http_responses_only_at_the_upstream_end() {
         );
     }
 }
+
+/// How [`chunked_upstream`] ends its one answer after the first chunk.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The terminating chunk: a clean end of the stream.
+    Clean,
+    /// One more chunk with `REAL_END`, then the terminating chunk.
+    Later,
+    /// The connection closes without the terminating chunk: a read failure.
+    Broken,
+}
+
+/// An upstream that answers its one request with a chunked event stream whose first chunk
+/// is `first`, then ends as `ending` says. The capture upstream always ends cleanly; this
+/// one can break the body after a whole event.
+async fn chunked_upstream(first: String, ending: Ending) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        // The request: its head, then a `content-length` body.
+        let mut request = Vec::new();
+        loop {
+            let mut buf = [0; 8192];
+            let n = conn.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).into_owned();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        conn.write_all(format!("{head}{:x}\r\n{first}\r\n", first.len()).as_bytes())
+            .await
+            .unwrap();
+        conn.flush().await.unwrap();
+        match ending {
+            Ending::Clean => conn.write_all(b"0\r\n\r\n").await.unwrap(),
+            Ending::Later => {
+                let tail = format!("data: {REAL_END}\n\n");
+                conn.write_all(format!("{:x}\r\n{tail}\r\n0\r\n\r\n", tail.len()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            Ending::Broken => {
+                // Lets the first chunk reach the reader before the close cuts the body.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        conn.flush().await.unwrap();
+    });
+    url
+}
+
+/// #25 (read-on), how the upstream ended: a buffered answer from an SSE upstream ends on a
+/// processing error only at a clean end of the stream, where the pinned SSE reader reports
+/// the error it recorded (`sse/responses.rs:616-621`). A read failure before any terminal
+/// event fails the answer, because that reader returns a read error at once (lines
+/// 602-614), whatever it recorded: the content-filter `response.incomplete` with usage
+/// 9/9/18 in one whole chunk, then a body cut off without its terminating chunk, is no
+/// successful answer and no successful record. The failure keeps the buffered route's
+/// request-scoped 408 for a stream without a terminal event, and its record carries no
+/// tokens (the server's failure records never do). Controls: the same event with a clean
+/// end is the answer, with its usage; a later completion decides; a cut-off body after
+/// `response.created` alone fails the same way; a cut-off after a real completion keeps
+/// that completion. The streaming route already fails on the read failure.
+#[tokio::test]
+async fn buffered_answers_end_on_a_processing_error_only_at_a_clean_end() {
+    const RECORDED: &str = r#"{"type":"response.incomplete","response":{"id":"resp_real","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    /// One body: its first chunk and ending, the client's mode, and what it gets.
+    struct Case {
+        name: &'static str,
+        first: &'static str,
+        ending: Ending,
+        buffered: bool,
+        status: u16,
+        answer: Option<&'static str>,
+        failed: bool,
+        total: i64,
+    }
+    let case = |name, first, ending, buffered, status, answer, failed, total| Case {
+        name,
+        first,
+        ending,
+        buffered,
+        status,
+        answer,
+        failed,
+        total,
+    };
+    let recorded_object = last_response_object(RECORDED);
+    let real_object = last_response_object(REAL_END);
+    let cases = [
+        case("recorded, broken", RECORDED, Ending::Broken, true, 408, None, true, 0),
+        case(
+            "recorded, clean",
+            RECORDED,
+            Ending::Clean,
+            true,
+            200,
+            Some(recorded_object),
+            false,
+            18,
+        ),
+        case(
+            "recorded, later completion",
+            RECORDED,
+            Ending::Later,
+            true,
+            200,
+            Some(real_object),
+            false,
+            5,
+        ),
+        case("created, broken", CREATED, Ending::Broken, true, 408, None, true, 0),
+        case(
+            "completion, broken",
+            REAL_END,
+            Ending::Broken,
+            true,
+            200,
+            Some(real_object),
+            false,
+            5,
+        ),
+        case(
+            "streaming, recorded, broken",
+            RECORDED,
+            Ending::Broken,
+            false,
+            200,
+            None,
+            true,
+            0,
+        ),
+    ];
+    for Case {
+        name: case,
+        first,
+        ending,
+        buffered: is_buffered,
+        status,
+        answer,
+        failed,
+        total,
+    } in cases
+    {
+        let upstream = chunked_upstream(format!("data: {first}\n\n"), ending).await;
+        let auth_dir = AuthDir::new();
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\naccess:\n  api-keys: [client-key]\n",
+            auth_dir.0.display()
+        ))
+        .unwrap();
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let rt = Arc::new(cpa_server::testing::runtime(
+            cfg,
+            vec![credential(false, &upstream)],
+            executors,
+        ));
+        rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let url = serve(cpa_server::router(rt.clone())).await;
+        let body = if is_buffered { buffered.clone() } else { full.clone() };
+        let response = wreq::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .header("authorization", "Bearer client-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let got_status = response.status().as_u16();
+        // A streaming body cut off by the upstream ends with an error, after the event.
+        let got = response.text().await.unwrap_or_default();
+        assert_eq!(got_status, status, "{case}: {got}");
+        match answer {
+            Some(answer) => assert_eq!(got, answer, "{case}"),
+            None if is_buffered => assert!(got.contains("stream closed before response.completed"), "{case}: {got}"),
+            None => {}
+        }
+        assert!(!got.contains("at-FAKE"), "{case}: {got}");
+        let queue = rt.usage_queue();
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while records.is_empty() {
+                records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+        assert_eq!(records.len(), 1, "{case}: {records:?}");
+        assert_eq!(records[0]["failed"], failed, "{case}: {records:?}");
+        assert_eq!(records[0]["tokens"]["total_tokens"], total, "{case}: {records:?}");
+        let credential = rt.store().snapshot()[0].id.clone();
+        assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+    }
+}

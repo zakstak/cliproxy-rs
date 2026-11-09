@@ -390,7 +390,7 @@ impl CodexExecutor {
         };
         let body = if sse {
             let wire = observer.wire.clone();
-            match observer.aggregate(&data) {
+            match observer.aggregate(&data, failed.is_none()) {
                 Ok(body) => body,
                 Err(error) => {
                     if let Some(failure) = failed {
@@ -690,9 +690,10 @@ impl Observer {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
         // Classification reads a copy, as the pinned `Value` holds it: the last of a
-        // repeated key decides. The client receives `delivered_failure`.
+        // repeated key and the private values resolved (`codex_event::pinned_view`). The
+        // client receives `delivered_failure`.
         let view = match event.kind.as_ref() {
-            "error" | "response.failed" => codex_event::last_wins(payload),
+            "error" | "response.failed" => codex_event::pinned_view(payload),
             _ => Cow::Borrowed(payload),
         };
         if let Some((error, _classified)) = response::terminal_failure(&view, self.model_level_cooling) {
@@ -732,8 +733,12 @@ impl Observer {
     /// A buffered answer from an SSE body: the terminal event's `response` object, byte
     /// for byte. A buffered client reads the SSE upstream as the pinned SSE reader does:
     /// past a processing error ([`Seen::Recorded`]) to a later terminal event, and on
-    /// the last such error when the stream ends without one.
-    fn aggregate(mut self, data: &[u8]) -> Result<Bytes, ExecError> {
+    /// the last such error when the stream ends `clean`ly without one
+    /// (`sse/responses.rs:616-621`). A read failure before any terminal event fails the
+    /// answer as a stream without one does, whatever was recorded: that reader returns a
+    /// read error at once (lines 602-614). A terminal event or failure before the read
+    /// failure still decides the answer.
+    fn aggregate(mut self, data: &[u8], clean: bool) -> Result<Bytes, ExecError> {
         let mut framer = cpa_translate::sse::Framer::with_limit(data.len() + 1);
         let mut frames = framer.push(data).unwrap_or_default();
         frames.extend(framer.finish());
@@ -746,7 +751,7 @@ impl Observer {
                 Seen::Handshake | Seen::Content | Seen::Undecoded => {}
             }
         }
-        match recorded {
+        match recorded.filter(|_| clean) {
             Some(frame) => {
                 self.account(&frame);
                 response_object(&frame)
@@ -900,7 +905,7 @@ impl Passthrough {
             let context = self.observer.codex_client
                 && parse_frame(&frame).1.is_some_and(|data| {
                     let payload = data.trim();
-                    let view = codex_event::last_wins(payload);
+                    let view = codex_event::pinned_view(payload);
                     cpa_common::codex_client::context_window_failure_event(payload, &view).is_some()
                 });
             context.then(|| frame.clone())
@@ -1021,8 +1026,10 @@ fn passthrough(
             match next {
                 Some(Ok(frame)) => st.take(frame),
                 Some(Err(error)) => {
-                    // The client has the provider's last processing error; its usage is
-                    // the provider's report, and the read failure still ends the attempt.
+                    // The client has the provider's last processing error, and the read
+                    // failure still ends the attempt: its record is failed, and a failure
+                    // record carries no tokens (the server's `PublishFailure`), whatever
+                    // the event reported.
                     if let Some(frame) = st.recorded.take() {
                         st.observer.account(&frame);
                     }

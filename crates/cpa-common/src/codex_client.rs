@@ -170,9 +170,9 @@ fn is_context_window_error(payload: &[u8]) -> bool {
 /// are left out when the upstream event has none.
 ///
 /// `reading` decides: the event as the client reads it, which for the pinned client is
-/// its `serde_json::Value`, keeping the last of a repeated key (the native routes'
-/// `codex_event::last_wins`). The event returned is `payload`, or built from `payload`'s
-/// own bytes.
+/// its `serde_json::Value`, keeping the last of a repeated key and resolving serde_json's
+/// private number and raw value tokens (the native routes' `codex_event::pinned_view`).
+/// The event returned is `payload`, or built from `payload`'s own bytes.
 pub fn context_window_failure_event<'a>(payload: &'a str, reading: &str) -> Option<std::borrow::Cow<'a, str>> {
     if is_context_window_failure(reading.as_bytes()) {
         return Some(std::borrow::Cow::Borrowed(payload));

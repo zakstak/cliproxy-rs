@@ -588,7 +588,7 @@ async fn every_sse_line_ending_and_split_passes_unchanged() {
             }
         }
         // A buffered answer reads the same terminal event.
-        let object = observer().aggregate(bytes).unwrap();
+        let object = observer().aggregate(bytes, true).unwrap();
         assert_eq!(
             text(&object),
             r#"{"id":"r","output":[],"n":12345678901234567890}"#,
@@ -632,13 +632,13 @@ async fn failures_deliver_the_raw_error_object() {
         assert!(error.direct);
         assert_eq!(text(&error.body), expected);
         // A buffered answer: the same.
-        let error = observer().aggregate(sse.as_bytes()).unwrap_err();
+        let error = observer().aggregate(sse.as_bytes(), true).unwrap_err();
         assert_eq!(text(&error.body), expected);
     }
     // An `error` event's own object, and an event without any: the whole event.
     let event = r#"{"type":"error","error":{"code":"server_is_overloaded","message":""}}"#;
     let error = observer()
-        .aggregate(format!("data: {event}\n\n").as_bytes())
+        .aggregate(format!("data: {event}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(
         text(&error.body),
@@ -646,7 +646,7 @@ async fn failures_deliver_the_raw_error_object() {
     );
     let bare = r#"{"type":"response.failed","response":{"id":"r","status":"failed"}}"#;
     let error = observer()
-        .aggregate(format!("data: {bare}\n\n").as_bytes())
+        .aggregate(format!("data: {bare}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(text(&error.body), bare);
 }
@@ -718,7 +718,7 @@ async fn every_incomplete_passes_unchanged_at_every_stage() {
                 assert!(error.is_none(), "{stage} hold={hold:?} {end}: {error:?}");
                 assert_eq!(text(&out), sse, "{stage} hold={hold:?}");
             }
-            let object = observer().aggregate(sse.as_bytes()).unwrap();
+            let object = observer().aggregate(sse.as_bytes(), true).unwrap();
             assert_eq!(text(&object), last_response_object(&end), "{stage}: buffered");
         }
     }
@@ -744,12 +744,12 @@ async fn upstream_events_skip_the_request_boundary() {
             assert!(error.is_none(), "hold={hold:?}: {error:?}");
             assert_eq!(text(&out), sse);
         }
-        let object = observer().aggregate(sse.as_bytes()).unwrap();
+        let object = observer().aggregate(sse.as_bytes(), true).unwrap();
         assert_eq!(text(&object), last_response_object(completed));
     }
     let failed = r#"{"type":"response.failed","sequence_number":7,"response":{"id":"r","dup":1,"dup":2,"error":{"code":"server_error","message":"m","x":1.50}}}"#;
     let error = observer()
-        .aggregate(format!("data: {failed}\n\n").as_bytes())
+        .aggregate(format!("data: {failed}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(
         text(&error.body),
@@ -776,7 +776,7 @@ async fn a_stream_without_its_terminal_event_stays_truncated() {
             assert_eq!(text(&out), sse, "what arrived, unchanged");
         }
     }
-    let error = observer().aggregate(sse.as_bytes()).unwrap_err();
+    let error = observer().aggregate(sse.as_bytes(), true).unwrap_err();
     assert_eq!((error.status, error.scope), (408, FailureScope::Request));
 }
 
@@ -1313,7 +1313,7 @@ async fn undecodable_events_never_end_fail_or_convert_the_response() {
                 assert_eq!(frames, want, "{event}: served over HTTP");
             }
         }
-        let answer = observer().aggregate(sse.as_bytes()).unwrap();
+        let answer = observer().aggregate(sse.as_bytes(), true).unwrap();
         assert_eq!(text(&answer), r#"{"id":"r2","output":[]}"#, "{event}");
     }
 }
@@ -1329,17 +1329,45 @@ async fn harmless_repeats_keep_the_decoded_outcome() {
     let (out, error) = through(&[sse.as_bytes()], None).await;
     assert!(error.is_none(), "{error:?}");
     assert_eq!(text(&out), format!("data: {end}\n\n"));
-    let answer = observer().aggregate(sse.as_bytes()).unwrap();
+    let answer = observer().aggregate(sse.as_bytes(), true).unwrap();
     assert_eq!(text(&answer), r#"{"id":"a","id":"b","output":[],"output":null}"#);
     let failed = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"r","error":{"code":"a"},"error":{"code":"b"}}}"#;
     let error = observer()
-        .aggregate(format!("data: {failed}\n\n").as_bytes())
+        .aggregate(format!("data: {failed}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(text(&error.body), failed);
     let single =
         r#"{"type":"response.failed","x":1,"x":2,"response":{"id":"r","id":"s","error":{"code":"a","code":"b"}}}"#;
     let error = observer()
-        .aggregate(format!("data: {single}\n\n").as_bytes())
+        .aggregate(format!("data: {single}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(text(&error.body), r#"{"error":{"code":"a","code":"b"}}"#);
+}
+
+/// #25 (read-on), how the body ended: a buffered answer ends on a processing error only
+/// at a `clean` end (`sse/responses.rs:616-621`). After a read failure the same events
+/// are a stream without a terminal event, which the pinned reader returns as the read
+/// error at once (lines 602-614): the request-scoped 408. A terminal event or a failure
+/// before the read failure still decides.
+#[test]
+fn a_processing_error_ends_a_buffered_answer_only_at_a_clean_end() {
+    let recorded = r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    let completed = r#"{"type":"response.completed","response":{"id":"r2","output":[]}}"#;
+    let failed = r#"{"type":"response.failed","response":{"id":"r","error":{"code":"server_error","message":"m"}}}"#;
+    let one = format!("data: {recorded}\n\n");
+    let object = observer().aggregate(one.as_bytes(), true).unwrap();
+    assert_eq!(text(&object), last_response_object(recorded));
+    for sse in [one.clone(), format!("data: {CREATED}\n\n{one}"), format!("{one}{one}")] {
+        let error = observer().aggregate(sse.as_bytes(), false).unwrap_err();
+        assert_eq!((error.status, error.scope), (408, FailureScope::Request), "{sse}");
+    }
+    for clean in [true, false] {
+        let later = format!("{one}data: {completed}\n\n");
+        let object = observer().aggregate(later.as_bytes(), clean).unwrap();
+        assert_eq!(text(&object), last_response_object(completed), "clean={clean}");
+        let error = observer()
+            .aggregate(format!("{one}data: {failed}\n\n").as_bytes(), clean)
+            .unwrap_err();
+        assert!(error.direct, "clean={clean}: {error:?}");
+    }
 }

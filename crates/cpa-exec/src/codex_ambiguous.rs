@@ -11,14 +11,19 @@
 //! withheld when any occurrence of any of those members could make it an account failure.
 //!
 //! The analysis is one tolerant pass that collects the occurrences of those members,
-//! then one check of each occurrence on its own; occurrences are not combined, so the
-//! work stays linear in the frame. That is a superset of the combinations a reader could
-//! make: an ambiguous frame can be withheld that no single reading classifies as an
-//! account failure. The pinned client skips it either way.
+//! then one check of each occurrence on its own, for the checks that read one member. The
+//! capacity check reads the error body a failure reading composes from several members
+//! (`response::terminal_failure`): the error object as sent, the frame's `message`,
+//! `code`, `error_type` and `param`, and a message taken from the other error object.
+//! For it, the pass keeps one summary of every piece any reading could compose, and no
+//! combination is enumerated, so the work stays linear in the frame. Both are a superset
+//! of the combinations a reader could make: an ambiguous frame can be withheld that no
+//! single reading classifies as an account failure. The pinned client skips it either
+//! way. A private number or raw value (`crate::codex_event::pinned_view`) is read both as
+//! sent and as the pinned `Value` reads it.
 
 use std::ops::Range;
 
-use crate::codex_response as response;
 use crate::rawjson;
 
 /// Where an object sits among those the failure readings read: the frame, its `error`
@@ -44,7 +49,7 @@ enum Slot {
     Field(&'static str),
 }
 
-const TOP: [&str; 7] = [
+const TOP: [&str; 8] = [
     "type",
     "status",
     "status_code",
@@ -52,6 +57,7 @@ const TOP: [&str; 7] = [
     "message",
     "code",
     "error_type",
+    "param",
 ];
 const FIELDS: [&str; 5] = ["type", "code", "status", "status_code", "message"];
 
@@ -201,11 +207,50 @@ fn key_text(quoted: &str) -> std::borrow::Cow<'_, str> {
 /// `type` of `error` or `response.failed`, with an account status (401, 402, 403 or 429)
 /// as the status frame reads it, or an error object `response::terminal_failure`
 /// classifies as one (an account `type`, `code` or status, a usage limit, a capacity
-/// message). Each occurrence is read as the readings read a value (`rawjson`); the
-/// capacity check is the readings' own (`response::is_capacity`).
+/// message in the body it composes, [`Capacity`]). Each occurrence is read as the
+/// readings read a value (`rawjson`). The frame is read as sent and, when it holds
+/// private values the pinned `Value` resolves, once more with them resolved.
 pub(crate) fn ambiguous_account(payload: &str) -> bool {
+    ambiguous(payload)
+        || match crate::codex_event::private_values_resolved(payload) {
+            std::borrow::Cow::Owned(resolved) => ambiguous(&resolved),
+            std::borrow::Cow::Borrowed(_) => false,
+        }
+}
+
+/// What the capacity check (`response::is_capacity`) can find in the error body some
+/// reading composes (`response::terminal_failure_body`). That body holds, as sent, an
+/// error object or the text of an error string, and it can take a message from the other
+/// error object, the error object's own `code` or `type`, or the frame's `message`,
+/// `code`, `error_type` and `param` (the text a reading takes from each). The check
+/// looks for its phrases in each message and in the whole body, so `model` in one piece
+/// and `at capacity` in another can be one capacity message. Each phrase lies within one
+/// piece: the body adds only keys and punctuation, which hold neither. So the union of
+/// what every piece holds is a superset of what any one body holds.
+#[derive(Default)]
+struct Capacity {
+    model: bool,
+    at_capacity: bool,
+    /// A phrase that is a capacity message on its own.
+    whole: bool,
+}
+
+impl Capacity {
+    fn note(&mut self, text: &str) {
+        let l = text.to_ascii_lowercase();
+        self.whole |= l.contains("model_at_capacity") || l.contains("model_is_at_capacity");
+        self.model |= l.contains("model");
+        self.at_capacity |= l.contains("at capacity");
+    }
+
+    fn possible(&self) -> bool {
+        self.whole || (self.model && self.at_capacity)
+    }
+}
+
+fn ambiguous(payload: &str) -> bool {
     let found = occurrences(payload);
-    // At most 13 distinct slots, so this stays linear in the occurrences.
+    // At most 14 distinct slots, so this stays linear in the occurrences.
     let mut seen: Vec<Slot> = Vec::new();
     let repeated = found.iter().any(|(slot, _)| {
         let again = seen.contains(slot);
@@ -262,14 +307,21 @@ pub(crate) fn ambiguous_account(payload: &str) -> bool {
         || values(&[Slot::Field("status"), Slot::Field("status_code")])
             .into_iter()
             .any(account)
-        || values(&[
-            Slot::Top("error"),
-            Slot::ResponseError,
-            Slot::Field("message"),
-            Slot::Top("message"),
-        ])
-        .into_iter()
-        .any(|raw| response::is_capacity(&format!(r#"{{"error":{raw}}}"#)))
+        || {
+            let mut capacity = Capacity::default();
+            for (slot, range) in &found {
+                let raw = &payload[range.clone()];
+                match slot {
+                    // An error object is composed as sent; an error string as its text.
+                    Slot::Top("error") | Slot::ResponseError if raw.starts_with(['{', '[']) => capacity.note(raw),
+                    Slot::Top("error" | "message" | "code" | "error_type" | "param")
+                    | Slot::ResponseError
+                    | Slot::Field("message" | "code" | "type") => capacity.note(rawjson::parse(raw).str()),
+                    _ => {}
+                }
+            }
+            capacity.possible()
+        }
 }
 
 #[cfg(test)]

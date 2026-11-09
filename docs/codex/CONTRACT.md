@@ -448,14 +448,22 @@ The response reaches the client as the upstream sent it:
   without one, the response ends on the last such event: the pinned SSE reader then
   reports the error it recorded (lines 616-621), which the client reads from the event
   it has, so nothing is added to the stream. A buffered answer is that event's
-  `response` object, and the one record carries its reported usage, not failed. A read
-  failure after it still fails the attempt, with that event's reported usage. A failure
-  event after it ends the response as any failure does. A stream that ends with no
+  `response` object, and the one record carries its reported usage, not failed. Only a
+  clean end does that: a read failure before any terminal event fails the attempt,
+  because the pinned SSE reader returns a read error at once (lines 602-614). A
+  streaming client gets the read failure after the events, and a buffered client the
+  request-scoped 408 of a stream without a terminal event; either record is failed and,
+  like every failure record (`PublishFailure`), carries no tokens. A terminal event or
+  failure before the read failure still decides the answer. A failure event after it
+  ends the response as any failure does. A stream that ends with no
   terminal event and no such event still fails with the request-scoped 408. A
   WebSocket turn served over HTTP is read by a WebSocket client, so it ends on such an
   event, as on an upstream socket ([Native WebSocket route](#native-websocket-route)).
 - A failure is classified as the pinned `Value` holds it: each object keeps the last of
-  a repeated key, compared after unescaping. That reading decides the status, scope,
+  a repeated key, compared after unescaping, and a member value that is serde_json's
+  private number or raw value is the number or the JSON text it holds, read the same way
+  (`value/de.rs` `visit_map` at serde_json 1.0.149;
+  `crates/cpa-exec/src/codex_event.rs` `pinned_view`). That reading decides the status, scope,
   retry hint, usage-limit, capacity and overload checks, the #5 context-window
   conversion and the account-failure boundary. The client still receives the event's
   own bytes; #5's converted event embeds the upstream `error` object as sent.
@@ -628,6 +636,11 @@ receives (`ExecError::delivered_event`).
   Before eviction, assigning an unmatched ID to the oldest pending create is inherited
   proxy policy from Go, with unknown provider applicability. The pinned client supplies
   no FIFO ownership rule for steering failures.
+- A decoded event names its response by the `response.id` the pinned `Value` reads: the
+  last of a repeated `id`, with private values resolved (`Event::response_id`). A
+  steering connection binds a `response.created` to that ID, feeds usage to and settles
+  the response it names, and an ordinary turn and the interrupt bookkeeping end that
+  response. Delivery keeps the event as sent.
 - An account failure (classified 401, 402, 403 or 429) never reaches the client as sent,
   on any path: an ordinary turn, the first or a later response of a steering connection,
   or a create still waiting in the duplex queue. Its frame can name the pooled account or
@@ -649,9 +662,15 @@ receives (`ExecError::delivered_event`).
   `status_code`, `error`, `code`, `message`, `error_type`, `response.error`, and the
   `type`, `code`, `status`, `status_code` and `message` of either error object), every
   other occurrence too, since a reader that acts on members as they stream past can
-  take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`). Each occurrence is
-  checked on its own, in one pass, so an ambiguous frame can be withheld that no single
-  reading classifies as an account failure; the pinned client skips it either way. It
+  take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`), and the frame's `param`,
+  which a status-less reading copies. Each occurrence is checked on its own, in one pass,
+  except the capacity check, which reads the error body a reading composes from several
+  members (the error object as sent, the frame's `message`, `code`, `error_type` and
+  `param`, and a message taken from the other error object): one summary of every piece
+  any reading could compose decides it, so `model` in one member and `at capacity` in
+  another count together. An ambiguous frame can therefore be withheld that no single
+  reading classifies as an account failure; the pinned client skips it either way. A
+  private number or raw value is read as sent and as the pinned `Value` reads it. It
   is not classified either, so the credential does not cool and the turn goes on. A
   decoded frame keeps the pinned last-key classification.
 - On an upstream socket a wrapped frame (a frame that does not decode, or a decoded

@@ -3213,3 +3213,380 @@ async fn ambiguous_account_frames_are_withheld_under_every_duplicate_reading() {
         }
     }
 }
+
+/// The five native paths a WebSocket client's turn can take: (name, extra config, whether
+/// the credential uses upstream sockets).
+const NATIVE_PATHS: [(&str, &str, bool); 5] = [
+    ("socket", "", true),
+    (
+        "socket, buffering",
+        "codex:\n  stream-bootstrap-buffering: true\n",
+        true,
+    ),
+    ("steering", STEERING, true),
+    ("http", "", false),
+    ("http, buffering", "codex:\n  stream-bootstrap-buffering: true\n", false),
+];
+
+/// What a WebSocket client got from one turn whose upstream sent `frames`, and what the
+/// proxy recorded.
+#[derive(Debug, PartialEq)]
+struct Turned {
+    frames: Vec<String>,
+    closed: Option<u16>,
+    records: Vec<serde_json::Value>,
+    cooldowns: usize,
+    attempts: usize,
+}
+
+/// One turn on `path` ([`NATIVE_PATHS`]): the upstream sends `frames` (as socket frames or
+/// SSE events), the client reads until `until` arrives, the socket closes or it goes
+/// quiet. The fake credential's token is `at-FAKE`; the client's key is `client-key`.
+async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> Turned {
+    let (_, config, websockets) = path;
+    let script = if websockets {
+        Script {
+            ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+            ..Script::default()
+        }
+    } else {
+        let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+        Script {
+            http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+            ..Script::default()
+        }
+    };
+    let proxy = proxy_with(script, config, |url| {
+        vec![credential(Profile::Chatgpt, url, websockets)]
+    })
+    .await;
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let mut got = Read::default();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                got.frames.push(text.as_str().to_owned());
+                if text.as_str() == until {
+                    break;
+                }
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                got.closed = Some(frame.map_or(1005, |f| u16::from(f.code)));
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_)) | None) => {
+                got.closed = Some(1006);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let records = records(&proxy, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let more = proxy.rt.usage_queue().pop_oldest(10);
+    assert!(more.is_empty(), "one record: {records:?} {more:?}");
+    let cooldowns = proxy
+        .rt
+        .store()
+        .snapshot()
+        .iter()
+        .map(|c| proxy.rt.store().cooldowns(&c.id).len())
+        .sum();
+    let attempts = if websockets {
+        proxy.upstream.sockets().len()
+    } else {
+        proxy.upstream.http().len()
+    };
+    Turned {
+        frames: got.frames,
+        closed: got.closed,
+        records,
+        cooldowns,
+        attempts,
+    }
+}
+
+/// #25 (E2) and #6, a capacity message composed from several members: a failure reading
+/// builds one error body from the error object as sent, the frame's `message`, `code`,
+/// `error_type` and `param`, and a message taken from the other error object
+/// (`codex_response::terminal_failure_body`), and its capacity check reads that whole
+/// body. So `model` in one member and `at capacity` in another make the middle reading of
+/// a repeated `type` a 429 although no member is one alone, and the frame, which the
+/// pinned client cannot decode, could name the pooled account or carry the credential's
+/// own token. Each is withheld without cooling, usage, acknowledgement or ownership
+/// effects: the real completion after it arrives, the one record carries its usage, and
+/// neither `at-FAKE` nor `acct-PRIVATE` reaches the client (whose key is `client-key`).
+/// The safe controls pass as sent: the same pieces where no reading composes them (an
+/// unrelated object), and pieces that are no capacity message together. On the five
+/// native paths.
+#[tokio::test]
+async fn composed_capacity_frames_are_withheld_on_every_native_path() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let withheld = [
+        // The three review witnesses: split `code` and `message`, `param`, and the
+        // response error's message composed into the root error object.
+        r#"{"type":"response.future","type":"error","type":"response.future","code":"model","message":"at capacity","private_account":"acct-PRIVATE","token":"at-FAKE"}"#,
+        r#"{"type":"response.future","type":"error","type":"response.future","param":"model at capacity","private_account":"acct-PRIVATE","token":"at-FAKE"}"#,
+        r#"{"type":"response.future","type":"error","type":"response.future","error":{"type":"model","private_account":"acct-PRIVATE","token":"at-FAKE"},"response":{"error":{"message":"at capacity"}}}"#,
+        // `error_type` with `message`; an escaped phrase a reading unescapes; a key of the
+        // error object holding `model`; a `response.failed` whose error object composes.
+        r#"{"type":"x","type":"error","type":"x","error_type":"model","message":"at capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}"#,
+        r#"{"type":"x","type":"error","type":"x","message":"mod\u0065l at\u0020capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"model":"gpt","note":"at capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#,
+        r#"{"type":"x","type":"response.failed","type":"x","response":{"error":{"code":"model","message":"at capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}}}"#,
+        // A capacity code alone, and an error string.
+        r#"{"type":"x","type":"error","type":"x","code":"model_at_capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":"model at capacity","token":"at-FAKE","private_account":"acct-PRIVATE"}"#,
+        // A private raw value the pinned `Value` reads as the error object.
+        r#"{"type":"x","type":"error","type":"x","error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\"}"},"token":"at-FAKE","private_account":"acct-PRIVATE"}"#,
+    ];
+    let passes = [
+        r#"{"type":"x","type":"error","type":"x","meta":{"code":"model","message":"at capacity"},"error":{"code":"other","message":"bad input"}}"#,
+        r#"{"type":"x","type":"error","type":"x","code":"model","message":"busy"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"code":"other","message":"at capacity"}}"#,
+    ];
+    let cases = withheld
+        .iter()
+        .map(|e| (*e, true))
+        .chain(passes.iter().map(|e| (*e, false)));
+    for (event, withhold) in cases {
+        for path in NATIVE_PATHS {
+            let case = format!("{}: {event}", path.0);
+            let got = native_turn(path, &[event, REAL_END], REAL_END).await;
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+                "{case}: the credential's token or the account reached the client: {got:?}"
+            );
+            if withhold {
+                assert_eq!(got.frames, [REAL_END], "{case}");
+            } else {
+                assert_eq!(got.frames, [event, REAL_END], "{case}");
+            }
+            assert_eq!(got.closed, None, "{case}");
+            assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+            assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}: {got:?}");
+            assert_eq!(got.cooldowns, 0, "{case}");
+            assert_eq!(got.attempts, 1, "{case}");
+        }
+    }
+}
+
+/// #25 and #6, a decoded failure as the pinned `Value` holds it: the first-party build's
+/// serde_json (1.0.149 with `arbitrary_precision` and `raw_value`) reads an object whose
+/// one member is its private raw value as the JSON text it holds, and one that is its
+/// private number as that number (`value/de.rs`, `visit_map`). A decoded `response.failed`
+/// whose `response.error` is such a raw value is the rate-limit failure inside it, so it
+/// is classified 429 and never reaches the client as sent: its frame can carry the
+/// credential's own token or name the pooled account. Each wrapped event takes the same
+/// turn, record and cooldowns as the same event with the value resolved, on the five
+/// native paths: the raw value, a raw value inside a raw value, the last of a repeated
+/// key inside the text, a private number as the error's status, and the whole `response`
+/// as a raw value. The reversed repeat (an account type first) is no account failure in
+/// either form, and reaches the client as sent.
+#[tokio::test]
+async fn decoded_private_values_classify_as_the_pinned_value_reads_them() {
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    // (event as sent, the same event with its private values resolved, an account failure)
+    let cases = [
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"$serde_json::private::RawValue\":\"{\\\"code\\\":\\\"invalid_api_key\\\",\\\"token\\\":\\\"at-FAKE\\\"}\"}"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"invalid_api_key","token":"at-FAKE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"type\":\"invalid_request_error\",\"type\":\"permission_error\",\"token\":\"at-FAKE\"}"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"permission_error","token":"at-FAKE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"other","status":{"$serde_json::private::Number":"429"},"token":"at-FAKE"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"other","status":429,"token":"at-FAKE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"$serde_json::private::RawValue":"{\"id\":\"r1\",\"error\":{\"code\":\"rate_limit_exceeded\",\"token\":\"at-FAKE\"}}"}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"rate_limit_exceeded","token":"at-FAKE"}}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"type\":\"permission_error\",\"type\":\"invalid_request_error\",\"message\":\"bad\"}"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","message":"bad"}}}"#,
+            false,
+        ),
+    ];
+    for (wrapped, resolved, account) in cases {
+        assert!(cpa_exec::codex_event::decode(wrapped).is_some(), "{wrapped}");
+        for path in NATIVE_PATHS {
+            let case = format!("{}: {wrapped}", path.0);
+            let got = native_turn(path, &[wrapped, REAL_END], REAL_END).await;
+            let want = native_turn(path, &[resolved, REAL_END], REAL_END).await;
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+                "{case}: the credential's token or the account reached the client: {got:?}"
+            );
+            // The resolved event's frames, as sent, wherever one reached the client.
+            let as_sent = |t: &Turned, raw: &str| -> Vec<String> {
+                t.frames
+                    .iter()
+                    .map(|f| if f == raw { "EVENT".to_owned() } else { f.clone() })
+                    .collect()
+            };
+            assert_eq!(as_sent(&got, wrapped), as_sent(&want, resolved), "{case}");
+            assert_eq!(got.closed, want.closed, "{case}");
+            assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+            assert_eq!(got.attempts, want.attempts, "{case}");
+            for key in ["failed", "fail"] {
+                assert_eq!(got.records[0][key], want.records[0][key], "{case}: {got:?} {want:?}");
+            }
+            assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+            // An account failure never reaches the client as sent; any other failure does.
+            assert_eq!(
+                !as_sent(&got, wrapped).iter().any(|f| f == "EVENT"),
+                account,
+                "{case}: {got:?}"
+            );
+            assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+        }
+    }
+}
+
+/// #25 and #7, response identity: a decoded event names its response by the `response.id`
+/// the pinned `Value` reads, the last of a repeated `id` (and a private raw value's text).
+/// A steering connection's ledger settles the response the pinned reader completes: a
+/// completion repeating `id` with the created response's ID last is that response's end,
+/// recorded while the socket stays open with its usage, as on an ordinary socket. Each
+/// event with a repeated or wrapped ID takes the same turn and record as the same event
+/// with the ID the pinned `Value` reads: the completion's last ID, the created event's
+/// last ID, the reversed order (whose last ID names no created response), and a private
+/// raw value. The client receives each frame as sent.
+#[tokio::test]
+async fn decoded_response_ids_settle_as_the_pinned_value_reads_them() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    let end = |id: &str| {
+        format!(
+            r#"{{"type":"response.completed","response":{{{id},"output":[],"usage":{{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}}}}"#
+        )
+    };
+    // (created, completion) as sent, the same pair with the IDs the pinned `Value` reads,
+    // and whether the created response settles while the socket is open.
+    let cases = [
+        (
+            CREATED.to_owned(),
+            end(r#""id":"stale","id":"r1""#),
+            CREATED.to_owned(),
+            end(r#""id":"r1""#),
+            true,
+        ),
+        (
+            r#"{"type":"response.created","response":{"id":"stale","id":"r1"}}"#.to_owned(),
+            end(r#""id":"r1""#),
+            CREATED.to_owned(),
+            end(r#""id":"r1""#),
+            true,
+        ),
+        (
+            CREATED.to_owned(),
+            end(r#""id":"r1","id":"stale""#),
+            CREATED.to_owned(),
+            end(r#""id":"stale""#),
+            false,
+        ),
+        (
+            CREATED.to_owned(),
+            end(r#""id":{"$serde_json::private::RawValue":"\"r1\""}"#),
+            CREATED.to_owned(),
+            end(r#""id":"r1""#),
+            true,
+        ),
+    ];
+    for (created, completed, pinned_created, pinned_completed, settles) in cases {
+        for steering in [false, true] {
+            let case = format!("steering {steering}: {created} {completed}");
+            let mut outcomes = Vec::new();
+            for (created, completed) in [(&created, &completed), (&pinned_created, &pinned_completed)] {
+                assert!(cpa_exec::codex_event::decode(completed).is_some(), "{completed}");
+                let proxy = proxy(
+                    Profile::Chatgpt,
+                    Script {
+                        ws: vec![vec![Bytes::from(created.clone()), Bytes::from(completed.clone())]],
+                        ..Script::default()
+                    },
+                    if steering { STEERING } else { "" },
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                let got = read(&mut socket, &["response.completed"]).await;
+                assert_eq!(got.frames, [created.as_str(), completed.as_str()], "{case}");
+                // Records published while the socket is open.
+                let mut open = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                    while open.is_empty() {
+                        open.extend(
+                            proxy
+                                .rt
+                                .usage_queue()
+                                .pop_oldest(10)
+                                .iter()
+                                .map(|r| serde_json::from_slice::<serde_json::Value>(r).unwrap()),
+                        );
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                let published_open = open.len();
+                socket.send(Message::Close(None)).await.unwrap();
+                drop(socket);
+                let all = if open.is_empty() {
+                    records(&proxy, 1).await
+                } else {
+                    open
+                };
+                // A response left open fails when the socket goes: as the client's
+                // cancellation (499) or as the upstream socket's end (502), whichever the
+                // duplex sees first, so only a settled record's status is compared.
+                let failed = all[0]["failed"].clone();
+                let status = if failed == false {
+                    all[0]["fail"]["status_code"].clone()
+                } else {
+                    serde_json::Value::Null
+                };
+                outcomes.push((published_open, all.len(), failed, status, tokens(&all[0])));
+            }
+            assert_eq!(
+                outcomes[0], outcomes[1],
+                "{case}: as sent, then as the pinned `Value` reads it: {outcomes:?}"
+            );
+            if settles {
+                assert_eq!(outcomes[0].0, 1, "{case}: settled while open: {outcomes:?}");
+                assert_eq!(outcomes[0].2, false, "{case}: {outcomes:?}");
+                assert_eq!(outcomes[0].4, [3, 2, 5], "{case}: {outcomes:?}");
+            }
+        }
+    }
+}

@@ -413,7 +413,7 @@ fn last_wins_keeps_the_last_of_each_repeated_key() {
             r#"{"s":"\"a\":1,\"a\":2","n":1e3}"#,
         ),
     ] {
-        let got = last_wins(payload);
+        let got = pinned_view(payload);
         assert!(matches!(got, Cow::Owned(_)), "{payload}");
         assert_eq!(got, view, "{payload}");
         let pinned: Value = serde_json::from_str(payload).unwrap();
@@ -428,7 +428,7 @@ fn last_wins_keeps_the_last_of_each_repeated_key() {
         "",
     ] {
         assert!(
-            matches!(last_wins(unchanged), Cow::Borrowed(s) if s == unchanged),
+            matches!(pinned_view(unchanged), Cow::Borrowed(s) if s == unchanged),
             "{unchanged}"
         );
     }
@@ -607,4 +607,121 @@ fn outcome_and_accounted_follow_the_pinned_reader() {
     assert_eq!(event.response_id().as_deref(), Some("b"));
     let event = decode(r#"{"type":"response.completed","response":{"id":5}}"#).unwrap();
     assert_eq!(event.response_id(), None);
+}
+
+/// The classification view resolves serde_json's private values as the first-party
+/// `Value` reads them (`value/de.rs` `visit_map` at serde_json 1.0.149 with
+/// `arbitrary_precision` and `raw_value`): an object whose first key is the private
+/// number token is that number, digits as sent; one whose first key is the private raw
+/// value token is the JSON text it holds, read in turn (nested raw values, private
+/// numbers, and the last of a repeated key inside it, root included). It also keeps the
+/// last of a repeated key around them. What the pinned `Value` would not read that way
+/// stays as sent: the event's own first key (the event is a struct), a token object with
+/// another member, a token that is not the first key, an invalid number or JSON text, and
+/// the token as a string.
+#[test]
+fn pinned_view_resolves_private_values_as_the_first_party_value_does() {
+    for (payload, view) in [
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\",\"token\":\"at-FAKE\"}"}}}"#,
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","token":"at-FAKE"}}}"#,
+        ),
+        (
+            r#"{"type":"error","error":{"status":{"$serde_json::private::Number":"429"},"n":{"$serde_json::private::Number":"-0"},"e":{"$serde_json::private::Number":"1e400"},"f":{ "$serde_json::private::Number" : "1.50" }}}"#,
+            r#"{"type":"error","error":{"status":429,"n":-0,"e":1e400,"f":1.50}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"$serde_json::private::RawValue":"{\"$serde_json::private::RawValue\":\"{\\\"code\\\":\\\"c\\\"}\"}"}}"#,
+            r#"{"type":"x","error":{"code":"c"}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"$serde_json::private::RawValue":"{\"type\":\"a\",\"type\":\"b\"}"}}"#,
+            r#"{"type":"x","error":{"type":"b"}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"$serde_json::private::RawValue":"{\"$serde_json::private::Number\":\"7\"}"}}"#,
+            r#"{"type":"x","error":7}"#,
+        ),
+        (
+            r#"{"type":"x","response":{"id":{"$serde_json::private::RawValue":"\"r1\""},"u":{"$serde_json::private::RawValue":" null "},"a":[{"$serde_json::private::Number":"1"},{"$serde_json::private::RawValue":"[1,{\"k\":1,\"k\":2}]"}]}}"#,
+            r#"{"type":"x","response":{"id":"r1","u":null,"a":[1,[1,{"k":2}]]}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\"}"},"error":{"code":"other"}}"#,
+            r#"{"type":"x","error":{"code":"other"}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"code":"other"},"error":{"$serde_json::private::RawValue":"{\"type\":\"rate_limit_error\"}"}}"#,
+            r#"{"type":"x","error":{"type":"rate_limit_error"}}"#,
+        ),
+        (
+            r#"{"type":"x","error":{"$serde_json::private::\u0052awValue":"{\"code\":\"c\"}"}}"#,
+            r#"{"type":"x","error":{"code":"c"}}"#,
+        ),
+    ] {
+        // A repeated `error` is a repeated known member: such a frame does not decode, and
+        // its view is what the account check of an undecodable frame reads.
+        assert_eq!(
+            decode(payload).is_some(),
+            payload.matches(r#""error":"#).count() < 2,
+            "{payload}"
+        );
+        let got = pinned_view(payload);
+        assert!(matches!(got, Cow::Owned(_)), "{payload}");
+        assert_eq!(got, view, "{payload}");
+        // Without the repeated-key cut only the private values change: every one is
+        // resolved, and cutting afterwards gives the same view.
+        let resolved = private_values_resolved(payload);
+        assert!(!resolved.contains("private::"), "{payload}: {resolved}");
+        assert_eq!(pinned_view(&resolved), view, "{payload}");
+    }
+    for unchanged in [
+        r#"{"$serde_json::private::Number":"5","type":"x"}"#,
+        r#"{"type":"x","error":{"$serde_json::private::Number":"5","y":1}}"#,
+        r#"{"type":"x","error":{"y":1,"$serde_json::private::Number":"5"}}"#,
+        r#"{"type":"x","error":{"$serde_json::private::Number":"05"}}"#,
+        r#"{"type":"x","error":{"$serde_json::private::RawValue":"{"}}"#,
+        r#"{"type":"x","error":"$serde_json::private::Number"}"#,
+    ] {
+        assert!(
+            matches!(pinned_view(unchanged), Cow::Borrowed(s) if s == unchanged),
+            "{unchanged}"
+        );
+    }
+}
+
+/// A response is named by the `response.id` the pinned `Value` reads: the last of a
+/// repeated `id`, through a private raw value of the `id` or of the whole `response`.
+#[test]
+fn response_ids_read_as_the_pinned_value_reads_them() {
+    for (event, id) in [
+        (
+            r#"{"type":"response.completed","response":{"id":"stale","id":"r1"}}"#,
+            Some("r1"),
+        ),
+        (
+            r#"{"type":"response.completed","response":{"id":"r1","id":"stale"}}"#,
+            Some("stale"),
+        ),
+        (
+            r#"{"type":"response.completed","response":{"id":{"$serde_json::private::RawValue":"\"r1\""}}}"#,
+            Some("r1"),
+        ),
+        (
+            r#"{"type":"response.completed","response":{"$serde_json::private::RawValue":"{\"id\":\"a\",\"id\":\"r1\"}"}}"#,
+            Some("r1"),
+        ),
+        (
+            r#"{"type":"response.completed","response":{"id":{"$serde_json::private::Number":"5"}}}"#,
+            None,
+        ),
+    ] {
+        let event = decode(event).expect("decodes");
+        assert_eq!(event.response_id().as_deref(), id);
+    }
+    let created = decode(
+        r#"{"type":"response.created","response":{"id":"r2","previous_response_id":"a","previous_response_id":"r1"}}"#,
+    )
+    .unwrap();
+    assert_eq!(created.response_str("previous_response_id").as_deref(), Some("r1"));
 }

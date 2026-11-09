@@ -34,8 +34,10 @@
 //! status error (`WrappedWebsocketErrorEvent`, lines 684-709), which the reader maps to an
 //! error or to nothing (lines 712-764). [`wrapped`] makes both decisions.
 //!
-//! Failure classification reads a decoded event as the pinned `Value` does: with the last
-//! of a repeated key ([`last_wins`]). The client still receives the bytes as sent.
+//! Failure classification and response identity read a decoded event as the pinned
+//! `Value` does: with the last of a repeated key and its private numbers and raw values
+//! resolved ([`pinned_view`], [`Event::response_id`]). The client still receives the
+//! bytes as sent.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -134,11 +136,18 @@ impl Event<'_> {
         }
     }
 
-    /// The `response.id` the pinned reader reads (`Value::get`, the last `id`), when it
-    /// is a string.
+    /// The `response.id` the pinned reader reads (`Value::get`, the last `id`, with the
+    /// private values of the `response` and of the `id` resolved), when it is a string.
+    /// Every native route names a response by it: settlement, usage ownership and
+    /// interrupt tracking.
     pub fn response_id(&self) -> Option<String> {
-        let id = member(self.response?, "id")?;
-        serde_json::from_str::<String>(id).ok()
+        self.response_str("id")
+    }
+
+    /// The string member `key` of `response`, as [`Event::response_id`] reads `id`.
+    pub(crate) fn response_str(&self, key: &str) -> Option<String> {
+        let value = get(self.response?, key)?;
+        serde_json::from_str::<String>(&value).ok()
     }
 }
 
@@ -487,12 +496,12 @@ trait Reads {
 }
 
 /// A derived struct, as `serde_json::from_value` reads it from the pinned `Value`: an
-/// object with the last of a repeated key ([`last_wins`]; `from_str` refuses a repeated
+/// object with the last of a repeated key ([`pinned_view`]; `from_str` refuses a repeated
 /// field, the `Value` keeps the last), unknown members ignored, a missing `Option` as
 /// `None`, and a JSON array by position. The members are checked by [`Member`] and
 /// [`Optional`].
 fn struct_reads<T: serde::de::DeserializeOwned>(text: &str) -> bool {
-    serde_json::from_str::<T>(&last_wins(text)).is_ok()
+    serde_json::from_str::<T>(&pinned_view(text)).is_ok()
 }
 
 /// `ResponseCompleted` (`sse/responses.rs:109-118`).
@@ -769,15 +778,51 @@ pub(crate) fn member<'a>(object: &'a str, name: &str) -> Option<&'a str> {
     de.deserialize_map(Last(name)).ok().flatten().map(RawValue::get)
 }
 
-/// `payload` as the pinned client's `serde_json::Value` holds it, for classification
-/// only: every object keeps the last of a repeated key (compared after unescaping), and
-/// each earlier occurrence is cut out with its separator. Nothing else changes: no byte
-/// is re-spelled. `payload` itself when no object repeats a key, and when it is not valid
-/// JSON. One validating pass and one scan, with a key table per object.
-pub(crate) fn last_wins(payload: &str) -> Cow<'_, str> {
+/// `payload`, an event, as the pinned client's `serde_json::Value` holds it, for
+/// classification only (#25). Two readings differ from the bytes as sent:
+///
+/// - Every object keeps the last of a repeated key (compared after unescaping); each
+///   earlier occurrence is cut out with its separator.
+/// - A member value that is serde_json's private number or raw value
+///   ([`NUMBER_TOKEN`], [`RAW_VALUE_TOKEN`]) is what the first-party `Value` reads it
+///   as (`value/de.rs`, `visit_map`): the number's own digits, or the JSON text it holds,
+///   itself read this way (with its own repeated keys and private values, and its root
+///   classified, as `serde_json::from_str::<Value>` reads it). Only one the pinned
+///   `Value` accepts is replaced; [`decode`] already refused an event with any other in
+///   a known member, and one in an unknown member or an undecoded frame stays as sent.
+///
+/// The event's own keys are plain: the pinned event is a struct, not a `Value`, so a
+/// private token as its first key is an ordinary unknown member. Nothing else changes:
+/// no other byte is re-spelled, and the client still receives `payload` as sent.
+/// `payload` itself when nothing differs, and when it is not valid JSON.
+///
+/// One validating pass and one scan, with a key table per object. The JSON text of a
+/// private raw value is unescaped and read once more at its own level, as
+/// [`value_decodes`] reads it; each such level at least doubles the escapes of the one
+/// inside it, so the levels stay logarithmic in the payload.
+pub(crate) fn pinned_view(payload: &str) -> Cow<'_, str> {
     if serde_json::from_str::<IgnoredAny>(payload).is_err() {
         return Cow::Borrowed(payload);
     }
+    view(payload, false, false, true)
+}
+
+/// `payload` with only the private values [`pinned_view`] resolves resolved: every
+/// repeated key stays. For the account safety of a frame the pinned client cannot decode
+/// (`crate::codex_ambiguous`), whose readers may keep any occurrence of a repeated key.
+pub(crate) fn private_values_resolved(payload: &str) -> Cow<'_, str> {
+    if serde_json::from_str::<IgnoredAny>(payload).is_err() {
+        return Cow::Borrowed(payload);
+    }
+    view(payload, false, false, false)
+}
+
+/// [`pinned_view`] of valid JSON `payload`: `classify_root` when its outermost object is
+/// itself a `Value` (the text of a private raw value), `validated` when every private
+/// token object inside it is known to be one the pinned `Value` accepts (inside an
+/// accepted raw value, whose whole text [`private_object`] checked), and `cut` to keep
+/// only the last of a repeated key.
+fn view(payload: &str, classify_root: bool, validated: bool, cut: bool) -> Cow<'_, str> {
     #[derive(Default)]
     struct Object<'a> {
         /// Where each member starts (its key's opening quote).
@@ -785,7 +830,8 @@ pub(crate) fn last_wins(payload: &str) -> Cow<'_, str> {
         keys: HashMap<Cow<'a, str>, usize>,
     }
     let b = payload.as_bytes();
-    let mut cut: Vec<Range<usize>> = Vec::new();
+    // Earlier occurrences to cut, and private values to replace, by their spans.
+    let mut edits: Vec<(Range<usize>, Option<String>)> = Vec::new();
     // `None` for an array.
     let mut stack: Vec<Option<Object<'_>>> = Vec::new();
     let mut key_next = false;
@@ -793,6 +839,14 @@ pub(crate) fn last_wins(payload: &str) -> Cow<'_, str> {
     while i < b.len() {
         match b[i] {
             b'{' => {
+                if (classify_root || !stack.is_empty())
+                    && let Some((end, value)) = private_value(payload, i, validated, cut)
+                {
+                    edits.push((i..end, Some(value)));
+                    key_next = false;
+                    i = end;
+                    continue;
+                }
                 stack.push(Some(Object::default()));
                 key_next = true;
             }
@@ -812,8 +866,10 @@ pub(crate) fn last_wins(payload: &str) -> Cow<'_, str> {
                     let key = unescape(quoted).unwrap_or(Cow::Borrowed(quoted));
                     let index = object.members.len();
                     object.members.push(i);
-                    if let Some(earlier) = object.keys.insert(key, index) {
-                        cut.push(object.members[earlier]..object.members[earlier + 1]);
+                    if let Some(earlier) = object.keys.insert(key, index)
+                        && cut
+                    {
+                        edits.push((object.members[earlier]..object.members[earlier + 1], None));
                     }
                 }
                 key_next = false;
@@ -823,22 +879,58 @@ pub(crate) fn last_wins(payload: &str) -> Cow<'_, str> {
         }
         i += 1;
     }
-    if cut.is_empty() {
+    if edits.is_empty() {
         return Cow::Borrowed(payload);
     }
-    cut.sort_by_key(|r| r.start);
+    // Spans never cross: a cut member can hold a private value, never the reverse, since
+    // the scan does not enter a private value.
+    edits.sort_by_key(|(r, _)| r.start);
     let mut out = String::with_capacity(payload.len());
     let mut at = 0;
-    for range in cut {
-        // A cut inside one already made goes with it.
+    for (range, replacement) in edits {
+        // An edit inside a cut already made goes with it.
         if range.start < at {
             continue;
         }
         out.push_str(&payload[at..range.start]);
+        if let Some(replacement) = replacement {
+            out.push_str(&replacement);
+        }
         at = range.end;
     }
     out.push_str(&payload[at..]);
     Cow::Owned(out)
+}
+
+/// The object starting at `open` (its `{`) in valid JSON `raw`, when it is a private
+/// number or raw value the pinned `Value` accepts: where it ends (exclusive), and what
+/// that `Value` reads it as, in [`view`]'s terms. `validated` skips the acceptance check
+/// an enclosing raw value already made.
+fn private_value(raw: &str, open: usize, validated: bool, cut: bool) -> Option<(usize, String)> {
+    if !validated && !matches!(private_object(raw, open + 1), Private::Accepted(_)) {
+        return None;
+    }
+    let b = raw.as_bytes();
+    let key_at = skip_space(b, open + 1);
+    if b.get(key_at) != Some(&b'"') {
+        return None;
+    }
+    let key_end = quote_end(b, key_at + 1);
+    let number = match unescape(&raw[key_at..=key_end]).as_deref() {
+        Some(NUMBER_TOKEN) => true,
+        Some(RAW_VALUE_TOKEN) => false,
+        _ => return None,
+    };
+    let value_at = skip_space(b, skip_space(b, key_end + 1) + 1);
+    let value_end = quote_end(b, value_at + 1);
+    let text = unescape(&raw[value_at..=value_end])?;
+    let close = skip_space(b, value_end + 1);
+    let value = if number {
+        text.into_owned()
+    } else {
+        view(text.trim(), true, true, cut).into_owned()
+    };
+    Some((close + 1, value))
 }
 
 /// The index of the quote closing the string whose contents start at `i`, in valid JSON.

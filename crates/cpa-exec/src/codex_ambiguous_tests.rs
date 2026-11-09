@@ -252,3 +252,134 @@ fn many_repeated_members_are_checked_in_linear_time() {
     frame.push_str(r#""status":429}"#);
     assert!(!ambiguous_account(&frame));
 }
+
+/// A failure reading composes one error body from several members
+/// (`response::terminal_failure_body`): the error object as sent, the frame's `message`,
+/// `code`, `error_type` and `param`, and the other error object's message. Its capacity
+/// check reads the whole body, so pieces that are no capacity message alone can make one
+/// together. Each frame's middle reading of a repeated `type` is a 429 by the exact
+/// readings (`codex_ws::account_shaped` of that projection), and the frame's own check
+/// finds it; the first and last readings do not. `<BS>` stands for a backslash.
+#[test]
+fn capacity_messages_composed_from_several_members_count() {
+    let middle = |frame: &str| frame.replacen(r#""type":"x","type":"error","type":"x""#, r#""type":"error""#, 1);
+    for frame in [
+        r#"{"type":"x","type":"error","type":"x","code":"model","message":"at capacity"}"#,
+        r#"{"type":"x","type":"error","type":"x","param":"model at capacity"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"type":"model"},"response":{"error":{"message":"at capacity"}}}"#,
+        r#"{"type":"x","type":"error","type":"x","error_type":"model","param":"at capacity"}"#,
+        r#"{"type":"x","type":"error","type":"x","message":"mod<BS>u0065l at<BS>u0020capacity"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"model":1,"x":"at capacity"}}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"code":"mod<BS>u0065l_at_capacity"}}"#,
+        r#"{"type":"x","type":"error","type":"x","error":"model at capacity"}"#,
+        r#"{"type":"x","type":"error","type":"x","code":{"m":"model at capacity"}}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"$serde_json::private::RawValue":"{<BS>"type<BS>":<BS>"rate_limit_error<BS>"}"}}"#,
+    ] {
+        let frame = frame.replace("<BS>", "\\");
+        assert!(
+            crate::codex_ws::account_shaped(&middle(&frame), true),
+            "{frame}: the middle reading is an account failure"
+        );
+        assert!(
+            !crate::codex_ws::account_shaped(&frame, true),
+            "{frame}: first and last readings"
+        );
+        assert!(ambiguous_account(&frame), "{frame}");
+    }
+    for frame in [
+        // The pieces sit where no reading composes them, or are no capacity message.
+        r#"{"type":"x","type":"error","type":"x","meta":{"code":"model","message":"at capacity"},"error":{"code":"other"}}"#,
+        r#"{"type":"x","type":"error","type":"x","code":"model","message":"busy"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"message":"at capacity"},"note":"model"}"#,
+        r#"{"type":"x","type":"error","type":"x","error":{"x":"mod<BS>u0065l","y":"at capacity"}}"#,
+    ] {
+        let frame = frame.replace("<BS>", "\\");
+        assert!(!crate::codex_ws::account_shaped(&middle(&frame), true), "{frame}");
+        assert!(!ambiguous_account(&frame), "{frame}");
+    }
+}
+
+/// Members whose pieces compose capacity messages, and others.
+const COMPOSED_ROOT: [(&str, &[&str]); 9] = [
+    ("type", &[r#""error""#, r#""response.failed""#, r#""response.future""#]),
+    ("code", &[r#""model""#, r#""other""#, r#""model_at_capacity""#]),
+    ("message", &[r#""at capacity""#, r#""fine""#, r#""mod<BS>u0065l""#]),
+    ("error_type", &[r#""model""#, r#""x""#]),
+    ("param", &[r#""at capacity""#, r#""p""#, r#""model at capacity""#]),
+    ("error", &["E", r#""model""#, r#""at capacity""#]),
+    ("response", &["R"]),
+    ("note", &[r#""model at capacity""#]),
+    ("status", &["400"]),
+];
+const COMPOSED_ERROR: [(&str, &[&str]); 5] = [
+    ("type", &[r#""model""#, r#""invalid_request_error""#]),
+    ("code", &[r#""other""#, r#""model""#]),
+    ("message", &[r#""at capacity""#, r#""m""#]),
+    ("note", &[r#""model""#, r#""at capacity""#, r#""x""#]),
+    ("status", &["400"]),
+];
+
+fn composed_object(rng: &mut Rng, pool: &[(&str, &[&str])], depth: usize) -> Vec<(String, Value)> {
+    let n = 2 + rng.below(6);
+    (0..n)
+        .map(|_| {
+            let (key, values) = pool[rng.below(pool.len())];
+            let value = match values[rng.below(values.len())] {
+                "E" if depth == 0 => Value::Object(composed_object(rng, &COMPOSED_ERROR, 1)),
+                "R" if depth == 0 => Value::Object(vec![(
+                    "error".to_owned(),
+                    Value::Object(composed_object(rng, &COMPOSED_ERROR, 1)),
+                )]),
+                "E" | "R" => Value::Text("{}".to_owned()),
+                text => Value::Text(text.replace("<BS>", "\\")),
+            };
+            (key.to_owned(), value)
+        })
+        .collect()
+}
+
+/// The soundness of the composed capacity check: generated frames whose pieces interact
+/// (split phrases, `param`, an escaped phrase, an error string, a message from the other
+/// error object, the same pieces in an unrelated member), against every projection read
+/// by the exact readings (`codex_ws::account_shaped` with nothing repeated).
+#[test]
+fn no_composed_reading_of_a_repeated_member_escapes_the_check() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let (mut checked, mut account, mut beyond_first_and_last) = (0, 0, 0);
+    while checked < 3000 {
+        let members = composed_object(&mut rng, &COMPOSED_ROOT, 0);
+        let all = projections(&members);
+        if all.len() > 512 {
+            continue;
+        }
+        checked += 1;
+        let frame = render(&members);
+        if all.iter().any(|p| crate::codex_ws::account_shaped(&render(p), true)) {
+            account += 1;
+            assert!(
+                crate::codex_ws::account_shaped(&frame, false),
+                "{frame}: a reading is an account failure"
+            );
+            if !crate::codex_ws::account_shaped(&frame, true) {
+                beyond_first_and_last += 1;
+            }
+        }
+    }
+    eprintln!("{account} of {checked} frames have an account reading, {beyond_first_and_last} past the first and last");
+    assert!(account > 100 && account < 2900, "{account} of {checked}");
+    assert!(beyond_first_and_last > 10, "{beyond_first_and_last} of {account}");
+}
+
+/// The composed check stays linear: very many repeated pieces are summarized at once.
+#[test]
+fn many_composed_pieces_are_checked_in_linear_time() {
+    let mut frame = String::from("{");
+    for _ in 0..100_000 {
+        frame.push_str(r#""type":"response.future","code":"model","error":{"type":"x"},"#);
+    }
+    frame.push_str(r#""type":"error","message":"at capacity"}"#);
+    assert!(ambiguous_account(&frame));
+    frame.truncate(frame.len() - r#""type":"error","message":"at capacity"}"#.len());
+    frame.push_str(r#""type":"error","message":"busy"}"#);
+    assert!(!ambiguous_account(&frame));
+}

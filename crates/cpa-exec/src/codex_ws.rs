@@ -195,7 +195,9 @@ fn acknowledged_id(payload: &str) -> Option<String> {
 }
 
 /// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
-/// without `error`) with a non-empty string `response.id`.
+/// without `error`) with a non-empty string `response.id`: for an event the pinned
+/// client decodes, the ID its `Value` reads ([`crate::codex_event::Event::response_id`]),
+/// the one the turn settles; for any other frame, the first as sent.
 fn terminal_response_id(payload: &str) -> Option<String> {
     let kind = rawjson::get(payload, "type");
     if !matches!(
@@ -203,6 +205,9 @@ fn terminal_response_id(payload: &str) -> Option<String> {
         "response.completed" | "response.done" | "response.incomplete" | "response.failed"
     ) {
         return None;
+    }
+    if let Some(event) = crate::codex_event::decode(payload) {
+        return event.response_id().filter(|id| !id.is_empty());
     }
     let id = rawjson::get(payload, "response.id");
     (id.kind() == Kind::String && !id.str().is_empty()).then(|| id.str().to_owned())
@@ -1226,7 +1231,7 @@ impl Turn {
         if !self.codex_client {
             return None;
         }
-        let view = crate::codex_event::last_wins(payload);
+        let view = crate::codex_event::pinned_view(payload);
         cpa_common::codex_client::context_window_failure_event(payload, &view).map(|e| Bytes::from(e.into_owned()))
     }
 
@@ -1340,8 +1345,9 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
 /// A decoded `error` that is not a wrapped frame keeps the same status-less reading, and
 /// a decoded `response.failed` is classified by `response::terminal_failure`. Every
 /// failure reading reads the frame as the pinned `Value` holds it
-/// (`crate::codex_event::last_wins`): the last of a repeated key decides the
-/// classification, while the client still receives the frame as sent.
+/// (`crate::codex_event::pinned_view`): the last of a repeated key, and the value a
+/// private number or raw value stands for, decide the classification, while the client
+/// still receives the frame as sent.
 pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>, cooling: bool) -> Reading {
     use crate::codex_event::Wrapped;
     let payload = text.trim();
@@ -1360,11 +1366,11 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
     };
     let failure = match (event, wrapped) {
         (_, Some(Wrapped::Status(_) | Wrapped::Retryable(Some(_)))) => {
-            status_frame(&crate::codex_event::last_wins(payload))
+            status_frame(&crate::codex_event::pinned_view(payload))
         }
-        (_, Some(Wrapped::Retryable(None))) => terminal(&crate::codex_event::last_wins(payload)),
+        (_, Some(Wrapped::Retryable(None))) => terminal(&crate::codex_event::pinned_view(payload)),
         (Some(event), Some(Wrapped::Notice)) if terminal_provider_error(event) => {
-            terminal(&crate::codex_event::last_wins(payload))
+            terminal(&crate::codex_event::pinned_view(payload))
         }
         (_, Some(Wrapped::Notice)) | (None, _) => {
             return Reading::Passed {
@@ -1372,7 +1378,7 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
             };
         }
         (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => {
-            let view = crate::codex_event::last_wins(payload);
+            let view = crate::codex_event::pinned_view(payload);
             status_frame(&view).or_else(|| terminal(&view))
         }
         (Some(event), _) => {
@@ -1445,10 +1451,11 @@ fn passed(text: String, raw_len: usize, decoded: bool) -> Frame {
 /// Whether a frame the pinned reader skips or ignores would be an account failure under
 /// any reading a client could give it: the status frame reading ([`ws_error`]) and the
 /// terminal failure reading (`response::terminal_failure`), each with the first and with
-/// the last of a repeated key (a JSON reader keeps one or the other). A frame the pinned
-/// client cannot decode (`decoded` false) is also read with every other occurrence of a
-/// repeated key that those readings read (`crate::codex_ambiguous`), since a reader that
-/// acts on members as they stream past can take any of them. A decoded frame (a wrapped
+/// the last of a repeated key (a JSON reader keeps one or the other; the last also with
+/// the pinned `Value`'s private values resolved, `crate::codex_event::pinned_view`). A
+/// frame the pinned client cannot decode (`decoded` false) is also read with every other
+/// occurrence of a repeated key that those readings read (`crate::codex_ambiguous`),
+/// since a reader that acts on members as they stream past can take any of them. A decoded frame (a wrapped
 /// notice) keeps the first and last readings: the pinned `Value` reads it with the last.
 /// A native WebSocket client never receives such a frame as sent, because it can name the
 /// pooled account (#6). That is all the result decides: the frame is not classified, the
@@ -1465,7 +1472,7 @@ pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
         .any(account_failure)
     };
     readings(payload)
-        || match crate::codex_event::last_wins(payload) {
+        || match crate::codex_event::pinned_view(payload) {
             std::borrow::Cow::Owned(view) => readings(&view),
             std::borrow::Cow::Borrowed(_) => false,
         }
@@ -1478,7 +1485,7 @@ pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
 fn preserved_rejection(payload: &str) -> bool {
     matches!(rawjson::get(payload, "type").str(), "error" | "response.failed")
         && crate::codex_event::decode(payload).is_some()
-        && cpa_common::codex_client::is_context_window_rejection(crate::codex_event::last_wins(payload).as_bytes())
+        && cpa_common::codex_client::is_context_window_rejection(crate::codex_event::pinned_view(payload).as_bytes())
 }
 
 /// An account failure: 401, 402, 403 or 429 as classified. Its frame can name the pooled
