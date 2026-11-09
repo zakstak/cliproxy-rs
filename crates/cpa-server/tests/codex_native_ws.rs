@@ -3654,3 +3654,56 @@ async fn decoded_response_ids_settle_as_the_pinned_value_reads_them() {
         }
     }
 }
+
+/// A readable ResponseCompleted array names the completed response by position. It
+/// must not donate its settlement to the latest open create on a steering socket.
+#[tokio::test]
+async fn positional_completions_settle_their_own_response() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    const CREATED_2: &str = r#"{"type":"response.created","response":{"id":"r2"}}"#;
+    const DONE_2: &str = r#"{"type":"response.completed","response":{"id":"r2","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}"#;
+    const FIRST: &str = r#"{"type":"response.create","model":"gpt-5.5","input":[],"service_tier":"priority"}"#;
+    const SECOND: &str = r#"{"type":"response.create","model":"gpt-5.5","input":[],"service_tier":"flex"}"#;
+    const STEER: &str = r#"{"type":"response.steer","previous_response_id":"r2","input":[]}"#;
+    for completed in [
+        r#"{"type":"response.completed","response":["r1",null,null,false]}"#,
+        r#"{"type":"response.completed","response":{"$serde_json::private::RawValue":"[\"r1\",null,null,false]"}}"#,
+        r#"{"type":"response.completed","response":{"id":"r1","end_turn":false}}"#,
+    ] {
+        let batch = |frames: &[&str]| frames.iter().map(|f| Bytes::from((*f).to_owned())).collect();
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: vec![batch(&[CREATED]), batch(&[CREATED_2, completed]), batch(&[DONE_2])],
+                ..Script::default()
+            },
+            STEERING,
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket.send(Message::text(FIRST)).await.unwrap();
+        assert_eq!(read(&mut socket, &["response.created"]).await.frames, [CREATED]);
+        socket.send(Message::text(SECOND)).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &["response.completed"]).await.frames,
+            [CREATED_2, completed]
+        );
+        let first = records(&proxy, 1).await;
+        assert_eq!(first.len(), 1, "{completed}: {first:?}");
+        assert_eq!(first[0]["service_tier"], "priority", "{completed}: {first:?}");
+        assert_eq!(first[0]["failed"], false, "{completed}: {first:?}");
+        socket.send(Message::text(STEER)).await.unwrap();
+        assert_eq!(read(&mut socket, &["response.completed"]).await.frames, [DONE_2]);
+        let second = records(&proxy, 1).await;
+        assert_eq!(second.len(), 1, "{completed}: {second:?}");
+        assert_eq!(second[0]["service_tier"], "flex", "{completed}: {second:?}");
+        assert_eq!(second[0]["failed"], false, "{completed}: {second:?}");
+        assert_eq!(tokens(&second[0]), [7, 1, 8]);
+        assert_eq!(upstream_frames(&proxy, 0), [FIRST, SECOND, STEER]);
+        socket.close(1000, "done").await.unwrap();
+    }
+}

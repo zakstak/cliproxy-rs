@@ -141,6 +141,16 @@ impl Event<'_> {
     /// Every native route names a response by it: settlement, usage ownership and
     /// interrupt tracking.
     pub fn response_id(&self) -> Option<String> {
+        if self.kind == "response.completed" {
+            let response = resolved(self.response?);
+            if response.trim_start().starts_with('[') && completes(&response) {
+                // ResponseCompleted is a serde struct: its positional form names the
+                // completed response in the first element, unlike response.created's
+                // object-member reading (sse/responses.rs:109-118,494-520).
+                let fields: Vec<&RawValue> = serde_json::from_str(&response).ok()?;
+                return serde_json::from_str::<String>(&resolved(fields.first()?.get())).ok();
+            }
+        }
         self.response_str("id")
     }
 
