@@ -2215,3 +2215,258 @@ async fn the_selected_credential_never_reaches_an_http_answer() {
         selected_upstream(&proxy);
     }
 }
+
+/// A token a second Codex account carries.
+const SECOND: &str = "at-SECOND";
+
+/// [`native`] (the ChatGPT profile) with one credential per token of `tokens`, the first
+/// preferred, `config` appended to its configuration, and with `logged`, through the
+/// shared request-log middleware (`request-log: true`), logging to the returned directory
+/// in its private `auth-dir`.
+async fn native_accounts(
+    script: Script,
+    tokens: &[&str],
+    config: &str,
+    logged: bool,
+) -> (
+    Native,
+    Option<(std::path::PathBuf, Arc<cpa_server::management::Management>)>,
+) {
+    let upstream = CaptureUpstream::start(script).await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\nrequest-log: {logged}\n{config}",
+        auth_dir.0.display()
+    ))
+    .unwrap();
+    let credentials = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| {
+            let mut c = credential(false, &upstream.base_url);
+            if i > 0 {
+                c.id = format!("codex-{i}.json");
+                c.metadata.insert("access_token".into(), serde_json::json!(token));
+            }
+            c.attributes.insert("priority".into(), (9 - i).to_string());
+            c
+        })
+        .collect();
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        meta: Default::default(),
+        xai: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
+    let logs = logged.then(|| {
+        let dir = auth_dir.0.join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let management = cpa_server::management::Management::with_options(
+            rt.clone(),
+            auth_dir.0.join("config.yaml"),
+            cpa_server::management::Options {
+                log_dir: Some(dir.clone()),
+                management_password: Some(String::new()),
+                auth_dir: Some(auth_dir.0.clone()),
+                ..Default::default()
+            },
+        );
+        (dir, management)
+    });
+    let app = match &logs {
+        Some((_, management)) => cpa_server::request_logging::router(management, cpa_server::router(rt.clone())),
+        None => cpa_server::router(rt.clone()),
+    };
+    let proxy = Native {
+        url: serve(app).await,
+        upstream,
+        rt,
+        _auth_dir: auth_dir,
+    };
+    counted(&proxy);
+    (proxy, logs)
+}
+
+/// The one request log in `dir`, once complete: no spool file is left and it reads the
+/// same three times in a row.
+async fn finished_log(dir: &Path) -> String {
+    let mut last: Option<String> = None;
+    let mut same = 0;
+    for _ in 0..250 {
+        let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        let spooling = entries.iter().any(|p| p.extension().is_some_and(|x| x == "tmp"));
+        let logs: Vec<_> = entries
+            .iter()
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        if let ([log], false) = (&logs[..], spooling) {
+            let content = std::fs::read_to_string(log).unwrap();
+            if last.as_ref() == Some(&content) {
+                same += 1;
+                if same == 3 {
+                    return content;
+                }
+            } else {
+                (last, same) = (Some(content), 0);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no complete request log in {dir:?}: {last:?}")
+}
+
+fn cooldowns(proxy: &Native) -> usize {
+    let store = proxy.rt.store();
+    store.snapshot().iter().map(|c| store.cooldowns(&c.id).len()).sum()
+}
+
+/// #25 on a streaming HTTP client: an event the credential guard leaves out was served,
+/// so the stream commits on it. A stream whose every event is left out, its completion
+/// included, keeps the outcome processing gave it: one execution on the selected account,
+/// one successful record with the reported usage, no cooldown, and no second execution
+/// on the other account available. The client reads a stream that ended without the
+/// completion. This holds with and without `stream-bootstrap-buffering`. The `at-OTHER`
+/// controls differ only in what the client reads.
+#[tokio::test]
+async fn a_withheld_stream_keeps_the_served_outcome_without_a_replay() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","note":"{T}"}}"#;
+    const SAFE_CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {T}","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const SECOND_END: &str = r#"{"type":"response.completed","response":{"id":"resp_second","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    let sse = |events: &[String]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+    let cases = [
+        ("sole completion", &[END][..]),
+        ("withheld prefix and completion", &[CREATED, END][..]),
+        ("safe prefix, withheld completion", &[SAFE_CREATED, END][..]),
+    ];
+    let buffering = ["", "codex:\n  stream-bootstrap-buffering: true\n"];
+    for (config, (name, events)) in buffering.iter().flat_map(|c| cases.map(|case| (c, case))) {
+        let name = format!("{name}{}", if config.is_empty() { "" } else { ", buffering" });
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let events: Vec<String> = events.iter().map(|e| with_token(e, token)).collect();
+            let (proxy, _) = native_accounts(
+                Script {
+                    http: vec![Reply::sse(sse(&events)), Reply::sse(sse(&[SECOND_END.to_owned()]))],
+                    ..Script::default()
+                },
+                &[SELECTED, SECOND],
+                config,
+                false,
+            )
+            .await;
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            let records = usage_records(&proxy, 1).await;
+            let exchanges = proxy.upstream.http();
+            assert_eq!(exchanges.len(), 1, "{name} {token}: one execution, no replay");
+            assert_eq!(exchanges[0].headers["authorization"], format!("Bearer {SELECTED}"));
+            assert_eq!(status, 200, "{name} {token}");
+            let delivered: Vec<String> = events.iter().filter(|e| !e.contains(SELECTED)).cloned().collect();
+            assert_eq!(answer, sse(&delivered), "{name} {token}");
+            assert_eq!(records.len(), 1, "{name} {token}: {records:?}");
+            assert_eq!(records[0]["failed"], false, "{name} {token}: {records:?}");
+            let usage = ["input_tokens", "output_tokens", "total_tokens"].map(|k| records[0]["tokens"][k].as_i64());
+            assert_eq!(usage, [Some(4), Some(1), Some(5)], "{name} {token}");
+            assert_eq!(cooldowns(&proxy), 0, "{name} {token}");
+            assert!(
+                !carries_token(&records[0].to_string(), SELECTED),
+                "{name}: {}",
+                records[0]
+            );
+            let model = records[0]["response_model"]
+                .as_str()
+                .map(|m| m.replace(token, "[REDACTED]"));
+            seen.push((records[0]["auth_index"].clone(), records[0]["tokens"].clone(), model));
+        }
+        assert_eq!(seen[0], seen[1], "{name}: privacy changes delivery only");
+        // The record keeps the model the withheld completion reported, scrubbed.
+        assert_eq!(seen[0].2.as_deref(), Some("gpt-5.5 [REDACTED]"), "{name}");
+    }
+}
+
+/// #25 and AGENTS.md on the native HTTP route: an upstream answer that quotes the selected
+/// credential (sent upstream as `Bearer at-FAKE`; the client's key is `client-key`) keeps
+/// it out of the request log and the queued failure record: an error body, a streamed
+/// event, and a buffered answer the route withholds. The entries stay, with `[REDACTED]`
+/// where the value was, and the record keeps the control's status and tokens; the
+/// withheld buffered answer is the route's request-scoped 502, whose fixed text carries
+/// nothing. The `at-OTHER` controls keep every byte.
+#[tokio::test]
+async fn http_logs_and_usage_records_never_keep_the_selected_credential() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","output":[]}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let error = r#"{"error":{"type":"invalid_request_error","code":"x","message":"bad {T}"}}"#;
+    let notice = r#"{"type":"response.future","note":"{T}"}"#;
+    let answer = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    for (name, body, reply) in [
+        ("error body", &full, Reply::json(400, error)),
+        (
+            "streamed event",
+            &full,
+            Reply::sse(format!("data: {CREATED}\n\ndata: {notice}\n\ndata: {REAL_END}\n\n")),
+        ),
+        (
+            "withheld buffered answer",
+            &buffered,
+            Reply::sse(format!("data: {answer}\n\n")),
+        ),
+    ] {
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let mut reply = reply.clone();
+            reply.body = Bytes::from(with_token(std::str::from_utf8(&reply.body).unwrap(), token));
+            // An error's upstream headers are kept in its record too.
+            if reply.status != 200 {
+                reply.headers.push(("x-trace".into(), format!("trace {token}")));
+            }
+            let (proxy, logs) = native_accounts(
+                Script {
+                    http: vec![reply],
+                    ..Script::default()
+                },
+                &[SELECTED],
+                "",
+                true,
+            )
+            .await;
+            let (status, _, client) = post(&proxy.url, "/v1/responses", &[], body.clone()).await;
+            let records = usage_records(&proxy, 1).await;
+            let log = finished_log(&logs.as_ref().unwrap().0).await;
+            selected_upstream(&proxy);
+            assert!(!carries_token(&client, SELECTED), "{name}: {client}");
+            let fail = records[0]["fail"]["body"].as_str().unwrap_or_default().to_owned();
+            let headers = records[0]["response_headers"].to_string();
+            if token == SELECTED {
+                assert!(!carries_token(&log, SELECTED), "{name}: {log}");
+                assert!(!log.contains("client-key"), "{name}: {log}");
+                assert!(log.contains("[REDACTED]"), "{name}: {log}");
+                assert!(!carries_token(&fail, SELECTED), "{name}: {fail}");
+                assert!(!carries_token(&headers, SELECTED), "{name}: {headers}");
+                if name == "error body" {
+                    assert!(headers.contains("trace [REDACTED]"), "{name}: {headers}");
+                }
+            } else {
+                if name == "error body" {
+                    assert!(headers.contains("trace at-OTHER"), "{name}: {headers}");
+                }
+                assert!(log.contains(LOOKALIKE), "{name}: the control keeps its bytes");
+                assert!(!log.contains("[REDACTED"), "{name}: nothing else is scrubbed");
+            }
+            seen.push((
+                status,
+                records[0]["failed"].clone(),
+                records[0]["fail"]["status_code"].clone(),
+                records[0]["tokens"].clone(),
+                fail.replace(token, "[REDACTED]"),
+            ));
+        }
+        if name == "withheld buffered answer" {
+            assert_eq!(seen[0].0, 502, "{name}: {seen:?}");
+            assert_eq!(seen[1].0, 200, "{name}: {seen:?}");
+        } else {
+            assert_eq!(seen[0], seen[1], "{name}: the record is the control's, scrubbed");
+        }
+    }
+}

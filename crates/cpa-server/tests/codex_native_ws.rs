@@ -3392,29 +3392,74 @@ struct Turned {
     attempts: usize,
     /// The `Authorization` each upstream attempt received: the selected credential's.
     authorization: Vec<String>,
+    /// The connection's request log, when the turn ran logged ([`native_turn_on`]).
+    log: String,
 }
 
 /// One turn on `path` ([`NATIVE_PATHS`]): the upstream sends `frames` (as socket frames or
 /// SSE events), the client reads until `until` arrives, the socket closes or it goes
 /// quiet. The fake credential's token is `at-FAKE`; the client's key is `client-key`.
 async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> Turned {
+    let turned = native_turn_on(path, &[frames], until, &[SELECTED], &[], false).await;
+    assert_eq!(turned.records.len(), 1, "one record: {:?}", turned.records);
+    turned
+}
+
+/// [`native_turn`] with one Codex credential per token of `tokens`, the first preferred
+/// (a fake second account, `at-SECOND`, shows a failover as a second `authorization`),
+/// an upstream that answers the attempts in order from `replies`, and upstream sockets
+/// that close after the client frames numbered in `ws_close` (a truncated turn). Every
+/// usage record is returned; with `logged`, the request log of the turn's connection too.
+async fn native_turn_on(
+    path: (&str, &str, bool),
+    replies: &[&[&str]],
+    until: &str,
+    tokens: &[&str],
+    ws_close: &[usize],
+    logged: bool,
+) -> Turned {
     let (_, config, websockets) = path;
+    let config = if logged {
+        format!("{config}request-log: true\n")
+    } else {
+        config.to_owned()
+    };
     let script = if websockets {
         Script {
-            ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+            ws: replies
+                .iter()
+                .map(|frames| frames.iter().map(|f| Bytes::from(f.to_string())).collect())
+                .collect(),
+            ws_close: ws_close.to_vec(),
             ..Script::default()
         }
     } else {
-        let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+        let sse = |frames: &&[&str]| frames.iter().map(|f| format!("data: {f}\n\n")).collect::<String>();
         Script {
-            http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+            http: replies
+                .iter()
+                .map(|frames| cpa_server::testing::codex_capture::Reply::sse(sse(frames)))
+                .collect(),
             ..Script::default()
         }
     };
-    let proxy = proxy_with(script, config, |url| {
-        vec![credential(Profile::Chatgpt, url, websockets)]
+    let mut proxy = proxy_with(script, &config, |url| {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| {
+                let mut c = credential(Profile::Chatgpt, url, websockets);
+                if i > 0 {
+                    c.id = format!("codex-{i}.json");
+                    c.metadata.insert("access_token".into(), serde_json::json!(token));
+                }
+                c.attributes.insert("priority".into(), (9 - i).to_string());
+                c
+            })
+            .collect()
     })
     .await;
+    let logs = logged.then(|| log_requests(&mut proxy));
     proxy.rt.usage_queue().configure(
         true,
         &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
@@ -3445,10 +3490,16 @@ async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> 
             Err(_) => break,
         }
     }
-    let records = records(&proxy, 1).await;
+    let mut records = records(&proxy, 1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let more = proxy.rt.usage_queue().pop_oldest(10);
-    assert!(more.is_empty(), "one record: {records:?} {more:?}");
+    records.extend(
+        proxy
+            .rt
+            .usage_queue()
+            .pop_oldest(10)
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(r).unwrap()),
+    );
     let cooldowns = proxy
         .rt
         .store()
@@ -3470,6 +3521,11 @@ async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> 
                 .to_owned()
         })
         .collect();
+    drop(socket);
+    let log = match &logs {
+        Some((dir, _)) => finished_logs(dir, 1).await.remove(0),
+        None => String::new(),
+    };
     Turned {
         frames: got.frames,
         closed: got.closed,
@@ -3477,7 +3533,63 @@ async fn native_turn(path: (&str, &str, bool), frames: &[&str], until: &str) -> 
         cooldowns,
         attempts: headers.len(),
         authorization,
+        log,
     }
+}
+
+/// Serves `proxy` through the shared request-log middleware (with `request-log: true` in
+/// its config): its connections are logged to the returned directory in its private
+/// `auth-dir`. Keep the management handle as long as the proxy serves.
+fn log_requests(proxy: &mut Proxy) -> (std::path::PathBuf, Arc<cpa_server::management::Management>) {
+    let dir = proxy._auth_dir.0.join("logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let management = cpa_server::management::Management::with_options(
+        proxy.rt.clone(),
+        proxy._auth_dir.0.join("config.yaml"),
+        cpa_server::management::Options {
+            log_dir: Some(dir.clone()),
+            management_password: Some(String::new()),
+            auth_dir: Some(proxy._auth_dir.0.clone()),
+            ..Default::default()
+        },
+    );
+    let app = cpa_server::request_logging::router(&management, cpa_server::router(proxy.rt.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    proxy.addr = listener.local_addr().unwrap().to_string();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (dir, management)
+}
+
+/// The `n` request logs in `dir`, oldest first, once complete: no spool file is left and
+/// the files read the same three times in a row. A log is written when its connection
+/// ends.
+async fn finished_logs(dir: &Path, n: usize) -> Vec<String> {
+    let mut last: Option<Vec<String>> = None;
+    let mut same = 0;
+    for _ in 0..250 {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
+        let spooling = entries.iter().any(|e| e.path().extension().is_some_and(|x| x == "tmp"));
+        entries.retain(|e| e.path().extension().is_some_and(|x| x == "log"));
+        entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+        if entries.len() == n && !spooling {
+            let content: Vec<String> = entries
+                .iter()
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect();
+            if last.as_ref() == Some(&content) {
+                same += 1;
+                if same == 3 {
+                    return content;
+                }
+            } else {
+                (last, same) = (Some(content), 0);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no {n} complete request logs in {dir:?}: {last:?}")
 }
 
 /// #25 (E2) and #6, a capacity message composed from several members: a failure reading
@@ -5349,6 +5461,345 @@ async fn quoted_cookie_values_are_guarded_but_empty_cookies_preserve_events() {
             };
             assert_eq!(headers["cookie"], cookie);
             assert_eq!(headers["authorization"], "Bearer at-FAKE");
+        }
+    }
+}
+
+// #25 privacy is processing-neutral (`docs/codex/CONTRACT.md` "Credential isolation"),
+// also when the guard leaves out every frame a turn would deliver, and the selected
+// credential reaches no request log or usage record. The second account's token is
+// `at-SECOND`; generated frames, loopback upstreams and fake tokens only.
+
+/// The token [`native_turn_on`] gives its second account.
+const SECOND: &str = "at-SECOND";
+/// What the upstream answers a second attempt: the client and the records see it only
+/// after a failover.
+const SECOND_END: &str = r#"{"type":"response.completed","response":{"id":"resp_second","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+
+/// What processing decided for each record: failed, status, tokens, whether usage was
+/// observed, and the account.
+fn outcomes(records: &[serde_json::Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {:?} {} {}",
+                r["failed"],
+                r["fail"]["status_code"],
+                tokens(r),
+                r["usage_observed"],
+                r["auth_index"]
+            )
+        })
+        .collect()
+}
+
+/// One turn with two accounts available, whose upstream sends `frames` with `token` for
+/// `{T}`, and the second account's completion to a second attempt.
+async fn served(path: (&str, &str, bool), frames: &[&str], token: &str, ws_close: &[usize]) -> Turned {
+    let frames: Vec<String> = frames.iter().map(|f| with_token(f, token)).collect();
+    let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+    let until = frames.last().copied().unwrap_or_default();
+    native_turn_on(
+        path,
+        &[&frames, &[SECOND_END]],
+        until,
+        &[SELECTED, SECOND],
+        ws_close,
+        false,
+    )
+    .await
+}
+
+/// #25: a frame the credential guard leaves out was served. The executor processed it, and
+/// the guard drops only its delivery, so the stream commits on it as on a delivered frame.
+/// A turn whose every frame is left out, its terminal event included, keeps the outcome
+/// processing gave it on every native path: one execution, on the selected account; one
+/// successful record with the usage the upstream reported (none when it reported none);
+/// no cooldown; and no second execution on the other account available. A failure or a
+/// truncation after a left-out prefix stays a failure. Each case runs against its
+/// `at-OTHER` control: the two differ only in the frames the client receives.
+#[tokio::test]
+async fn withheld_frames_keep_the_served_outcome_without_a_replay() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","note":"{T}"}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"{T}"}"#;
+    const SAFE_CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const SAFE_DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"hello"}"#;
+    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {T}","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const ESCAPED_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {E}","status":"completed","output":[],"note":"{E}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const NO_USAGE_END: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"note":"{T}"}}"#;
+    const FAILED: &str =
+        r#"{"type":"response.failed","response":{"id":"resp_real","error":{"code":"x","message":"retry later"}}}"#;
+    // A name, the upstream frames, the client frames after which the socket closes, and
+    // for a served terminal the usage its one successful record keeps.
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [usize], Option<[i64; 3]>);
+    let cases: [Case; 7] = [
+        ("sole terminal", &[END], &[], Some([4, 1, 5])),
+        ("sole escaped terminal", &[ESCAPED_END], &[], Some([4, 1, 5])),
+        ("sole terminal without usage", &[NO_USAGE_END], &[], Some([0, 0, 0])),
+        (
+            "withheld prefix and terminal",
+            &[CREATED, DELTA, END],
+            &[],
+            Some([4, 1, 5]),
+        ),
+        (
+            "safe prefix, withheld terminal",
+            &[SAFE_CREATED, SAFE_DELTA, END],
+            &[],
+            Some([4, 1, 5]),
+        ),
+        ("withheld prefix, then a failure", &[CREATED, FAILED], &[], None),
+        ("withheld prefix, then a truncation", &[CREATED], &[0], None),
+    ];
+    // Whether a control's record kept the model a withheld terminal reported.
+    let mut model_kept = false;
+    for path in NATIVE_PATHS {
+        for (name, frames, ws_close, served_usage) in cases {
+            let case = format!("{} {name}", path.0);
+            let got = served(path, frames, SELECTED, ws_close).await;
+            let want = served(path, frames, LOOKALIKE, ws_close).await;
+            // Each execution carries its own account's token, and there are as many as the
+            // control's.
+            assert_eq!(got.authorization, want.authorization, "{case}: {got:?}");
+            assert!(
+                !got.frames.iter().any(|f| carries_token(f, SELECTED)),
+                "{case}: {got:?}"
+            );
+            let delivered: Vec<String> = want
+                .frames
+                .iter()
+                .filter(|f| !f.contains(LOOKALIKE) && !carries_token(f, LOOKALIKE))
+                .cloned()
+                .collect();
+            assert_eq!(got.frames, delivered, "{case}: only the withheld frames are missing");
+            assert_eq!(outcomes(&got.records), outcomes(&want.records), "{case}: {got:?}");
+            assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+            // The records keep no spelling of the token, and otherwise the control's
+            // upstream text (the model the terminal reported).
+            for (got, want) in got.records.iter().zip(&want.records) {
+                assert!(!carries_token(&got.to_string(), SELECTED), "{case}: {got}");
+                let model = want["response_model"]
+                    .as_str()
+                    .map(|m| m.replace(LOOKALIKE, "[REDACTED]"));
+                assert_eq!(got["response_model"].as_str(), model.as_deref(), "{case}");
+                model_kept |= model.is_some_and(|m| m.contains("[REDACTED]"));
+            }
+            if let Some(usage) = served_usage {
+                assert_eq!(got.authorization, [format!("Bearer {SELECTED}")], "{case}: no replay");
+                assert!(!got.frames.iter().any(|f| f == SECOND_END), "{case}: {got:?}");
+                assert_eq!(got.records.len(), 1, "{case}: {:?}", got.records);
+                assert_eq!(got.records[0]["failed"], false, "{case}: {:?}", got.records);
+                assert_eq!(tokens(&got.records[0]), usage, "{case}");
+                assert_eq!(got.cooldowns, 0, "{case}");
+            }
+        }
+    }
+    assert!(model_kept, "a record keeps the reported model, scrubbed");
+}
+
+/// #25 and AGENTS.md: an upstream credential is never logged. The request log and the
+/// usage record are operator-side, and they keep what the upstream answered: an upstream
+/// that quotes the selected credential (`Bearer at-FAKE`, sent upstream; the client's key
+/// is `client-key`) gets it scrubbed from the log file (its spooled sections included)
+/// and from the queued failure record, as written or escaped, on every native path,
+/// before and after output. The rest of each entry stays: the record's status, tokens
+/// and account, and the log's events, with `[REDACTED]` where the value was. Delivery is
+/// unchanged. The `at-OTHER` controls keep every byte in both.
+#[tokio::test]
+async fn logs_and_usage_records_never_keep_the_selected_credential() {
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"r1","delta":"hello"}"#;
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let failure = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","code":"bad_input","message":"quoted {T}"}}}"#;
+    let escaped = failure.replace("{T}", "{E}");
+    let notice = r#"{"type":"response.future","note":"{T}","n":1.50}"#;
+    // Over the 64 KiB a log section keeps in memory: its bytes go through a spool file.
+    let spooled = failure.replace("{T}", &format!("{{T}} {}", "x".repeat(70_000)));
+    let mut cases: Vec<(&str, Vec<&str>, bool)> = vec![
+        ("failure", vec![failure], true),
+        ("escaped failure", vec![&escaped], false),
+        ("failure after output", vec![DELTA, failure], true),
+        ("skipped notice", vec![notice, REAL_END], true),
+    ];
+    for path in NATIVE_PATHS {
+        if path.0 == "socket" {
+            cases.push(("spooled failure", vec![&spooled], true));
+        }
+        for (name, frames, literal) in &cases {
+            let case = format!("{} {name}", path.0);
+            let run = |token: &str| {
+                let frames: Vec<String> = frames.iter().map(|f| with_token(f, token)).collect();
+                async move {
+                    let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+                    native_turn_on(path, &[&frames], REAL_END, &[SELECTED], &[], true).await
+                }
+            };
+            let got = run(SELECTED).await;
+            let want = run(LOOKALIKE).await;
+            assert_eq!(got.authorization, [format!("Bearer {SELECTED}")], "{case}");
+            // The log: no spelling of the token, the event still there.
+            assert!(!carries_token(&got.log, SELECTED), "{case}: {}", got.log);
+            assert!(!got.log.contains("client-key"), "{case}: {}", got.log);
+            assert!(got.log.contains("[REDACTED"), "{case}: {}", got.log);
+            assert!(
+                carries_token(&want.log, LOOKALIKE),
+                "{case}: the control keeps its bytes"
+            );
+            assert!(!want.log.contains("[REDACTED"), "{case}: nothing else is scrubbed");
+            // The record: the control's, the token scrubbed.
+            assert_eq!(outcomes(&got.records), outcomes(&want.records), "{case}");
+            assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+            for (got, want) in got.records.iter().zip(&want.records) {
+                let body = got["fail"]["body"].as_str().unwrap_or_default();
+                let control = want["fail"]["body"].as_str().unwrap_or_default();
+                assert!(!carries_token(body, SELECTED), "{case}: {body}");
+                if *literal {
+                    assert_eq!(body, control.replace(LOOKALIKE, "[REDACTED]"), "{case}");
+                } else if !control.is_empty() {
+                    assert!(body.starts_with("[REDACTED"), "{case}: {body}");
+                }
+            }
+        }
+        cases.retain(|(name, ..)| *name != "spooled failure");
+    }
+}
+
+/// The log and the record follow the values each socket's own handshake carried, as the
+/// delivery guard does. A config-backed API key serves a turn on socket A (`key-OLD`); the
+/// key then changes in memory. The next turn reuses socket A, whose upstream only knows
+/// `key-OLD`: its failure quoting both keys is logged and recorded with `key-OLD`
+/// scrubbed and `key-NEW`, never sent on that socket, kept. Socket A closes; a new
+/// connection dials socket B with `key-NEW`, and the same failure keeps `key-OLD` and
+/// loses `key-NEW`.
+#[tokio::test]
+async fn logs_follow_the_values_each_socket_carried() {
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const FAILED: &str = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","code":"bad_input","message":"quoted key-OLD and key-NEW"}}}"#;
+    let mut proxy = proxy_with(
+        Script {
+            ws: vec![
+                vec![Bytes::from_static(DONE.as_bytes())],
+                vec![Bytes::from_static(FAILED.as_bytes())],
+                vec![Bytes::from_static(FAILED.as_bytes())],
+            ],
+            ws_close: vec![1],
+            ..Script::default()
+        },
+        "request-log: true\n",
+        |url| {
+            let cfg = Config::parse(&format!(
+                "codex-api-key:\n  - api-key: key-OLD\n    base-url: {url}\n    websockets: true\n"
+            ))
+            .unwrap();
+            cpa_core::config::credentials::from_config(&cfg)
+        },
+    )
+    .await;
+    let (dir, _management) = log_requests(&mut proxy);
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+    let mut socket = connect(&proxy).await;
+    assert_eq!(first_turn(&mut socket).await, [DONE]);
+    for credential in proxy.rt.store().snapshot() {
+        let mut changed = Credential::clone(&credential);
+        changed.attributes.insert("api_key".into(), "key-NEW".into());
+        proxy
+            .rt
+            .store()
+            .replace_config_backed(changed, credential.revision)
+            .unwrap();
+    }
+    assert!(first_turn(&mut socket).await.is_empty(), "socket A's own key: withheld");
+    drop(socket);
+    let first = finished_logs(&dir, 1).await.remove(0);
+    let mut socket = connect(&proxy).await;
+    assert!(first_turn(&mut socket).await.is_empty(), "socket B's own key: withheld");
+    drop(socket);
+    let second = finished_logs(&dir, 2).await.remove(1);
+    let records = records(&proxy, 3).await;
+    let sockets = proxy.upstream.sockets();
+    let auth = |i: usize| sockets[i].headers["authorization"].to_str().unwrap().to_owned();
+    assert_eq!(
+        (sockets.len(), auth(0), auth(1)),
+        (2, "Bearer key-OLD".to_owned(), "Bearer key-NEW".to_owned())
+    );
+    assert!(!first.contains("key-OLD"), "{first}");
+    assert!(first.contains("quoted [REDACTED] and key-NEW"), "{first}");
+    assert!(!second.contains("key-NEW"), "{second}");
+    assert!(second.contains("quoted key-OLD and [REDACTED]"), "{second}");
+    let bodies: Vec<&str> = records
+        .iter()
+        .map(|r| r["fail"]["body"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(records[0]["failed"], false);
+    assert!(bodies[1].contains("quoted [REDACTED] and key-NEW"), "{bodies:?}");
+    assert!(bodies[2].contains("quoted key-OLD and [REDACTED]"), "{bodies:?}");
+}
+
+/// A lost upstream socket whose close reason quotes the selected credential: the log keeps
+/// nothing of it. Before output the turn's failure is logged, and the control's reason
+/// shows it; an idle socket's loss after a completed turn writes nothing to the log (Go's
+/// disconnect notifier), for the control too.
+#[tokio::test]
+async fn a_lost_socket_logs_no_credential() {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    for after in [false, true] {
+        let mut logs = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let reason = format!("reason {token}");
+            let app = axum::Router::new().route(
+                "/responses",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let _ = socket.recv().await;
+                        if after {
+                            let _ = socket.send(Upstream::Text(CREATED.into())).await;
+                            let _ = socket.send(Upstream::Text(DONE.into())).await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let _ = socket
+                            .send(Upstream::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: reason.into(),
+                            })))
+                            .await;
+                    })
+                }),
+            );
+            let upstream = format!("http://{}", serve(app).await);
+            let mut proxy = proxy_with(Script::default(), "request-log: true\n", |_| {
+                vec![credential(Profile::Chatgpt, &upstream, true)]
+            })
+            .await;
+            let (dir, _management) = log_requests(&mut proxy);
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            if after {
+                assert_eq!(read(&mut socket, &TERMINAL).await.frames, [CREATED, DONE]);
+            }
+            let got = read(&mut socket, &[]).await;
+            assert!(got.closed.is_some(), "{after} {token}: {got:?}");
+            assert!(!got.frames.iter().any(|f| carries_token(f, SELECTED)), "{got:?}");
+            drop(socket);
+            logs.push(finished_logs(&dir, 1).await.remove(0));
+        }
+        assert!(!carries_token(&logs[0], SELECTED), "after={after}: {}", logs[0]);
+        assert_eq!(
+            logs[1].contains("reason at-OTHER"),
+            !after,
+            "after={after}: {}",
+            logs[1]
+        );
+        if !after {
+            assert!(logs[0].contains("reason [REDACTED]"), "{}", logs[0]);
         }
     }
 }

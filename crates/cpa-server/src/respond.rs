@@ -183,15 +183,12 @@ pub trait Writer: Send + 'static {
     }
 }
 
-/// Forwards `first` and `rest` through `writer` as a response body.
+/// Forwards `first` and `rest` through `writer` as a response body. Without `first` (a
+/// stream that committed on a served frame its delivery guard left out,
+/// `dispatch::Done::Stream`), `rest` alone decides what follows and how it ends.
 pub fn stream<W: Writer>(first: Option<Bytes>, rest: ExecStream, mut writer: W, keepalive: Option<Duration>) -> Body {
-    let (ready, finished) = match first {
-        Some(event) => {
-            let ready = writer.chunk(event);
-            (ready, writer.stopped())
-        }
-        None => (writer.end(), true),
-    };
+    let ready = first.map(|event| writer.chunk(event)).unwrap_or_default();
+    let finished = writer.stopped();
     resume(ready, finished, rest, writer, keepalive)
 }
 
@@ -343,11 +340,27 @@ mod tests {
             collect(stream(Some(Bytes::from_static(b"a")), rest, Plain, None)).await,
             "aERR"
         );
+        // Without a first payload, `rest` alone decides the body: its events, then its
+        // end or its error. The body never ends before `rest` does.
         assert_eq!(
-            collect(stream(None, futures_util::stream::pending().boxed(), Plain, None)).await,
+            collect(stream(None, futures_util::stream::empty().boxed(), Plain, None)).await,
             "END"
         );
+        let rest = futures_util::stream::iter([Ok(Bytes::from_static(b"b"))]).boxed();
+        assert_eq!(collect(stream(None, rest, Plain, None)).await, "bEND");
+        let err = cpa_core::exec::ExecError::local(502, cpa_core::exec::FailureScope::Transport, "x");
+        let rest = futures_util::stream::iter([Err(err)])
+            .chain(futures_util::stream::pending())
+            .boxed();
+        assert_eq!(collect(stream(None, rest, Plain, None)).await, "ERR");
         tokio::time::pause();
+        let slow = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(Bytes::from_static(b"z"))
+        })
+        .boxed();
+        let body = stream(None, slow, Plain, Some(Duration::from_millis(100)));
+        assert_eq!(collect(body).await, ": keep-alive\n\n: keep-alive\n\nzEND");
         let slow = futures_util::stream::once(async {
             tokio::time::sleep(Duration::from_millis(250)).await;
             Ok(Bytes::from_static(b"z"))

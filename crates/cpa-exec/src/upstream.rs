@@ -92,7 +92,12 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
         let bytes = read_bounded(body, usize::MAX).await?;
         ResponseBody::Buffered(bytes)
     };
-    Ok(ExecResponse { status, headers, body })
+    Ok(ExecResponse {
+        status,
+        headers,
+        body,
+        omitted: Default::default(),
+    })
 }
 
 pub(crate) async fn read_bounded<S>(mut body: S, limit: usize) -> Result<Bytes, ExecError>

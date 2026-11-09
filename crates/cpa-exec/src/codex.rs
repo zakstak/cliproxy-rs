@@ -421,7 +421,12 @@ impl CodexExecutor {
                 }
             }
         };
-        Ok(ExecResponse { status, headers, body })
+        Ok(ExecResponse {
+            status,
+            headers,
+            body,
+            omitted: Default::default(),
+        })
     }
 
     /// The URL an Alpha Search on `credential` posts to; `None` for an API key without
@@ -568,6 +573,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Buffered(data),
+            omitted: Default::default(),
         })
     }
 }
@@ -606,6 +612,7 @@ fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecEr
         status: 200,
         headers,
         body: ResponseBody::Buffered(Bytes::from(payload)),
+        omitted: Default::default(),
     })
 }
 

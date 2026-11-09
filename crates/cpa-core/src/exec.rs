@@ -15,6 +15,7 @@ use futures_util::stream::BoxStream;
 use http::HeaderMap;
 
 use crate::format::Format;
+pub use crate::sent::SentCredentials;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -206,6 +207,15 @@ pub trait UsageObserver: Send + Sync {
     fn successor(&self, request: Option<&[u8]>) -> Option<std::sync::Arc<dyn UsageObserver>> {
         let _ = request;
         None
+    }
+    /// The authentication values the attempt's upstream request or socket carried, as
+    /// the executor learns which one serves it (the native Codex routes, #25): the record
+    /// keeps what it has of the upstream's answer (a failure body, response headers, the
+    /// reported model) [`SentCredentials::scrub`]bed of them. A later call replaces an
+    /// earlier one, and the records [`UsageObserver::detach`] and
+    /// [`UsageObserver::successor`] make inherit them.
+    fn sent_credentials(&self, sent: &SentCredentials) {
+        let _ = sent;
     }
 }
 
@@ -476,6 +486,13 @@ impl UsageSink {
         let record = self.0.as_ref().and_then(|o| o.successor(request));
         Self(record, self.1.clone(), self.2.clone())
     }
+
+    /// See [`UsageObserver::sent_credentials`].
+    pub fn sent_credentials(&self, sent: &SentCredentials) {
+        if let Some(o) = &self.0 {
+            o.sent_credentials(sent);
+        }
+    }
 }
 
 impl fmt::Debug for UsageSink {
@@ -561,14 +578,20 @@ pub enum CaptureEvent<'a> {
 }
 
 pub trait CaptureObserver: Send + Sync {
-    fn record(&self, event: CaptureEvent<'_>);
+    /// `event` of an upstream exchange whose request or socket carried `sent` (none when
+    /// the caller does not bind them): an observer that keeps anything of the response
+    /// side keeps it [`SentCredentials::scrub`]bed of them (#25).
+    fn record(&self, event: CaptureEvent<'_>, sent: &SentCredentials);
     /// [`CaptureEvent::Request`] for a body the caller already holds as [`Bytes`]: an
     /// observer that keeps the body may keep this handle instead of a copy of it.
     fn record_request(&self, info: UpstreamRequest<'_>, body: &Bytes) {
-        self.record(CaptureEvent::Request(UpstreamRequest {
-            body: &body[..],
-            ..info
-        }));
+        self.record(
+            CaptureEvent::Request(UpstreamRequest {
+                body: &body[..],
+                ..info
+            }),
+            &SentCredentials::default(),
+        );
     }
     /// Whether response events are kept right now (Go's `requestLogCaptureEnabled`).
     /// An observer that drops them while logging is off says so, so executors need not
@@ -593,9 +616,15 @@ impl CaptureSink {
     pub fn logs_responses(&self) -> bool {
         self.0.as_ref().is_some_and(|observer| observer.logs_responses())
     }
+    /// [`CaptureObserver::record`] with no values bound: the providers without the #25
+    /// guard.
     pub fn record(&self, event: CaptureEvent<'_>) {
+        self.record_sent(event, &SentCredentials::default());
+    }
+    /// [`CaptureObserver::record`] for an exchange whose request or socket carried `sent`.
+    pub fn record_sent(&self, event: CaptureEvent<'_>, sent: &SentCredentials) {
         if let Some(observer) = &self.0 {
-            observer.record(event);
+            observer.record(event, sent);
         }
     }
     /// [`CaptureObserver::record_request`].
@@ -678,6 +707,38 @@ pub struct ExecResponse {
     /// Upstream headers. The server decides which, if any, reach the client.
     pub headers: HeaderMap,
     pub body: ResponseBody,
+    /// The stream frames an outbound delivery guard left out of `body` ([`Omissions`]).
+    pub omitted: Omissions,
+}
+
+/// Whether an outbound delivery guard (the native Codex routes' credential guard, #25)
+/// left a frame out of a response's stream. Such a frame was served: the executor
+/// processed it as it processes a delivered one, and only its delivery was dropped. So
+/// the stream's bootstrap commits on an omitted frame as on a delivered one: an omission
+/// never makes the stream empty, and never lets an attempt the upstream served run again
+/// on another credential. The default tracks nothing (a response without such a guard).
+#[derive(Clone, Default)]
+pub struct Omissions(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+
+impl Omissions {
+    /// A record the guard [`Omissions::omit`]s into, for its response's [`ExecResponse::omitted`].
+    pub fn tracked() -> Self {
+        Self(Some(std::sync::Arc::default()))
+    }
+
+    /// The guard left a served frame out. Set before the stream yields its next item.
+    pub fn omit(&self) {
+        if let Some(any) = &self.0 {
+            any.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether a served frame was left out so far.
+    pub fn any(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|any| any.load(std::sync::atomic::Ordering::Acquire))
+    }
 }
 
 /// What a failure says about the attempt, for retry and cooldown decisions.
@@ -712,8 +773,10 @@ pub enum Delivery {
     /// credential guard). Nothing derived from it reaches the client: no frame, no
     /// rendering of `body`, no subscription-limit event, no close reason, no passthrough
     /// headers. A WebSocket client gets a silent close, an HTTP client a status-only
-    /// error. `status`, `scope` and `body` stay the scheduler's classification.
-    Confidential,
+    /// error. `status`, `scope` and `body` stay the scheduler's classification. It holds
+    /// the values it was checked against, which a log of `body` is scrubbed of
+    /// ([`SentCredentials::scrub`]).
+    Confidential(SentCredentials),
 }
 
 #[derive(Debug, Clone)]
@@ -767,20 +830,20 @@ impl ExecError {
     pub fn delivered_event(&self) -> Option<&Bytes> {
         match &self.delivery {
             Delivery::AsSent(frame) => Some(frame),
-            Delivery::Classified | Delivery::Withheld | Delivery::Confidential => None,
+            Delivery::Classified | Delivery::Withheld | Delivery::Confidential(_) => None,
         }
     }
 
     /// Whether the client must get nothing of this failure but a fixed rendering
     /// ([`Delivery::Withheld`] or [`Delivery::Confidential`]).
     pub fn withheld(&self) -> bool {
-        matches!(self.delivery, Delivery::Withheld | Delivery::Confidential)
+        matches!(self.delivery, Delivery::Withheld | Delivery::Confidential(_))
     }
 
     /// Whether this failure carries an upstream authentication value
     /// ([`Delivery::Confidential`]).
     pub fn confidential(&self) -> bool {
-        self.delivery == Delivery::Confidential
+        matches!(self.delivery, Delivery::Confidential(_))
     }
 
     pub fn with_diagnostic(mut self, diagnostic: Diagnostic) -> Self {

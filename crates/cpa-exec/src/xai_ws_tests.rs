@@ -1081,7 +1081,7 @@ fn request_frame_sets_store_and_keeps_prompt_cache_key() {
 fn disabled_capture_keeps_no_frame() {
     struct Ignore;
     impl cpa_core::exec::CaptureObserver for Ignore {
-        fn record(&self, _: cpa_core::exec::CaptureEvent<'_>) {}
+        fn record(&self, _: cpa_core::exec::CaptureEvent<'_>, _: &cpa_core::exec::SentCredentials) {}
     }
     let turn = serde_json::json!({"payload": r#"{"model":"grok-4.3","input":"hi"}"#});
     let c = credential("xai-1", &serde_json::json!({"api_key": "sk-fake"}), "127.0.0.1:1");

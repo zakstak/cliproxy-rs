@@ -1166,10 +1166,14 @@ impl Duplex {
             // Its own record settled above; every other one fails with the connection.
             // Any other event is only dropped.
             let ends = match &terminal {
-                Some(error) => Some(crate::codex_secret::confidential(error.clone())),
-                None if reading_ended => Some(crate::codex_secret::confidential(local(
-                    crate::codex_secret::WITHHELD_FRAME,
-                ))),
+                Some(error) => Some(crate::codex_secret::confidential(
+                    error.clone(),
+                    &self.turn.conn.secrets,
+                )),
+                None if reading_ended => Some(crate::codex_secret::confidential(
+                    local(crate::codex_secret::WITHHELD_FRAME),
+                    &self.turn.conn.secrets,
+                )),
                 None => None,
             };
             if !self.first_response {

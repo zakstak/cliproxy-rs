@@ -118,8 +118,14 @@ struct Sink {
     terminated: Option<String>,
 }
 
-/// Go `websocketTimelineLog.Append`: one `formatWebsocketTimelineEvent` part.
-fn timeline_event(timeline: Option<&crate::request_logging::WebsocketLog>, kind: &str, payload: &[u8]) {
+/// Go `websocketTimelineLog.Append`: one `formatWebsocketTimelineEvent` part, which the
+/// log keeps scrubbed of `sent` (#25).
+fn timeline_event(
+    timeline: Option<&crate::request_logging::WebsocketLog>,
+    kind: &str,
+    payload: &[u8],
+    sent: &cpa_core::exec::SentCredentials,
+) {
     let Some(timeline) = timeline else {
         return;
     };
@@ -135,7 +141,7 @@ fn timeline_event(timeline: Option<&crate::request_logging::WebsocketLog>, kind:
     part.extend_from_slice(payload);
     part.push(b'\n');
     // Go only warns when a timeline part cannot be written.
-    let _ = timeline.append_part(&part);
+    let _ = timeline.append_part(&part, sent);
 }
 
 /// gorilla's text for the error after this side closed the connection.
@@ -143,7 +149,13 @@ const CLOSE_SENT: &str = "websocket: close sent";
 
 impl Sink {
     fn event(&self, kind: &str, payload: &[u8]) {
-        timeline_event(self.timeline.as_deref(), kind, payload);
+        self.upstream_event(kind, payload, &Default::default());
+    }
+
+    /// [`Sink::event`] for a payload taken from an upstream answer whose request or
+    /// socket carried `sent`.
+    fn upstream_event(&self, kind: &str, payload: &[u8], sent: &cpa_core::exec::SentCredentials) {
+        timeline_event(self.timeline.as_deref(), kind, payload, sent);
     }
 
     async fn send(&self, message: Message) -> Result<(), axum::Error> {
@@ -260,6 +272,9 @@ struct Failure {
     /// ([`cpa_core::exec::Delivery::Confidential`]): the client gets `limit` (never for a
     /// confidential failure) or a silent close, nothing else.
     withheld: bool,
+    /// The values a confidential failure carries, which the timeline keeps `text`
+    /// scrubbed of ([`cpa_core::exec::Delivery::Confidential`]).
+    sent: cpa_core::exec::SentCredentials,
 }
 
 impl Failure {
@@ -274,6 +289,7 @@ impl Failure {
             addon: e.addon.clone(),
             delivered: delivered(e),
             withheld: withheld(e),
+            sent: sent(e),
         }
     }
 
@@ -290,6 +306,7 @@ impl Failure {
                     addon: e.addon.clone(),
                     delivered: delivered(e),
                     withheld: withheld(e),
+                    sent: sent(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
@@ -300,6 +317,7 @@ impl Failure {
                 limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
                 delivered: delivered(e),
                 withheld: withheld(e),
+                sent: sent(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -325,6 +343,7 @@ impl Failure {
             limit: crate::websocket_limit::from_error_event(payload, unix_now()),
             delivered: None,
             withheld: false,
+            sent: Default::default(),
         }
     }
 
@@ -338,6 +357,7 @@ impl Failure {
             limit: None,
             delivered: None,
             withheld: false,
+            sent: Default::default(),
         }
     }
 }
@@ -349,6 +369,13 @@ fn delivered(e: &ExecError) -> Option<String> {
 
 fn withheld(e: &ExecError) -> bool {
     e.withheld()
+}
+
+fn sent(e: &ExecError) -> cpa_core::exec::SentCredentials {
+    match &e.delivery {
+        cpa_core::exec::Delivery::Confidential(sent) => sent.clone(),
+        _ => Default::default(),
+    }
 }
 
 /// The limit event for an executor error: the frame's headers (addon) first, then the
@@ -720,7 +747,7 @@ impl Control {
         } else {
             "interrupt.outcome"
         };
-        timeline_event(Some(timeline), kind, data.as_bytes());
+        timeline_event(Some(timeline), kind, data.as_bytes(), &Default::default());
     }
 }
 
@@ -1842,7 +1869,7 @@ async fn close_for_failure(socket: &mut Sink, failure: &Failure, codex_client: b
         let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(payload.into()))).await;
     } else {
         // Keeps the upstream reason although the client only sees the connection close.
-        socket.event("disconnect", failure.text.as_bytes());
+        socket.upstream_event("disconnect", failure.text.as_bytes(), &failure.sent);
     }
     socket.terminate(CLOSE_SENT);
 }

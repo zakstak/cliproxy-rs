@@ -190,3 +190,31 @@ key changes, and a middle repeated `body.error` that names the pooled account.
 The header has a never-sent-value control; the ambiguity case carries no selected
 credential, so its protection depends on the account reading. These are local mock
 regressions, not provider or full-client acceptance.
+
+### Served outcome and persisted evidence
+
+`dispatch::tests::an_omitted_frame_commits_the_stream` pins the bootstrap: a served
+frame the guard left out commits the stream on the same poll, its end is a clean end and
+its error the stream's own, and only a stream that served nothing is `empty_stream`.
+`codex_native_ws` `withheld_frames_keep_the_served_outcome_without_a_replay` runs a sole
+terminal (plain, escaped, without usage), a withheld prefix and terminal, a safe prefix
+with a withheld terminal, and a withheld prefix followed by a failure or a truncation on
+all five native WebSocket paths, with a second account available, each against its
+`at-OTHER` control: the same executions, records and cooldowns, and no replay of a
+served terminal. `codex_native_request`
+`a_withheld_stream_keeps_the_served_outcome_without_a_replay` does the same for a
+streaming HTTP client, with and without `stream-bootstrap-buffering`. A committed stream
+without a first payload is forwarded until its own end (`respond::stream`), as the
+WebSocket forwarder already did.
+
+`cpa_core::sent` tests the scrub; `request_logging::tests::sent_values_never_reach_a_section_or_its_spool`
+reads the spool file while the request runs and the log written after it.
+`codex_native_ws` `logs_and_usage_records_never_keep_the_selected_credential` (five
+paths; a failure, an escaped one, one after output, a skipped notice, and a spooled
+failure), `logs_follow_the_values_each_socket_carried` (a reused socket after a key
+change, then a fresh dial) and `a_lost_socket_logs_no_credential`, and
+`codex_native_request` `http_logs_and_usage_records_never_keep_the_selected_credential`
+(an error body and its headers, a streamed event, a withheld buffered answer) read the
+actual log file and the queued usage record against `at-OTHER` controls. These are
+local mock regressions with fake credentials; no collector, real client or provider
+traffic is claimed.

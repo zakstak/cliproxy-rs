@@ -465,8 +465,8 @@ impl cpa_core::exec::CaptureObserver for RequestLog {
         })
     }
 
-    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>) {
-        self.capture(event, None);
+    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>, sent: &cpa_core::exec::SentCredentials) {
+        self.capture(event, None, sent);
     }
 
     fn record_request(&self, info: cpa_core::exec::UpstreamRequest<'_>, body: &Bytes) {
@@ -474,14 +474,29 @@ impl cpa_core::exec::CaptureObserver for RequestLog {
             body: &body[..],
             ..info
         };
-        self.capture(cpa_core::exec::CaptureEvent::Request(info), Some(body));
+        self.capture(
+            cpa_core::exec::CaptureEvent::Request(info),
+            Some(body),
+            &cpa_core::exec::SentCredentials::default(),
+        );
     }
 }
 
 impl RequestLog {
     /// `shared` is the request event's body as the caller holds it: the deferred copy
     /// for an error log keeps a handle to it instead of a copy.
-    fn capture(&self, event: cpa_core::exec::CaptureEvent<'_>, shared: Option<&Bytes>) {
+    ///
+    /// `sent` are the authentication values the exchange's upstream request or socket
+    /// carried (#25): everything recorded here of the exchange, apart from the request
+    /// body, is scrubbed of them before it is kept, in memory, spooled or written
+    /// ([`cpa_core::exec::SentCredentials::scrub`]). The request body is the client's own
+    /// bytes, sent as they came: the upstream's answer is what can carry a value back.
+    fn capture(
+        &self,
+        event: cpa_core::exec::CaptureEvent<'_>,
+        shared: Option<&Bytes>,
+        sent: &cpa_core::exec::SentCredentials,
+    ) {
         use cpa_core::exec::CaptureEvent::*;
         let mut locked = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(record) = locked.as_mut() else { return };
@@ -551,6 +566,7 @@ impl RequestLog {
                 head.extend_from_slice(b"\nHeaders:\n");
                 upstream_headers(&mut head, info.headers);
                 head.extend_from_slice(b"\nBody:\n");
+                let head = sent.scrub(&head).into_owned();
                 let body: &[u8] = if info.body.is_empty() {
                     b"<empty>"
                 } else {
@@ -595,7 +611,7 @@ impl RequestLog {
                     part.push(b'\n');
                     record.upstream.headers = true;
                 }
-                record.api_response.append(&record.state.dir, &part);
+                record.api_response.append(&record.state.dir, &sent.scrub(&part));
             }
             ResponseError(error) => {
                 upstream_intro(record);
@@ -604,7 +620,7 @@ impl RequestLog {
                     part.push(b'\n');
                 }
                 writeln!(part, "Error: {error}").unwrap();
-                record.api_response.append(&record.state.dir, &part);
+                record.api_response.append(&record.state.dir, &sent.scrub(&part));
                 record.upstream.error = true;
             }
             ResponseChunk(chunk) => {
@@ -612,6 +628,8 @@ impl RequestLog {
                 if chunk.is_empty() {
                     return;
                 }
+                let scrubbed = sent.scrub(chunk);
+                let chunk = &*scrubbed;
                 upstream_intro(record);
                 let dir = &record.state.dir;
                 if !record.upstream.headers {
@@ -643,6 +661,7 @@ impl RequestLog {
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, info.headers);
                 part.extend_from_slice(b"\nBody:\n");
+                let mut part = sent.scrub(&part).into_owned();
                 part.extend_from_slice(if info.body.is_empty() { b"<empty>" } else { info.body });
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
@@ -653,7 +672,7 @@ impl RequestLog {
                 }
                 part.extend_from_slice(b"Headers:\n");
                 upstream_headers(&mut part, headers);
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &sent.scrub(&part));
             }
             WebsocketResponse(payload) => {
                 let payload = trim(payload);
@@ -662,7 +681,7 @@ impl RequestLog {
                 }
                 record.api_timestamp.get_or_insert_with(Local::now);
                 let mut part = websocket_event("api.websocket.response");
-                part.extend_from_slice(payload);
+                part.extend_from_slice(&sent.scrub(payload));
                 upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
             }
             WebsocketError { stage, error, cause } => {
@@ -676,7 +695,7 @@ impl RequestLog {
                 if let Some(cause) = cause.filter(|c| !c.trim().is_empty()) {
                     writeln!(part, "Cause: {}", logged_cause(cause)).unwrap();
                 }
-                upstream_timeline(&mut record.api_timeline, &record.state.dir, &part);
+                upstream_timeline(&mut record.api_timeline, &record.state.dir, &sent.scrub(&part));
             }
         }
     }
@@ -768,10 +787,15 @@ fn upstream_timeline(out: &mut Section, dir: &Path, part: &[u8]) {
 pub struct WebsocketLog(Option<RequestLog>);
 
 impl WebsocketLog {
-    pub fn append_part(&self, part: &[u8]) -> io::Result<()> {
+    /// One timeline part, scrubbed of `sent`: the authentication values of the upstream
+    /// request or socket whose answer it records (#25; none for the connection's own
+    /// events).
+    pub fn append_part(&self, part: &[u8], sent: &cpa_core::exec::SentCredentials) -> io::Result<()> {
         if trim(part).is_empty() {
             return Ok(());
         }
+        let scrubbed = sent.scrub(part);
+        let part = &*scrubbed;
         if let Some(sink) = &self.0 {
             let mut record = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(record) = record.as_mut() {
@@ -2287,7 +2311,10 @@ mod tests {
         drop(response);
         let (log, socket) = rx.recv().await.unwrap();
         socket
-            .append_part(b"Timestamp: fixture\nEvent: websocket.disconnect\nbye\n")
+            .append_part(
+                b"Timestamp: fixture\nEvent: websocket.disconnect\nbye\n",
+                &Default::default(),
+            )
             .unwrap();
         let caller = tokio::spawn(socket.close());
         gate.0.notified().await;
@@ -2427,6 +2454,7 @@ mod tests {
                 &base64::engine::general_purpose::STANDARD
                     .decode(part.as_str().unwrap())
                     .unwrap(),
+                &Default::default(),
             )
             .unwrap();
         }
@@ -2982,6 +3010,112 @@ mod tests {
             );
             assert!(content.contains("\nContent-Type: application/json\n"));
         }
+    }
+
+    /// #25: the values an exchange's upstream request or socket carried are scrubbed
+    /// before a section keeps them: in memory, in its spool file while the request still
+    /// runs (a section over `SECTION_MEMORY`), and in the log written at the end. The
+    /// request body is the client's own and stays. Text no request carried, and an
+    /// exchange recorded without values, keep every byte.
+    #[tokio::test]
+    async fn sent_values_never_reach_a_section_or_its_spool() {
+        use cpa_core::exec::CaptureEvent::*;
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        let spool_dir = dir.clone();
+        let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
+            let spool_dir = spool_dir.clone();
+            async move {
+                let sink = log.capture_sink();
+                let sent = cpa_core::exec::SentCredentials::new(["at-FAKE"]);
+                let headers = [("X-Echo".to_owned(), "echo at-FAKE".to_owned())];
+                sink.record_sent(
+                    WebsocketRequest(upstream_request("wss://up.example/v1", &headers, b"client at-FAKE")),
+                    &sent,
+                );
+                sink.record_sent(WebsocketHandshake(101, &headers), &sent);
+                let big = format!("{{\"message\":\"quoted at-FAKE {}\"}}", "x".repeat(SECTION_MEMORY));
+                sink.record_sent(WebsocketResponse(big.as_bytes()), &sent);
+                sink.record_sent(WebsocketResponse(br#"{"m":"at\u002dFAKE"}"#), &sent);
+                sink.record_sent(
+                    WebsocketError {
+                        stage: "read",
+                        error: "closed: reason at-FAKE",
+                        cause: Some("cause at-FAKE"),
+                    },
+                    &sent,
+                );
+                sink.record_sent(WebsocketResponse(br#"{"m":"at-OTHER"}"#), &sent);
+                sink.record(WebsocketResponse(br#"{"unbound":"at-FAKE-UNBOUND"}"#));
+                // The spool already holds what passed the memory bound.
+                let spools: Vec<Vec<u8>> = std::fs::read_dir(&spool_dir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+                    .map(|e| std::fs::read(e.path()).unwrap())
+                    .collect();
+                assert!(!spools.is_empty(), "the section spooled");
+                for spool in &spools {
+                    // The client's own request body aside.
+                    let spool = String::from_utf8_lossy(spool).replace("client at-FAKE", "");
+                    assert!(!sent.exposes(spool.as_bytes()), "{spool}");
+                    assert!(spool.contains("quoted [REDACTED] xxx"), "{spool}");
+                }
+                (StatusCode::OK, "done")
+            }
+        });
+        let mut app = router(&state, app);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/fixture")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.call(request).await.unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        // Complete: the response and the timeline are in, and no spool file is left.
+        let mut content = String::new();
+        for _ in 0..500 {
+            let spooling = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "tmp"));
+            if let ([log], false) = (&logs(&dir)[..], spooling) {
+                content = std::fs::read_to_string(log).unwrap();
+                if content.contains("\ndone") && content.contains("unbound") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            content.contains("\ndone") && content.contains("unbound"),
+            "no complete log: {content} {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .collect::<Vec<_>>()
+        );
+        let sent = cpa_core::exec::SentCredentials::new(["at-FAKE"]);
+        // The unbound exchange keeps its bytes; every bound one is scrubbed.
+        let bound = content
+            .replace(r#"{"unbound":"at-FAKE-UNBOUND"}"#, "")
+            .replace("client at-FAKE", "");
+        assert!(!sent.exposes(bound.as_bytes()), "{bound}");
+        for kept in [
+            "X-Echo: echo [REDACTED]",
+            "quoted [REDACTED] xxx",
+            "[REDACTED: 20 bytes carried an upstream credential]",
+            "Error: closed: reason [REDACTED]",
+            r#"{"m":"at-OTHER"}"#,
+            r#"{"unbound":"at-FAKE-UNBOUND"}"#,
+            "client at-FAKE",
+        ] {
+            assert!(content.contains(kept), "{kept}: {content}");
+        }
+        drop(app);
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

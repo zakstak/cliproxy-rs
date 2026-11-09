@@ -288,7 +288,7 @@ impl CaptureLog {
 }
 
 impl cpa_core::exec::CaptureObserver for CaptureLog {
-    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>) {
+    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>, _: &cpa_core::exec::SentCredentials) {
         use cpa_core::exec::CaptureEvent as E;
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         let request = |websocket, r: cpa_core::exec::UpstreamRequest<'_>| Captured::Request {

@@ -267,6 +267,7 @@ impl ClaudeExecutor {
                 status: 200,
                 headers,
                 body: ResponseBody::Buffered(compaction::response(&model, &sealed, usage).into()),
+                omitted: Default::default(),
             });
         }
         headers.insert(
@@ -281,6 +282,7 @@ impl ClaudeExecutor {
             status: 200,
             headers,
             body: ResponseBody::Stream(futures_util::stream::iter(chunks).boxed()),
+            omitted: Default::default(),
         })
     }
 
@@ -487,6 +489,7 @@ impl ClaudeExecutor {
             status: response.status,
             headers: response.headers,
             body,
+            omitted: Default::default(),
         };
         if req.response_format == Format::Claude {
             return Ok(response);
@@ -534,6 +537,7 @@ impl ClaudeExecutor {
                 status: 200,
                 headers: Default::default(),
                 body: ResponseBody::Buffered(render(&tokens::count(body.as_bytes())?)),
+                omitted: Default::default(),
             });
         }
         let mut prepared = ctx.prepare_count(&req, &translated, &original).await?;
@@ -550,6 +554,7 @@ impl ClaudeExecutor {
             status: response.status,
             headers: response.headers,
             body: ResponseBody::Buffered(render(&body)),
+            omitted: Default::default(),
         })
     }
 

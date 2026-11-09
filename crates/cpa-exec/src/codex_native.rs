@@ -42,6 +42,7 @@ use cpa_common::codex_body::{CodexBody, Kind};
 
 use super::*;
 use crate::codex_event;
+use crate::codex_secret::Guard;
 
 /// The endpoint profiles. Every profile takes the native and translated routes (#28).
 /// Only `chatgpt` gets the buffered `stream: true` adaptation; the others pass the
@@ -237,7 +238,7 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
         let usage = req.usage.clone();
-        let mut secrets = crate::codex_secret::Secrets::default();
+        let mut secrets = cpa_core::exec::SentCredentials::default();
         let send = self.native_send(view, settings, req, profile, call, model, body, None, &mut secrets);
         let answer = crate::cancel::fail_if_canceled(&usage, send).await;
         secrets.guard_response(answer)
@@ -257,7 +258,7 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = ws_http_body(&req.body, &model)?;
         let usage = req.usage.clone();
-        let mut secrets = crate::codex_secret::Secrets::default();
+        let mut secrets = cpa_core::exec::SentCredentials::default();
         let send = self.native_send(
             view,
             settings,
@@ -289,7 +290,7 @@ impl CodexExecutor {
         model: String,
         body: Bytes,
         ws_session: Option<&str>,
-        secrets: &mut crate::codex_secret::Secrets,
+        secrets: &mut cpa_core::exec::SentCredentials,
     ) -> Result<ExecResponse, ExecError> {
         settings.refuse_image_tool(&req.request_path, &body)?;
         // The body passed the boundary, so this never fails.
@@ -322,8 +323,11 @@ impl CodexExecutor {
         };
         // The outbound credential guard (`crate::codex_secret`): bound to what this
         // request carries, the caller checks everything the response delivers with it.
-        *secrets = crate::codex_secret::Secrets::from_request(&headers, &url);
-        let wire = Wire::new(req.capture(), view.credential);
+        *secrets = crate::codex_secret::from_request(&headers, &url);
+        // The request log and the usage record keep this exchange scrubbed of them.
+        let mut wire = Wire::new(req.capture(), view.credential);
+        wire.bind(secrets);
+        req.usage.sent_credentials(secrets);
         let error_body = if call == Call::Stream {
             ErrorBody::Strict
         } else {
@@ -384,6 +388,7 @@ impl CodexExecutor {
                 status,
                 headers,
                 body: ResponseBody::Stream(stream),
+                omitted: Default::default(),
             });
         }
         // Every byte that arrived is recorded, an unfinished tail included, then any read
@@ -431,6 +436,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Buffered(body),
+            omitted: Default::default(),
         })
     }
 }

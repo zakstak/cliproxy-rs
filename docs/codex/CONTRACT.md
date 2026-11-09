@@ -955,6 +955,14 @@ reading above, which decides by what a failure means.
     ends the connection with a silent close, because the client would otherwise wait for a
     response that already ended. The response's own record is settled as processed, and
     every other open record and queued create fails with the connection.
+  - A frame that is not delivered was still served: the executor processed it, so the
+    stream commits on it as on a delivered frame (`ExecResponse::omitted`,
+    `dispatch::finish`). A response whose every frame is withheld, its terminal event
+    included, keeps the outcome processing gave it: one execution, a successful record
+    with the usage the upstream reported (none when it reported none), no cooldown. It
+    is not Go's empty stream (`empty_stream`), which cools the credential and runs the
+    request again on another one. A failure or a truncation after a withheld frame stays
+    a failure after delivery, as after a delivered one.
   - A failure that carries a value, in its body, the frame it would deliver as sent, or
     a header it hands the client, becomes `Delivery::Confidential`. Its classified status
     and scope stay the scheduler's (no conversion to 429). The client gets no frame, no
@@ -972,9 +980,19 @@ reading above, which decides by what a failure means.
     acknowledgement that carries one is not delivered.
 - **What stays.** A frame without such a value keeps every byte: spacing, number
   spellings, duplicate members, unknown fields and opaque arrays.
-- **What it does not cover.** Request logs and usage records are operator-side. They keep
-  the shared capture sink's redaction policy (`crates/cpa-server/src/request_logging.rs`)
-  and are unchanged. The translated route (#27) and other providers have no such guard.
+- **Logs and records.** The request log (`crates/cpa-server/src/request_logging.rs`) and
+  the usage record keep what the upstream answered scrubbed of the same values
+  (`cpa_core::sent::SentCredentials::scrub`): each value as written becomes `[REDACTED]`,
+  and an entry that still carries one in an escaped spelling keeps only its length. This
+  covers every log section and its spool file, the `api.websocket.*` events, the
+  WebSocket timeline's disconnect entry, and a record's `fail.body`, `response_headers`
+  and `response_model`. The values are bound as delivery binds them: the request's until a
+  socket serves the turn, then that socket's handshake values; a fresh dial, a refreshed
+  request and a failover attempt bring their own. A record's status, tokens, account and
+  every other field stay as processed. The request body is the client's own bytes and is
+  logged as sent.
+- **What it does not cover.** The translated route (#27) and other providers have no
+  such guard.
 
 ## Translated route
 

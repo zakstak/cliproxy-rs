@@ -1652,6 +1652,10 @@ struct Reported {
     /// For a record of its own ([`Own`]): when its first upstream payload arrived, from
     /// the record's start.
     first: Option<std::time::Duration>,
+    /// The authentication values the upstream request or socket serving the attempt
+    /// carried ([`cpa_core::exec::UsageObserver::sent_credentials`]): the record keeps
+    /// nothing of the upstream's answer that carries them ([`finish`]).
+    sent: cpa_core::exec::SentCredentials,
 }
 
 impl Reported {
@@ -1995,7 +1999,16 @@ impl cpa_core::exec::UsageObserver for Observer {
             Some(body) => std::sync::Arc::new(own.facts.successor(body)),
             None => own.facts.clone(),
         };
-        Some(std::sync::Arc::new(self.record(facts, Reported::default(), false)))
+        // The same connection: the same socket's values.
+        let reported = Reported {
+            sent: self.lock().sent.clone(),
+            ..Reported::default()
+        };
+        Some(std::sync::Arc::new(self.record(facts, reported, false)))
+    }
+
+    fn sent_credentials(&self, sent: &cpa_core::exec::SentCredentials) {
+        self.lock().sent = sent.clone();
     }
 }
 
@@ -2034,6 +2047,24 @@ fn finish(
     ttft: std::time::Duration,
     stamp: &Stamp<'_>,
 ) {
+    // #25: nothing of the upstream's answer keeps a value its request or socket carried.
+    // Status, scope and every other field stay as classified.
+    let sent = &reported.sent;
+    for text in [&mut record.fail_body, &mut record.response_model] {
+        if let std::borrow::Cow::Owned(scrubbed) = sent.scrub_str(text) {
+            *text = scrubbed;
+        }
+    }
+    for (name, values) in &mut record.response_headers {
+        if let std::borrow::Cow::Owned(scrubbed) = sent.scrub_str(name) {
+            *name = scrubbed;
+        }
+        for value in values {
+            if let std::borrow::Cow::Owned(scrubbed) = sent.scrub_str(value) {
+                *value = scrubbed;
+            }
+        }
+    }
     // Go can publish a tokenless failure after observing a Claude response.
     // Keep the returned TTL buckets as observations, not inferred accounting.
     let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));

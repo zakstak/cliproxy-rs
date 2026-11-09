@@ -47,6 +47,7 @@ use crate::codex_json::{set_raw, set_str};
 use crate::codex_quota::{self, QuotaSignals};
 use crate::codex_request::{self as request, Settings, View};
 use crate::codex_response as response;
+use crate::codex_secret::Guard;
 use crate::proxy::Proxy;
 use crate::ws_cause;
 
@@ -257,7 +258,7 @@ pub(crate) struct Upstream {
     /// The authentication values this socket's handshake carried: the outbound
     /// credential guard of everything read from it ([`crate::codex_secret`]). A reused
     /// socket keeps its own handshake's values; a fresh dial gets the request's.
-    pub(crate) secrets: crate::codex_secret::Secrets,
+    pub(crate) secrets: cpa_core::exec::SentCredentials,
 }
 
 /// A socket's upgrade `openai-model` and the upstream model the upgrade was sent for.
@@ -285,7 +286,7 @@ impl Upstream {
         target: Target,
         sink: SplitSink<WebSocket, Message>,
         write: WriteLimit,
-        secrets: crate::codex_secret::Secrets,
+        secrets: cpa_core::exec::SentCredentials,
     ) -> Arc<Self> {
         Arc::new(Self {
             secrets,
@@ -1749,7 +1750,7 @@ impl CodexExecutor {
         }
         let (socket, handshake) = self.dial(target, headers, model, model_level_cooling, wire).await?;
         let (sink, stream) = socket.split();
-        let secrets = crate::codex_secret::Secrets::from_request(headers, &target.url);
+        let secrets = crate::codex_secret::from_request(headers, &target.url);
         let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets);
         if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
             let _ = conn.upgrade_model.set(upgrade);
@@ -1853,7 +1854,7 @@ impl CodexExecutor {
         exec_session: &ExecSession,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
-        let mut secrets = crate::codex_secret::Secrets::default();
+        let mut secrets = cpa_core::exec::SentCredentials::default();
         let turn = self
             .stream_ws_turn(view, settings, req, exec_session, cfg, &mut secrets)
             .await;
@@ -1868,7 +1869,7 @@ impl CodexExecutor {
         req: ExecRequest,
         exec_session: &ExecSession,
         cfg: &Config,
-        secrets: &mut crate::codex_secret::Secrets,
+        secrets: &mut cpa_core::exec::SentCredentials,
     ) -> Result<ExecResponse, ExecError> {
         // The native WebSocket route (#24): the client's `response.create` frame goes
         // upstream with only its `model` routed. No shaping, payload rules, prompt-cache
@@ -1902,7 +1903,7 @@ impl CodexExecutor {
         // The outbound credential guard (`crate::codex_secret`): this request's values
         // for a failure before the turn reads (a refused upgrade, say), and the serving
         // socket's own handshake values for everything read from that socket.
-        *secrets = crate::codex_secret::Secrets::from_request(&headers, &target.url);
+        *secrets = crate::codex_secret::from_request(&headers, &target.url);
         let session = self.ws.session(&exec_session.id);
         // `WebsocketInputFromContext(ctx) != nil && cfg.Codex.ResponseSteering`.
         let steering = settings
@@ -1912,9 +1913,13 @@ impl CodexExecutor {
             .map(|input| (input, duplex::Prepared::new(native)));
         let guard = session.turn.clone().lock_owned().await;
         let model_kept = model_kept(&req.original_body, body);
-        // A native frame is already a `response.create`.
-        let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
+        // A native frame is already a `response.create`. The request log and the usage
+        // record keep the exchange scrubbed of the same values as the guard: this
+        // request's until a socket serves the turn, then that socket's.
+        let mut wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
+        wire.bind(secrets);
+        req.usage.sent_credentials(secrets);
         wire.ws_request(&target.url, &headers, &frame);
         let (mut conn, mut handshake) = if exec_session.continuation {
             match session.current().filter(|c| c.target.serves(&target)) {
@@ -1933,6 +1938,8 @@ impl CodexExecutor {
             .await?
         };
         conn.bind(&session, exec_session.lease.as_ref())?;
+        wire.bind(&conn.secrets);
+        req.usage.sent_credentials(&conn.secrets);
         if let Some(handshake) = &handshake {
             wire.ws_handshake(101, handshake);
         }
@@ -1951,7 +1958,10 @@ impl CodexExecutor {
             if !retry {
                 return Err(error);
             }
-            // Retry once on a fresh socket: upstream may have closed it between turns.
+            // Retry once on a fresh socket: upstream may have closed it between turns. Its
+            // dial carries this request's values.
+            wire.bind(secrets);
+            req.usage.sent_credentials(secrets);
             let (fresh, fresh_handshake) = match self
                 .ensure(&session, &target, &headers, &model, settings.model_level_cooling, None)
                 .await
@@ -1963,6 +1973,8 @@ impl CodexExecutor {
                 }
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
+            wire.bind(&fresh.secrets);
+            req.usage.sent_credentials(&fresh.secrets);
             rx = fresh.activate(preserves);
             wire.ws_request(&target.url, &headers, &frame);
             if let Some(handshake) = &fresh_handshake {
@@ -2014,6 +2026,7 @@ impl CodexExecutor {
                 status: 200,
                 headers: returned,
                 body: ResponseBody::Stream(stream),
+                omitted: Default::default(),
             }));
         }
         let stream = if settings.bootstrap_buffering {
@@ -2027,6 +2040,7 @@ impl CodexExecutor {
             status: 200,
             headers: returned,
             body: ResponseBody::Stream(stream),
+            omitted: Default::default(),
         }))
     }
 }

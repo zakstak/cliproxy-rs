@@ -1274,6 +1274,7 @@ impl XaiExecutor {
             status: 200,
             headers: handshake.unwrap_or_default(),
             body: ResponseBody::Stream(prepared.replay_scope.writes.gate(stream)),
+            omitted: Default::default(),
         })
     }
 
@@ -1312,7 +1313,7 @@ impl XaiExecutor {
             sink,
             self.ws.pool.write,
             // xAI keeps its own delivery rules; the guard covers the native Codex routes.
-            crate::codex_secret::Secrets::default(),
+            cpa_core::exec::SentCredentials::default(),
         );
         // Publish before the reader runs, as the Codex executor does.
         let mut reader = conn.reader.lock().expect("reader handle");
@@ -1513,6 +1514,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Stream(futures_util::stream::iter(frames).boxed()),
+            omitted: Default::default(),
         })
     }
 }

@@ -3,11 +3,12 @@
 
 use super::*;
 use cpa_core::exec::{Delivery, ExecError, FailureScope};
+use futures_util::StreamExt;
 use http::HeaderValue;
 
 const SELECTED: &str = "at-SELECTED.token_9";
 
-fn bearer(token: &str) -> Secrets {
+fn bearer(token: &str) -> SentCredentials {
     let mut h = HeaderMap::new();
     h.insert(
         "authorization",
@@ -15,7 +16,7 @@ fn bearer(token: &str) -> Secrets {
     );
     h.insert("chatgpt-account-id", HeaderValue::from_static("acct-PUBLIC"));
     h.insert("session-id", HeaderValue::from_static("sess-PUBLIC"));
-    Secrets::from_request(&h, "https://chatgpt.example/backend-api/codex/responses")
+    from_request(&h, "https://chatgpt.example/backend-api/codex/responses")
 }
 
 #[test]
@@ -33,19 +34,19 @@ fn values_come_from_what_the_request_carried() {
     let mut h = HeaderMap::new();
     h.insert("authorization", HeaderValue::from_static("Bearer  "));
     h.insert("cookie", HeaderValue::from_static("a=; b= ;"));
-    let empty = Secrets::from_request(&h, "http://127.0.0.1:1/x");
+    let empty = from_request(&h, "http://127.0.0.1:1/x");
     assert!(!empty.exposes(b"anything at all, Bearer, a=, b"));
     // A scheme-less value, cookie values, API-key headers and a URL password.
     let mut h = HeaderMap::new();
     h.insert("authorization", HeaderValue::from_static("rawtoken-1"));
     h.insert("cookie", HeaderValue::from_static("sid=cookie-2; other=cookie-3"));
     h.insert("x-api-key", HeaderValue::from_static("key-4"));
-    let s = Secrets::from_request(&h, "https://user:p%40ss-5@relay.example/v1");
+    let s = from_request(&h, "https://user:p%40ss-5@relay.example/v1");
     for value in ["rawtoken-1", "cookie-2", "cookie-3", "key-4", "p@ss-5", "p%40ss-5"] {
         assert!(s.exposes(format!("x {value} y").as_bytes()), "{value}");
     }
     assert!(!s.exposes(b"sid other user relay.example"));
-    assert_eq!(format!("{s:?}"), "Secrets(6 redacted)");
+    assert_eq!(format!("{s:?}"), "SentCredentials(6 redacted)");
 }
 
 #[test]
@@ -90,20 +91,20 @@ fn a_failure_keeps_its_classification_and_loses_its_delivery() {
     error.direct = true;
     error.delivered_status = Some(400);
     let guarded = s.guarded(error);
-    assert_eq!(guarded.delivery, Delivery::Confidential);
+    assert_eq!(guarded.delivery, Delivery::Confidential(s.clone()));
     assert_eq!((guarded.status, guarded.scope), (400, FailureScope::Request));
     assert_eq!(&guarded.body[..], br#"{"error":{"message":"bad"}}"#);
     assert!(!guarded.direct && guarded.delivered_status.is_none() && guarded.addon.is_none());
     // A Withheld account failure whose body carries the value becomes Confidential.
     let mut account = ExecError::local(429, FailureScope::Credential, "limited at-FAKE");
     account.delivery = Delivery::Withheld;
-    assert_eq!(s.guarded(account).delivery, Delivery::Confidential);
+    assert!(s.guarded(account).confidential());
     // An addon header carrying it.
     let mut headers = HeaderMap::new();
     headers.insert("x-echo", HeaderValue::from_static("at-FAKE"));
     let mut addon = ExecError::local(503, FailureScope::Credential, "busy");
     addon.addon = Some(Box::new(headers));
-    assert_eq!(s.guarded(addon).delivery, Delivery::Confidential);
+    assert!(s.guarded(addon).confidential());
     // A failure without the value keeps its delivery, bytes and all.
     let safe = Bytes::from_static(br#"{ "type":"error","error":{"message":"at-FAKF"} , "n":1.50 }"#);
     let mut error = ExecError::local(400, FailureScope::Request, "x");
@@ -119,15 +120,61 @@ async fn a_stream_drops_frames_that_carry_a_value_and_goes_on() {
     let safe2 = Bytes::from_static(br#"{"type":"response.completed","response":{"id":"r"}}"#);
     let failure = ExecError::local(502, FailureScope::Credential, "upstream said at-FAKE");
     let items: Vec<Result<Bytes, ExecError>> = vec![Ok(safe1.clone()), Ok(leak), Ok(safe2.clone()), Err(failure)];
+    let omitted = Omissions::tracked();
     let out: Vec<_> = s
-        .guard_stream(futures_util::stream::iter(items).boxed())
+        .guard_stream(futures_util::stream::iter(items).boxed(), &omitted)
         .collect()
         .await;
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].as_ref().unwrap(), &safe1);
     assert_eq!(out[1].as_ref().unwrap(), &safe2);
     let error = out[2].as_ref().unwrap_err();
-    assert_eq!((error.status, error.delivery.clone()), (502, Delivery::Confidential));
+    assert_eq!(
+        (error.status, error.delivery.clone()),
+        (502, Delivery::Confidential(s.clone()))
+    );
+    // Classification keeps the original body; a log scrubs it with the values it holds.
+    assert_eq!(&error.body[..], b"upstream said at-FAKE");
+    assert!(omitted.any());
+}
+
+/// A served frame the guard leaves out is recorded before the stream yields its next item,
+/// so the bootstrap that reads the stream sees the omission ahead of the end or the error
+/// that follows it. A stream without such a frame records nothing.
+#[tokio::test]
+async fn an_omission_is_recorded_before_the_next_item() {
+    let s = bearer("at-FAKE");
+    let terminal = Bytes::from_static(
+        br#"{"type":"response.completed","response":{"id":"r","note":"at-FAKE","usage":{"total_tokens":5}}}"#,
+    );
+    let safe = Bytes::from_static(br#"{"type":"response.completed","response":{"id":"r","note":"at-OTHER"}}"#);
+    // The stream's items, whether one was left out, and the first item delivered.
+    type Case = (Vec<Result<Bytes, ExecError>>, bool, Option<Bytes>);
+    let cases: [Case; 4] = [
+        (vec![Ok(terminal.clone())], true, None),
+        (vec![Ok(terminal.clone()), Ok(safe.clone())], true, Some(safe.clone())),
+        (vec![Ok(safe.clone())], false, Some(safe.clone())),
+        (vec![], false, None),
+    ];
+    for (items, omits, first) in cases {
+        let omitted = Omissions::tracked();
+        let mut stream = s.guard_stream(futures_util::stream::iter(items).boxed(), &omitted);
+        let got = stream.next().await.map(Result::unwrap);
+        assert_eq!((got, omitted.any()), (first, omits));
+    }
+    // An error after an omitted frame: the omission is there when the error arrives.
+    let omitted = Omissions::tracked();
+    let failure = ExecError::local(502, FailureScope::Credential, "read failed");
+    let mut stream = s.guard_stream(
+        futures_util::stream::iter(vec![Ok(terminal), Err(failure)]).boxed(),
+        &omitted,
+    );
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(omitted.any());
+    // A response without a guard tracks nothing.
+    let untracked = Omissions::default();
+    untracked.omit();
+    assert!(!untracked.any());
 }
 
 #[test]
@@ -141,6 +188,7 @@ fn a_buffered_answer_with_a_value_fails_request_scoped() {
             status: 200,
             headers,
             body: ResponseBody::Buffered(Bytes::from_static(body)),
+            omitted: Default::default(),
         })
     };
     let error = s
@@ -148,8 +196,9 @@ fn a_buffered_answer_with_a_value_fails_request_scoped() {
         .err()
         .unwrap();
     assert_eq!((error.status, error.scope), (502, FailureScope::Request));
-    assert_eq!(error.delivery, Delivery::Confidential);
+    assert!(error.confidential());
     let ok = s.guard_response(response(br#"{"id":"r" , "output":"safe"}"#)).unwrap();
+    assert!(!ok.omitted.any());
     assert!(ok.headers.get("x-echo").is_none());
     assert_eq!(ok.headers.get("x-request-id").unwrap(), "req-1");
     let ResponseBody::Buffered(body) = ok.body else {
@@ -181,7 +230,7 @@ fn cookie_quotes_are_syntax_and_an_empty_quoted_cookie_matches_nothing() {
     let cookies = |value: &'static str| {
         let mut h = HeaderMap::new();
         h.insert("cookie", HeaderValue::from_static(value));
-        Secrets::from_request(&h, "http://127.0.0.1/x")
+        from_request(&h, "http://127.0.0.1/x")
     };
     let s = cookies(r#"sid="cookie-QUOTED"; empty=""; other=unquoted-TOKEN"#);
     assert!(s.exposes(b"echo cookie-QUOTED"));

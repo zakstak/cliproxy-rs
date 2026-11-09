@@ -302,6 +302,7 @@ impl MetaExecutor {
             status: upstream.status,
             headers: upstream.headers,
             body: out,
+            omitted: Default::default(),
         })
     }
 
@@ -329,6 +330,7 @@ impl MetaExecutor {
             status: 200,
             headers: http::HeaderMap::new(),
             body: ResponseBody::Buffered(Bytes::from(payload)),
+            omitted: Default::default(),
         })
     }
 }
