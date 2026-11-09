@@ -2661,6 +2661,12 @@ async fn each_socket_reports_its_own_loss_once() {
             .await
             .is_err()
     }
+    async fn fires(losses: &mut SessionLosses, what: &str) -> String {
+        let loss = tokio::time::timeout(Duration::from_secs(2), losses.next())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no loss fired"));
+        String::from_utf8_lossy(&loss.body).into_owned()
+    }
     let lost = |text: &str| transport(text);
     let pool = Pool::default();
     let session = pool.session("s");
@@ -2670,7 +2676,7 @@ async fn each_socket_reports_its_own_loss_once() {
     assert!(shadow.pending().is_none());
     session.notify(a, &lost("a lost"));
     assert_eq!(&shadow.pending().unwrap().body[..], b"a lost", "pending until taken");
-    assert_eq!(&losses.next().await.body[..], b"a lost");
+    assert_eq!(fires(&mut losses, "a").await, "a lost");
     assert!(shadow.pending().is_none(), "a taken loss is not pending");
     session.notify(a, &lost("a again"));
     assert!(quiet(&mut losses).await, "a socket reports one loss");
@@ -2681,7 +2687,7 @@ async fn each_socket_reports_its_own_loss_once() {
     assert!(shadow.pending().is_none());
     session.notify(b, &lost("b lost"));
     assert_eq!(&shadow.pending().unwrap().body[..], b"b lost");
-    assert_eq!(&losses.next().await.body[..], b"b lost", "the replacement's loss fires");
+    assert_eq!(fires(&mut losses, "the replacement's loss").await, "b lost");
     // A loss nobody took is superseded by the next dial, whether or not it succeeds.
     let c = session.begin_socket();
     session.notify(c, &lost("c lost"));
@@ -2692,6 +2698,6 @@ async fn each_socket_reports_its_own_loss_once() {
     let e = session.begin_socket();
     session.notify(e, &lost("e lost"));
     let mut later = pool.losses("s");
-    assert_eq!(&later.next().await.body[..], b"e lost");
-    assert_eq!(&losses.next().await.body[..], b"e lost");
+    assert_eq!(fires(&mut later, "a later subscription").await, "e lost");
+    assert_eq!(fires(&mut losses, "e").await, "e lost");
 }
