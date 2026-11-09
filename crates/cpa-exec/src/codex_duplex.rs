@@ -50,9 +50,8 @@ use cpa_core::format::Format;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Turn, Upstream, transport, ws_error};
+use super::{Read, Reading, Turn, Upstream, transport};
 use crate::codex_request::View;
-use crate::codex_response as response;
 use crate::rawjson::{self, Kind};
 
 /// Bound on queued and outstanding `response.create` requests.
@@ -213,10 +212,6 @@ const RESPONSE_EVENTS: [&str; 7] = [
     "response.done",
 ];
 
-fn response_terminal(kind: &str) -> bool {
-    matches!(kind, "response.completed" | "response.done" | "response.incomplete")
-}
-
 /// The request an upstream failure (`error`, `response.failed`) after the first response
 /// belongs to. A failure names its response in `response.id`, or in `response_id` on an
 /// `error` event.
@@ -248,19 +243,8 @@ struct Observing {
     observation: futures_util::future::BoxFuture<'static, ()>,
     payload: String,
     kind: String,
+    /// What the pinned WebSocket reader makes of the message (`codex_ws::reading`).
     reading: Reading,
-}
-
-/// How the pinned WebSocket reader decodes an upstream frame (`crate::codex_event`,
-/// `endpoint/responses_websocket.rs:864-884` at 44ccf394573c).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reading {
-    /// A `ResponsesStreamEvent`.
-    Event,
-    /// Not that, but a wrapped status `error`: only its status classification applies.
-    Wrapped,
-    /// Neither: the reader skips the frame.
-    Skipped,
 }
 
 pub(super) struct Duplex {
@@ -471,8 +455,7 @@ impl Duplex {
             // Nobody reads the stream any more, but the upstream outcome that message
             // carries is known: it settles the records it settles while the client is
             // there (a terminal, a failure, a rejection), and nothing is delivered.
-            let terminal = self.failure(&observing.payload, observing.reading);
-            self.settle(&observing.payload, &observing.kind, terminal.as_ref());
+            self.settle(&observing.payload, &observing.kind, &observing.reading);
         }
         // Records still open settle as the client's cancellation when `self` drops.
     }
@@ -622,61 +605,42 @@ impl Duplex {
         self.open.iter().rposition(|open| open.id == id.str())
     }
 
-    /// An upstream message's classified failure, if it is one, as its [`Reading`] allows.
-    fn failure(&self, payload: &str, reading: Reading) -> Option<ExecError> {
-        let cooling = self.turn.cooling;
-        match reading {
-            Reading::Event => {
-                ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
-            }
-            Reading::Wrapped => ws_error(payload, cooling),
-            Reading::Skipped => None,
-        }
-    }
-
     /// What an upstream message settles, apart from its delivery: a terminal event its
     /// response's record, a failure the record of the request it belongs to, and an
-    /// account failure every record. `terminal` is the message's classification. The
+    /// account failure every record. `reading` is the message's classification. The
     /// queue and running state follow (a rejected create leaves the queue). The same
     /// whether or not the consumer still reads the stream.
-    fn settle(&mut self, payload: &str, kind: &str, terminal: Option<&ExecError>) -> Settlement {
-        let failure = kind == "error" || kind == "response.failed";
-        if failure && let Some(error) = terminal.filter(|e| super::account_failure(e.status)) {
-            self.fail_records(error);
-            return Settlement::Account(error.clone());
-        }
-        if failure && !self.first_response {
-            // Both failure kinds always classify; the fallback only keeps the record a
-            // failure.
-            let fallback;
-            let error = match terminal {
-                Some(error) => error,
-                None => {
-                    fallback = local("upstream failure event without details");
-                    &fallback
-                }
-            };
-            match self.failure_owner(payload) {
-                Owner::Ambiguous => return Settlement::Ambiguous,
-                Owner::Rejected => {
-                    if let Some(rejected) = self.pending.pop_front()
-                        && let Some(accounting) = rejected.accounting
-                    {
-                        accounting.fail(error);
+    fn settle(&mut self, payload: &str, kind: &str, reading: &Reading) -> Settlement {
+        if let Reading::Failure { error, .. } = reading {
+            if super::account_failure(error.status) {
+                self.fail_records(error);
+                return Settlement::Account(error.clone());
+            }
+            if !self.first_response {
+                match self.failure_owner(payload) {
+                    Owner::Ambiguous => return Settlement::Ambiguous,
+                    Owner::Rejected => {
+                        if let Some(rejected) = self.pending.pop_front()
+                            && let Some(accounting) = rejected.accounting
+                        {
+                            accounting.fail(error);
+                        }
                     }
-                }
-                Owner::Started { ends_latest, open } => {
-                    if ends_latest {
-                        self.response_active = false;
-                        self.automatic_active = false;
-                    }
-                    if let Some(open) = open.and_then(|i| self.open.remove(i)) {
-                        open.accounting.fail(error);
+                    Owner::Started { ends_latest, open } => {
+                        if ends_latest {
+                            self.response_active = false;
+                            self.automatic_active = false;
+                        }
+                        if let Some(open) = open.and_then(|i| self.open.remove(i)) {
+                            open.accounting.fail(error);
+                        }
                     }
                 }
             }
         }
-        if response_terminal(kind) {
+        // Only an event the response ends on (`codex_event::Event::terminal`): a
+        // `response.completed` without a `response`, or a `response.done`, ends nothing.
+        if matches!(reading, Reading::Event { terminal: true }) {
             self.response_active = false;
             self.automatic_active = false;
             if self.first_response {
@@ -716,9 +680,11 @@ impl Duplex {
     // A failure reusing a retained settled ID cannot be told from that old response;
     // only a new response.created binds a fresh record to that ID.
     fn failure_owner(&self, payload: &str) -> Owner {
-        let mut failed = rawjson::get(payload, "response.id").str().to_owned();
+        // As the pinned `Value` holds the failure: the last of a repeated key.
+        let view = crate::codex_event::last_wins(payload);
+        let mut failed = rawjson::get(&view, "response.id").str().to_owned();
         if failed.is_empty() {
-            failed = rawjson::get(payload, "response_id").str().to_owned();
+            failed = rawjson::get(&view, "response_id").str().to_owned();
         }
         if failed.is_empty() {
             if (!self.pending.is_empty() && self.response_active) || !self.unacknowledged.is_empty() {
@@ -756,9 +722,6 @@ impl Duplex {
 
     /// A terminal event settles its response's record with what it reported.
     fn settle_terminal(&mut self, payload: &str, kind: &str) {
-        if !response_terminal(kind) {
-            return;
-        }
         if let Some(open) = self.open_index(payload, kind).and_then(|i| self.open.remove(i)) {
             open.accounting.complete();
         }
@@ -1042,17 +1005,25 @@ impl Duplex {
         }
         // A native connection hands each frame on as it arrived.
         let payload = text.as_str();
-        let (reading, kind) = match crate::codex_event::decode(payload) {
-            Some(event) => (Reading::Event, event.kind.into_owned()),
-            None if crate::codex_event::wrapped_error(payload) => (Reading::Wrapped, "error".to_owned()),
-            None => (Reading::Skipped, String::new()),
+        let event = crate::codex_event::decode(payload);
+        let reading = super::reading(payload, event.as_ref(), self.turn.cooling);
+        // A decoded event or a wrapped failure: what the pinned reader reads.
+        let read = event.is_some() || matches!(reading, Reading::Failure { .. });
+        let accounted = event.as_ref().is_none_or(crate::codex_event::Event::accounted);
+        let kind = match (event, &reading) {
+            (Some(event), _) => event.kind.into_owned(),
+            // A wrapped status error.
+            (None, Reading::Failure { .. }) => "error".to_owned(),
+            (None, _) => String::new(),
         };
-        if reading != Reading::Skipped {
+        if read {
             if kind == "response.created" && !self.response_created(payload) {
                 return;
             }
             self.turn.signals(payload);
-            self.account(payload, &kind);
+            if accounted {
+                self.account(payload, &kind);
+            }
         }
         match self.turn.wire.ws_response_observation(payload) {
             Some(observation) => {
@@ -1082,10 +1053,9 @@ impl Duplex {
             }
             return;
         }
-        let terminal = self.failure(payload, reading);
-        if reading != Reading::Event && terminal.is_none() {
-            // The pinned reader skips this frame. It settles nothing and reaches the client
-            // as sent, unless it would read as an account failure (#6).
+        if matches!(reading, Reading::Passed) {
+            // The pinned reader skips or ignores this frame. It settles nothing and
+            // reaches the client as sent, unless it would read as an account failure (#6).
             if !super::account_shaped(payload) {
                 self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
             }
@@ -1093,7 +1063,7 @@ impl Duplex {
         }
         // Records settle before the event is delivered: a record does not depend on
         // whether the client is still there to receive it.
-        match self.settle(payload, kind, terminal.as_ref()) {
+        match self.settle(payload, kind, &reading) {
             Settlement::Settled => {}
             // An account failure on a native connection never reaches the client as
             // sent, whichever request it belongs to: its frame can name the pooled
@@ -1118,6 +1088,10 @@ impl Duplex {
         // restored.
         // Only the first rejection fails the stream (and can enter bootstrap retry);
         // later ones are events the client may correct on this socket.
+        let terminal = match reading {
+            Reading::Failure { error, .. } => Some(error),
+            Reading::Event { .. } | Reading::Passed => None,
+        };
         if let Some(error) = &terminal {
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
@@ -1128,10 +1102,11 @@ impl Duplex {
             // context-window failure does too, so Codex can compact and retry (#5). On a
             // native connection any other initial failure travels on the error as the
             // upstream sent it, for delivery once failover is decided.
+            let view = crate::codex_event::last_wins(payload);
             match self
                 .turn
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload))
+                .then(|| cpa_common::codex_client::context_window_failure_event(payload, &view))
                 .flatten()
             {
                 Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),

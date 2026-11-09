@@ -171,3 +171,297 @@ fn the_corpus_straddles_the_recursion_limit() {
     assert!(decode(&at(MAX_DEPTH - 1)).is_some());
     assert!(decode(&at(MAX_DEPTH)).is_none());
 }
+
+/// What the first-party build's `Value` (serde_json 1.0.149 with `arbitrary_precision`
+/// and `raw_value`, `value/de.rs` `KeyClassifier`) does with an object whose first key is
+/// a private token, at each position a known member's value can hold one. This build's
+/// `Value` lacks `arbitrary_precision`, so the in-crate oracle cannot judge these; the
+/// expectations were checked against that serde_json (event-safety-completion evidence,
+/// `oracle-extra`).
+const PRIVATE_TOKENS: [(&str, bool); 30] = [
+    // A number written as a string: exactly one JSON number, and nothing else.
+    (r#"{"$serde_json::private::Number":"1"}"#, true),
+    (r#"{"$serde_json::private::Number":"-0"}"#, true),
+    (r#"{"$serde_json::private::Number":"-1.5e+3"}"#, true),
+    (r#"{"$serde_json::private::Number":"1E400"}"#, true),
+    (
+        r#"{"$serde_json::private::Number":"123456789012345678901234567890"}"#,
+        true,
+    ),
+    (r#"{ "$serde_json::private::Number" : "2" }"#, true),
+    (r#"{"$serde_json::private::Numbe\u0072":"3"}"#, true),
+    (r#"{"$serde_json::private::Number":"bad"}"#, false),
+    (r#"{"$serde_json::private::Number":12}"#, false),
+    (r#"{"$serde_json::private::Number":null}"#, false),
+    (r#"{"$serde_json::private::Number":""}"#, false),
+    (r#"{"$serde_json::private::Number":" 1"}"#, false),
+    (r#"{"$serde_json::private::Number":"1 "}"#, false),
+    (r#"{"$serde_json::private::Number":"01"}"#, false),
+    (r#"{"$serde_json::private::Number":"1."}"#, false),
+    (r#"{"$serde_json::private::Number":".5"}"#, false),
+    (r#"{"$serde_json::private::Number":"+1"}"#, false),
+    (r#"{"$serde_json::private::Number":"1e"}"#, false),
+    (r#"{"$serde_json::private::Number":"-"}"#, false),
+    (r#"{"$serde_json::private::Number":"1","x":3}"#, false),
+    (r#"{"$serde_json::private::Number":"\ud83d"}"#, false),
+    // JSON text written as a string: valid JSON that decodes as a `Value` itself.
+    (r#"{"$serde_json::private::RawValue":"{\"a\":[1e400]}"}"#, true),
+    (r#"{"$serde_json::private::RawValue":" 7 "}"#, true),
+    (
+        r#"{"$serde_json::private::RawValue":"{\"$serde_json::private::Number\":\"4\"}"}"#,
+        true,
+    ),
+    (r#"{"$serde_json::private::RawValue":"{"}"#, false),
+    (r#"{"$serde_json::private::RawValue":"1 2"}"#, false),
+    (r#"{"$serde_json::private::RawValue":{}}"#, false),
+    (
+        r#"{"$serde_json::private::RawValue":"{\"$serde_json::private::Number\":\"x\"}"}"#,
+        false,
+    ),
+    (r#"{"$serde_json::private::RawValue":"\"\\ud83d\""}"#, false),
+    (r#"{"$serde_json::private::RawValue":"1","x":3}"#, false),
+];
+
+#[test]
+fn private_tokens_decode_as_the_first_party_value_does() {
+    for (object, accepted) in PRIVATE_TOKENS {
+        for event in [
+            format!(r#"{{"type":"x","response":{object}}}"#),
+            format!(r#"{{"type":"x","error":{{"a":[{object}]}}}}"#),
+            format!(r#"{{"type":"x","safety_buffering":[0,{{"b":{object}}}]}}"#),
+            // The positional form, `metadata` third, every member without a default.
+            format!(r#"["x",null,{object},null,null,null,null,null,null,null,null,null,null]"#),
+        ] {
+            assert_eq!(decode(&event).is_some(), accepted, "{event}");
+        }
+    }
+    // Only the first key is read that way, and only inside a known member.
+    for event in [
+        r#"{"type":"x","response":{"id":"r","$serde_json::private::Number":"bad"}}"#,
+        r#"{"type":"x","future":{"$serde_json::private::Number":"bad"}}"#,
+        r#"{"type":"x","$serde_json::private::Number":"bad"}"#,
+        r#"{"$serde_json::private::Number":"bad","type":"x"}"#,
+        r#"{"type":"x","response":{"s":"{\"$serde_json::private::Number\":\"bad\"}"}}"#,
+    ] {
+        assert!(decode(event).is_some(), "{event}");
+    }
+}
+
+/// A private token's object is one level of nesting; the JSON text of a raw-value token
+/// starts a fresh budget.
+#[test]
+fn private_tokens_count_toward_nesting_as_the_pinned_value_does() {
+    let number = r#"{"$serde_json::private::Number":"1"}"#;
+    let at = |depth: usize, inner: &str| {
+        format!(
+            r#"{{"type":"x","response":{}{inner}{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+    };
+    assert!(decode(&at(MAX_DEPTH - 2, number)).is_some());
+    assert!(decode(&at(MAX_DEPTH - 1, number)).is_none());
+    let deep = format!("{}0{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+    let raw = format!(r#"{{"$serde_json::private::RawValue":"{deep}"}}"#);
+    assert!(decode(&format!(r#"{{"type":"x","response":{raw}}}"#)).is_some());
+    let deeper = format!("{}0{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+    let raw = format!(r#"{{"$serde_json::private::RawValue":"{deeper}"}}"#);
+    assert!(decode(&format!(r#"{{"type":"x","response":{raw}}}"#)).is_none());
+}
+
+/// `WrappedWebsocketErrorEvent` as pinned (`endpoint/responses_websocket.rs:684-709`):
+/// the in-crate oracle for [`wrapped`]'s shape decision, numbers and private tokens aside.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct PinnedWrapped {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(alias = "status_code")]
+    status: Option<u16>,
+    #[serde(default)]
+    error: Option<PinnedWrappedError>,
+    #[serde(default)]
+    headers: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct PinnedWrappedError {
+    code: Option<String>,
+    message: Option<String>,
+    #[serde(default)]
+    headers: Option<Value>,
+}
+
+/// The pinned mapping (`map_wrapped_websocket_error_event`, lines 712-764): a recognised
+/// code is retryable first; then a status `http::StatusCode` accepts and that is not a
+/// success is an HTTP error; anything else maps to nothing.
+#[test]
+fn wrapped_frames_map_as_the_pinned_reader_maps_them() {
+    use Wrapped::*;
+    let cases = [
+        (
+            r#"{"type":"error","status":400,"error":{"code":"x"}}"#,
+            Some(Status(400)),
+        ),
+        (r#"{"type":"error","status_code":429}"#, Some(Status(429))),
+        (r#"{"type":"error","status":100}"#, Some(Status(100))),
+        (r#"{"type":"error","status":199}"#, Some(Status(199))),
+        (r#"{"type":"error","status":300}"#, Some(Status(300))),
+        (r#"{"type":"error","status":999}"#, Some(Status(999))),
+        (
+            r#"{"type":"error","status":200,"error":{"code":"other"}}"#,
+            Some(Notice),
+        ),
+        (r#"{"type":"error","status":299}"#, Some(Notice)),
+        (r#"{"type":"error","status":99}"#, Some(Notice)),
+        (r#"{"type":"error","status":0}"#, Some(Notice)),
+        (r#"{"type":"error","status":1000}"#, Some(Notice)),
+        (r#"{"type":"error","status":65535}"#, Some(Notice)),
+        (r#"{"type":"error","error":{"code":"other"}}"#, Some(Statusless)),
+        (r#"{"type":"error","status":null}"#, Some(Statusless)),
+        (
+            r#"{"type":"error","error":{"code":"previous_response_not_found"}}"#,
+            Some(Retryable(None)),
+        ),
+        (
+            r#"{"type":"error","status":200,"error":{"code":"websocket_connection_limit_reached"}}"#,
+            Some(Retryable(None)),
+        ),
+        (
+            r#"{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached"}}"#,
+            Some(Retryable(Some(429))),
+        ),
+        (r#"{"type":"error","item_id":23,"status":503}"#, Some(Status(503))),
+        // Not the pinned shape.
+        (r#"{"type":"error","status":65536}"#, None),
+        (r#"{"type":"error","status":-1}"#, None),
+        (r#"{"type":"error","status":400.0}"#, None),
+        (r#"{"type":"error","status":"400"}"#, None),
+        (r#"{"type":"error","status":400,"status_code":400}"#, None),
+        (r#"{"type":"error","status":400,"status":429}"#, None),
+        (r#"{"type":"error","type":"error","status":400}"#, None),
+        (r#"{"type":"response.failed","status":400}"#, None),
+        (r#"{"type":"error","status":400,"error":"boom"}"#, None),
+        (r#"{"type":"error","status":400,"error":{"code":5}}"#, None),
+        (r#"{"type":"error","status":400,"error":{"code":"a","code":"b"}}"#, None),
+        (r#"{"type":"error","status":400,"headers":[]}"#, None),
+        (r#"{"type":"error","status":400,"headers":"x"}"#, None),
+        (r#"{"status":400}"#, None),
+    ];
+    for (frame, want) in cases {
+        assert_eq!(wrapped(frame), want, "{frame}");
+        let pinned = serde_json::from_str::<PinnedWrapped>(frame).is_ok_and(|w| w.kind == "error");
+        assert_eq!(wrapped(frame).is_some(), pinned, "{frame}");
+    }
+}
+
+/// The top-level `headers` is a `Map`, whose own keys are plain and whose values sit at
+/// the second level; `error.headers` is a `Value` at the third.
+#[test]
+fn wrapped_header_values_decode_at_their_own_level() {
+    let nest = |depth: usize| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+    let top = |depth| format!(r#"{{"type":"error","status":400,"headers":{{"x":{}}}}}"#, nest(depth));
+    let inner = |depth| {
+        format!(
+            r#"{{"type":"error","status":400,"error":{{"code":"x","headers":{{"x":{}}}}}}}"#,
+            nest(depth)
+        )
+    };
+    for (frame, accepted) in [
+        (top(MAX_DEPTH - 2), true),
+        (top(MAX_DEPTH - 1), false),
+        (inner(MAX_DEPTH - 3), true),
+        (inner(MAX_DEPTH - 2), false),
+    ] {
+        let pinned = serde_json::from_str::<PinnedWrapped>(&frame).is_ok();
+        assert_eq!(pinned, accepted, "oracle: {frame}");
+        assert_eq!(wrapped(&frame).is_some(), accepted, "{frame}");
+    }
+    let marker = r#"{"$serde_json::private::Number":"bad"}"#;
+    // The map's own first key is a plain key; a `Value` inside it is read as a `Value`.
+    assert!(wrapped(&format!(r#"{{"type":"error","status":400,"headers":{marker}}}"#)).is_some());
+    assert!(
+        wrapped(&format!(
+            r#"{{"type":"error","status":400,"headers":{{"x":{marker}}}}}"#
+        ))
+        .is_none()
+    );
+    assert!(
+        wrapped(&format!(
+            r#"{{"type":"error","status":400,"error":{{"headers":{marker}}}}}"#
+        ))
+        .is_none()
+    );
+}
+
+#[test]
+fn last_wins_keeps_the_last_of_each_repeated_key() {
+    for (payload, view) in [
+        (
+            r#"{"type":"response.failed","response":{"error":{"type":"a","type":"b","code":"c"}}}"#,
+            r#"{"type":"response.failed","response":{"error":{"type":"b","code":"c"}}}"#,
+        ),
+        (r#"{"a":1,"b":2,"a":3}"#, r#"{"b":2,"a":3}"#),
+        (r#"{"a":1,"a":2,"a":3}"#, r#"{"a":3}"#),
+        (r#"{ "a" : 1 , "a" : {"x":1,"x":2} }"#, r#"{ "a" : {"x":2} }"#),
+        (r#"{"a":{"x":1,"x":2},"a":5}"#, r#"{"a":5}"#),
+        (r#"{"typ\u0065":"x","type":"error"}"#, r#"{"type":"error"}"#),
+        (r#"[{"k":1,"k":2},{"k":3}]"#, r#"[{"k":2},{"k":3}]"#),
+        (
+            r#"{"s":"\"a\":1,\"a\":2","n":1.50,"n":1e3}"#,
+            r#"{"s":"\"a\":1,\"a\":2","n":1e3}"#,
+        ),
+    ] {
+        let got = last_wins(payload);
+        assert!(matches!(got, Cow::Owned(_)), "{payload}");
+        assert_eq!(got, view, "{payload}");
+        let pinned: Value = serde_json::from_str(payload).unwrap();
+        let read: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(read, pinned, "{payload}");
+    }
+    for unchanged in [
+        r#"{"a":1,"b":{"a":2}}"#,
+        r#"{"type":"error","error":{"code":"x"}}"#,
+        r#"{"a":1,"a":2"#,
+        "not json",
+        "",
+    ] {
+        assert!(
+            matches!(last_wins(unchanged), Cow::Borrowed(s) if s == unchanged),
+            "{unchanged}"
+        );
+    }
+}
+
+#[test]
+fn member_reads_the_last_key_as_value_get_does() {
+    assert_eq!(member(r#"{"id":"a","x":1,"id":"b"}"#, "id"), Some(r#""b""#));
+    assert_eq!(member(r#"{"i\u0064":"a"}"#, "id"), Some(r#""a""#));
+    assert_eq!(member(r#"{"x":{"id":"a"}}"#, "id"), None);
+    assert_eq!(member(r#"["id"]"#, "id"), None);
+    assert_eq!(member("null", "id"), None);
+}
+
+#[test]
+fn terminal_and_accounted_follow_the_pinned_reader() {
+    for (event, terminal, accounted) in [
+        (r#"{"type":"response.completed","response":{"id":"r"}}"#, true, true),
+        (r#"{"type":"response.completed","response":[]}"#, true, true),
+        (r#"{"type":"response.completed","response":null}"#, false, false),
+        (r#"{"type":"response.completed"}"#, false, false),
+        (r#"{"type":"response.incomplete"}"#, true, true),
+        (r#"{"type":"response.incomplete","response":null}"#, true, true),
+        (r#"{"type":"response.done","response":{"id":"r"}}"#, false, false),
+        (r#"{"type":"response.failed","response":{"id":"r"}}"#, false, true),
+        (r#"{"type":"response.output_text.delta","delta":"x"}"#, false, true),
+    ] {
+        let decoded = decode(event).expect("decodes");
+        assert_eq!(decoded.terminal(), terminal, "{event}");
+        assert_eq!(decoded.accounted(), accounted, "{event}");
+    }
+    let event = decode(r#"{"type":"response.completed","response":{"id":"a","id":"b"}}"#).unwrap();
+    assert_eq!(event.response_id().as_deref(), Some("b"));
+    let event = decode(r#"{"type":"response.completed","response":{"id":5}}"#).unwrap();
+    assert_eq!(event.response_id(), None);
+}

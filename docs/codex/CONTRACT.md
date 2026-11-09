@@ -408,13 +408,38 @@ The response reaches the client as the upstream sent it:
   types, and whose `type` is a string. Unknown members are ignored, repeated or not.
   A key repeated inside a known member's value is ignored too, and the client's
   `serde_json::Value` keeps the last one. A number of any size counts, because the
-  first-party build enables serde_json's `arbitrary_precision`
-  (`exec-server-protocol/Cargo.toml:25`). `crates/cpa-exec/src/codex_event.rs` makes
-  the same decision with the same serde-derived shape. Only a decoded event ends the
-  response, fails it, is converted (#5) or feeds usage. An event that does not decode,
-  such as invalid JSON, a repeated `type` or `response`, or a known member of the wrong
-  type, passes as sent. It counts as delivered content, and the stream goes on to the
-  next event.
+  first-party build enables serde_json's `arbitrary_precision` and `raw_value`
+  (`exec-server-protocol/Cargo.toml:25`; `Cargo.lock` pins serde_json 1.0.149). With
+  them, that `Value` reads an object whose first key is serde_json's private
+  `$serde_json::private::Number` or `$serde_json::private::RawValue` token as a number
+  or as JSON text, and refuses it unless it has that one member holding exactly one
+  JSON number, or JSON text that itself decodes. The token is an ordinary key anywhere
+  else, and in unknown members. `crates/cpa-exec/src/codex_event.rs` makes the same
+  decision with the same serde-derived shape and a one-pass check of each known
+  `Value` member for nesting, surrogate escapes and those tokens; the proxy's own
+  serde_json features stay unchanged. Only a decoded event ends the response, fails
+  it, is converted (#5) or feeds usage. An event that does not decode, such as invalid
+  JSON, a repeated `type` or `response`, a known member of the wrong type, or an
+  invalid private token, passes as sent. It counts as delivered content, and the
+  stream goes on to the next event.
+- A decoded event ends the response only when the pinned reader ends it
+  (`process_responses_event`, `sse/responses.rs:375-562`): a `response.completed` with
+  a `response`, or any `response.incomplete`. A `response.completed` whose `response`
+  is missing or `null` returns no event there, and `response.done` is not handled, so
+  both pass as sent and the stream goes on; usage skips them, so the record keeps the
+  usage of the event the response does end on. A buffered answer takes its `response`
+  object from the event the response ends on. One boundary stays: a `response` the
+  pinned reader cannot read as `ResponseCompleted` (no string `id`, a malformed
+  `usage`), a content-filter `response.incomplete` and an interrupted one with such a
+  `response` end the WebSocket reader's turn with an error, while its SSE reader
+  records that error and reads on until the stream ends. The proxy ends the response
+  on them on both transports, so over HTTP a further terminal event after one is not
+  forwarded.
+- A failure is classified as the pinned `Value` holds it: each object keeps the last of
+  a repeated key, compared after unescaping. That reading decides the status, scope,
+  retry hint, usage-limit, capacity and overload checks, the #5 context-window
+  conversion and the account-failure boundary. The client still receives the event's
+  own bytes; #5's converted event embeds the upstream `error` object as sent.
 - An upstream HTTP error keeps its classification for the scheduler, and the client
   receives the upstream's status, body and filtered headers unchanged
   (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit
@@ -596,12 +621,25 @@ receives (`ExecError::delivered_event`).
   [native HTTP route](#native-http-route), on an upstream socket, a steering connection
   and a turn served over HTTP. The WebSocket reader has one more reading. A frame that
   is not a `ResponsesStreamEvent` can still be a wrapped status `error`
-  (`responses_websocket.rs:684-709`, 864-884), and on an upstream socket such a frame
-  still fails the turn by its status. The SSE reader has no such reading, so over HTTP
+  (`responses_websocket.rs:684-709`, 864-884), decided as the next item describes. The SSE reader has no such reading, so over HTTP
   it is a frame that does not decode. A frame that does not decode passes as sent and
   ends, fails and settles nothing, with one exception. When its failure reading would
-  be an account failure, it is withheld, because it can name the pooled account. It is
-  not classified either, so the credential does not cool and the turn goes on.
+  be an account failure, with the first or the last of a repeated key (a JSON reader
+  keeps one or the other), it is withheld, because it can name the pooled account. It
+  is not classified either, so the credential does not cool and the turn goes on.
+- On an upstream socket a wrapped frame (a frame that does not decode, or a decoded
+  `error`, that decodes as `WrappedWebsocketErrorEvent`) is decided by the pinned
+  mapping (`responses_websocket.rs:712-764`). `previous_response_not_found` and
+  `websocket_connection_limit_reached` fail the turn whatever the status, and reach
+  the client as sent. A status `http::StatusCode` accepts (100 to 999) that is not a
+  success fails it by that status. A success status, or one outside 100 to 999, maps
+  to no error: the frame is a notice that passes as sent (or is withheld when it would
+  read as an account failure), ends nothing and cools nothing. A decoded notice still
+  fails the turn when the pinned `error` branch raises its code
+  (`parse_terminal_provider_error`, `error.rs:79-127`). A decoded `error` without a
+  status, or one that is not a wrapped frame, keeps the status-less failure reading
+  above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
+  stays as described for the native HTTP route.
 - Every `response.incomplete` reaches the client as received, on an ordinary turn, a
   steering connection and a turn served over HTTP, at any stage: as the turn's first
   event, after events held for bootstrap, or after output. The socket stays for the next

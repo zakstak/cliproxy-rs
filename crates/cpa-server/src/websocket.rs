@@ -1515,12 +1515,20 @@ impl Connection {
                 payloads_from_chunk(&chunk)
             };
             for mut payload in payloads {
+                // A native turn's executor already decided what each frame does: whether
+                // the response ends on it and whether it fails the turn (`codex_ws`). A
+                // decoded event ends the turn here only when the pinned reader ends it
+                // (`cpa_exec::codex_event::Event::terminal`).
+                let mut native_terminal = None;
                 let kind = if ctx.native_served {
                     // The upstream event boundary (`cpa_exec::codex_event`): a frame the
                     // pinned client skips is relayed as sent, and nothing here reads it:
                     // no type, completion, failure or tool call (#25).
                     match cpa_exec::codex_event::decode(&payload) {
-                        Some(event) => event.kind.into_owned(),
+                        Some(event) => {
+                            native_terminal = Some(event.terminal());
+                            event.kind.into_owned()
+                        }
                         None => {
                             preserved_event = false;
                             if let Some(metadata) = metadata.take()
@@ -1554,8 +1562,10 @@ impl Connection {
                 turn.track_pending(&payload);
                 // Once the duplex's first response starts or ends, an error event is
                 // recoverable: the client may correct the request on this socket.
-                // Stream errors still close it.
-                if kind == "error" && !duplex_established {
+                // Stream errors still close it. A native turn's failures arrive as the
+                // stream's error, so an `error` event it relays is one the pinned reader
+                // ignores (a wrapped notice) or a recoverable steering failure.
+                if kind == "error" && !duplex_established && !ctx.native_served {
                     // `responsesWebsocketErrorMessageFromPayload`.
                     let mut status = rawjson::get(&payload, "status").i64();
                     if status <= 0 {
@@ -1571,7 +1581,7 @@ impl Connection {
                 }
                 // Codex acknowledges `response.interrupt` with an interrupted
                 // `response.incomplete`; the connection stays open for the next request.
-                if completion || kind == "response.incomplete" {
+                if native_terminal.unwrap_or(completion || kind == "response.incomplete") {
                     // The executor also admits later frames after a first terminal
                     // without `response.created` (`Duplex::first_terminal`). Keep the
                     // relay's recoverable-error state in step with it.

@@ -503,8 +503,10 @@ enum Seen {
     /// A leading event with no content yet (`response.created` and the like).
     Handshake,
     Content,
-    /// `response.completed`, `response.incomplete` or `response.done`, whatever its
-    /// reason, output or usage: the provider's terminal event, delivered as sent.
+    /// The provider's terminal event, delivered as sent: a `response.completed` with a
+    /// `response`, or any `response.incomplete`, whatever its reason, output or usage
+    /// ([`codex_event::Event::terminal`]). A `response.completed` without a `response`
+    /// and a `response.done` end nothing: the pinned reader reads on after them.
     Terminal,
     /// An event the pinned client does not decode ([`codex_event::decode`]): invalid
     /// JSON, a repeated known member, or a known member of the wrong type. The pinned
@@ -672,15 +674,20 @@ impl Observer {
             return Seen::Undecoded;
         };
         let payload = data.trim();
-        if self.usage.enabled() {
+        if self.usage.enabled() && event.accounted() {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
-        // Classification reads a copy; the client receives `delivered_failure`.
-        if let Some((error, _classified)) = response::terminal_failure(payload, self.model_level_cooling) {
+        // Classification reads a copy, as the pinned `Value` holds it: the last of a
+        // repeated key decides. The client receives `delivered_failure`.
+        let view = match event.kind.as_ref() {
+            "error" | "response.failed" => codex_event::last_wins(payload),
+            _ => Cow::Borrowed(payload),
+        };
+        if let Some((error, _classified)) = response::terminal_failure(&view, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload))
+                .then(|| cpa_common::codex_client::context_window_failure_event(payload, &view))
                 .flatten()
                 .and_then(|event| match event {
                     Cow::Owned(event) => Some(Bytes::from(match name {
@@ -694,7 +701,7 @@ impl Observer {
         }
         match event.kind.as_ref() {
             "response.output_item.done" => Seen::Content,
-            "response.completed" | "response.incomplete" | "response.done" => Seen::Terminal,
+            _ if event.terminal() => Seen::Terminal,
             _ if response::bufferable(payload) => Seen::Handshake,
             _ => Seen::Content,
         }
@@ -836,9 +843,11 @@ impl Passthrough {
         // event ahead of the error, renamed when it was the status-less `error`.
         let preserved = deliver.or_else(|| {
             let context = self.observer.codex_client
-                && parse_frame(&frame)
-                    .1
-                    .is_some_and(|data| cpa_common::codex_client::context_window_failure_event(data.trim()).is_some());
+                && parse_frame(&frame).1.is_some_and(|data| {
+                    let payload = data.trim();
+                    let view = codex_event::last_wins(payload);
+                    cpa_common::codex_client::context_window_failure_event(payload, &view).is_some()
+                });
             context.then(|| frame.clone())
         });
         match preserved {

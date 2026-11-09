@@ -2715,3 +2715,299 @@ async fn undecodable_events_never_end_or_fail_websocket_turns() {
         }
     }
 }
+
+/// What a WebSocket client sees for one upstream frame followed by a real completion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outcome {
+    /// The frame and the completion reach the client as sent; nothing cools.
+    Passes,
+    /// The frame is withheld (#6), the completion still arrives, nothing cools.
+    Withheld,
+    /// A request-scoped failure: the frame reaches the client as sent and ends the turn;
+    /// nothing cools and the completion after it is not read.
+    FailsAsSent,
+    /// An account failure: the frame never reaches the client, the turn ends and the
+    /// credential cools.
+    AccountFailure,
+}
+
+/// #25 (E1-E4) and #6: the pinned client's readings, not the proxy's, decide what a frame
+/// does to a WebSocket turn, as the first event, on an upstream socket with and without
+/// bootstrap buffering, on a steering connection, and on a turn served over HTTP with and
+/// without buffering:
+///
+/// - E1: the first-party build's `serde_json::Value` (`arbitrary_precision`,
+///   `raw_value`) refuses an object whose first key is a private number or raw-value
+///   token with anything but its one valid value, so such an event does not decode.
+/// - E2: a failure is classified as its pinned `Value` holds it, with the last of a
+///   repeated key. A request fault first and an account failure last is an account
+///   failure; its frame, with the account and the credential's own token in it, never
+///   reaches the client. The reverse order is the request fault the client reads, sent
+///   as it arrived. An undecodable frame that would read as an account failure with
+///   either its first or its last repeated key is withheld, and nothing cools.
+/// - E3: the pinned wrapped mapping (`responses_websocket.rs:712-764`) decides a wrapped
+///   frame: a status that maps to no error (2xx, outside 100-999) is a notice that ends
+///   nothing and cools nothing; a retryable code fails the turn without a status and
+///   reaches the client as sent. The SSE reader has no wrapped reading, so these hold for
+///   upstream sockets; over HTTP an undecodable one is an undecodable event and passes.
+/// - E4: a decoded `response.completed` without a `response`, and a `response.done`, are
+///   no terminal event for the pinned reader, so the turn reads on.
+#[tokio::test]
+async fn pinned_readings_decide_websocket_turns() {
+    use Outcome::*;
+    const REAL_END: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[]}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    // The credential's own token (`credential`), standing in for a leaked secret.
+    const TOKEN: &str = "at-FAKE";
+    const ACCOUNT: &str = "acct-PRIVATE";
+    let cases: [(&str, Outcome, bool); 22] = [
+        // E1.
+        (
+            r#"{"type":"response.completed","response":{"id":"bad","future":{"$serde_json::private::Number":"bad"}}}"#,
+            Passes,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"id":"bad","output":[],"n":{"$serde_json::private::Number":"1","x":3}}}"#,
+            Passes,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"id":"bad","output":[{"$serde_json::private::RawValue":"{"}]}}"#,
+            Passes,
+            false,
+        ),
+        // Undecodable, but an account failure if it decoded: withheld, nothing cools.
+        (
+            r#"{"type":"response.failed","error":{"$serde_json::private::Number":"12a"},"response":{"error":{"code":"rate_limit_exceeded","message":"acct-PRIVATE"}}}"#,
+            Withheld,
+            false,
+        ),
+        // E4.
+        (r#"{"type":"response.completed","response":null}"#, Passes, false),
+        (r#"{"type":"response.completed","sequence_number":4}"#, Passes, false),
+        (
+            r#"{"type":"response.done","response":{"id":"resp_done","status":"completed","output":[]}}"#,
+            Passes,
+            false,
+        ),
+        // E3.
+        (
+            r#"{"type":"error","item_id":23,"status":200,"error":{"code":"other","message":"notice"}}"#,
+            Passes,
+            false,
+        ),
+        (
+            r#"{"type":"error","status":204,"error":{"code":"other","message":"notice"}}"#,
+            Passes,
+            true,
+        ),
+        (
+            r#"{"type":"error","status_code":1000,"error":{"code":"other","message":"notice"}}"#,
+            Passes,
+            true,
+        ),
+        (
+            r#"{"type":"error","item_id":23,"status":200,"error":{"code":"other","message":"acct-PRIVATE","type":"usage_limit_reached"}}"#,
+            Withheld,
+            false,
+        ),
+        (
+            r#"{"type":"error","item_id":23,"error":{"code":"previous_response_not_found","message":"resend the full input"}}"#,
+            FailsAsSent,
+            true,
+        ),
+        (
+            r#"{"type":"error","item_id":23,"status":200,"error":{"code":"previous_response_not_found","message":"resend the full input"}}"#,
+            FailsAsSent,
+            true,
+        ),
+        // E2: decoded failures, read with the last repeated key.
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","type":"rate_limit_error","code":"other","message":"limited","private_account":"acct-PRIVATE","token":"at-FAKE"}}}"#,
+            AccountFailure,
+            false,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"context_length_exceeded","code":"invalid_api_key","message":"limited","private_account":"acct-PRIVATE","token":"at-FAKE"}}}"#,
+            AccountFailure,
+            false,
+        ),
+        // A repeated `status` is no wrapped frame; the decoded `error` keeps the socket's
+        // status reading, with the last status. SSE has no status frame to read.
+        (
+            r#"{"type":"error","status":400,"status":429,"error":{"code":"other","message":"acct-PRIVATE"}}"#,
+            AccountFailure,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","type":"invalid_request_error","code":"other","message":"bad input"}}}"#,
+            FailsAsSent,
+            false,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"invalid_api_key","code":"context_length_exceeded","message":"context window exceeded"}}}"#,
+            FailsAsSent,
+            false,
+        ),
+        (
+            r#"{"type":"error","error":{"code":"other","type":"invalid_request_error","type":"usage_limit_reached","message":"acct-PRIVATE"}}"#,
+            AccountFailure,
+            false,
+        ),
+        // E2: undecodable envelopes, either reading of the repeated key.
+        (
+            r#"{"type":"response.future","type":"error","status":429,"error":{"type":"usage_limit_reached","private_account":"acct-PRIVATE","token":"at-FAKE"}}"#,
+            Withheld,
+            false,
+        ),
+        (
+            r#"{"type":"error","type":"response.future","status":429,"error":{"type":"usage_limit_reached","private_account":"acct-PRIVATE","token":"at-FAKE"}}"#,
+            Withheld,
+            false,
+        ),
+        // A safe control: the undecodable envelope with no account reading passes.
+        (
+            r#"{"type":"response.future","type":"error","status":400,"error":{"code":"other","message":"bad input"}}"#,
+            Passes,
+            false,
+        ),
+    ];
+    for (event, outcome, socket_only) in cases {
+        for (transport, config, websockets) in [
+            ("socket", "", true),
+            ("socket, buffering", BUFFERING, true),
+            ("steering", STEERING, true),
+            ("http", "", false),
+            ("http, buffering", BUFFERING, false),
+        ] {
+            if socket_only && !websockets {
+                continue;
+            }
+            let case = format!("{transport}: {event}");
+            let frames = [event, REAL_END];
+            let script = if websockets {
+                Script {
+                    ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+                    ..Script::default()
+                }
+            } else {
+                let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                Script {
+                    http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, config, |url| {
+                vec![credential(Profile::Chatgpt, url, websockets)]
+            })
+            .await;
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let mut got = Read::default();
+            while got.closed.is_none() && got.frames.last().map(String::as_str) != Some(REAL_END) {
+                let more = read(&mut socket, &["response.completed"]).await;
+                got.frames.extend(more.frames);
+                got.closed = more.closed;
+            }
+            assert!(
+                !got.frames.iter().any(|f| f.contains(TOKEN)),
+                "{case}: the credential's token reached the client: {got:?}"
+            );
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            let cooled = !proxy.rt.store().cooldowns(&credential).is_empty();
+            match outcome {
+                Passes => {
+                    assert_eq!(got.frames, [event, REAL_END], "{case}");
+                    assert_eq!(got.closed, None, "{case}");
+                }
+                Withheld => {
+                    assert_eq!(got.frames, [REAL_END], "{case}");
+                    assert_eq!(got.closed, None, "{case}");
+                }
+                FailsAsSent => {
+                    assert!(got.frames.iter().any(|f| f == event), "{case}: {got:?}");
+                    assert!(!got.frames.iter().any(|f| f == REAL_END), "{case}: {got:?}");
+                    assert!(got.closed.is_some(), "{case}: {got:?}");
+                }
+                AccountFailure => {
+                    assert!(
+                        !got.frames
+                            .iter()
+                            .any(|f| f == event || f.contains(ACCOUNT) || f == REAL_END),
+                        "{case}: {got:?}"
+                    );
+                    assert!(got.closed.is_some(), "{case}: {got:?}");
+                }
+            }
+            assert_eq!(cooled, outcome == AccountFailure, "{case}: cooldown");
+        }
+    }
+}
+
+/// #25 (E4) and usage: a `response.done` and a `response.completed` without a `response`
+/// end nothing for the pinned reader, so the turn's record keeps the usage of the real
+/// completion after them, not the earlier event's. On an upstream socket with and without
+/// bootstrap buffering, on a steering connection (whose records settle per response), and
+/// on a turn served over HTTP with and without buffering. One record, not failed.
+#[tokio::test]
+async fn non_terminal_events_leave_the_record_to_the_real_completion() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    for event in [
+        r#"{"type":"response.done","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+        r#"{"type":"response.completed","response":null,"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}"#,
+    ] {
+        for (transport, config, websockets) in [
+            ("socket", "", true),
+            ("socket, buffering", BUFFERING, true),
+            ("steering", STEERING, true),
+            ("http", "", false),
+            ("http, buffering", BUFFERING, false),
+        ] {
+            let case = format!("{transport}: {event}");
+            let frames = [CREATED, event, REAL_END];
+            let script = if websockets {
+                Script {
+                    ws: vec![frames.iter().map(|f| Bytes::from(f.to_string())).collect()],
+                    ..Script::default()
+                }
+            } else {
+                let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                Script {
+                    http: vec![cpa_server::testing::codex_capture::Reply::sse(sse)],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, config, |url| {
+                vec![credential(Profile::Chatgpt, url, websockets)]
+            })
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let mut got = Read::default();
+            while got.closed.is_none() && got.frames.last().map(String::as_str) != Some(REAL_END) {
+                let more = read(&mut socket, &["response.completed"]).await;
+                got.frames.extend(more.frames);
+                got.closed = more.closed;
+            }
+            assert_eq!(got.frames, frames, "{case}");
+            let records = records(&proxy, 1).await;
+            assert_eq!(records.len(), 1, "{case}: {records:?}");
+            assert_eq!(records[0]["failed"], false, "{case}: {records:?}");
+            assert_eq!(tokens(&records[0]), [4, 1, 5], "{case}: {records:?}");
+        }
+    }
+}

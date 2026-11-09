@@ -1680,7 +1680,7 @@ fn codex_client_request(body: &str) -> ExecRequest {
 #[tokio::test]
 async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
     let live = LIVE_CONTEXT_ERROR.trim();
-    let normalized = cpa_common::codex_client::context_window_failure_event(live)
+    let normalized = cpa_common::codex_client::context_window_failure_event(live, live)
         .unwrap()
         .into_owned();
     let buffered = Config::parse("codex:\n  stream-bootstrap-buffering: true\n").unwrap();
