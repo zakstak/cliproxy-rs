@@ -2195,3 +2195,29 @@ mod committed_context_failure {
         every_shape(During::Leave).await;
     }
 }
+
+/// #6: a native Codex failure withheld for account safety (`Delivery::Withheld`, set by
+/// the executor when the frame is an account failure or reads as one) is never rendered
+/// for the client: no frame as sent, no error event built from its classified body (which
+/// is the provider's error, with whatever it names), and no close reason taken from it.
+/// The same 400 classified normally is a request fault the client sees (the control).
+#[test]
+fn a_withheld_failure_is_never_rendered() {
+    use cpa_core::exec::{Delivery, ExecError, FailureScope};
+    let body = r#"{"status":400,"error":{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
+    let mut error = ExecError::local(400, FailureScope::Request, body);
+    assert!(super::exposed(&super::Failure::from_exec(&error)), "control");
+    error.delivery = Delivery::Withheld;
+    let failure = super::Failure::from_exec(&error);
+    assert!(failure.delivered.is_none());
+    assert!(!super::exposed(&failure));
+    assert!(super::close_code(&failure).is_none());
+    let mut big = ExecError::local(
+        413,
+        FailureScope::Request,
+        r#"{"error":{"code":"message_too_big","message":"at-FAKE"}}"#,
+    );
+    assert!(super::close_code(&super::Failure::from_exec(&big)).is_some(), "control");
+    big.delivery = Delivery::Withheld;
+    assert!(super::close_code(&super::Failure::from_exec(&big)).is_none());
+}

@@ -174,16 +174,21 @@ impl Event<'_> {
     }
 
     /// A context failure preserved by the executor. The relay must use the same
-    /// logical reading before delivering it and consuming its classified stream error.
+    /// logical reading before delivering it and consuming its classified stream error:
+    /// `response.error` as `parse_failed_response` reads it ([`failed_error_object`]),
+    /// so also the `Error` struct written as a JSON array.
     pub fn is_context_window_failure(&self) -> bool {
-        self.kind == "response.failed"
-            && self
-                .response
-                .and_then(|response| get(response, "error"))
-                .and_then(|error| get(&error, "code"))
-                .and_then(|code| serde_json::from_str::<String>(&code).ok())
-                .as_deref()
-                == Some("context_length_exceeded")
+        if self.kind != "response.failed" {
+            return false;
+        }
+        let Some(error) = self.response.and_then(|response| get(response, "error")) else {
+            return false;
+        };
+        let error = failed_error_object(&error).unwrap_or(error);
+        get(&error, "code")
+            .and_then(|code| serde_json::from_str::<String>(&code).ok())
+            .as_deref()
+            == Some("context_length_exceeded")
     }
 }
 
@@ -813,26 +818,51 @@ fn string_end(raw: &[u8], mut i: usize) -> Option<usize> {
 /// The raw value of the last `name` member of the JSON object `object`, as
 /// `Value::get` reads it; `None` when `object` is not an object or has no such member.
 pub(crate) fn member<'a>(object: &'a str, name: &str) -> Option<&'a str> {
-    struct Last<'n>(&'n str);
-    impl<'de, 'n> Visitor<'de> for Last<'n> {
-        type Value = Option<&'de RawValue>;
+    let [found] = members(object, [name]);
+    found
+}
+
+/// [`member`] for each of `names`, in one pass over `object`. Each value borrows from
+/// `object`.
+fn members<'a, const N: usize>(object: &'a str, names: [&str; N]) -> [Option<&'a str>; N] {
+    struct Last<'n, const N: usize>([&'n str; N]);
+    impl<'de, const N: usize> Visitor<'de> for Last<'_, N> {
+        type Value = [Option<&'de RawValue>; N];
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("an object")
         }
         fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-            let mut found = None;
+            let mut found = [None; N];
             while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-                if key == self.0 {
-                    found = Some(map.next_value::<&'de RawValue>()?);
-                } else {
-                    map.next_value::<IgnoredAny>()?;
+                match self.0.iter().position(|name| key == *name) {
+                    Some(i) => found[i] = Some(map.next_value::<&'de RawValue>()?),
+                    None => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
                 }
             }
             Ok(found)
         }
     }
     let mut de = serde_json::Deserializer::from_str(object);
-    de.deserialize_map(Last(name)).ok().flatten().map(RawValue::get)
+    de.deserialize_map(Last(names))
+        .map_or([None; N], |found| found.map(|raw| raw.map(RawValue::get)))
+}
+
+/// Whether the `error` frame `view`, read as [`classification_view`] reads it, carries a
+/// status: a `status` or `status_code` member (the pinned wrapped event's `status` and
+/// its alias, `endpoint/responses_websocket.rs:692-702`) that is not `null`, whatever its
+/// value. A missing or `null` one is the struct's `None`. Any other value is a status
+/// the pinned mapping turns into no error unless it is one `http::StatusCode` accepts
+/// outside 2xx: zero (`StatusCode::from_u16` refuses it), and a value that does not
+/// read as a `u16` at all (negative, too large, a fraction, a string, a container), in
+/// which case the frame is not a wrapped event and the reader goes on to the `error`
+/// branch.
+pub(crate) fn status_present(view: &str) -> bool {
+    members(view, ["status", "status_code"])
+        .into_iter()
+        .flatten()
+        .any(|value| value.trim() != "null")
 }
 
 /// `payload`, an event, as the pinned client's `serde_json::Value` holds it, for
@@ -900,7 +930,9 @@ const WRAPPED_ERROR_MEMBERS: [&str; 3] = ["code", "message", "headers"];
 /// `sequence_number` or other member outside its struct. That object, and every other
 /// frame, is then read as [`pinned_view`] reads it: the last of a repeated key, private
 /// values resolved. Members are not read further than the pinned reader reads them: a
-/// `Value` member that is an array stays one. One reading is wider than the struct's: a
+/// `Value` member that is an array stays one, except a `response.failed`'s
+/// `response.error`, which `parse_failed_response` reads into its `Error` struct, by
+/// position when it is an array ([`failed_error_object`]). One reading is wider than the struct's: a
 /// wrapped error's `error` is a struct, not a `Value`, so the pinned reader ignores a
 /// private token there as an unknown member, while this view resolves it as it does in
 /// every object frame's `error`; that only adds members a failure reading can find, so
@@ -911,9 +943,82 @@ const WRAPPED_ERROR_MEMBERS: [&str; 3] = ["code", "message", "headers"];
 /// only for a frame that starts with `[`.
 pub(crate) fn classification_view(payload: &str) -> Cow<'_, str> {
     match positional_object(payload) {
-        Some(object) => Cow::Owned(pinned_view(&object).into_owned()),
-        None => pinned_view(payload),
+        Some(object) => Cow::Owned(members_view(&object).into_owned()),
+        None => members_view(payload),
     }
+}
+
+/// [`classification_view`] of `members`, a frame or the object a positional one stands
+/// for: [`pinned_view`], then a `response.failed`'s `response.error` as
+/// `parse_failed_response` reads it ([`failed_error_object`]).
+fn members_view(members: &str) -> Cow<'_, str> {
+    let view = pinned_view(members);
+    let Some((span, object)) = failed_error_in(&view) else {
+        return view;
+    };
+    let mut out = String::with_capacity(view.len() + 48);
+    out.push_str(&view[..span.start]);
+    out.push_str(&object);
+    out.push_str(&view[span.end..]);
+    Cow::Owned(out)
+}
+
+/// In `view`, a [`pinned_view`]: the span of a `response.failed`'s `response.error` that
+/// `parse_failed_response` reads as its `Error` struct written as a JSON array, and that
+/// struct's object ([`failed_error_object`]). `None` for every other frame, so an `error`
+/// event's `error`, which the pinned `error` branch reads by `Value::get` only
+/// (`parse_terminal_provider_error`), stays as it is.
+fn failed_error_in(view: &str) -> Option<(Range<usize>, String)> {
+    let [kind, response] = members(view, ["type", "response"]);
+    if kind
+        .and_then(|kind| serde_json::from_str::<Cow<'_, str>>(kind).ok())
+        .as_deref()
+        != Some("response.failed")
+    {
+        return None;
+    }
+    // `pinned_view` already resolved private values and kept the last of a repeated key.
+    let error = member(response?, "error")?;
+    let object = failed_error_object(error)?;
+    // `member` borrows from its input, which borrows from `view`.
+    let start = error.as_ptr() as usize - view.as_ptr() as usize;
+    Some((start..start + error.len(), object))
+}
+
+/// `Error`, the struct `parse_failed_response` reads a `response.failed`'s
+/// `response.error` into (`codex-api/src/sse/responses_error.rs:14-24` at 44ccf394573c):
+/// it classifies the failure by that struct's `code` (context window, quota, rate limit
+/// and the rest) once `parse_terminal_provider_error` found no terminal provider code.
+/// Checked as [`struct_reads`] checks a struct.
+#[derive(Deserialize)]
+#[allow(dead_code)] // Members are decoded for their acceptance, not read.
+struct FailedError {
+    #[serde(rename = "type")]
+    kind: Optional<Str>,
+    code: Optional<Str>,
+    message: Optional<Str>,
+    plan_type: Optional<Str>,
+    resets_at: Optional<I64>,
+    #[serde(default)]
+    misalignment: Optional<AnyValue>,
+}
+
+/// [`FailedError`]'s members in order, as serde reads them from a JSON array.
+const FAILED_ERROR_MEMBERS: [&str; 6] = ["type", "code", "message", "plan_type", "resets_at", "misalignment"];
+
+/// `error`, a `response.failed`'s `response.error` as `Value::get` reads it, as the
+/// object of the members `parse_failed_response` reads from it when it is the `Error`
+/// struct written as a JSON array: five or six elements (the last, `misalignment`, has a
+/// default), each `null` or of its member's type, a `null` member absent. `None` for an
+/// object, which classification already reads by name, and for an array that struct
+/// refuses (too short, too long, a member of the wrong type): the pinned reader then has
+/// only its generic stream error, which names no code.
+fn failed_error_object(error: &str) -> Option<String> {
+    let error = error.trim();
+    if !error.starts_with('[') || !struct_reads::<FailedError>(error) {
+        return None;
+    }
+    named(error, &FAILED_ERROR_MEMBERS, |_, _| None)
 }
 
 /// The object a frame written as a JSON array stands for ([`classification_view`]),
@@ -974,7 +1079,7 @@ fn named(array: &str, names: &[&str], nested: impl Fn(&str, &str) -> Option<Stri
 /// as an array). `None` for any other event.
 pub(crate) fn context_window_event(payload: &str) -> Option<Cow<'_, str>> {
     let members = positional_object(payload).map_or(Cow::Borrowed(payload), Cow::Owned);
-    let view = pinned_view(&members);
+    let view = members_view(&members);
     match cpa_common::codex_client::context_window_failure_event(&members, &view)? {
         Cow::Borrowed(_) => Some(Cow::Borrowed(payload)),
         Cow::Owned(built) => Some(Cow::Owned(built)),

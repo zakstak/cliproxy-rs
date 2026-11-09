@@ -26,7 +26,7 @@ use bytes::Bytes;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{
-    ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
+    Delivery, ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -1088,7 +1088,7 @@ impl Turn {
             Reading::Passed { decoded } => passed(text, raw_len, decoded),
             Reading::Failure { mut error, body: None } => {
                 self.wire.ws_exec_error("upstream_error", &error);
-                self.deliver_as_sent(&mut error, &text);
+                deliver_as_sent(&mut error, &text);
                 Frame::Failed {
                     error,
                     overload: false,
@@ -1107,7 +1107,7 @@ impl Turn {
                 // travels on the error, for delivery once failover is decided.
                 let event = self.preserved_event(payload);
                 if event.is_none() {
-                    self.deliver_as_sent(&mut error, &text);
+                    deliver_as_sent(&mut error, &text);
                 }
                 Frame::Failed {
                     error,
@@ -1220,17 +1220,6 @@ impl Turn {
         }
     }
 
-    /// A native turn's failure reaches the client as the upstream sent it
-    /// ([`ExecError::delivered_event`]), while `error` keeps the scheduler's
-    /// classification. An account failure keeps the classified delivery instead (the
-    /// allowlisted subscription-limit event, #6, or a silent close): its frame can name the
-    /// pooled account or carry its tokens.
-    fn deliver_as_sent(&self, error: &mut ExecError, frame: &str) {
-        if !account_failure(error.status) {
-            error.delivered_event = Some(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
-        }
-    }
-
     /// The event a Codex client receives before this turn's error for an upstream
     /// context-window rejection (`cpa_common::codex_client::context_window_failure_event`).
     fn preserved_event(&self, payload: &str) -> Option<Bytes> {
@@ -1301,7 +1290,7 @@ fn rest(turn: Turn) -> ExecStream {
                         turn.invalidate_after_event(&error);
                         return Some((Ok(event), State::Failing(error)));
                     }
-                    if error.delivered_event.is_some() {
+                    if error.delivered_event().is_some() {
                         // The client gets the provider's frame with the error: a loss
                         // reported first would replace it with a generic close.
                         turn.invalidate_after_event(&error);
@@ -1324,7 +1313,7 @@ fn rest(turn: Turn) -> ExecStream {
 /// sent ([`ExecError::delivered_event`]) does not report the session's loss, which would
 /// close the client with a generic error first.
 fn invalidate_failed(turn: &Turn, error: &ExecError) {
-    if error.delivered_event.is_some() {
+    if error.delivered_event().is_some() {
         turn.invalidate_after_event(error);
     } else {
         turn.invalidate(error, true);
@@ -1349,8 +1338,9 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
 ///
 /// A decoded `error` that is not a wrapped frame keeps the same readings: a status that
 /// [`ws_error`] reads and the pinned mapping would turn into an error fails it by that
-/// status, one that would map to no error makes it a notice, and without a status it
-/// keeps the status-less reading. A decoded `response.failed` is classified by
+/// status, any other status the frame carries (zero included,
+/// `crate::codex_event::status_present`) makes it a notice, and only without a status
+/// does it keep the status-less reading. A decoded `response.failed` is classified by
 /// `response::terminal_failure`. Every failure reading reads the frame as the pinned
 /// reader decodes it (`crate::codex_event::classification_view`): a struct written as a
 /// JSON array as the members it decodes to, the last of a repeated key, and the value a
@@ -1398,6 +1388,14 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
                     notice(event)
                 }
                 Some(failure) => Some(failure),
+                // A status the status-frame reading does not take (it reads only a
+                // positive one, as Go does) is still a status: zero, a negative number,
+                // one past `u16`, or no number at all. The pinned mapping turns none of
+                // them into an error (`StatusCode::from_u16` refuses zero, and the others
+                // do not read as `WrappedWebsocketErrorEvent` at all), so the frame is a
+                // notice as well. Only a missing or `null` status keeps the status-less
+                // reading.
+                None if event.kind == "error" && crate::codex_event::status_present(&view) => notice(event),
                 None => terminal(&view),
             }
         }
@@ -1408,6 +1406,10 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         }
     };
     // Both failure kinds always classify; a wrapped frame always carries `type: error`.
+    let mut failure = failure;
+    if let Some(Reading::Failure { error, .. }) = &mut failure {
+        withhold_sensitive(error, payload);
+    }
     failure.unwrap_or(Reading::Passed {
         decoded: event.is_some(),
     })
@@ -1480,21 +1482,24 @@ fn passed(text: String, raw_len: usize, decoded: bool) -> Frame {
 /// credential does not cool and the response goes on. The pinned reader acts on none of
 /// these frames, so withholding one changes nothing it does.
 pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
-    let readings = |text: &str| {
-        [
-            ws_error(text, false).map(|error| error.status),
-            response::terminal_failure(text, false).map(|(error, _)| error.status),
-        ]
-        .into_iter()
-        .flatten()
-        .any(account_failure)
-    };
-    readings(payload)
+    account_reading(payload)
         || match crate::codex_event::classification_view(payload) {
-            std::borrow::Cow::Owned(view) => readings(&view),
+            std::borrow::Cow::Owned(view) => account_reading(&view),
             std::borrow::Cow::Borrowed(_) => false,
         }
         || (!decoded && crate::codex_ambiguous::ambiguous_account(payload))
+}
+
+/// Whether the status-frame reading ([`ws_error`]) or the terminal failure reading
+/// (`response::terminal_failure`) of `text` is an account failure.
+fn account_reading(text: &str) -> bool {
+    [
+        ws_error(text, false).map(|error| error.status),
+        response::terminal_failure(text, false).map(|(error, _)| error.status),
+    ]
+    .into_iter()
+    .flatten()
+    .any(account_failure)
 }
 
 /// Whether the session reader hands its turn a frame the turn gives a Codex client as
@@ -1512,6 +1517,41 @@ fn preserved_rejection(payload: &str) -> bool {
 /// account, so a native route never hands it to the client as sent (#6).
 pub(super) fn account_failure(status: u16) -> bool {
     matches!(status, 401 | 402 | 403 | 429)
+}
+
+/// Whether a native client must not see the upstream failure `frame` as sent, nor any
+/// rendering of it (#6): an account failure as classified (`status`), or a frame whose
+/// status-frame or terminal failure reading is one, read as the pinned reader decodes it
+/// (`crate::codex_event::classification_view`, the view the failure was classified
+/// from: the last of a repeated key, private values, positional structs). The two can
+/// part: the pinned wrapped mapping keeps an explicit `status: 400` for the scheduler
+/// while the frame's own error reads as a rate limit. The classification is not changed
+/// here; only what the client receives is. Unlike [`account_shaped`], which judges frames
+/// the pinned reader skips or ignores, a failure keeps the pinned last-key reading.
+pub(super) fn account_sensitive(status: u16, frame: &str) -> bool {
+    account_failure(status) || account_reading(&crate::codex_event::classification_view(frame.trim()))
+}
+
+/// Marks `error`, the classification of the upstream failure `frame`, as
+/// [`Delivery::Withheld`] when the frame is [`account_sensitive`]: the client then gets
+/// nothing of it (the allowlisted subscription-limit event, #6, or a silent close),
+/// however the error travels on (bootstrap failover, a steering connection's records,
+/// the session's loss). The scheduler keeps the status. [`reading`] decides it for an
+/// upstream socket and a steering connection, and a turn served over HTTP for its own
+/// failures.
+pub(super) fn withhold_sensitive(error: &mut ExecError, frame: &str) {
+    if account_sensitive(error.status, frame) {
+        error.delivery = Delivery::Withheld;
+    }
+}
+
+/// A native turn's failure reaches the client as the upstream sent it, `frame` byte for
+/// byte ([`Delivery::AsSent`]), while `error` keeps the scheduler's classification;
+/// unless it was withheld ([`withhold_sensitive`]).
+pub(super) fn deliver_as_sent(error: &mut ExecError, frame: &str) {
+    if error.delivery != Delivery::Withheld {
+        error.delivery = Delivery::AsSent(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
+    }
 }
 
 /// Bootstrap buffering over WebSocket messages (codex_websockets_stream.go): every
@@ -1548,7 +1588,7 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     turn.invalidate(&error, false);
                     let body = String::from_utf8_lossy(&error.body).into_owned();
                     let mut overloaded = response::bootstrap_overload(&body);
-                    overloaded.delivered_event = error.delivered_event;
+                    overloaded.delivery = error.delivery;
                     return Err(overloaded);
                 }
                 if let Some(event) = event {

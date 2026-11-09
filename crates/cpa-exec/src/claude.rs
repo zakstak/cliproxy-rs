@@ -800,7 +800,7 @@ fn upstream_error(
             body,
             direct: true,
             delivered_status: None,
-            delivered_event: None,
+            delivery: cpa_core::exec::Delivery::Classified,
             addon: None,
             diagnostic: None,
         };
@@ -817,7 +817,7 @@ fn upstream_error(
         },
         direct: false,
         delivered_status: None,
-        delivered_event: None,
+        delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
     };

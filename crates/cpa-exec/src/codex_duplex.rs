@@ -230,7 +230,9 @@ enum Owner {
 enum Settlement {
     /// The message's records are settled, if it settles any.
     Settled,
-    /// An account failure: every record failed with it, and it ends the stream.
+    /// A failure the client must not see ([`cpa_core::exec::Delivery::Withheld`]): an
+    /// account failure, or one whose frame reads as one. Every record failed with it, and
+    /// it ends the stream.
     Account(ExecError),
     /// A failure no request can be assigned; nothing settled.
     Ambiguous,
@@ -618,13 +620,17 @@ impl Duplex {
     }
 
     /// What an upstream message settles, apart from its delivery: a terminal event its
-    /// response's record, a failure the record of the request it belongs to, and an
-    /// account failure every record. `reading` is the message's classification. The
+    /// response's record, a failure the record of the request it belongs to, and a
+    /// withheld failure every record. `reading` is the message's classification. The
     /// queue and running state follow (a rejected create leaves the queue). The same
     /// whether or not the consumer still reads the stream.
     fn settle(&mut self, payload: &str, kind: &str, response_id: Option<&str>, reading: &Reading) -> Settlement {
         if let Reading::Failure { error, .. } = reading {
-            if super::account_failure(error.status) {
+            // `super::reading` withheld an account failure, and a failure whose frame
+            // reads as one under another reading (an explicit `status: 400` beside a
+            // rate-limit error, say): neither may reach the client as an event, so the
+            // stream ends on it, as on any account failure. Its classified status stays.
+            if error.delivery == cpa_core::exec::Delivery::Withheld {
                 self.fail_records(error);
                 return Settlement::Account(error.clone());
             }
@@ -1088,7 +1094,8 @@ impl Duplex {
             // An account failure on a native connection never reaches the client as
             // sent, whichever request it belongs to: its frame can name the pooled
             // account. The error alone ends the stream, and the server delivers the
-            // allowlisted subscription-limit event (#6) or closes silently.
+            // allowlisted subscription-limit event (#6) or closes silently
+            // (`Delivery::Withheld`).
             Settlement::Account(error) => {
                 self.turn.wire.ws_exec_error("upstream_error", &error);
                 self.outbox.push_back(Err(error));
@@ -1129,9 +1136,7 @@ impl Duplex {
                 .flatten()
             {
                 Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),
-                None => {
-                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(payload.as_bytes())));
-                }
+                None => super::deliver_as_sent(&mut error, payload),
             }
             self.outbox.push_back(Err(error));
             self.done = true;

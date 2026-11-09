@@ -622,7 +622,15 @@ as `["response.failed",null,null,{"id":"r1","error":{…}},null,…]` or a wrapp
 error such as `["error",429,{"code":…}]` is read as the object of the members it
 decodes to, each value as sent, a `null` member absent and nothing outside the struct
 added (a positional event has no `status`). Members are then read with the last of a
-repeated key and private values resolved. A `Value` member that is an array stays one.
+repeated key and private values resolved. A `Value` member that is an array stays one,
+with one exception: a `response.failed`'s `response.error`, which `parse_failed_response`
+reads into its `Error` struct (`sse/responses_error.rs:14-24`), so also by position. Five
+or six members, each `null` or of its member's type, read as the object of those members
+(`type`, `code`, `message`, `plan_type`, `resets_at`, `misalignment`), and the failure
+classifies as that object does; any other array is one that struct refuses, which the
+pinned reader reports as its generic stream error, and it stays an array. An `error`
+event's `error` is read only by `Value::get` there (`parse_terminal_provider_error`), so
+an array in it stays one.
 A status-less context-window `error` written that way becomes the #5 `response.failed`
 built from the bytes of its members.
 
@@ -661,7 +669,20 @@ built from the bytes of its members.
   or a create still waiting in the duplex queue. Its frame can name the pooled account or
   carry its tokens. The client gets the allowlisted subscription-limit event when it is an
   official Codex client (#6), or else a silent close. The scheduler still receives the
-  classification, so the credential cools as before.
+  classification, so the credential cools as before. The same holds for a failure whose
+  own error is an account failure under the status-frame or terminal failure reading, read
+  as the pinned reader decodes the frame (`codex_ws::account_sensitive`: the last of a
+  repeated key, private values, positional structs): the pinned wrapped mapping keeps an
+  explicit `status: 400` beside a rate-limit error, so the scheduler records that 400 and
+  cools nothing, while the frame is withheld. A decoded failure whose first repeated
+  `type` is a rate limit but whose last is not is no account failure, as the pinned
+  `Value` reads it, and reaches the client as sent. Withheld
+  means the client also gets no rendering of the frame's error (the error the server would
+  otherwise build from the classified body, or a close reason taken from it): the decision
+  travels on the error (`ExecError::delivery`), so it holds wherever the failure ends the
+  connection, after bootstrap failover and as the session's loss too. On a steering
+  connection such a later failure ends the connection like an account failure, failing
+  every open record and queued create with its classified status.
 - One exception stays: a Codex client gets the status-less context-window `error` as
   `response.failed` (#5).
 - Every frame passes the upstream event boundary of the
@@ -704,8 +725,14 @@ built from the bytes of its members.
   a wrapped frame (for example because its `error.code` is a private raw value, which
   `WrappedWebsocketError` cannot read as a `String`) is read by the `status` the
   status-frame reading finds: an error status fails the turn by that status, a status
-  that maps to no error makes it a notice as above, and a decoded `error` without a
-  status keeps the status-less failure reading above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
+  that maps to no error makes it a notice as above. Any other `status` or `status_code`
+  the frame carries is a status too, and maps to no error: zero, which
+  `StatusCode::from_u16` refuses, and a value the wrapped struct cannot read as a `u16`
+  (negative, too large, a fraction, a string, a container), in which case the pinned
+  reader has no wrapped event and goes on to the `error` branch. Such a frame is a notice
+  as above, checked for a terminal provider code, and passes or is withheld as
+  account-shaped. Only a decoded `error` whose status is missing or `null` keeps the
+  status-less failure reading above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
   stays as described for the native HTTP route.
 - Every `response.incomplete` reaches the client as received, on an ordinary turn, a
   steering connection and a turn served over HTTP, at any stage: as the turn's first

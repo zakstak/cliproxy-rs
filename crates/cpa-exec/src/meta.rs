@@ -534,7 +534,7 @@ fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         retry_after,
         direct: false,
         delivered_status: None,
-        delivered_event: None,
+        delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
     }

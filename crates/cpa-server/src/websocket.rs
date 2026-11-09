@@ -54,7 +54,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::rawjson;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
-use cpa_core::exec::{Caller, ExecError, ExecSession, ExecStream, Operation};
+use cpa_core::exec::{Caller, Delivery, ExecError, ExecSession, ExecStream, Operation};
 use cpa_core::format::Format;
 use cpa_exec::codex::{CodexExecutor, InterruptError, SteeringInput};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -255,6 +255,9 @@ struct Failure {
     /// The provider's own failure frame a native Codex turn delivers as sent
     /// ([`ExecError::delivered_event`]); never set for an account failure.
     delivered: Option<String>,
+    /// A native Codex failure whose frame, and so its `text`, can name the pooled account
+    /// ([`Delivery::Withheld`]): the client gets `limit` or a silent close, nothing else.
+    withheld: bool,
 }
 
 impl Failure {
@@ -268,6 +271,7 @@ impl Failure {
             replay: e.is_replay_required(),
             addon: e.addon.clone(),
             delivered: delivered(e),
+            withheld: withheld(e),
         }
     }
 
@@ -283,6 +287,7 @@ impl Failure {
                     replay: e.is_replay_required(),
                     addon: e.addon.clone(),
                     delivered: delivered(e),
+                    withheld: withheld(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
@@ -292,6 +297,7 @@ impl Failure {
             dispatch::Failure::Remote { error: e, .. } => Self {
                 limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
                 delivered: delivered(e),
+                withheld: withheld(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -316,6 +322,7 @@ impl Failure {
             addon: None,
             limit: crate::websocket_limit::from_error_event(payload, unix_now()),
             delivered: None,
+            withheld: false,
         }
     }
 
@@ -328,14 +335,18 @@ impl Failure {
             addon: None,
             limit: None,
             delivered: None,
+            withheld: false,
         }
     }
 }
 
 fn delivered(e: &ExecError) -> Option<String> {
-    e.delivered_event
-        .as_ref()
+    e.delivered_event()
         .map(|frame| String::from_utf8_lossy(frame).into_owned())
+}
+
+fn withheld(e: &ExecError) -> bool {
+    e.delivery == Delivery::Withheld
 }
 
 /// The limit event for an executor error: the frame's headers (addon) first, then the
@@ -1761,7 +1772,11 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
     if failure.replay {
         return Some((CLOSE_SERVICE_RESTART, "upstream requires HTTP replay".into()));
     }
-    if failure.status == 413 && rawjson::get(&failure.text, "error.code").str() == "message_too_big" {
+    // Its close reason would come from the withheld frame.
+    if failure.status == 413
+        && !failure.withheld
+        && rawjson::get(&failure.text, "error.code").str() == "message_too_big"
+    {
         // An upstream close keeps gorilla's `CloseError.Text` verbatim; a mapped 413's
         // message is trimmed.
         let raw = rawjson::get(&failure.text, "close_reason");
@@ -1789,10 +1804,11 @@ fn preserved_failure(failure: &Failure) -> bool {
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,
 /// quota and transport failures close silently so the client reconnects and resends. A
 /// native Codex client's subscription limit (`Failure::limit`) is sent before this check
-/// (docs/DIFFERENCES-FROM-GO.md).
+/// (docs/DIFFERENCES-FROM-GO.md). A withheld native Codex failure is never exposed: its
+/// `text` is the provider's error, which can name the pooled account (#6).
 // ponytail: Go also exposes terminal upstream-auth errors; no executor reports them yet.
 fn exposed(failure: &Failure) -> bool {
-    classify::is_request_fault(failure.status, &failure.text)
+    !failure.withheld && classify::is_request_fault(failure.status, &failure.text)
 }
 
 /// `closeForUpstreamError` then `writeResponsesWebsocketTerminalError`: a close code,

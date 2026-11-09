@@ -693,6 +693,22 @@ pub enum FailureScope {
     Transport,
 }
 
+/// What a WebSocket client receives for a failure. The native Codex routes decide it
+/// where they read the provider's frame (docs/codex/CONTRACT.md "Native WebSocket
+/// route"); every other route keeps [`Delivery::Classified`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// The route's own rendering of `status` and `body`.
+    #[default]
+    Classified,
+    /// The provider's own failure frame, as sent. Boxed: errors are the cold path.
+    AsSent(Box<Bytes>),
+    /// The frame can name the pooled account or carry its tokens (#6), and so can
+    /// `body`: the client gets only the allowlisted subscription-limit event or a silent
+    /// close, never a rendering of the frame or of `body`.
+    Withheld,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecError {
     pub status: u16,
@@ -711,11 +727,9 @@ pub struct ExecError {
     /// `status`, which stays the scheduler's classification (the Codex native route
     /// delivers the upstream's own status while a usage limit is classified as 429).
     pub delivered_status: Option<u16>,
-    /// The provider's own failure frame for the client, when it differs from `body`,
-    /// which stays the scheduler's classification. The native Codex WebSocket route
-    /// sets it for a failure the client may see as sent; never for an account failure,
-    /// whose frame can name the pooled account. Boxed: errors are the cold path.
-    pub delivered_event: Option<Box<Bytes>>,
+    /// How a WebSocket client learns of this failure ([`Delivery`]), apart from `status`
+    /// and `body`, which stay the scheduler's classification.
+    pub delivery: Delivery,
     /// Headers this error hands the client under `requests.passthrough-headers` (Go
     /// `ErrorMessage.Addon`, filled only from errors with `Headers()`: Codex and xAI
     /// WebSocket error frames and stream bootstrap failures). `headers` stays the
@@ -735,9 +749,18 @@ impl ExecError {
             retry_after: None,
             direct: false,
             delivered_status: None,
-            delivered_event: None,
+            delivery: Delivery::Classified,
             addon: None,
             diagnostic: None,
+        }
+    }
+
+    /// The provider's own failure frame the client receives as sent
+    /// ([`Delivery::AsSent`]).
+    pub fn delivered_event(&self) -> Option<&Bytes> {
+        match &self.delivery {
+            Delivery::AsSent(frame) => Some(frame),
+            Delivery::Classified | Delivery::Withheld => None,
         }
     }
 

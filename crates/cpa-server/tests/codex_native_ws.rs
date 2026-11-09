@@ -4129,3 +4129,326 @@ async fn positional_completion_events_settle_their_own_response() {
     assert_eq!(proxy.upstream.sockets().len(), 1);
     socket.close(1000, "done").await.unwrap();
 }
+
+/// The real completion the nested-error, explicit-status and zero-status tests end on.
+const NESTED_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+
+/// Content that reaches the client before a later failure: nothing fails over after it.
+const NESTED_DELTA: &str =
+    r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"partial"}"#;
+
+/// Whether any frame the client got carries the fake credential's token or the account.
+fn discloses(t: &Turned) -> bool {
+    t.frames
+        .iter()
+        .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE"))
+}
+
+/// #25 and #6 (review finding 1): `parse_failed_response` reads a decoded
+/// `response.failed`'s `response.error` into its `Error` struct
+/// (`codex-api/src/sse/responses_error.rs:14-24` at 44ccf394573c), so the struct written
+/// as a JSON array of five or six members is the rate limit its object form is, with the
+/// credential's own token in its message. On the five native paths, first and after
+/// content, each positional form takes the object form's turn, record and cooldowns, and
+/// neither `at-FAKE` nor `acct-PRIVATE` reaches the client (whose key is `client-key`):
+/// six members, five, a private raw value holding the array, escapes, a private raw value
+/// as the code, the whole event positional, and the whole `response` a raw value. A
+/// four-member array is no `Error`: the pinned reader has its generic stream error, which
+/// names no code, so it is no account failure and reaches the client as sent.
+#[tokio::test]
+async fn nested_positional_failed_errors_classify_as_their_object_form() {
+    const OBJECT: &str = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited at-FAKE acct-PRIVATE"}}}"#;
+    let nested = [
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited at-FAKE acct-PRIVATE",null,null,null]}}"#,
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited at-FAKE acct-PRIVATE",null,null]}}"#,
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"$serde_json::private::RawValue":"[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]"}}}"#,
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_\u0065rror","rate_limit_exceeded","limited at-\u0046AKE acct-PRIVATE",null,null,null]}}"#,
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error",{"$serde_json::private::RawValue":"\"rate_limit_exceeded\""},"limited at-FAKE acct-PRIVATE",null,null,null]}}"#,
+        r#"["response.failed",null,null,{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited at-FAKE acct-PRIVATE",null,null,null]},null,null,null,null,null,null,null,null,null,null]"#,
+        r#"{"type":"response.failed","response":{"$serde_json::private::RawValue":"{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}"}}"#,
+    ];
+    let same = |raw: &str, object: &str, t: &Turned| -> Vec<String> {
+        t.frames
+            .iter()
+            .map(|f| {
+                if f == raw || f == object {
+                    "EVENT".to_owned()
+                } else {
+                    f.clone()
+                }
+            })
+            .collect()
+    };
+    for (stage, before) in [("first", None), ("after content", Some(NESTED_DELTA))] {
+        for path in NATIVE_PATHS {
+            let frames =
+                |event: &'static str| -> Vec<&'static str> { before.into_iter().chain([event, NESTED_END]).collect() };
+            let want = native_turn(path, &frames(OBJECT), NESTED_END).await;
+            assert!(!discloses(&want), "{} {stage}: object control: {want:?}", path.0);
+            assert_eq!(want.records[0]["failed"], true, "{} {stage}: {want:?}", path.0);
+            assert_eq!(
+                want.records[0]["fail"]["status_code"]
+                    .as_u64()
+                    .map(|s| s == 429 || s == 503),
+                Some(true),
+                "{} {stage}: {want:?}",
+                path.0
+            );
+            for event in nested {
+                let case = format!("{} {stage}: {event}", path.0);
+                assert!(cpa_exec::codex_event::decode(event).is_some(), "{case}");
+                let got = native_turn(path, &frames(event), NESTED_END).await;
+                assert!(
+                    !discloses(&got),
+                    "{case}: the token or account reached the client: {got:?}"
+                );
+                assert_eq!(same(event, OBJECT, &got), same(event, OBJECT, &want), "{case}");
+                assert_eq!(got.closed, want.closed, "{case}");
+                assert_eq!(got.cooldowns, want.cooldowns, "{case}");
+                assert_eq!(got.attempts, want.attempts, "{case}");
+                assert_eq!(got.records[0]["failed"], want.records[0]["failed"], "{case}");
+                let fail = |t: &Turned| {
+                    let body = t.records[0]["fail"]["body"].as_str().unwrap_or_default().to_owned();
+                    // The record keeps the frame's own spelling; compare what it says.
+                    (
+                        t.records[0]["fail"]["status_code"].clone(),
+                        serde_json::from_str::<serde_json::Value>(&body).ok(),
+                    )
+                };
+                assert_eq!(fail(&got), fail(&want), "{case}: {got:?} {want:?}");
+                assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+            }
+            let short =
+                r#"{"type":"response.failed","response":{"id":"r1","error":["server_error","x","generic",null]}}"#;
+            let got = native_turn(path, &frames(short), NESTED_END).await;
+            assert!(
+                got.frames.iter().any(|f| f == short),
+                "{} {stage}: as sent: {got:?}",
+                path.0
+            );
+            assert_eq!(got.records[0]["failed"], true, "{} {stage}: {got:?}", path.0);
+            assert_eq!(
+                got.records[0]["fail"]["status_code"], 502,
+                "{} {stage}: {got:?}",
+                path.0
+            );
+        }
+    }
+}
+
+/// #6 (review finding 2): the pinned wrapped mapping keeps an explicit `status: 400` for
+/// the scheduler, but the frame's own error is a rate limit with the credential's token.
+/// An upstream socket fails the turn with 400 (no cooldown, as for any 400) and the frame
+/// never reaches the client, nor any rendering of its error: the turn ends silently (the
+/// client is no subscription-limit case). A turn served over HTTP reads the event's error
+/// alone, a 429, and withholds it too. The wrapped arrays an SSE reader cannot decode are
+/// withheld as account-shaped frames and the real completion follows. Resolved, raw error
+/// object and raw code; first and after content. (A wrapped array whose code is a private
+/// raw value decodes as neither pinned struct; it is the review's retained decoder-rejected
+/// limitation, outside this test.)
+#[tokio::test]
+async fn explicit_status_account_errors_are_withheld_on_every_native_path() {
+    let error = r#"{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
+    let raw_error = serde_json::json!({"$serde_json::private::RawValue": error}).to_string();
+    let raw_code = r#"{"type":"rate_limit_error","code":{"$serde_json::private::RawValue":"\"budget_reached\""},"message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
+    let mut cases = Vec::new();
+    for (label, e) in [
+        ("object", error.to_owned()),
+        ("raw error", raw_error),
+        ("raw code", raw_code.to_owned()),
+    ] {
+        cases.push((
+            label.to_owned(),
+            format!(r#"{{"type":"error","status":400,"error":{e}}}"#),
+        ));
+        if label != "raw code" {
+            cases.push((format!("{label} array"), format!(r#"["error",400,{e}]"#)));
+        }
+    }
+    for (stage, before) in [("first", None), ("after content", Some(NESTED_DELTA))] {
+        for path in NATIVE_PATHS {
+            let socket = path.2;
+            for (label, event) in &cases {
+                let case = format!("{} {stage}, {label}: {event}", path.0);
+                let frames: Vec<&str> = before.into_iter().chain([event.as_str(), NESTED_END]).collect();
+                let got = native_turn(path, &frames, NESTED_END).await;
+                assert!(!discloses(&got), "{case}: {got:?}");
+                assert!(!got.frames.iter().any(|f| f == event), "{case}");
+                let array = label.ends_with("array");
+                // The upstream socket reads every form as the wrapped 400; HTTP decodes only
+                // the objects, as the 429 their error is.
+                let fails = socket || !array;
+                let lead: Vec<String> = before.iter().map(|d| (*d).to_owned()).collect();
+                if fails {
+                    assert_eq!(got.frames, lead, "{case}: {got:?}");
+                    assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+                    let status = if socket { 400 } else { 429 };
+                    assert_eq!(got.records[0]["fail"]["status_code"], status, "{case}: {got:?}");
+                    if socket {
+                        assert_eq!(got.cooldowns, 0, "{case}: a 400 cools nothing");
+                    }
+                } else {
+                    let mut want = lead;
+                    want.push(NESTED_END.to_owned());
+                    assert_eq!(got.frames, want, "{case}: {got:?}");
+                    assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                    assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                    assert_eq!(got.cooldowns, 0, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// #6 (review finding 2) on a later response of a steering connection: the first
+/// response completes, the next create is answered with the explicit-400 rate limit. It
+/// never reaches the client as an event: the connection ends, the create's record fails
+/// with the wrapped 400, and nothing cools. The same create answered with a plain 400 is
+/// the recoverable event the client may correct (the control).
+#[tokio::test]
+async fn a_later_steering_failure_that_reads_as_an_account_failure_is_withheld() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_first","output":[]}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_first","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const ACCOUNT: &str = r#"{"type":"error","status":400,"response_id":"rejected","error":{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
+    const PLAIN: &str = r#"{"type":"error","status":400,"response_id":"rejected","error":{"type":"invalid_request_error","message":"correct this create"}}"#;
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"steer_first","input":[]}"#;
+    for (rejection, withheld) in [(ACCOUNT, true), (PLAIN, false)] {
+        let mut upstream = Gated::start(
+            vec![
+                vec![CREATED.to_owned(), COMPLETED.to_owned()],
+                vec![rejection.to_owned()],
+            ],
+            false,
+        )
+        .await;
+        let proxy = proxy_with(Script::default(), STEERING, |_| {
+            vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+        })
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket.send(Message::text(create.clone())).await.unwrap();
+        upstream.read(1).await;
+        upstream.release.notify_one();
+        let first = read(&mut socket, &TERMINAL).await;
+        assert_eq!(first.frames.last().map(String::as_str), Some(COMPLETED));
+        assert_eq!(records(&proxy, 1).await[0]["failed"], false);
+        socket.send(Message::text(next)).await.unwrap();
+        upstream.read(2).await;
+        let got = read(&mut socket, &["error"]).await;
+        assert!(
+            !got.frames
+                .iter()
+                .any(|f| f.contains("at-FAKE") || f.contains("acct-PRIVATE")),
+            "{rejection}: {got:?}"
+        );
+        let rejected = records(&proxy, 1).await;
+        assert_eq!(rejected[0]["failed"], true, "{rejection}");
+        assert_eq!(rejected[0]["fail"]["status_code"], 400, "{rejection}");
+        if withheld {
+            assert!(got.frames.is_empty(), "{rejection}: {got:?}");
+            assert!(got.closed.is_some(), "{rejection}: the connection ends");
+        } else {
+            assert_eq!(got.frames, [PLAIN], "{rejection}");
+            assert_eq!(got.closed, None, "{rejection}");
+        }
+        let credential = proxy.rt.store().snapshot()[0].id.clone();
+        assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{rejection}");
+    }
+}
+
+/// #25 (review finding 3): an explicit status that the pinned mapping turns into no error
+/// is a notice, whatever spells it: zero, `-0`, a negative or too large number, a string,
+/// a private number, or `status_code`. With a private raw value as `error.code` the frame
+/// is no pinned wrapped event and the pinned `error` branch goes on (`x` is no terminal
+/// provider code), as it does for the same frame with the code resolved. On the three
+/// upstream-socket paths, first and after content, the notice reaches the client and the
+/// real completion follows, with its usage and no cooldown. A logical rate limit is
+/// withheld without failing; a logical terminal provider code still fails; a missing
+/// status keeps the status-less failure reading. A turn served over HTTP keeps its own
+/// eager reading of every decoded `error` event, unchanged.
+#[tokio::test]
+async fn explicit_zero_status_notices_keep_the_real_completion() {
+    let frame = |member: &str, code: &str, private: bool| {
+        let code = if private {
+            format!(r#"{{"$serde_json::private::RawValue":"\"{code}\""}}"#)
+        } else {
+            format!(r#""{code}""#)
+        };
+        let member = if member.is_empty() {
+            String::new()
+        } else {
+            format!("{member},")
+        };
+        format!(r#"{{"type":"error",{member}"error":{{"code":{code},"message":"notice"}}}}"#)
+    };
+    let statuses = [
+        r#""status":0"#,
+        r#""status":-0"#,
+        r#""status":-1"#,
+        r#""status":70000"#,
+        r#""status":"0""#,
+        r#""status":{"$serde_json::private::Number":"0"}"#,
+        r#""status_code":0"#,
+    ];
+    for (stage, before) in [("first", None), ("after content", Some(NESTED_DELTA))] {
+        for path in NATIVE_PATHS {
+            let lead: Vec<String> = before.iter().map(|d| (*d).to_owned()).collect();
+            for status in statuses {
+                for private in [true, false] {
+                    let notice = frame(status, "x", private);
+                    let limited = frame(status, "rate_limit_exceeded", private);
+                    let terminal = frame(status, "budget_reached", private);
+                    let turn = |event: &str| {
+                        let frames: Vec<String> = lead
+                            .iter()
+                            .cloned()
+                            .chain([event.to_owned(), NESTED_END.to_owned()])
+                            .collect();
+                        async move {
+                            let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+                            native_turn(path, &frames, NESTED_END).await
+                        }
+                    };
+                    let case = format!("{} {stage}, {status}, private={private}", path.0);
+                    let got = turn(&notice).await;
+                    if path.2 {
+                        let mut want = lead.clone();
+                        want.extend([notice.clone(), NESTED_END.to_owned()]);
+                        assert_eq!(got.frames, want, "{case}: notice");
+                        assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                        assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{case}");
+                        assert_eq!(got.cooldowns, 0, "{case}");
+                        let got = turn(&limited).await;
+                        let mut want = lead.clone();
+                        want.push(NESTED_END.to_owned());
+                        assert_eq!(got.frames, want, "{case}: withheld rate limit");
+                        assert_eq!(got.records[0]["failed"], false, "{case}: {got:?}");
+                        assert_eq!(got.cooldowns, 0, "{case}");
+                    } else {
+                        // The HTTP-backed turn's eager reading: every decoded `error` fails.
+                        assert_eq!(got.records[0]["failed"], true, "{case}: {got:?}");
+                    }
+                    let got = turn(&terminal).await;
+                    assert_eq!(
+                        got.records[0]["failed"], true,
+                        "{case}: terminal provider code: {got:?}"
+                    );
+                    assert!(!got.frames.iter().any(|f| f == NESTED_END), "{case}");
+                }
+            }
+            let statusless = frame("", "x", true);
+            let frames: Vec<&str> = before.into_iter().chain([statusless.as_str(), NESTED_END]).collect();
+            let got = native_turn(path, &frames, NESTED_END).await;
+            assert_eq!(
+                got.records[0]["failed"], true,
+                "{} {stage}: status-less: {got:?}",
+                path.0
+            );
+        }
+    }
+}

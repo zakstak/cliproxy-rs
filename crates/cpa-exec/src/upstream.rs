@@ -77,7 +77,7 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
             body,
             direct: false,
             delivered_status: None,
-            delivered_event: None,
+            delivery: cpa_core::exec::Delivery::Classified,
             addon: None,
             diagnostic: None,
         });

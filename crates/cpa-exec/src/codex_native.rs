@@ -889,8 +889,9 @@ impl Passthrough {
     /// delivers one (`codex_ws.rs`, docs/codex/CONTRACT.md "Responses and failures"): the
     /// #5 context-window event a Codex client receives goes ahead of the error; any other
     /// failure travels on the error as the upstream sent it, for delivery once failover is
-    /// decided; an account failure (401, 402, 403, 429) never reaches the client as sent,
-    /// because its frame can name the pooled account.
+    /// decided; an account failure (401, 402, 403, 429), or a frame that reads as one,
+    /// never reaches the client, as sent or otherwise, because it can name the pooled
+    /// account.
     fn fail_websocket(&mut self, mut error: ExecError, frame: Bytes, deliver: Option<Bytes>) {
         // Nothing was delivered and another credential may serve the turn: the held
         // handshake events go with the attempt, as on the HTTP route.
@@ -911,12 +912,19 @@ impl Passthrough {
         });
         match preserved {
             Some(event) if !retry => self.out.push_back(Ok(event)),
-            _ if crate::codex_ws::account_failure(error.status) => {}
-            _ => {
-                if let Some(data) = parse_frame(&frame).1 {
-                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(data.as_bytes())));
+            // The same account safety an upstream socket applies (`codex_ws::reading`):
+            // withheld when classified as an account failure, or when the frame reads as
+            // one under another reading.
+            _ => match parse_frame(&frame).1 {
+                Some(data) => {
+                    crate::codex_ws::withhold_sensitive(&mut error, data.trim());
+                    crate::codex_ws::deliver_as_sent(&mut error, &data);
                 }
-            }
+                None if crate::codex_ws::account_failure(error.status) => {
+                    error.delivery = cpa_core::exec::Delivery::Withheld;
+                }
+                None => {}
+            },
         }
         self.out.push_back(Err(error));
         self.done = true;

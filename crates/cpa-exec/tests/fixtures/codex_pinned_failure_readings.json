@@ -1,0 +1,3530 @@
+{
+ "provenance": {
+  "what": "The pinned first-party readers on each frame: whether ResponsesStreamEvent decodes it, the WebSocket loop decision (a wrapped mapping error, else the processing result of a decoded event, else a skipped frame), and for a decoded response.failed the Error struct reading parse_failed_response makes of response.error.",
+  "source": "openai/codex 44ccf394573cabb95e1f751a59f9d76f6f79faf1: codex-api/src/sse/responses.rs 109-186 and 375-563, sse/responses_error.rs (Error and parse_failed_response with helpers), error.rs 81-125, endpoint/responses_websocket.rs 684-764 and the loop at 864-978, responses_headers.rs",
+  "serde_json": "1.0.149 with arbitrary_precision, raw_value and preserve_order (sha256 83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86, the pinned Cargo.lock)",
+  "oracle_binary_sha256": "a2c1c6fb9f16b8da757f75b28a801185e2df224a3b7fedadf6acf87aae79d0b5",
+  "evidence": "issue25-completion/nested-status-safety-completion (scripts/corpus.py, scripts/check-oracle.py, scripts/fixture.py, oracle/, evidence/oracle-results.jsonl)",
+  "fields": "ws: fail | read-on | skip; pinned: the same with the ApiError variant; error_array: the pinned Value holds response.error as an array; error_struct: the Error reading, null members left out, or null when that struct refuses the value."
+ },
+ "cases": [
+  {
+   "name": "nested-6-rate_limit_exceeded-rate_limit_error",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-rate_limit_exceeded-rate_limit_error",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-slow_down-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"slow_down\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "slow_down",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-slow_down-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"slow_down\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "slow_down",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-insufficient_quota-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"insufficient_quota\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail QuotaExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "insufficient_quota",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-insufficient_quota-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"insufficient_quota\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail QuotaExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "insufficient_quota",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-usage_not_included-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"usage_not_included\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail UsageNotIncluded",
+   "error_array": true,
+   "error_struct": {
+    "code": "usage_not_included",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-usage_not_included-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"usage_not_included\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail UsageNotIncluded",
+   "error_array": true,
+   "error_struct": {
+    "code": "usage_not_included",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-context_length_exceeded-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"context_length_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ContextWindowExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "context_length_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-context_length_exceeded-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"context_length_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ContextWindowExceeded",
+   "error_array": true,
+   "error_struct": {
+    "code": "context_length_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-server_is_overloaded-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"server_is_overloaded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ServerOverloaded",
+   "error_array": true,
+   "error_struct": {
+    "code": "server_is_overloaded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-server_is_overloaded-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"server_is_overloaded\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ServerOverloaded",
+   "error_array": true,
+   "error_struct": {
+    "code": "server_is_overloaded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-invalid_prompt-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"invalid_prompt\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail InvalidPrompt",
+   "error_array": true,
+   "error_struct": {
+    "code": "invalid_prompt",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-invalid_prompt-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"invalid_prompt\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail InvalidPrompt",
+   "error_array": true,
+   "error_struct": {
+    "code": "invalid_prompt",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-model_not_found-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"model_not_found\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "model_not_found",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-model_not_found-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"model_not_found\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "model_not_found",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-budget_reached-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"budget_reached\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "budget_reached",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-budget_reached-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"budget_reached\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "budget_reached",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-x-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"x\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "x",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-x-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,\"x\",\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "code": "x",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-None-rate_limit_error",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",null,\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-None-rate_limit_error",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",null,\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-6-None-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,null,\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-5-None-None",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[null,null,\"limited at-FAKE acct-PRIVATE\",null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": true,
+   "error_struct": {
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-object",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"limited at-FAKE acct-PRIVATE\",\"plan_type\":null,\"resets_at\":null,\"misalignment\":null}}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": false,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-raw-array",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":{\"$serde_json::private::RawValue\":\"[\\\"rate_limit_error\\\",\\\"rate_limit_exceeded\\\",\\\"limited at-FAKE acct-PRIVATE\\\",null,null,null]\"}}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-raw-raw-array",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":{\"$serde_json::private::RawValue\":\"{\\\"$serde_json::private::RawValue\\\":\\\"[\\\\\\\"rate_limit_error\\\\\\\",\\\\\\\"rate_limit_exceeded\\\\\\\",\\\\\\\"limited at-FAKE acct-PRIVATE\\\\\\\",null,null,null]\\\"}\"}}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-escaped",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_\\u0065rror\",\"rate_limit_exceeded\",\"limited at-\\u0046AKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-private-code",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-private-resets",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",\"plus\",{\"$serde_json::private::Number\":\"5\"},null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE",
+    "plan_type": "plus",
+    "resets_at": 5
+   }
+  },
+  {
+   "name": "nested-resets-neg0",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",\"plus\",{\"$serde_json::private::Number\":\"-0\"},null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE",
+    "plan_type": "plus",
+    "resets_at": 0
+   }
+  },
+  {
+   "name": "nested-resets-int",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",\"plus\",1700000000,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE",
+    "plan_type": "plus",
+    "resets_at": 1700000000
+   }
+  },
+  {
+   "name": "nested-misalignment-object",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,{\"k\":[1,2]}]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE",
+    "misalignment": {
+     "k": [
+      1,
+      2
+     ]
+    }
+   }
+  },
+  {
+   "name": "nested-misalignment-number",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,3]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE",
+    "misalignment": 3
+   }
+  },
+  {
+   "name": "nested-repeated-error-last-array",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":{\"code\":\"other\"},\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-repeated-error-last-object",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null],\"error\":{\"code\":\"other\"}}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable",
+   "error_array": false,
+   "error_struct": {
+    "code": "other"
+   }
+  },
+  {
+   "name": "nested-positional-event",
+   "raw": "[\"response.failed\",null,null,{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]},null,null,null,null,null,null,null,null,null,null]",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-raw-response",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"$serde_json::private::RawValue\":\"{\\\"id\\\":\\\"r1\\\",\\\"error\\\":[\\\"rate_limit_error\\\",\\\"rate_limit_exceeded\\\",\\\"limited at-FAKE acct-PRIVATE\\\",null,null,null]}\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail RateLimitExceeded",
+   "error_array": true,
+   "error_struct": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded",
+    "message": "limited at-FAKE acct-PRIVATE"
+   }
+  },
+  {
+   "name": "nested-bad-0",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-1",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\"]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-2",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\"]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-3",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-4",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-5",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-6",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[23,\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-7",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",42,\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-8",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",true,null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-9",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",7,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-10",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,\"5\",null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-11",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,1.5,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-12",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,9223372036854775808,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-13",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,{},null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-bad-14",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":[\"rate_limit_error\",{\"code\":\"rate_limit_exceeded\"},\"limited at-FAKE acct-PRIVATE\",null,null,null]}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": true,
+   "error_struct": null
+  },
+  {
+   "name": "nested-error-event",
+   "raw": "{\"type\":\"error\",\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "nested-root-error",
+   "raw": "{\"type\":\"response.failed\",\"response\":{\"id\":\"r1\"},\"error\":[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": false,
+   "error_struct": null
+  },
+  {
+   "name": "nested-response-array",
+   "raw": "{\"type\":\"response.failed\",\"response\":[[\"rate_limit_error\",\"rate_limit_exceeded\",\"limited at-FAKE acct-PRIVATE\",null,null,null]]}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Stream",
+   "error_array": false,
+   "error_struct": null
+  },
+  {
+   "name": "status-absent-x-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-x-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-absent-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-absent-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-absent-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-absent-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-absent-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-absent-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-x-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-null-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-null-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-null-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-null-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-null-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-null-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":null,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-x-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--1-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--1-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--1-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--1-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--1-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-x-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-1-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-x-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-99-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-99-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-99-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-99-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-99-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-99-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":99,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-100-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-100-x-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-100-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-100-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-100-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-100-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-100-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-100-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-100-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-100-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-100-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-100-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":100,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-x-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-200-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-200-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-200-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-200-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-200-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-200-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":200,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-x-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-204-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-204-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-204-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-204-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-204-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-204-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":204,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-x-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-299-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-299-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-299-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-299-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-299-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-299-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":299,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-400-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-400-x-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-400-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-400-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-400-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-400-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-400-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-400-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-400-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-400-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-400-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-400-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-429-x-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-429-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-429-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-429-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-429-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-429-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-429-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-429-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-999-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-999-x-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-999-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-999-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-999-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-999-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-999-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-999-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-999-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-999-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-999-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "status-999-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":999,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-x-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1000-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1000-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1000-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1000-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-1000-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1000-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1000,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-x-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-65535-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-65535-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-65535-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-65535-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Retryable"
+  },
+  {
+   "name": "status-65535-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65535-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":65535,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-x-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-65536-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-65536-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-65536-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-65536-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-65536-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":65536,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-x-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--429-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status--429-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--429-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status--429-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status--429-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":-429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0.0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0.0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0.0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0.0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0.0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-x-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1.5-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-1.5-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1.5-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-1.5-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-1.5-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":1.5,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-429.0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-429.0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-429.0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-429.0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-429.0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":429.0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0e0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-0e0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0e0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-0e0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-0e0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":0e0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"0\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-x-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-429-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-429-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-429-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-429-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-429-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"429\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-x-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-abc-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-str-abc-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-abc-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-str-abc-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-str-abc-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":\"abc\",\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-x-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-true-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-true-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-true-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-true-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-true-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":true,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-x-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-false-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-false-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-false-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-false-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-false-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":false,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-x-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-array-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-array-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-array-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-array-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-array-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":[],\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-x-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-object-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-object-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-object-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-object-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-object-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-num-0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-num-0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-num-0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-num-0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-x-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-num-429-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-num-429-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-num-429-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-num-429-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-num-429-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::Number\":\"429\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-x-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-raw-0-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-raw-0-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-raw-0-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-raw-0-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-0-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"0\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-x-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-x-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-rate_limit_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-rate_limit_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"rate_limit_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-budget_reached-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"budget_reached\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-raw-null-budget_reached-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "status-raw-null-model_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"model_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-raw-null-model_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"model_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail ModelNotFound"
+  },
+  {
+   "name": "status-raw-null-previous_response_not_found-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-previous_response_not_found-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"previous_response_not_found\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-context_length_exceeded-plain",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "status-raw-null-context_length_exceeded-private",
+   "raw": "{\"type\":\"error\",\"status\":{\"$serde_json::private::RawValue\":\"null\"},\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"context_length_exceeded\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "alias-0",
+   "raw": "{\"type\":\"error\",\"status_code\":0,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "alias-0-plain",
+   "raw": "{\"type\":\"error\",\"status_code\":0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "alias-429",
+   "raw": "{\"type\":\"error\",\"status_code\":429,\"error\":{\"code\":{\"$serde_json::private::RawValue\":\"\\\"x\\\"\"},\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "both-0-429",
+   "raw": "{\"type\":\"error\",\"status\":0,\"status_code\":429,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "both-0-0",
+   "raw": "{\"type\":\"error\",\"status\":0,\"status_code\":0,\"error\":{\"code\":\"x\",\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "raw-error-0",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"$serde_json::private::RawValue\":\"{\\\"code\\\":\\\"x\\\",\\\"message\\\":\\\"notice\\\"}\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "raw-error-0-budget",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"$serde_json::private::RawValue\":\"{\\\"code\\\":\\\"budget_reached\\\"}\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "number-code-0",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":{\"code\":5,\"message\":\"notice\"}}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "string-error-0",
+   "raw": "{\"type\":\"error\",\"status\":0,\"error\":\"notice\"}",
+   "accepted": true,
+   "ws": "read-on",
+   "pinned": "read-on"
+  },
+  {
+   "name": "conflict-object",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"rate_limit_error\",\"code\":\"budget_reached\",\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "conflict-object-array",
+   "raw": "[\"error\",400,{\"type\":\"rate_limit_error\",\"code\":\"budget_reached\",\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}]",
+   "accepted": false,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "conflict-raw-error",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"$serde_json::private::RawValue\":\"{\\\"type\\\":\\\"rate_limit_error\\\",\\\"code\\\":\\\"budget_reached\\\",\\\"message\\\":\\\"limited\\\",\\\"token\\\":\\\"at-FAKE\\\",\\\"private_account\\\":\\\"acct-PRIVATE\\\"}\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "conflict-raw-error-array",
+   "raw": "[\"error\",400,{\"$serde_json::private::RawValue\":\"{\\\"type\\\":\\\"rate_limit_error\\\",\\\"code\\\":\\\"budget_reached\\\",\\\"message\\\":\\\"limited\\\",\\\"token\\\":\\\"at-FAKE\\\",\\\"private_account\\\":\\\"acct-PRIVATE\\\"}\"}]",
+   "accepted": false,
+   "ws": "fail",
+   "pinned": "fail Transport"
+  },
+  {
+   "name": "conflict-raw-code",
+   "raw": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"rate_limit_error\",\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}}",
+   "accepted": true,
+   "ws": "fail",
+   "pinned": "fail SessionBudgetExceeded"
+  },
+  {
+   "name": "conflict-raw-code-array",
+   "raw": "[\"error\",400,{\"type\":\"rate_limit_error\",\"code\":{\"$serde_json::private::RawValue\":\"\\\"budget_reached\\\"\"},\"message\":\"limited\",\"token\":\"at-FAKE\",\"private_account\":\"acct-PRIVATE\"}]",
+   "accepted": false,
+   "ws": "skip",
+   "pinned": "skip"
+  }
+ ]
+}

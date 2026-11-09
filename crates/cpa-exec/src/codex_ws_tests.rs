@@ -1749,10 +1749,7 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
             );
         } else {
             assert_eq!(
-                error
-                    .delivered_event
-                    .as_deref()
-                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                error.delivered_event().map(|b| String::from_utf8_lossy(b).into_owned()),
                 Some(live.to_owned()),
                 "{name}: the frame as sent"
             );
@@ -2218,4 +2215,246 @@ fn positional_frames_read_by_their_decoded_members() {
     assert!(ws_error(wrapped, false).is_none());
     assert!(matches!(reading(wrapped, None, false), Reading::Failure { ref error, body: None } if error.status == 429));
     assert!(account_shaped(wrapped, false));
+}
+
+/// The pinned first-party readers' outcome for each frame of
+/// `tests/fixtures/codex_pinned_failure_readings.json` (its `provenance` names the pinned
+/// source, the serde_json build and the evidence): nested `response.failed` errors written
+/// as the `Error` struct by position, private values, malformed arrays, and `error`
+/// frames with every status representation.
+fn pinned_readings() -> Vec<Value> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/codex_pinned_failure_readings.json")).unwrap();
+    fixture["cases"].as_array().unwrap().clone()
+}
+
+/// #25, #6 and #7 against the pinned readers. A frame the pinned WebSocket reader fails
+/// fails the turn. A frame it reads on or skips fails only by one of the proxy's two
+/// documented readings beyond it: a decoded `error` without a status keeps the
+/// status-less failure reading, and a decoded `error` whose status Go's reader takes as
+/// an HTTP error status (`gjson` `Int`, `status` then `status_code`, so also `"429"` or
+/// `429.0`) fails by it. Every other status is a notice, zero, negative, too large and
+/// type-wrong ones included, whether or not a private value keeps the frame from reading
+/// as the pinned wrapped event.
+#[test]
+fn readings_follow_the_pinned_readers() {
+    let mut checked = [0usize; 2];
+    for case in pinned_readings() {
+        let name = case["name"].as_str().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+        let event = crate::codex_event::decode(raw);
+        assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
+        let failed = matches!(reading(raw, event.as_ref(), false), Reading::Failure { .. });
+        if case["ws"] == "fail" {
+            assert!(failed, "{name}: the pinned reader fails it ({})", case["pinned"]);
+            checked[0] += 1;
+            continue;
+        }
+        let view = crate::codex_event::classification_view(raw);
+        let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
+        let members: Value = serde_json::from_str(&view).unwrap_or(Value::Null);
+        let statusless = ["status", "status_code"]
+            .iter()
+            .all(|key| members.get(key).is_none_or(Value::is_null));
+        let mut go = cpa_common::json::get(view.as_bytes(), "status").int();
+        if go == 0 {
+            go = cpa_common::json::get(view.as_bytes(), "status_code").int();
+        }
+        let go_error = u16::try_from(go).is_ok_and(crate::codex_event::error_status);
+        assert_eq!(
+            failed,
+            decoded_error && (statusless || go_error),
+            "{name}: the pinned reader goes on ({})",
+            case["pinned"]
+        );
+        checked[1] += 1;
+    }
+    assert!(checked[0] > 150 && checked[1] > 150, "{checked:?}");
+}
+
+/// #25 and #6: a decoded `response.failed`'s `response.error` is read as
+/// `parse_failed_response` reads it into its `Error` struct
+/// (`sse/responses_error.rs:14-24`), so the struct written as a JSON array of five or six
+/// members is the object of those members, private values and escapes resolved. Its
+/// failure then classifies, and is withheld or delivered, exactly as that object does. An
+/// array the struct refuses (too short, too long, a member of the wrong type) stays one:
+/// the pinned reader has only its generic stream error for it, which names no code.
+#[test]
+fn failed_errors_read_as_the_pinned_error_struct() {
+    let mut read = [0usize; 2];
+    for case in pinned_readings() {
+        if case["error_array"] != true {
+            continue;
+        }
+        let name = case["name"].as_str().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+        let view: Value = serde_json::from_str(&crate::codex_event::classification_view(raw)).unwrap();
+        let error = &view["response"]["error"];
+        let event = crate::codex_event::decode(raw).unwrap();
+        let Reading::Failure { error: got, .. } = reading(raw, Some(&event), false) else {
+            panic!("{name}: a response.failed fails");
+        };
+        if case["error_struct"].is_null() {
+            assert!(error.is_array(), "{name}: {error}");
+            read[1] += 1;
+            continue;
+        }
+        // Numbers by value: the view keeps `-0` as sent, which the struct's `i64` reads as 0.
+        let fields = error.as_object().unwrap();
+        let want = case["error_struct"].as_object().unwrap();
+        assert_eq!(fields.len(), want.len(), "{name}: {error}");
+        for (key, value) in want {
+            match (value.as_f64(), fields.get(key)) {
+                (Some(n), Some(got)) => assert_eq!(got.as_f64(), Some(n), "{name}: {key}"),
+                (None, got) => assert_eq!(got, Some(value), "{name}: {key}"),
+                (Some(_), None) => panic!("{name}: {key} missing"),
+            }
+        }
+        // The same failure written with the object the struct reads.
+        let object =
+            serde_json::json!({"type": "response.failed", "response": {"id": "r1", "error": case["error_struct"]}})
+                .to_string();
+        let object_event = crate::codex_event::decode(&object).unwrap();
+        let Reading::Failure { error: want, .. } = reading(&object, Some(&object_event), false) else {
+            panic!("{name}: the object form fails");
+        };
+        assert_eq!(got.status, want.status, "{name}");
+        assert_eq!(got.delivery, want.delivery, "{name}");
+        read[0] += 1;
+    }
+    assert!(read[0] >= 30 && read[1] >= 15, "{read:?}");
+}
+
+/// #6 (review finding 1): the nested positional rate limit, with the credential's own
+/// token in its message, is the 429 its object form is, and never reaches the client:
+/// withheld, as an account failure. The #5 relay and the session reader read the
+/// positional context-window code as the pinned parser does too.
+#[test]
+fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
+    let nested = r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited at-FAKE acct-PRIVATE",null,null,null]}}"#;
+    let event = crate::codex_event::decode(nested).unwrap();
+    let Reading::Failure { mut error, .. } = reading(nested, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.status, 429);
+    assert_eq!(error.delivery, Delivery::Withheld);
+    deliver_as_sent(&mut error, nested);
+    assert_eq!(error.delivery, Delivery::Withheld, "never as sent");
+    assert!(account_shaped(nested, true));
+    let context = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null,null]}}"#;
+    let event = crate::codex_event::decode(context).unwrap();
+    assert!(event.is_context_window_failure());
+    assert!(preserved_rejection(context));
+    assert!(matches!(
+        crate::codex_event::context_window_event(context),
+        Some(std::borrow::Cow::Borrowed(sent)) if sent == context
+    ));
+    let Reading::Failure { error, .. } = reading(context, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.status, 400);
+    // A four-member array is no `Error`: no context window, no account failure.
+    let short = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null]}}"#;
+    assert!(!crate::codex_event::decode(short).unwrap().is_context_window_failure());
+    assert!(!account_shaped(
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited"]}}"#,
+        true
+    ));
+}
+
+/// #6 (review finding 2): the pinned wrapped mapping keeps an explicit `status: 400` for
+/// the scheduler, while the frame's own error is a rate limit carrying the credential's
+/// token. The failure stays 400 and the frame is withheld, in every representation that
+/// reads that way; a 400 whose error reads as no account failure still reaches the client
+/// as sent.
+#[test]
+fn explicit_status_account_errors_keep_their_status_and_are_withheld() {
+    for case in pinned_readings() {
+        let name = case["name"].as_str().unwrap();
+        // The wrapped array whose code is a private raw value decodes as neither pinned
+        // struct, so the pinned reader skips it; like any frame it cannot decode, it is
+        // read for account safety only as sent and by repeated keys (the review's retained
+        // decoder-rejected limitation, outside this finding).
+        if !name.starts_with("conflict-") || name == "conflict-raw-code-array" {
+            continue;
+        }
+        let raw = case["raw"].as_str().unwrap();
+        let event = crate::codex_event::decode(raw);
+        match reading(raw, event.as_ref(), false) {
+            Reading::Failure { mut error, .. } => {
+                assert_eq!(error.status, 400, "{name}");
+                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                deliver_as_sent(&mut error, raw);
+                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+            }
+            Reading::Passed { .. } | Reading::Event { .. } => panic!("{name}"),
+        }
+    }
+    // A decoded failure keeps the pinned last-key reading: a rate-limit `type` the
+    // `Value` replaces with a later one is no account failure.
+    let first = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","type":"invalid_request_error","message":"bad input"}}}"#;
+    let event = crate::codex_event::decode(first).unwrap();
+    let Reading::Failure { error, .. } = reading(first, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!((error.status, error.delivery), (400, Delivery::Classified));
+    let plain = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":"bad"}}"#;
+    let event = crate::codex_event::decode(plain).unwrap();
+    let Reading::Failure { mut error, .. } = reading(plain, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.delivery, Delivery::Classified);
+    deliver_as_sent(&mut error, plain);
+    assert_eq!(error.delivered_event().map(|b| b.as_ref()), Some(plain.as_bytes()));
+}
+
+/// #25 (review finding 3): an explicit zero status is a status. With a private raw value
+/// as `error.code` the frame is no pinned wrapped event, the pinned `error` branch reads
+/// its logical code `x` and goes on; so does the proxy, as for the same frame with the
+/// code resolved. A logical rate limit is withheld without failing; a logical terminal
+/// provider code still fails; only a missing or `null` status keeps the status-less
+/// failure reading.
+#[test]
+fn explicit_zero_status_is_a_notice() {
+    let frame = |status: &str, code: &str| {
+        let status = if status.is_empty() {
+            String::new()
+        } else {
+            format!(r#""status":{status},"#)
+        };
+        format!(
+            r#"{{"type":"error",{status}"error":{{"code":{{"$serde_json::private::RawValue":"\"{code}\""}},"message":"notice"}}}}"#
+        )
+    };
+    let read = |raw: &str| {
+        let event = crate::codex_event::decode(raw).unwrap();
+        match reading(raw, Some(&event), false) {
+            Reading::Failure { error, .. } => Some(error.status),
+            Reading::Passed { decoded: true } => None,
+            _ => panic!("{raw}"),
+        }
+    };
+    for status in [
+        "0",
+        "-0",
+        "-1",
+        "70000",
+        "\"0\"",
+        "0.0",
+        "[]",
+        r#"{"$serde_json::private::Number":"0"}"#,
+    ] {
+        assert_eq!(read(&frame(status, "x")), None, "{status}");
+        let limited = frame(status, "rate_limit_exceeded");
+        assert_eq!(read(&limited), None, "{status}");
+        assert!(account_shaped(&limited, true), "{status}");
+        assert!(read(&frame(status, "budget_reached")).is_some(), "{status}");
+    }
+    assert!(crate::codex_event::status_present(r#"{"status_code":0}"#));
+    assert!(!crate::codex_event::status_present(
+        r#"{"status":null,"status_code":null}"#
+    ));
+    for status in ["", "null", r#"{"$serde_json::private::RawValue":"null"}"#] {
+        assert_eq!(read(&frame(status, "x")), Some(502), "{status}: status-less");
+    }
 }
