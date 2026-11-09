@@ -33,13 +33,15 @@ use std::ops::Range;
 use crate::rawjson;
 
 /// Where an object sits among those the failure readings read: the frame, its `error`
-/// object, its `response` object, and the `error` object inside that.
+/// object, its `response` or `body` object, and the `error` object inside either.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Object {
     Root,
     Error,
     Response,
     ResponseError,
+    Body,
+    BodyError,
     /// Anything else, which no failure reading looks into.
     Other,
 }
@@ -48,23 +50,25 @@ enum Object {
 /// frame (`codex_ws::ws_error`, and `response::terminal_failure` for `type` and the
 /// status-less fallbacks); `Response` is the frame's `response`, which no reading
 /// classifies itself but which holds `ResponseError`, `response.error`; `Field` is a
-/// member of one of the two error objects ([`Object::Error`] or
-/// [`Object::ResponseError`]), which `response::terminal_failure` classifies. A slot
+/// member of one of the three error objects ([`Object::Error`],
+/// [`Object::ResponseError`] or [`Object::BodyError`]), which `response::terminal_failure` classifies. A slot
 /// occurs more than once exactly when a key on its path repeats within one object.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Top(&'static str),
     Response,
     ResponseError,
+    Body,
+    BodyError,
     Field(Object, &'static str),
 }
 
 impl Slot {
-    /// A member of either error object, whichever object it is in.
+    /// A member of any error object, whichever object it is in.
     fn field(self) -> Option<&'static str> {
         match self {
             Self::Field(_, name) => Some(name),
-            Self::Top(_) | Self::Response | Self::ResponseError => None,
+            Self::Top(_) | Self::Response | Self::ResponseError | Self::Body | Self::BodyError => None,
         }
     }
 }
@@ -89,11 +93,15 @@ fn member(object: Object, key: &str) -> (Option<Slot>, Object) {
         Object::Root => match key {
             "error" => (Some(Slot::Top("error")), Object::Error),
             "response" => (Some(Slot::Response), Object::Response),
+            "body" => (Some(Slot::Body), Object::Body),
             _ => (named(&TOP).map(Slot::Top), Object::Other),
         },
         Object::Response if key == "error" => (Some(Slot::ResponseError), Object::ResponseError),
-        Object::Error | Object::ResponseError => (named(&FIELDS).map(|name| Slot::Field(object, name)), Object::Other),
-        Object::Response | Object::Other => (None, Object::Other),
+        Object::Body if key == "error" => (Some(Slot::BodyError), Object::BodyError),
+        Object::Error | Object::ResponseError | Object::BodyError => {
+            (named(&FIELDS).map(|name| Slot::Field(object, name)), Object::Other)
+        }
+        Object::Response | Object::Body | Object::Other => (None, Object::Other),
     }
 }
 
@@ -270,7 +278,7 @@ impl Capacity {
 
 fn ambiguous(payload: &str) -> bool {
     let found = occurrences(payload);
-    // At most 20 distinct slots, so this stays linear in the occurrences.
+    // At most 27 distinct slots, so this stays linear in the occurrences.
     let mut seen: Vec<Slot> = Vec::new();
     let repeated = found.iter().any(|(slot, _)| {
         let again = seen.contains(slot);
@@ -282,7 +290,7 @@ fn ambiguous(payload: &str) -> bool {
     if !repeated {
         return false;
     }
-    // The values of the given frame members and of the given fields of either error
+    // The values of the given frame members and of the given fields of any error
     // object: a conservative union once anything repeats.
     let values = |slots: &[Slot], fields: &[&str]| -> Vec<&str> {
         found
@@ -330,9 +338,12 @@ fn ambiguous(payload: &str) -> bool {
                 let raw = &payload[range.clone()];
                 match slot {
                     // An error object is composed as sent; an error string as its text.
-                    Slot::Top("error") | Slot::ResponseError if raw.starts_with(['{', '[']) => capacity.note(raw),
+                    Slot::Top("error") | Slot::ResponseError | Slot::BodyError if raw.starts_with(['{', '[']) => {
+                        capacity.note(raw)
+                    }
                     Slot::Top("error" | "message" | "code" | "error_type" | "param")
                     | Slot::ResponseError
+                    | Slot::BodyError
                     | Slot::Field(_, "message" | "code" | "type") => capacity.note(rawjson::parse(raw).str()),
                     _ => {}
                 }

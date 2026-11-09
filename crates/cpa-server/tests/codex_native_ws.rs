@@ -5184,3 +5184,126 @@ async fn each_socket_guards_the_values_its_handshake_carried() {
             .all(|s| !format!("{:?}", s.headers).contains("client-key"))
     );
 }
+
+/// A non-direct upgrade rejection still supplies headers to the subscription-limit
+/// formatter. Only the header carrying the serving request's credential is withheld.
+#[tokio::test]
+async fn subscription_limit_headers_cannot_echo_the_selected_credential() {
+    use cpa_server::testing::codex_capture::Reply;
+    for value in ["at-FAKE", "at-OTHER"] {
+        let mut rejected = Reply::json(429, r#"{"error":{"type":"usage_limit_reached","message":"limited"}}"#);
+        rejected.headers.push(("x-codex-active-limit".into(), value.into()));
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws_reject: Some(rejected),
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let got = read(&mut socket, &[]).await;
+        let sockets = proxy.upstream.sockets();
+        assert!(!sockets.is_empty());
+        assert!(sockets.iter().all(|s| s.headers["authorization"] == "Bearer at-FAKE"));
+        assert!(got.closed.is_some(), "{value}: {got:?}");
+        if value == "at-FAKE" {
+            assert!(
+                got.frames.is_empty(),
+                "confidential header must not become a limit event: {got:?}"
+            );
+        } else {
+            assert_eq!(
+                got.frames.len(),
+                1,
+                "safe control keeps its subscription-limit event: {got:?}"
+            );
+            let event: serde_json::Value = serde_json::from_str(&got.frames[0]).unwrap();
+            assert_eq!(event["status"], 429);
+            assert_eq!(event["headers"]["x-codex-active-limit"], value);
+        }
+    }
+}
+
+/// A reused socket's request-scoped bootstrap error quotes a new config value that
+/// its handshake never carried. It must retain its as-sent delivery.
+#[tokio::test]
+async fn bootstrap_errors_use_only_the_serving_sockets_credential() {
+    const DONE: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[]}}"#;
+    const ERROR: &str = r#"{"type":"error","status":400,"error":{"code":"invalid_prompt","message":"key-NEW is ordinary text on this socket"}}"#;
+    let proxy = proxy_with(
+        Script {
+            ws: vec![
+                vec![Bytes::from_static(DONE.as_bytes())],
+                vec![Bytes::from_static(ERROR.as_bytes())],
+            ],
+            ..Script::default()
+        },
+        "codex:\n  stream-bootstrap-buffering: true\n",
+        |url| {
+            let cfg = Config::parse(&format!(
+                "codex-api-key:\n  - api-key: key-OLD\n    base-url: {url}\n    websockets: true\n"
+            ))
+            .unwrap();
+            cpa_core::config::credentials::from_config(&cfg)
+        },
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    assert_eq!(first_turn(&mut socket).await, [DONE]);
+    for credential in proxy.rt.store().snapshot() {
+        let mut changed = Credential::clone(&credential);
+        changed.attributes.insert("api_key".into(), "key-NEW".into());
+        proxy
+            .rt
+            .store()
+            .replace_config_backed(changed, credential.revision)
+            .unwrap();
+    }
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(
+        got.frames,
+        [ERROR],
+        "the new key was never sent on this socket: {got:?}"
+    );
+    let sockets = proxy.upstream.sockets();
+    assert_eq!(sockets.len(), 1);
+    assert_eq!(sockets[0].headers["authorization"], "Bearer key-OLD");
+}
+
+/// The middle body.error is account-bearing but contains no selected token: the
+/// ambiguity policy must withhold it independently of the credential byte guard.
+#[tokio::test]
+async fn ambiguous_body_errors_do_not_expose_a_pooled_account() {
+    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const ACCOUNT: &str = r#"{"type":"error","type":"error","status":400,"body":{"error":{"type":"invalid_request_error"}},"body":{"error":{"type":"usage_limit_reached","message":"acct-PRIVATE"}},"body":{"error":{"type":"invalid_request_error"}}}"#;
+    const SAFE: &str = r#"{"type":"error","type":"error","status":400,"body":{"error":{"type":"invalid_request_error"}},"body":{"error":{"type":"invalid_request_error","message":"safe"}},"body":{"error":{"type":"invalid_request_error"}}}"#;
+    for path in NATIVE_PATHS {
+        let got = native_turn(path, &[ACCOUNT, END], END).await;
+        let control = native_turn(path, &[SAFE, END], END).await;
+        assert!(
+            !got.frames.iter().any(|f| f.contains("acct-PRIVATE")),
+            "{}: {got:?}",
+            path.0
+        );
+        assert_eq!(got.frames, [END], "{}: the rejected event is skipped", path.0);
+        assert!(control.frames.iter().any(|f| f == SAFE), "{}: {control:?}", path.0);
+        assert_eq!(tokens(&got.records[0]), [4, 1, 5], "{}: {got:?}", path.0);
+        assert_eq!(
+            (got.cooldowns, got.attempts),
+            (control.cooldowns, control.attempts),
+            "{}",
+            path.0
+        );
+    }
+}

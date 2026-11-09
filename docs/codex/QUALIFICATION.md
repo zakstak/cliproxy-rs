@@ -181,3 +181,12 @@ Local mocks cannot show these, and nothing here claims them:
 - How accounts are enforced, rate-limited or metered upstream.
 - Behaviour under real network failure, latency and concurrency at scale.
 - Hosted CI: GitHub Actions is disabled on this fork, so no hosted check has run. The local runs the PR lists are not CI.
+
+### Selected-credential guard follow-up regressions
+
+`codex_native_ws` covers a rejected upgrade whose subscription-limit header carries
+the selected credential, a bootstrap error on a reused socket after its configured
+key changes, and a middle repeated `body.error` that names the pooled account.
+The header has a never-sent-value control; the ambiguity case carries no selected
+credential, so its protection depends on the account reading. These are local mock
+regressions, not provider or full-client acceptance.

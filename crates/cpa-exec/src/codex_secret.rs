@@ -155,7 +155,8 @@ impl Secrets {
         let exposed = self.exposes(&error.body)
             || error.delivered_event().is_some_and(|frame| self.exposes(frame))
             || error.addon.as_deref().is_some_and(|h| self.headers_expose(h))
-            || (error.direct && self.headers_expose(&error.headers));
+            // Handshake headers can also feed a derived subscription-limit event.
+            || self.headers_expose(&error.headers);
         if exposed {
             *error = confidential(std::mem::replace(
                 error,

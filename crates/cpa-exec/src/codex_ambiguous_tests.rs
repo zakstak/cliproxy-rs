@@ -8,6 +8,9 @@ fn slots(payload: &str) -> Vec<(String, &str)> {
                 Slot::Top(n) => n.to_owned(),
                 Slot::Response => "response".to_owned(),
                 Slot::ResponseError => "response.error".to_owned(),
+                Slot::Body => "body".to_owned(),
+                Slot::BodyError => "body.error".to_owned(),
+                Slot::Field(Object::BodyError, n) => format!("body.error.{n}"),
                 Slot::Field(Object::ResponseError, n) => format!("response.error.{n}"),
                 Slot::Field(_, n) => format!("error.{n}"),
             };
@@ -415,4 +418,22 @@ fn only_a_repeated_path_is_a_repeated_member() {
     }
     let middle = r#"{"type":"response.failed","response":{"id":"a"},"response":{"error":{"code":"rate_limit_exceeded"}},"response":{"id":"b"}}"#;
     assert!(crate::codex_ws::account_shaped(middle, false));
+}
+
+#[test]
+fn body_error_occurrences_and_their_ancestors_are_read() {
+    for frame in [
+        r#"{"type":"error","type":"error","status":400,"body":{"error":{"type":"invalid_request_error"}},"body":{"error":{"type":"usage_limit_reached","message":"pooled account"}},"body":{"error":{"type":"invalid_request_error"}}}"#,
+        r#"{"type":"error","type":"error","status":400,"body":{"error":{"type":"invalid_request_error"},"error":{"code":"slow_down"},"error":{"type":"invalid_request_error"}}}"#,
+        r#"{"type":"error","type":"error","status":400,"body":{"error":{"code":"x","code":"insufficient_quota","code":"x"}}}"#,
+    ] {
+        assert!(ambiguous_account(frame), "{frame}");
+    }
+    for frame in [
+        r#"{"type":"error","status":400,"error":{"type":"invalid_request_error"},"body":{"error":{"type":"usage_limit_reached"}}}"#,
+        r#"{"type":"error","type":"error","status":400,"body":{"error":{"type":"invalid_request_error"}},"body":{"error":{"type":"invalid_request_error"}}}"#,
+        r#"{"type":"error","type":"error","status":400,"meta":{"body":{"error":{"type":"usage_limit_reached"}}}}"#,
+    ] {
+        assert!(!ambiguous_account(frame), "{frame}");
+    }
 }

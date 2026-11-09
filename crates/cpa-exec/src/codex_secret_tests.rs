@@ -157,3 +157,21 @@ fn a_buffered_answer_with_a_value_fails_request_scoped() {
     };
     assert_eq!(&body[..], br#"{"id":"r" , "output":"safe"}"#);
 }
+
+#[test]
+fn non_direct_handshake_headers_are_guarded_before_limit_rendering() {
+    for token in ["at-FAKE", "at-OTHER"] {
+        let mut error = ExecError::local(
+            429,
+            FailureScope::Credential,
+            r#"{"error":{"type":"usage_limit_reached"}}"#,
+        );
+        error
+            .headers
+            .insert("x-codex-active-limit", HeaderValue::from_str(token).unwrap());
+        assert!(!error.direct && error.addon.is_none());
+        let guarded = bearer("at-FAKE").guarded(error);
+        assert_eq!(guarded.status, 429);
+        assert_eq!(guarded.confidential(), token == "at-FAKE");
+    }
+}

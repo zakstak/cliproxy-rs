@@ -2004,6 +2004,9 @@ impl CodexExecutor {
             drain: None,
         };
         let socket_secrets = turn.conn.secrets.clone();
+        // The outer error guard must follow the serving socket too: a reused socket
+        // may carry the old key while this request's freshly prepared headers do not.
+        *secrets = socket_secrets.clone();
         if let Some((input, initial)) = steering {
             // The socket now belongs to this connection; bootstrap buffering does not apply.
             let stream = duplex::Duplex::start(turn, input, initial, req, view, settings.image_generation).await;
