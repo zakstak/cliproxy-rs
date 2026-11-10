@@ -150,7 +150,7 @@ pub const APPEND_REFUSED: &str = "`response.append` is not supported on Codex cr
 /// (`generate: false`) has no HTTP meaning and is refused.
 pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
     let body = CodexBody::parse(frame)?;
-    if body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null) {
+    if continues(&body) {
         return Err(ExecError::replay_required());
     }
     if body.get("generate").is_some_and(|m| m.kind == Kind::False) {
@@ -192,6 +192,16 @@ pub(crate) fn upstream_model(req: &ExecRequest) -> Result<String, ExecError> {
         ));
     }
     Ok(req.model.trim().to_owned())
+}
+
+/// Whether a `response.create` continues upstream state: it names a
+/// `previous_response_id` (a string; `null` names none). Such a request belongs to the
+/// socket that produced that response. It runs only on the session's current socket, or
+/// fails with the replay close; it never travels on a new socket or over HTTP
+/// (docs/codex/CONTRACT.md "Socket and account ownership"). The frame decides this, not
+/// the transport of the connection's previous turn.
+pub(crate) fn continues(body: &CodexBody<'_>) -> bool {
+    body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null)
 }
 
 /// `frame` with `model` routed to `model`: the contract's one permitted request edit

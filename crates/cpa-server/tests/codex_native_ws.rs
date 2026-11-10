@@ -6734,3 +6734,178 @@ async fn a_retained_socket_loss_does_not_end_a_turn_served_elsewhere() {
         }
     }
 }
+
+/// #25: a continuation belongs to the socket that holds its previous response, whatever
+/// transport the connection's last turn used. A first create completes on account A's
+/// socket (response `first`, 4/1/5). The next create runs on HTTP-only account B and
+/// completes (4/1/5); meanwhile A's idle socket closes 1011, or stays open in the
+/// control. A third create then names `previous_response_id: first`:
+/// - A's socket was lost: the replay close (1012), no new dial, nothing sent upstream,
+///   and one failed record without tokens;
+/// - A's socket is still open: the continuation goes on that same socket and completes;
+/// - a fresh create without a previous response, after the loss, dials a new socket and
+///   completes.
+/// With and without bootstrap buffering.
+#[tokio::test]
+async fn a_continuation_needs_the_socket_that_holds_its_response() {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    use std::sync::Mutex;
+    const FIRST: &str = r#"{"type":"response.completed","response":{"id":"first","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const CURRENT: &str = r#"{"type":"response.completed","response":{"id":"current","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const NEXT: &str = r#"{"type":"response.completed","response":{"id":"next","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let continuation = r#"{"type":"response.create","model":"socket-model","previous_response_id":"first","input":[]}"#;
+    for buffering in [false, true] {
+        for (case_name, close_old, continues) in [
+            ("lost socket, continuation", true, true),
+            ("lost socket, fresh create", true, false),
+            ("live socket, continuation", false, true),
+        ] {
+            let case = format!("buffering={buffering} {case_name}");
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let frames = Arc::new(Mutex::new(Vec::<String>::new()));
+            let old_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let old_closed = Arc::new(tokio::sync::Notify::new());
+            let app = {
+                let (ws_seen, http_seen, frames) = (seen.clone(), seen.clone(), frames.clone());
+                let (old_gate, old_closed) = (old_gate.clone(), old_closed.clone());
+                axum::Router::new().route(
+                    "/responses",
+                    axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                        let dial = {
+                            let mut seen = ws_seen.lock().unwrap();
+                            seen.push(format!("WS {}", headers["authorization"].to_str().unwrap()));
+                            seen.iter().filter(|s| s.starts_with("WS")).count()
+                        };
+                        let (gate, closed, frames) = (old_gate.clone(), old_closed.clone(), frames.clone());
+                        async move {
+                            upgrade.on_upgrade(move |mut socket| async move {
+                                let mut replies = if dial == 1 { vec![FIRST, NEXT] } else { vec![NEXT] }.into_iter();
+                                while let Some(Ok(message)) = socket.recv().await {
+                                    let Upstream::Text(text) = message else { continue };
+                                    frames.lock().unwrap().push(text.to_string());
+                                    let Some(reply) = replies.next() else { continue };
+                                    let _ = socket.send(Upstream::Text(reply.into())).await;
+                                    if dial == 1 && reply == FIRST {
+                                        gate.acquire().await.unwrap().forget();
+                                        if close_old {
+                                            let _ = socket
+                                                .send(Upstream::Close(Some(CloseFrame {
+                                                    code: 1011,
+                                                    reason: "old idle loss".into(),
+                                                })))
+                                                .await;
+                                            closed.notify_one();
+                                            return;
+                                        }
+                                    }
+                                }
+                            })
+                        }
+                    })
+                    .post(move |headers: axum::http::HeaderMap| {
+                        http_seen
+                            .lock()
+                            .unwrap()
+                            .push(format!("HTTP {}", headers["authorization"].to_str().unwrap()));
+                        async move { ([("content-type", "text/event-stream")], format!("data: {CURRENT}\n\n")) }
+                    }),
+                )
+            };
+            let upstream = format!("http://{}", serve(app).await);
+            let config = format!(
+                "codex:\n  stream-bootstrap-buffering: {buffering}\ncodex-api-key:\n  - api-key: key-OLD\n    base-url: {upstream}\n    websockets: true\n    models: [{{name: gpt-5.5, alias: socket-model}}]\n  - api-key: key-CURRENT\n    base-url: {upstream}\n    websockets: false\n    models: [{{name: gpt-5.5, alias: http-model}}]\n"
+            );
+            let proxy = proxy_with(Script::default(), &config, |_| Vec::new()).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "socket-model")))
+                .await
+                .unwrap();
+            assert_eq!(read(&mut socket, &TERMINAL).await.frames, [FIRST], "{case}");
+            socket
+                .send(Message::text(client_frame("ws-create-first", "http-model")))
+                .await
+                .unwrap();
+            old_gate.add_permits(1);
+            if close_old {
+                tokio::time::timeout(Duration::from_secs(2), old_closed.notified())
+                    .await
+                    .unwrap();
+            }
+            let second = read(&mut socket, &TERMINAL).await;
+            assert_eq!(
+                (second.frames, second.closed),
+                (vec![CURRENT.to_owned()], None),
+                "{case}"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(70), socket.next())
+                    .await
+                    .is_err(),
+                "{case}: the connection stays open"
+            );
+            let third = if continues {
+                continuation.to_owned()
+            } else {
+                client_frame("ws-create-first", "socket-model")
+            };
+            socket.send(Message::text(third)).await.unwrap();
+            let got = read(&mut socket, &TERMINAL).await;
+            let records = records(&proxy, 3).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no other record"
+            );
+            let seen = seen.lock().unwrap().clone();
+            let frames = frames.lock().unwrap().clone();
+            for record in &records[..2] {
+                assert_eq!(record["failed"], false, "{case}: {record}");
+                assert_eq!(tokens(record), [4, 1, 5], "{case}");
+            }
+            match (close_old, continues) {
+                (true, true) => {
+                    assert_eq!(got.closed, Some(1012), "{case}: the replay close: {got:?}");
+                    assert!(got.frames.is_empty(), "{case}: {got:?}");
+                    assert_eq!(
+                        seen,
+                        ["WS Bearer key-OLD", "HTTP Bearer key-CURRENT"],
+                        "{case}: no new dial"
+                    );
+                    assert_eq!(frames.len(), 1, "{case}: nothing more sent upstream: {frames:?}");
+                    assert_eq!(records[2]["failed"], true, "{case}: {}", records[2]);
+                    assert_eq!(records[2]["fail"]["status_code"], 426, "{case}");
+                    assert_eq!(tokens(&records[2]), [0, 0, 0], "{case}");
+                }
+                (true, false) => {
+                    assert_eq!((got.frames, got.closed), (vec![NEXT.to_owned()], None), "{case}");
+                    assert_eq!(
+                        seen,
+                        ["WS Bearer key-OLD", "HTTP Bearer key-CURRENT", "WS Bearer key-OLD"],
+                        "{case}: a new socket"
+                    );
+                    assert!(!frames[1].contains("previous_response_id"), "{case}: {frames:?}");
+                    assert_eq!(records[2]["failed"], false, "{case}");
+                }
+                _ => {
+                    assert_eq!((got.frames, got.closed), (vec![NEXT.to_owned()], None), "{case}");
+                    assert_eq!(
+                        seen,
+                        ["WS Bearer key-OLD", "HTTP Bearer key-CURRENT"],
+                        "{case}: the same socket"
+                    );
+                    assert!(
+                        frames[1].contains(r#""previous_response_id":"first""#),
+                        "{case}: {frames:?}"
+                    );
+                    assert_eq!(records[2]["failed"], false, "{case}");
+                    assert_eq!(tokens(&records[2]), [4, 1, 5], "{case}");
+                }
+            }
+        }
+    }
+}

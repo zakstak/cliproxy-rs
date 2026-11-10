@@ -1992,6 +1992,11 @@ impl CodexExecutor {
         let model = crate::codex::native::upstream_model(&req)?;
         let frame = crate::codex::native::routed(&req.body, &model)?;
         settings.refuse_image_tool(&req.request_path, &frame)?;
+        // A frame that names a previous response runs only on the socket that holds it,
+        // whatever transport the connection's previous turn used: a lost or replaced
+        // socket gets the replay close, never a new dial carrying the old ID (#25).
+        let continuation = exec_session.continuation
+            || crate::codex::native::continues(&cpa_common::codex_body::CodexBody::parse(&frame)?);
         // The frame passed the request boundary, so it is UTF-8. It is read in place and
         // sent as these bytes: no copy of the frame.
         let body = std::str::from_utf8(&frame)
@@ -2032,7 +2037,7 @@ impl CodexExecutor {
         wire.bind(secrets);
         req.usage.sent_credentials(secrets);
         wire.ws_request(&target.url, &headers, &frame);
-        let (mut conn, mut handshake) = if exec_session.continuation {
+        let (mut conn, mut handshake) = if continuation {
             match session.current().filter(|c| c.target.serves(&target)) {
                 Some(conn) => (conn, None),
                 None => return Err(ExecError::replay_required()),
@@ -2061,7 +2066,7 @@ impl CodexExecutor {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
             let retry = error.scope != FailureScope::Request;
-            if exec_session.continuation {
+            if continuation {
                 session.invalidate(&conn, &error, false);
                 return Err(if retry { ExecError::replay_required() } else { error });
             }
