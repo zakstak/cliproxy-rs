@@ -584,9 +584,10 @@ credential or delivers that failure itself. Each socket's loss is its own. The l
 socket that then serves closes the connection like any other, idle or during a response,
 and a failure on that socket renders its own error, never the loss let pass during
 failover. A replaced socket's late loss reports nothing. A loss renders only in place of a
-failure of the attempt that ran on that socket: an attempt over HTTP or on another
-provider fails with its own error, and once such an attempt is chosen, a socket already
-lost reports nothing more, while a live socket keeps its own loss. On a new
+failure of the attempt that acquired that socket. An attempt that fails before it serves
+on a socket (over HTTP, on another provider, or refused while it prepares its request)
+fails with its own error. Once a new attempt starts, a socket already lost reports nothing
+more, while a live socket keeps its own loss. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:

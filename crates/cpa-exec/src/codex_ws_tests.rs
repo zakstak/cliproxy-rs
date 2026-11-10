@@ -2668,11 +2668,14 @@ async fn each_socket_reports_its_own_loss_once() {
         String::from_utf8_lossy(&loss.body).into_owned()
     }
     let lost = |text: &str| transport(text);
+    // The attempt serves on `id` ([`Upstream::bind`]).
+    let acquire = |session: &Session, id: u64| session.acquired.store(id, std::sync::atomic::Ordering::Release);
     let pool = Pool::default();
     let session = pool.session("s");
     let mut losses = pool.losses("s");
     let shadow = losses.clone();
     let a = session.begin_socket();
+    acquire(&session, a);
     assert!(shadow.pending().is_none());
     session.notify(a, &lost("a lost"));
     assert_eq!(&shadow.pending().unwrap().body[..], b"a lost", "pending until taken");
@@ -2682,6 +2685,7 @@ async fn each_socket_reports_its_own_loss_once() {
     assert!(quiet(&mut losses).await, "a socket reports one loss");
     // A replacement socket: a replaced socket's late notice is nobody's loss.
     let b = session.begin_socket();
+    acquire(&session, b);
     session.notify(a, &lost("a late"));
     assert!(quiet(&mut losses).await, "a replaced socket reports nothing");
     assert!(shadow.pending().is_none());
@@ -2702,14 +2706,15 @@ async fn each_socket_reports_its_own_loss_once() {
     assert_eq!(fires(&mut losses, "e").await, "e lost");
 }
 
-/// #25 R1 (HTTP-only attempts): an attempt that will not run on the session's socket
-/// releases only the loss of a socket that is already gone. A late notice from a lost
-/// socket's reader then reports nothing, before and after it was released. A live socket
-/// that served the last turn keeps its own loss: when it closes later, the loss still
-/// fires. Releasing a session that never existed creates none.
+/// #25 R1: a loss stands in for an attempt's failure only when it is the loss of the
+/// socket that attempt acquired. A new attempt owns no socket until it serves on one; a
+/// socket an earlier attempt lost reports nothing more once a new attempt starts, a late
+/// notice from its reader included. A live socket that served the last turn keeps its
+/// own loss across a new attempt: when it closes, the connection's watcher still gets
+/// it. Starting an attempt on a session that never existed creates none.
 #[tokio::test]
-async fn an_attempt_elsewhere_releases_only_a_lost_socket() {
-    // A live socket: the turn completed and keeps it.
+async fn an_attempt_owns_only_the_socket_it_acquired() {
+    // A live socket: the turn completed on it and keeps it.
     let close = Arc::new(tokio::sync::Notify::new());
     let (_up, url) = upstream(vec![Act::SendCloseOn(vec![CREATED, COMPLETED], close.clone())]).await;
     let executor = CodexExecutor::new().unwrap();
@@ -2719,25 +2724,52 @@ async fn an_attempt_elsewhere_releases_only_a_lost_socket() {
         .unwrap();
     assert!(collect(response).await.iter().all(Result::is_ok), "the turn completed");
     let mut losses = executor.session_losses("conn-1");
-    executor.release_lost_socket("conn-1");
+    executor.begin_session_attempt("conn-1");
     assert!(losses.pending().is_none());
     close.notify_one();
     let loss = tokio::time::timeout(Duration::from_secs(5), losses.next()).await;
-    assert!(loss.is_ok(), "a live socket's later loss is still reported");
-    // A socket that is already gone: its late notice is nobody's loss once released.
+    assert!(loss.is_ok(), "a live socket's later loss still reaches the watcher");
+    assert!(
+        losses.pending().is_none(),
+        "a socket the new attempt did not acquire is not its failure"
+    );
+    // An attempt that served on a socket owns its loss.
     let pool = Pool::default();
     let session = pool.session("s");
-    let mut gone = pool.losses("s");
-    let lost = session.begin_socket();
-    pool.release_lost("s");
-    session.notify(lost, &transport("late notice"));
-    assert!(gone.pending().is_none(), "a released socket reports nothing");
+    let mut watch = pool.losses("s");
+    let acquire = |id: u64| session.acquired.store(id, std::sync::atomic::Ordering::Release);
+    let a = session.begin_socket();
+    acquire(a);
+    session.notify(a, &transport("a lost"));
+    assert_eq!(
+        watch.pending().map(|l| l.body),
+        Some(Bytes::from_static(b"a lost")),
+        "the attempt's own socket"
+    );
+    // The next attempt fails before it acquires anything: the lost socket is not its
+    // failure, and its reader's late notice reports nothing.
+    pool.begin_attempt("s");
+    assert!(watch.pending().is_none(), "a new attempt owns no earlier loss");
+    session.notify(a, &transport("a late"));
+    assert!(watch.pending().is_none());
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), gone.next())
+        tokio::time::timeout(Duration::from_millis(50), watch.next())
             .await
             .is_err(),
-        "a released socket's late notice never fires"
+        "a lost socket's late notice never fires once a new attempt started"
     );
-    pool.release_lost("never-made");
-    assert!(pool.get("never-made").is_none(), "releasing creates no session");
+    // A socket dialed but not yet served on: its loss reaches the watcher, not the
+    // attempt's failure.
+    let b = session.begin_socket();
+    session.notify(b, &transport("b lost"));
+    assert!(watch.pending().is_none(), "not acquired");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), watch.next()).await.is_ok(),
+        "the latest socket's loss still fires"
+    );
+    pool.begin_attempt("never-made");
+    assert!(
+        pool.get("never-made").is_none(),
+        "starting an attempt creates no session"
+    );
 }

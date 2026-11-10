@@ -236,19 +236,15 @@ impl Executors {
         }
     }
 
-    /// An attempt of session `id` selected `credential`. A pool whose socket cannot serve
-    /// that attempt (another provider, or HTTP) and that holds no live socket gives up the
-    /// loss of its last one: that socket failed an earlier attempt, which the turn already
+    /// A new attempt of session `id` starts, whatever credential and transport it uses.
+    /// It owns no socket until it acquires one, so a loss stands in for its failure only
+    /// once it served on that socket. A pool that holds no live socket gives up the loss
+    /// of its last one: that socket failed an earlier attempt, which the turn already
     /// dealt with, so a late notice from its reader reports nothing. A live socket keeps
-    /// its own loss: it may still serve a later turn.
-    pub fn session_attempt(&self, id: &str, credential: &Credential) {
-        let provider = credential.provider.as_str();
-        if !(provider == "codex" && codex::CodexExecutor::upstream_websocket(credential)) {
-            self.codex.release_lost_socket(id);
-        }
-        if !(provider == xai::PROVIDER && xai::XaiExecutor::session_upstream(credential)) {
-            self.xai.release_lost_socket(id);
-        }
+    /// its own loss: it may still serve this attempt or a later turn.
+    pub fn session_attempt(&self, id: &str) {
+        self.codex.begin_session_attempt(id);
+        self.xai.begin_session_attempt(id);
     }
 
     /// The losses of the upstream sockets the executors hold for session `id`.

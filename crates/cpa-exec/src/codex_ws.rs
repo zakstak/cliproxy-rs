@@ -429,6 +429,8 @@ impl Upstream {
         session: &Arc<Session>,
         lease: Option<&SessionLease>,
     ) -> Result<(), ExecError> {
+        // The attempt serves on this socket: its loss is now the attempt's own.
+        session.acquired.store(self.id, std::sync::atomic::Ordering::Release);
         let Some(lease) = lease else { return Ok(()) };
         if self
             .lease
@@ -506,6 +508,10 @@ pub(crate) struct Session {
     closed: watch::Sender<SocketLoss>,
     /// Counts the sockets dialed for the session ([`Session::begin_socket`]).
     sockets: std::sync::atomic::AtomicU64,
+    /// The socket the session's current attempt acquired ([`Upstream::bind`]), 0 when it
+    /// acquired none yet ([`Session::begin_attempt`]). Only that socket's loss is the
+    /// attempt's own ([`SessionLosses::pending`]).
+    acquired: std::sync::atomic::AtomicU64,
     /// The downstream connection's client frames when response steering is configured.
     steering: Mutex<Option<Arc<SteeringInput>>>,
     /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
@@ -532,13 +538,16 @@ impl Session {
         id
     }
 
-    /// An attempt will not run on this session's socket. When the session holds no live
-    /// socket (the last one was lost and detached), that socket's loss is superseded as by
-    /// a new dial, so a late notice from its reader reports nothing. A live socket keeps
-    /// its loss: it may still serve a later turn.
-    fn release_lost(&self) {
+    /// A new attempt of the session starts: it owns no socket until it acquires one
+    /// ([`Upstream::bind`]). When the session holds no live socket (the last one was lost
+    /// and detached by an earlier attempt, which dealt with that failure), the lost
+    /// socket's loss is superseded as by a new dial, so a late notice from its reader
+    /// reports nothing. A live socket keeps its loss: it may still serve this attempt or
+    /// a later turn.
+    fn begin_attempt(&self) {
         // Held across the check, so a dial's publication cannot come in between.
         let conn = self.conn.lock().expect("session conn");
+        self.acquired.store(0, std::sync::atomic::Ordering::Release);
         if conn.is_none() {
             self.begin_socket();
         }
@@ -648,6 +657,7 @@ impl Pool {
                     conn: Mutex::default(),
                     closed: watch::channel(SocketLoss::default()).0,
                     sockets: Default::default(),
+                    acquired: Default::default(),
                     steering: Mutex::default(),
                     credential: Mutex::default(),
                 })
@@ -809,17 +819,19 @@ impl Pool {
         }
     }
 
-    /// [`Session::release_lost`] for session `id`, when it exists.
-    pub fn release_lost(&self, id: &str) {
+    /// [`Session::begin_attempt`] for session `id`, when it exists.
+    pub fn begin_attempt(&self, id: &str) {
         if let Some(session) = self.get(id) {
-            session.release_lost();
+            session.begin_attempt();
         }
     }
 
     /// The losses of the session's sockets, for its downstream handler.
     pub fn losses(&self, id: &str) -> SessionLosses {
+        let session = self.session(id);
         SessionLosses {
-            rx: self.session(id).closed.subscribe(),
+            rx: session.closed.subscribe(),
+            session,
             taken: Default::default(),
         }
     }
@@ -837,16 +849,24 @@ impl Pool {
 #[derive(Clone)]
 pub struct SessionLosses {
     rx: watch::Receiver<SocketLoss>,
+    session: Arc<Session>,
     /// The socket whose loss was taken (0: none; socket ids start at 1).
     taken: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionLosses {
-    /// The latest socket's loss, unless it was taken.
+    /// The loss of the socket the current attempt acquired, unless it was taken: what
+    /// may stand in for that attempt's failure. An attempt that failed before it acquired
+    /// a socket (over HTTP, on another provider, or refused while it prepared its
+    /// request) owns no loss, so its failure is its own.
     pub fn pending(&self) -> Option<ExecError> {
         let state = self.rx.borrow();
         let taken = self.taken.load(std::sync::atomic::Ordering::Acquire);
-        state.lost.clone().filter(|_| state.socket != taken)
+        let acquired = self.session.acquired.load(std::sync::atomic::Ordering::Acquire);
+        state
+            .lost
+            .clone()
+            .filter(|_| state.socket != taken && state.socket == acquired)
     }
 
     /// Resolves with the next socket loss not taken yet, and takes it. Cancel safe: a

@@ -6508,3 +6508,96 @@ async fn an_http_attempt_after_a_lost_socket_fails_with_its_own_error() {
         }
     }
 }
+
+/// #25 R1: a socket's loss stands in only for the failure of the attempt that acquired
+/// that socket. Both accounts take WebSocket turns. The first account's socket answers a
+/// safe 429 with a subscription reset and is lost; the turn fails over to the second
+/// account, configured with a thinking-suffixed upstream model (`gpt-5.5(high)`), which
+/// the native route refuses with a request-scoped 400 before it acquires or dials any
+/// socket. The client gets that refusal, never the first account's limit event. Control:
+/// when the second account does serve on its own socket and that socket closes 1009,
+/// the client gets that socket's own loss (close 1009), still never the first account's
+/// limit. Bootstrap buffering off and on; one record per attempt, without tokens.
+#[tokio::test]
+async fn a_refusal_before_any_socket_fails_with_its_own_error() {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    use std::sync::Mutex;
+    const LIMITED: &str = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"abandoned account","resets_at":2000000000}}"#;
+    for buffering in [false, true] {
+        for refused in [true, false] {
+            let case = format!("buffering={buffering} refused before a socket={refused}");
+            let dials = Arc::new(Mutex::new(Vec::<String>::new()));
+            let app = {
+                let dials = dials.clone();
+                axum::Router::new().route(
+                    "/responses",
+                    axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                        let authorization = headers["authorization"].to_str().unwrap().to_owned();
+                        dials.lock().unwrap().push(authorization.clone());
+                        async move {
+                            upgrade.on_upgrade(move |mut socket| async move {
+                                let _ = socket.recv().await;
+                                if authorization == "Bearer key-OLD" {
+                                    let _ = socket.send(Upstream::Text(LIMITED.into())).await;
+                                } else {
+                                    let _ = socket
+                                        .send(Upstream::Close(Some(CloseFrame {
+                                            code: 1009,
+                                            reason: "too big".into(),
+                                        })))
+                                        .await;
+                                }
+                                while let Some(Ok(_)) = socket.recv().await {}
+                            })
+                        }
+                    }),
+                )
+            };
+            let upstream = format!("http://{}", serve(app).await);
+            let second_model = if refused { "gpt-5.5(high)" } else { "gpt-5.5" };
+            let config = format!(
+                "codex:\n  stream-bootstrap-buffering: {buffering}\ncodex-api-key:\n  - api-key: key-OLD\n    base-url: {upstream}\n    priority: 9\n    websockets: true\n    models: [{{name: gpt-5.5, alias: shared}}]\n  - api-key: key-CURRENT\n    base-url: {upstream}\n    priority: 0\n    websockets: true\n    models: [{{name: '{second_model}', alias: shared}}]\n"
+            );
+            let proxy = proxy_with(Script::default(), &config, |_| Vec::new()).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "shared")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &[]).await;
+            let records = records(&proxy, 2).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no other record"
+            );
+            let dials = dials.lock().unwrap().clone();
+            assert!(
+                !got.frames
+                    .iter()
+                    .any(|f| f.contains("usage_limit_reached") || f.contains("2000000000")),
+                "{case}: the first account's limit is not the turn's failure: {got:?}"
+            );
+            assert_eq!(records[0]["fail"]["status_code"], 429, "{case}");
+            assert_eq!(records[1]["failed"], true, "{case}: {records:?}");
+            for record in &records {
+                assert_eq!(tokens(record), [0, 0, 0], "{case}");
+            }
+            if refused {
+                assert_eq!(dials, ["Bearer key-OLD"], "{case}: the refusal dials nothing");
+                assert_eq!(records[1]["fail"]["status_code"], 400, "{case}");
+                assert!(
+                    got.frames.len() == 1 && got.frames[0].contains("model suffix"),
+                    "{case}: the refusal's own error: {got:?}"
+                );
+            } else {
+                assert_eq!(dials, ["Bearer key-OLD", "Bearer key-CURRENT"], "{case}");
+                assert_eq!(got.closed, Some(1009), "{case}: its own socket's loss: {got:?}");
+            }
+        }
+    }
+}
