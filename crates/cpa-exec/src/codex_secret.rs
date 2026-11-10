@@ -109,10 +109,10 @@ pub(crate) fn from_request(headers: &HeaderMap, url: &str) -> SentCredentials {
 /// checked against the values one upstream request or socket carried.
 pub(crate) trait Guard {
     /// Marks `error` [`Delivery::Confidential`] when anything a client could get of it
-    /// carries a value: its body, the frame it would deliver as sent, the headers it
-    /// hands the client (`addon`, and a direct response's headers). Its status, scope and
-    /// body stay the scheduler's; it is no longer a direct response, and it hands the
-    /// client no headers.
+    /// carries a value: its body, its original frame (delivered as sent, or withheld
+    /// while a limit event may be derived from its body), the headers it hands the client
+    /// (`addon`, and a direct response's headers). Its status, scope and body stay the
+    /// scheduler's; it is no longer a direct response, and it hands the client no headers.
     fn guard_error(&self, error: &mut ExecError);
     /// `error` as [`Guard::guard_error`] leaves it.
     fn guarded(&self, error: ExecError) -> ExecError;
@@ -141,8 +141,11 @@ impl Guard for SentCredentials {
         if self.is_empty() || error.confidential() {
             return;
         }
+        // The original frame, delivered as sent or withheld: a withheld one still feeds
+        // the client a limit event derived from `body`, which can lack the member that
+        // carries the value.
         let exposed = self.exposes(&error.body)
-            || error.delivered_event().is_some_and(|frame| self.exposes(frame))
+            || error.original_frame().is_some_and(|frame| self.exposes(frame))
             || error.addon.as_deref().is_some_and(|h| headers_expose(self, h))
             // Handshake headers can also feed a derived subscription-limit event.
             || headers_expose(self, &error.headers);

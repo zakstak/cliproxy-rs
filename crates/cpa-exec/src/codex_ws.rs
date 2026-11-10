@@ -27,6 +27,7 @@ use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{
     Delivery, ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
+    WithheldFrame,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -1738,10 +1739,13 @@ pub(super) fn account_sensitive(status: u16, frame: &str) -> bool {
 /// however the error travels on (bootstrap failover, a steering connection's records,
 /// the session's loss). The scheduler keeps the status. [`reading`] decides it for an
 /// upstream socket and a steering connection, and a turn served over HTTP for its own
-/// failures.
+/// failures. The frame travels with the error, undelivered, so the outbound credential
+/// guard of the socket or request that read it still checks its original bytes
+/// (`crate::codex_secret`): a member no reading keeps can carry the credential, and
+/// then the failure is Confidential, with no limit event either.
 pub(super) fn withhold_sensitive(error: &mut ExecError, frame: &str) {
     if account_sensitive(error.status, frame) && !error.confidential() {
-        error.delivery = Delivery::Withheld;
+        error.delivery = Delivery::Withheld(WithheldFrame::new(Bytes::copy_from_slice(frame.as_bytes())));
     }
 }
 
