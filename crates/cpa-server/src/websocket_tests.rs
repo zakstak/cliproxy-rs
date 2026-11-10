@@ -1232,13 +1232,17 @@ async fn removal_closes_only_its_sockets(section: &str) {
                         .trim_start_matches("Bearer ")
                         .to_owned();
                     dials.lock().unwrap().push(key.clone());
+                    // The response ID names the socket's key without spelling it: a
+                    // native Codex client never receives a frame that carries the
+                    // credential its socket's handshake sent (`cpa_exec::codex_secret`).
+                    let id = key.to_ascii_uppercase();
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(message)) = socket.recv().await {
                             if !matches!(message, AxMessage::Text(_)) {
                                 continue;
                             }
                             let completed = format!(
-                                r#"{{"type":"response.completed","response":{{"id":"resp-{key}","output":[],"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}}}"#
+                                r#"{{"type":"response.completed","response":{{"id":"resp-{id}","output":[],"usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}}}"#
                             );
                             if socket.send(AxMessage::Text(completed.into())).await.is_err() {
                                 break;
@@ -1322,7 +1326,7 @@ async fn removal_closes_only_its_sockets(section: &str) {
         "{section}: only the removed key's socket closed"
     );
 
-    turn(&mut kept, "keep", "resp-keep").await;
+    turn(&mut kept, "keep", "resp-KEEP").await;
     assert_eq!(
         *dials.lock().unwrap(),
         ["keep", "drop"],
@@ -2194,4 +2198,30 @@ mod committed_context_failure {
     async fn a_client_leaving_during_the_event_write_keeps_the_failure() {
         every_shape(During::Leave).await;
     }
+}
+
+/// #6: a native Codex failure withheld for account safety (`Delivery::Withheld`, set by
+/// the executor when the frame is an account failure or reads as one) is never rendered
+/// for the client: no frame as sent, no error event built from its classified body (which
+/// is the provider's error, with whatever it names), and no close reason taken from it.
+/// The same 400 classified normally is a request fault the client sees (the control).
+#[test]
+fn a_withheld_failure_is_never_rendered() {
+    use cpa_core::exec::{Delivery, ExecError, FailureScope};
+    let body = r#"{"status":400,"error":{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
+    let mut error = ExecError::local(400, FailureScope::Request, body);
+    assert!(super::exposed(&super::Failure::from_exec(&error)), "control");
+    error.delivery = Delivery::Withheld;
+    let failure = super::Failure::from_exec(&error);
+    assert!(failure.delivered.is_none());
+    assert!(!super::exposed(&failure));
+    assert!(super::close_code(&failure).is_none());
+    let mut big = ExecError::local(
+        413,
+        FailureScope::Request,
+        r#"{"error":{"code":"message_too_big","message":"at-FAKE"}}"#,
+    );
+    assert!(super::close_code(&super::Failure::from_exec(&big)).is_some(), "control");
+    big.delivery = Delivery::Withheld;
+    assert!(super::close_code(&super::Failure::from_exec(&big)).is_none());
 }

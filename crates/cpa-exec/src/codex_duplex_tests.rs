@@ -627,12 +627,17 @@ async fn automatic_successor_metadata() {
                 r#"{{"type":"response.create","model":"gpt-6-astra","prompt_cache_key":"{key}","previous_response_id":"first","input":[]}}"#
             )
         };
+        // The first create names no previous response: a continuation runs only on the
+        // socket that holds it, and this session has none yet (docs/codex/CONTRACT.md
+        // "Socket and account ownership"). Go's fixture sent one here too; the later
+        // creates continue `first` on the live socket, as before.
+        let first = |key: &str| {
+            format!(r#"{{"type":"response.create","model":"gpt-6-astra","prompt_cache_key":"{key}","input":[]}}"#)
+        };
         // Go's executor test leaves the execution session out of `req.Metadata`, so its
         // Codex-source key survives; through the conductor Go replaces it with the session
         // UUID, as this executor does. Responses clients keep their key in both.
-        let mut stream = client
-            .start(&up.url, &request("first-key"), Format::OpenAIResponse)
-            .await;
+        let mut stream = client.start(&up.url, &first("first-key"), Format::OpenAIResponse).await;
         let (mut queued_create, mut automatic, mut explicit) = (false, false, false);
         while let Some(chunk) = next(&mut stream).await {
             let chunk = chunk.unwrap_or_else(|e| panic!("{scenario}: {e}"));

@@ -1072,6 +1072,63 @@ pub struct Record {
     pub timings: Timings,
 }
 
+impl Record {
+    /// Every text the upstream's answer put in the record: what [`finish`] scrubs of the
+    /// authentication values the upstream request or socket carried (#25). The patterns
+    /// name every field, so a new field does not compile until it is placed here: with
+    /// the upstream's text, or with the local, request, credential and numeric facts,
+    /// which no upstream answer writes.
+    fn upstream_text(&mut self) -> impl Iterator<Item = &mut String> {
+        let Record {
+            fail_body,
+            response_model,
+            response_headers,
+            detail,
+            timestamp: _,
+            latency_ms: _,
+            ttft_ms: _,
+            execution_id: _,
+            provider: _,
+            executor_type: _,
+            model: _,
+            alias: _,
+            source: _,
+            auth_index: _,
+            access_token_sha256: _,
+            auth_type: _,
+            reasoning_effort: _,
+            service_tier: _,
+            generate: _,
+            stream: _,
+            failed: _,
+            fail_status: _,
+            prompt_prefix_hash: _,
+            claude_cache: _,
+            usage_observed: _,
+            timings: _,
+        } = self;
+        let Detail {
+            response_service_tier,
+            input: _,
+            output: _,
+            reasoning: _,
+            cached: _,
+            cache_read: _,
+            cache_creation: _,
+            cache_creation_5m: _,
+            cache_creation_1h: _,
+            total: _,
+            breakdown: _,
+        } = detail;
+        let headers = response_headers
+            .iter_mut()
+            .flat_map(|(name, values)| std::iter::once(name).chain(values.iter_mut()));
+        [fail_body, response_model, response_service_tier]
+            .into_iter()
+            .chain(headers)
+    }
+}
+
 /// Where an attempt's time went, in milliseconds from when the server accepted the
 /// client request, and the bytes it moved. Not in Go's record: cliproxy-rs adds these
 /// fields (docs/DIFFERENCES-FROM-GO.md), and leaves out each one it did not see. The
@@ -1687,6 +1744,13 @@ struct Origin {
     /// Go `requestedAt`.
     requested_at: chrono::DateTime<chrono::FixedOffset>,
     attempt: usize,
+    /// The authentication values the upstream request or socket serving the attempt
+    /// carried ([`cpa_core::exec::UsageObserver::sent_credentials`]). Every record of the
+    /// attempt keeps nothing of the upstream's answer that carries them ([`finish`]): its
+    /// own, a detached one and each successor on the same connection, published before or
+    /// after the others. The binding belongs to the connection, not to a report, so taking
+    /// a report for its record never takes it.
+    sent: cpa_core::exec::SentCredentials,
 }
 
 /// A record that publishes itself, for one upstream response on a connection that
@@ -1721,6 +1785,8 @@ struct Stamp<'a> {
     attempt: usize,
     client: &'a Client,
     auth_id: &'a str,
+    /// [`Origin::sent`].
+    sent: &'a cpa_core::exec::SentCredentials,
 }
 
 impl Observer {
@@ -1843,6 +1909,7 @@ impl Observer {
             attempt: origin.attempt,
             client: origin.client.as_ref().unwrap_or(&facts.client),
             auth_id: &origin.auth_id,
+            sent: &origin.sent,
         };
         finish(queue, record, reported, latency, ttft, &stamp);
     }
@@ -1997,6 +2064,10 @@ impl cpa_core::exec::UsageObserver for Observer {
         };
         Some(std::sync::Arc::new(self.record(facts, Reported::default(), false)))
     }
+
+    fn sent_credentials(&self, sent: &cpa_core::exec::SentCredentials) {
+        self.origin().sent = sent.clone();
+    }
 }
 
 /// The record's [`Timings`]: each mark as an offset from the request's arrival.
@@ -2034,6 +2105,13 @@ fn finish(
     ttft: std::time::Duration,
     stamp: &Stamp<'_>,
 ) {
+    // #25: nothing of the upstream's answer keeps a value its request or socket carried.
+    // Status, scope and every other field stay as classified.
+    for text in record.upstream_text() {
+        if let std::borrow::Cow::Owned(scrubbed) = stamp.sent.scrub_str(text) {
+            *text = scrubbed;
+        }
+    }
     // Go can publish a tokenless failure after observing a Claude response.
     // Keep the returned TTL buckets as observations, not inferred accounting.
     let returned_cache = reported.usage().map(|d| (d.cache_creation_5m, d.cache_creation_1h));
@@ -2156,6 +2234,7 @@ impl Tracker {
             client: home_client,
             requested_at: now.fixed_offset(),
             attempt: facts.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sent: cpa_core::exec::SentCredentials::default(),
         };
         Self {
             facts: facts.clone(),
@@ -2310,16 +2389,33 @@ impl Tracker {
             attempt: origin.attempt,
             client: origin.client.as_ref().unwrap_or(&self.facts.client),
             auth_id: &origin.auth_id,
+            sent: &origin.sent,
         };
         finish(queue, record, reported, latency, ttft, &stamp);
     }
 }
 
 impl Drop for Tracker {
+    /// Go's deferred publish: a stream the client dropped keeps what was observed. An
+    /// attempt dropped before the upstream answered it ([`Tracker::arrived`]) served
+    /// nothing, so it is never a success: it records the canceled failure an executor
+    /// records for a request the client abandons (`cpa_exec::cancel`: 499, `context
+    /// canceled`), unless the executor settled its outcome first.
     fn drop(&mut self) {
-        self.publish(Ending::Done);
+        if self.first.is_some() {
+            self.publish(Ending::Done);
+        } else {
+            let canceled =
+                cpa_core::exec::ExecError::local(CANCELED_STATUS, cpa_core::exec::FailureScope::Request, CANCELED_BODY);
+            self.publish(Ending::Failed(&canceled));
+        }
     }
 }
+
+/// The record of an attempt abandoned before the upstream answered it, as
+/// `cpa_exec::cancel` records one: internal accounting only.
+const CANCELED_STATUS: u16 = 499;
+const CANCELED_BODY: &str = "context canceled";
 
 /// Go's `http.Header` view of upstream headers: canonical names, values in order.
 fn go_headers(headers: &axum::http::HeaderMap) -> Vec<(String, Vec<String>)> {
@@ -2621,6 +2717,98 @@ mod tests {
         assert!(sink.detach().is_none());
     }
 
+    /// #25: the values an attempt's socket carried bind every record of its connection,
+    /// whichever publishes first. Publishing a record takes its report, never the
+    /// binding: a detached record, an explicit successor made after it published and an
+    /// automatic successor of that one each keep the model, the service tier and the
+    /// failure text the upstream reported scrubbed of the values, and every other byte.
+    #[test]
+    fn every_record_of_a_connection_keeps_its_binding() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAIResponse,
+            Format::OpenAIResponse,
+            "gpt-fixture",
+            br#"{"model":"gpt-fixture","input":[]}"#,
+            true,
+            &crate::dispatch::Trace::default(),
+        ));
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"response.completed","response":{{"id":"{id}","model":"m at-FAKE","service_tier":"echo at-FAKE","usage":{{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}}}}"#
+            )
+        };
+        let tracker = Tracker::start(&rt, &facts, &credential_for("codex"), "gpt-fixture");
+        tracker
+            .sink()
+            .sent_credentials(&cpa_core::exec::SentCredentials::new(["at-FAKE"]));
+        let first = tracker.sink().detach().expect("an attempt detaches once");
+        first.response_line(Format::Codex, line("r1").as_bytes());
+        first.publish();
+        let explicit = first.successor(Some(br#"{"type":"response.create","input":[]}"#));
+        explicit.response_line(Format::Codex, line("r2").as_bytes());
+        explicit.publish();
+        let automatic = explicit.successor(None);
+        automatic.publish_failure(400, "bad at-FAKE, kept at-OTHER");
+        drop((first, explicit, automatic));
+        let records: Vec<Value> = rt
+            .usage_queue()
+            .pop_oldest(10)
+            .iter()
+            .map(|q| serde_json::from_slice(q).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3, "{records:?}");
+        for record in &records {
+            assert!(!record.to_string().contains("at-FAKE"), "{record}");
+        }
+        for record in &records[..2] {
+            assert_eq!(record["response_model"], "m [REDACTED]", "{record}");
+            assert_eq!(record["response_service_tier"], "echo [REDACTED]", "{record}");
+            assert_eq!(record["tokens"]["total_tokens"], 5, "{record}");
+        }
+        assert_eq!(records[2]["fail"]["status_code"], 400);
+        assert_eq!(records[2]["fail"]["body"], "bad [REDACTED], kept at-OTHER");
+    }
+
+    /// An attempt dropped before the upstream answered it ([`Tracker::arrived`]) served
+    /// nothing: its record is the canceled failure (499, no tokens), never a success. One
+    /// dropped after the upstream answered keeps Go's deferred publish, a success with
+    /// what was observed, and an outcome the executor settled first stays.
+    #[test]
+    fn an_attempt_dropped_before_the_upstream_answered_is_canceled() {
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::OpenAIResponse,
+            Format::OpenAIResponse,
+            "gpt-fixture",
+            br#"{"model":"gpt-fixture","input":[]}"#,
+            true,
+            &crate::dispatch::Trace::default(),
+        ));
+        let start = || Tracker::start(&rt, &facts, &credential_for("codex"), "gpt-fixture");
+        let published = || -> Value {
+            let records = rt.usage_queue().pop_oldest(10);
+            assert_eq!(records.len(), 1);
+            serde_json::from_slice(&records[0]).unwrap()
+        };
+        drop(start());
+        let abandoned = published();
+        assert_eq!(abandoned["failed"], true, "{abandoned}");
+        assert_eq!(abandoned["fail"]["status_code"], 499);
+        assert_eq!(abandoned["fail"]["body"], "context canceled");
+        assert_eq!(abandoned["tokens"]["total_tokens"], 0);
+        let mut answered = start();
+        answered.arrived(&axum::http::HeaderMap::new());
+        drop(answered);
+        assert_eq!(published()["failed"], false);
+        let settled = start();
+        settled.sink().publish_failure(502, "upstream failed");
+        drop(settled);
+        assert_eq!(published()["fail"]["status_code"], 502);
+    }
+
     #[test]
     fn owned_outcomes_preserve_payload_ttft_and_explicit_marks() {
         use cpa_core::exec::UsageObserver;
@@ -2764,12 +2952,14 @@ mod tests {
             observation["failed"], false,
             "absence of usage is not a successful completion signal"
         );
-        let tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "claude-sonnet-4-6");
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "claude-sonnet-4-6");
         tracker.sink().usage_required();
         tracker
             .sink()
             .claude_cache(cpa_core::exec::ClaudeCacheTelemetry::default());
-        drop(tracker); // Same path as a client dropping its stream before usage.
+        // Same path as a client dropping its stream before usage: the upstream answered.
+        tracker.arrived(&axum::http::HeaderMap::new());
+        drop(tracker);
         let got = rt.usage_queue().pop_oldest(10);
         let observation: Value = serde_json::from_slice(&got[0]).unwrap();
         assert_eq!(observation["usage_observed"], false);

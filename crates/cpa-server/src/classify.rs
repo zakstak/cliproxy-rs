@@ -18,6 +18,18 @@ pub fn error_text(e: &ExecError) -> String {
     }
 }
 
+/// The text a cooldown keeps for `e`, whose classification text is `text`: `text`,
+/// unless the failure carries an upstream authentication value
+/// ([`cpa_core::exec::Delivery::Confidential`]); then only its status, since that text
+/// is shown later, to other clients too ("last error").
+pub fn stored_error_text(e: &ExecError, text: &str) -> String {
+    if e.confidential() {
+        format!("status {}", e.status)
+    } else {
+        text.to_owned()
+    }
+}
+
 /// Go `extractErrorBody`, what request-scoped error rules match: the error's text,
 /// except for the Claude executor's own missing-thread error, whose structured body
 /// (`claudeThreadNotFoundError.ResponseBody`, v8.0.27 e7b2226) is Anthropic's JSON

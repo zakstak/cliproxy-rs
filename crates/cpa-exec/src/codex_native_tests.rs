@@ -523,25 +523,38 @@ fn observer() -> Observer {
         capture_lines: true,
         model_level_cooling: false,
         codex_client: false,
-        items: 0,
-        saw_delta: false,
     }
 }
 
 /// `chunks` through the shared framer and the native stream: what the client receives
 /// and the error that ended it.
 async fn through(chunks: &[&[u8]], hold: Option<Option<Duration>>) -> (Vec<u8>, Option<ExecError>) {
+    let (items, error) = through_with(observer(), chunks, hold, false).await;
+    (items.concat(), error)
+}
+
+/// `chunks` through the native stream with `observer`; with `websocket`, as a turn
+/// served over HTTP delivers it (one payload per item).
+async fn through_with(
+    observer: Observer,
+    chunks: &[&[u8]],
+    hold: Option<Option<Duration>>,
+    websocket: bool,
+) -> (Vec<Vec<u8>>, Option<ExecError>) {
     let upstream = futures_util::stream::iter(
         chunks
             .iter()
             .map(|c| Ok::<_, ExecError>(Bytes::copy_from_slice(c)))
             .collect::<Vec<_>>(),
     );
-    let mut stream = passthrough(crate::upstream::framed(upstream), observer(), hold, false);
+    let mut stream = passthrough(crate::upstream::framed(upstream), observer, hold, websocket);
+    if websocket {
+        stream = stream.filter_map(|item| async move { unframed(item) }).boxed();
+    }
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
-            Ok(bytes) => out.extend_from_slice(&bytes),
+            Ok(bytes) => out.push(bytes.to_vec()),
             Err(error) => return (out, Some(error)),
         }
     }
@@ -575,7 +588,7 @@ async fn every_sse_line_ending_and_split_passes_unchanged() {
             }
         }
         // A buffered answer reads the same terminal event.
-        let object = observer().aggregate(bytes).unwrap();
+        let object = observer().aggregate(bytes, true).unwrap();
         assert_eq!(
             text(&object),
             r#"{"id":"r","output":[],"n":12345678901234567890}"#,
@@ -619,13 +632,13 @@ async fn failures_deliver_the_raw_error_object() {
         assert!(error.direct);
         assert_eq!(text(&error.body), expected);
         // A buffered answer: the same.
-        let error = observer().aggregate(sse.as_bytes()).unwrap_err();
+        let error = observer().aggregate(sse.as_bytes(), true).unwrap_err();
         assert_eq!(text(&error.body), expected);
     }
     // An `error` event's own object, and an event without any: the whole event.
     let event = r#"{"type":"error","error":{"code":"server_is_overloaded","message":""}}"#;
     let error = observer()
-        .aggregate(format!("data: {event}\n\n").as_bytes())
+        .aggregate(format!("data: {event}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(
         text(&error.body),
@@ -633,7 +646,7 @@ async fn failures_deliver_the_raw_error_object() {
     );
     let bare = r#"{"type":"response.failed","response":{"id":"r","status":"failed"}}"#;
     let error = observer()
-        .aggregate(format!("data: {bare}\n\n").as_bytes())
+        .aggregate(format!("data: {bare}\n\n").as_bytes(), true)
         .unwrap_err();
     assert_eq!(text(&error.body), bare);
 }
@@ -669,19 +682,102 @@ async fn upstream_http_status_is_delivered_apart_from_classification() {
     }
 }
 
-/// The two narrow exceptions stay: an empty `response.incomplete` without a client-side
-/// reason before any delivery is a 502; with `interrupted` it passes unchanged.
+/// The buffered answer for an event whose `response` is its last member: that object,
+/// sliced from the event's own bytes.
+fn last_response_object(event: &str) -> &str {
+    &event[event.find(r#""response":"#).unwrap() + 11..event.len() - 1]
+}
+
+/// #25 and #7: every `response.incomplete` is the provider's terminal event, whatever its
+/// reason (absent, null, empty, unknown or named), output or usage, and however much of
+/// the response was delivered before it. The pinned client reads it as a terminal,
+/// non-retryable `ResponseIncomplete`, or `interrupted` as the end of the turn
+/// (`codex-api/src/sse/responses.rs:451-506` at 44ccf394573c). It reaches a streaming
+/// client byte for byte, with no error after it, whether bootstrap buffering holds the
+/// leading events or not; a buffered client gets its `response` object byte for byte.
 #[tokio::test]
-async fn empty_incomplete_keeps_its_narrow_exception() {
-    let empty = r#"{"type":"response.incomplete","response":{"id":"r","output":[],"usage":{"output_tokens":0}}}"#;
-    let (out, error) = through(&[format!("data: {empty}\n\n").as_bytes()], None).await;
-    assert!(out.is_empty());
-    assert_eq!(error.unwrap().status, 502);
-    let interrupted = r#"{"type":"response.incomplete","response":{"id":"r","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"output_tokens":0}}}"#;
-    let sse = format!("data: {interrupted}\n\n");
-    let (out, error) = through(&[sse.as_bytes()], None).await;
-    assert!(error.is_none(), "{error:?}");
-    assert_eq!(text(&out), sse);
+async fn every_incomplete_passes_unchanged_at_every_stage() {
+    let created = format!("event: response.created\ndata: {CREATED}\n\n");
+    let output = concat!(
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_inc_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+        "\n\n",
+    );
+    let ends = fixture("probe-sse-incomplete-ends").frames();
+    assert_eq!(ends.len(), 11);
+    for end in ends {
+        let end = text(&end);
+        let terminal = format!("event: response.incomplete\ndata: {end}\n\n");
+        for (stage, sse) in [
+            ("first event", terminal.clone()),
+            ("after response.created", format!("{created}{terminal}")),
+            ("after output", format!("{created}{output}{terminal}")),
+        ] {
+            for hold in [None, Some(None), Some(Some(Duration::from_secs(30)))] {
+                let (out, error) = through(&[sse.as_bytes()], hold).await;
+                assert!(error.is_none(), "{stage} hold={hold:?} {end}: {error:?}");
+                assert_eq!(text(&out), sse, "{stage} hold={hold:?}");
+            }
+            let object = observer().aggregate(sse.as_bytes(), true).unwrap();
+            assert_eq!(text(&object), last_response_object(&end), "{stage}: buffered");
+        }
+    }
+}
+
+/// Upstream events are read as the provider sent them, not through the client request
+/// boundary: a terminal event with a duplicate key or a top-level member whose type a
+/// request could not have still ends the response, and a failure event with a duplicate
+/// key still delivers its error object. An event that is not valid JSON has no type (the
+/// pinned client skips it, `sse/responses.rs:633-643`), so it never ends the response;
+/// it passes as sent like any other event.
+#[tokio::test]
+async fn upstream_events_skip_the_request_boundary() {
+    let completed =
+        r#"{"type":"response.completed","model":1,"stream":"x","response":{"id":"r","output":[],"dup":1,"dup":2}}"#;
+    let broken = r#"{"type":"response.completed","response":{"id":"r""#;
+    for sse in [
+        format!("data: {completed}\n\n"),
+        format!("data: {CREATED}\n\ndata: {broken}\n\ndata: {completed}\n\n"),
+    ] {
+        for hold in [None, Some(None)] {
+            let (out, error) = through(&[sse.as_bytes()], hold).await;
+            assert!(error.is_none(), "hold={hold:?}: {error:?}");
+            assert_eq!(text(&out), sse);
+        }
+        let object = observer().aggregate(sse.as_bytes(), true).unwrap();
+        assert_eq!(text(&object), last_response_object(completed));
+    }
+    let failed = r#"{"type":"response.failed","sequence_number":7,"response":{"id":"r","dup":1,"dup":2,"error":{"code":"server_error","message":"m","x":1.50}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {failed}\n\n").as_bytes(), true)
+        .unwrap_err();
+    assert_eq!(
+        text(&error.body),
+        r#"{"error":{"code":"server_error","message":"m","x":1.50},"sequence_number":7}"#
+    );
+}
+
+/// A stream that ends without a terminal event is still a truncation: an
+/// `incomplete` event is never invented for it, and the attempt ends with the
+/// request-scoped 408 after the events that arrived (`docs/codex/CONTRACT.md` "Native
+/// HTTP route").
+#[tokio::test]
+async fn a_stream_without_its_terminal_event_stays_truncated() {
+    let sse = format!("data: {CREATED}\n\n");
+    for hold in [None, Some(None)] {
+        let (out, error) = through(&[sse.as_bytes()], hold).await;
+        let error = error.expect("a truncated stream fails");
+        assert_eq!(
+            (error.status, error.scope),
+            (408, FailureScope::Request),
+            "hold={hold:?}"
+        );
+        if hold.is_none() {
+            assert_eq!(text(&out), sse, "what arrived, unchanged");
+        }
+    }
+    let error = observer().aggregate(sse.as_bytes(), true).unwrap_err();
+    assert_eq!((error.status, error.scope), (408, FailureScope::Request));
 }
 
 /// An API key on api.openai.com is the `api-key` profile. The request is captured as it
@@ -1153,4 +1249,125 @@ async fn an_upstream_failure_is_never_recorded_as_a_cancellation() {
     let expected = (error.status, String::from_utf8_lossy(&error.body).into_owned());
     assert_ne!(expected.0, 499);
     assert_eq!(settled(&record), [expected]);
+}
+
+/// Upstream events the pinned client does not decode (`codex_event::decode`): repeated
+/// known members in either order, a known member of the wrong type, and invalid JSON
+/// that reads as a failure, a context-window `error`, an account failure or a
+/// completion carrying usage.
+const UNDECODABLE: [&str; 10] = [
+    r#"{"type":"response.completed","type":"response.future","response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.future","type":"response.completed","response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.completed","response":{"id":"old","output":[]},"response":{"id":"new","output":[]}}"#,
+    r#"{"type":"response.failed","type":"x","response":{"error":{"code":"server_error","message":"m"}}}"#,
+    r#"{"type":"error","error":{"code":"context_length_exceeded"},"error":{"code":"context_length_exceeded"}}"#,
+    r#"{"type":"response.completed","item_id":7,"response":{"id":"r1","output":[]}}"#,
+    r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"broken"}}"#,
+    r#"{"type":"error","error":{"code":"context_length_exceeded","message":"broken"}"#,
+    r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"acct"}}"#,
+    r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":90,"output_tokens":9,"total_tokens":99}}"#,
+];
+
+/// #25 (F1, F3): an undecodable event passes as sent and the stream goes on to the real
+/// terminal event, on a held and an unheld stream, for a Codex client (which would get
+/// #5's conversion) and any other. A buffered answer is the real terminal's `response`.
+/// Usage reads only the decoded events. On a turn served over HTTP, each reaches the
+/// client as a frame, except invalid JSON that reads as an account failure, which is
+/// withheld and still not classified.
+#[tokio::test]
+async fn undecodable_events_never_end_fail_or_convert_the_response() {
+    let end = r#"{"type":"response.completed","response":{"id":"r2","output":[]}}"#;
+    let account = UNDECODABLE[8];
+    for event in UNDECODABLE {
+        let sse = format!("data: {event}\n\nevent: response.completed\ndata: {end}\n\n");
+        for codex_client in [false, true] {
+            for hold in [None, Some(None)] {
+                let recorder = std::sync::Arc::new(crate::usage_testkit::Recorder::default());
+                let recorded = Observer {
+                    codex_client,
+                    usage: cpa_core::exec::UsageSink::new(recorder.clone()),
+                    ..observer()
+                };
+                let (out, error) = through_with(recorded, &[sse.as_bytes()], hold, false).await;
+                assert!(error.is_none(), "{event}: {error:?}");
+                assert_eq!(text(&out.concat()), sse, "{event}");
+                let lines: Vec<String> = recorder
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|r| match r {
+                        crate::usage_testkit::Report::Line(_, line) => Some(String::from_utf8_lossy(line).into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(lines, [end], "{event}: usage reads only the decoded event");
+                let client = Observer {
+                    codex_client,
+                    ..observer()
+                };
+                let (frames, error) = through_with(client, &[sse.as_bytes()], hold, true).await;
+                assert!(error.is_none(), "{event}: {error:?}");
+                let frames: Vec<String> = frames.iter().map(|f| text(f)).collect();
+                let want: &[&str] = if event == account { &[end] } else { &[event, end] };
+                assert_eq!(frames, want, "{event}: served over HTTP");
+            }
+        }
+        let answer = observer().aggregate(sse.as_bytes(), true).unwrap();
+        assert_eq!(text(&answer), r#"{"id":"r2","output":[]}"#, "{event}");
+    }
+}
+
+/// Decodable events with repeats the pinned client ignores still end the response:
+/// unknown members, and keys repeated inside `response`, whose object a buffered client
+/// gets as sent. A failure whose `response` repeats `error` is delivered whole rather
+/// than one of them picked.
+#[tokio::test]
+async fn harmless_repeats_keep_the_decoded_outcome() {
+    let end = r#"{"type":"response.completed","x":1,"x":[2],"response":{"id":"a","id":"b","output":[],"output":null}}"#;
+    let sse = format!("data: {end}\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"late\"}}\n\n");
+    let (out, error) = through(&[sse.as_bytes()], None).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&out), format!("data: {end}\n\n"));
+    let answer = observer().aggregate(sse.as_bytes(), true).unwrap();
+    assert_eq!(text(&answer), r#"{"id":"a","id":"b","output":[],"output":null}"#);
+    let failed = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"r","error":{"code":"a"},"error":{"code":"b"}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {failed}\n\n").as_bytes(), true)
+        .unwrap_err();
+    assert_eq!(text(&error.body), failed);
+    let single =
+        r#"{"type":"response.failed","x":1,"x":2,"response":{"id":"r","id":"s","error":{"code":"a","code":"b"}}}"#;
+    let error = observer()
+        .aggregate(format!("data: {single}\n\n").as_bytes(), true)
+        .unwrap_err();
+    assert_eq!(text(&error.body), r#"{"error":{"code":"a","code":"b"}}"#);
+}
+
+/// #25 (read-on), how the body ended: a buffered answer ends on a processing error only
+/// at a `clean` end (`sse/responses.rs:616-621`). After a read failure the same events
+/// are a stream without a terminal event, which the pinned reader returns as the read
+/// error at once (lines 602-614): the request-scoped 408. A terminal event or a failure
+/// before the read failure still decides.
+#[test]
+fn a_processing_error_ends_a_buffered_answer_only_at_a_clean_end() {
+    let recorded = r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    let completed = r#"{"type":"response.completed","response":{"id":"r2","output":[]}}"#;
+    let failed = r#"{"type":"response.failed","response":{"id":"r","error":{"code":"server_error","message":"m"}}}"#;
+    let one = format!("data: {recorded}\n\n");
+    let object = observer().aggregate(one.as_bytes(), true).unwrap();
+    assert_eq!(text(&object), last_response_object(recorded));
+    for sse in [one.clone(), format!("data: {CREATED}\n\n{one}"), format!("{one}{one}")] {
+        let error = observer().aggregate(sse.as_bytes(), false).unwrap_err();
+        assert_eq!((error.status, error.scope), (408, FailureScope::Request), "{sse}");
+    }
+    for clean in [true, false] {
+        let later = format!("{one}data: {completed}\n\n");
+        let object = observer().aggregate(later.as_bytes(), clean).unwrap();
+        assert_eq!(text(&object), last_response_object(completed), "clean={clean}");
+        let error = observer()
+            .aggregate(format!("{one}data: {failed}\n\n").as_bytes(), clean)
+            .unwrap_err();
+        assert!(error.direct, "clean={clean}: {error:?}");
+    }
 }

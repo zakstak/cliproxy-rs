@@ -187,7 +187,7 @@ fn context_window_error_becomes_the_failure_codex_compacts_on() {
     let event = LIVE_CONTEXT_ERROR.trim();
     assert!(is_context_window_rejection(event.as_bytes()));
     assert!(!is_context_window_failure(event.as_bytes()));
-    let out = context_window_failure_event(event).expect("normalized");
+    let out = context_window_failure_event(event, event).expect("normalized");
     assert_eq!(
         out,
         concat!(
@@ -201,9 +201,10 @@ fn context_window_error_becomes_the_failure_codex_compacts_on() {
 #[test]
 fn context_window_failure_event_keeps_failures_and_ignores_others() {
     let failed = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"context_length_exceeded"}}}"#;
-    assert!(matches!(context_window_failure_event(failed), Some(std::borrow::Cow::Borrowed(f)) if f == failed));
+    assert!(matches!(context_window_failure_event(failed, failed), Some(std::borrow::Cow::Borrowed(f)) if f == failed));
+    let error = r#"{"type":"error","error":{"code":"context_length_exceeded"}}"#;
     assert_eq!(
-        context_window_failure_event(r#"{"type":"error","error":{"code":"context_length_exceeded"}}"#).as_deref(),
+        context_window_failure_event(error, error).as_deref(),
         Some(
             r#"{"type":"response.failed","response":{"object":"response","status":"failed","error":{"code":"context_length_exceeded"}}}"#
         )
@@ -217,7 +218,7 @@ fn context_window_failure_event_keeps_failures_and_ignores_others() {
         r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#,
         r#"{"type":"response.completed","response":{"error":{"code":"context_length_exceeded"}}}"#,
     ] {
-        assert!(context_window_failure_event(other).is_none(), "{other}");
+        assert!(context_window_failure_event(other, other).is_none(), "{other}");
         assert!(!is_context_window_rejection(other.as_bytes()), "{other}");
     }
 }

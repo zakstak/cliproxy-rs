@@ -1628,7 +1628,7 @@ async fn usage_reports_follow_go_reporter_calls() {
 pub(super) struct Captured(pub std::sync::Mutex<Vec<String>>);
 
 impl cpa_core::exec::CaptureObserver for Captured {
-    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>) {
+    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>, _: &cpa_core::exec::SentCredentials) {
         use cpa_core::exec::CaptureEvent::*;
         let line = match event {
             Request(r) => {

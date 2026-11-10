@@ -151,6 +151,7 @@ impl CodexExecutor {
                 status,
                 headers,
                 body: ResponseBody::Stream(client_stream(&req, body, held, rest)),
+                omitted: Default::default(),
             });
         }
         let completed = aggregate(events, processor, &wire).await?;
@@ -158,6 +159,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Buffered(client_body(&req, body, &completed)?),
+            omitted: Default::default(),
         })
     }
 }

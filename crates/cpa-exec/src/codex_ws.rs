@@ -26,7 +26,7 @@ use bytes::Bytes;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{
-    ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
+    Delivery, ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, ResponseBody, SessionLease,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -46,7 +46,8 @@ use crate::codex::CodexExecutor;
 use crate::codex_json::{set_raw, set_str};
 use crate::codex_quota::{self, QuotaSignals};
 use crate::codex_request::{self as request, Settings, View};
-use crate::codex_response::{self as response, OutputItems};
+use crate::codex_response as response;
+use crate::codex_secret::Guard;
 use crate::proxy::Proxy;
 use crate::ws_cause;
 
@@ -195,13 +196,24 @@ fn acknowledged_id(payload: &str) -> Option<String> {
 }
 
 /// `response.completed`, `.done`, `.incomplete` and `.failed` (Go `isTerminalEvent`
-/// without `error`) with a non-empty string `response.id`.
+/// without `error`) with a non-empty string response ID: for an event the pinned client
+/// decodes, its decoded kind and the ID the turn settles
+/// ([`crate::codex_event::Event::response_id`], so also a positional event or
+/// completion); for any other frame, the first `type` and `response.id` as sent.
 fn terminal_response_id(payload: &str) -> Option<String> {
-    let kind = rawjson::get(payload, "type");
-    if !matches!(
-        kind.str(),
-        "response.completed" | "response.done" | "response.incomplete" | "response.failed"
-    ) {
+    let terminal = |kind: &str| {
+        matches!(
+            kind,
+            "response.completed" | "response.done" | "response.incomplete" | "response.failed"
+        )
+    };
+    if let Some(event) = crate::codex_event::decode(payload) {
+        return terminal(&event.kind)
+            .then(|| event.response_id())
+            .flatten()
+            .filter(|id| !id.is_empty());
+    }
+    if !terminal(rawjson::get(payload, "type").str()) {
         return None;
     }
     let id = rawjson::get(payload, "response.id");
@@ -231,6 +243,9 @@ impl std::fmt::Display for InterruptError {
 }
 
 pub(crate) struct Upstream {
+    /// This socket among the session's sockets ([`Session::begin_socket`]): its loss is
+    /// its own, never a later socket's.
+    pub(crate) id: u64,
     pub(crate) target: Target,
     pub(crate) sink: tokio::sync::Mutex<SplitSink<WebSocket, Message>>,
     pub(crate) link: Mutex<Link>,
@@ -243,6 +258,10 @@ pub(crate) struct Upstream {
     /// executor before the socket is published. Later requests on this socket repeat
     /// it ([`Upstream::later_metadata`]); no other socket's value can reach them.
     upgrade_model: std::sync::OnceLock<UpgradeModel>,
+    /// The authentication values this socket's handshake carried: the outbound
+    /// credential guard of everything read from it ([`crate::codex_secret`]). A reused
+    /// socket keeps its own handshake's values; a fresh dial gets the request's.
+    pub(crate) secrets: cpa_core::exec::SentCredentials,
 }
 
 /// A socket's upgrade `openai-model` and the upstream model the upgrade was sent for.
@@ -265,9 +284,18 @@ impl UpgradeModel {
 }
 
 impl Upstream {
-    /// A socket for `target`, not yet published to a session and without a reader.
-    pub(crate) fn new(target: Target, sink: SplitSink<WebSocket, Message>, write: WriteLimit) -> Arc<Self> {
+    /// A socket for `target`, not yet published to a session and without a reader. `id`
+    /// comes from [`Session::begin_socket`].
+    pub(crate) fn new(
+        target: Target,
+        sink: SplitSink<WebSocket, Message>,
+        write: WriteLimit,
+        secrets: cpa_core::exec::SentCredentials,
+        id: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            id,
+            secrets,
             target,
             write,
             sink: tokio::sync::Mutex::new(sink),
@@ -401,6 +429,8 @@ impl Upstream {
         session: &Arc<Session>,
         lease: Option<&SessionLease>,
     ) -> Result<(), ExecError> {
+        // The attempt serves on this socket: its loss is now the attempt's own.
+        session.acquired.store(self.id, std::sync::atomic::Ordering::Release);
         let Some(lease) = lease else { return Ok(()) };
         if self
             .lease
@@ -473,8 +503,15 @@ pub(crate) struct Session {
     /// Serialises turns (`reqMu`).
     pub(crate) turn: Arc<tokio::sync::Mutex<()>>,
     pub(crate) conn: Mutex<Option<Arc<Upstream>>>,
-    /// Set once when the session's socket is lost (`notifyUpstreamDisconnect`).
-    closed: watch::Sender<Option<ExecError>>,
+    /// The session's latest socket and why it was lost, if it was
+    /// (`notifyUpstreamDisconnect`, with Go's per-connection `upstreamDisconnectErr`).
+    closed: watch::Sender<SocketLoss>,
+    /// Counts the sockets dialed for the session ([`Session::begin_socket`]).
+    sockets: std::sync::atomic::AtomicU64,
+    /// The socket the session's current attempt acquired ([`Upstream::bind`]), 0 when it
+    /// acquired none yet ([`Session::begin_attempt`]). Only that socket's loss is the
+    /// attempt's own ([`SessionLosses::pending`]).
+    acquired: std::sync::atomic::AtomicU64,
     /// The downstream connection's client frames when response steering is configured.
     steering: Mutex<Option<Arc<SteeringInput>>>,
     /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
@@ -482,7 +519,40 @@ pub(crate) struct Session {
     credential: Mutex<String>,
 }
 
+/// The session's latest socket ([`Upstream::id`]) and its loss. A loss belongs to one
+/// socket: a new dial supersedes the previous socket's loss, and a socket that is no
+/// longer the latest cannot report one. So a replacement starts without a loss, and a
+/// late notice from a replaced socket's reader cannot become the replacement's.
+#[derive(Clone, Default)]
+pub(crate) struct SocketLoss {
+    socket: u64,
+    lost: Option<ExecError>,
+}
+
 impl Session {
+    /// A socket is about to be dialed for the session: its id, now the latest. The loss
+    /// of the socket it replaces is superseded (Go `resetUpstreamDisconnectError`).
+    pub(crate) fn begin_socket(&self) -> u64 {
+        let id = self.sockets.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.closed.send_replace(SocketLoss { socket: id, lost: None });
+        id
+    }
+
+    /// A new attempt of the session starts: it owns no socket until it acquires one
+    /// ([`Upstream::bind`]). When the session holds no live socket (the last one was lost
+    /// and detached by an earlier attempt, which dealt with that failure), the lost
+    /// socket's loss is superseded as by a new dial, so a late notice from its reader
+    /// reports nothing. A live socket keeps its loss: it may still serve this attempt or
+    /// a later turn.
+    fn begin_attempt(&self) {
+        // Held across the check, so a dial's publication cannot come in between.
+        let conn = self.conn.lock().expect("session conn");
+        self.acquired.store(0, std::sync::atomic::Ordering::Release);
+        if conn.is_none() {
+            self.begin_socket();
+        }
+    }
+
     /// Makes `conn` the session's socket.
     pub(crate) fn publish(&self, conn: Arc<Upstream>) {
         let mut slot = self.conn.lock().expect("session conn");
@@ -511,19 +581,21 @@ impl Session {
             *current = None;
         }
         if notify {
-            self.notify(error);
+            // The loss reaches the downstream handler, which can render it.
+            self.notify(conn.id, &conn.secrets.guarded(error.clone()));
         }
         conn.shutdown();
     }
 
-    /// `notifyUpstreamDisconnect`: the first loss is the one reported.
-    fn notify(&self, error: &ExecError) {
-        self.closed.send_if_modified(|slot| {
-            let first = slot.is_none();
-            if first {
-                *slot = Some(error.clone());
+    /// `notifyUpstreamDisconnect`: socket `socket` was lost. Only the latest socket's first
+    /// loss is reported (Go `setUpstreamDisconnectError`); a replaced socket's is not.
+    fn notify(&self, socket: u64, error: &ExecError) {
+        self.closed.send_if_modified(|state| {
+            let report = state.socket == socket && state.lost.is_none();
+            if report {
+                state.lost = Some(error.clone());
             }
-            first
+            report
         });
     }
 }
@@ -583,7 +655,9 @@ impl Pool {
                 Arc::new(Session {
                     turn: Arc::default(),
                     conn: Mutex::default(),
-                    closed: watch::channel(None).0,
+                    closed: watch::channel(SocketLoss::default()).0,
+                    sockets: Default::default(),
+                    acquired: Default::default(),
                     steering: Mutex::default(),
                     credential: Mutex::default(),
                 })
@@ -649,12 +723,6 @@ impl Pool {
         }
     }
 
-    /// The error that lost the session's upstream socket, if it was lost.
-    pub fn loss(&self, id: &str) -> Option<ExecError> {
-        let session = self.get(id)?;
-        session.closed.borrow().clone()
-    }
-
     /// `InterruptExecutionSession`: writes the client's `response.interrupt` unchanged
     /// to the session's socket. It never dials, replays or selects another credential.
     /// `enabled(credential_id)` is the live account check, called without holding a
@@ -691,9 +759,7 @@ impl Pool {
             }
             let mut link = conn.link.lock().expect("link");
             if let Some(lost) = &link.lost {
-                return Err(InterruptError::Rejected(
-                    String::from_utf8_lossy(&lost.body).into_owned(),
-                ));
+                return Err(InterruptError::Rejected(rejected_text(lost)));
             }
             let finished_by = response_id.as_ref().and_then(|id| link.terminal.get(id)).copied();
             let reading = link.active.is_some();
@@ -741,30 +807,32 @@ impl Pool {
             link.late = None;
         }
         match acknowledged {
-            Ok(Ok(ack)) => Ok(Some(Bytes::from(ack))),
+            // An acknowledgement that carries the socket's credential is not delivered
+            // (`crate::codex_secret`).
+            Ok(Ok(ack)) => Ok(conn.secrets.deliverable(Bytes::from(ack))),
             // The reader stopped: the socket is gone.
             Ok(Err(_)) => match &link.lost {
-                Some(lost) => Err(InterruptError::Rejected(
-                    String::from_utf8_lossy(&lost.body).into_owned(),
-                )),
+                Some(lost) => Err(InterruptError::Rejected(rejected_text(lost))),
                 None => Ok(None),
             },
             Err(_) => Ok(None),
         }
     }
 
-    /// Resolves with the error that lost the session's upstream socket.
-    pub fn closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let mut rx = self.session(id).closed.subscribe();
-        async move {
-            loop {
-                if let Some(error) = rx.borrow_and_update().clone() {
-                    return error;
-                }
-                if rx.changed().await.is_err() {
-                    return std::future::pending().await;
-                }
-            }
+    /// [`Session::begin_attempt`] for session `id`, when it exists.
+    pub fn begin_attempt(&self, id: &str) {
+        if let Some(session) = self.get(id) {
+            session.begin_attempt();
+        }
+    }
+
+    /// The losses of the session's sockets, for its downstream handler.
+    pub fn losses(&self, id: &str) -> SessionLosses {
+        let session = self.session(id);
+        SessionLosses {
+            rx: session.closed.subscribe(),
+            session,
+            taken: Default::default(),
         }
     }
 
@@ -774,8 +842,79 @@ impl Pool {
     }
 }
 
+/// A socket loss the downstream handler took ([`SessionLosses::next`]).
+#[derive(Debug, Clone)]
+pub struct TakenLoss {
+    pub error: ExecError,
+    /// The lost socket is the one the session's current attempt acquired
+    /// ([`Upstream::bind`]); when it is not (the attempt runs over HTTP, on another
+    /// provider, or on no socket yet), the loss is no failure of that attempt's turn.
+    pub acquired: bool,
+}
+
+/// The losses of one session's upstream sockets, as its downstream handler takes them
+/// (#25 R3). Each socket's loss is taken at most once: one the handler let pass, while a
+/// turn failed over to another socket, never fires again, and the replacement's own loss
+/// still does. Clones share what was taken.
+#[derive(Clone)]
+pub struct SessionLosses {
+    rx: watch::Receiver<SocketLoss>,
+    session: Arc<Session>,
+    /// The socket whose loss was taken (0: none; socket ids start at 1).
+    taken: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SessionLosses {
+    /// The loss of the socket the current attempt acquired, unless it was taken: what
+    /// may stand in for that attempt's failure. An attempt that failed before it acquired
+    /// a socket (over HTTP, on another provider, or refused while it prepared its
+    /// request) owns no loss, so its failure is its own.
+    pub fn pending(&self) -> Option<ExecError> {
+        let state = self.rx.borrow();
+        let taken = self.taken.load(std::sync::atomic::Ordering::Acquire);
+        let acquired = self.session.acquired.load(std::sync::atomic::Ordering::Acquire);
+        state
+            .lost
+            .clone()
+            .filter(|_| state.socket != taken && state.socket == acquired)
+    }
+
+    /// Resolves with the next socket loss not taken yet, and takes it. Cancel safe: a
+    /// loss is taken only as it is returned.
+    pub async fn next(&mut self) -> TakenLoss {
+        loop {
+            {
+                let state = self.rx.borrow_and_update();
+                if let Some(error) = &state.lost
+                    && state.socket != self.taken.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.taken.store(state.socket, std::sync::atomic::Ordering::Release);
+                    let acquired = self.session.acquired.load(std::sync::atomic::Ordering::Acquire);
+                    return TakenLoss {
+                        error: error.clone(),
+                        acquired: state.socket == acquired,
+                    };
+                }
+            }
+            if self.rx.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
+    }
+}
+
 fn transport(message: &str) -> ExecError {
     ExecError::local(502, FailureScope::Transport, message)
+}
+
+/// What an interrupt's caller learns of the socket's loss: its text, unless the loss
+/// carries the socket's credential ([`crate::codex_secret`]).
+fn rejected_text(lost: &ExecError) -> String {
+    if lost.confidential() {
+        "codex websockets executor: upstream websocket lost".to_owned()
+    } else {
+        String::from_utf8_lossy(&lost.body).into_owned()
+    }
 }
 
 /// gorilla/websocket `CloseError.Error()`: what Go returns for an upstream close.
@@ -986,8 +1125,6 @@ struct Turn {
     _turn: Option<OwnedMutexGuard<()>>,
     /// The observation of the message being read, while it runs.
     observing: Option<crate::ws_observation::Observation>,
-    items: OutputItems,
-    saw_delta: bool,
     /// A Codex client: it gets an upstream context-window rejection as a `response.failed`
     /// before the error (`request::codex_client`).
     codex_client: bool,
@@ -1002,9 +1139,6 @@ struct Turn {
     model: String,
     /// The attempt's wire capture (Go's `api.websocket.*` timeline events).
     wire: crate::codex_capture::Wire,
-    /// Inside the bootstrap window, where Go records an empty incomplete as a
-    /// WebSocket error rather than a response error.
-    bootstrapping: bool,
     /// Bound on waiting for an interrupt acknowledgement after the response ended.
     ack_wait: Duration,
     /// After the terminal event: the interrupted response whose acknowledgement the turn
@@ -1065,85 +1199,81 @@ impl Turn {
         if payload.is_empty() {
             return Frame::Skip;
         }
-        self.observe(payload);
+        // The upstream event boundary (`crate::codex_event`): a frame the pinned reader
+        // cannot decode is skipped there, unless it is a wrapped status `error`.
+        let event = crate::codex_event::decode(&text);
+        let reading = reading(&text, event.as_ref(), self.cooling);
+        if event.is_some() || matches!(reading, Reading::Failure { .. }) {
+            self.observe(payload, event.as_ref().is_none_or(crate::codex_event::Event::accounted));
+        }
         crate::ws_observation::observe(&mut self.observing, self.wire.ws_response_observation(payload)).await;
         let raw_len = payload.len();
-        if let Some(mut error) = ws_error(payload, self.cooling) {
-            self.wire.ws_exec_error("upstream_error", &error);
-            self.deliver_as_sent(&mut error, &text);
-            return Frame::Failed {
-                error,
-                overload: false,
-                read: false,
-                status_frame: true,
-                event: None,
-            };
-        }
-        if let Some((mut error, body)) = response::terminal_failure(payload, self.cooling) {
-            self.wire.ws_exec_error("upstream_error", &error);
-            // The context-window `error` a Codex client gets as `response.failed` (#5) is
-            // delivered ahead of the error; any other failure of a native turn travels on
-            // the error, for delivery once failover is decided.
-            let event = self.preserved_event(payload);
-            if event.is_none() {
-                self.deliver_as_sent(&mut error, &text);
-            }
-            return Frame::Failed {
-                error,
-                overload: response::is_overload(&body),
-                read: false,
-                status_frame: false,
-                event,
-            };
-        }
-        let kind = rawjson::get(payload, "type");
-        let kind = kind.str().to_owned();
-        if response::meaningful_delta(payload) {
-            self.saw_delta = true;
-        }
-        if response::empty_incomplete(payload, self.items.len(), self.saw_delta) {
-            let error = response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE);
-            if self.bootstrapping {
+        let terminal_id = match reading {
+            Reading::Event { terminal: true } => event.as_ref().and_then(crate::codex_event::Event::response_id),
+            _ => None,
+        };
+        match reading {
+            Reading::Passed { decoded } => passed(text, raw_len, decoded),
+            Reading::Failure { mut error, body: None } => {
                 self.wire.ws_exec_error("upstream_error", &error);
-            } else {
-                self.wire.exec_error(&error);
+                deliver_as_sent(&mut error, &text);
+                Frame::Failed {
+                    error,
+                    overload: false,
+                    read: false,
+                    status_frame: true,
+                    event: None,
+                }
             }
-            return Frame::Failed {
-                error,
-                overload: false,
-                read: false,
-                status_frame: false,
-                event: None,
-            };
-        }
-        let bufferable = response::bufferable(payload);
-        let terminal = matches!(
-            kind.as_str(),
-            "response.completed" | "response.done" | "response.incomplete"
-        );
-        let terminal_id = terminal
-            .then(|| rawjson::get(payload, "response.id"))
-            .filter(|id| id.kind() == Kind::String)
-            .map(|id| id.str().to_owned());
-        let ack = acknowledged_id(payload);
-        if kind == "response.output_item.done" {
-            self.items.collect(payload);
-        }
-        // Observation above read a copy; the client gets the frame as it arrived.
-        Frame::Event {
-            raw_len,
-            out: Bytes::from(text),
-            bufferable,
-            terminal,
-            terminal_id,
-            ack,
+            Reading::Failure {
+                mut error,
+                body: Some(body),
+            } => {
+                self.wire.ws_exec_error("upstream_error", &error);
+                // The context-window `error` a Codex client gets as `response.failed` (#5)
+                // is delivered ahead of the error; any other failure of a native turn
+                // travels on the error, for delivery once failover is decided.
+                let event = self.preserved_event(payload);
+                if event.is_none() {
+                    deliver_as_sent(&mut error, &text);
+                }
+                Frame::Failed {
+                    error,
+                    overload: response::is_overload(&body),
+                    read: false,
+                    status_frame: false,
+                    event,
+                }
+            }
+            // Every `response.incomplete` is delivered as sent, whatever its reason,
+            // output or usage, and whether or not anything reached the client yet:
+            // first-party Codex classifies its reason as an interrupted end, a
+            // content-filter error or a terminal `ResponseIncomplete`
+            // (`sse/responses.rs:451-506` at 44ccf394573c) (#25). The turn ends where the
+            // WebSocket reader ends it (`codex_event::Outcome::ends_turn`): on a terminal
+            // event and on a processing error alike, never on a decoded
+            // `response.completed` without a `response`.
+            Reading::Event { terminal } => {
+                let bufferable = response::bufferable(&crate::codex_event::classification_view(payload));
+                let ack = acknowledged_id(payload);
+                // Observation above read a copy; the client gets the frame as it arrived.
+                Frame::Event {
+                    raw_len,
+                    out: Bytes::from(text),
+                    bufferable,
+                    terminal,
+                    terminal_id,
+                    ack,
+                }
+            }
         }
     }
 
-    /// Quota headers and usage from one upstream event.
-    fn observe(&mut self, payload: &str) {
+    /// Quota headers and, when `usage` (`crate::codex_event::Event::accounted`), usage
+    /// from one upstream event.
+    fn observe(&mut self, payload: &str, usage: bool) {
         self.signals(payload);
-        if self.usage.enabled() {
+        if usage && self.usage.enabled() {
             self.usage
                 .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
         }
@@ -1214,18 +1344,7 @@ impl Turn {
             link.deferred.take()
         };
         if let Some(error) = deferred {
-            self.session.notify(&error);
-        }
-    }
-
-    /// A native turn's failure reaches the client as the upstream sent it
-    /// ([`ExecError::delivered_event`]), while `error` keeps the scheduler's
-    /// classification. An account failure keeps the classified delivery instead (the
-    /// allowlisted subscription-limit event, #6, or a silent close): its frame can name the
-    /// pooled account or carry its tokens.
-    fn deliver_as_sent(&self, error: &mut ExecError, frame: &str) {
-        if !account_failure(error.status) {
-            error.delivered_event = Some(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
+            self.session.notify(self.conn.id, &error);
         }
     }
 
@@ -1235,13 +1354,13 @@ impl Turn {
         if !self.codex_client {
             return None;
         }
-        cpa_common::codex_client::context_window_failure_event(payload).map(|e| Bytes::from(e.into_owned()))
+        crate::codex_event::context_window_event(payload).map(|e| Bytes::from(e.into_owned()))
     }
 
-    /// The raw error that lost the session's socket, as the reader recorded it (the
-    /// duplex wraps gorilla's close error unmapped).
+    /// The raw error that lost this turn's socket, as its reader recorded it (the duplex
+    /// wraps gorilla's close error unmapped). Never another socket's loss.
     fn loss(&self) -> Option<ExecError> {
-        self.session.closed.borrow().clone()
+        self.conn.link.lock().expect("link").lost.clone()
     }
 }
 
@@ -1299,7 +1418,7 @@ fn rest(turn: Turn) -> ExecStream {
                         turn.invalidate_after_event(&error);
                         return Some((Ok(event), State::Failing(error)));
                     }
-                    if error.delivered_event.is_some() {
+                    if error.delivered_event().is_some() {
                         // The client gets the provider's frame with the error: a loss
                         // reported first would replace it with a generic close.
                         turn.invalidate_after_event(&error);
@@ -1322,11 +1441,269 @@ fn rest(turn: Turn) -> ExecStream {
 /// sent ([`ExecError::delivered_event`]) does not report the session's loss, which would
 /// close the client with a generic error first.
 fn invalidate_failed(turn: &Turn, error: &ExecError) {
-    if error.delivered_event.is_some() {
+    if error.delivered_event().is_some() {
         turn.invalidate_after_event(error);
     } else {
         turn.invalidate(error, true);
     }
+}
+
+/// What the pinned WebSocket reader makes of one upstream text frame, with the proxy's
+/// classification of a failure. A frame that does not decode, or a decoded `error`,
+/// first gets the wrapped reading (`crate::codex_event::wrapped`,
+/// `endpoint/responses_websocket.rs:864-884` and 712-764 at 44ccf394573c):
+///
+/// - An HTTP error status fails the turn as a status frame ([`ws_error`]).
+/// - A retryable code (`websocket_connection_limit_reached`,
+///   `previous_response_not_found`) fails it whatever the status: as a status frame when
+///   the status is an error status, otherwise by `response::terminal_failure`.
+/// - A status that maps to no error (2xx, or not an HTTP status) makes the frame a
+///   notice. A decoded one fails the turn only when the pinned `error` branch raises it
+///   anyway (a terminal provider code, `error.rs:79-127`); otherwise it is passed.
+/// - Without a status or a recognised code, a decoded `error` keeps the status-less
+///   failure reading ([`ws_error`], then `response::terminal_failure`), and an
+///   undecoded frame is passed.
+///
+/// A decoded `error` that is not a wrapped frame but carries a status anyway
+/// (`crate::codex_event::status_present`: any non-`null` `status` or `status_code`) is a
+/// notice, whatever Go's integer reading of that status ([`ws_error`]) makes of it: the
+/// pinned `error` branch reads no status. It fails only on a terminal provider code,
+/// keeping the status [`ws_error`] reads for the scheduler when that is an error status.
+/// Only without any status does it keep the status-less reading. A decoded
+/// `response.failed` is classified by `response::terminal_failure`. Every failure reading reads the frame as the pinned
+/// reader decodes it (`crate::codex_event::classification_view`): a struct written as a
+/// JSON array as the members it decodes to, the last of a repeated key, and the value a
+/// private number or raw value stands for, decide the classification, while the client
+/// still receives the frame as sent.
+pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>, cooling: bool) -> Reading {
+    use crate::codex_event::Wrapped;
+    let payload = text.trim();
+    let kind = event.map(|e| e.kind.as_ref());
+    let wrapped = if matches!(kind, None | Some("error")) {
+        crate::codex_event::wrapped(payload)
+    } else {
+        None
+    };
+    let status_frame = |view: &str| ws_error(view, cooling).map(|error| Reading::Failure { error, body: None });
+    let terminal = |view: &str| {
+        response::terminal_failure(view, cooling).map(|(error, body)| Reading::Failure {
+            error,
+            body: Some(body),
+        })
+    };
+    let view = || crate::codex_event::classification_view(payload);
+    // A decoded notice: the pinned `error` branch fails it only on a terminal provider
+    // code, as its `Value` reads that code.
+    let notice = |event: &crate::codex_event::Event<'_>| {
+        if terminal_provider_error(event) {
+            terminal(&view())
+        } else {
+            None
+        }
+    };
+    let failure = match (event, wrapped) {
+        (_, Some(Wrapped::Status(_) | Wrapped::Retryable(Some(_)))) => status_frame(&view()),
+        (_, Some(Wrapped::Retryable(None))) => terminal(&view()),
+        (Some(event), Some(Wrapped::Notice)) => notice(event),
+        (None, _) => return Reading::Passed { decoded: false },
+        // A decoded `error` with a status that is no wrapped frame: the status did not
+        // read as the wrapped struct's `u16` (zero, negative, past `u16`, a fraction or
+        // exponent, a string, a private number, a container), or the frame is refused for
+        // another member (`status` beside `status_code`, a repeated `status`, a private
+        // value in `error.code`, which `WrappedWebsocketError` cannot read as a
+        // `String`). The pinned reader then reads the `error` branch, which reads no
+        // status (`process_responses_event`, `sse/responses.rs:375-385`): a notice
+        // unless its logical code is a terminal provider code. Go's integer reading of
+        // the status ([`ws_error`]) decides nothing here; it only keeps the scheduler's
+        // status for a terminal provider failure the pinned reader raises anyway.
+        (Some(event), _) if event.kind == "error" && crate::codex_event::status_present(payload) => {
+            if terminal_provider_error(event) {
+                let view = view();
+                match status_frame(&view) {
+                    Some(Reading::Failure { error, body }) if crate::codex_event::error_status(error.status) => {
+                        Some(Reading::Failure { error, body })
+                    }
+                    _ => terminal(&view),
+                }
+            } else {
+                None
+            }
+        }
+        // Only a decoded `error` without any status keeps the status-less failure
+        // reading (the status-frame reading finds no status in it either); a decoded
+        // `response.failed` is classified by its own reading.
+        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(&view()),
+        (Some(event), _) => {
+            return Reading::Event {
+                terminal: event.outcome().ends_turn(),
+            };
+        }
+    };
+    // Both failure kinds always classify; a wrapped frame always carries `type: error`.
+    let mut failure = failure;
+    if let Some(Reading::Failure { error, .. }) = &mut failure {
+        withhold_sensitive(error, payload);
+    }
+    failure.unwrap_or(Reading::Passed {
+        decoded: event.is_some(),
+    })
+}
+
+/// What [`reading`] decided for one frame.
+pub(super) enum Reading {
+    /// A decoded event that is not a failure; `terminal` when the WebSocket reader ends
+    /// the turn on it (`crate::codex_event::Outcome::ends_turn`).
+    Event { terminal: bool },
+    /// A failure. `body` is what `response::terminal_failure` classified, or `None` for a
+    /// status frame.
+    Failure { error: ExecError, body: Option<String> },
+    /// The pinned reader skips the frame (it does not decode and is no wrapped error) or
+    /// ignores it (a wrapped notice): delivered as sent, as content, never as a terminal
+    /// event, failure or acknowledgement, unless it is [`account_shaped`]. `decoded` when
+    /// it decodes as a `ResponsesStreamEvent` (a wrapped notice can).
+    Passed { decoded: bool },
+}
+
+/// Whether the pinned `error` branch fails the response on a decoded `error` event
+/// without a status (`parse_terminal_provider_error`, `codex-api/src/error.rs:79-127`):
+/// its last `error.code` is a terminal provider code.
+fn terminal_provider_error(event: &crate::codex_event::Event<'_>) -> bool {
+    let code = event.error_str("code");
+    matches!(
+        code.as_deref(),
+        Some(
+            "budget_reached"
+                | "audio_too_large"
+                | "audio_too_short"
+                | "invalid_audio"
+                | "invalid_audio_data"
+                | "invalid_audio_format"
+                | "missing_audio_sample_rate"
+                | "flex_unavailable"
+                | "model_not_found"
+        )
+    )
+}
+
+/// A frame [`reading`] passes: delivered as sent, as content. A frame that would read as
+/// an account failure is withheld instead ([`account_shaped`]).
+fn passed(text: String, raw_len: usize, decoded: bool) -> Frame {
+    if account_shaped(text.trim(), decoded) {
+        return Frame::Skip;
+    }
+    Frame::Event {
+        raw_len,
+        out: Bytes::from(text),
+        bufferable: false,
+        terminal: false,
+        terminal_id: None,
+        ack: None,
+    }
+}
+
+/// Whether a frame the pinned reader skips or ignores would be an account failure under
+/// any reading a client could give it: the status frame reading ([`ws_error`]) and the
+/// terminal failure reading (`response::terminal_failure`), each with the first and with
+/// the last of a repeated key (a JSON reader keeps one or the other; the last also as
+/// the pinned reader decodes the frame, `crate::codex_event::classification_view`: a
+/// struct written as a JSON array by its members, private values resolved). A
+/// frame the pinned client cannot decode (`decoded` false) is also read with every other
+/// occurrence of a repeated key that those readings read (`crate::codex_ambiguous`),
+/// since a reader that acts on members as they stream past can take any of them. A decoded frame (a wrapped
+/// notice) keeps the first and last readings: the pinned `Value` reads it with the last.
+/// A native WebSocket client never receives such a frame as sent, because it can name the
+/// pooled account (#6). That is all the result decides: the frame is not classified, the
+/// credential does not cool and the response goes on. The pinned reader acts on none of
+/// these frames, so withholding one changes nothing it does.
+pub(crate) fn account_shaped(payload: &str, decoded: bool) -> bool {
+    account_reading(payload)
+        || match crate::codex_event::classification_view(payload) {
+            std::borrow::Cow::Owned(view) => account_reading(&view),
+            std::borrow::Cow::Borrowed(_) => false,
+        }
+        || refused_slot_account(payload)
+        || (!decoded && crate::codex_ambiguous::ambiguous_account(payload))
+}
+
+/// Whether a failure slot a failure reading reads as an error object, named by position
+/// although its typed decode refuses it (`crate::codex_event::safety_views`), reads as an
+/// account failure. A wrapped error array whose `error.code` is a private raw value, which
+/// the pinned reader skips, or a `response.failed` whose `response.error` array the
+/// `Error` struct refuses, which it reports only as its generic stream error, still
+/// carries what the upstream wrote. Safety only: the frame keeps its classification, or
+/// its skip.
+fn refused_slot_account(payload: &str) -> bool {
+    crate::codex_event::safety_views(payload)
+        .iter()
+        .any(|view| account_reading(view))
+}
+
+/// Whether the status-frame reading ([`ws_error`]) or the terminal failure reading
+/// (`response::terminal_failure`) of `text` is an account failure, or its error is one
+/// of the pinned client's account kinds ([`pinned_account_kind`]).
+fn account_reading(text: &str) -> bool {
+    [
+        ws_error(text, false).map(|error| error.status),
+        response::terminal_failure(text, false).map(|(error, _)| error.status),
+    ]
+    .into_iter()
+    .flatten()
+    .any(account_failure)
+        || pinned_account_kind(text)
+}
+
+/// Error codes the pinned client reads as a failure of the pooled account's own limits,
+/// whatever status Go's table gives them: `RateLimitExceeded` (`rate_limit_exceeded`,
+/// `slow_down`), `QuotaExceeded` (`insufficient_quota`, `credit_balance_exhausted`,
+/// `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, and
+/// `organization_usage_limit_exceeded` on a 429) and `UsageNotIncluded`
+/// (`usage_not_included`): `codex-api/src/sse/responses_error.rs:48-103` and
+/// `codex-api/src/api_bridge.rs:136-140,241-255` at 44ccf394573c. Their message, plan and
+/// reset describe that account.
+pub(crate) const PINNED_ACCOUNT_CODES: [&str; 8] = [
+    "rate_limit_exceeded",
+    "slow_down",
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+    "usage_not_included",
+];
+
+/// Error types the pinned client reads the same way on a 429 (`UsageLimitReached`,
+/// `UsageNotIncluded`, `QuotaExceeded`: `codex-api/src/api_bridge.rs:212-255`).
+pub(crate) const PINNED_ACCOUNT_TYPES: [&str; 3] = ["usage_limit_reached", "usage_not_included", "insufficient_quota"];
+
+/// Whether a failure frame carries an error of a pinned account kind
+/// ([`PINNED_ACCOUNT_CODES`], [`PINNED_ACCOUNT_TYPES`]) in an error object a failure
+/// reading of its type reads: a `response.failed`'s `response.error` (the pinned reader's
+/// `Error`) and its own `error` (the proxy's fallback); an `error` frame's `error` and a
+/// status frame's `body.error`. Delivery only: it withholds such a frame from a native
+/// WebSocket client (#6). The scheduler keeps Go's classification of it, and the pinned
+/// reader's own outcome is unchanged.
+pub(crate) fn pinned_account_kind(text: &str) -> bool {
+    let paths: &[&str] = match rawjson::get(text, "type").str().trim() {
+        "response.failed" => &["response.error", "error"],
+        "error" => &["error", "body.error"],
+        _ => return false,
+    };
+    paths.iter().any(|path| {
+        let error = rawjson::get(text, path);
+        PINNED_ACCOUNT_CODES.contains(&error.get("code").str())
+            || PINNED_ACCOUNT_TYPES.contains(&error.get("type").str())
+    })
+}
+
+/// Whether the session reader hands its turn a frame the turn gives a Codex client as
+/// the #5 context-window event (`Turn::preserved_event`): a decoded failure event that is
+/// a context-window rejection as the pinned reader decodes it
+/// (`crate::codex_event::classification_view`).
+fn preserved_rejection(payload: &str) -> bool {
+    crate::codex_event::decode(payload).is_some_and(|event| matches!(event.kind.as_ref(), "error" | "response.failed"))
+        && cpa_common::codex_client::is_context_window_rejection(
+            crate::codex_event::classification_view(payload).as_bytes(),
+        )
 }
 
 /// An account failure: 401, 402, 403 or 429 as classified. Its frame can name the pooled
@@ -1335,10 +1712,51 @@ pub(super) fn account_failure(status: u16) -> bool {
     matches!(status, 401 | 402 | 403 | 429)
 }
 
+/// Whether a native client must not see the upstream failure `frame` as sent, nor any
+/// rendering of it (#6): an account failure as classified (`status`), or a frame whose
+/// status-frame or terminal failure reading is one, read as the pinned reader decodes it
+/// (`crate::codex_event::classification_view`, the view the failure was classified
+/// from: the last of a repeated key, private values, positional structs). The two can
+/// part: the pinned wrapped mapping keeps an explicit `status: 400` for the scheduler
+/// while the frame's own error reads as a rate limit. The classification is not changed
+/// here; only what the client receives is. Unlike [`account_shaped`], which judges frames
+/// the pinned reader skips or ignores, a failure keeps the pinned last-key reading. A
+/// failure slot the pinned reader refuses to decode is read by position as well
+/// ([`refused_slot_account`]): a `response.failed` whose `response.error` array the
+/// `Error` struct refuses keeps its generic 502 for the scheduler and is withheld when
+/// that array reads as an account failure.
+pub(super) fn account_sensitive(status: u16, frame: &str) -> bool {
+    let frame = frame.trim();
+    account_failure(status)
+        || account_reading(&crate::codex_event::classification_view(frame))
+        || refused_slot_account(frame)
+}
+
+/// Marks `error`, the classification of the upstream failure `frame`, as
+/// [`Delivery::Withheld`] when the frame is [`account_sensitive`]: the client then gets
+/// nothing of it (the allowlisted subscription-limit event, #6, or a silent close),
+/// however the error travels on (bootstrap failover, a steering connection's records,
+/// the session's loss). The scheduler keeps the status. [`reading`] decides it for an
+/// upstream socket and a steering connection, and a turn served over HTTP for its own
+/// failures.
+pub(super) fn withhold_sensitive(error: &mut ExecError, frame: &str) {
+    if account_sensitive(error.status, frame) && !error.confidential() {
+        error.delivery = Delivery::Withheld;
+    }
+}
+
+/// A native turn's failure reaches the client as the upstream sent it, `frame` byte for
+/// byte ([`Delivery::AsSent`]), while `error` keeps the scheduler's classification;
+/// unless it was withheld ([`withhold_sensitive`]).
+pub(super) fn deliver_as_sent(error: &mut ExecError, frame: &str) {
+    if !error.withheld() {
+        error.delivery = Delivery::AsSent(Box::new(Bytes::copy_from_slice(frame.as_bytes())));
+    }
+}
+
 /// Bootstrap buffering over WebSocket messages (codex_websockets_stream.go): every
 /// message read counts toward the 48-frame window, held frames are bounded by 1 MiB.
 async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) -> Result<ExecStream, ExecError> {
-    turn.bootstrapping = true;
     let mut held: Vec<Result<Bytes, ExecError>> = Vec::new();
     let (mut frames, mut bytes) = (0usize, 0usize);
     loop {
@@ -1370,7 +1788,7 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                     turn.invalidate(&error, false);
                     let body = String::from_utf8_lossy(&error.body).into_owned();
                     let mut overloaded = response::bootstrap_overload(&body);
-                    overloaded.delivered_event = error.delivered_event;
+                    overloaded.delivery = error.delivery;
                     return Err(overloaded);
                 }
                 if let Some(event) = event {
@@ -1401,7 +1819,6 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
                 if terminal {
                     if turn.settle(terminal_id.as_deref()) {
                         // An interrupt acknowledgement still follows the terminal event.
-                        turn.bootstrapping = false;
                         return Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed());
                     }
                     return Ok(futures_util::stream::iter(held).boxed());
@@ -1410,7 +1827,6 @@ async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) 
             }
         }
     }
-    turn.bootstrapping = false;
     Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed())
 }
 
@@ -1440,9 +1856,13 @@ impl CodexExecutor {
             drop(slot);
             current.shutdown();
         }
+        // The socket this dial makes supersedes any earlier one's loss, also when the
+        // dial itself fails.
+        let socket_id = session.begin_socket();
         let (socket, handshake) = self.dial(target, headers, model, model_level_cooling, wire).await?;
         let (sink, stream) = socket.split();
-        let conn = Upstream::new(target.clone(), sink, self.ws.write);
+        let secrets = crate::codex_secret::from_request(headers, &target.url);
+        let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets, socket_id);
         if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
             let _ = conn.upgrade_model.set(upgrade);
         }
@@ -1535,7 +1955,8 @@ impl CodexExecutor {
     }
 
     /// One Responses turn over the session's upstream socket (`ExecuteStream` on
-    /// `CodexWebsocketsExecutor` with a downstream WebSocket).
+    /// `CodexWebsocketsExecutor` with a downstream WebSocket). A failure before the turn
+    /// reads is guarded with the values the request carried ([`crate::codex_secret`]).
     pub(crate) async fn stream_ws(
         &self,
         view: &View<'_>,
@@ -1543,6 +1964,23 @@ impl CodexExecutor {
         req: ExecRequest,
         exec_session: &ExecSession,
         cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        let mut secrets = cpa_core::exec::SentCredentials::default();
+        let turn = self
+            .stream_ws_turn(view, settings, req, exec_session, cfg, &mut secrets)
+            .await;
+        turn.map_err(|error| secrets.guarded(error))
+    }
+
+    /// [`Self::stream_ws`]; `secrets` receives the values the request carries.
+    async fn stream_ws_turn(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        req: ExecRequest,
+        exec_session: &ExecSession,
+        cfg: &Config,
+        secrets: &mut cpa_core::exec::SentCredentials,
     ) -> Result<ExecResponse, ExecError> {
         // The native WebSocket route (#24): the client's `response.create` frame goes
         // upstream with only its `model` routed. No shaping, payload rules, prompt-cache
@@ -1554,6 +1992,11 @@ impl CodexExecutor {
         let model = crate::codex::native::upstream_model(&req)?;
         let frame = crate::codex::native::routed(&req.body, &model)?;
         settings.refuse_image_tool(&req.request_path, &frame)?;
+        // A frame that names a previous response runs only on the socket that holds it,
+        // whatever transport the connection's previous turn used: a lost or replaced
+        // socket gets the replay close, never a new dial carrying the old ID (#25).
+        let continuation = exec_session.continuation
+            || crate::codex::native::continues(&cpa_common::codex_body::CodexBody::parse(&frame)?);
         // The frame passed the request boundary, so it is UTF-8. It is read in place and
         // sent as these bytes: no copy of the frame.
         let body = std::str::from_utf8(&frame)
@@ -1573,6 +2016,10 @@ impl CodexExecutor {
             crate::codex_identity::Origin::Caller,
         );
         let target = Target::new(view.credential, ws_url(&format!("{}/responses", view.base_url))?, cfg);
+        // The outbound credential guard (`crate::codex_secret`): this request's values
+        // for a failure before the turn reads (a refused upgrade, say), and the serving
+        // socket's own handshake values for everything read from that socket.
+        *secrets = crate::codex_secret::from_request(&headers, &target.url);
         let session = self.ws.session(&exec_session.id);
         // `WebsocketInputFromContext(ctx) != nil && cfg.Codex.ResponseSteering`.
         let steering = settings
@@ -1582,11 +2029,15 @@ impl CodexExecutor {
             .map(|input| (input, duplex::Prepared::new(native)));
         let guard = session.turn.clone().lock_owned().await;
         let model_kept = model_kept(&req.original_body, body);
-        // A native frame is already a `response.create`.
-        let wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
+        // A native frame is already a `response.create`. The request log and the usage
+        // record keep the exchange scrubbed of the same values as the guard: this
+        // request's until a socket serves the turn, then that socket's.
+        let mut wire = crate::codex_capture::Wire::new(req.capture(), view.credential)
             .with_websocket(req.websocket_emitter("codex", view.credential));
+        wire.bind(secrets);
+        req.usage.sent_credentials(secrets);
         wire.ws_request(&target.url, &headers, &frame);
-        let (mut conn, mut handshake) = if exec_session.continuation {
+        let (mut conn, mut handshake) = if continuation {
             match session.current().filter(|c| c.target.serves(&target)) {
                 Some(conn) => (conn, None),
                 None => return Err(ExecError::replay_required()),
@@ -1603,6 +2054,8 @@ impl CodexExecutor {
             .await?
         };
         conn.bind(&session, exec_session.lease.as_ref())?;
+        wire.bind(&conn.secrets);
+        req.usage.sent_credentials(&conn.secrets);
         if let Some(handshake) = &handshake {
             wire.ws_handshake(101, handshake);
         }
@@ -1613,7 +2066,7 @@ impl CodexExecutor {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
             let retry = error.scope != FailureScope::Request;
-            if exec_session.continuation {
+            if continuation {
                 session.invalidate(&conn, &error, false);
                 return Err(if retry { ExecError::replay_required() } else { error });
             }
@@ -1621,7 +2074,10 @@ impl CodexExecutor {
             if !retry {
                 return Err(error);
             }
-            // Retry once on a fresh socket: upstream may have closed it between turns.
+            // Retry once on a fresh socket: upstream may have closed it between turns. Its
+            // dial carries this request's values.
+            wire.bind(secrets);
+            req.usage.sent_credentials(secrets);
             let (fresh, fresh_handshake) = match self
                 .ensure(&session, &target, &headers, &model, settings.model_level_cooling, None)
                 .await
@@ -1633,12 +2089,15 @@ impl CodexExecutor {
                 }
             };
             fresh.bind(&session, exec_session.lease.as_ref())?;
+            wire.bind(&fresh.secrets);
+            req.usage.sent_credentials(&fresh.secrets);
             rx = fresh.activate(preserves);
             wire.ws_request(&target.url, &headers, &frame);
             if let Some(handshake) = &fresh_handshake {
                 wire.ws_handshake(101, handshake);
             }
-            if let Err(error) = fresh.send_raw(frame).await {
+            // `frame` is borrowed by `body`; a clone is a reference count.
+            if let Err(error) = fresh.send_raw(frame.clone()).await {
                 wire.ws_exec_error("send_retry", &error);
                 session.invalidate(&fresh, &error, true);
                 return Err(error);
@@ -1661,8 +2120,6 @@ impl CodexExecutor {
             session,
             _turn: Some(guard),
             observing: None,
-            items: OutputItems::default(),
-            saw_delta: false,
             codex_client: request::codex_client(&req),
             cooling: settings.model_level_cooling,
             quota: self.quota_handle(),
@@ -1671,29 +2128,36 @@ impl CodexExecutor {
             usage: req.usage.clone(),
             model: model.clone(),
             wire,
-            bootstrapping: false,
             ack_wait: self.ws.ack_wait,
             drain: None,
         };
+        let socket_secrets = turn.conn.secrets.clone();
+        // The outer error guard must follow the serving socket too: a reused socket
+        // may carry the old key while this request's freshly prepared headers do not.
+        *secrets = socket_secrets.clone();
         if let Some((input, initial)) = steering {
             // The socket now belongs to this connection; bootstrap buffering does not apply.
             let stream = duplex::Duplex::start(turn, input, initial, req, view, settings.image_generation).await;
-            return Ok(ExecResponse {
+            return socket_secrets.guard_response(Ok(ExecResponse {
                 status: 200,
                 headers: returned,
                 body: ResponseBody::Stream(stream),
-            });
+                omitted: Default::default(),
+            }));
         }
         let stream = if settings.bootstrap_buffering {
-            bootstrap(turn, settings.bootstrap_timeout, started).await?
+            bootstrap(turn, settings.bootstrap_timeout, started)
+                .await
+                .map_err(|error| socket_secrets.guarded(error))?
         } else {
             rest(turn)
         };
-        Ok(ExecResponse {
+        socket_secrets.guard_response(Ok(ExecResponse {
             status: 200,
             headers: returned,
             body: ResponseBody::Stream(stream),
-        })
+            omitted: Default::default(),
+        }))
     }
 }
 
@@ -1848,11 +2312,14 @@ pub(crate) async fn read_loop(
         };
         held = false;
         if let Some(tx) = active {
-            let failure = preserves && cpa_common::codex_client::is_context_window_rejection(text.trim().as_bytes());
+            let failure = preserves && preserved_rejection(text.trim());
             // Waits while the turn is busy: backpressure instead of unbounded queueing.
             held = tx.send(Read::Text(text)).await.is_ok() && failure;
         }
     };
+    // A close reason or read error can quote the handshake's credential; everything the
+    // loss reaches (the turn, the session, an interrupt) is guarded.
+    let error = conn.secrets.guarded(error);
     let (active, defer) = {
         let mut link = conn.link.lock().expect("link");
         link.lost = Some(error.clone());

@@ -612,9 +612,11 @@ async fn bootstrap_overload_fails_over_without_disconnect_notice() {
         .err()
         .expect("overload fails the attempt");
     assert_ne!(error.scope, FailureScope::Request, "another credential may serve it");
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), closed).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(200), closed.next())
+            .await
+            .is_err(),
         "overload must not close the downstream session"
     );
 }
@@ -626,7 +628,7 @@ async fn bootstrap_overload_fails_over_without_disconnect_notice() {
 async fn close_1009_is_a_request_scoped_413_and_notifies() {
     let (_up, url) = upstream(vec![Act::SendClose(vec![CREATED], 1009)]).await;
     let executor = CodexExecutor::new().unwrap();
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     let response = executor
         .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
         .await
@@ -638,15 +640,20 @@ async fn close_1009_is_a_request_scoped_413_and_notifies() {
         String::from_utf8_lossy(&error.body),
         r#"{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}"#
     );
-    let notified = tokio::time::timeout(Duration::from_secs(2), closed)
+    let notified = tokio::time::timeout(Duration::from_secs(2), closed.next())
         .await
         .expect("session notified");
+    assert!(notified.acquired, "the turn's own socket");
+    let notified = notified.error;
     assert_eq!(notified.status, 413);
     assert_eq!(
         crate::rawjson::get(&String::from_utf8_lossy(&notified.body), "error.message").str(),
         "bye"
     );
-    assert_eq!(executor.session_loss("conn-1").map(|e| e.body), Some(notified.body));
+    assert_eq!(
+        executor.session_losses("conn-1").pending().map(|e| e.body),
+        Some(notified.body)
+    );
 }
 
 /// gorilla/websocket reads a peer that vanishes without a close frame as close 1006,
@@ -965,13 +972,13 @@ async fn close_1009_on_a_full_turn_channel_keeps_the_413() {
     events.extend(std::iter::repeat_n(DELTA, TURN_BUFFER - 1));
     let (_up, url) = upstream(vec![Act::SendClose(events, 1009)]).await;
     let executor = CodexExecutor::new().unwrap();
-    let closed = executor.session_closed("conn-1");
+    let mut closed = executor.session_losses("conn-1");
     let response = executor
         .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
         .await
         .unwrap();
     // Nothing reads the turn until the reader has filled the channel and seen the close.
-    tokio::time::timeout(Duration::from_secs(5), closed)
+    tokio::time::timeout(Duration::from_secs(5), closed.next())
         .await
         .expect("session notified");
     let events = collect(response).await;
@@ -1604,7 +1611,7 @@ async fn late_interrupts_for_finished_responses() {
             "{terminal}: r1 never reached upstream while r2 ran"
         );
         conn.send("bye".into()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
+        tokio::time::timeout(Duration::from_secs(5), executor.ws.losses("conn-1").next())
             .await
             .unwrap_or_else(|_| panic!("{terminal}: the disconnect was not reported"));
         assert_eq!(
@@ -1641,7 +1648,7 @@ async fn reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn() 
             matches!(after, Ok(Some(Read::Failed(_)))),
             "{preserves} {last}: no read error"
         );
-        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.closed("conn-1"))
+        let reported = tokio::time::timeout(Duration::from_millis(200), executor.ws.losses("conn-1").next())
             .await
             .is_ok();
         assert_eq!(reported, !deferred, "{preserves} {last}: loss reported by the reader");
@@ -1680,7 +1687,7 @@ fn codex_client_request(body: &str) -> ExecRequest {
 #[tokio::test]
 async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
     let live = LIVE_CONTEXT_ERROR.trim();
-    let normalized = cpa_common::codex_client::context_window_failure_event(live)
+    let normalized = cpa_common::codex_client::context_window_failure_event(live, live)
         .unwrap()
         .into_owned();
     let buffered = Config::parse("codex:\n  stream-bootstrap-buffering: true\n").unwrap();
@@ -1743,16 +1750,13 @@ async fn live_context_window_error_reaches_a_codex_client_as_a_failure() {
         // reported, not even a close right after the event.
         if codex_client {
             assert!(
-                executor.ws.loss("conn-1").is_none(),
+                executor.ws.losses("conn-1").pending().is_none(),
                 "{name}: a loss was reported: {:?}",
-                executor.ws.loss("conn-1").map(|l| code(&l))
+                executor.ws.losses("conn-1").pending().map(|l| code(&l))
             );
         } else {
             assert_eq!(
-                error
-                    .delivered_event
-                    .as_deref()
-                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                error.delivered_event().map(|b| String::from_utf8_lossy(b).into_owned()),
                 Some(live.to_owned()),
                 "{name}: the frame as sent"
             );
@@ -1822,7 +1826,7 @@ async fn an_abandoned_preserving_turn_leaves_no_loss_unreported() {
             "{rejection}: the abandoned turn released its read channel during the observation"
         );
         close.notify_one();
-        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_closed("conn-1")).await;
+        let loss = tokio::time::timeout(Duration::from_secs(5), executor.session_losses("conn-1").next()).await;
         let deferred = conn.link.lock().expect("link").deferred.is_some();
         observer.release.add_permits(100);
         assert!(
@@ -2191,4 +2195,584 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     assert_eq!(received.len(), 3);
     assert!(received[1].len() > 32 << 20);
     assert!(received[2].contains(r#""previous_response_id":"r1""#));
+}
+
+/// #25 and #6: the failure readings of a frame written as a JSON array read the members
+/// the pinned client decodes it to (`codex_event::classification_view`). A positional
+/// `response.failed` is the rate limit its `response.error` says; a positional wrapped
+/// status error fails by its status; a positional event has no status, so its status-frame
+/// reading finds none. The frame as sent reads as neither.
+#[test]
+fn positional_frames_read_by_their_decoded_members() {
+    let failed = r#"["response.failed",null,null,{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited"}},null,null,null,null,null,null,null,null,null,null]"#;
+    let event = crate::codex_event::decode(failed).unwrap();
+    let view = crate::codex_event::classification_view(failed);
+    let (error, _) = response::terminal_failure(&view, false).unwrap();
+    assert_eq!(error.status, 429);
+    assert!(ws_error(&view, false).is_none());
+    assert!(response::terminal_failure(failed, false).is_none());
+    assert!(matches!(reading(failed, Some(&event), false), Reading::Failure { ref error, .. } if error.status == 429));
+    assert!(account_shaped(failed, true));
+    let wrapped = r#"["error",429,{"code":"rate_limit_exceeded","message":"limited"}]"#;
+    assert!(crate::codex_event::decode(wrapped).is_none());
+    assert_eq!(
+        ws_error(&crate::codex_event::classification_view(wrapped), false).map(|e| e.status),
+        Some(429)
+    );
+    assert!(ws_error(wrapped, false).is_none());
+    assert!(matches!(reading(wrapped, None, false), Reading::Failure { ref error, body: None } if error.status == 429));
+    assert!(account_shaped(wrapped, false));
+}
+
+/// The pinned first-party readers' outcome for each frame of
+/// `tests/fixtures/codex_pinned_failure_readings.json` (its `provenance` names the pinned
+/// source, the serde_json build and the evidence): nested `response.failed` errors written
+/// as the `Error` struct by position, private values, malformed arrays, and `error`
+/// frames with every status representation.
+fn pinned_readings() -> Vec<Value> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/codex_pinned_failure_readings.json")).unwrap();
+    fixture["cases"].as_array().unwrap().clone()
+}
+
+/// The pinned first-party readers' outcome for each frame of
+/// `tests/fixtures/codex_pinned_notice_readings.json`, recorded by the same oracle as
+/// [`pinned_readings`] (its `provenance` names the evidence): status spellings the first
+/// fixture does not hold (group `status`), and failure slots a pinned struct refuses
+/// (group `refused`).
+fn notice_readings() -> Vec<Value> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/codex_pinned_notice_readings.json")).unwrap();
+    fixture["cases"].as_array().unwrap().clone()
+}
+
+/// Whether the frame `raw` has no status at all: each `status` and `status_code` member
+/// of its root object, every occurrence, is missing or `null` (a private raw value
+/// holding `null` is `null` to this build's `Value` too). The proxy's one documented
+/// reading beyond the pinned WebSocket reader keys on it: a decoded `error` without a
+/// status keeps the status-less failure reading (`reading`).
+fn statusless(raw: &str) -> bool {
+    struct Members;
+    impl<'de> serde::de::Visitor<'de> for Members {
+        type Value = Vec<(String, Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut out = Vec::new();
+            while let Some(entry) = map.next_entry::<String, Value>()? {
+                out.push(entry);
+            }
+            Ok(out)
+        }
+    }
+    use serde::Deserializer as _;
+    serde_json::Deserializer::from_str(raw)
+        .deserialize_map(Members)
+        .unwrap_or_default()
+        .iter()
+        .filter(|(key, _)| key == "status" || key == "status_code")
+        .all(|(_, value)| value.is_null())
+}
+
+/// The pinned WebSocket reader's decision on `case` against the proxy's [`reading`]: a
+/// frame it fails fails the turn; a frame it reads on or skips fails only by the one
+/// documented reading beyond it, a decoded `error` without any status ([`statusless`]).
+/// Go's integer reading of a status (`gjson` `Int`, which also takes `"429"` or `429.0`)
+/// decides nothing: a status the wrapped struct does not read is no wrapped status, and
+/// the pinned `error` branch reads no status at all.
+fn assert_pinned_reading(case: &Value) -> bool {
+    let name = case["name"].as_str().unwrap();
+    let raw = case["raw"].as_str().unwrap();
+    let event = crate::codex_event::decode(raw);
+    assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
+    let failed = matches!(reading(raw, event.as_ref(), false), Reading::Failure { .. });
+    if case["ws"] == "fail" {
+        assert!(failed, "{name}: the pinned reader fails it ({})", case["pinned"]);
+        return true;
+    }
+    let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
+    assert_eq!(
+        failed,
+        decoded_error && statusless(raw),
+        "{name}: the pinned reader goes on ({})",
+        case["pinned"]
+    );
+    false
+}
+
+/// #25, #6 and #7 against the pinned readers ([`assert_pinned_reading`]): every status
+/// that is present is a notice unless the wrapped struct reads it as an error status,
+/// zero, negative, too large and type-wrong ones included, whether or not a private
+/// value keeps the frame from reading as the pinned wrapped event.
+#[test]
+fn readings_follow_the_pinned_readers() {
+    let mut checked = [0usize; 2];
+    for case in pinned_readings() {
+        checked[usize::from(!assert_pinned_reading(&case))] += 1;
+    }
+    assert!(checked[0] > 150 && checked[1] > 150, "{checked:?}");
+}
+
+/// #25 (review finding 3): the status spellings Go's integer reading takes as an error
+/// status and the pinned wrapped struct does not read as a `u16` (`"429"`, `" 429"`,
+/// `"+429"`, `429.0`, `4.29e2`, `429e0`, a private number or raw value, `status_code`
+/// spelled so) and the frames the wrapped struct refuses as a duplicate field (`status`
+/// beside `status_code`, a repeated `status`) are notices when the pinned `error` branch
+/// reads on: the turn goes on to the real completion and nothing cools. A terminal
+/// provider code still fails; an escaped `status` key is the wrapped status it unescapes
+/// to. Only a frame with no status at all (`null` in every occurrence) keeps the
+/// status-less failure reading.
+#[test]
+fn notice_readings_follow_the_pinned_readers() {
+    let mut checked = [0usize; 3];
+    for case in notice_readings().iter().filter(|c| c["group"] == "status") {
+        let raw = case["raw"].as_str().unwrap();
+        if assert_pinned_reading(case) {
+            checked[0] += 1;
+        } else if statusless(raw) {
+            checked[2] += 1;
+        } else {
+            let event = crate::codex_event::decode(raw).unwrap();
+            assert!(
+                matches!(reading(raw, Some(&event), false), Reading::Passed { decoded: true }),
+                "{}: a notice",
+                case["name"]
+            );
+            checked[1] += 1;
+        }
+    }
+    assert!(checked[0] > 150 && checked[1] > 300 && checked[2] > 5, "{checked:?}");
+}
+
+/// #25 and #6: a decoded `response.failed`'s `response.error` is read as
+/// `parse_failed_response` reads it into its `Error` struct
+/// (`sse/responses_error.rs:14-24`), so the struct written as a JSON array of five or six
+/// members is the object of those members, private values and escapes resolved. Its
+/// failure then classifies, and is withheld or delivered, exactly as that object does. An
+/// array the struct refuses (too short, too long, a member of the wrong type) stays one:
+/// the pinned reader has only its generic stream error for it, which names no code.
+#[test]
+fn failed_errors_read_as_the_pinned_error_struct() {
+    let mut read = [0usize; 2];
+    for case in pinned_readings() {
+        if case["error_array"] != true {
+            continue;
+        }
+        let name = case["name"].as_str().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+        let view: Value = serde_json::from_str(&crate::codex_event::classification_view(raw)).unwrap();
+        let error = &view["response"]["error"];
+        let event = crate::codex_event::decode(raw).unwrap();
+        let Reading::Failure { error: got, .. } = reading(raw, Some(&event), false) else {
+            panic!("{name}: a response.failed fails");
+        };
+        if case["error_struct"].is_null() {
+            assert!(error.is_array(), "{name}: {error}");
+            read[1] += 1;
+            continue;
+        }
+        // Numbers by value: the view keeps `-0` as sent, which the struct's `i64` reads as 0.
+        let fields = error.as_object().unwrap();
+        let want = case["error_struct"].as_object().unwrap();
+        assert_eq!(fields.len(), want.len(), "{name}: {error}");
+        for (key, value) in want {
+            match (value.as_f64(), fields.get(key)) {
+                (Some(n), Some(got)) => assert_eq!(got.as_f64(), Some(n), "{name}: {key}"),
+                (None, got) => assert_eq!(got, Some(value), "{name}: {key}"),
+                (Some(_), None) => panic!("{name}: {key} missing"),
+            }
+        }
+        // The same failure written with the object the struct reads.
+        let object =
+            serde_json::json!({"type": "response.failed", "response": {"id": "r1", "error": case["error_struct"]}})
+                .to_string();
+        let object_event = crate::codex_event::decode(&object).unwrap();
+        let Reading::Failure { error: want, .. } = reading(&object, Some(&object_event), false) else {
+            panic!("{name}: the object form fails");
+        };
+        assert_eq!(got.status, want.status, "{name}");
+        assert_eq!(got.delivery, want.delivery, "{name}");
+        read[0] += 1;
+    }
+    assert!(read[0] >= 30 && read[1] >= 15, "{read:?}");
+}
+
+/// #6 (review finding 1): the nested positional rate limit, with the credential's own
+/// token in its message, is the 429 its object form is, and never reaches the client:
+/// withheld, as an account failure. The #5 relay and the session reader read the
+/// positional context-window code as the pinned parser does too.
+#[test]
+fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
+    let nested = r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited at-FAKE acct-PRIVATE",null,null,null]}}"#;
+    let event = crate::codex_event::decode(nested).unwrap();
+    let Reading::Failure { mut error, .. } = reading(nested, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.status, 429);
+    assert_eq!(error.delivery, Delivery::Withheld);
+    deliver_as_sent(&mut error, nested);
+    assert_eq!(error.delivery, Delivery::Withheld, "never as sent");
+    assert!(account_shaped(nested, true));
+    let context = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null,null]}}"#;
+    let event = crate::codex_event::decode(context).unwrap();
+    assert!(event.is_context_window_failure());
+    assert!(preserved_rejection(context));
+    assert!(matches!(
+        crate::codex_event::context_window_event(context),
+        Some(std::borrow::Cow::Borrowed(sent)) if sent == context
+    ));
+    let Reading::Failure { error, .. } = reading(context, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.status, 400);
+    // A four-member array is no `Error`: no context window, and no classification. It is
+    // still read by position for account safety (`codex_event::safety_views`).
+    let short = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null]}}"#;
+    assert!(!crate::codex_event::decode(short).unwrap().is_context_window_failure());
+    assert!(account_shaped(
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited"]}}"#,
+        true
+    ));
+}
+
+/// #25 criterion 7 and #6 (review findings 1 and 2): a failure slot a pinned reader reads
+/// by position keeps what the upstream wrote in it when the typed decode refuses it.
+/// Processing and safety are separate facts. A `response.failed` whose `response.error`
+/// array the `Error` struct refuses stays the pinned generic stream error, classified 502
+/// as before, and is withheld when that array reads as an account failure by position. A
+/// wrapped array neither pinned struct accepts stays skipped: it is passed, never a
+/// failure, and withheld when it reads as one. Safe refused arrays and opaque arrays reach
+/// the client as sent, and their classification does not change.
+#[test]
+fn refused_failure_slots_are_read_for_account_safety() {
+    let account = |name: &str| !name.contains("safe") && !name.contains("empty") && !name.starts_with("opaque");
+    let mut checked = [0usize; 4];
+    for case in notice_readings().iter().filter(|c| c["group"] == "refused") {
+        let name = case["name"].as_str().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+        let event = crate::codex_event::decode(raw);
+        assert_eq!(event.is_some(), case["accepted"].as_bool().unwrap(), "{name}");
+        let ws = case["ws"].as_str().unwrap();
+        // The group's read-on frames are decoded `error` events without a status, which
+        // the proxy's documented status-less reading fails (`assert_pinned_reading`).
+        let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
+        let fails = ws == "fail" || (ws == "read-on" && decoded_error && statusless(raw));
+        match (fails, ws, reading(raw, event.as_ref(), false)) {
+            (true, _, Reading::Failure { mut error, .. }) => {
+                if ws == "fail" {
+                    assert_eq!(case["pinned"], "fail Stream", "{name}");
+                }
+                assert_eq!(error.status, 502, "{name}: the generic failure keeps its status");
+                if account(name) {
+                    assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                    deliver_as_sent(&mut error, raw);
+                    assert_eq!(error.delivery, Delivery::Withheld, "{name}: never as sent");
+                    checked[0] += 1;
+                } else {
+                    assert_eq!(error.delivery, Delivery::Classified, "{name}");
+                    deliver_as_sent(&mut error, raw);
+                    assert_eq!(
+                        error.delivered_event().map(|b| b.as_ref()),
+                        Some(raw.as_bytes()),
+                        "{name}"
+                    );
+                    checked[1] += 1;
+                }
+            }
+            (false, "skip", Reading::Passed { decoded: false }) => {
+                assert_eq!(account_shaped(raw, false), account(name), "{name}");
+                checked[if account(name) { 2 } else { 3 }] += 1;
+            }
+            (_, ws, _) => panic!("{name}: pinned {ws}, read otherwise"),
+        }
+    }
+    assert_eq!(checked, [9, 4, 5, 3]);
+    // The projections are read, never delivered: the frame itself is unchanged, and an
+    // accepted slot keeps the classification view's reading alone.
+    let accepted = r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited",null,null,null]}}"#;
+    assert!(crate::codex_event::safety_views(accepted).is_empty());
+    assert!(crate::codex_event::safety_views(r#"{"type":"response.completed","response":{"id":"r"}}"#).is_empty());
+    let views = crate::codex_event::safety_views(
+        r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error",{"$serde_json::private::RawValue":"\"rate_limit_exceeded\""},"m"]}}"#,
+    );
+    assert_eq!(
+        views,
+        [
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"m"}}}"#
+        ]
+    );
+}
+
+/// #6 (review finding 2): the pinned wrapped mapping keeps an explicit `status: 400` for
+/// the scheduler, while the frame's own error is a rate limit carrying the credential's
+/// token. The failure stays 400 and the frame is withheld, in every representation that
+/// reads that way; a 400 whose error reads as no account failure still reaches the client
+/// as sent.
+#[test]
+fn explicit_status_account_errors_keep_their_status_and_are_withheld() {
+    for case in pinned_readings() {
+        let name = case["name"].as_str().unwrap();
+        if !name.starts_with("conflict-") {
+            continue;
+        }
+        let raw = case["raw"].as_str().unwrap();
+        let event = crate::codex_event::decode(raw);
+        if name == "conflict-raw-code-array" {
+            // Neither pinned struct reads it (its `error.code` is a private raw value), so
+            // the pinned reader skips it (review finding 2): it stays skipped, and its
+            // wrapped slots, read by position, withhold it.
+            assert_eq!(case["ws"], "skip");
+            assert!(
+                matches!(reading(raw, None, false), Reading::Passed { decoded: false }),
+                "{name}"
+            );
+            assert!(account_shaped(raw, false), "{name}");
+            continue;
+        }
+        match reading(raw, event.as_ref(), false) {
+            Reading::Failure { mut error, .. } => {
+                assert_eq!(error.status, 400, "{name}");
+                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                deliver_as_sent(&mut error, raw);
+                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+            }
+            Reading::Passed { .. } | Reading::Event { .. } => panic!("{name}"),
+        }
+    }
+    // A decoded failure keeps the pinned last-key reading: a rate-limit `type` the
+    // `Value` replaces with a later one is no account failure.
+    let first = r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","type":"invalid_request_error","message":"bad input"}}}"#;
+    let event = crate::codex_event::decode(first).unwrap();
+    let Reading::Failure { error, .. } = reading(first, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!((error.status, error.delivery), (400, Delivery::Classified));
+    let plain = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":"bad"}}"#;
+    let event = crate::codex_event::decode(plain).unwrap();
+    let Reading::Failure { mut error, .. } = reading(plain, Some(&event), false) else {
+        panic!("a failure");
+    };
+    assert_eq!(error.delivery, Delivery::Classified);
+    deliver_as_sent(&mut error, plain);
+    assert_eq!(error.delivered_event().map(|b| b.as_ref()), Some(plain.as_bytes()));
+}
+
+/// #25 (review finding 3): an explicit zero status is a status. With a private raw value
+/// as `error.code` the frame is no pinned wrapped event, the pinned `error` branch reads
+/// its logical code `x` and goes on; so does the proxy, as for the same frame with the
+/// code resolved. A logical rate limit is withheld without failing; a logical terminal
+/// provider code still fails; only a missing or `null` status keeps the status-less
+/// failure reading.
+#[test]
+fn explicit_zero_status_is_a_notice() {
+    let frame = |status: &str, code: &str| {
+        let status = if status.is_empty() {
+            String::new()
+        } else {
+            format!(r#""status":{status},"#)
+        };
+        format!(
+            r#"{{"type":"error",{status}"error":{{"code":{{"$serde_json::private::RawValue":"\"{code}\""}},"message":"notice"}}}}"#
+        )
+    };
+    let read = |raw: &str| {
+        let event = crate::codex_event::decode(raw).unwrap();
+        match reading(raw, Some(&event), false) {
+            Reading::Failure { error, .. } => Some(error.status),
+            Reading::Passed { decoded: true } => None,
+            _ => panic!("{raw}"),
+        }
+    };
+    for status in [
+        "0",
+        "-0",
+        "-1",
+        "70000",
+        "\"0\"",
+        "0.0",
+        "[]",
+        r#"{"$serde_json::private::Number":"0"}"#,
+    ] {
+        assert_eq!(read(&frame(status, "x")), None, "{status}");
+        let limited = frame(status, "rate_limit_exceeded");
+        assert_eq!(read(&limited), None, "{status}");
+        assert!(account_shaped(&limited, true), "{status}");
+        assert!(read(&frame(status, "budget_reached")).is_some(), "{status}");
+    }
+    assert!(crate::codex_event::status_present(r#"{"status_code":0}"#));
+    assert!(!crate::codex_event::status_present(
+        r#"{"status":null,"status_code":null}"#
+    ));
+    for status in ["", "null", r#"{"$serde_json::private::RawValue":"null"}"#] {
+        assert_eq!(read(&frame(status, "x")), Some(502), "{status}: status-less");
+    }
+}
+
+/// #6 by the pinned client's failure kinds (`sse/responses_error.rs:48-103`,
+/// `api_bridge.rs:136-140,212-255` at 44ccf394573c): each account code or type is read in
+/// the error objects a reading of the frame's type reads, and nowhere else. Generated
+/// frames.
+#[test]
+fn pinned_account_kinds_follow_the_slots_each_frame_type_reads() {
+    for code in super::PINNED_ACCOUNT_CODES {
+        for frame in [
+            format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#),
+            format!(r#"{{"type":"response.failed","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"error","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"error","status":503,"body":{{"error":{{"code":"{code}"}}}}}}"#),
+        ] {
+            assert!(super::pinned_account_kind(&frame), "{frame}");
+            assert!(super::account_sensitive(502, &frame), "{frame}");
+        }
+        for frame in [
+            // A slot no reading of that type reads, or no failure frame at all.
+            format!(r#"{{"type":"error","response":{{"error":{{"code":"{code}"}}}}}}"#),
+            format!(r#"{{"type":"response.output_text.delta","error":{{"code":"{code}"}}}}"#),
+            format!(r#"{{"type":"response.failed","response":{{"error":{{"message":"{code}"}}}}}}"#),
+        ] {
+            assert!(!super::pinned_account_kind(&frame), "{frame}");
+        }
+    }
+    for kind in super::PINNED_ACCOUNT_TYPES {
+        let frame = format!(r#"{{"type":"error","status":429,"error":{{"type":"{kind}"}}}}"#);
+        assert!(super::pinned_account_kind(&frame), "{frame}");
+    }
+    for code in [
+        "invalid_prompt",
+        "context_length_exceeded",
+        "server_is_overloaded",
+        "x",
+        "budget_reached",
+    ] {
+        let frame = format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#);
+        assert!(!super::pinned_account_kind(&frame), "{frame}");
+    }
+}
+
+/// #25 R3: a loss belongs to one socket, and the downstream handler takes each socket's
+/// loss once. A loss it took never fires again, nor counts as pending; a replacement
+/// socket starts without a loss and reports its own; a late notice from a replaced
+/// socket's reader reports nothing; and a dial that starts supersedes the earlier loss
+/// even when that dial fails. A subscription made later still finds the latest
+/// socket's loss.
+#[tokio::test]
+async fn each_socket_reports_its_own_loss_once() {
+    async fn quiet(losses: &mut SessionLosses) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), losses.next())
+            .await
+            .is_err()
+    }
+    async fn fires(losses: &mut SessionLosses, what: &str) -> String {
+        let loss = tokio::time::timeout(Duration::from_secs(2), losses.next())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no loss fired"));
+        String::from_utf8_lossy(&loss.error.body).into_owned()
+    }
+    let lost = |text: &str| transport(text);
+    // The attempt serves on `id` ([`Upstream::bind`]).
+    let acquire = |session: &Session, id: u64| session.acquired.store(id, std::sync::atomic::Ordering::Release);
+    let pool = Pool::default();
+    let session = pool.session("s");
+    let mut losses = pool.losses("s");
+    let shadow = losses.clone();
+    let a = session.begin_socket();
+    acquire(&session, a);
+    assert!(shadow.pending().is_none());
+    session.notify(a, &lost("a lost"));
+    assert_eq!(&shadow.pending().unwrap().body[..], b"a lost", "pending until taken");
+    assert_eq!(fires(&mut losses, "a").await, "a lost");
+    assert!(shadow.pending().is_none(), "a taken loss is not pending");
+    session.notify(a, &lost("a again"));
+    assert!(quiet(&mut losses).await, "a socket reports one loss");
+    // A replacement socket: a replaced socket's late notice is nobody's loss.
+    let b = session.begin_socket();
+    acquire(&session, b);
+    session.notify(a, &lost("a late"));
+    assert!(quiet(&mut losses).await, "a replaced socket reports nothing");
+    assert!(shadow.pending().is_none());
+    session.notify(b, &lost("b lost"));
+    assert_eq!(&shadow.pending().unwrap().body[..], b"b lost");
+    assert_eq!(fires(&mut losses, "the replacement's loss").await, "b lost");
+    // A loss nobody took is superseded by the next dial, whether or not it succeeds.
+    let c = session.begin_socket();
+    session.notify(c, &lost("c lost"));
+    let _d = session.begin_socket();
+    assert!(shadow.pending().is_none(), "the dial superseded the earlier loss");
+    assert!(quiet(&mut losses).await);
+    // A new subscription finds the latest socket's loss, taken or not by another one.
+    let e = session.begin_socket();
+    session.notify(e, &lost("e lost"));
+    let mut later = pool.losses("s");
+    assert_eq!(fires(&mut later, "a later subscription").await, "e lost");
+    assert_eq!(fires(&mut losses, "e").await, "e lost");
+}
+
+/// #25 R1: a loss stands in for an attempt's failure only when it is the loss of the
+/// socket that attempt acquired. A new attempt owns no socket until it serves on one; a
+/// socket an earlier attempt lost reports nothing more once a new attempt starts, a late
+/// notice from its reader included. A live socket that served the last turn keeps its
+/// own loss across a new attempt: when it closes, the connection's watcher still gets
+/// it. Starting an attempt on a session that never existed creates none.
+#[tokio::test]
+async fn an_attempt_owns_only_the_socket_it_acquired() {
+    // A live socket: the turn completed on it and keeps it.
+    let close = Arc::new(tokio::sync::Notify::new());
+    let (_up, url) = upstream(vec![Act::SendCloseOn(vec![CREATED, COMPLETED], close.clone())]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let response = executor
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .unwrap();
+    assert!(collect(response).await.iter().all(Result::is_ok), "the turn completed");
+    let mut losses = executor.session_losses("conn-1");
+    executor.begin_session_attempt("conn-1");
+    assert!(losses.pending().is_none());
+    close.notify_one();
+    let loss = tokio::time::timeout(Duration::from_secs(5), losses.next()).await;
+    let loss = loss.expect("a live socket's later loss still reaches the watcher");
+    assert!(!loss.acquired, "not the new attempt's socket: no failure of its turn");
+    assert!(
+        losses.pending().is_none(),
+        "a socket the new attempt did not acquire is not its failure"
+    );
+    // An attempt that served on a socket owns its loss.
+    let pool = Pool::default();
+    let session = pool.session("s");
+    let mut watch = pool.losses("s");
+    let acquire = |id: u64| session.acquired.store(id, std::sync::atomic::Ordering::Release);
+    let a = session.begin_socket();
+    acquire(a);
+    session.notify(a, &transport("a lost"));
+    assert_eq!(
+        watch.pending().map(|l| l.body),
+        Some(Bytes::from_static(b"a lost")),
+        "the attempt's own socket"
+    );
+    // The next attempt fails before it acquires anything: the lost socket is not its
+    // failure, and its reader's late notice reports nothing.
+    pool.begin_attempt("s");
+    assert!(watch.pending().is_none(), "a new attempt owns no earlier loss");
+    session.notify(a, &transport("a late"));
+    assert!(watch.pending().is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), watch.next())
+            .await
+            .is_err(),
+        "a lost socket's late notice never fires once a new attempt started"
+    );
+    // A socket dialed but not yet served on: its loss reaches the watcher, not the
+    // attempt's failure.
+    let b = session.begin_socket();
+    session.notify(b, &transport("b lost"));
+    assert!(watch.pending().is_none(), "not acquired");
+    let b_loss = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .expect("the latest socket's loss still fires");
+    assert!(!b_loss.acquired, "a socket not served on is no attempt's failure");
+    pool.begin_attempt("never-made");
+    assert!(
+        pool.get("never-made").is_none(),
+        "starting an attempt creates no session"
+    );
 }

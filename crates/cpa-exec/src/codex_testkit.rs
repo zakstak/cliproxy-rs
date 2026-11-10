@@ -140,7 +140,7 @@ impl Wiretap {
 }
 
 impl cpa_core::exec::CaptureObserver for Wiretap {
-    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>) {
+    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>, _: &cpa_core::exec::SentCredentials) {
         use cpa_core::exec::CaptureEvent::*;
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         let account = |i: &cpa_core::exec::UpstreamRequest<'_>| {

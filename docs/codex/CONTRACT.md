@@ -144,12 +144,29 @@ discretionary mutation, and a migrated route must not perform it.
 | Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
 | Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
-| Answer an empty `response.incomplete` with no client-side reason, before anything was delivered, with a request-scoped 502 | All native profiles | Failure classification of an upstream silent abort. Reasons `interrupted`, `content_filter` and `max_output_tokens` pass unchanged. |
 | Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. |
 | Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
 | Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
+
+No row replaces a provider's `response.incomplete` on a native route. Every one
+reaches the client as received, whatever its reason (absent, `null`, empty, unknown or
+named), output or usage, and however much of the response was delivered before it
+(#25, #7). The earlier row that answered a zero-output end without an exempt reason
+with a request-scoped 502, Go's `IsCodexTerminalEmptyIncomplete`, is removed. No
+first-party or provider source shows that the backend sends that shape as a silent
+abort. The pinned client classifies the event itself
+(`codex-api/src/sse/responses.rs:451-506`): `interrupted` ends the turn with
+`end_turn: false`, `content_filter` is its own error, and any other reason, `unknown`
+when missing or not a string, is a terminal `ResponseIncomplete` carrying the reason,
+response ID, usage and incomplete output items. That error has no retry delay
+(`protocol/src/error.rs:428-442`), so the client neither retries it nor reads it as a
+success. A replacement 502 would drop the ID, usage and partial output and change that
+classification. A stream that ends without any terminal event is a different case and
+still fails ([Native HTTP route](#native-http-route), [Native WebSocket
+route](#native-websocket-route)). The translated route keeps Go's rule until #27
+([Translated route](#translated-route)).
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
 Until it lands, header behaviour stays as it is; see
@@ -369,26 +386,106 @@ The response reaches the client as the upstream sent it:
   with no event renamed, no output repaired and no usage added. Usage, capture and
   failure classification read a copy. The observer splits lines as the shared SSE
   framer does (`\r\n`, `\r` or `\n`) and joins a multiline `data` field in one pass.
-- Leading handshake events are held under `stream-bootstrap-buffering`. A failure that
+- Leading handshake events are held under `stream-bootstrap-buffering`, using their
+  decoded classification view; positional and object envelopes are held alike. A failure that
   arrives before anything was delivered fails over to another credential when its scope
   allows it; otherwise the provider's event is delivered. After something was delivered,
   a failure ends the stream after its event and is never replayed on another credential.
+- Every `response.incomplete` is a terminal event and reaches the client as received, at
+  any stage, including as the first event and after events held for bootstrap.
+  [Permitted transformations](#permitted-transformations) explains why nothing replaces
+  it.
 - A stream that ends without a terminal event ends for the client too, without a local
-  event. The attempt records a request-scoped 408. A final event the upstream left open
-  gets the line endings that close it.
+  event. The proxy invents neither a `response.incomplete` nor a completion for it. The
+  attempt records a request-scoped 408. A final event the upstream left open gets the
+  line endings that close it.
+- The observer reads upstream events as the pinned client decodes them, not through the
+  client [request boundary](#request-boundary). The pinned client decodes each event
+  into `ResponsesStreamEvent` and skips an event that does not decode
+  (`sse/responses.rs:161-179`, 633-643). An event decodes when it is one JSON value
+  whose known members (`type`, `headers`, `metadata`, `response`, `response_id`,
+  `error`, `item`, `item_id`, `call_id`, `delta`, `text`, `summary_index`,
+  `content_index`, `safety_buffering`) each appear at most once, with the struct's
+  types, and whose `type` is a string. Unknown members are ignored, repeated or not.
+  A key repeated inside a known member's value is ignored too, and the client's
+  `serde_json::Value` keeps the last one. A number of any size counts, because the
+  first-party build enables serde_json's `arbitrary_precision` and `raw_value`
+  (`exec-server-protocol/Cargo.toml:25`; `Cargo.lock` pins serde_json 1.0.149). With
+  them, that `Value` reads an object whose first key is serde_json's private
+  `$serde_json::private::Number` or `$serde_json::private::RawValue` token as a number
+  or as JSON text, and refuses it unless it has that one member holding exactly one
+  JSON number, or JSON text that itself decodes. The token is an ordinary key anywhere
+  else, and in unknown members. `crates/cpa-exec/src/codex_event.rs` makes the same
+  decision with the same serde-derived shape and a one-pass check of each known
+  `Value` member for nesting, surrogate escapes and those tokens; the proxy's own
+  serde_json features stay unchanged. Only a decoded event ends the response, fails
+  it, is converted (#5) or feeds usage. An event that does not decode, such as invalid
+  JSON, a repeated `type` or `response`, a known member of the wrong type, or an
+  invalid private token, passes as sent. It counts as delivered content, and the
+  stream goes on to the next event.
+- A decoded event ends the response only where the pinned reader of the client ends it
+  (`process_responses_event`, `sse/responses.rs:375-562`, and its callers). Both
+  readers end on a `response` that reads as `ResponseCompleted` (lines 109-159: a
+  string `id`, and a `usage`, `usage_metadata` and `end_turn` of their types or
+  absent) on a `response.completed` or an interrupted `response.incomplete`, and on a
+  `response.incomplete` with any other reason but `content_filter`, which is a
+  `ResponseIncomplete` the SSE reader returns at once (lines 680-688). A
+  `response.completed` whose `response` is missing or `null` returns no event, and
+  `response.done` is not handled, so both pass as sent and the stream goes on; usage
+  skips them. The readers part on a processing error: a `response` that does not read
+  as `ResponseCompleted`, on a `response.completed` or an interrupted
+  `response.incomplete`, and a content-filter `response.incomplete`. The SSE reader
+  records it and reads on (lines 677-690); the WebSocket reader returns it, ending the
+  turn and retiring its socket (`endpoint/responses_websocket.rs:968-978`, 387-395).
+  `crates/cpa-exec/src/codex_event.rs` reads `ResponseCompleted` with the pinned
+  struct's shape (positional arrays, missing `Option`s and defaults included), the last
+  of a repeated key and the first-party `Value`'s private tokens; a 355-case
+  differential against the pinned code built with serde_json 1.0.149 and its features
+  matches every outcome.
+- Over HTTP the client is an SSE reader, so such an event passes as sent and the
+  response goes on. A later terminal event ends it and decides it: a streaming client
+  receives every event, a buffered answer is that later event's `response` object, and
+  usage is that event's, never the earlier one's. When the upstream ends cleanly
+  without one, the response ends on the last such event: the pinned SSE reader then
+  reports the error it recorded (lines 616-621), which the client reads from the event
+  it has, so nothing is added to the stream. A buffered answer is that event's
+  `response` object, and the one record carries its reported usage, not failed. Only a
+  clean end does that: a read failure before any terminal event fails the attempt,
+  because the pinned SSE reader returns a read error at once (lines 602-614). A
+  streaming client gets the read failure after the events, and a buffered client the
+  request-scoped 408 of a stream without a terminal event; either record is failed and,
+  like every failure record (`PublishFailure`), carries no tokens. A terminal event or
+  failure before the read failure still decides the answer. A failure event after it
+  ends the response as any failure does. A stream that ends with no
+  terminal event and no such event still fails with the request-scoped 408. A
+  WebSocket turn served over HTTP is read by a WebSocket client, so it ends on such an
+  event, as on an upstream socket ([Native WebSocket route](#native-websocket-route)).
+- A failure is classified as the pinned `Value` holds it: each object keeps the last of
+  a repeated key, compared after unescaping, and a member value that is serde_json's
+  private number or raw value is the number or the JSON text it holds, read the same way
+  (`value/de.rs` `visit_map` at serde_json 1.0.149;
+  `crates/cpa-exec/src/codex_event.rs` `pinned_view`). That reading decides the status, scope,
+  retry hint, usage-limit, capacity and overload checks, the #5 context-window
+  conversion and the account-failure boundary. The client still receives the event's
+  own bytes; #5's converted event embeds the upstream `error` object as sent.
 - An upstream HTTP error keeps its classification for the scheduler, and the client
   receives the upstream's status, body and filtered headers unchanged
   (`ExecError::delivered_status`). The scheduler may classify a usage or capacity limit
   as 429 while the client still gets the upstream's 400 or 503.
 - A buffered `chatgpt` answer is the terminal event's `response` object, byte for byte.
+  For a `response.incomplete` that is the incomplete response, `status` and
+  `incomplete_details` included, under HTTP 200, as the upstream reported it.
   On `api-key` and `compatible`, a JSON answer passes unchanged. Compaction answers pass
   unchanged.
 - A failure event the client does not receive as an event (a buffered answer, or a
   failure before anything was delivered that the scheduler fails over) is delivered as
   `{"error":<the provider's error object>,"sequence_number":<as sent>}`, byte for byte
-  from the event, or as the whole event when it has no error object. Nothing is filled
-  in. It arrived on an HTTP 200, so its status is the classified one.
+  from the event, or as the whole event when it has no error object or its `response`
+  repeats `error`. Nothing is filled in. It arrived on an HTTP 200, so its status is
+  the classified one.
 - The alias `force-mapping` model rewrite does not run.
+- Nothing above delivers an authentication value the request carried
+  ([Credential isolation](#credential-isolation)).
 
 [Settings](#settings) lists the final outcome of every Codex rewrite and impersonation
 control on every route.
@@ -480,7 +577,21 @@ reconnect. A pick that is lost or released, a credential that Home's snapshot ma
 unavailable, or a continuation for another model drops the pin, and the continuation
 closes with 1012. When it cannot, the connection closes with 1012,
 and the continuation never moves to another socket or account. When the upstream socket
-is lost, the client connection closes, and the client recovers on its own. On a new
+is lost, the client connection closes, and the client recovers on its own. A loss reported
+while the turn's request has not been served yet is the loss of a socket its own attempt
+already failed on: it does not close the connection, and the turn fails over to another
+credential or delivers that failure itself. Each socket's loss is its own. The loss of the
+socket that then serves closes the connection like any other, idle or during a response,
+and a failure on that socket renders its own error, never the loss let pass during
+failover. A replaced socket's late loss reports nothing. A loss renders only in place of a
+failure of the attempt that acquired that socket. An attempt that fails before it serves
+on a socket (over HTTP, on another provider, or refused while it prepares its request)
+fails with its own error. Once a new attempt starts, a socket already lost reports nothing
+more, while a live socket keeps its own loss. The loss of a retained socket that the
+current attempt did not acquire (the turn runs over HTTP or on another provider) does not
+end that turn. A continuation always needs the socket that holds its previous response,
+whatever transport the connection's last turn used: when that socket is gone, the
+continuation closes with 1012 and nothing reaches the upstream. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:
@@ -520,7 +631,33 @@ Leading events are held under `stream-bootstrap-buffering`, but they are never c
 
 Every upstream failure frame keeps two readings: the scheduler's classification, which
 drives failover and credential health, and the frame itself, which is what the client
-receives (`ExecError::delivered_event`).
+receives (`ExecError::delivered_event`). Classification reads the frame as the pinned
+reader decodes it (`codex_event::classification_view`), on every native path: serde
+reads a derived struct from a JSON array by position, so a `ResponsesStreamEvent` such
+as `["response.failed",null,null,{"id":"r1","error":{…}},null,…]` or a wrapped status
+error such as `["error",429,{"code":…}]` is read as the object of the members it
+decodes to, each value as sent, a `null` member absent and nothing outside the struct
+added (a positional event has no `status`). Members are then read with the last of a
+repeated key and private values resolved. A `Value` member that is an array stays one,
+with one exception: a `response.failed`'s `response.error`, which `parse_failed_response`
+reads into its `Error` struct (`sse/responses_error.rs:14-24`), so also by position. Five
+or six members, each `null` or of its member's type, read as the object of those members
+(`type`, `code`, `message`, `plan_type`, `resets_at`, `misalignment`), and the failure
+classifies as that object does; any other array is one that struct refuses, which the
+pinned reader reports as its generic stream error, and it stays an array. An `error`
+event's `error` is read only by `Value::get` there (`parse_terminal_provider_error`), so
+an array in it stays one.
+Account safety reads a failure slot by position even when its typed decode refuses it
+(`codex_event::safety_views`), because processing eligibility and safety are separate
+facts: a refused struct still carries what the upstream wrote in it. A `response.failed`'s
+refused `response.error` array, and its own `error` array, which the proxy's failure
+reading falls back to, are named as `Error` names its members; an `error` event's `error`
+array as `WrappedWebsocketError` names them and as `Error` does; and a frame written as an
+array that neither `ResponsesStreamEvent` nor `WrappedWebsocketErrorEvent` accepts as each
+of those structs names its members, extra elements left out. That reading never classifies,
+settles or cools; it only decides whether the client may receive the frame.
+A status-less context-window `error` written that way becomes the #5 `response.failed`
+built from the bytes of its members.
 
 - A failure that is not an account failure reaches the client as the upstream sent it.
   This covers `response.failed`, a status-less `error` and the wrapped status `error`
@@ -542,15 +679,132 @@ receives (`ExecError::delivered_event`).
   Before eviction, assigning an unmatched ID to the oldest pending create is inherited
   proxy policy from Go, with unknown provider applicability. The pinned client supplies
   no FIFO ownership rule for steering failures.
+- A decoded event names its response by the `response.id` the pinned `Value` reads: the
+  last of a repeated `id`, with private values resolved (`Event::response_id`). A
+  `response.completed` whose `response` reads as `ResponseCompleted` names the
+  response that reading carries, the same decoding that decides it ends the response:
+  `ResponseCompleted` written as a JSON array (serde's positional struct form) names
+  its first element, which `Value::get` would not find; `response.created` and every
+  other event keep the `Value::get` reading. A
+  steering connection binds a `response.created` to that ID, feeds usage to and settles
+  the response it names, and an ordinary turn and the interrupt bookkeeping end that
+  response. Delivery keeps the event as sent.
 - An account failure (classified 401, 402, 403 or 429) never reaches the client as sent,
   on any path: an ordinary turn, the first or a later response of a steering connection,
   or a create still waiting in the duplex queue. Its frame can name the pooled account or
   carry its tokens. The client gets the allowlisted subscription-limit event when it is an
   official Codex client (#6), or else a silent close. The scheduler still receives the
-  classification, so the credential cools as before.
-- Two exceptions stay. A Codex client gets the status-less context-window `error` as
-  `response.failed` (#5). An empty `response.incomplete` before any content is a
-  request-scoped 502 (#7).
+  classification, so the credential cools as before. The same holds for a failure whose
+  own error is an account failure under the status-frame or terminal failure reading, read
+  as the pinned reader decodes the frame (`codex_ws::account_sensitive`: the last of a
+  repeated key, private values, positional structs), or read by position where a pinned
+  struct refuses the slot (above): the pinned wrapped mapping keeps an
+  explicit `status: 400` beside a rate-limit error, so the scheduler records that 400 and
+  cools nothing, while the frame is withheld; a `response.failed` whose refused
+  `response.error` array reads as a rate limit by position keeps the generic 502 and its
+  cooldown, while the frame is withheld. A failure whose error is one of the pinned
+  client's account kinds is withheld too, whatever status Go's table gives it
+  (`codex_ws::pinned_account_kind`): `RateLimitExceeded` (`rate_limit_exceeded`,
+  `slow_down`), `QuotaExceeded` (`insufficient_quota`, `credit_balance_exhausted`,
+  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, and
+  `organization_usage_limit_exceeded` on a 429) and `UsageNotIncluded`
+  (`usage_not_included`), read from a `response.failed`'s `response.error` or own `error`
+  and an `error` frame's `error` or `body.error` (`sse/responses_error.rs:48-103`,
+  `api_bridge.rs:136-140,212-255`); the types `usage_limit_reached`,
+  `usage_not_included` and `insufficient_quota` count the same. Their message, plan and
+  reset describe the pooled account. Only delivery changes: Go's table still classifies
+  `slow_down` and `insufficient_quota` as 502 and `usage_not_included` as it did, so
+  cooldowns and failover are unchanged. A decoded failure whose first repeated
+  `type` is a rate limit but whose last is not is no account failure, as the pinned
+  `Value` reads it, and reaches the client as sent. Withheld
+  means the client also gets no rendering of the frame's error (the error the server would
+  otherwise build from the classified body, or a close reason taken from it): the decision
+  travels on the error (`ExecError::delivery`), so it holds wherever the failure ends the
+  connection, after bootstrap failover and as the session's loss too. On a steering
+  connection such a later failure ends the connection like an account failure, failing
+  every open record and queued create with its classified status.
+- One exception stays: a Codex client gets the status-less context-window `error` as
+  `response.failed` (#5).
+- Every frame passes the upstream event boundary of the
+  [native HTTP route](#native-http-route), on an upstream socket, a steering connection
+  and a turn served over HTTP. The WebSocket reader has one more reading. A frame that
+  is not a `ResponsesStreamEvent` can still be a wrapped status `error`
+  (`responses_websocket.rs:684-709`, 864-884), decided as the next item describes. The SSE reader has no such reading, so over HTTP
+  it is a frame that does not decode. A frame that does not decode passes as sent and
+  ends, fails and settles nothing, with one exception. When its failure reading would
+  be an account failure, it is withheld, because it can name the pooled account. That
+  reading takes the first and the last of a repeated key (a JSON reader keeps one or
+  the other) and, when a member the failure readings read repeats (`type`, `status`,
+  `status_code`, `error`, `code`, `message`, `error_type`, `response.error`, and the
+  `type`, `code`, `status`, `status_code` and `message` of either error object), every
+  other occurrence too, since a reader that acts on members as they stream past can
+  take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`), and the frame's `param`,
+  which a status-less reading copies. A member repeats when its path does: the same key
+  twice in one object, or inside a repeated ancestor such as the frame's `response`.
+  `error.type` and `response.error.type`, once each, repeat nothing. Each occurrence is checked on its own, in one pass,
+  except the capacity check, which reads the error body a reading composes from several
+  members (the error object as sent, the frame's `message`, `code`, `error_type` and
+  `param`, and a message taken from the other error object): one summary of every piece
+  any reading could compose decides it, so `model` in one member and `at capacity` in
+  another count together. An ambiguous frame can therefore be withheld that no single
+  reading classifies as an account failure; the pinned client skips it either way. A
+  private number or raw value is read as sent and as the pinned `Value` reads it. A
+  frame written as an array that neither pinned struct accepts is also read by position
+  (above), so a wrapped error array whose `error.code` is a private raw value is withheld
+  when it reads as an account failure. It
+  is not classified either, so the credential does not cool and the turn goes on. A
+  decoded frame keeps the pinned last-key classification.
+- On an upstream socket a wrapped frame (a frame that does not decode, or a decoded
+  `error`, that decodes as `WrappedWebsocketErrorEvent`) is decided by the pinned
+  mapping (`responses_websocket.rs:712-764`). `previous_response_not_found` and
+  `websocket_connection_limit_reached` fail the turn whatever the status, and reach
+  the client as sent. A status `http::StatusCode` accepts (100 to 999) that is not a
+  success fails it by that status. A success status, or one outside 100 to 999, maps
+  to no error: the frame is a notice that passes as sent (or is withheld when it would
+  read as an account failure), ends nothing and cools nothing. A decoded notice still
+  fails the turn when the pinned `error` branch raises its logical code (including
+  an error object or code represented by a private raw value)
+  (`parse_terminal_provider_error`, `error.rs:79-127`). A decoded `error` that carries
+  a status but is not a wrapped frame is a notice too, whatever Go's integer reading
+  makes of the status: the pinned reader has no wrapped event and goes on to the `error`
+  branch, which reads no status (`sse/responses.rs:375-385`). That covers a status the
+  wrapped struct cannot read as a `u16` (negative, too large, a fraction or exponent
+  such as `429.0` or `4.29e2`, a string such as `"429"`, `" 429"` or `"+429"`, a private
+  number or raw value, a container) and a frame the struct refuses for another member
+  (`status` beside `status_code`, a repeated `status`, a private raw value as
+  `error.code`, which `WrappedWebsocketError` cannot read as a `String`); zero, which
+  `StatusCode::from_u16` refuses, is a wrapped notice already. Such a frame is checked
+  for a terminal provider code, which still fails the turn (by the status-frame reading's
+  status when that is an error status, else by the terminal failure reading), and
+  otherwise passes or is withheld as account-shaped; the turn goes on and nothing cools.
+  `codex_pinned_notice_readings.json` records the pinned decision for each spelling. Only
+  a decoded `error` with no status at all (every `status` and `status_code` missing or
+  `null`) keeps the status-less failure reading above. Over HTTP the SSE reader has no wrapped reading, and the proxy's HTTP reading
+  stays as described for the native HTTP route.
+- Every `response.incomplete` reaches the client as received, on an ordinary turn, a
+  steering connection and a turn served over HTTP, at any stage: as the turn's first
+  event, after events held for bootstrap, or after output. The socket stays for the next
+  turn, and the credential does not cool. A WebSocket client's turn ends on a
+  processing error as on a terminal event (a content filter, or a `response` that does
+  not read as `ResponseCompleted`), because the pinned WebSocket reader returns that
+  error and retires its socket; on a turn served over HTTP too, although the SSE
+  upstream would have more to read. Its record carries the event's reported usage, not
+  failed. A steering connection relays every frame, so a later completion also reaches
+  the client, which decides. Passive accounting records the response once,
+  as it records any terminal event the provider sends. An upstream socket that closes or
+  fails before the terminal event still ends the turn with that failure, and the proxy
+  invents no terminal event for it.
+- A steering connection's duplex reads the client's later frames once the first
+  response's `response.created` has reached the client. When upstream ends the first
+  response without one, the duplex starts reading once that terminal event has reached
+  the client. Only the bootstrap create was outstanding, so that terminal event settles
+  it. Its usage record is published once, with what the terminal reported, and later
+  creates get records of their own. The next create runs on the same socket with the
+  bootstrap's settings. The proxy invents no `response.created`, and the terminal's
+  response ID binds no retained settings. Go reads later frames only after a
+  `response.created` (`codex_websockets_duplex.go:391`, 601-605), so a create sent on
+  such a connection waits there with no answer. Whether a provider sends that shape is
+  unknown. The pinned client does not use the steering transport.
 - The interrupt regressions stay. An interrupt acknowledgement that arrives after the
   terminal event is still delivered. A late interrupt does not poison the next turn. An
   interrupted `response.incomplete` passes unchanged.
@@ -676,6 +930,90 @@ An upstream handshake that answers 426 fails the turn with that status. No proxy
 HTTP conversion follows. The pinned client's own HTTP fallback runs only for its own
 upgrade, and the proxy's downstream upgrade has already succeeded.
 
+## Credential isolation
+
+An upstream can write the authentication value it received into its answer: an error
+message that quotes the bearer token, a close reason, a header. The native routes deliver
+the upstream's own bytes, so they check every delivery against the values the request
+that produced it actually carried (`crates/cpa-exec/src/codex_secret.rs`, #25 acceptance
+criterion 7). This is a backstop for the selected credential. It is not the #6 account
+reading above, which decides by what a failure means.
+
+- **Which values.** The values are the credential of each `Authorization` header (the
+  token after `Bearer`), each cookie value, each API-key header, and a password in the
+  URL, taken from the request as sent upstream: the HTTP request, or the handshake of the
+  socket that reads the frame. A reused socket keeps its own handshake's values, even
+  after the credential was refreshed. A fresh dial, a refreshed HTTP request and a
+  failover attempt each get their own. Routing, account, session and cache identities
+  (`chatgpt-account-id`, `session_id`) are no authentication values. Neither is the same
+  text from another account, a saved login or a configured credential that this
+  request did not carry. Empty values match nothing.
+- **Which spellings.** The check reads the original bytes, whatever a parser makes of
+  them. It covers a frame the pinned client cannot decode, a repeated member that a
+  last-key reader drops, an array, an opaque or refused failure slot, a private raw value
+  and invalid JSON. A value counts as written and under up to 16 rounds of JSON
+  unescaping over every byte (`\"`, `\\`, `\/`, the control escapes and `\uXXXX`, surrogate
+  pairs included), so an escaped spelling and a raw value's string inside a string count
+  too. Bytes still unescaping after the last round count as carrying a value. An HTTP
+  stream is checked event by event, after the shared SSE framer has joined its chunks.
+- **What it changes.** Delivery only. Eligibility, classification, settlement, cooldown,
+  usage and the pinned outcome are decided before the check and stay as they are.
+  - A frame that carries a value is not delivered, and the response goes on as the
+    processing decided. For a frame the pinned reader skips, or a notice, the real
+    completion follows and nothing cools. For an ordinary event, only that event is
+    missing. For an event a WebSocket turn ends on, the turn ends without it: an upstream
+    socket's turn closes silently (the server's "stream closed before
+    `response.completed`" close), with its record and usage as processed. An HTTP stream
+    ends without the event, so the client reads a stream that closed before completion.
+    On a steering connection, such an event, or a later failure that carries a value,
+    ends the connection with a silent close, because the client would otherwise wait for a
+    response that already ended. The response's own record is settled as processed, and
+    every other open record and queued create fails with the connection.
+  - A frame that is not delivered was still served: the executor processed it, so the
+    stream commits on it as on a delivered frame (`ExecResponse::omitted`,
+    `dispatch::finish`). A response whose every frame is withheld, its terminal event
+    included, keeps the outcome processing gave it: one execution, a successful record
+    with the usage the upstream reported (none when it reported none), no cooldown. It
+    is not Go's empty stream (`empty_stream`), which cools the credential and runs the
+    request again on another one. A failure or a truncation after a withheld frame stays
+    a failure after delivery, as after a delivered one, an account failure included: it
+    fails the request and is never retried on another account. A steering connection
+    processes its frames before the stream does, and hands the stream every frame it
+    processed, so the stream's guard alone leaves one out and records it.
+  - A failure that carries a value, in its body, the frame it would deliver as sent, or
+    a header it hands the client, becomes `Delivery::Confidential`. Its classified status
+    and scope stay the scheduler's (no conversion to 429). The client gets no frame, no
+    rendering of the body, no subscription-limit event, no close reason and no
+    passthrough headers: a WebSocket client gets a silent close, and an HTTP client gets
+    an error rendered from the classified status alone. This also holds when the failure
+    ends the connection after bootstrap failover, as the session's loss, or as an
+    interrupt's rejection. A cooldown that such a failure starts keeps only its status as
+    the "last error" that a later request's cooldown answer shows.
+  - A buffered or compaction answer that carries a value fails with a request-scoped
+    502 (`codex upstream response withheld: it carried the upstream credential`). It does
+    not fail over, because the upstream served it, and it does not cool the credential.
+    Its record is a failure without tokens. A buffered client has no stream to end.
+  - An upstream response header that carries a value is dropped. An interrupt
+    acknowledgement that carries one is not delivered.
+- **What stays.** A frame without such a value keeps every byte: spacing, number
+  spellings, duplicate members, unknown fields and opaque arrays.
+- **Logs and records.** The request log (`crates/cpa-server/src/request_logging.rs`) and
+  the usage record keep what the upstream answered scrubbed of the same values
+  (`cpa_core::sent::SentCredentials::scrub`): each value as written becomes `[REDACTED]`,
+  and an entry that still carries one in an escaped spelling keeps only its length. This
+  covers every log section and its spool file, the `api.websocket.*` events, the
+  WebSocket timeline's disconnect entry, and every text of the upstream's answer a record
+  keeps: `fail.body`, `response_headers`, `response_model` and `response_service_tier`
+  (`usage_record::Record::upstream_text`). The values are bound as delivery binds them:
+  the request's until a socket serves the turn, then that socket's handshake values; a
+  fresh dial, a refreshed request and a failover attempt bring their own. The binding
+  belongs to the connection, so every record on it, a steering connection's later
+  responses included, is scrubbed of its socket's values whichever publishes first. A
+  record's status, tokens, account and every other field stay as processed. The request
+  body is the client's own bytes and is logged as sent.
+- **What it does not cover.** The translated route (#27) and other providers have no
+  such guard.
+
 ## Translated route
 
 [#27](https://github.com/zakstak/cliproxy-rs/issues/27) puts this route in place. A
@@ -800,7 +1138,11 @@ the translation of the aggregated terminal event. Usage is the provider's. A Cla
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
 provider's counts. Upstream errors keep their classification and reach the client in
-its own error format.
+its own error format. Until #27 replaces it, the translator keeps Go's empty-incomplete
+rule: a `response.incomplete` with no output item, no output delta and
+`output_tokens` 0, whose reason is missing or is not `interrupted`, `content_filter` or
+`max_output_tokens`, becomes a request-scoped 502. The native routes no longer apply it
+([Permitted transformations](#permitted-transformations)).
 
 ### Token counts and images
 
@@ -933,9 +1275,13 @@ Passive accounting reads a copy and changes nothing.
   event (`responses_websocket.rs:919-933`). [Handshake metadata](#handshake-metadata) has the details.
 - Interrupted and incomplete responses. `response.incomplete` with reason `interrupted`
   ends the turn with `end_turn: false`. `content_filter` is its own error. Any other
-  reason is an error that keeps the partial output and usage (`sse/responses.rs:451-512`).
-  The proxy forwards all three as received, and it never turns an incomplete or
-  disconnected response into a successful completion.
+  reason, `unknown` when missing, is a terminal `ResponseIncomplete` that keeps the
+  reason, response ID, partial output and usage, with no retry delay
+  (`sse/responses.rs:451-506`, `protocol/src/error.rs:428-442`). It needs no preceding
+  `response.created`. The proxy forwards every native `response.incomplete` as
+  received, zero-output ends included, before or after anything was delivered. It never
+  turns an incomplete or disconnected response into a successful completion, and never
+  replaces an incomplete with a local failure.
 
 ## WebSocket state
 

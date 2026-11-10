@@ -1,0 +1,6 @@
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"IMAGE_BUDGET_SUMMARY"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"compact-images","usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}
+

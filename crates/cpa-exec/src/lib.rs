@@ -23,10 +23,12 @@ pub mod claude;
 mod claude_input_tokens;
 pub mod claude_login;
 pub mod codex;
+mod codex_ambiguous;
 mod codex_capture;
 mod codex_client;
 #[cfg(any(test, feature = "test-support"))]
 pub mod codex_contract;
+pub mod codex_event;
 pub mod codex_identity;
 pub mod codex_images;
 mod codex_json;
@@ -36,6 +38,7 @@ pub mod codex_quota;
 pub mod codex_refresh;
 mod codex_request;
 mod codex_response;
+mod codex_secret;
 pub mod codex_siwc;
 pub mod codex_siwc_bind;
 mod codex_sse;
@@ -115,6 +118,31 @@ pub struct Executors {
 /// The built-in upstream providers. Every other provider name has no executor: its
 /// credentials never enter selection.
 pub const PROVIDERS: [&str; 4] = ["claude", "codex", meta::PROVIDER, xai::PROVIDER];
+
+/// The losses of the upstream sockets the executors hold for one downstream session
+/// ([`Executors::session_losses`]). Each socket's loss is taken once: a loss the handler
+/// let pass while a turn moved to another socket never fires again, and the new socket's
+/// own loss still does.
+pub struct SessionLosses {
+    codex: codex::SessionLosses,
+    xai: codex::SessionLosses,
+}
+
+impl SessionLosses {
+    /// Resolves with the next socket loss not taken yet, and takes it; pending while no
+    /// socket is lost. Cancel safe.
+    pub async fn next(&mut self) -> codex::TakenLoss {
+        tokio::select! {
+            error = self.codex.next() => error,
+            error = self.xai.next() => error,
+        }
+    }
+
+    /// The Codex session's losses, sharing what this subscription took.
+    pub fn codex(&self) -> &codex::SessionLosses {
+        &self.codex
+    }
+}
 
 impl Executors {
     pub async fn execute(
@@ -208,16 +236,22 @@ impl Executors {
         }
     }
 
-    /// Resolves when an upstream socket held for session `id` is lost; pending forever
-    /// when no executor holds one.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        let codex = self.codex.session_closed(id);
-        let xai = self.xai.session_closed(id);
-        async move {
-            tokio::select! {
-                error = codex => error,
-                error = xai => error,
-            }
+    /// A new attempt of session `id` starts, whatever credential and transport it uses.
+    /// It owns no socket until it acquires one, so a loss stands in for its failure only
+    /// once it served on that socket. A pool that holds no live socket gives up the loss
+    /// of its last one: that socket failed an earlier attempt, which the turn already
+    /// dealt with, so a late notice from its reader reports nothing. A live socket keeps
+    /// its own loss: it may still serve this attempt or a later turn.
+    pub fn session_attempt(&self, id: &str) {
+        self.codex.begin_session_attempt(id);
+        self.xai.begin_session_attempt(id);
+    }
+
+    /// The losses of the upstream sockets the executors hold for session `id`.
+    pub fn session_losses(&self, id: &str) -> SessionLosses {
+        SessionLosses {
+            codex: self.codex.session_losses(id),
+            xai: self.xai.session_losses(id),
         }
     }
 

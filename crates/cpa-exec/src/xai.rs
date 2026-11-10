@@ -492,6 +492,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body,
+            omitted: Default::default(),
         })
     }
 
@@ -579,6 +580,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Buffered(out),
+            omitted: Default::default(),
         })
     }
 
@@ -605,6 +607,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Stream(futures_util::stream::iter(frames).boxed()),
+            omitted: Default::default(),
         })
     }
 
@@ -627,6 +630,7 @@ impl XaiExecutor {
             status: 200,
             headers: HeaderMap::new(),
             body: ResponseBody::Buffered(Bytes::from(payload)),
+            omitted: Default::default(),
         })
     }
 
@@ -728,6 +732,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Buffered(data),
+            omitted: Default::default(),
         })
     }
 }
@@ -832,6 +837,7 @@ impl XaiExecutor {
             status: 200,
             headers,
             body: ResponseBody::Buffered(data),
+            omitted: Default::default(),
         })
     }
 }

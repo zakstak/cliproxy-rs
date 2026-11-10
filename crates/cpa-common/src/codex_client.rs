@@ -168,14 +168,19 @@ fn is_context_window_error(payload: &[u8]) -> bool {
 /// `response.error` is the upstream `error` object byte for byte (code, message, type and
 /// param); `response.id` comes from `response_id`, and `sequence_number` is kept. Both
 /// are left out when the upstream event has none.
-pub fn context_window_failure_event(payload: &str) -> Option<std::borrow::Cow<'_, str>> {
-    let bytes = payload.as_bytes();
-    if is_context_window_failure(bytes) {
+///
+/// `reading` decides: the event as the client reads it, which for the pinned client is
+/// its `serde_json::Value`, keeping the last of a repeated key and resolving serde_json's
+/// private number and raw value tokens (the native routes' `codex_event::pinned_view`).
+/// The event returned is `payload`, or built from `payload`'s own bytes.
+pub fn context_window_failure_event<'a>(payload: &'a str, reading: &str) -> Option<std::borrow::Cow<'a, str>> {
+    if is_context_window_failure(reading.as_bytes()) {
         return Some(std::borrow::Cow::Borrowed(payload));
     }
-    if !is_context_window_error(bytes) {
+    if !is_context_window_error(reading.as_bytes()) {
         return None;
     }
+    let bytes = payload.as_bytes();
     let mut out = br#"{"type":"response.failed"}"#.to_vec();
     let sequence = gj::get(bytes, "sequence_number");
     if sequence.exists() && sequence.kind == Kind::Number {

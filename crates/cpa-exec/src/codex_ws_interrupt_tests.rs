@@ -241,7 +241,7 @@ async fn a_socket_lost_while_waiting_for_the_acknowledgement_ends_the_turn_clean
     interrupt_r1(&executor).await;
     let events = rest_of(stream).await;
     assert_eq!(kinds(&events), ["response.incomplete"], "{events:?}");
-    tokio::time::timeout(Duration::from_secs(5), executor.ws.closed("conn-1"))
+    tokio::time::timeout(Duration::from_secs(5), executor.ws.losses("conn-1").next())
         .await
         .expect("the loss was not reported");
 }
@@ -373,24 +373,59 @@ async fn a_zero_token_interrupted_response_is_a_normal_end() {
         crate::rawjson::get(incomplete, "response.incomplete_details.reason").str(),
         "interrupted"
     );
-    assert!(executor.ws.loss("conn-1").is_none(), "the socket was not dropped");
+    assert!(
+        executor.ws.losses("conn-1").pending().is_none(),
+        "the socket was not dropped"
+    );
     follow_up_is_clean(&executor, &url, &up).await;
 }
 
-/// The same shape without a reason is still an upstream abort: a request-scoped 502.
+const UNEXPLAINED_R1: &str =
+    r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#;
+
+/// The same shape without a reason is the provider's terminal event too, at every
+/// stage of the response (#25): as the first event, after a delivered
+/// `response.created`, after one held by bootstrap buffering, and after an event the
+/// buffer does not hold. First-party Codex reads it as a terminal, non-retryable
+/// `ResponseIncomplete` with reason `unknown`, its ID and usage
+/// (`codex-api/src/sse/responses.rs:451-506`, `protocol/src/error.rs:428-442` at
+/// 44ccf394573c), so the proxy invents no 502 in its place. It passes byte for byte, with
+/// no error after it, and the socket serves the next turn.
 #[tokio::test]
-async fn an_unexplained_zero_output_incomplete_still_fails() {
-    let (_up, url) = upstream(vec![Act::Send(vec![
-        CREATED,
-        r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
-    ])])
-    .await;
-    let executor = CodexExecutor::new().unwrap();
-    let events = rest_of(start(&executor, &url, false).await).await;
-    let error = events
-        .last()
-        .and_then(|e| e.as_ref().err())
-        .unwrap_or_else(|| panic!("{events:?}"));
-    assert_eq!(error.status, 502, "{error}");
-    assert_eq!(error.scope, FailureScope::Request);
+async fn an_unexplained_zero_output_incomplete_passes_unchanged_at_every_stage() {
+    const UNKNOWN: &str = r#"{"type":"response.future_event","n":1.50}"#;
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    for (config, sent) in [
+        ("", vec![]),
+        ("", vec![CREATED]),
+        (BUFFERING, vec![]),
+        (BUFFERING, vec![CREATED]),
+        (BUFFERING, vec![CREATED, UNKNOWN]),
+    ] {
+        let case = format!("{config:?} after {} events", sent.len());
+        let mut first = sent.clone();
+        first.push(UNEXPLAINED_R1);
+        let (up, url) = upstream(vec![
+            Act::Send(first.clone()),
+            Act::Send(vec![CREATED_R2, COMPLETED_R2]),
+        ])
+        .await;
+        let executor = CodexExecutor::new().unwrap();
+        let cfg = Config::parse(config).unwrap();
+        let response = executor
+            .execute_in_session(&credential(&url), request(BODY), &cfg, &session(false))
+            .await
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        let ResponseBody::Stream(stream) = response.body else {
+            panic!("websocket turns stream");
+        };
+        let events = rest_of(stream).await;
+        assert!(events.iter().all(Result::is_ok), "{case}: no error: {events:?}");
+        assert_eq!(texts(&events), first, "{case}: the events as upstream sent them");
+        assert!(
+            executor.ws.losses("conn-1").pending().is_none(),
+            "{case}: the socket was kept"
+        );
+        follow_up_is_clean(&executor, &url, &up).await;
+    }
 }

@@ -243,6 +243,7 @@ async fn run(
             status,
             headers,
             body: ResponseBody::Stream(mut stream),
+            ..
         }) => {
             while let Some(item) = stream.next().await {
                 items.push(item);
@@ -251,6 +252,7 @@ async fn run(
                 status,
                 headers,
                 body: ResponseBody::Buffered(Bytes::new()),
+                omitted: Default::default(),
             })
         }
         other => other,

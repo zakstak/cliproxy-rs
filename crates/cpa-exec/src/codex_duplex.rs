@@ -2,7 +2,8 @@
 //!
 //! With `response-steering` on, a downstream Responses WebSocket whose turn runs on a
 //! Codex credential in WebSocket mode keeps that upstream socket for the rest of the
-//! connection. Once the first `response.created` reached the client, the client's later
+//! connection. Once the first `response.created` reached the client (or the first
+//! response's terminal event, when upstream ends it without one), the client's later
 //! frames go straight to the socket: `response.steer` raw and `response.create` with
 //! only its model routed. `response.append` is refused. A response terminal is not a
 //! stream terminal: accepted steering may start an automatic successor or wait for tool results. The
@@ -49,10 +50,9 @@ use cpa_core::format::Format;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Turn, Upstream, transport, ws_error};
+use super::{Read, Reading, Turn, Upstream, transport};
 use crate::codex_request::View;
-use crate::codex_response as response;
-use crate::rawjson::{self, Kind};
+use crate::rawjson;
 
 /// Bound on queued and outstanding `response.create` requests.
 const MAX_PENDING: usize = 16;
@@ -212,10 +212,6 @@ const RESPONSE_EVENTS: [&str; 7] = [
     "response.done",
 ];
 
-fn response_terminal(kind: &str) -> bool {
-    matches!(kind, "response.completed" | "response.done" | "response.incomplete")
-}
-
 /// The request an upstream failure (`error`, `response.failed`) after the first response
 /// belongs to. A failure names its response in `response.id`, or in `response_id` on an
 /// `error` event.
@@ -234,7 +230,9 @@ enum Owner {
 enum Settlement {
     /// The message's records are settled, if it settles any.
     Settled,
-    /// An account failure: every record failed with it, and it ends the stream.
+    /// A failure the client must not see ([`cpa_core::exec::Delivery::Withheld`]): an
+    /// account failure, or one whose frame reads as one. Every record failed with it, and
+    /// it ends the stream.
     Account(ExecError),
     /// A failure no request can be assigned; nothing settled.
     Ambiguous,
@@ -247,7 +245,10 @@ struct Observing {
     observation: futures_util::future::BoxFuture<'static, ()>,
     payload: String,
     kind: String,
-    establishing: bool,
+    /// The message's `response.id` ([`crate::codex_event::Event::response_id`]).
+    response_id: Option<String>,
+    /// What the pinned WebSocket reader makes of the message (`codex_ws::reading`).
+    reading: Reading,
 }
 
 pub(super) struct Duplex {
@@ -305,7 +306,8 @@ pub(super) struct Duplex {
     deferred_steer: Option<(String, String)>,
     /// The metadata of the explicit create whose `response.created` is being handled.
     announce: Option<String>,
-    /// Client frames are read only after the first `response.created` was delivered.
+    /// Client frames are read only once the first response's `response.created`, or its
+    /// terminal event when it has none, was delivered.
     input_ready: bool,
     first_response: bool,
     response_active: bool,
@@ -457,8 +459,12 @@ impl Duplex {
             // Nobody reads the stream any more, but the upstream outcome that message
             // carries is known: it settles the records it settles while the client is
             // there (a terminal, a failure, a rejection), and nothing is delivered.
-            let terminal = self.classify(&observing.payload);
-            self.settle(&observing.payload, &observing.kind, terminal.as_ref());
+            self.settle(
+                &observing.payload,
+                &observing.kind,
+                observing.response_id.as_deref(),
+                &observing.reading,
+            );
         }
         // Records still open settle as the client's cancellation when `self` drops.
     }
@@ -506,10 +512,11 @@ impl Duplex {
                     let Observing {
                         payload,
                         kind,
-                        establishing,
+                        response_id,
+                        reading,
                         ..
                     } = self.observing.take().expect("an observation finished");
-                    self.observed(&payload, &kind, establishing);
+                    self.observed(&payload, &kind, response_id.as_deref(), reading);
                     // The deferred failure follows the message, unless the message
                     // itself ended the stream.
                     if let Some(error) = self.failing.take()
@@ -583,14 +590,14 @@ impl Duplex {
     /// Feeds one upstream event to the usage record it belongs to: the attempt's own
     /// until the attempt is detached, then the open response the event names (or the
     /// latest). An event of no open response feeds none.
-    fn account(&self, payload: &str, kind: &str) {
+    fn account(&self, payload: &str, kind: &str, response_id: Option<&str>) {
         if !self.detached {
             if self.turn.usage.enabled() {
                 self.turn.usage.response_line(Format::Codex, payload.as_bytes());
             }
             return;
         }
-        if let Some(i) = self.open_index(payload, kind) {
+        if let Some(i) = self.open_index(kind, response_id) {
             self.open[i].accounting.observe(payload);
         }
     }
@@ -598,73 +605,88 @@ impl Duplex {
     /// The open response an upstream event belongs to: the latest one with the
     /// `response.id` a response event names; any other event, or one without an ID,
     /// belongs to the latest. A response event naming no open response (a duplicate
-    /// terminal event, say) belongs to none.
-    fn open_index(&self, payload: &str, kind: &str) -> Option<usize> {
+    /// terminal event, say) belongs to none. `response_id` is the ID as the pinned
+    /// `Value` reads it ([`crate::codex_event::Event::response_id`]): the last of a
+    /// repeated `id`, so a decoded event settles the response its reader completes.
+    fn open_index(&self, kind: &str, response_id: Option<&str>) -> Option<usize> {
         let latest = self.open.len().checked_sub(1)?;
         if !RESPONSE_EVENTS.contains(&kind) {
             return Some(latest);
         }
-        let id = rawjson::get(payload, "response.id");
-        if id.kind() != Kind::String || id.str().is_empty() {
-            return Some(latest);
+        match response_id.filter(|id| !id.is_empty()) {
+            Some(id) => self.open.iter().rposition(|open| open.id == id),
+            None => Some(latest),
         }
-        self.open.iter().rposition(|open| open.id == id.str())
-    }
-
-    /// An upstream message's classified failure, if it is one.
-    fn classify(&self, payload: &str) -> Option<ExecError> {
-        let cooling = self.turn.cooling;
-        ws_error(payload, cooling).or_else(|| response::terminal_failure(payload, cooling).map(|(e, _)| e))
     }
 
     /// What an upstream message settles, apart from its delivery: a terminal event its
-    /// response's record, a failure the record of the request it belongs to, and an
-    /// account failure every record. `terminal` is the message's classification. The
+    /// response's record, a failure the record of the request it belongs to, and a
+    /// withheld failure every record. `reading` is the message's classification. The
     /// queue and running state follow (a rejected create leaves the queue). The same
     /// whether or not the consumer still reads the stream.
-    fn settle(&mut self, payload: &str, kind: &str, terminal: Option<&ExecError>) -> Settlement {
-        let failure = kind == "error" || kind == "response.failed";
-        if failure && let Some(error) = terminal.filter(|e| super::account_failure(e.status)) {
-            self.fail_records(error);
-            return Settlement::Account(error.clone());
-        }
-        if failure && !self.first_response {
-            // Both failure kinds always classify; the fallback only keeps the record a
-            // failure.
-            let fallback;
-            let error = match terminal {
-                Some(error) => error,
-                None => {
-                    fallback = local("upstream failure event without details");
-                    &fallback
-                }
-            };
-            match self.failure_owner(payload) {
-                Owner::Ambiguous => return Settlement::Ambiguous,
-                Owner::Rejected => {
-                    if let Some(rejected) = self.pending.pop_front()
-                        && let Some(accounting) = rejected.accounting
-                    {
-                        accounting.fail(error);
+    fn settle(&mut self, payload: &str, kind: &str, response_id: Option<&str>, reading: &Reading) -> Settlement {
+        if let Reading::Failure { error, .. } = reading {
+            // `super::reading` withheld an account failure, and a failure whose frame
+            // reads as one under another reading (an explicit `status: 400` beside a
+            // rate-limit error, say): neither may reach the client as an event, so the
+            // stream ends on it, as on any account failure. Its classified status stays.
+            if error.withheld() {
+                self.fail_records(error);
+                return Settlement::Account(error.clone());
+            }
+            if !self.first_response {
+                match self.failure_owner(payload) {
+                    Owner::Ambiguous => return Settlement::Ambiguous,
+                    Owner::Rejected => {
+                        if let Some(rejected) = self.pending.pop_front()
+                            && let Some(accounting) = rejected.accounting
+                        {
+                            accounting.fail(error);
+                        }
                     }
-                }
-                Owner::Started { ends_latest, open } => {
-                    if ends_latest {
-                        self.response_active = false;
-                        self.automatic_active = false;
-                    }
-                    if let Some(open) = open.and_then(|i| self.open.remove(i)) {
-                        open.accounting.fail(error);
+                    Owner::Started { ends_latest, open } => {
+                        if ends_latest {
+                            self.response_active = false;
+                            self.automatic_active = false;
+                        }
+                        if let Some(open) = open.and_then(|i| self.open.remove(i)) {
+                            open.accounting.fail(error);
+                        }
                     }
                 }
             }
         }
-        if response_terminal(kind) {
+        // Only an event the WebSocket reader ends the response on
+        // (`codex_event::Outcome::ends_turn`): a `response.completed` without a
+        // `response`, or a `response.done`, ends nothing.
+        if matches!(reading, Reading::Event { terminal: true }) {
             self.response_active = false;
             self.automatic_active = false;
-            self.settle_terminal(payload, kind);
+            if self.first_response {
+                self.first_terminal();
+            } else {
+                self.settle_terminal(kind, response_id);
+            }
         }
         Settlement::Settled
+    }
+
+    /// The first response ended without a `response.created`: upstream answered the
+    /// bootstrap create with its terminal event alone. That create was the only one
+    /// upstream had, because no client frame is read before the first response ends or
+    /// starts, so the terminal is its outcome. Its record settles now with what the
+    /// terminal reported, detached as `response.created` would have detached it, so the
+    /// attempt publishes nothing more and later creates get records of their own. The
+    /// connection then goes on as after a first response that started: client frames are
+    /// read, and the next create runs on this socket with the bootstrap's settings.
+    /// Nothing is invented: no `response.created`, and the terminal's response ID binds
+    /// no settings, so a later event naming it is read as any unmatched ID.
+    fn first_terminal(&mut self) {
+        let bootstrap = self.pending.pop_front().and_then(|p| p.accounting);
+        if let Some(accounting) = bootstrap.or_else(|| self.detach()) {
+            accounting.complete();
+        }
+        self.first_response = false;
     }
 
     /// [`Owner`] of a failure after the first response. A response the socket saw start
@@ -677,9 +699,12 @@ impl Duplex {
     // A failure reusing a retained settled ID cannot be told from that old response;
     // only a new response.created binds a fresh record to that ID.
     fn failure_owner(&self, payload: &str) -> Owner {
-        let mut failed = rawjson::get(payload, "response.id").str().to_owned();
+        // As the pinned reader decodes the failure: a struct written as a JSON array by
+        // its members, the last of a repeated key, private values resolved.
+        let view = crate::codex_event::classification_view(payload);
+        let mut failed = rawjson::get(&view, "response.id").str().to_owned();
         if failed.is_empty() {
-            failed = rawjson::get(payload, "response_id").str().to_owned();
+            failed = rawjson::get(&view, "response_id").str().to_owned();
         }
         if failed.is_empty() {
             if (!self.pending.is_empty() && self.response_active) || !self.unacknowledged.is_empty() {
@@ -716,11 +741,8 @@ impl Duplex {
     }
 
     /// A terminal event settles its response's record with what it reported.
-    fn settle_terminal(&mut self, payload: &str, kind: &str) {
-        if !response_terminal(kind) {
-            return;
-        }
-        if let Some(open) = self.open_index(payload, kind).and_then(|i| self.open.remove(i)) {
+    fn settle_terminal(&mut self, kind: &str, response_id: Option<&str>) {
+        if let Some(open) = self.open_index(kind, response_id).and_then(|i| self.open.remove(i)) {
             open.accounting.complete();
         }
     }
@@ -1003,28 +1025,56 @@ impl Duplex {
         }
         // A native connection hands each frame on as it arrived.
         let payload = text.as_str();
-        let kind = rawjson::get(payload, "type").str().to_owned();
-        let establishing = self.first_response && kind == "response.created";
-        if kind == "response.created" && !self.response_created(payload) {
-            return;
+        let event = crate::codex_event::decode(payload);
+        let reading = super::reading(payload, event.as_ref(), self.turn.cooling);
+        // A decoded event or a wrapped failure: what the pinned reader reads.
+        let read = event.is_some() || matches!(reading, Reading::Failure { .. });
+        let accounted = event.as_ref().is_none_or(crate::codex_event::Event::accounted);
+        // The response IDs as the pinned `Value` reads them.
+        let response_id = event.as_ref().and_then(crate::codex_event::Event::response_id);
+        let parent = event
+            .as_ref()
+            .and_then(|event| event.response_str("previous_response_id"));
+        let kind = match (event, &reading) {
+            (Some(event), _) => event.kind.into_owned(),
+            // A wrapped status error.
+            (None, Reading::Failure { .. }) => "error".to_owned(),
+            (None, _) => String::new(),
+        };
+        if read {
+            if kind == "response.created" && !self.response_created(response_id.as_deref(), parent) {
+                return;
+            }
+            self.turn.signals(payload);
+            if accounted {
+                self.account(payload, &kind, response_id.as_deref());
+            }
         }
-        self.turn.signals(payload);
-        self.account(payload, &kind);
         match self.turn.wire.ws_response_observation(payload) {
             Some(observation) => {
                 self.observing = Some(Observing {
                     observation,
                     payload: payload.to_owned(),
                     kind,
-                    establishing,
+                    response_id,
+                    reading,
                 });
             }
-            None => self.observed(payload, &kind, establishing),
+            None => self.observed(payload, &kind, response_id.as_deref(), reading),
         }
     }
 
     /// The rest of an upstream message's handling, once observers saw it.
-    fn observed(&mut self, payload: &str, kind: &str, establishing: bool) {
+    fn observed(&mut self, payload: &str, kind: &str, response_id: Option<&str>, reading: Reading) {
+        // The outbound credential guard (`crate::codex_secret`): a message that carries
+        // the socket's credential is never delivered, whatever it does. What it does is
+        // decided as for any other message: it settles, cools and accounts as read. Only
+        // the stream's guard leaves it out ([`super::CodexExecutor::stream_ws`]), which
+        // records that it was served (`ExecResponse::omitted`), so a later failure cannot
+        // fail over a response that already ran (#25). Every message processed here goes
+        // to the stream; this connection only has to end where the client would
+        // otherwise wait for a response that ended.
+        let confidential = self.turn.conn.secrets.exposes(payload.as_bytes());
         // Steering acknowledgements, pending notices and failures are opaque: IDs, input,
         // sequence numbers and event types reach the client byte for byte.
         if kind.starts_with("response.steer.") {
@@ -1038,15 +1088,23 @@ impl Duplex {
             }
             return;
         }
-        let terminal = self.classify(payload);
+        if let Reading::Passed { decoded } = reading {
+            // The pinned reader skips or ignores this frame. It settles nothing and
+            // reaches the client as sent, unless it would read as an account failure (#6).
+            if !super::account_shaped(payload, decoded) {
+                self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            }
+            return;
+        }
         // Records settle before the event is delivered: a record does not depend on
         // whether the client is still there to receive it.
-        match self.settle(payload, kind, terminal.as_ref()) {
+        match self.settle(payload, kind, response_id, &reading) {
             Settlement::Settled => {}
             // An account failure on a native connection never reaches the client as
             // sent, whichever request it belongs to: its frame can name the pooled
             // account. The error alone ends the stream, and the server delivers the
-            // allowlisted subscription-limit event (#6) or closes silently.
+            // allowlisted subscription-limit event (#6) or closes silently
+            // (`Delivery::Withheld`).
             Settlement::Account(error) => {
                 self.turn.wire.ws_exec_error("upstream_error", &error);
                 self.outbox.push_back(Err(error));
@@ -1066,6 +1124,11 @@ impl Duplex {
         // restored.
         // Only the first rejection fails the stream (and can enter bootstrap retry);
         // later ones are events the client may correct on this socket.
+        let reading_ended = matches!(reading, Reading::Event { terminal: true });
+        let terminal = match reading {
+            Reading::Failure { error, .. } => Some(error),
+            Reading::Event { .. } | Reading::Passed { .. } => None,
+        };
         if let Some(error) = &terminal {
             self.turn.wire.ws_exec_error("upstream_error", error);
         }
@@ -1079,20 +1142,15 @@ impl Duplex {
             match self
                 .turn
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload))
+                .then(|| crate::codex_event::context_window_event(payload))
                 .flatten()
             {
                 Some(event) => self.outbox.push_back(Ok(Bytes::from(event.into_owned()))),
-                None => {
-                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(payload.as_bytes())));
-                }
+                None => super::deliver_as_sent(&mut error, payload),
             }
             self.outbox.push_back(Err(error));
             self.done = true;
             return;
-        }
-        if kind == "response.output_item.done" {
-            self.turn.items.collect(payload);
         }
         // An explicit later create's model-only metadata, ahead of its first event.
         if kind == "response.created"
@@ -1100,18 +1158,48 @@ impl Duplex {
         {
             self.outbox.push_back(Ok(Bytes::from(announce)));
         }
+        if confidential {
+            // The stream's guard leaves it out, and records it as served.
+            self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
+            // A later failure, or an event the client's reader ends a response on, that
+            // the client cannot get: the connection ends here, as after an account
+            // failure, so the client does not wait for a response that already ended.
+            // Its own record settled above; every other one fails with the connection.
+            // Any other event is only left out.
+            let ends = match &terminal {
+                Some(error) => Some(crate::codex_secret::confidential(
+                    error.clone(),
+                    &self.turn.conn.secrets,
+                )),
+                None if reading_ended => Some(crate::codex_secret::confidential(
+                    local(crate::codex_secret::WITHHELD_FRAME),
+                    &self.turn.conn.secrets,
+                )),
+                None => None,
+            };
+            if !self.first_response {
+                self.input_ready = true;
+            }
+            if let Some(error) = ends {
+                self.fail(error);
+            }
+            return;
+        }
         self.outbox.push_back(Ok(Bytes::from(payload.to_owned())));
-        if establishing {
-            // Delivered before any locally generated error, so the handler also sees the
-            // bootstrap succeed first.
+        if !self.first_response {
+            // The first response started (`response_created`) or ended without starting
+            // ([`Duplex::first_terminal`]). Delivered before any locally generated
+            // error, so the handler also sees the bootstrap succeed first.
             self.input_ready = true;
         }
     }
 
     /// `response.created`: which request it serves and what it retains. False ends the
-    /// stream (an automatic successor without retained parent settings).
-    fn response_created(&mut self, payload: &str) -> bool {
-        let mut parent = rawjson::get(payload, "response.previous_response_id").str().to_owned();
+    /// stream (an automatic successor without retained parent settings). `response_id`
+    /// and `parent` (its `previous_response_id`) are read as the pinned `Value` reads
+    /// them ([`crate::codex_event::Event::response_str`]).
+    fn response_created(&mut self, response_id: Option<&str>, parent: Option<String>) -> bool {
+        let mut parent = parent.unwrap_or_default();
         if parent.is_empty() {
             parent.clone_from(&self.response_id);
         }
@@ -1151,7 +1239,7 @@ impl Duplex {
         for open in &mut self.open {
             open.latest_start = false;
         }
-        self.response_id = rawjson::get(payload, "response.id").str().to_owned();
+        self.response_id = response_id.unwrap_or_default().to_owned();
         if let Some(accounting) = accounting {
             self.track(self.response_id.clone(), accounting);
         }
@@ -1169,7 +1257,6 @@ impl Duplex {
         self.release_steering_settings();
         self.first_response = false;
         self.response_active = true;
-        self.turn.items = Default::default();
         true
     }
 

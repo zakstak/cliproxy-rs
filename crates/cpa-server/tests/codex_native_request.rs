@@ -258,6 +258,7 @@ use cpa_server::testing::codex_capture::{CaptureUpstream, Reply, Script};
 struct Native {
     url: String,
     upstream: CaptureUpstream,
+    rt: Arc<cpa_server::runtime::Runtime>,
     _auth_dir: AuthDir,
 }
 
@@ -283,8 +284,9 @@ async fn native(api_key: bool, script: Script, extra_config: &str) -> Native {
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, vec![credential], executors));
     Native {
-        url: serve(cpa_server::router(rt)).await,
+        url: serve(cpa_server::router(rt.clone())).await,
         upstream,
+        rt,
         _auth_dir: auth_dir,
     }
 }
@@ -790,6 +792,1734 @@ async fn issue2_parallelism_and_output_replay_pass_unchanged_for_every_client() 
             let (auth, sent) = send(&siwc, headers, client.clone()).await;
             assert_eq!(auth["authorization"], "Bearer siwc-at-FAKE");
             assert_eq!(sent, client, "siwc {headers:?} {parallel:?}");
+        }
+    }
+}
+
+/// #25: first-party Codex derives its retry delay from a `rate_limit_exceeded` failure's
+/// message text (`codex-api/src/sse/responses_error.rs:93-128` at 44ccf394573c), so the
+/// fixture's message, irregular spacing included, must arrive unchanged. After the
+/// response started the client gets the provider's event as sent. Before anything was
+/// delivered the scheduler classifies it as a 429 (the credential cools, and with one
+/// credential nothing else can serve it), and the streaming and the buffered client alike
+/// get the provider's error object and sequence number as sent, under that status.
+#[tokio::test]
+async fn a_rate_limit_failure_keeps_the_message_codex_reads_its_delay_from() {
+    let failed = text_of("sse-failed-rate-limit");
+    let data = text(fixture("sse-failed-rate-limit").frames()[0].clone());
+    let started = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_rl\"}}}}\n\n{failed}"
+    );
+    let proxy = native(
+        true,
+        Script {
+            http: vec![Reply::sse(started.clone())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((status, answer.as_str()), (200, started.as_str()), "after the start");
+
+    // The provider's error object, sliced from the fixture's own bytes.
+    let error = &data[data.find(r#""error":"#).unwrap() + 8..data.find(r#", "usage""#).unwrap()];
+    let delivered = format!(r#"{{"error":{error},"sequence_number":3}}"#);
+    let full = routed("http-request-full");
+    for body in [full.clone(), full.replacen(r#""stream":true"#, r#""stream":false"#, 1)] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(failed.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], body).await;
+        assert_eq!((status, answer.as_str()), (429, delivered.as_str()), "before the start");
+        assert_eq!(proxy.upstream.http().len(), 1, "one attempt, no replay");
+    }
+}
+
+/// #25: usage that the upstream reports as zero stays zero, with its own spelling, in a
+/// stream and in the buffered answer, and missing usage stays missing. Passive usage
+/// accounting is on: it records each answer as a success from a copy and changes no byte.
+#[tokio::test]
+async fn reported_zero_and_missing_usage_pass_unchanged() {
+    let zero = r#"{"type":"response.completed","response":{"id":"resp_z","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}}"#;
+    let zero_stream = format!("event: response.completed\ndata: {zero}\n\n");
+    let zero_object = &zero[zero.find(r#""response":"#).unwrap() + 11..zero.len() - 1];
+    let none_stream = text_of("sse-completed-no-usage");
+    let none_data = text(fixture("sse-completed-no-usage").frames().pop().unwrap());
+    let none_object = &none_data[none_data.find(r#""response":"#).unwrap() + 11..none_data.len() - 1];
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (stream, object) in [(zero_stream.as_str(), zero_object), (none_stream.as_str(), none_object)] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.to_owned()), Reply::sse(stream.to_owned())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let queue = proxy.rt.usage_queue();
+        queue.configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, stream), "streamed");
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, object), "buffered");
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while records.len() < 2 {
+                records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        for record in &records {
+            assert_eq!(record["failed"], false, "{record}");
+            assert_eq!(record["tokens"]["total_tokens"], 0, "{record}");
+        }
+    }
+}
+
+fn text(bytes: Bytes) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// The buffered answer for an event whose `response` is its last member: that object,
+/// sliced from the event's own bytes.
+fn last_response_object(event: &str) -> &str {
+    &event[event.find(r#""response":"#).unwrap() + 11..event.len() - 1]
+}
+
+/// The usage records published for `count` answers.
+async fn usage_records(proxy: &Native, count: usize) -> Vec<serde_json::Value> {
+    let queue = proxy.rt.usage_queue();
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while records.len() < count {
+            records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+    records
+}
+
+/// #25 and #7: every `response.incomplete` the provider sends (the hand-written probe:
+/// absent, null, empty, unknown and named reasons with zero output, missing usage, opaque
+/// members, raw spellings and a duplicate key, partial output with partial usage)
+/// reaches the client as sent at every stage: as the first event, after
+/// `response.created`, and after output, with and without bootstrap buffering. A
+/// streaming client gets the upstream's bytes; a buffered client gets the event's
+/// `response` object byte for byte. The pinned client reads each end itself
+/// (`codex-api/src/sse/responses.rs:451-506` at 44ccf394573c), so no 502, completion,
+/// usage or output is invented. Each answer is one attempt, recorded once by passive
+/// accounting as the provider's terminal event, and the credential does not cool.
+#[tokio::test]
+async fn every_incomplete_reaches_http_clients_as_sent() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_inc"}}"#,
+        "\n\n"
+    );
+    let output = concat!(
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_inc_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+        "\n\n"
+    );
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let ends: Vec<String> = fixture("probe-sse-incomplete-ends")
+        .frames()
+        .into_iter()
+        .map(text)
+        .collect();
+    assert_eq!(ends.len(), 11);
+    for end in &ends {
+        let terminal = format!("event: response.incomplete\ndata: {end}\n\n");
+        for (stage, stream) in [
+            ("first event", terminal.clone()),
+            ("after response.created", format!("{created}{terminal}")),
+            ("after output", format!("{created}{output}{terminal}")),
+        ] {
+            for (api_key, config) in [
+                (false, ""),
+                (false, "codex:\n  stream-bootstrap-buffering: true\n"),
+                (true, ""),
+            ] {
+                let case = format!("{stage} api_key={api_key} {config:?}: {end}");
+                let proxy = native(
+                    api_key,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(end)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                assert!(records.iter().all(|r| r["failed"] == false), "{case}: {records:?}");
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// #25: a remote compaction v2 answer. The pinned client sends a `compaction_trigger`
+/// request through its ordinary Responses stream on `/responses` and requires one
+/// `compaction` output item before `response.completed`
+/// (`core/src/compact_remote_v2.rs:291-492` at 44ccf394573c). The first-party test's
+/// answer (`sse-compaction-v2`) and the opaque probe reach a streaming client byte for
+/// byte; a buffered client gets the completion's `response` object byte for byte (the
+/// destination contract; `chatgpt` acceptance of `stream: false` is unknown). The
+/// request reaches the upstream as sent. Both native profiles a loopback can stand for.
+#[tokio::test]
+async fn compaction_v2_answers_pass_unchanged() {
+    let request = routed("http-request-compaction");
+    let buffered = request.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for name in ["sse-compaction-v2", "probe-sse-compaction-v2-opaque"] {
+        let stream = text_of(name);
+        let completed = text(fixture(name).frames().pop().unwrap());
+        for api_key in [false, true] {
+            let case = format!("{name} api_key={api_key}");
+            let proxy = native(
+                api_key,
+                Script {
+                    http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], request.clone()).await;
+            assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+            assert_eq!(
+                (status, answer.as_str()),
+                (200, last_response_object(&completed)),
+                "{case}: buffered"
+            );
+            let sent = proxy.upstream.http();
+            assert_eq!(sent.len(), 2, "{case}");
+            assert_eq!(sent[0].uri.path(), "/responses", "{case}");
+            assert_eq!(
+                String::from_utf8_lossy(&sent[0].body),
+                request,
+                "{case}: the request as sent"
+            );
+        }
+    }
+}
+
+/// The upstream completion each undecodable event is followed by.
+const REAL_END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+
+/// Upstream events the pinned client does not decode into `ResponsesStreamEvent`
+/// (`codex-api/src/sse/responses.rs:161-179` and 633-643 at 44ccf394573c), so it skips
+/// them: a repeated known member in either order, a known member of the wrong type, and
+/// invalid JSON that would otherwise read as a failure, a context-window `error`, an
+/// account failure or a completion.
+const UNDECODABLE: [(&str, &str); 10] = [
+    (
+        "repeated type, terminal first",
+        r#"{"type":"response.completed","type":"response.future","response":{"id":"resp_dup","output":[]}}"#,
+    ),
+    (
+        "repeated type, terminal last",
+        r#"{"type":"response.future","type":"response.completed","response":{"id":"resp_dup","output":[]}}"#,
+    ),
+    (
+        "repeated response",
+        r#"{"type":"response.completed","response":{"id":"resp_old","output":[]},"response":{"id":"resp_new","output":[]}}"#,
+    ),
+    (
+        "repeated type on a failure",
+        r#"{"type":"response.failed","type":"response.future","response":{"error":{"code":"server_error","message":"m"}}}"#,
+    ),
+    (
+        "repeated error",
+        r#"{"type":"error","error":{"code":"context_length_exceeded","message":"a"},"error":{"code":"context_length_exceeded","message":"b"}}"#,
+    ),
+    (
+        "known member of the wrong type",
+        r#"{"type":"response.completed","delta":5,"response":{"id":"resp_typed","output":[]}}"#,
+    ),
+    (
+        "malformed failure",
+        r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"broken"}}"#,
+    ),
+    (
+        "malformed context window",
+        r#"{"type":"error","error":{"code":"context_length_exceeded","message":"broken"}"#,
+    ),
+    (
+        "malformed account failure",
+        r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"limit for acct-FAKE"}}"#,
+    ),
+    (
+        "malformed completion",
+        r#"{"type":"response.completed","response":{"id":"resp_bad","output":[]}"#,
+    ),
+];
+
+/// #25 (F1, F3): an upstream event the pinned client cannot decode never ends, fails or
+/// converts a native HTTP response, and it feeds no usage. It reaches a streaming client
+/// as sent, and the later real completion follows it. A buffered client gets that
+/// completion's `response` object. This holds as the first event and after
+/// `response.created`, with and without bootstrap buffering, for a Codex client (which
+/// would get #5's conversion). Each request is one attempt, recorded once with the
+/// completion's usage, and the credential does not cool.
+#[tokio::test]
+async fn undecodable_upstream_events_never_end_or_fail_http_responses() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let real = format!("event: response.completed\ndata: {REAL_END}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (name, event) in UNDECODABLE {
+        for (stage, leading) in [("first event", ""), ("after response.created", created)] {
+            for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+                let case = format!("{name}, {stage}, {config:?}");
+                let stream = format!("{leading}data: {event}\n\n{real}");
+                let proxy = native(
+                    false,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(REAL_END)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                for record in &records {
+                    assert_eq!(record["failed"], false, "{case}: {records:?}");
+                    assert_eq!(record["tokens"]["total_tokens"], 5, "{case}: {records:?}");
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// The controls for the boundary above, through the same route. Decodable events with
+/// repeated members the pinned client ignores (unknown members, and keys repeated inside
+/// `response`, where its `Value` keeps the last) still end the response: the stream ends
+/// with that terminal event, and nothing the upstream sends after it is read. A buffered
+/// client gets the `response` object as sent, repeats included. A valid status-less
+/// context-window `error` still reaches a Codex client as `response.failed` (#5), and a
+/// valid account failure still cools the credential (#6).
+#[tokio::test]
+async fn decodable_events_keep_their_outcomes_on_http_responses() {
+    let end = r#"{"type":"response.completed","future":1,"future":{"n":1.50},"response":{"id":"resp_rep","id":"resp_rep_last","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5},"usage":null}}"#;
+    let after =
+        r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"late"}"#;
+    let terminal = format!("event: response.completed\ndata: {end}\n\n");
+    let stream = format!("{terminal}data: {after}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(stream.clone()), Reply::sse(stream)],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+    assert_eq!((status, answer.as_str()), (200, terminal.as_str()));
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered).await;
+    assert_eq!((status, answer.as_str()), (200, last_response_object(end)));
+
+    // #5: the valid status-less context-window `error`, renamed for a Codex client.
+    let context = r#"{"type":"error","error":{"code":"context_length_exceeded","message":"too long"},"response_id":"resp_ctx","sequence_number":2}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(format!("data: {context}\n\ndata: {REAL_END}\n\n"))],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, full.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        answer,
+        r#"data: {"type":"response.failed","sequence_number":2,"response":{"id":"resp_ctx","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#
+            .to_owned()
+            + "\n\n"
+    );
+
+    // #6: a valid account failure before anything was delivered is classified, cools the
+    // only credential and reaches the client as the provider's error object.
+    let limit = r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"limit"}}}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(format!("data: {limit}\n\ndata: {REAL_END}\n\n"))],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full).await;
+    assert_eq!(
+        (status, answer.as_str()),
+        (429, r#"{"error":{"code":"rate_limit_exceeded","message":"limit"}}"#)
+    );
+    let credential = proxy.rt.store().snapshot()[0].id.clone();
+    assert!(
+        !proxy.rt.store().cooldowns(&credential).is_empty(),
+        "the account failure cools"
+    );
+}
+
+/// Events the pinned client decodes or refuses differently from a plain JSON reading, each
+/// followed by [`REAL_END`]: E1, objects whose first key is serde_json's private number or
+/// raw-value token with anything but its one valid value, which the first-party build's
+/// `Value` (`arbitrary_precision`, `raw_value`) refuses, so the event does not decode;
+/// E4, decoded events the pinned reader does not end the response on: a
+/// `response.completed` without a `response` (`sse/responses.rs:507-519` at
+/// 44ccf394573c), and `response.done`, which it does not handle.
+const NOT_TERMINAL: [(&str, &str); 7] = [
+    (
+        "invalid private number",
+        r#"{"type":"response.completed","response":{"id":"bad","future":{"$serde_json::private::Number":"bad"}}}"#,
+    ),
+    (
+        "private number with a second member",
+        r#"{"type":"response.completed","response":{"id":"bad","output":[],"n":{"$serde_json::private::Number":"1","x":3}}}"#,
+    ),
+    (
+        "private number that is no string",
+        r#"{"type":"response.completed","error":{"$serde_json::private::Number":12},"response":{"id":"bad","output":[]}}"#,
+    ),
+    (
+        "private raw value that is no JSON",
+        r#"{"type":"response.completed","response":{"id":"bad","output":[{"$serde_json::private::RawValue":"{"}]}}"#,
+    ),
+    (
+        "completed with a null response",
+        r#"{"type":"response.completed","response":null}"#,
+    ),
+    (
+        "completed without a response",
+        r#"{"type":"response.completed","sequence_number":4}"#,
+    ),
+    (
+        "response.done",
+        r#"{"type":"response.done","response":{"id":"resp_done","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+];
+
+/// #25 (E1, E4): none of [`NOT_TERMINAL`] ends a native HTTP response. A streaming client
+/// gets it as sent and then the real completion; a buffered (`chatgpt`) client gets the
+/// real completion's `response` object. As the first event and after `response.created`,
+/// with and without bootstrap buffering. Each request is one attempt, recorded once with
+/// the real completion's usage, and nothing cools. The controls: the same private tokens
+/// with their valid values, a marker that is not an object's first key, and one in an
+/// unknown member, decode, so that completion ends the response and the real one after it
+/// is not read.
+#[tokio::test]
+async fn pinned_non_terminal_events_never_end_http_responses() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let real = format!("event: response.completed\ndata: {REAL_END}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (name, event) in NOT_TERMINAL {
+        for (stage, leading) in [("first event", ""), ("after response.created", created)] {
+            for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+                let case = format!("{name}, {stage}, {config:?}");
+                let stream = format!("{leading}data: {event}\n\n{real}");
+                let proxy = native(
+                    false,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(REAL_END)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                for record in &records {
+                    assert_eq!(record["failed"], false, "{case}: {records:?}");
+                    assert_eq!(record["tokens"]["total_tokens"], 5, "{case}: {records:?}");
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+    for end in [
+        r#"{"type":"response.completed","response":{"id":"resp_ok","output":[],"n":{"$serde_json::private::Number":"-1.5e+3"}}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","output":[{"$serde_json::private::RawValue":"{\"a\":[1e400]}"}]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","output":[],"n":{"x":1,"$serde_json::private::Number":"bad"}}}"#,
+        r#"{"type":"response.completed","future":{"$serde_json::private::Number":"bad"},"response":{"id":"resp_ok","output":[]}}"#,
+    ] {
+        let terminal = format!("data: {end}\n\n");
+        let proxy = native(
+            false,
+            Script {
+                http: vec![
+                    Reply::sse(format!("{terminal}{real}")),
+                    Reply::sse(format!("{terminal}{real}")),
+                ],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, terminal.as_str()), "{end}");
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, last_response_object(end)), "{end}");
+    }
+}
+
+/// #25 (E2) on the native HTTP route: a failure is classified as the pinned `Value` holds
+/// it, with the last of a repeated key. A request fault first and a rate limit last is a
+/// rate limit: classified 429, the credential cools. The reverse order is a request fault:
+/// classified 400, delivered in the stream as sent, nothing cools. A context-window code first and `invalid_api_key` last is an
+/// authentication failure, not #5's context window, so a Codex client gets no
+/// `response.failed` conversion; the reverse order is the context window and gets it.
+/// An account failure before anything was delivered reaches the client as the provider's
+/// error object (the HTTP contract).
+#[tokio::test]
+async fn http_failures_are_classified_with_the_last_repeated_key() {
+    let full = routed("http-request-full");
+    let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    for (event, status, cools) in [
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","type":"rate_limit_error","code":"other","message":"limited"}}}"#,
+            429,
+            true,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"rate_limit_error","type":"invalid_request_error","code":"other","message":"bad input"}}}"#,
+            400,
+            false,
+        ),
+        (
+            r#"{"type":"error","error":{"code":"context_length_exceeded","code":"invalid_api_key","message":"limited"},"response_id":"r1"}"#,
+            401,
+            true,
+        ),
+    ] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(format!("data: {event}\n\ndata: {REAL_END}\n\n"))],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (got, _, answer) = post(&proxy.url, "/v1/responses", &headers, full.clone()).await;
+        if status == 400 {
+            // A request fault does not fail over: the stream delivers the event as sent.
+            assert_eq!((got, answer), (200, format!("data: {event}\n\n")), "{event}");
+        } else {
+            assert_eq!(got, status, "{event}: {answer}");
+            let error = cpa_common::rawjson::get(event, "response.error");
+            let error = if error.exists() {
+                error
+            } else {
+                cpa_common::rawjson::get(event, "error")
+            };
+            assert_eq!(answer, format!(r#"{{"error":{}}}"#, error.json()), "{event}");
+        }
+        let credential = proxy.rt.store().snapshot()[0].id.clone();
+        assert_eq!(!proxy.rt.store().cooldowns(&credential).is_empty(), cools, "{event}");
+    }
+    // The context window last: #5's conversion for a Codex client, the bytes as sent.
+    let context = r#"{"type":"error","error":{"code":"invalid_api_key","code":"context_length_exceeded","message":"too long"},"response_id":"resp_ctx"}"#;
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(format!("data: {context}\n\ndata: {REAL_END}\n\n"))],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, full).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        answer,
+        r#"data: {"type":"response.failed","response":{"id":"resp_ctx","object":"response","status":"failed","error":{"code":"invalid_api_key","code":"context_length_exceeded","message":"too long"}}}"#
+            .to_owned()
+            + "\n\n"
+    );
+    let credential = proxy.rt.store().snapshot()[0].id.clone();
+    assert!(proxy.rt.store().cooldowns(&credential).is_empty());
+}
+
+/// Decoded terminal-shaped events the pinned SSE reader records as an error and reads past
+/// (`codex-api/src/sse/responses.rs:667-690` at 44ccf394573c): a `response` that does not
+/// read as `ResponseCompleted` (lines 109-159 and 494-520: no string `id`, a malformed
+/// `usage`, `usage_metadata` or `end_turn`), on a `response.completed` or an interrupted
+/// `response.incomplete`, and a content-filter `response.incomplete` (lines 461-463). Each
+/// reports usage of 9 + 9 = 18 where its `usage` reads.
+const READ_ON: [(&str, &str); 10] = [
+    (
+        "completed without an id",
+        r#"{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a numeric id",
+        r#"{"type":"response.completed","response":{"id":7,"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a null id",
+        r#"{"type":"response.completed","response":{"id":null,"status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a string token count",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":"9","output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed without total_tokens",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9}}}"#,
+    ),
+    (
+        "completed with a null cached_tokens",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":null},"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a numeric usage_metadata amount",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","output":[],"usage_metadata":{"amount":5},"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "completed with a string end_turn",
+        r#"{"type":"response.completed","response":{"id":"resp_early","status":"completed","end_turn":"yes","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "content filter",
+        r#"{"type":"response.incomplete","response":{"id":"resp_early","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+    (
+        "interrupted without an id",
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#,
+    ),
+];
+
+/// #25 (E4, read-on): none of [`READ_ON`] ends a native HTTP response, because the pinned
+/// SSE reader reads on after each and ends on the real completion that follows. As the
+/// first event, after `response.created` and after output, with and without bootstrap
+/// buffering: a streaming client receives every event as sent, the candidate and the real
+/// completion included; a buffered client receives the real completion's `response`
+/// object byte for byte; each answer is one attempt with one record that is not failed
+/// and carries the real completion's usage (5), not the candidate's (18); nothing cools.
+#[tokio::test]
+async fn read_on_events_leave_http_responses_to_the_real_completion() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let output = concat!(
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"partial"}"#,
+        "\n\n"
+    );
+    let real = format!("event: response.completed\ndata: {REAL_END}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (name, event) in READ_ON {
+        for (stage, leading) in [
+            ("first event", ""),
+            ("after response.created", created),
+            ("after output", output),
+        ] {
+            for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+                let case = format!("{name}, {stage}, {config:?}");
+                let stream = format!("{leading}data: {event}\n\n{real}");
+                let proxy = native(
+                    false,
+                    Script {
+                        http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                        ..Script::default()
+                    },
+                    config,
+                )
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+                assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{case}: streamed");
+                let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+                assert_eq!(
+                    (status, answer.as_str()),
+                    (200, last_response_object(REAL_END)),
+                    "{case}: buffered"
+                );
+                assert_eq!(proxy.upstream.http().len(), 2, "{case}: one attempt each");
+                let records = usage_records(&proxy, 2).await;
+                assert_eq!(records.len(), 2, "{case}: {records:?}");
+                for record in &records {
+                    assert_eq!(record["failed"], false, "{case}: {records:?}");
+                    assert_eq!(record["tokens"]["total_tokens"], 5, "{case}: {records:?}");
+                }
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                assert!(proxy.rt.store().cooldowns(&credential).is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// #25 (read-on) at the end of the upstream stream: when no usable terminal event follows
+/// a [`READ_ON`] event, the response ends where the upstream ended it, on the last such
+/// event, which is the provider's own end. The pinned SSE reader then reports the error it
+/// recorded for that event (`sse/responses.rs:616-621`), which the client reads from the
+/// event itself, so nothing is added: a streaming client gets the events as sent and a
+/// clean end, a buffered client gets the last such event's `response` object, and the one
+/// record carries that event's reported usage. Two in a row keep the last (the reader
+/// keeps the last recorded error). Controls: a stream that ends after
+/// `response.created` alone still fails, with the request-scoped 408, and each event the
+/// pinned reader ends on (a readable completion with missing, null or empty usage
+/// details, a readable interruption, and any other incomplete reason, even with an
+/// unreadable `usage`) still ends the response there, so a later completion is not read.
+#[tokio::test]
+async fn read_on_events_end_http_responses_only_at_the_upstream_end() {
+    let created = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_real"}}"#,
+        "\n\n"
+    );
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let later = r#"{"type":"response.incomplete","response":{"id":"resp_later","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}"#;
+    let cases = [
+        (READ_ON[0].1, None, 18),
+        (READ_ON[8].1, None, 18),
+        (READ_ON[9].1, None, 18),
+        (READ_ON[0].1, Some(later), 30),
+    ];
+    for (event, second, total) in cases {
+        let last = second.unwrap_or(event);
+        let stream = match second {
+            None => format!("{created}data: {event}\n\n"),
+            Some(second) => format!("{created}data: {event}\n\ndata: {second}\n\n"),
+        };
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.clone()), Reply::sse(stream.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!((status, answer.as_str()), (200, stream.as_str()), "{last}: streamed");
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!(
+            (status, answer.as_str()),
+            (200, last_response_object(last)),
+            "{last}: buffered"
+        );
+        let records = usage_records(&proxy, 2).await;
+        assert_eq!(records.len(), 2, "{last}: {records:?}");
+        for record in &records {
+            assert_eq!(record["failed"], false, "{last}: {records:?}");
+            assert_eq!(record["tokens"]["total_tokens"], total, "{last}: {records:?}");
+        }
+    }
+    // Nothing the client could read as an end: the truncated response still fails.
+    let proxy = native(
+        false,
+        Script {
+            http: vec![Reply::sse(created.to_owned())],
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+    assert_eq!(status, 408, "{answer}");
+    assert!(answer.contains("stream closed before response.completed"), "{answer}");
+    // The pinned reader ends on these: the completion after them is not read.
+    let real = format!("data: {REAL_END}\n\n");
+    for end in [
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[],"usage":null}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_ok","status":"completed","output":[],"usage":{"input_tokens":1,"input_tokens_details":null,"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2,"codex_rollout_budget_units":1e400},"end_turn":null}}"#,
+        r#"{"type":"response.incomplete","response":{"id":"resp_ok","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[]}}"#,
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":"bad"}}}"#,
+    ] {
+        let stream = format!("{created}data: {end}\n\n{real}");
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(stream.clone()), Reply::sse(stream)],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(
+            (status, answer),
+            (200, format!("{created}data: {end}\n\n")),
+            "{end}: streamed"
+        );
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!(
+            (status, answer.as_str()),
+            (200, last_response_object(end)),
+            "{end}: buffered"
+        );
+    }
+}
+
+/// How [`chunked_upstream`] ends its one answer after the first chunk.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The terminating chunk: a clean end of the stream.
+    Clean,
+    /// One more chunk with `REAL_END`, then the terminating chunk.
+    Later,
+    /// The connection closes without the terminating chunk: a read failure.
+    Broken,
+}
+
+/// An upstream that answers its one request with a chunked event stream whose first chunk
+/// is `first`, then ends as `ending` says. The capture upstream always ends cleanly; this
+/// one can break the body after a whole event.
+async fn chunked_upstream(first: String, ending: Ending) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        // The request: its head, then a `content-length` body.
+        let mut request = Vec::new();
+        loop {
+            let mut buf = [0; 8192];
+            let n = conn.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).into_owned();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        conn.write_all(format!("{head}{:x}\r\n{first}\r\n", first.len()).as_bytes())
+            .await
+            .unwrap();
+        conn.flush().await.unwrap();
+        match ending {
+            Ending::Clean => conn.write_all(b"0\r\n\r\n").await.unwrap(),
+            Ending::Later => {
+                let tail = format!("data: {REAL_END}\n\n");
+                conn.write_all(format!("{:x}\r\n{tail}\r\n0\r\n\r\n", tail.len()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            Ending::Broken => {
+                // Lets the first chunk reach the reader before the close cuts the body.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        conn.flush().await.unwrap();
+    });
+    url
+}
+
+/// #25 (read-on), how the upstream ended: a buffered answer from an SSE upstream ends on a
+/// processing error only at a clean end of the stream, where the pinned SSE reader reports
+/// the error it recorded (`sse/responses.rs:616-621`). A read failure before any terminal
+/// event fails the answer, because that reader returns a read error at once (lines
+/// 602-614), whatever it recorded: the content-filter `response.incomplete` with usage
+/// 9/9/18 in one whole chunk, then a body cut off without its terminating chunk, is no
+/// successful answer and no successful record. The failure keeps the buffered route's
+/// request-scoped 408 for a stream without a terminal event, and its record carries no
+/// tokens (the server's failure records never do). Controls: the same event with a clean
+/// end is the answer, with its usage; a later completion decides; a cut-off body after
+/// `response.created` alone fails the same way; a cut-off after a real completion keeps
+/// that completion. The streaming route already fails on the read failure.
+#[tokio::test]
+async fn buffered_answers_end_on_a_processing_error_only_at_a_clean_end() {
+    const RECORDED: &str = r#"{"type":"response.incomplete","response":{"id":"resp_real","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    /// One body: its first chunk and ending, the client's mode, and what it gets.
+    struct Case {
+        name: &'static str,
+        first: &'static str,
+        ending: Ending,
+        buffered: bool,
+        status: u16,
+        answer: Option<&'static str>,
+        failed: bool,
+        total: i64,
+    }
+    let case = |name, first, ending, buffered, status, answer, failed, total| Case {
+        name,
+        first,
+        ending,
+        buffered,
+        status,
+        answer,
+        failed,
+        total,
+    };
+    let recorded_object = last_response_object(RECORDED);
+    let real_object = last_response_object(REAL_END);
+    let cases = [
+        case("recorded, broken", RECORDED, Ending::Broken, true, 408, None, true, 0),
+        case(
+            "recorded, clean",
+            RECORDED,
+            Ending::Clean,
+            true,
+            200,
+            Some(recorded_object),
+            false,
+            18,
+        ),
+        case(
+            "recorded, later completion",
+            RECORDED,
+            Ending::Later,
+            true,
+            200,
+            Some(real_object),
+            false,
+            5,
+        ),
+        case("created, broken", CREATED, Ending::Broken, true, 408, None, true, 0),
+        case(
+            "completion, broken",
+            REAL_END,
+            Ending::Broken,
+            true,
+            200,
+            Some(real_object),
+            false,
+            5,
+        ),
+        case(
+            "streaming, recorded, broken",
+            RECORDED,
+            Ending::Broken,
+            false,
+            200,
+            None,
+            true,
+            0,
+        ),
+    ];
+    for Case {
+        name: case,
+        first,
+        ending,
+        buffered: is_buffered,
+        status,
+        answer,
+        failed,
+        total,
+    } in cases
+    {
+        let upstream = chunked_upstream(format!("data: {first}\n\n"), ending).await;
+        let auth_dir = AuthDir::new();
+        let cfg = Config::parse(&format!(
+            "auth-dir: {}\naccess:\n  api-keys: [client-key]\n",
+            auth_dir.0.display()
+        ))
+        .unwrap();
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let rt = Arc::new(cpa_server::testing::runtime(
+            cfg,
+            vec![credential(false, &upstream)],
+            executors,
+        ));
+        rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let url = serve(cpa_server::router(rt.clone())).await;
+        let body = if is_buffered { buffered.clone() } else { full.clone() };
+        let response = wreq::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .header("authorization", "Bearer client-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let got_status = response.status().as_u16();
+        // A streaming body cut off by the upstream ends with an error, after the event.
+        let got = response.text().await.unwrap_or_default();
+        assert_eq!(got_status, status, "{case}: {got}");
+        match answer {
+            Some(answer) => assert_eq!(got, answer, "{case}"),
+            None if is_buffered => assert!(got.contains("stream closed before response.completed"), "{case}: {got}"),
+            None => {}
+        }
+        assert!(!got.contains("at-FAKE"), "{case}: {got}");
+        let queue = rt.usage_queue();
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while records.is_empty() {
+                records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+        assert_eq!(records.len(), 1, "{case}: {records:?}");
+        assert_eq!(records[0]["failed"], failed, "{case}: {records:?}");
+        assert_eq!(records[0]["tokens"]["total_tokens"], total, "{case}: {records:?}");
+        let credential = rt.store().snapshot()[0].id.clone();
+        assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+    }
+}
+
+/// #25 and #6 on the native HTTP route, an event written as a JSON array: the pinned SSE
+/// reader decodes `["response.failed",null,null,{…}]` by position
+/// (`codex-api/src/sse/responses.rs:161-179` at 44ccf394573c), and failure classification
+/// reads the members it decodes to (`codex_event::classification_view`). Each positional
+/// event takes its object form's answer, status, cooldown and record, for a streaming and
+/// a buffered client: an account failure is that status with the provider's error object
+/// (the route's established answer) and cools the credential; another failure keeps its
+/// classification; a Codex client gets the #5 `response.failed` built from a status-less
+/// context-window `error`'s members; a positional completion ends the response. The real
+/// completion after a failure is never the answer. One attempt each.
+#[tokio::test]
+async fn positional_events_classify_as_their_object_form_on_http() {
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let headers = [("user-agent", CODEX_UA), ("originator", "codex_cli_rs")];
+    let limited = r#"{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}"#;
+    let context = r#"{"code":"context_length_exceeded","message":"too long","param":"input"}"#;
+    let positional = |members: &[(usize, &str)]| {
+        let mut all = vec!["null"; 14];
+        for (i, raw) in members {
+            all[*i] = raw;
+        }
+        format!("[{}]", all.join(","))
+    };
+    let limited_response = format!(r#"{{"id":"r1","error":{limited}}}"#);
+    // (positional, object form, the streaming client's status)
+    let cases = [
+        (
+            positional(&[(0, r#""response.failed""#), (3, &limited_response)]),
+            format!(r#"{{"type":"response.failed","response":{limited_response}}}"#),
+            429,
+        ),
+        (
+            positional(&[(0, r#""error""#), (5, limited)]),
+            format!(r#"{{"type":"error","error":{limited}}}"#),
+            429,
+        ),
+        (
+            positional(&[
+                (0, r#""response.failed""#),
+                (3, r#"{"id":"r1","error":{"type":"invalid_request_error","code":"other","message":"bad input"}}"#),
+            ]),
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"type":"invalid_request_error","code":"other","message":"bad input"}}}"#.to_owned(),
+            200,
+        ),
+        (
+            positional(&[(0, r#""error""#), (4, r#""resp_ctx""#), (5, context)]),
+            format!(r#"{{"type":"error","response_id":"resp_ctx","error":{context}}}"#),
+            200,
+        ),
+        (
+            positional(&[(0, r#""response.completed""#), (3, r#"{"id":"r1","end_turn":true}"#)]),
+            r#"{"type":"response.completed","response":{"id":"r1","end_turn":true}}"#.to_owned(),
+            200,
+        ),
+    ];
+    let answer = |event: &str, body: &str| {
+        let event = event.to_owned();
+        let body = body.to_owned();
+        async move {
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(format!("data: {event}\n\ndata: {REAL_END}\n\n"))],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &headers, body).await;
+            let records = usage_records(&proxy, 1).await;
+            let credential = proxy.rt.store().snapshot()[0].id.clone();
+            let cooled = !proxy.rt.store().cooldowns(&credential).is_empty();
+            assert_eq!(proxy.upstream.http().len(), 1, "{event}");
+            assert_eq!(records.len(), 1, "{event}: {records:?}");
+            let record = (records[0]["failed"].clone(), records[0]["fail"]["status_code"].clone());
+            (status, answer.replace(&event, "EVENT"), cooled, record)
+        }
+    };
+    for (array, object, streaming_status) in cases {
+        assert!(cpa_exec::codex_event::decode(&array).is_some(), "{array}");
+        for (stream, body) in [(true, &full), (false, &buffered)] {
+            let case = format!("stream {stream}: {array}");
+            let got = answer(&array, body).await;
+            let want = answer(&object, body).await;
+            assert_eq!(got, want, "{case}");
+            assert!(!got.1.contains("resp_real"), "{case}: {got:?}");
+            if stream {
+                assert_eq!(got.0, streaming_status, "{case}: {got:?}");
+            }
+            assert_eq!(got.2, streaming_status == 429, "{case}: {got:?}");
+        }
+    }
+}
+
+// #25 acceptance criterion 7 on the native HTTP route, the outbound credential guard
+// (`cpa_exec::codex_secret`): the selected credential's token is the fixture's `at-FAKE`,
+// sent upstream as `Bearer at-FAKE`; the client's key is `client-key`. Every case also
+// runs with `at-OTHER`, text no request carried, which keeps every byte. Generated
+// frames, no recorded provider traffic.
+
+const SELECTED: &str = "at-FAKE";
+const LOOKALIKE: &str = "at-OTHER";
+
+fn with_token(frame: &str, token: &str) -> String {
+    let escaped: String = token.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect();
+    frame.replace("{T}", token).replace("{E}", &escaped)
+}
+
+fn carries_token(text: &str, token: &str) -> bool {
+    let escaped: String = token.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect();
+    text.contains(token) || text.contains(&escaped)
+}
+
+/// Usage records on, for the assertions on them.
+fn counted(proxy: &Native) {
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+}
+
+/// The attempt carried the selected credential, never the client's key.
+fn selected_upstream(proxy: &Native) {
+    for exchange in proxy.upstream.http() {
+        assert_eq!(exchange.headers["authorization"], format!("Bearer {SELECTED}"));
+        assert!(!format!("{:?}", exchange.headers).contains("client-key"));
+    }
+}
+
+/// Streaming: an event the pinned reader skips or reads as content that carries the
+/// token is dropped and the real completion follows, one successful record with its
+/// usage; a failure after content that carries it ends the stream without it (the record
+/// and its status as the control's); one before content is a status-only error with the
+/// control's status.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_a_streaming_http_client() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","output":[]}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"hello"}"#;
+    let sse = |events: &[&str]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+    for (name, frame) in [
+        (
+            "malformed JSON",
+            r#"{"type":"response.failed","response":{"error":{"message":"{T}"}}"#,
+        ),
+        ("unknown event", r#"{"type":"response.future","note":["{T}",1.50]}"#),
+        (
+            "escaped delta",
+            r#"{"type":"response.output_text.delta","response_id":"resp_real","delta":"{E}"}"#,
+        ),
+        (
+            "repeated member",
+            r#"{"type":"error","error":{"message":"{T}"},"error":{"code":"x"}}"#,
+        ),
+    ] {
+        for token in [SELECTED, LOOKALIKE] {
+            let event = with_token(frame, token);
+            let upstream = sse(&[CREATED, &event, REAL_END]);
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(upstream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            counted(&proxy);
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            assert_eq!(status, 200, "{name} {token}");
+            if token == SELECTED {
+                assert_eq!(answer, sse(&[CREATED, REAL_END]), "{name}: dropped, completion follows");
+            } else {
+                assert_eq!(answer, upstream, "{name}: the control as sent");
+            }
+            let records = usage_records(&proxy, 1).await;
+            assert_eq!(records.len(), 1, "{name} {token}");
+            assert_eq!(records[0]["failed"], false, "{name} {token}");
+            assert_eq!(records[0]["tokens"]["total_tokens"], 5, "{name} {token}");
+            selected_upstream(&proxy);
+        }
+    }
+    let failure = r#"{"type":"response.failed","response":{"id":"resp_real","error":{"code":"x","message":"retry {T}"},"error":{"code":"x","message":"safe"}}}"#;
+    for leading in [&[CREATED, DELTA][..], &[][..]] {
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let event = with_token(failure, token);
+            let mut events = leading.to_vec();
+            events.push(&event);
+            let upstream = sse(&events);
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(upstream.clone())],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            counted(&proxy);
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+            if leading.is_empty() {
+                if token == LOOKALIKE {
+                    assert!(answer.contains(LOOKALIKE), "the control's own error: {answer}");
+                }
+            } else if token == SELECTED {
+                assert_eq!(answer, sse(leading), "the stream ends without the failure");
+            } else {
+                assert_eq!(answer, upstream, "the control as sent");
+            }
+            let records = usage_records(&proxy, 1).await;
+            seen.push((
+                status,
+                records[0]["failed"].clone(),
+                records[0]["fail"]["status_code"].clone(),
+            ));
+            selected_upstream(&proxy);
+        }
+        assert_eq!(seen[0], seen[1], "privacy changes delivery only: {seen:?}");
+        assert_eq!(seen[0].1, true);
+    }
+}
+
+/// An upstream HTTP error, a buffered answer and a compaction answer that carry the
+/// token: a status-only error instead of the upstream's body (the error keeps its
+/// classified status; a buffered or compaction answer, which has no stream to end, is a
+/// request-scoped 502 that neither fails over nor cools). A usage limit that carries the
+/// token still cools the credential, and the cooldown's later "last error" carries only
+/// its status. The controls keep their bytes.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_an_http_answer() {
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let compaction = routed("http-request-compaction").replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let error = r#"{"error":{"type":"invalid_request_error","code":"x","message":"bad {T}"}}"#;
+    let completed = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"note":"{E}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let compacted = r#"{"id":"cmp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"ENC {T}"}]}"#;
+    for token in [SELECTED, LOOKALIKE] {
+        let selected = token == SELECTED;
+        // An upstream 400.
+        let body = with_token(error, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(400, body.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 400, "{token}");
+        if selected {
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+            assert!(!answer.contains("bad"), "status-only: {answer}");
+        } else {
+            assert_eq!(answer, body);
+        }
+        selected_upstream(&proxy);
+        // A buffered answer.
+        let event = with_token(completed, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(format!("data: {event}\n\n"))],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        if selected {
+            assert_eq!(status, 502, "{answer}");
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!((status, answer.as_str()), (200, last_response_object(&event)));
+        }
+        assert_eq!(
+            proxy.upstream.http().len(),
+            1,
+            "no failover after the upstream served it"
+        );
+        let cooled: usize = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .map(|c| proxy.rt.store().cooldowns(&c.id).len())
+            .sum();
+        assert_eq!(cooled, 0, "{token}");
+        selected_upstream(&proxy);
+        // A compaction answer.
+        let answer_body = with_token(compacted, token);
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(200, answer_body.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses/compact", &[], compaction.clone()).await;
+        if selected {
+            assert_eq!(status, 502, "{answer}");
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!((status, answer.as_str()), (200, answer_body.as_str()));
+        }
+        selected_upstream(&proxy);
+        // A usage limit cools the credential; the cooldown's answer names its last error.
+        let limit = with_token(
+            r#"{"error":{"type":"usage_limit_reached","message":"limit for {T}","resets_in_seconds":600}}"#,
+            token,
+        );
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::json(429, limit.clone())],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 429, "{token}: {answer}");
+        if selected {
+            assert!(!carries_token(&answer, SELECTED), "{answer}");
+        } else {
+            assert_eq!(answer, limit);
+        }
+        let (status, _, later) = post(&proxy.url, "/v1/responses", &[], full.clone()).await;
+        assert_eq!(status, 429, "{later}");
+        assert_eq!(proxy.upstream.http().len(), 1, "cooled");
+        if selected {
+            assert!(!carries_token(&later, SELECTED), "{later}");
+        } else {
+            assert!(later.contains(LOOKALIKE), "the control's last error is shown: {later}");
+        }
+        selected_upstream(&proxy);
+    }
+}
+
+/// A token a second Codex account carries.
+const SECOND: &str = "at-SECOND";
+
+/// [`native`] (the ChatGPT profile) with one credential per token of `tokens`, the first
+/// preferred, `config` appended to its configuration, and with `logged`, through the
+/// shared request-log middleware (`request-log: true`), logging to the returned directory
+/// in its private `auth-dir`.
+async fn native_accounts(
+    script: Script,
+    tokens: &[&str],
+    config: &str,
+    logged: bool,
+) -> (
+    Native,
+    Option<(std::path::PathBuf, Arc<cpa_server::management::Management>)>,
+) {
+    let upstream = CaptureUpstream::start(script).await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [client-key]\nrequest-log: {logged}\n{config}",
+        auth_dir.0.display()
+    ))
+    .unwrap();
+    let credentials = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| {
+            let mut c = credential(false, &upstream.base_url);
+            if i > 0 {
+                c.id = format!("codex-{i}.json");
+                c.metadata.insert("access_token".into(), serde_json::json!(token));
+            }
+            c.attributes.insert("priority".into(), (9 - i).to_string());
+            c
+        })
+        .collect();
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        meta: Default::default(),
+        xai: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
+    let logs = logged.then(|| {
+        let dir = auth_dir.0.join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let management = cpa_server::management::Management::with_options(
+            rt.clone(),
+            auth_dir.0.join("config.yaml"),
+            cpa_server::management::Options {
+                log_dir: Some(dir.clone()),
+                management_password: Some(String::new()),
+                auth_dir: Some(auth_dir.0.clone()),
+                ..Default::default()
+            },
+        );
+        (dir, management)
+    });
+    let app = match &logs {
+        Some((_, management)) => cpa_server::request_logging::router(management, cpa_server::router(rt.clone())),
+        None => cpa_server::router(rt.clone()),
+    };
+    let proxy = Native {
+        url: serve(app).await,
+        upstream,
+        rt,
+        _auth_dir: auth_dir,
+    };
+    counted(&proxy);
+    (proxy, logs)
+}
+
+/// The one request log in `dir`, once complete: no spool file is left and it reads the
+/// same three times in a row.
+async fn finished_log(dir: &Path) -> String {
+    let mut last: Option<String> = None;
+    let mut same = 0;
+    for _ in 0..250 {
+        let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        let spooling = entries.iter().any(|p| p.extension().is_some_and(|x| x == "tmp"));
+        let logs: Vec<_> = entries
+            .iter()
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        if let ([log], false) = (&logs[..], spooling) {
+            let content = std::fs::read_to_string(log).unwrap();
+            if last.as_ref() == Some(&content) {
+                same += 1;
+                if same == 3 {
+                    return content;
+                }
+            } else {
+                (last, same) = (Some(content), 0);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no complete request log in {dir:?}: {last:?}")
+}
+
+fn cooldowns(proxy: &Native) -> usize {
+    let store = proxy.rt.store();
+    store.snapshot().iter().map(|c| store.cooldowns(&c.id).len()).sum()
+}
+
+/// #25 on a streaming HTTP client: an event the credential guard leaves out was served,
+/// so the stream commits on it. A stream whose every event is left out, its completion
+/// included, keeps the outcome processing gave it: one execution on the selected account,
+/// one successful record with the reported usage, no cooldown, and no second execution
+/// on the other account available. The client reads a stream that ended without the
+/// completion. This holds with and without `stream-bootstrap-buffering`. The `at-OTHER`
+/// controls differ only in what the client reads.
+#[tokio::test]
+async fn a_withheld_stream_keeps_the_served_outcome_without_a_replay() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","note":"{T}"}}"#;
+    const SAFE_CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real"}}"#;
+    const END: &str = r#"{"type":"response.completed","response":{"id":"resp_real","model":"gpt-5.5 {T}","service_tier":"echo {T}","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const SECOND_END: &str = r#"{"type":"response.completed","response":{"id":"resp_second","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":9,"total_tokens":18}}}"#;
+    let sse = |events: &[String]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+    let cases = [
+        ("sole completion", &[END][..]),
+        ("withheld prefix and completion", &[CREATED, END][..]),
+        ("safe prefix, withheld completion", &[SAFE_CREATED, END][..]),
+    ];
+    let buffering = ["", "codex:\n  stream-bootstrap-buffering: true\n"];
+    for (config, (name, events)) in buffering.iter().flat_map(|c| cases.map(|case| (c, case))) {
+        let name = format!("{name}{}", if config.is_empty() { "" } else { ", buffering" });
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let events: Vec<String> = events.iter().map(|e| with_token(e, token)).collect();
+            let (proxy, _) = native_accounts(
+                Script {
+                    http: vec![Reply::sse(sse(&events)), Reply::sse(sse(&[SECOND_END.to_owned()]))],
+                    ..Script::default()
+                },
+                &[SELECTED, SECOND],
+                config,
+                false,
+            )
+            .await;
+            let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+            let records = usage_records(&proxy, 1).await;
+            let exchanges = proxy.upstream.http();
+            assert_eq!(exchanges.len(), 1, "{name} {token}: one execution, no replay");
+            assert_eq!(exchanges[0].headers["authorization"], format!("Bearer {SELECTED}"));
+            assert_eq!(status, 200, "{name} {token}");
+            let delivered: Vec<String> = events.iter().filter(|e| !e.contains(SELECTED)).cloned().collect();
+            assert_eq!(answer, sse(&delivered), "{name} {token}");
+            assert_eq!(records.len(), 1, "{name} {token}: {records:?}");
+            assert_eq!(records[0]["failed"], false, "{name} {token}: {records:?}");
+            let usage = ["input_tokens", "output_tokens", "total_tokens"].map(|k| records[0]["tokens"][k].as_i64());
+            assert_eq!(usage, [Some(4), Some(1), Some(5)], "{name} {token}");
+            assert_eq!(cooldowns(&proxy), 0, "{name} {token}");
+            assert!(
+                !carries_token(&records[0].to_string(), SELECTED),
+                "{name}: {}",
+                records[0]
+            );
+            let scrubbed = |field: &str| records[0][field].as_str().map(|m| m.replace(token, "[REDACTED]"));
+            seen.push((
+                records[0]["auth_index"].clone(),
+                records[0]["tokens"].clone(),
+                scrubbed("response_model"),
+                scrubbed("response_service_tier"),
+            ));
+        }
+        assert_eq!(seen[0], seen[1], "{name}: privacy changes delivery only");
+        // The record keeps the model and the tier the withheld completion reported, scrubbed.
+        assert_eq!(seen[0].2.as_deref(), Some("gpt-5.5 [REDACTED]"), "{name}");
+        assert_eq!(seen[0].3.as_deref(), Some("echo [REDACTED]"), "{name}");
+    }
+}
+
+/// #25 and AGENTS.md on the native HTTP route: an upstream answer that quotes the selected
+/// credential (sent upstream as `Bearer at-FAKE`; the client's key is `client-key`) keeps
+/// it out of the request log and the queued failure record: an error body, a streamed
+/// event, and a buffered answer the route withholds. The entries stay, with `[REDACTED]`
+/// where the value was, and the record keeps the control's status and tokens; the
+/// withheld buffered answer is the route's request-scoped 502, whose fixed text carries
+/// nothing. The `at-OTHER` controls keep every byte.
+#[tokio::test]
+async fn http_logs_and_usage_records_never_keep_the_selected_credential() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_real","output":[]}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    let error = r#"{"error":{"type":"invalid_request_error","code":"x","message":"bad {T}"}}"#;
+    let notice = r#"{"type":"response.future","note":"{T}"}"#;
+    let answer = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"note":"{T}","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    for (name, body, reply) in [
+        ("error body", &full, Reply::json(400, error)),
+        (
+            "streamed event",
+            &full,
+            Reply::sse(format!("data: {CREATED}\n\ndata: {notice}\n\ndata: {REAL_END}\n\n")),
+        ),
+        (
+            "withheld buffered answer",
+            &buffered,
+            Reply::sse(format!("data: {answer}\n\n")),
+        ),
+    ] {
+        let mut seen = Vec::new();
+        for token in [SELECTED, LOOKALIKE] {
+            let mut reply = reply.clone();
+            reply.body = Bytes::from(with_token(std::str::from_utf8(&reply.body).unwrap(), token));
+            // An error's upstream headers are kept in its record too.
+            if reply.status != 200 {
+                reply.headers.push(("x-trace".into(), format!("trace {token}")));
+            }
+            let (proxy, logs) = native_accounts(
+                Script {
+                    http: vec![reply],
+                    ..Script::default()
+                },
+                &[SELECTED],
+                "",
+                true,
+            )
+            .await;
+            let (status, _, client) = post(&proxy.url, "/v1/responses", &[], body.clone()).await;
+            let records = usage_records(&proxy, 1).await;
+            let log = finished_log(&logs.as_ref().unwrap().0).await;
+            selected_upstream(&proxy);
+            assert!(!carries_token(&client, SELECTED), "{name}: {client}");
+            let fail = records[0]["fail"]["body"].as_str().unwrap_or_default().to_owned();
+            let headers = records[0]["response_headers"].to_string();
+            if token == SELECTED {
+                assert!(!carries_token(&log, SELECTED), "{name}: {log}");
+                assert!(!log.contains("client-key"), "{name}: {log}");
+                assert!(log.contains("[REDACTED]"), "{name}: {log}");
+                assert!(!carries_token(&fail, SELECTED), "{name}: {fail}");
+                assert!(!carries_token(&headers, SELECTED), "{name}: {headers}");
+                if name == "error body" {
+                    assert!(headers.contains("trace [REDACTED]"), "{name}: {headers}");
+                }
+            } else {
+                if name == "error body" {
+                    assert!(headers.contains("trace at-OTHER"), "{name}: {headers}");
+                }
+                assert!(log.contains(LOOKALIKE), "{name}: the control keeps its bytes");
+                assert!(!log.contains("[REDACTED"), "{name}: nothing else is scrubbed");
+            }
+            seen.push((
+                status,
+                records[0]["failed"].clone(),
+                records[0]["fail"]["status_code"].clone(),
+                records[0]["tokens"].clone(),
+                fail.replace(token, "[REDACTED]"),
+            ));
+        }
+        if name == "withheld buffered answer" {
+            assert_eq!(seen[0].0, 502, "{name}: {seen:?}");
+            assert_eq!(seen[1].0, 200, "{name}: {seen:?}");
+        } else {
+            assert_eq!(seen[0], seen[1], "{name}: the record is the control's, scrubbed");
+        }
+    }
+}
+
+/// #25 (`Delivery::Confidential`): a failure that carried the selected credential hands the
+/// client no upstream headers, even safe ones and even when `passthrough-headers` is on. A
+/// streaming request whose upstream answers HTTP 200 with a safe `x-upstream-trace` header
+/// and then an initial usage-limit `response.failed` quoting the token fails as a stream
+/// bootstrap error. Its status-only 429 carries neither the token nor that header. The
+/// `at-OTHER` control is the same classified failure, rendered from the upstream's body as
+/// before.
+#[tokio::test]
+async fn a_confidential_bootstrap_failure_hands_the_client_no_upstream_headers() {
+    let failed = r#"{"type":"response.failed","response":{"id":"real","error":{"type":"usage_limit_reached","message":"limited {T}","resets_in_seconds":600}}}"#;
+    for (case, body) in [
+        ("selected", format!("data: {}\n\n", with_token(failed, SELECTED))),
+        ("unsent", format!("data: {}\n\n", with_token(failed, LOOKALIKE))),
+    ] {
+        let mut reply = Reply::sse(body);
+        reply
+            .headers
+            .push(("x-upstream-trace".into(), "safe-never-sent-marker".into()));
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![reply],
+                ..Script::default()
+            },
+            &[SELECTED],
+            "requests:\n  passthrough-headers: true\n",
+            false,
+        )
+        .await;
+        let (status, headers, body) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        let records = usage_records(&proxy, 1).await;
+        selected_upstream(&proxy);
+        assert!(!carries_token(&body, SELECTED), "{case}: {body}");
+        assert!(!carries_token(&format!("{headers:?}"), SELECTED), "{case}: {headers:?}");
+        assert_eq!(records[0]["failed"], true, "{case}");
+        assert_eq!(status, 429, "{case}: {body}");
+        if case == "selected" {
+            assert!(
+                headers.get("x-upstream-trace").is_none(),
+                "a Confidential failure kept a passthrough header: {headers:?}"
+            );
+        } else {
+            assert!(
+                body.contains(LOOKALIKE),
+                "the classified control keeps its body: {body}"
+            );
         }
     }
 }

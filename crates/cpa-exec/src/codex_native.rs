@@ -18,14 +18,21 @@
 //!
 //! The response reaches the client as the upstream sent it. A stream's events are
 //! forwarded byte for byte; observation (usage, capture, failure classification) reads
-//! a copy. Leading handshake events are held, never changed, so that a failure before
+//! a copy. Only an event the pinned client decodes ([`codex_event`]) can end, fail or
+//! convert the response or feed usage. Leading handshake events are held, never changed, so that a failure before
 //! any content can still fail over to another credential. Once anything is delivered,
 //! a failure ends the stream after its event and is never replayed elsewhere. A
 //! buffered `chatgpt` answer is the `response` object of the terminal event, byte for
-//! byte. Two existing exceptions stay (`docs/DIFFERENCES-FROM-GO.md`): a Codex client
-//! gets the backend's status-less context-window `error` event as `response.failed`
-//! (#5), and an empty `response.incomplete` without a client-side reason before any
-//! content is a request-scoped 502.
+//! byte. One exception stays (`docs/DIFFERENCES-FROM-GO.md`): a Codex client gets the
+//! backend's status-less context-window `error` event as `response.failed` (#5). Every
+//! `response.incomplete` reaches the client as sent, whatever its reason, output or
+//! usage, before or after delivery (#25). The pinned client classifies its reason as an
+//! interrupted end, a content-filter error or a terminal `ResponseIncomplete`
+//! (`codex-api/src/sse/responses.rs:451-506`). The response ends where the client's
+//! reader ends it ([`codex_event::Outcome`]): an SSE client reads past a processing error
+//! (a content filter, or a `response` that does not read as `ResponseCompleted`) to a
+//! later terminal event, and ends on it only when the stream ends; a WebSocket turn served
+//! over HTTP ends on it, as the WebSocket reader does.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -34,6 +41,8 @@ use std::time::Duration;
 use cpa_common::codex_body::{CodexBody, Kind};
 
 use super::*;
+use crate::codex_event;
+use crate::codex_secret::Guard;
 
 /// The endpoint profiles. Every profile takes the native and translated routes (#28).
 /// Only `chatgpt` gets the buffered `stream: true` adaptation; the others pass the
@@ -185,6 +194,19 @@ pub(crate) fn upstream_model(req: &ExecRequest) -> Result<String, ExecError> {
     Ok(req.model.trim().to_owned())
 }
 
+/// Whether a WebSocket `response.create` continues upstream state: it names a
+/// `previous_response_id`, a string that is not blank (`null` and an empty string name
+/// none, as the server reads the frame). Such a request belongs to the socket that
+/// produced that response. It runs only on the session's current socket, or fails with
+/// the replay close; it never travels on a new socket (docs/codex/CONTRACT.md "Socket and
+/// account ownership"). The frame decides this, not the transport of the connection's
+/// previous turn.
+pub(crate) fn continues(body: &CodexBody<'_>) -> bool {
+    body.get("previous_response_id")
+        .filter(|m| m.kind == Kind::String)
+        .is_some_and(|m| serde_json::from_slice::<String>(m.raw).map_or(true, |id| !id.trim().is_empty()))
+}
+
 /// `frame` with `model` routed to `model`: the contract's one permitted request edit
 /// besides the buffered `stream` adaptation. The bytes are shared when the model
 /// already matches.
@@ -229,8 +251,10 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = upstream_body(&req, profile, call, &model)?;
         let usage = req.usage.clone();
-        let send = self.native_send(view, settings, req, profile, call, model, body, None);
-        crate::cancel::fail_if_canceled(&usage, send).await
+        let mut secrets = cpa_core::exec::SentCredentials::default();
+        let send = self.native_send(view, settings, req, profile, call, model, body, None, &mut secrets);
+        let answer = crate::cancel::fail_if_canceled(&usage, send).await;
+        secrets.guard_response(answer)
     }
 
     /// A WebSocket turn on a credential without `websockets`: the client's
@@ -247,14 +271,27 @@ impl CodexExecutor {
         let model = upstream_model(&req)?;
         let body = ws_http_body(&req.body, &model)?;
         let usage = req.usage.clone();
-        let send = self.native_send(view, settings, req, profile, Call::Stream, model, body, Some(session));
-        crate::cancel::fail_if_canceled(&usage, send).await
+        let mut secrets = cpa_core::exec::SentCredentials::default();
+        let send = self.native_send(
+            view,
+            settings,
+            req,
+            profile,
+            Call::Stream,
+            model,
+            body,
+            Some(session),
+            &mut secrets,
+        );
+        let answer = crate::cancel::fail_if_canceled(&usage, send).await;
+        secrets.guard_response(answer)
     }
 
     /// The exchange up to the response: the upstream send, then either the stream, or the
     /// whole body for a buffered client. The callers record the attempt as canceled when
     /// the client leaves before this returns ([`crate::cancel`]); a stream settles its own
-    /// outcome ([`passthrough`]).
+    /// outcome ([`passthrough`]). `secrets` receives the authentication values the request
+    /// carries, which the callers guard the answer with ([`crate::codex_secret`]).
     #[allow(clippy::too_many_arguments)]
     async fn native_send(
         &self,
@@ -266,6 +303,7 @@ impl CodexExecutor {
         model: String,
         body: Bytes,
         ws_session: Option<&str>,
+        secrets: &mut cpa_core::exec::SentCredentials,
     ) -> Result<ExecResponse, ExecError> {
         settings.refuse_image_tool(&req.request_path, &body)?;
         // The body passed the boundary, so this never fails.
@@ -296,7 +334,13 @@ impl CodexExecutor {
             Call::Compact => format!("{}/responses/compact", view.base_url),
             _ => format!("{}/responses", view.base_url),
         };
-        let wire = Wire::new(req.capture(), view.credential);
+        // The outbound credential guard (`crate::codex_secret`): bound to what this
+        // request carries, the caller checks everything the response delivers with it.
+        *secrets = crate::codex_secret::from_request(&headers, &url);
+        // The request log and the usage record keep this exchange scrubbed of them.
+        let mut wire = Wire::new(req.capture(), view.credential);
+        wire.bind(secrets);
+        req.usage.sent_credentials(secrets);
         let error_body = if call == Call::Stream {
             ErrorBody::Strict
         } else {
@@ -327,8 +371,6 @@ impl CodexExecutor {
             capture_lines: call == Call::Stream,
             model_level_cooling: settings.model_level_cooling,
             codex_client: request::codex_client(&req),
-            items: 0,
-            saw_delta: false,
         };
         let (status, headers) = (upstream.status, upstream.headers);
         if ws_session.is_some() && !sse {
@@ -359,6 +401,7 @@ impl CodexExecutor {
                 status,
                 headers,
                 body: ResponseBody::Stream(stream),
+                omitted: Default::default(),
             });
         }
         // Every byte that arrived is recorded, an unfinished tail included, then any read
@@ -384,7 +427,7 @@ impl CodexExecutor {
         };
         let body = if sse {
             let wire = observer.wire.clone();
-            match observer.aggregate(&data) {
+            match observer.aggregate(&data, failed.is_none()) {
                 Ok(body) => body,
                 Err(error) => {
                     if let Some(failure) = failed {
@@ -406,6 +449,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Buffered(body),
+            omitted: Default::default(),
         })
     }
 }
@@ -501,10 +545,23 @@ enum Seen {
     /// A leading event with no content yet (`response.created` and the like).
     Handshake,
     Content,
-    /// `response.completed`, `response.incomplete` or `response.done`.
+    /// The provider's terminal event, delivered as sent: one both pinned readers end the
+    /// response on ([`codex_event::Outcome::Ends`]), a readable completion or a
+    /// `response.incomplete` with any reason but interrupted and content filter. A
+    /// `response.completed` without a `response` and a `response.done` end nothing: the
+    /// pinned reader reads on after them.
     Terminal,
-    /// An empty `response.incomplete` that counts as a silent upstream abort.
-    EmptyIncomplete,
+    /// A `response.incomplete` or `response.completed` the pinned readers take as a
+    /// processing error ([`codex_event::Outcome::Recorded`]): a content filter, or a
+    /// `response` that does not read as `ResponseCompleted`. Delivered as sent, as the
+    /// provider's event. Its usage is not observed yet: whether the response ends on it
+    /// depends on the client's reader ([`Passthrough::take`], [`Observer::aggregate`]).
+    Recorded,
+    /// An event the pinned client does not decode ([`codex_event::decode`]): invalid
+    /// JSON, a repeated known member, or a known member of the wrong type. The pinned
+    /// client skips it, so it never ends, fails or converts the response and feeds no
+    /// usage. It passes as sent, except where [`Passthrough::undecoded`] withholds it.
+    Undecoded,
     /// A failure event, classified on a copy. `deliver` replaces the event only for the
     /// #5 context-window conversion.
     Failure {
@@ -524,8 +581,6 @@ struct Observer {
     capture_lines: bool,
     model_level_cooling: bool,
     codex_client: bool,
-    items: usize,
-    saw_delta: bool,
 }
 
 /// The lines of one framed event, split as the shared SSE framer splits them: `\r\n`,
@@ -600,30 +655,38 @@ fn unframed(item: Result<Bytes, ExecError>) -> Option<Result<Bytes, ExecError>> 
 /// What the client receives for a failure it does not see as an event (a buffered
 /// answer, or a failure before anything was delivered): the provider's error object in
 /// the API's error envelope, byte for byte, with the event's `sequence_number` as
-/// spelled; the whole event when it carries no error object. Nothing is filled in.
-fn delivered_failure(payload: &str) -> Bytes {
+/// spelled; the whole event when it carries no single error object. Nothing is filled
+/// in. `event` is the decoded event ([`codex_event::decode`]), so its `response` and
+/// `error` members are unique; a `response` with more than one `error` member is
+/// delivered whole rather than one of them picked.
+fn delivered_failure(event: &codex_event::Event<'_>, payload: &str) -> Bytes {
     let whole = || Bytes::copy_from_slice(payload.as_bytes());
-    let Ok(event) = CodexBody::parse(payload.as_bytes()) else {
-        return whole();
-    };
-    fn object<'a>(m: Option<&cpa_common::codex_body::Member<'a>>) -> Option<&'a [u8]> {
-        m.filter(|m| m.kind == Kind::Object).map(|m| m.raw)
+    let mut nested = None;
+    if let Some(response) = event.response.filter(|r| r.starts_with('{')) {
+        let mut repeated = false;
+        rawjson::parse(response).each(|key, value| {
+            if key.str() == "error" {
+                repeated |= nested.is_some();
+                nested = Some(value);
+            }
+            !repeated
+        });
+        if repeated {
+            return whole();
+        }
     }
-    let mut error = None;
-    if let Some(response) = object(event.get("response"))
-        && let Ok(response) = CodexBody::parse(response)
-    {
-        error = object(response.get("error"));
-    }
-    let Some(error) = error.or_else(|| object(event.get("error"))) else {
+    let nested = nested.filter(|v| v.kind() == rawjson::Kind::Object);
+    let top = event.error.filter(|e| e.starts_with('{'));
+    let Some(error) = nested.as_ref().map(rawjson::Value::json).or(top) else {
         return whole();
     };
     let mut out = Vec::with_capacity(error.len() + 48);
     out.extend_from_slice(b"{\"error\":");
-    out.extend_from_slice(error);
-    if let Some(sequence) = event.get("sequence_number") {
+    out.extend_from_slice(error.as_bytes());
+    let sequence = rawjson::get(payload, "sequence_number");
+    if sequence.exists() {
         out.extend_from_slice(b",\"sequence_number\":");
-        out.extend_from_slice(sequence.raw);
+        out.extend_from_slice(sequence.json().as_bytes());
     }
     out.push(b'}');
     Bytes::from(out)
@@ -635,7 +698,7 @@ impl Observer {
         if self.capture_lines {
             // Each physical line as scanned, and none after the event that ends the
             // response.
-            let last = matches!(seen, Seen::Terminal | Seen::EmptyIncomplete | Seen::Failure { .. });
+            let last = matches!(seen, Seen::Terminal | Seen::Failure { .. });
             for line in sse_lines(frame) {
                 self.wire.chunk(line);
                 if last && line.starts_with(b"data:") {
@@ -647,23 +710,36 @@ impl Observer {
     }
 
     fn classify(&mut self, frame: &Bytes) -> Seen {
-        let (name, payload) = parse_frame(frame);
-        let Some(payload) = payload else {
+        let (name, data) = parse_frame(frame);
+        let Some(data) = data else {
             return Seen::Handshake;
         };
-        let payload = payload.trim();
-        if payload.is_empty() {
+        if data.trim().is_empty() {
             return Seen::Handshake;
         }
-        if self.usage.enabled() {
+        // The upstream event boundary comes first: an event the pinned client skips
+        // ends, fails, converts and accounts for nothing here either.
+        let Some(event) = codex_event::decode(&data) else {
+            return Seen::Undecoded;
+        };
+        let payload = data.trim();
+        let outcome = event.outcome();
+        if self.usage.enabled() && event.accounted() && outcome != codex_event::Outcome::Recorded {
             self.usage.response_line(Format::Codex, payload.as_bytes());
         }
-        // Classification reads a copy; the client receives `delivered_failure`.
-        if let Some((error, _classified)) = response::terminal_failure(payload, self.model_level_cooling) {
+        // Classification reads a copy, as the pinned reader decodes the event: a struct
+        // written as a JSON array by its members, the last of a repeated key and the
+        // private values resolved (`codex_event::classification_view`). The client
+        // receives `delivered_failure`.
+        let view = match event.kind.as_ref() {
+            "error" | "response.failed" => codex_event::classification_view(payload),
+            _ => Cow::Borrowed(payload),
+        };
+        if let Some((error, _classified)) = response::terminal_failure(&view, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client
-                .then(|| cpa_common::codex_client::context_window_failure_event(payload))
+                .then(|| codex_event::context_window_event(payload))
                 .flatten()
                 .and_then(|event| match event {
                     Cow::Owned(event) => Some(Bytes::from(match name {
@@ -672,55 +748,67 @@ impl Observer {
                     })),
                     Cow::Borrowed(_) => None,
                 });
-            let body = delivered_failure(payload);
+            let body = delivered_failure(&event, payload);
             return Seen::Failure { error, body, deliver };
         }
-        if response::meaningful_delta(payload) {
-            self.saw_delta = true;
-        }
-        let kind = CodexBody::parse(payload.as_bytes())
-            .ok()
-            .and_then(|event| event.get("type").and_then(|t| t.text()).map(Cow::into_owned))
-            .unwrap_or_default();
-        match kind.as_str() {
-            "response.output_item.done" => {
-                self.items += 1;
-                Seen::Content
-            }
-            "response.incomplete" if response::empty_incomplete(payload, self.items, self.saw_delta) => {
-                Seen::EmptyIncomplete
-            }
-            "response.completed" | "response.incomplete" | "response.done" => Seen::Terminal,
-            _ if response::bufferable(payload) => Seen::Handshake,
+        match (event.kind.as_ref(), outcome) {
+            ("response.output_item.done", _) => Seen::Content,
+            (_, codex_event::Outcome::Ends) => Seen::Terminal,
+            (_, codex_event::Outcome::Recorded) => Seen::Recorded,
+            _ if response::bufferable(&codex_event::classification_view(payload)) => Seen::Handshake,
             _ => Seen::Content,
         }
     }
 
+    /// Usage of a [`Seen::Recorded`] event the response ends on after all.
+    fn account(&self, frame: &Bytes) {
+        if self.usage.enabled()
+            && let Some(data) = parse_frame(frame).1
+        {
+            self.usage.response_line(Format::Codex, data.trim().as_bytes());
+        }
+    }
+
     /// A buffered answer from an SSE body: the terminal event's `response` object, byte
-    /// for byte.
-    fn aggregate(mut self, data: &[u8]) -> Result<Bytes, ExecError> {
+    /// for byte. A buffered client reads the SSE upstream as the pinned SSE reader does:
+    /// past a processing error ([`Seen::Recorded`]) to a later terminal event, and on
+    /// the last such error when the stream ends `clean`ly without one
+    /// (`sse/responses.rs:616-621`). A read failure before any terminal event fails the
+    /// answer as a stream without one does, whatever was recorded: that reader returns a
+    /// read error at once (lines 602-614). A terminal event or failure before the read
+    /// failure still decides the answer.
+    fn aggregate(mut self, data: &[u8], clean: bool) -> Result<Bytes, ExecError> {
         let mut framer = cpa_translate::sse::Framer::with_limit(data.len() + 1);
         let mut frames = framer.push(data).unwrap_or_default();
         frames.extend(framer.finish());
+        let mut recorded = None;
         for frame in frames {
             match self.see(&frame) {
-                Seen::Terminal => {
-                    let (_, payload) = parse_frame(&frame);
-                    let payload = payload.unwrap_or_default();
-                    let event = CodexBody::parse(payload.trim().as_bytes()).map_err(|_| response_unreadable())?;
-                    let object = event.get("response").filter(|r| r.kind == Kind::Object);
-                    return object
-                        .map(|r| Bytes::copy_from_slice(r.raw))
-                        .ok_or_else(response_unreadable);
-                }
-                Seen::EmptyIncomplete => {
-                    return Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE));
-                }
+                Seen::Terminal => return response_object(&frame),
+                Seen::Recorded => recorded = Some(frame),
                 Seen::Failure { error, body, .. } => return Err(direct(error, body)),
-                Seen::Handshake | Seen::Content => {}
+                Seen::Handshake | Seen::Content | Seen::Undecoded => {}
             }
         }
-        Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE))
+        match recorded.filter(|_| clean) {
+            Some(frame) => {
+                self.account(&frame);
+                response_object(&frame)
+            }
+            None => Err(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+        }
+    }
+}
+
+/// The `response` object of a terminal event [`Observer::see`] decoded (its `response`
+/// member is unique), byte for byte.
+fn response_object(frame: &Bytes) -> Result<Bytes, ExecError> {
+    let (_, data) = parse_frame(frame);
+    let data = data.unwrap_or_default();
+    let response = codex_event::decode(&data).and_then(|event| event.response);
+    match response.filter(|r| r.starts_with('{')) {
+        Some(object) => Ok(Bytes::copy_from_slice(object.as_bytes())),
+        None => Err(response_unreadable()),
     }
 }
 
@@ -761,6 +849,10 @@ struct Passthrough {
     websocket: bool,
     out: VecDeque<Result<Bytes, ExecError>>,
     done: bool,
+    /// The last [`Seen::Recorded`] event delivered to an SSE client, whose reader reads
+    /// past it: the response ends on it, with its usage, only if the upstream ends without
+    /// a later terminal event or failure.
+    recorded: Option<Bytes>,
     /// The attempt's record if the consumer drops the stream: canceled until the
     /// upstream completes or the consumer takes the failure that ends it.
     outcome: crate::cancel::StreamOutcome,
@@ -787,20 +879,27 @@ impl Passthrough {
                 self.commit();
                 self.out.push_back(Ok(frame));
             }
+            Seen::Undecoded => self.undecoded(frame),
             Seen::Terminal => {
                 self.commit();
                 self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
             }
-            Seen::EmptyIncomplete if !self.committed => {
-                self.held.clear();
-                self.out
-                    .push_back(Err(response::request_scoped(502, response::EMPTY_INCOMPLETE_MESSAGE)));
-                self.done = true;
-            }
-            Seen::EmptyIncomplete => {
+            // A WebSocket client's reader returns the processing error: its turn ends on
+            // the event (docs/codex/CONTRACT.md "Responses and failures").
+            Seen::Recorded if self.websocket => {
+                self.observer.account(&frame);
+                self.commit();
                 self.out.push_back(Ok(terminated(frame)));
                 self.done = true;
+            }
+            // An SSE client's reader records it and reads on, to a later terminal event or
+            // the end of the stream (`sse/responses.rs:616-621` and 677-690). An event the
+            // upstream left open can only be its last.
+            Seen::Recorded => {
+                self.commit();
+                self.out.push_back(Ok(terminated(frame.clone())));
+                self.recorded = Some(frame);
             }
             Seen::Failure { error, deliver, .. } if self.websocket => {
                 self.observer.wire.exec_error(&error);
@@ -828,8 +927,9 @@ impl Passthrough {
     /// delivers one (`codex_ws.rs`, docs/codex/CONTRACT.md "Responses and failures"): the
     /// #5 context-window event a Codex client receives goes ahead of the error; any other
     /// failure travels on the error as the upstream sent it, for delivery once failover is
-    /// decided; an account failure (401, 402, 403, 429) never reaches the client as sent,
-    /// because its frame can name the pooled account.
+    /// decided; an account failure (401, 402, 403, 429), or a frame that reads as one,
+    /// never reaches the client, as sent or otherwise, because it can name the pooled
+    /// account.
     fn fail_websocket(&mut self, mut error: ExecError, frame: Bytes, deliver: Option<Bytes>) {
         // Nothing was delivered and another credential may serve the turn: the held
         // handshake events go with the attempt, as on the HTTP route.
@@ -845,20 +945,43 @@ impl Passthrough {
             let context = self.observer.codex_client
                 && parse_frame(&frame)
                     .1
-                    .is_some_and(|data| cpa_common::codex_client::context_window_failure_event(data.trim()).is_some());
+                    .is_some_and(|data| codex_event::context_window_event(data.trim()).is_some());
             context.then(|| frame.clone())
         });
         match preserved {
             Some(event) if !retry => self.out.push_back(Ok(event)),
-            _ if crate::codex_ws::account_failure(error.status) => {}
-            _ => {
-                if let Some(data) = parse_frame(&frame).1 {
-                    error.delivered_event = Some(Box::new(Bytes::copy_from_slice(data.as_bytes())));
+            // The same account safety an upstream socket applies (`codex_ws::reading`):
+            // withheld when classified as an account failure, or when the frame reads as
+            // one under another reading.
+            _ => match parse_frame(&frame).1 {
+                Some(data) => {
+                    crate::codex_ws::withhold_sensitive(&mut error, data.trim());
+                    crate::codex_ws::deliver_as_sent(&mut error, &data);
                 }
-            }
+                None if crate::codex_ws::account_failure(error.status) => {
+                    error.delivery = cpa_core::exec::Delivery::Withheld;
+                }
+                None => {}
+            },
         }
         self.out.push_back(Err(error));
         self.done = true;
+    }
+
+    /// An event the pinned client does not decode. It is delivered as sent, and it
+    /// counts as delivered content: the client may show it, so nothing fails over after
+    /// it. A WebSocket client never gets one that would be an account failure if it
+    /// decoded (`codex_ws::account_shaped`), and the shared capture still records it.
+    fn undecoded(&mut self, frame: Bytes) {
+        if self.websocket
+            && parse_frame(&frame)
+                .1
+                .is_some_and(|data| crate::codex_ws::account_shaped(data.trim(), false))
+        {
+            return;
+        }
+        self.commit();
+        self.out.push_back(Ok(frame));
     }
 
     fn end(&mut self, error: ExecError) {
@@ -920,6 +1043,7 @@ fn passthrough(
         websocket,
         out: VecDeque::new(),
         done: false,
+        recorded: None,
         outcome,
     };
     futures_util::stream::unfold(state, |mut st| async move {
@@ -946,9 +1070,27 @@ fn passthrough(
             };
             match next {
                 Some(Ok(frame)) => st.take(frame),
-                Some(Err(error)) => st.end(error),
-                // A clean end without a terminal event: a truncated response.
-                None => st.end(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+                Some(Err(error)) => {
+                    // The client has the provider's last processing error, and the read
+                    // failure still ends the attempt: its record is failed, and a failure
+                    // record carries no tokens (the server's `PublishFailure`), whatever
+                    // the event reported.
+                    if let Some(frame) = st.recorded.take() {
+                        st.observer.account(&frame);
+                    }
+                    st.end(error)
+                }
+                // A clean end after a processing error the client recorded: the response
+                // ended on it, as the pinned SSE reader reports at the end of the stream.
+                // Nothing is added: the client reads that end from the event it has.
+                None => match st.recorded.take() {
+                    Some(frame) => {
+                        st.observer.account(&frame);
+                        st.done = true;
+                    }
+                    // A clean end without a terminal event: a truncated response.
+                    None => st.end(response::request_scoped(408, response::INCOMPLETE_MESSAGE)),
+                },
             }
             if st.done {
                 // The upstream response ended: a terminal event (its usage is observed),

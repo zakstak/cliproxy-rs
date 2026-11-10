@@ -194,6 +194,7 @@ impl CodexExecutor {
                 status,
                 headers,
                 body: ResponseBody::Buffered(data),
+                omitted: Default::default(),
             });
         }
         let usage = req.usage.clone();
@@ -220,6 +221,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Stream(stream.boxed()),
+            omitted: Default::default(),
         })
     }
 
@@ -263,6 +265,7 @@ impl CodexExecutor {
                 status: res.status,
                 headers: res.headers,
                 body: ResponseBody::Stream(frames(upstream, prepared, req.usage.clone(), wire)),
+                omitted: Default::default(),
             });
         }
         // Go reads the whole body (`io.ReadAll`) and records it before parsing.
@@ -302,6 +305,7 @@ impl CodexExecutor {
                                 usage.as_deref(),
                                 prepared.url_format,
                             ))),
+                            omitted: Default::default(),
                         });
                     }
                     _ => {}

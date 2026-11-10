@@ -1,10 +1,12 @@
 //! Codex upstream wire capture (Go `helps.RecordAPI*` and `AppendAPI*` at the Codex call
 //! sites). One [`Wire`] per attempt carries the call's capture sink and the selected
 //! account's identity, so every physical request is recorded with Go's provider and auth
-//! fields. Without an observer every call is a no-op.
+//! fields. Without an observer every call is a no-op. A native route binds the wire to the
+//! authentication values its upstream request or socket carried ([`Wire::bind`]), and the
+//! sink keeps everything it records scrubbed of them (#25).
 
 use cpa_core::credential::Credential;
-use cpa_core::exec::{CaptureEvent, CaptureSink, UpstreamRequest};
+use cpa_core::exec::{CaptureEvent, CaptureSink, SentCredentials, UpstreamRequest};
 use http::HeaderMap;
 
 /// Go `http.Header` keys for a header map built like Go's: canonical spelling, values
@@ -59,6 +61,8 @@ pub(crate) struct Wire {
     auth_label: String,
     auth_type: &'static str,
     auth_value: String,
+    /// The values the request or socket being recorded carried ([`Wire::bind`]).
+    sent: SentCredentials,
 }
 
 impl Wire {
@@ -74,7 +78,19 @@ impl Wire {
             auth_label: credential.label.clone(),
             auth_type,
             auth_value,
+            sent: SentCredentials::default(),
         }
+    }
+
+    /// From here on, the exchange recorded is the one whose upstream request or socket
+    /// carried `sent`: a native request's own headers, then the socket that serves the
+    /// turn (its handshake's values, which a reused socket keeps).
+    pub(crate) fn bind(&mut self, sent: &SentCredentials) {
+        self.sent = sent.clone();
+    }
+
+    fn record(&self, event: CaptureEvent<'_>) {
+        self.sink.record_sent(event, &self.sent);
     }
 
     /// Reports the WebSocket frames this wire records to the attempt's observer.
@@ -111,8 +127,7 @@ impl Wire {
     pub(crate) fn request(&self, url: &str, headers: &HeaderMap, body: &[u8]) {
         if self.enabled() {
             let headers = http_pairs(headers);
-            self.sink
-                .record(CaptureEvent::Request(self.info(url, "POST", &headers, body)));
+            self.record(CaptureEvent::Request(self.info(url, "POST", &headers, body)));
         }
     }
 
@@ -120,18 +135,18 @@ impl Wire {
     pub(crate) fn metadata(&self, status: u16, headers: &HeaderMap) {
         if self.enabled() {
             let headers = http_pairs(headers);
-            self.sink.record(CaptureEvent::ResponseMetadata(status, &headers));
+            self.record(CaptureEvent::ResponseMetadata(status, &headers));
         }
     }
 
     /// `AppendAPIResponseChunk`.
     pub(crate) fn chunk(&self, bytes: &[u8]) {
-        self.sink.record(CaptureEvent::ResponseChunk(bytes));
+        self.record(CaptureEvent::ResponseChunk(bytes));
     }
 
     /// `RecordAPIResponseError`.
     pub(crate) fn error(&self, text: &str) {
-        self.sink.record(CaptureEvent::ResponseError(text));
+        self.record(CaptureEvent::ResponseError(text));
     }
 
     /// `RecordAPIResponseError` with an executor error's Go text (`statusErr.Error()`
@@ -146,7 +161,7 @@ impl Wire {
     pub(crate) fn ws_request(&self, url: &str, headers: &HeaderMap, body: &[u8]) {
         if self.enabled() {
             let headers = websocket_pairs(headers);
-            self.sink.record(CaptureEvent::WebsocketRequest(self.info(
+            self.record(CaptureEvent::WebsocketRequest(self.info(
                 url,
                 "WEBSOCKET",
                 &headers,
@@ -159,7 +174,7 @@ impl Wire {
     /// method, body, provider and account ID there.
     pub(crate) fn ws_frame(&self, url: &str, body: &[u8]) {
         if self.enabled() {
-            self.sink.record(CaptureEvent::WebsocketRequest(UpstreamRequest {
+            self.record(CaptureEvent::WebsocketRequest(UpstreamRequest {
                 url,
                 method: "WEBSOCKET",
                 headers: &[],
@@ -177,7 +192,7 @@ impl Wire {
     pub(crate) fn ws_handshake(&self, status: u16, headers: &HeaderMap) {
         if self.enabled() {
             let headers = http_pairs(headers);
-            self.sink.record(CaptureEvent::WebsocketHandshake(status, &headers));
+            self.record(CaptureEvent::WebsocketHandshake(status, &headers));
         }
     }
 
@@ -188,7 +203,7 @@ impl Wire {
         &self,
         payload: &str,
     ) -> Option<futures_util::future::BoxFuture<'static, ()>> {
-        self.sink.record(CaptureEvent::WebsocketResponse(payload.as_bytes()));
+        self.record(CaptureEvent::WebsocketResponse(payload.as_bytes()));
         let websocket = self.websocket.clone()?;
         let payload = payload.to_owned();
         Some(Box::pin(async move { websocket.emit(payload.as_bytes()).await }))
@@ -199,7 +214,7 @@ impl Wire {
     /// that before writing it).
     pub(crate) fn ws_exec_error(&self, stage: &str, error: &cpa_core::exec::ExecError) {
         if self.enabled() {
-            self.sink.record(CaptureEvent::WebsocketError {
+            self.record(CaptureEvent::WebsocketError {
                 stage,
                 error: &String::from_utf8_lossy(&error.body),
                 cause: error.diagnostic.as_ref().map(cpa_core::exec::Diagnostic::as_str),
@@ -232,8 +247,7 @@ impl Wire {
             }
         }
         let url = upgrade_url(ws_url);
-        self.sink
-            .record(CaptureEvent::Request(self.info(&url, "GET", &pairs, &[])));
+        self.record(CaptureEvent::Request(self.info(&url, "GET", &pairs, &[])));
         self.metadata(status, headers);
         self.chunk(body);
     }

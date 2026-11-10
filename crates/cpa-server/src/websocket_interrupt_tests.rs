@@ -250,14 +250,16 @@ async fn an_http_turn_acknowledges_its_local_interrupt() {
     assert_eq!(*calls.lock().unwrap(), 2);
 }
 
-/// zakstak/cliproxy-rs#7: Codex cancels a response after `response.created` and before
-/// any output, and upstream ends it as `response.incomplete` with reason `interrupted`,
-/// no output and `output_tokens` 0. The pinned client completes the turn on that event
-/// and classifies `content_filter` and every other reason itself
-/// (`codex-api/src/sse/responses.rs:451-518` at 44ccf394573c). Through the whole
-/// handler, such an end reaches the client as sent, the socket and the credential serve
-/// the next request, and the response's usage is recorded once. An incomplete response
-/// that gives no reason stays a silent abort.
+/// zakstak/cliproxy-rs#7 and #25: Codex cancels a response after `response.created` and
+/// before any output, and upstream ends it as `response.incomplete` with reason
+/// `interrupted`, no output and `output_tokens` 0. The pinned client completes the turn
+/// on that event, reads `content_filter` as its own error, and reads every other reason,
+/// a missing one included (as `unknown`), as a terminal, non-retryable
+/// `ResponseIncomplete` with its ID, usage and partial output
+/// (`codex-api/src/sse/responses.rs:451-506`, `protocol/src/error.rs:428-442` at
+/// 44ccf394573c). Through the whole handler, every such end reaches the client as sent,
+/// at every stage of the response, the socket and the credential serve the next request,
+/// and the response's usage is recorded once.
 mod zero_output_ends {
     use super::*;
     use serde_json::Value;
@@ -269,6 +271,9 @@ mod zero_output_ends {
     /// A follow-up with the full input, for a turn served over HTTP.
     const CREATE_FULL: &str = r#"{"type":"response.create","model":"gpt-fixture","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#;
     const STEERING: &str = "codex:\n  response-steering: true\n";
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    /// [`BUFFERING`] under a `codex:` key [`STEERING`] already opened.
+    const BUFFERING_KEY: &str = "  stream-bootstrap-buffering: true\n";
 
     fn reason(terminal: &str) -> String {
         cpa_common::rawjson::get(terminal, "response.incomplete_details.reason")
@@ -342,36 +347,6 @@ mod zero_output_ends {
         }
     }
 
-    /// The silent abort: the connection ends without the incomplete event, the attempt is
-    /// recorded once as a 502, and the request-scoped failure cools nothing.
-    async fn aborted(client: &mut Proxy, rt: &crate::Runtime, credential: &str, case: &str) {
-        loop {
-            match tokio::time::timeout(Duration::from_secs(3), client.socket.next()).await {
-                Ok(Some(Ok(WsMessage::Text(text)))) => {
-                    assert!(!text.as_str().contains("response.incomplete"), "{case}: {text:?}");
-                }
-                Ok(Some(Ok(WsMessage::Close(_)) | Err(_)) | None) => break,
-                Ok(Some(Ok(_))) => {}
-                Err(_) => panic!("{case}: the connection stayed open"),
-            }
-        }
-        let queue = rt.usage_queue();
-        let mut got: Vec<Value> = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-            while got.is_empty() {
-                got.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        got.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
-        assert_eq!(got.len(), 1, "{case}: {got:?}");
-        assert_eq!(got[0]["failed"], true, "{case}");
-        assert_eq!(got[0]["fail"]["status_code"], 502, "{case}");
-        assert!(rt.store().cooldowns(credential).is_empty(), "{case}: request-scoped");
-    }
-
     /// Canceled before the first delta, acknowledged before or after the terminal event,
     /// with and without `response-steering`: both events arrive as upstream sent them, the
     /// next create runs on the same socket and sees only its own response, and the
@@ -418,99 +393,126 @@ mod zero_output_ends {
         }
     }
 
-    /// `content_filter` and `max_output_tokens` with zero output are the provider's
-    /// answer: they reach the client unchanged, with their own reason, and the socket and
-    /// the credential stay. An unexplained end sent before any event is delivered is
-    /// an upstream silent abort: the client never gets it, the attempt is a request-scoped
-    /// 502 that cools nothing, and the socket is gone.
+    /// `content_filter`, `max_output_tokens` and an end without a reason, each with zero
+    /// output, are the provider's answer at every stage (#25): as the turn's first event,
+    /// after a delivered `response.created`, and after one bootstrap buffering held. Each
+    /// reaches the client unchanged with its own reason, nothing is invented in its place,
+    /// the next create runs on the same socket and sees only its own response, the
+    /// credential does not cool, and the response is recorded once with its usage, as
+    /// any terminal event the provider sends is. With response steering, buffering does
+    /// not apply and each response gets its own record; a steering connection whose first
+    /// response ends without `response.created` is checked only for that end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn named_reasons_stay_distinct_and_an_unexplained_end_stays_an_abort() {
+    async fn zero_output_ends_pass_unchanged_at_every_stage() {
         for steering in [false, true] {
-            for terminal in [CONTENT_FILTER, MAX_OUTPUT] {
-                let case = format!("steering={steering} reason={}", reason(terminal));
-                let (upstream, frames, dials) =
-                    ws_upstream(vec![vec![CREATED_R1, terminal], vec![CREATED_R2, COMPLETED_R2]]).await;
-                let (mut client, rt, credential) =
-                    proxy_with(&upstream, true, if steering { STEERING } else { "" }).await;
+            for buffering in [false, true] {
+                for leading in [&[][..], &[CREATED_R1][..]] {
+                    for terminal in [CONTENT_FILTER, MAX_OUTPUT, UNEXPLAINED] {
+                        let case = format!(
+                            "steering={steering} buffering={buffering} leading={} reason={}",
+                            leading.len(),
+                            reason(terminal)
+                        );
+                        let mut first = leading.to_vec();
+                        first.push(terminal);
+                        let (upstream, frames, dials) =
+                            ws_upstream(vec![first.clone(), vec![CREATED_R2, COMPLETED_R2]]).await;
+                        let mut config = String::new();
+                        if steering {
+                            config.push_str(STEERING);
+                        }
+                        if buffering {
+                            config.push_str(if steering { BUFFERING_KEY } else { BUFFERING });
+                        }
+                        let (mut client, rt, credential) = proxy_with(&upstream, true, &config).await;
+                        client.send(CREATE).await;
+                        let mut got = Vec::new();
+                        for _ in &first {
+                            got.push(client.read().await);
+                        }
+                        assert_eq!(got, first, "{case}");
+                        if steering && leading.is_empty() {
+                            // Inherited steering limit (docs/codex/CONTRACT.md "Native
+                            // WebSocket route"): the duplex reads the client's later
+                            // frames only after a first `response.created`, so a first
+                            // response that ends without one leaves no follow-up to
+                            // check. The end itself arrived as sent, and nothing else.
+                            quiet(&mut client, &case).await;
+                            assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+                            continue;
+                        }
+                        client.send(CREATE_R2).await;
+                        assert_eq!(
+                            [client.read().await, client.read().await],
+                            [CREATED_R2, COMPLETED_R2],
+                            "{case}"
+                        );
+                        quiet(&mut client, &case).await;
+                        assert_eq!(*frames.lock().unwrap(), [CREATE, CREATE_R2], "{case}");
+                        assert_eq!(*dials.lock().unwrap(), 1, "{case}: one socket");
+                        assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
+                        if steering {
+                            recorded_per_response(&steering_records(&rt).await, &case);
+                        } else {
+                            recorded_once(&records(&rt).await, &case);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A WebSocket turn served over HTTP (a credential without `websockets`): every
+    /// zero-output end reaches the client unchanged at every stage, as the first event,
+    /// after a delivered `response.created` and after one bootstrap buffering held, and
+    /// the next request runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_over_http_keeps_every_zero_output_end() {
+        for terminal in [INTERRUPTED, CONTENT_FILTER, MAX_OUTPUT, UNEXPLAINED] {
+            for (leading, hold) in [(false, false), (true, false), (true, true)] {
+                let case = format!("reason={} leading={leading} hold={hold}", reason(terminal));
+                let calls: Arc<Mutex<usize>> = Arc::default();
+                let counter = calls.clone();
+                let upstream = serve(axum::Router::new().fallback(move || {
+                    let call = {
+                        let mut calls = counter.lock().unwrap();
+                        *calls += 1;
+                        *calls
+                    };
+                    async move {
+                        let (created, end) = if call == 1 {
+                            (leading.then_some(CREATED_R1), terminal)
+                        } else {
+                            (Some(CREATED_R2), COMPLETED_R2)
+                        };
+                        let kind = cpa_common::rawjson::get(end, "type").str().to_owned();
+                        let mut body = String::new();
+                        if let Some(created) = created {
+                            body.push_str(&format!("event: response.created\ndata: {created}\n\n"));
+                        }
+                        body.push_str(&format!("event: {kind}\ndata: {end}\n\n"));
+                        ([("content-type", "text/event-stream")], body)
+                    }
+                }))
+                .await;
+                let config = if hold { BUFFERING } else { "" };
+                let (mut client, rt, credential) = proxy_with(&upstream, false, config).await;
                 client.send(CREATE).await;
-                assert_eq!(
-                    [client.read().await, client.read().await],
-                    [CREATED_R1, terminal],
-                    "{case}"
-                );
-                client.send(CREATE_R2).await;
+                if leading {
+                    assert_eq!(client.read().await, CREATED_R1, "{case}");
+                }
+                assert_eq!(client.read().await, terminal, "{case}");
+                client.send(CREATE_FULL).await;
                 assert_eq!(
                     [client.read().await, client.read().await],
                     [CREATED_R2, COMPLETED_R2],
                     "{case}"
                 );
-                assert_eq!(frames.lock().unwrap().len(), 2, "{case}");
-                assert_eq!(*dials.lock().unwrap(), 1, "{case}: one socket");
+                quiet(&mut client, &case).await;
+                assert_eq!(*calls.lock().unwrap(), 2, "{case}");
                 assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
-                if steering {
-                    recorded_per_response(&steering_records(&rt).await, &case);
-                } else {
-                    recorded_once(&records(&rt).await, &case);
-                }
+                recorded_once(&records(&rt).await, &case);
             }
-        }
-        let (upstream, frames, _) = ws_upstream(vec![vec![UNEXPLAINED]]).await;
-        let (mut client, rt, credential) = proxy_with(&upstream, true, "").await;
-        client.send(CREATE).await;
-        aborted(&mut client, &rt, &credential, "no reason before delivery").await;
-        assert_eq!(frames.lock().unwrap().len(), 1);
-    }
-
-    /// A WebSocket turn served over HTTP (a credential without `websockets`), with
-    /// bootstrap buffering holding `response.created` so the end arrives before anything
-    /// was delivered: a zero-output end that names its reason reaches the client unchanged
-    /// and the next request runs; without a reason it is the 502.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_turn_over_http_keeps_named_zero_output_ends() {
-        for terminal in [INTERRUPTED, CONTENT_FILTER, MAX_OUTPUT, UNEXPLAINED] {
-            let case = format!("reason={}", reason(terminal));
-            let calls: Arc<Mutex<usize>> = Arc::default();
-            let counter = calls.clone();
-            let upstream = serve(axum::Router::new().fallback(move || {
-                let call = {
-                    let mut calls = counter.lock().unwrap();
-                    *calls += 1;
-                    *calls
-                };
-                async move {
-                    let (created, end) = if call == 1 {
-                        (CREATED_R1, terminal)
-                    } else {
-                        (CREATED_R2, COMPLETED_R2)
-                    };
-                    let kind = cpa_common::rawjson::get(end, "type").str().to_owned();
-                    let body = format!("event: response.created\ndata: {created}\n\nevent: {kind}\ndata: {end}\n\n");
-                    ([("content-type", "text/event-stream")], body)
-                }
-            }))
-            .await;
-            let (mut client, rt, credential) =
-                proxy_with(&upstream, false, "codex:\n  stream-bootstrap-buffering: true\n").await;
-            client.send(CREATE).await;
-            if terminal == UNEXPLAINED {
-                aborted(&mut client, &rt, &credential, &case).await;
-                assert_eq!(*calls.lock().unwrap(), 1, "{case}");
-                continue;
-            }
-            assert_eq!(
-                [client.read().await, client.read().await],
-                [CREATED_R1, terminal],
-                "{case}"
-            );
-            client.send(CREATE_FULL).await;
-            assert_eq!(
-                [client.read().await, client.read().await],
-                [CREATED_R2, COMPLETED_R2],
-                "{case}"
-            );
-            assert_eq!(*calls.lock().unwrap(), 2, "{case}");
-            assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
-            recorded_once(&records(&rt).await, &case);
         }
     }
 }

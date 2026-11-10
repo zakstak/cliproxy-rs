@@ -235,7 +235,8 @@ pub enum Done {
         headers: HeaderMap,
         body: Bytes,
     },
-    /// A stream whose first event already arrived. `rest` reports its lease outcome.
+    /// A committed stream: its first event (`first`), or, with `first: None`, a served
+    /// frame an outbound guard left out ([`finish`]). `rest` reports its lease outcome.
     Stream {
         headers: HeaderMap,
         first: Option<Bytes>,
@@ -286,6 +287,9 @@ impl Failure {
     /// Go `err.Error()`: what route error writers render.
     pub fn text(&self) -> String {
         match self {
+            // A failure that carries an upstream authentication value
+            // (`Delivery::Confidential`) renders by its status alone.
+            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.confidential() => String::new(),
             Failure::Exec(e) | Failure::Remote { error: e, .. } => classify::error_text(e),
             Failure::UnknownModel(model) => {
                 let message = gojson::sjson_string(&format!("unknown provider for model {model}"));
@@ -359,7 +363,7 @@ impl Failure {
     pub fn direct(&self) -> Option<&ExecError> {
         // Go finds the direct response through any wrapper, a Home round marker included.
         match self {
-            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.direct => Some(e),
+            Failure::Exec(e) | Failure::Remote { error: e, .. } if e.direct && !e.confidential() => Some(e),
             _ => None,
         }
     }
@@ -2156,11 +2160,15 @@ async fn attempt(
         let last_here = stop || i + 1 == target.models.len() || classify::credential_scoped(error);
         // Go returns a stopping bootstrap failure as is: an error, not a stream, so the
         // handler's bootstrap retries never see it. Any other one goes on as a
-        // `streamBootstrapError`, whose `Headers()` are the stream's.
+        // `streamBootstrapError`, whose `Headers()` are the stream's. A failure that
+        // carried an upstream credential hands the client no upstream headers at all
+        // (`Delivery::Confidential`, #25), so it gets none here either.
         let mut fault = fault;
         if stop {
             fault.bootstrap = None;
-        } else if let Some(headers) = &fault.bootstrap {
+        } else if let Some(headers) = &fault.bootstrap
+            && !fault.error.confidential()
+        {
             fault.error.addon = Some(headers.clone());
         }
         if last_here {
@@ -2362,32 +2370,71 @@ fn attempt_request(
     req
 }
 
+/// How a stream's bootstrap ends ([`finish`]).
+enum Bootstrap {
+    /// The first payload: the stream commits.
+    First(Bytes),
+    /// A served frame was left out of the stream ([`cpa_core::exec::Omissions`]), and
+    /// nothing deliverable has come yet: the stream commits without a first payload and
+    /// goes on.
+    Omitted,
+    /// As [`Bootstrap::Omitted`], and the stream then ended (`None`) or failed.
+    OmittedThen(Option<ExecError>),
+    /// Failed before anything was served.
+    Failed(ExecError),
+    /// Ended before anything was served.
+    Empty,
+}
+
 /// Bootstraps a stream (first event before committing) or buffers a body.
+///
+/// A frame an outbound delivery guard left out ([`cpa_core::exec::ExecResponse::omitted`])
+/// was served: the executor processed it as a delivered one. The stream commits on it as
+/// on its first payload, so that processing decides the attempt's outcome, its usage and
+/// whether anything fails over, exactly as if the frame had been delivered. In particular a
+/// stream whose every frame was left out is not empty (#25: the upstream served it, and it
+/// must not run again on another credential).
 async fn finish(call: &Call, response: cpa_core::exec::ExecResponse) -> Result<Done, Fault> {
-    match response.body {
-        ResponseBody::Buffered(body) => Ok(Done::Buffered {
-            headers: response.headers,
-            body,
-        }),
+    let cpa_core::exec::ExecResponse {
+        headers, body, omitted, ..
+    } = response;
+    match body {
+        ResponseBody::Buffered(body) => Ok(Done::Buffered { headers, body }),
         ResponseBody::Stream(mut stream) if call.stream => {
             let bootstrap = |error| Fault {
                 error,
-                bootstrap: Some(Box::new(response.headers.clone())),
+                bootstrap: Some(Box::new(headers.clone())),
             };
-            let first = loop {
-                match stream.next().await {
-                    Some(Ok(bytes)) if bytes.is_empty() => continue,
-                    Some(Ok(bytes)) => break bytes,
-                    Some(Err(error)) => return Err(bootstrap(error)),
-                    // Go conductor_stream.go: an empty stream is a failed attempt.
-                    None => return Err(bootstrap(classify::empty_stream())),
+            // An omission is recorded before the stream yields the item after it, or
+            // before it reports `Pending`: it is read on the same poll.
+            let start = std::future::poll_fn(|cx| {
+                use std::task::Poll;
+                loop {
+                    return match stream.poll_next_unpin(cx) {
+                        Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                        Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Bootstrap::First(bytes)),
+                        Poll::Ready(Some(Err(error))) if omitted.any() => {
+                            Poll::Ready(Bootstrap::OmittedThen(Some(error)))
+                        }
+                        Poll::Ready(Some(Err(error))) => Poll::Ready(Bootstrap::Failed(error)),
+                        Poll::Ready(None) if omitted.any() => Poll::Ready(Bootstrap::OmittedThen(None)),
+                        Poll::Ready(None) => Poll::Ready(Bootstrap::Empty),
+                        Poll::Pending if omitted.any() => Poll::Ready(Bootstrap::Omitted),
+                        Poll::Pending => Poll::Pending,
+                    };
                 }
-            };
-            Ok(Done::Stream {
-                headers: response.headers,
-                first: Some(first),
-                rest: stream,
             })
+            .await;
+            let (first, rest) = match start {
+                Bootstrap::First(first) => (Some(first), stream),
+                Bootstrap::Omitted => (None, stream),
+                Bootstrap::OmittedThen(None) => (None, futures_util::stream::empty().boxed()),
+                Bootstrap::OmittedThen(Some(error)) => (None, futures_util::stream::iter([Err(error)]).boxed()),
+                Bootstrap::Failed(error) => return Err(bootstrap(error)),
+                // Go conductor_stream.go: an empty stream is a failed attempt.
+                Bootstrap::Empty => return Err(bootstrap(classify::empty_stream())),
+            };
+            Ok(Done::Stream { headers, first, rest })
         }
         ResponseBody::Stream(mut stream) => {
             let mut body = BytesMut::new();
@@ -2395,7 +2442,7 @@ async fn finish(call: &Call, response: cpa_core::exec::ExecResponse) -> Result<D
                 body.extend_from_slice(&event.map_err(|error| Fault { error, bootstrap: None })?);
             }
             Ok(Done::Buffered {
-                headers: response.headers,
+                headers,
                 body: body.freeze(),
             })
         }
@@ -2606,6 +2653,114 @@ mod tests {
         // A status keeps the credential/status path, whatever the text says.
         let statused = ExecError::local(500, cpa_core::exec::FailureScope::Credential, "unexpected EOF");
         assert!(!lifecycle(&statused));
+    }
+
+    /// #25: a served frame an outbound guard left out commits the stream as a first
+    /// payload does, on the same poll that read it: without a payload yet the stream
+    /// goes on, its end is a clean end, and its error stays the stream's own. Only a
+    /// stream that served nothing is Go's failed `empty_stream` attempt, and an error
+    /// before anything was served stays a bootstrap failure.
+    #[tokio::test]
+    async fn an_omitted_frame_commits_the_stream() {
+        use std::task::Poll;
+        let call = Call {
+            entry: Format::OpenAIResponse,
+            response: Format::OpenAIResponse,
+            operation: Operation::Generate,
+            model: "m".into(),
+            body: Bytes::new(),
+            stream: true,
+            alt: None,
+            headers: HeaderMap::new(),
+            caller: Caller {
+                principal: String::new(),
+                source: "",
+                provider: String::new(),
+            },
+            forced_provider: None,
+            selection_model: None,
+            execution_session: None,
+            request_path: String::new(),
+            peer: None,
+            native: None,
+            turn: None,
+            media: None,
+        };
+        let failure = || ExecError::local(503, cpa_core::exec::FailureScope::Credential, "read failed");
+        // What the stream does on its first poll, after it omitted a frame or not.
+        #[derive(Clone, Copy, Debug)]
+        enum Then {
+            End,
+            Fail,
+            Wait,
+            Payload,
+        }
+        for omit in [true, false] {
+            for then in [Then::End, Then::Fail, Then::Wait, Then::Payload] {
+                let omitted = cpa_core::exec::Omissions::tracked();
+                let mut polls = 0;
+                let marker = omitted.clone();
+                let stream = futures_util::stream::poll_fn(move |_| {
+                    polls += 1;
+                    if polls > 1 {
+                        return Poll::Ready(None);
+                    }
+                    if omit {
+                        marker.omit();
+                    }
+                    match then {
+                        Then::End => Poll::Ready(None),
+                        Then::Fail => Poll::Ready(Some(Err(failure()))),
+                        Then::Wait => Poll::Pending,
+                        Then::Payload => Poll::Ready(Some(Ok(Bytes::from_static(b"payload")))),
+                    }
+                })
+                .boxed();
+                let response = cpa_core::exec::ExecResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    body: ResponseBody::Stream(stream),
+                    omitted,
+                };
+                let case = format!("omit={omit} {then:?}");
+                let started = futures_util::poll!(std::pin::pin!(finish(&call, response)));
+                match (omit, then, started) {
+                    (_, Then::Payload, Poll::Ready(Ok(Done::Stream { first, .. }))) => {
+                        assert_eq!(first.as_deref(), Some(&b"payload"[..]), "{case}");
+                    }
+                    (
+                        true,
+                        _,
+                        Poll::Ready(Ok(Done::Stream {
+                            first: None, mut rest, ..
+                        })),
+                    ) => match then {
+                        Then::End => assert!(rest.next().await.is_none(), "{case}"),
+                        Then::Fail => {
+                            let error = rest.next().await.unwrap().unwrap_err();
+                            assert_eq!((error.status, &error.body[..]), (503, &b"read failed"[..]), "{case}");
+                        }
+                        // The stream goes on from where it was: its next item is its end.
+                        Then::Wait => assert!(rest.next().await.is_none(), "{case}"),
+                        Then::Payload => unreachable!(),
+                    },
+                    (false, Then::End, Poll::Ready(Err(fault))) => {
+                        assert_eq!(
+                            classify::error_text(&fault.error),
+                            classify::error_text(&classify::empty_stream())
+                        );
+                        assert!(fault.bootstrap.is_some(), "{case}");
+                    }
+                    (false, Then::Fail, Poll::Ready(Err(fault))) => {
+                        assert_eq!(fault.error.status, 503, "{case}");
+                    }
+                    (false, Then::Wait, Poll::Pending) => {}
+                    (_, _, Poll::Ready(Ok(_))) => panic!("{case}: committed as it should not"),
+                    (_, _, Poll::Ready(Err(fault))) => panic!("{case}: failed: {:?}", fault.error),
+                    (_, _, Poll::Pending) => panic!("{case}: still bootstrapping"),
+                }
+            }
+        }
     }
 
     /// Go starts the non-stream keep-alive in the non-stream generate handlers only, and

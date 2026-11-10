@@ -302,6 +302,7 @@ impl MetaExecutor {
             status: upstream.status,
             headers: upstream.headers,
             body: out,
+            omitted: Default::default(),
         })
     }
 
@@ -329,6 +330,7 @@ impl MetaExecutor {
             status: 200,
             headers: http::HeaderMap::new(),
             body: ResponseBody::Buffered(Bytes::from(payload)),
+            omitted: Default::default(),
         })
     }
 }
@@ -534,7 +536,7 @@ fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         retry_after,
         direct: false,
         delivered_status: None,
-        delivered_event: None,
+        delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
     }

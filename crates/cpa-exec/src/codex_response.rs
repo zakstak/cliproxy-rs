@@ -249,7 +249,7 @@ pub(crate) fn status_error_raw(code: u16, message: &str, headers: HeaderMap, mod
         retry_after,
         direct: false,
         delivered_status: None,
-        delivered_event: None,
+        delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
     }
@@ -418,6 +418,9 @@ pub(crate) fn meaningful_delta(payload: &str) -> bool {
 /// (`interrupted`, `content_filter`, `max_output_tokens`) is that response, not an
 /// abort: a cancellation before the first token produces exactly this shape, and current
 /// Codex reads those reasons itself (docs/DIFFERENCES-FROM-GO.md).
+///
+/// Only the translated route ([`Processor`]) still applies it (#27). Native HTTP and
+/// WebSocket routes deliver every `response.incomplete` as sent (#25).
 pub(crate) fn empty_incomplete(payload: &str, items: usize, saw_delta: bool) -> bool {
     if rawjson::get(payload, "type").str() != "response.incomplete" || saw_delta || items > 0 {
         return false;

@@ -772,7 +772,7 @@ pub(crate) enum CaptureRecord {
 pub(crate) struct CaptureLog(Mutex<Vec<CaptureRecord>>);
 
 impl cpa_core::exec::CaptureObserver for CaptureLog {
-    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>) {
+    fn record(&self, event: cpa_core::exec::CaptureEvent<'_>, _: &cpa_core::exec::SentCredentials) {
         use cpa_core::exec::CaptureEvent as E;
         let record = match event {
             E::Request(r) => CaptureRecord::Request {

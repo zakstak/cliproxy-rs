@@ -295,6 +295,56 @@
       ],
       "contract": "An incomplete response keeps its reason, its incomplete output items and its usage.",
       "notes": "The function_call item is hand-authored; the test uses a generic call item."
+    },
+    {
+      "name": "sse-compaction-v2",
+      "file": "sse/compaction_v2.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/core/tests/suite/compact_remote.rs:764-773 remote_compact_v2_charges_retained_images_to_token_budget mounts this stream for a compaction_trigger request on /v1/responses",
+        "codex-rs/core/tests/common/responses.rs:798-811 sse writes event and data lines",
+        "codex-rs/core/tests/common/responses.rs:818-826 ev_completed",
+        "codex-rs/core/src/compact_remote_v2.rs:386-492 collect_compaction_output requires exactly one compaction output item before response.completed",
+        "codex-rs/protocol/src/models.rs:1312-1321 ResponseItem::Compaction, encrypted_content required"
+      ],
+      "contract": "A remote compaction v2 answer: an ordinary Responses stream whose one output item is a compaction item with opaque encrypted_content, then response.completed with zero usage as reported.",
+      "notes": "Values verbatim from the test's json! literals, written in source key order. serde_json without preserve_order would sort the keys, so key order is not part of the contract."
+    },
+    {
+      "name": "probe-sse-compaction-v2-opaque",
+      "file": "probe/sse_compaction_v2_opaque.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "contract-probe",
+      "sources": [
+        "codex-rs/protocol/src/models.rs:1312-1321 ResponseItem::Compaction: optional id, required encrypted_content",
+        "codex-rs/core/src/compact_remote_v2.rs:386-492 the compaction item arrives as response.output_item.done before response.completed",
+        "docs/codex/CONTRACT.md#field-preservation"
+      ],
+      "contract": "A compaction v2 stream with a compaction item carrying an id, opaque encrypted content and unknown members with raw number spellings (1.50, 1e3, -0.0, a u64 overflow) and a JSON unicode escape, and a completion with reported zero output tokens: every byte reaches the client, and a buffered answer is the completion's response object byte for byte.",
+      "notes": "Not first-party output and not recorded traffic. Hand-authored to probe the preservation rule on a compaction answer."
+    },
+    {
+      "name": "probe-sse-incomplete-ends",
+      "file": "probe/sse_incomplete_ends.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "contract-probe",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:451-506 response.incomplete: a missing or non-string reason reads as unknown, content_filter is its own error, interrupted completes with end_turn false, any other reason is a terminal ResponseIncomplete with reason, response ID, usage and incomplete output items",
+        "codex-rs/protocol/src/error.rs:428-442 ResponseIncomplete has no retry delay",
+        "docs/codex/CONTRACT.md#permitted-transformations"
+      ],
+      "contract": "One response.incomplete per event: reason absent, incomplete_details null, reason null, reason empty, an unknown reason, interrupted, content_filter and max_output_tokens, each with zero output and output_tokens 0; usage missing; opaque members with raw number spellings, a unicode escape and a duplicate key; and partial output with partial usage. Each reaches the client as sent at every stage of the response, and a buffered answer is its response object byte for byte.",
+      "notes": "Not first-party output and not recorded traffic: no source shows which of these shapes a backend sends. Hand-authored to probe the preservation rule. In every event response is the last member, so a test can slice the buffered answer from the fixture's own bytes."
     }
   ]
 }

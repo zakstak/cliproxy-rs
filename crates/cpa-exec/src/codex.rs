@@ -26,7 +26,9 @@ use crate::codex_response::{self as response, Bootstrap, Processor};
 use crate::rawjson;
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
-pub use crate::codex_ws::{ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SteeringInput, handshake_metadata_event};
+pub use crate::codex_ws::{
+    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SessionLosses, SteeringInput, TakenLoss, handshake_metadata_event,
+};
 pub use native::APPEND_REFUSED;
 
 pub struct CodexExecutor {
@@ -210,15 +212,16 @@ impl CodexExecutor {
         self.ws.interrupt(session, payload, enabled).await
     }
 
-    /// The error that lost the session's upstream socket, once it is lost (what Go's
-    /// disconnect notifier hands the downstream handler).
-    pub fn session_loss(&self, id: &str) -> Option<ExecError> {
-        self.ws.loss(id)
+    /// A new attempt of session `id` starts
+    /// ([`Executors::session_attempt`](crate::Executors::session_attempt)).
+    pub fn begin_session_attempt(&self, id: &str) {
+        self.ws.begin_attempt(id);
     }
 
-    /// Resolves when the session's upstream socket is lost.
-    pub fn session_closed(&self, id: &str) -> impl std::future::Future<Output = ExecError> + Send + 'static {
-        self.ws.closed(id)
+    /// The losses of the session's upstream sockets (what Go's disconnect notifier hands
+    /// the downstream handler), each socket's taken once ([`SessionLosses`]).
+    pub fn session_losses(&self, id: &str) -> SessionLosses {
+        self.ws.losses(id)
     }
 
     /// Releases the session's upstream socket (downstream connection ended).
@@ -421,7 +424,12 @@ impl CodexExecutor {
                 }
             }
         };
-        Ok(ExecResponse { status, headers, body })
+        Ok(ExecResponse {
+            status,
+            headers,
+            body,
+            omitted: Default::default(),
+        })
     }
 
     /// The URL an Alpha Search on `credential` posts to; `None` for an API key without
@@ -568,6 +576,7 @@ impl CodexExecutor {
             status,
             headers,
             body: ResponseBody::Buffered(data),
+            omitted: Default::default(),
         })
     }
 }
@@ -606,6 +615,7 @@ fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecEr
         status: 200,
         headers,
         body: ResponseBody::Buffered(Bytes::from(payload)),
+        omitted: Default::default(),
     })
 }
 

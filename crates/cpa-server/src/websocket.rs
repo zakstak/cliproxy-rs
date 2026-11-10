@@ -118,8 +118,14 @@ struct Sink {
     terminated: Option<String>,
 }
 
-/// Go `websocketTimelineLog.Append`: one `formatWebsocketTimelineEvent` part.
-fn timeline_event(timeline: Option<&crate::request_logging::WebsocketLog>, kind: &str, payload: &[u8]) {
+/// Go `websocketTimelineLog.Append`: one `formatWebsocketTimelineEvent` part, which the
+/// log keeps scrubbed of `sent` (#25).
+fn timeline_event(
+    timeline: Option<&crate::request_logging::WebsocketLog>,
+    kind: &str,
+    payload: &[u8],
+    sent: &cpa_core::exec::SentCredentials,
+) {
     let Some(timeline) = timeline else {
         return;
     };
@@ -135,7 +141,7 @@ fn timeline_event(timeline: Option<&crate::request_logging::WebsocketLog>, kind:
     part.extend_from_slice(payload);
     part.push(b'\n');
     // Go only warns when a timeline part cannot be written.
-    let _ = timeline.append_part(&part);
+    let _ = timeline.append_part(&part, sent);
 }
 
 /// gorilla's text for the error after this side closed the connection.
@@ -143,7 +149,13 @@ const CLOSE_SENT: &str = "websocket: close sent";
 
 impl Sink {
     fn event(&self, kind: &str, payload: &[u8]) {
-        timeline_event(self.timeline.as_deref(), kind, payload);
+        self.upstream_event(kind, payload, &Default::default());
+    }
+
+    /// [`Sink::event`] for a payload taken from an upstream answer whose request or
+    /// socket carried `sent`.
+    fn upstream_event(&self, kind: &str, payload: &[u8], sent: &cpa_core::exec::SentCredentials) {
+        timeline_event(self.timeline.as_deref(), kind, payload, sent);
     }
 
     async fn send(&self, message: Message) -> Result<(), axum::Error> {
@@ -255,6 +267,14 @@ struct Failure {
     /// The provider's own failure frame a native Codex turn delivers as sent
     /// ([`ExecError::delivered_event`]); never set for an account failure.
     delivered: Option<String>,
+    /// A native Codex failure whose frame, and so its `text`, can name the pooled account
+    /// ([`cpa_core::exec::Delivery::Withheld`]) or carries the upstream credential
+    /// ([`cpa_core::exec::Delivery::Confidential`]): the client gets `limit` (never for a
+    /// confidential failure) or a silent close, nothing else.
+    withheld: bool,
+    /// The values a confidential failure carries, which the timeline keeps `text`
+    /// scrubbed of ([`cpa_core::exec::Delivery::Confidential`]).
+    sent: cpa_core::exec::SentCredentials,
 }
 
 impl Failure {
@@ -268,6 +288,8 @@ impl Failure {
             replay: e.is_replay_required(),
             addon: e.addon.clone(),
             delivered: delivered(e),
+            withheld: withheld(e),
+            sent: sent(e),
         }
     }
 
@@ -283,6 +305,8 @@ impl Failure {
                     replay: e.is_replay_required(),
                     addon: e.addon.clone(),
                     delivered: delivered(e),
+                    withheld: withheld(e),
+                    sent: sent(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
@@ -292,6 +316,8 @@ impl Failure {
             dispatch::Failure::Remote { error: e, .. } => Self {
                 limit: exec_limit(classify::response_status(e), &classify::error_text(e), e),
                 delivered: delivered(e),
+                withheld: withheld(e),
+                sent: sent(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -316,6 +342,8 @@ impl Failure {
             addon: None,
             limit: crate::websocket_limit::from_error_event(payload, unix_now()),
             delivered: None,
+            withheld: false,
+            sent: Default::default(),
         }
     }
 
@@ -328,19 +356,36 @@ impl Failure {
             addon: None,
             limit: None,
             delivered: None,
+            withheld: false,
+            sent: Default::default(),
         }
     }
 }
 
 fn delivered(e: &ExecError) -> Option<String> {
-    e.delivered_event
-        .as_ref()
+    e.delivered_event()
         .map(|frame| String::from_utf8_lossy(frame).into_owned())
 }
 
+fn withheld(e: &ExecError) -> bool {
+    e.withheld()
+}
+
+fn sent(e: &ExecError) -> cpa_core::exec::SentCredentials {
+    match &e.delivery {
+        cpa_core::exec::Delivery::Confidential(sent) => sent.clone(),
+        _ => Default::default(),
+    }
+}
+
 /// The limit event for an executor error: the frame's headers (addon) first, then the
-/// upstream response's.
+/// upstream response's. None for a failure that carries an upstream authentication value
+/// ([`cpa_core::exec::Delivery::Confidential`]): its allowlisted fields come from that
+/// failure too.
 fn exec_limit(status: u16, text: &str, e: &ExecError) -> Option<String> {
+    if e.confidential() {
+        return None;
+    }
     let maps: Vec<&HeaderMap> = e.addon.as_deref().into_iter().chain([&*e.headers]).collect();
     crate::websocket_limit::event(status, text, &crate::websocket_limit::Headers::Maps(&maps), unix_now())
 }
@@ -386,6 +431,14 @@ struct Connection {
     /// The turn is a native continuation that attempted its pinned credential, so a
     /// 401/429 makes the client replay over HTTP (1012) rather than close on the loss.
     replays: Arc<AtomicBool>,
+    /// The turn's request got its stream: an attempt was served. Until then a session loss
+    /// belongs to a socket the turn's own attempt already gave up (its failure is the
+    /// turn's to fail over or to deliver), and it does not end the turn.
+    serving: Arc<AtomicBool>,
+    /// The Codex session's socket losses ([`cpa_exec::codex::SessionLosses`]), sharing
+    /// what the connection's loss watch took: a turn's failure renders only a loss of the
+    /// latest socket that nobody took yet. Set when the connection runs.
+    losses: Option<cpa_exec::codex::SessionLosses>,
     /// The upgrade request's log: upstream capture for every turn and its middleware ID.
     capture: cpa_core::exec::CaptureSink,
     request_id: Option<String>,
@@ -702,7 +755,7 @@ impl Control {
         } else {
             "interrupt.outcome"
         };
-        timeline_event(Some(timeline), kind, data.as_bytes());
+        timeline_event(Some(timeline), kind, data.as_bytes(), &Default::default());
     }
 }
 
@@ -793,6 +846,8 @@ impl Connection {
             steering: false,
             duplex: Arc::default(),
             replays: Arc::default(),
+            serving: Arc::default(),
+            losses: None,
             capture: Default::default(),
             request_id: None,
             timeline: None,
@@ -831,14 +886,17 @@ impl Connection {
                 .attach_steering(&self.session, SteeringInput::new(client.frames.clone(), enabled));
             self.steering = true;
         }
-        let (duplex, replays) = (self.duplex.clone(), self.replays.clone());
-        // Fused: a loss ignored during a duplex turn never fires again.
-        let mut lost = Box::pin(self.rt.executors.session_closed(&self.session).fuse());
+        let (duplex, replays, serving) = (self.duplex.clone(), self.replays.clone(), self.serving.clone());
+        // Each socket's loss fires once. One a duplex or replaying turn owns, or one of a
+        // socket a bootstrapping turn already gave up, is taken and never fires again; a
+        // later socket's loss still does.
+        let mut lost = self.rt.executors.session_losses(&self.session);
+        self.losses = Some(lost.codex().clone());
         loop {
             let frame = tokio::select! {
                 frame = client.next() => frame,
-                error = &mut lost => {
-                    close_for_upstream_loss(&mut sink, &error, self.codex_client).await;
+                loss = lost.next() => {
+                    close_for_upstream_loss(&mut sink, &loss.error, self.codex_client).await;
                     break;
                 }
             };
@@ -860,11 +918,21 @@ impl Connection {
                 tokio::select! {
                     biased;
                     flow = &mut turn => Ok(flow),
-                    error = &mut lost => {
+                    loss = lost.next() => {
+                        let error = loss.error;
                         // A pinned continuation's own 401/429 lost the socket: the turn
                         // sends the replay close (1012), or the final limit, instead.
                         let replay = replays.load(Ordering::Acquire) && matches!(error.status, 401 | 429);
-                        if duplex.load(Ordering::Acquire) || replay {
+                        // Before an attempt served the request, the loss is of a socket the
+                        // turn's attempt already failed on: the turn fails over to another
+                        // credential or delivers that failure itself. Ending it here would
+                        // drop an unserved request mid-failover (#25).
+                        let bootstrapping = !serving.load(Ordering::Acquire);
+                        // A socket the current attempt did not acquire (a retained socket
+                        // while the turn runs over HTTP or another provider) serves nothing
+                        // of this turn: its loss does not end it (#25 R3).
+                        let elsewhere = !loss.acquired;
+                        if duplex.load(Ordering::Acquire) || replay || bootstrapping || elsewhere {
                             tokio::select! {
                                 biased;
                                 flow = &mut turn => Ok(flow),
@@ -1194,11 +1262,18 @@ impl Connection {
     /// Go's disconnect notifier closes the client as soon as the session's upstream socket
     /// is lost, ahead of the turn's own error (whose 1009 body is a fixed message rather
     /// than the upstream's close reason). A duplex stream owns its closure instead.
+    ///
+    /// The loss replaces the failure only when it is the loss of the socket the turn's
+    /// current attempt acquired and the connection did not take it already
+    /// ([`cpa_exec::codex::SessionLosses::pending`]). An attempt that failed before it
+    /// served on a socket (over HTTP, on another provider, or refused while it prepared
+    /// its request) fails with its own error, whatever an earlier attempt's socket
+    /// reported (#25 R3).
     fn upstream_loss(&self) -> Option<ExecError> {
         if self.duplex.load(Ordering::Acquire) {
             return None;
         }
-        self.rt.executors.codex.session_loss(&self.session)
+        self.losses.as_ref()?.pending()
     }
 
     /// A pinned continuation reached a subscription limit and no other credential can
@@ -1346,13 +1421,18 @@ impl Connection {
         }));
         self.duplex.store(false, Ordering::Release);
         self.replays.store(false, Ordering::Release);
+        self.serving.store(false, Ordering::Release);
         let on_selected: dispatch::OnSelected = {
             let (selected, rt, pinned) = (selected.clone(), self.rt.clone(), self.pinned.clone());
+            let session = self.session.clone();
             let native_request = ctx.native_request;
             let continuation = ctx.native && ctx.requires_current;
             let (duplex, replays, steering) = (self.duplex.clone(), self.replays.clone(), self.steering);
             Box::new(move |credential: &Credential| {
                 let mut s = selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A new attempt owns no socket until it acquires one, and a socket an
+                // earlier attempt already lost reports nothing more (#25 R3).
+                rt.executors.session_attempt(&session);
                 s.last.clone_from(&credential.id);
                 s.pinned_attempted |= !pinned.is_empty() && credential.id == pinned;
                 replays.store(continuation && s.pinned_attempted, Ordering::Release);
@@ -1412,7 +1492,9 @@ impl Connection {
             ctx.preserve_output = s.preserve_output || ctx.native_served;
             ctx.codex_socket = s.codex_socket;
         }
-        match result? {
+        let done = result?;
+        self.serving.store(true, Ordering::Release);
+        match done {
             dispatch::Done::Stream { headers, first, rest } => Ok(Started {
                 first,
                 stream: rest,
@@ -1448,7 +1530,7 @@ impl Connection {
         // A duplex stream takes the client's later frames from the shared queue and owns
         // the connection's end.
         let duplex = self.duplex.load(Ordering::Acquire);
-        let mut response_started = false;
+        let mut duplex_established = false;
         // The last payload sent was an upstream context-window `response.failed`, which
         // the executor follows with its own classified error (`preserved_failure`).
         let mut preserved_event = false;
@@ -1515,9 +1597,44 @@ impl Connection {
                 payloads_from_chunk(&chunk)
             };
             for mut payload in payloads {
-                let kind = rawjson::get(&payload, "type").str().to_owned();
+                // A native turn's executor already decided what each frame does: whether
+                // the response ends on it and whether it fails the turn (`codex_ws`). A
+                // decoded event ends the turn here only when the pinned WebSocket reader
+                // ends it (`cpa_exec::codex_event::Outcome::ends_turn`).
+                let mut native_terminal = None;
+                // A decoded native event's `response.id` as the pinned `Value` reads it
+                // (the last of a repeated `id`), the response the executor settles.
+                let mut native_id = None;
+                let mut native_context_failure = false;
+                let kind = if ctx.native_served {
+                    // The upstream event boundary (`cpa_exec::codex_event`): a frame the
+                    // pinned client skips is relayed as sent, and nothing here reads it:
+                    // no type, completion, failure or tool call (#25).
+                    match cpa_exec::codex_event::decode(&payload) {
+                        Some(event) => {
+                            native_terminal = Some(event.outcome().ends_turn());
+                            native_id = Some(event.response_id().unwrap_or_default());
+                            native_context_failure = event.is_context_window_failure();
+                            event.kind.into_owned()
+                        }
+                        None => {
+                            preserved_event = false;
+                            if let Some(metadata) = metadata.take()
+                                && !send_text(socket, metadata).await
+                            {
+                                return Forwarded::End;
+                            }
+                            if !send_text(socket, payload).await {
+                                return Forwarded::End;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    rawjson::get(&payload, "type").str().to_owned()
+                };
                 if kind == "response.created" {
-                    response_started = true;
+                    duplex_established = duplex;
                     completed = false;
                     turn.reset();
                 }
@@ -1531,10 +1648,12 @@ impl Connection {
                     None => tools::record_calls(&self.tool_key, &payload),
                 }
                 turn.track_pending(&payload);
-                // In duplex mode an error event after `response.created` is recoverable:
-                // the client may correct the request on this socket. Stream errors still
-                // close it.
-                if kind == "error" && !(response_started && duplex) {
+                // Once the duplex's first response starts or ends, an error event is
+                // recoverable: the client may correct the request on this socket.
+                // Stream errors still close it. A native turn's failures arrive as the
+                // stream's error, so an `error` event it relays is one the pinned reader
+                // ignores (a wrapped notice) or a recoverable steering failure.
+                if kind == "error" && !duplex_established && !ctx.native_served {
                     // `responsesWebsocketErrorMessageFromPayload`.
                     let mut status = rawjson::get(&payload, "status").i64();
                     if status <= 0 {
@@ -1550,12 +1669,20 @@ impl Connection {
                 }
                 // Codex acknowledges `response.interrupt` with an interrupted
                 // `response.incomplete`; the connection stays open for the next request.
-                if completion || kind == "response.incomplete" {
+                if native_terminal.unwrap_or(completion || kind == "response.incomplete") {
+                    // The executor also admits later frames after a first terminal
+                    // without `response.created` (`Duplex::first_terminal`). Keep the
+                    // relay's recoverable-error state in step with it.
+                    duplex_established = duplex;
                     completed = true;
                     completed_output = turn.completed_output(&payload);
-                    completed_id = field(&payload, "response.id");
+                    completed_id = native_id.take().unwrap_or_else(|| field(&payload, "response.id"));
                 }
-                preserved_event = cpa_common::codex_client::is_context_window_failure(payload.as_bytes());
+                preserved_event = if ctx.native_served {
+                    native_context_failure
+                } else {
+                    cpa_common::codex_client::is_context_window_failure(payload.as_bytes())
+                };
                 // The executor follows such an event with its classified error at once
                 // (cpa-exec `Frame::Failed`): taken before the write, it reaches the
                 // scheduler even when the client interrupts or leaves during the write,
@@ -1716,7 +1843,11 @@ fn close_code(failure: &Failure) -> Option<(u16, String)> {
     if failure.replay {
         return Some((CLOSE_SERVICE_RESTART, "upstream requires HTTP replay".into()));
     }
-    if failure.status == 413 && rawjson::get(&failure.text, "error.code").str() == "message_too_big" {
+    // Its close reason would come from the withheld frame.
+    if failure.status == 413
+        && !failure.withheld
+        && rawjson::get(&failure.text, "error.code").str() == "message_too_big"
+    {
         // An upstream close keeps gorilla's `CloseError.Text` verbatim; a mapped 413's
         // message is trimmed.
         let raw = rawjson::get(&failure.text, "close_reason");
@@ -1744,10 +1875,11 @@ fn preserved_failure(failure: &Failure) -> bool {
 /// `shouldExposeResponsesUpstreamError`: only request faults reach the client; credential,
 /// quota and transport failures close silently so the client reconnects and resends. A
 /// native Codex client's subscription limit (`Failure::limit`) is sent before this check
-/// (docs/DIFFERENCES-FROM-GO.md).
+/// (docs/DIFFERENCES-FROM-GO.md). A withheld native Codex failure is never exposed: its
+/// `text` is the provider's error, which can name the pooled account (#6).
 // ponytail: Go also exposes terminal upstream-auth errors; no executor reports them yet.
 fn exposed(failure: &Failure) -> bool {
-    classify::is_request_fault(failure.status, &failure.text)
+    !failure.withheld && classify::is_request_fault(failure.status, &failure.text)
 }
 
 /// `closeForUpstreamError` then `writeResponsesWebsocketTerminalError`: a close code,
@@ -1774,7 +1906,7 @@ async fn close_for_failure(socket: &mut Sink, failure: &Failure, codex_client: b
         let _ = tokio::time::timeout(TERMINAL_WRITE, socket.send(Message::Text(payload.into()))).await;
     } else {
         // Keeps the upstream reason although the client only sees the connection close.
-        socket.event("disconnect", failure.text.as_bytes());
+        socket.upstream_event("disconnect", failure.text.as_bytes(), &failure.sent);
     }
     socket.terminate(CLOSE_SENT);
 }

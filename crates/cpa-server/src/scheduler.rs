@@ -1368,6 +1368,10 @@ impl Scheduler {
         let disabled = policy.cooling_disabled(c) && !action.force_cooldown;
         let status = crate::classify::go_status(error);
         let text = crate::classify::error_text(error);
+        // What the cooldown keeps and later shows (a "last error" to other clients, the
+        // management API): never an upstream authentication value
+        // (`Delivery::Confidential`), while `text` still classifies the failure.
+        let stored = crate::classify::stored_error_text(error, &text);
         let prev = self.cooldowns.get(&key);
         // An ended bounded window that a newer probe took over, or that opened after this
         // attempt was picked, waits for its own probe: this older answer neither renews
@@ -1429,7 +1433,7 @@ impl Scheduler {
                             let mut window_trust = window.trust;
                             if let Some(slot) = self.cooldowns.get_mut(&key) {
                                 slot.deadline = deadline;
-                                slot.error = text;
+                                slot.error = stored;
                                 slot.trust.stated = reset.or(slot.trust.stated);
                                 window_trust = slot.trust;
                             }
@@ -1468,7 +1472,7 @@ impl Scheduler {
                         // reused, not extended.
                         let deadline = prev.deadline;
                         if let Some(slot) = self.cooldowns.get_mut(&key) {
-                            slot.error = text;
+                            slot.error = stored;
                         }
                         if credential_quota {
                             self.extend_siblings(c, deadline, None, now);
@@ -1502,7 +1506,7 @@ impl Scheduler {
         if prev_live == Some(deadline)
             && let Some(slot) = self.cooldowns.get_mut(&key).filter(|s| s.quota && s.trust.bounded)
         {
-            slot.error = text;
+            slot.error = stored;
             // Go's level still counts a Cloudflare challenge (unchanged for other causes).
             slot.level = level;
             return;
@@ -1536,7 +1540,7 @@ impl Scheduler {
             level,
             status: error.status,
             quota,
-            error: text.clone(),
+            error: stored.clone(),
             since: SystemTime::now(),
             credential: false,
             trust: provenance(deadline),
