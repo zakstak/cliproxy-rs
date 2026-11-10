@@ -150,7 +150,7 @@ pub const APPEND_REFUSED: &str = "`response.append` is not supported on Codex cr
 /// (`generate: false`) has no HTTP meaning and is refused.
 pub(crate) fn ws_http_body(frame: &Bytes, model: &str) -> Result<Bytes, ExecError> {
     let body = CodexBody::parse(frame)?;
-    if continues(&body) {
+    if body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null) {
         return Err(ExecError::replay_required());
     }
     if body.get("generate").is_some_and(|m| m.kind == Kind::False) {
@@ -194,14 +194,17 @@ pub(crate) fn upstream_model(req: &ExecRequest) -> Result<String, ExecError> {
     Ok(req.model.trim().to_owned())
 }
 
-/// Whether a `response.create` continues upstream state: it names a
-/// `previous_response_id` (a string; `null` names none). Such a request belongs to the
-/// socket that produced that response. It runs only on the session's current socket, or
-/// fails with the replay close; it never travels on a new socket or over HTTP
-/// (docs/codex/CONTRACT.md "Socket and account ownership"). The frame decides this, not
-/// the transport of the connection's previous turn.
+/// Whether a WebSocket `response.create` continues upstream state: it names a
+/// `previous_response_id`, a string that is not blank (`null` and an empty string name
+/// none, as the server reads the frame). Such a request belongs to the socket that
+/// produced that response. It runs only on the session's current socket, or fails with
+/// the replay close; it never travels on a new socket (docs/codex/CONTRACT.md "Socket and
+/// account ownership"). The frame decides this, not the transport of the connection's
+/// previous turn.
 pub(crate) fn continues(body: &CodexBody<'_>) -> bool {
-    body.get("previous_response_id").is_some_and(|m| m.kind != Kind::Null)
+    body.get("previous_response_id")
+        .filter(|m| m.kind == Kind::String)
+        .is_some_and(|m| serde_json::from_slice::<String>(m.raw).map_or(true, |id| !id.trim().is_empty()))
 }
 
 /// `frame` with `model` routed to `model`: the contract's one permitted request edit
