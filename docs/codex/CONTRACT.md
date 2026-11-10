@@ -587,7 +587,9 @@ failover. A replaced socket's late loss reports nothing. A loss renders only in 
 failure of the attempt that acquired that socket. An attempt that fails before it serves
 on a socket (over HTTP, on another provider, or refused while it prepares its request)
 fails with its own error. Once a new attempt starts, a socket already lost reports nothing
-more, while a live socket keeps its own loss. On a new
+more, while a live socket keeps its own loss. The loss of a retained socket that the
+current attempt did not acquire (the turn runs over HTTP or on another provider) does not
+end that turn. On a new
 connection, a `previous_response_id` from the old one is refused locally with
 `previous_response_not_found`, and nothing reaches the upstream. The duplex queue is
 bounded:

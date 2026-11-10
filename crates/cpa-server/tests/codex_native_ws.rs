@@ -6601,3 +6601,136 @@ async fn a_refusal_before_any_socket_fails_with_its_own_error() {
         }
     }
 }
+
+/// #25 R3: a retained socket's loss does not end a turn that runs elsewhere. A first
+/// create completes on account A's socket (4/1/5), which the connection keeps. The next
+/// create names a model only HTTP account B serves; B streams a real delta, and its
+/// completion waits. Then A's idle socket closes 1011, its own bearer in the reason. The
+/// client keeps its connection, gets B's completion, and B's record is a success with
+/// its 4/1/5 tokens, not a cancellation. The control has A's socket stay open. One WS
+/// dial for A, one HTTP request for B; with and without bootstrap buffering.
+#[tokio::test]
+async fn a_retained_socket_loss_does_not_end_a_turn_served_elsewhere() {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    use std::sync::Mutex;
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"first","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    const DELTA: &str =
+        r#"{"type":"response.output_text.delta","response_id":"current","delta":"real current prefix"}"#;
+    const CURRENT_DONE: &str = r#"{"type":"response.completed","response":{"id":"current","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    for buffering in [false, true] {
+        for close_old in [false, true] {
+            let case = format!("buffering={buffering} old socket closes={close_old}");
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (old_gate, tail_gate) = (
+                Arc::new(tokio::sync::Semaphore::new(0)),
+                Arc::new(tokio::sync::Semaphore::new(0)),
+            );
+            let old_closed = Arc::new(tokio::sync::Notify::new());
+            let app = {
+                let (ws_seen, http_seen) = (seen.clone(), seen.clone());
+                let (old_gate, tail_gate, old_closed) = (old_gate.clone(), tail_gate.clone(), old_closed.clone());
+                axum::Router::new().route(
+                    "/responses",
+                    axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                        ws_seen
+                            .lock()
+                            .unwrap()
+                            .push(format!("WS {}", headers["authorization"].to_str().unwrap()));
+                        let (gate, closed) = (old_gate.clone(), old_closed.clone());
+                        async move {
+                            upgrade.on_upgrade(move |mut socket| async move {
+                                let _ = socket.recv().await;
+                                let _ = socket.send(Upstream::Text(DONE.into())).await;
+                                gate.acquire().await.unwrap().forget();
+                                if close_old {
+                                    let _ = socket
+                                        .send(Upstream::Close(Some(CloseFrame {
+                                            code: 1011,
+                                            reason: "old idle loss key-OLD".into(),
+                                        })))
+                                        .await;
+                                    closed.notify_one();
+                                }
+                                while let Some(Ok(_)) = socket.recv().await {}
+                            })
+                        }
+                    })
+                    .post(move |headers: axum::http::HeaderMap| {
+                        http_seen
+                            .lock()
+                            .unwrap()
+                            .push(format!("HTTP {}", headers["authorization"].to_str().unwrap()));
+                        let tail = tail_gate.clone();
+                        async move {
+                            let first = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from(format!(
+                                "data: {DELTA}\n\n"
+                            )))]);
+                            let last = futures_util::stream::once(async move {
+                                tail.acquire().await.unwrap().forget();
+                                Ok(Bytes::from(format!("data: {CURRENT_DONE}\n\n")))
+                            });
+                            (
+                                [("content-type", "text/event-stream")],
+                                axum::body::Body::from_stream(first.chain(last)),
+                            )
+                        }
+                    }),
+                )
+            };
+            let upstream = format!("http://{}", serve(app).await);
+            let config = format!(
+                "codex:\n  stream-bootstrap-buffering: {buffering}\ncodex-api-key:\n  - api-key: key-OLD\n    base-url: {upstream}\n    websockets: true\n    models: [{{name: gpt-5.5, alias: socket-model}}]\n  - api-key: key-CURRENT\n    base-url: {upstream}\n    websockets: false\n    models: [{{name: gpt-5.5, alias: http-model}}]\n"
+            );
+            let proxy = proxy_with(Script::default(), &config, |_| Vec::new()).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "socket-model")))
+                .await
+                .unwrap();
+            assert_eq!(read(&mut socket, &TERMINAL).await.frames, [DONE], "{case}");
+            socket
+                .send(Message::text(client_frame("ws-create-first", "http-model")))
+                .await
+                .unwrap();
+            let delta = read(&mut socket, &["response.output_text.delta"]).await;
+            assert_eq!((delta.frames, delta.closed), (vec![DELTA.to_owned()], None), "{case}");
+            old_gate.add_permits(1);
+            if close_old {
+                tokio::time::timeout(Duration::from_secs(2), old_closed.notified())
+                    .await
+                    .unwrap();
+            }
+            let early = tokio::time::timeout(Duration::from_millis(180), socket.next()).await;
+            assert!(
+                early.is_err(),
+                "{case}: the turn served elsewhere ended early: {early:?}"
+            );
+            tail_gate.add_permits(1);
+            let rest = read(&mut socket, &TERMINAL).await;
+            assert_eq!(
+                (rest.frames, rest.closed),
+                (vec![CURRENT_DONE.to_owned()], None),
+                "{case}"
+            );
+            let records = records(&proxy, 2).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: no other record"
+            );
+            assert_eq!(
+                seen.lock().unwrap().clone(),
+                ["WS Bearer key-OLD", "HTTP Bearer key-CURRENT"],
+                "{case}"
+            );
+            for record in &records {
+                assert_eq!(record["failed"], false, "{case}: {record}");
+                assert_eq!(tokens(record), [4, 1, 5], "{case}");
+            }
+        }
+    }
+}

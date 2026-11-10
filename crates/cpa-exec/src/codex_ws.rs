@@ -842,6 +842,16 @@ impl Pool {
     }
 }
 
+/// A socket loss the downstream handler took ([`SessionLosses::next`]).
+#[derive(Debug, Clone)]
+pub struct TakenLoss {
+    pub error: ExecError,
+    /// The lost socket is the one the session's current attempt acquired
+    /// ([`Upstream::bind`]); when it is not (the attempt runs over HTTP, on another
+    /// provider, or on no socket yet), the loss is no failure of that attempt's turn.
+    pub acquired: bool,
+}
+
 /// The losses of one session's upstream sockets, as its downstream handler takes them
 /// (#25 R3). Each socket's loss is taken at most once: one the handler let pass, while a
 /// turn failed over to another socket, never fires again, and the replacement's own loss
@@ -871,7 +881,7 @@ impl SessionLosses {
 
     /// Resolves with the next socket loss not taken yet, and takes it. Cancel safe: a
     /// loss is taken only as it is returned.
-    pub async fn next(&mut self) -> ExecError {
+    pub async fn next(&mut self) -> TakenLoss {
         loop {
             {
                 let state = self.rx.borrow_and_update();
@@ -879,7 +889,11 @@ impl SessionLosses {
                     && state.socket != self.taken.load(std::sync::atomic::Ordering::Acquire)
                 {
                     self.taken.store(state.socket, std::sync::atomic::Ordering::Release);
-                    return error.clone();
+                    let acquired = self.session.acquired.load(std::sync::atomic::Ordering::Acquire);
+                    return TakenLoss {
+                        error: error.clone(),
+                        acquired: state.socket == acquired,
+                    };
                 }
             }
             if self.rx.changed().await.is_err() {

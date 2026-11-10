@@ -27,7 +27,7 @@ use crate::rawjson;
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{
-    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SessionLosses, SteeringInput, handshake_metadata_event,
+    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SessionLosses, SteeringInput, TakenLoss, handshake_metadata_event,
 };
 pub use native::APPEND_REFUSED;
 

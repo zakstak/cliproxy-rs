@@ -643,6 +643,8 @@ async fn close_1009_is_a_request_scoped_413_and_notifies() {
     let notified = tokio::time::timeout(Duration::from_secs(2), closed.next())
         .await
         .expect("session notified");
+    assert!(notified.acquired, "the turn's own socket");
+    let notified = notified.error;
     assert_eq!(notified.status, 413);
     assert_eq!(
         crate::rawjson::get(&String::from_utf8_lossy(&notified.body), "error.message").str(),
@@ -2665,7 +2667,7 @@ async fn each_socket_reports_its_own_loss_once() {
         let loss = tokio::time::timeout(Duration::from_secs(2), losses.next())
             .await
             .unwrap_or_else(|_| panic!("{what}: no loss fired"));
-        String::from_utf8_lossy(&loss.body).into_owned()
+        String::from_utf8_lossy(&loss.error.body).into_owned()
     }
     let lost = |text: &str| transport(text);
     // The attempt serves on `id` ([`Upstream::bind`]).
@@ -2728,7 +2730,8 @@ async fn an_attempt_owns_only_the_socket_it_acquired() {
     assert!(losses.pending().is_none());
     close.notify_one();
     let loss = tokio::time::timeout(Duration::from_secs(5), losses.next()).await;
-    assert!(loss.is_ok(), "a live socket's later loss still reaches the watcher");
+    let loss = loss.expect("a live socket's later loss still reaches the watcher");
+    assert!(!loss.acquired, "not the new attempt's socket: no failure of its turn");
     assert!(
         losses.pending().is_none(),
         "a socket the new attempt did not acquire is not its failure"
@@ -2763,10 +2766,10 @@ async fn an_attempt_owns_only_the_socket_it_acquired() {
     let b = session.begin_socket();
     session.notify(b, &transport("b lost"));
     assert!(watch.pending().is_none(), "not acquired");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), watch.next()).await.is_ok(),
-        "the latest socket's loss still fires"
-    );
+    let b_loss = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .expect("the latest socket's loss still fires");
+    assert!(!b_loss.acquired, "a socket not served on is no attempt's failure");
     pool.begin_attempt("never-made");
     assert!(
         pool.get("never-made").is_none(),

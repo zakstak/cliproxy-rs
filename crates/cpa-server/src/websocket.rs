@@ -895,8 +895,8 @@ impl Connection {
         loop {
             let frame = tokio::select! {
                 frame = client.next() => frame,
-                error = lost.next() => {
-                    close_for_upstream_loss(&mut sink, &error, self.codex_client).await;
+                loss = lost.next() => {
+                    close_for_upstream_loss(&mut sink, &loss.error, self.codex_client).await;
                     break;
                 }
             };
@@ -918,7 +918,8 @@ impl Connection {
                 tokio::select! {
                     biased;
                     flow = &mut turn => Ok(flow),
-                    error = lost.next() => {
+                    loss = lost.next() => {
+                        let error = loss.error;
                         // A pinned continuation's own 401/429 lost the socket: the turn
                         // sends the replay close (1012), or the final limit, instead.
                         let replay = replays.load(Ordering::Acquire) && matches!(error.status, 401 | 429);
@@ -927,7 +928,11 @@ impl Connection {
                         // credential or delivers that failure itself. Ending it here would
                         // drop an unserved request mid-failover (#25).
                         let bootstrapping = !serving.load(Ordering::Acquire);
-                        if duplex.load(Ordering::Acquire) || replay || bootstrapping {
+                        // A socket the current attempt did not acquire (a retained socket
+                        // while the turn runs over HTTP or another provider) serves nothing
+                        // of this turn: its loss does not end it (#25 R3).
+                        let elsewhere = !loss.acquired;
+                        if duplex.load(Ordering::Acquire) || replay || bootstrapping || elsewhere {
                             tokio::select! {
                                 biased;
                                 flow = &mut turn => Ok(flow),

@@ -131,7 +131,7 @@ pub struct SessionLosses {
 impl SessionLosses {
     /// Resolves with the next socket loss not taken yet, and takes it; pending while no
     /// socket is lost. Cancel safe.
-    pub async fn next(&mut self) -> ExecError {
+    pub async fn next(&mut self) -> codex::TakenLoss {
         tokio::select! {
             error = self.codex.next() => error,
             error = self.xai.next() => error,
