@@ -5351,6 +5351,235 @@ async fn subscription_limit_headers_cannot_echo_the_selected_credential() {
     }
 }
 
+/// An account failure the official Codex client would get as a subscription-limit event,
+/// with `{T}` in a member no reading of the failure keeps (`echo`, and the same value
+/// nested). Its classification and the limit event's allowlisted fields come from
+/// `error` alone.
+const ECHOED_LIMITS: [(&str, &str); 3] = [
+    (
+        "ignored member",
+        r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000},"echo":"{T}"}"#,
+    ),
+    (
+        "escaped ignored member",
+        r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000},"echo":"{E}"}"#,
+    ),
+    (
+        "nested ignored member",
+        r#"{"type":"error","status":429,"echo":{"headers":{"authorization":"Bearer {T}"}},"error":{"type":"usage_limit_reached","message":"The usage limit has been reached.","resets_at":2000000000}}"#,
+    ),
+];
+
+/// Whether a client frame is the proxy's subscription-limit event for [`ECHOED_LIMITS`].
+fn limit_event(frame: &str) -> bool {
+    frame.contains("usage_limit_reached") && frame.contains("2000000000") && !frame.contains("echo")
+}
+
+/// #25 criterion 7 against #6 (hosted review on PR #63, `codex_ws.rs` original line
+/// 1545): an account failure is withheld from a native WebSocket client, and the official
+/// Codex client gets the allowlisted subscription-limit event instead. When the original
+/// frame carries the credential the serving socket or request sent, in a member no
+/// reading keeps, the failure is Confidential: no limit event, a silent close. On every
+/// native path (ordinary socket, buffering, a steering connection's first response, a
+/// turn over HTTP and its buffering), first and after content. Each case runs against
+/// [`LOOKALIKE`], a value no request carried, which keeps its limit event; the two differ
+/// only in that event: the same record (429, no tokens), cooldowns and attempts. Every
+/// case runs before the verdict, which names the cases that delivered a derived event.
+#[tokio::test]
+async fn withheld_account_failures_check_their_original_frame_for_the_credential() {
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"r1","delta":"hello"}"#;
+    let (mut cases, mut derived) = (0usize, Vec::new());
+    for path in NATIVE_PATHS {
+        for after in [false, true] {
+            let prefix: Vec<String> = if after { vec![DELTA.to_owned()] } else { vec![] };
+            for (name, frame) in ECHOED_LIMITS {
+                let case = format!("{} after={after} {name}", path.0);
+                let run = |token: &str| {
+                    let mut frames = prefix.clone();
+                    frames.push(with_token(frame, token));
+                    async move {
+                        let until = frames.last().cloned().unwrap_or_default();
+                        let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+                        native_turn(path, &frames, &until).await
+                    }
+                };
+                let got = run(SELECTED).await;
+                let want = run(LOOKALIKE).await;
+                assert_eq!(got.authorization, [format!("Bearer {SELECTED}")], "{case}");
+                // The control: the limit event, built from `error` alone, after the prefix.
+                let control_limits = want.frames.iter().filter(|f| limit_event(f)).count();
+                assert_eq!(control_limits, 1, "{case}: the control keeps its limit event");
+                assert_eq!(want.frames[..prefix.len()], prefix[..], "{case}: control prefix");
+                assert!(want.closed.is_some(), "{case}: control closes");
+                // The selected credential: the prefix alone, then a silent close.
+                let leaked = got.frames.iter().filter(|f| carries_token(f, SELECTED)).count();
+                assert_eq!(leaked, 0, "{case}: no frame carries the selected credential");
+                let limits = got.frames.iter().filter(|f| limit_event(f)).count();
+                cases += 1;
+                if limits != 0 || got.frames != prefix {
+                    derived.push(case.clone());
+                }
+                assert!(got.closed.is_some(), "{case}: the turn ends");
+                // Delivery alone differs.
+                assert_eq!(got.records[0]["failed"], true, "{case}");
+                assert_eq!(got.records[0]["fail"]["status_code"], 429, "{case}");
+                assert_eq!(
+                    got.records[0]["fail"]["status_code"], want.records[0]["fail"]["status_code"],
+                    "{case}"
+                );
+                assert_eq!(tokens(&got.records[0]), tokens(&want.records[0]), "{case}");
+                assert_eq!((got.cooldowns, got.attempts), (want.cooldowns, want.attempts), "{case}");
+                let kept = got.records.iter().any(|r| carries_token(&r.to_string(), SELECTED));
+                assert!(!kept, "{case}: no record keeps the selected credential");
+            }
+        }
+    }
+    assert_eq!(cases, 30);
+    assert!(
+        derived.is_empty(),
+        "{} of {cases} cases delivered more than the prefix (a derived limit event): {derived:#?}",
+        derived.len()
+    );
+}
+
+/// [`withheld_account_failures_check_their_original_frame_for_the_credential`] on a
+/// later response of a steering connection: the first response completes, and the next
+/// create is answered with the account failure. The connection ends; with the selected
+/// credential in an ignored member it ends silently, while the [`LOOKALIKE`] control gets
+/// the limit event. Both fail the create's record with 429 and cool alike. Every case runs
+/// before the verdict.
+#[tokio::test]
+async fn later_steering_account_failures_check_their_original_frame_for_the_credential() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_first","output":[]}}"#;
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"steer_first","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}"#;
+    const NEXT_CREATED: &str = r#"{"type":"response.created","response":{"id":"steer_second","output":[]}}"#;
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    let next = r#"{"type":"response.create","model":"gpt-5.5","previous_response_id":"steer_first","input":[]}"#;
+    let mut derived = Vec::new();
+    for started in [false, true] {
+        for (name, frame) in ECHOED_LIMITS {
+            let mut outcomes = Vec::new();
+            for token in [SELECTED, LOOKALIKE] {
+                let case = format!("started={started} {name} selected={}", token == SELECTED);
+                let rejection = with_token(frame, token);
+                let second = if started {
+                    vec![NEXT_CREATED.to_owned(), rejection]
+                } else {
+                    vec![rejection]
+                };
+                let mut upstream =
+                    Gated::start(vec![vec![CREATED.to_owned(), COMPLETED.to_owned()], second], false).await;
+                let proxy = proxy_with(Script::default(), STEERING, |_| {
+                    vec![credential(Profile::Chatgpt, &upstream.base_url, true)]
+                })
+                .await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let mut socket = connect(&proxy).await;
+                socket.send(Message::text(create.clone())).await.unwrap();
+                upstream.read(1).await;
+                upstream.release.notify_one();
+                let first = read(&mut socket, &TERMINAL).await;
+                assert_eq!(first.frames.last().map(String::as_str), Some(COMPLETED), "{case}");
+                assert_eq!(records(&proxy, 1).await[0]["failed"], false, "{case}");
+                socket.send(Message::text(next)).await.unwrap();
+                upstream.read(2).await;
+                let got = read(&mut socket, &[]).await;
+                let leaked = got.frames.iter().filter(|f| carries_token(f, SELECTED)).count();
+                assert_eq!(leaked, 0, "{case}: no frame carries the selected credential");
+                assert!(got.closed.is_some(), "{case}: the connection ends");
+                let limits = got.frames.iter().filter(|f| limit_event(f)).count();
+                let rejected = records(&proxy, 1).await;
+                assert_eq!(rejected[0]["failed"], true, "{case}");
+                assert_eq!(rejected[0]["fail"]["status_code"], 429, "{case}");
+                let kept = carries_token(&rejected[0].to_string(), SELECTED);
+                assert!(!kept, "{case}: the record keeps no selected credential");
+                let credential = proxy.rt.store().snapshot()[0].id.clone();
+                let cooled = proxy.rt.store().cooldowns(&credential).len();
+                outcomes.push((limits, cooled));
+            }
+            let case = format!("started={started} {name}");
+            assert_eq!(outcomes[1].0, 1, "{case}: the control keeps its limit event");
+            assert_eq!(outcomes[0].1, outcomes[1].1, "{case}: the same cooldowns");
+            if outcomes[0].0 != 0 {
+                derived.push(case);
+            }
+        }
+    }
+    assert!(
+        derived.is_empty(),
+        "{} of 6 cases derived a limit event from a frame carrying the credential: {derived:#?}",
+        derived.len()
+    );
+}
+
+/// The original-frame check is bound to the socket that read the frame, not to the
+/// credential as configured now. A config-backed key serves a turn on socket A
+/// (`key-OLD`); the key then changes in memory to `key-NEW`, which socket A never
+/// carried. The next turn reuses socket A and is answered with the account failure
+/// quoting one of the two in an ignored member: `key-OLD` makes it Confidential (silent
+/// close), while `key-NEW` keeps the official client's limit event. Every case runs
+/// before the verdict.
+#[tokio::test]
+async fn withheld_account_failures_use_the_serving_sockets_values() {
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"resp_real","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let mut wrong = Vec::new();
+    for (name, frame) in ECHOED_LIMITS {
+        let mut limits = Vec::new();
+        for echoed in ["key-OLD", "key-NEW"] {
+            let case = format!("{name} echo={echoed}");
+            let rejection = with_token(frame, echoed);
+            let proxy = proxy_with(
+                Script {
+                    ws: vec![vec![Bytes::from(DONE)], vec![Bytes::from(rejection)]],
+                    ..Script::default()
+                },
+                "",
+                |url| {
+                    let cfg = Config::parse(&format!(
+                        "codex-api-key:\n  - api-key: key-OLD\n    base-url: {url}\n    websockets: true\n"
+                    ))
+                    .unwrap();
+                    cpa_core::config::credentials::from_config(&cfg)
+                },
+            )
+            .await;
+            let mut socket = connect(&proxy).await;
+            assert_eq!(first_turn(&mut socket).await, [DONE], "{case}");
+            for credential in proxy.rt.store().snapshot() {
+                let mut changed = Credential::clone(&credential);
+                changed.attributes.insert("api_key".into(), "key-NEW".into());
+                proxy
+                    .rt
+                    .store()
+                    .replace_config_backed(changed, credential.revision)
+                    .unwrap();
+            }
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &[]).await;
+            assert!(got.closed.is_some(), "{case}: the turn ends");
+            let leaked = got.frames.iter().filter(|f| carries_token(f, "key-OLD")).count();
+            assert_eq!(leaked, 0, "{case}: no frame carries the sent key");
+            limits.push(got.frames.iter().filter(|f| limit_event(f)).count());
+            let sockets = proxy.upstream.sockets();
+            assert_eq!(sockets.len(), 1, "{case}: socket A served both turns");
+            assert_eq!(sockets[0].headers["authorization"], "Bearer key-OLD", "{case}");
+        }
+        if limits != [0, 1] {
+            wrong.push(format!("{name}: limit events {limits:?} for [key-OLD, key-NEW]"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "only the sent key makes the failure Confidential: {wrong:#?}"
+    );
+}
+
 /// A reused socket's request-scoped bootstrap error quotes a new config value that
 /// its handshake never carried. It must retain its as-sent delivery.
 #[tokio::test]

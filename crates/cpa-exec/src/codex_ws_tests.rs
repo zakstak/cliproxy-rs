@@ -2392,10 +2392,24 @@ fn failed_errors_read_as_the_pinned_error_struct() {
             panic!("{name}: the object form fails");
         };
         assert_eq!(got.status, want.status, "{name}");
-        assert_eq!(got.delivery, want.delivery, "{name}");
+        // The same delivery decision; a withheld failure keeps its own frame's bytes.
+        if want.withheld() {
+            assert_eq!(got.delivery, withheld(raw), "{name}");
+            assert_eq!(want.delivery, withheld(&object), "{name}");
+        } else {
+            assert_eq!(got.delivery, want.delivery, "{name}");
+        }
         read[0] += 1;
     }
     assert!(read[0] >= 30 && read[1] >= 15, "{read:?}");
+}
+
+/// What [`withhold_sensitive`] makes of a failure `frame`'s delivery: withheld, with the
+/// frame's original bytes kept for the credential guard.
+fn withheld(frame: &str) -> Delivery {
+    Delivery::Withheld(cpa_core::exec::WithheldFrame::new(Bytes::copy_from_slice(
+        frame.trim().as_bytes(),
+    )))
 }
 
 /// #6 (review finding 1): the nested positional rate limit, with the credential's own
@@ -2410,9 +2424,9 @@ fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
         panic!("a failure");
     };
     assert_eq!(error.status, 429);
-    assert_eq!(error.delivery, Delivery::Withheld);
+    assert_eq!(error.delivery, withheld(nested));
     deliver_as_sent(&mut error, nested);
-    assert_eq!(error.delivery, Delivery::Withheld, "never as sent");
+    assert_eq!(error.delivery, withheld(nested), "never as sent");
     assert!(account_shaped(nested, true));
     let context = r#"{"type":"response.failed","response":{"id":"r1","error":[null,"context_length_exceeded","too large",null,null]}}"#;
     let event = crate::codex_event::decode(context).unwrap();
@@ -2434,6 +2448,53 @@ fn nested_positional_errors_are_withheld_and_relayed_as_their_struct() {
         r#"{"type":"response.failed","response":{"id":"r1","error":["rate_limit_error","rate_limit_exceeded","limited"]}}"#,
         true
     ));
+}
+
+/// #25 criterion 7 against #6 (hosted review on PR #63, `codex_ws.rs` original line
+/// 1545): withholding an account failure from the client must not discard the bytes the
+/// credential guard reads. The frame's `echo` member is one no reading keeps, so the
+/// classified body never carries the token; the guard bound to the values the socket
+/// sent still finds it in the original frame, as written and escaped, and makes the
+/// failure Confidential with its classification unchanged. A value the socket never
+/// sent leaves it Withheld.
+#[test]
+fn withheld_failures_keep_their_original_frame_for_the_credential_guard() {
+    use crate::codex_secret::Guard;
+    let sent = |token: &str| {
+        let mut headers = http::HeaderMap::new();
+        let value = http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        headers.insert("authorization", value);
+        crate::codex_secret::from_request(&headers, "wss://chatgpt.example/backend-api/codex/responses")
+    };
+    let limited = |echo: &str| {
+        format!(
+            r#"{{"type":"error","status":429,"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached."}},"echo":"{echo}"}}"#
+        )
+    };
+    for (echo, confidential) in [
+        ("at-FAKE", true),
+        (r"at\u002dFAKE", true),
+        (r"\u0061\u0074\u002d\u0046\u0041\u004b\u0045", true),
+        ("at-OTHER", false),
+    ] {
+        let frame = limited(echo);
+        let event = crate::codex_event::decode(&frame);
+        let Reading::Failure { mut error, .. } = reading(&frame, event.as_ref(), false) else {
+            panic!("{echo}: a failure");
+        };
+        deliver_as_sent(&mut error, &frame);
+        assert_eq!(error.status, 429, "{echo}");
+        assert!(error.withheld() && error.delivered_event().is_none(), "{echo}");
+        assert!(!sent("at-FAKE").exposes(&error.body), "{echo}: the body drops `echo`");
+        let guarded = sent("at-FAKE").guarded(error.clone());
+        assert_eq!(guarded.confidential(), confidential, "{echo}");
+        assert!(guarded.withheld(), "{echo}: never as sent");
+        assert_eq!((guarded.status, guarded.scope), (error.status, error.scope), "{echo}");
+        assert_eq!(guarded.body, error.body, "{echo}: the classified body stays");
+        assert_eq!(guarded.retry_after, error.retry_after, "{echo}");
+        // A value this socket never sent is no secret of it.
+        assert!(!sent("at-NEVER").guarded(error).confidential(), "{echo}");
+    }
 }
 
 /// #25 criterion 7 and #6 (review findings 1 and 2): a failure slot a pinned reader reads
@@ -2465,9 +2526,9 @@ fn refused_failure_slots_are_read_for_account_safety() {
                 }
                 assert_eq!(error.status, 502, "{name}: the generic failure keeps its status");
                 if account(name) {
-                    assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                    assert_eq!(error.delivery, withheld(raw), "{name}");
                     deliver_as_sent(&mut error, raw);
-                    assert_eq!(error.delivery, Delivery::Withheld, "{name}: never as sent");
+                    assert_eq!(error.delivery, withheld(raw), "{name}: never as sent");
                     checked[0] += 1;
                 } else {
                     assert_eq!(error.delivery, Delivery::Classified, "{name}");
@@ -2533,9 +2594,9 @@ fn explicit_status_account_errors_keep_their_status_and_are_withheld() {
         match reading(raw, event.as_ref(), false) {
             Reading::Failure { mut error, .. } => {
                 assert_eq!(error.status, 400, "{name}");
-                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                assert_eq!(error.delivery, withheld(raw), "{name}");
                 deliver_as_sent(&mut error, raw);
-                assert_eq!(error.delivery, Delivery::Withheld, "{name}");
+                assert_eq!(error.delivery, withheld(raw), "{name}");
             }
             Reading::Passed { .. } | Reading::Event { .. } => panic!("{name}"),
         }

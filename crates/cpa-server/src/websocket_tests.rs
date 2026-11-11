@@ -2207,11 +2207,13 @@ mod committed_context_failure {
 /// The same 400 classified normally is a request fault the client sees (the control).
 #[test]
 fn a_withheld_failure_is_never_rendered() {
-    use cpa_core::exec::{Delivery, ExecError, FailureScope};
+    use cpa_core::exec::{Delivery, ExecError, FailureScope, WithheldFrame};
+    let withheld =
+        |frame: &str| Delivery::Withheld(WithheldFrame::new(bytes::Bytes::copy_from_slice(frame.as_bytes())));
     let body = r#"{"status":400,"error":{"type":"rate_limit_error","code":"budget_reached","message":"limited","token":"at-FAKE","private_account":"acct-PRIVATE"}}"#;
     let mut error = ExecError::local(400, FailureScope::Request, body);
     assert!(super::exposed(&super::Failure::from_exec(&error)), "control");
-    error.delivery = Delivery::Withheld;
+    error.delivery = withheld(body);
     let failure = super::Failure::from_exec(&error);
     assert!(failure.delivered.is_none());
     assert!(!super::exposed(&failure));
@@ -2222,6 +2224,6 @@ fn a_withheld_failure_is_never_rendered() {
         r#"{"error":{"code":"message_too_big","message":"at-FAKE"}}"#,
     );
     assert!(super::close_code(&super::Failure::from_exec(&big)).is_some(), "control");
-    big.delivery = Delivery::Withheld;
+    big.delivery = withheld(r#"{"type":"error","status":413}"#);
     assert!(super::close_code(&super::Failure::from_exec(&big)).is_none());
 }

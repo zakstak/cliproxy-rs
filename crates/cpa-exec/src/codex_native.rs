@@ -959,7 +959,9 @@ impl Passthrough {
                     crate::codex_ws::deliver_as_sent(&mut error, &data);
                 }
                 None if crate::codex_ws::account_failure(error.status) => {
-                    error.delivery = cpa_core::exec::Delivery::Withheld;
+                    // A clone of `frame` is a reference count.
+                    let frame = cpa_core::exec::WithheldFrame::new(frame.clone());
+                    error.delivery = cpa_core::exec::Delivery::Withheld(frame);
                 }
                 None => {}
             },

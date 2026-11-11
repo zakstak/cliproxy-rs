@@ -766,8 +766,11 @@ pub enum Delivery {
     AsSent(Box<Bytes>),
     /// The frame can name the pooled account or carry its tokens (#6), and so can
     /// `body`: the client gets only the allowlisted subscription-limit event or a silent
-    /// close, never a rendering of the frame or of `body`.
-    Withheld,
+    /// close, never a rendering of the frame or of `body`. The frame stays with the
+    /// failure, never to be delivered: the outbound credential guard still reads its
+    /// original bytes ([`ExecError::original_frame`]), because a member that no reading
+    /// keeps, and so `body` lacks, can carry the upstream credential.
+    Withheld(WithheldFrame),
     /// The failure, or the frame it would deliver, carries an authentication value the
     /// upstream request or socket that produced it used (the native Codex routes' outbound
     /// credential guard). Nothing derived from it reaches the client: no frame, no
@@ -777,6 +780,28 @@ pub enum Delivery {
     /// the values it was checked against, which a log of `body` is scrubbed of
     /// ([`SentCredentials::scrub`]).
     Confidential(SentCredentials),
+}
+
+/// The original bytes of a failure frame the client must not receive
+/// ([`Delivery::Withheld`]). Its `Debug` shows only the length: the frame can name the
+/// pooled account. Boxed: errors are the cold path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WithheldFrame(Box<Bytes>);
+
+impl WithheldFrame {
+    pub fn new(frame: Bytes) -> Self {
+        Self(Box::new(frame))
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WithheldFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WithheldFrame({} bytes)", self.0.len())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -830,14 +855,26 @@ impl ExecError {
     pub fn delivered_event(&self) -> Option<&Bytes> {
         match &self.delivery {
             Delivery::AsSent(frame) => Some(frame),
-            Delivery::Classified | Delivery::Withheld | Delivery::Confidential(_) => None,
+            Delivery::Classified | Delivery::Withheld(_) | Delivery::Confidential(_) => None,
+        }
+    }
+
+    /// The provider's own failure frame, as the upstream sent it: the frame the client
+    /// receives ([`Delivery::AsSent`]) or the one it must not receive
+    /// ([`Delivery::Withheld`]). The outbound credential guard reads it; a withheld frame
+    /// is never delivered.
+    pub fn original_frame(&self) -> Option<&Bytes> {
+        match &self.delivery {
+            Delivery::AsSent(frame) => Some(frame),
+            Delivery::Withheld(frame) => Some(frame.bytes()),
+            Delivery::Classified | Delivery::Confidential(_) => None,
         }
     }
 
     /// Whether the client must get nothing of this failure but a fixed rendering
     /// ([`Delivery::Withheld`] or [`Delivery::Confidential`]).
     pub fn withheld(&self) -> bool {
-        matches!(self.delivery, Delivery::Withheld | Delivery::Confidential(_))
+        matches!(self.delivery, Delivery::Withheld(_) | Delivery::Confidential(_))
     }
 
     /// Whether this failure carries an upstream authentication value

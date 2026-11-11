@@ -2,7 +2,7 @@
 //! bytes, bound to the values one request carried.
 
 use super::*;
-use cpa_core::exec::{Delivery, ExecError, FailureScope};
+use cpa_core::exec::{Delivery, ExecError, FailureScope, WithheldFrame};
 use futures_util::StreamExt;
 use http::HeaderValue;
 
@@ -95,10 +95,22 @@ fn a_failure_keeps_its_classification_and_loses_its_delivery() {
     assert_eq!((guarded.status, guarded.scope), (400, FailureScope::Request));
     assert_eq!(&guarded.body[..], br#"{"error":{"message":"bad"}}"#);
     assert!(!guarded.direct && guarded.delivered_status.is_none() && guarded.addon.is_none());
-    // A Withheld account failure whose body carries the value becomes Confidential.
+    // A Withheld account failure whose body carries the value becomes Confidential, and
+    // so does one whose withheld frame alone carries it (a member no reading keeps).
+    let withheld = |frame: &'static [u8]| Delivery::Withheld(WithheldFrame::new(Bytes::from_static(frame)));
     let mut account = ExecError::local(429, FailureScope::Credential, "limited at-FAKE");
-    account.delivery = Delivery::Withheld;
+    account.delivery = withheld(br#"{"type":"error","status":429}"#);
     assert!(s.guarded(account).confidential());
+    let mut account = ExecError::local(429, FailureScope::Credential, "limited");
+    account.delivery = withheld(br#"{"type":"error","status":429,"error":{},"echo":"at\u002dFAKE"}"#);
+    let guarded = s.guarded(account);
+    assert!(guarded.confidential());
+    assert_eq!((guarded.status, &guarded.body[..]), (429, &b"limited"[..]));
+    // A withheld frame without the value stays withheld, never delivered.
+    let mut account = ExecError::local(429, FailureScope::Credential, "limited");
+    account.delivery = withheld(br#"{"type":"error","status":429,"echo":"at-FAKF"}"#);
+    let kept = s.guarded(account);
+    assert!(kept.withheld() && !kept.confidential() && kept.delivered_event().is_none());
     // An addon header carrying it.
     let mut headers = HeaderMap::new();
     headers.insert("x-echo", HeaderValue::from_static("at-FAKE"));
