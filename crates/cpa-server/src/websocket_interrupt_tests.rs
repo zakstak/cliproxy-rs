@@ -1474,8 +1474,11 @@ mod steering_usage {
 /// zakstak/cliproxy-rs#7 and #25 acceptance, end to end through the whole handler: the
 /// pinned client cancels a running response with `response.interrupt` after
 /// `response.created` (`codex-api/src/endpoint/responses_websocket.rs:824-839` at
-/// 44ccf394573c), then waits for the response's terminal event and an acknowledgement
-/// with its ID, accepted or failed, in either order (lines 310-333, 886-913). An
+/// 44ccf394573c), then waits for the response's terminal event and an accepted
+/// acknowledgement with its ID, in either order (lines 310-333, 886-913). A failed
+/// acknowledgement immediately errors and retires the client's socket (lines 387-395).
+/// The failed-acknowledgement and held-created cases below are adversarial proxy probes,
+/// not sequences whose follow-up reuse is established for the pinned client. An
 /// interrupted `response.incomplete` with zero (or no) output tokens completes the turn
 /// with `end_turn: false` (`sse/responses.rs:451-464`); it is not an empty-response
 /// failure. Every case runs on a native upstream socket, with two Codex credentials in
@@ -1754,6 +1757,10 @@ mod interrupt_route_matrix {
             }
         }
         let records = records(&p.rt).await;
+        let snapshot = p.rt.store().snapshot();
+        let credential = snapshot.iter().find(|c| c.id == p.credentials[served]).unwrap();
+        let expected_source = crate::usage_record::source(credential, "");
+        let expected_auth = cpa_core::config::credentials::auth_index(credential);
         let first = match (after_delta, usage) {
             (_, false) => [0, 0, 0],
             (false, true) => [5, 0, 5],
@@ -1771,10 +1778,11 @@ mod interrupt_route_matrix {
             if r["failed"] != false || r["fail"]["status_code"] != 200 {
                 return Err(format!("a failed record {r}"));
             }
-            for field in ["source", "auth_index", "provider", "model"] {
-                if r[field] != records[0][field] {
-                    return Err(format!("{field} differs: {records:?}"));
-                }
+            if r["source"] != expected_source
+                || r["auth_index"] != expected_auth
+                || r["model"] != "gpt-fixture"
+            {
+                return Err("record identity does not name the serving credential/model".into());
             }
             if r.get("usage_observed").is_some() || r["provider"] != "codex" {
                 return Err(format!("record shape {r}"));
