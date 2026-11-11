@@ -1778,10 +1778,7 @@ mod interrupt_route_matrix {
             if r["failed"] != false || r["fail"]["status_code"] != 200 {
                 return Err(format!("a failed record {r}"));
             }
-            if r["source"] != expected_source
-                || r["auth_index"] != expected_auth
-                || r["model"] != "gpt-fixture"
-            {
+            if r["source"] != expected_source || r["auth_index"] != expected_auth || r["model"] != "gpt-fixture" {
                 return Err("record identity does not name the serving credential/model".into());
             }
             if r.get("usage_observed").is_some() || r["provider"] != "codex" {
