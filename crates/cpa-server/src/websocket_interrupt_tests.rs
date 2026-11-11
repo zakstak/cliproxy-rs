@@ -1470,3 +1470,357 @@ mod steering_usage {
         assert!(rt.store().cooldowns(&credential).is_empty(), "{case}");
     }
 }
+
+/// zakstak/cliproxy-rs#7 and #25 acceptance, end to end through the whole handler: the
+/// pinned client cancels a running response with `response.interrupt` after
+/// `response.created` (`codex-api/src/endpoint/responses_websocket.rs:824-839` at
+/// 44ccf394573c), then waits for the response's terminal event and an acknowledgement
+/// with its ID, accepted or failed, in either order (lines 310-333, 886-913). An
+/// interrupted `response.incomplete` with zero (or no) output tokens completes the turn
+/// with `end_turn: false` (`sse/responses.rs:451-464`); it is not an empty-response
+/// failure. Every case runs on a native upstream socket, with two Codex credentials in
+/// the pool, and checks the whole lifecycle at the route:
+///
+/// - the client's create and interrupt reach one upstream socket unchanged, and nothing
+///   reaches the other credential;
+/// - the terminal event and the acknowledgement reach the client byte for byte, in the
+///   order upstream sent them, with the response ID, reason and usage (reported zero, or
+///   missing) as sent, and nothing is invented or left over;
+/// - a follow-up continuation (`previous_response_id` of the interrupted response) runs
+///   on the same socket and the same credential, and sees only its own response;
+/// - no credential cools, and the interrupted response and the follow-up each get one
+///   successful record on the one credential (missing usage reads as zero there: the
+///   legacy record schema has no "unreported" tokens; the response keeps it missing).
+///
+/// Dimensions: `response-steering` off and on; `stream-bootstrap-buffering` off and on
+/// (an ordinary turn then holds `response.created` until the next upstream frame, so the
+/// interrupt goes while it is held, which the reader must still route at once); a plain
+/// and an official Codex client (`originator`, `User-Agent`), which only #5/#6 failure
+/// delivery distinguishes; the interrupt before the first delta (zero output) and after
+/// it (partial output); accepted after and before the terminal event, and failed before
+/// and after a completion; usage reported and missing. Violations are collected by case
+/// label so a control shows the whole matrix.
+mod interrupt_route_matrix {
+    use super::*;
+    use serde_json::Value;
+
+    const DELTA_R1: &str = r#"{"type":"response.output_text.delta","item_id":"msg_r1","output_index":0,"content_index":0,"delta":"Hel","sequence_number":2}"#;
+    const ACK_R1: &str =
+        r#"{"type":"response.interrupt.accepted","response_id":"r1","sequence_number":3,"future":{"n":1.50}}"#;
+    const NACK_R1: &str = r#"{"type":"response.interrupt.failed","response_id":"r1","error":{"code":"too_late","message":"already done"}}"#;
+    const ZERO_INTERRUPTED: &str = r#"{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":5}}}"#;
+    const BARE_INTERRUPTED: &str = r#"{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[]}}"#;
+    const PARTIAL_INTERRUPTED: &str = r#"{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[{"type":"message","id":"msg_r1","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"Hel","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}"#;
+    const BARE_PARTIAL_INTERRUPTED: &str = r#"{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[{"type":"message","id":"msg_r1","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"Hel","annotations":[]}]}]}}"#;
+    const ZERO_COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}"#;
+    const BARE_COMPLETED: &str =
+        r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}"#;
+    const PARTIAL_COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[{"type":"message","id":"msg_r1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hel","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}"#;
+    const BARE_PARTIAL_COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[{"type":"message","id":"msg_r1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hel","annotations":[]}]}]}}"#;
+    const STEERING: &str = "codex:\n  response-steering: true\n";
+    const BUFFERING: &str = "codex:\n  stream-bootstrap-buffering: true\n";
+    const BUFFERING_KEY: &str = "  stream-bootstrap-buffering: true\n";
+    const OFFICIAL: [(&str, &str); 2] = [
+        ("originator", "codex_cli_rs"),
+        ("user-agent", "codex_cli_rs/0.0.0 (Linux 6.1; x86_64) xterm"),
+    ];
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Ack {
+        AcceptedAfter,
+        AcceptedBefore,
+        FailedBefore,
+        FailedAfter,
+    }
+
+    struct Pool {
+        socket: wreq::ws::WebSocket,
+        rt: Arc<crate::Runtime>,
+        credentials: [String; 2],
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Two Codex API keys with `websockets`, each on its own upstream, usage on, and a
+    /// client connected with `headers`.
+    async fn pool(upstreams: [&str; 2], extra: &str, headers: &[(&str, &str)]) -> Pool {
+        let dir = std::env::temp_dir().join(format!("cpa-ws-interrupt-matrix-{}", uuid::Uuid::new_v4()));
+        let mut yaml = format!("auth-dir: {}\ncodex-api-key:\n", dir.join("auths").display());
+        for (i, upstream) in upstreams.iter().enumerate() {
+            yaml.push_str(&format!(
+                "  - api-key: sk-FAKE-{i}\n    base-url: http://{upstream}\n    websockets: true\n    models:\n      - name: gpt-fixture\n"
+            ));
+        }
+        yaml.push_str(extra);
+        let cfg = Config::parse(&yaml).unwrap();
+        let credentials = cpa_core::config::credentials::from_config(&cfg);
+        assert_eq!(credentials.len(), 2);
+        let ids = [credentials[0].id.clone(), credentials[1].id.clone()];
+        let executors = Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+            meta: Default::default(),
+            xai: Default::default(),
+        };
+        let rt = Arc::new(crate::testing::runtime(cfg, credentials, executors));
+        rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let proxy = serve(router(rt.clone())).await;
+        let mut request = wreq::Client::new().websocket(format!("ws://{proxy}/v1/responses"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let socket = request.send().await.unwrap().into_websocket().await.unwrap();
+        Pool {
+            socket,
+            rt,
+            credentials: ids,
+            dir,
+        }
+    }
+
+    /// The next text frame within `wait`, or why there is none.
+    async fn next(socket: &mut wreq::ws::WebSocket, wait: Duration) -> Result<String, String> {
+        match tokio::time::timeout(wait, socket.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => Ok(text.as_str().to_owned()),
+            Ok(other) => Err(format!("not a text frame: {other:?}")),
+            Err(_) => Err("no frame".into()),
+        }
+    }
+
+    async fn read_n(socket: &mut wreq::ws::WebSocket, n: usize) -> Result<Vec<String>, String> {
+        let mut got = Vec::new();
+        for _ in 0..n {
+            match next(socket, Duration::from_secs(3)).await {
+                Ok(text) => got.push(text),
+                Err(why) => return Err(format!("{why} after {got:?}")),
+            }
+        }
+        Ok(got)
+    }
+
+    fn tokens(record: &Value) -> [i64; 3] {
+        let t = &record["tokens"];
+        [
+            t["input_tokens"].as_i64().unwrap_or(-1),
+            t["output_tokens"].as_i64().unwrap_or(-1),
+            t["total_tokens"].as_i64().unwrap_or(-1),
+        ]
+    }
+
+    /// Records until two arrived (at most five seconds), plus any within 300 ms.
+    async fn records(rt: &crate::Runtime) -> Vec<Value> {
+        let pop = || -> Vec<Value> {
+            rt.usage_queue()
+                .pop_oldest(50)
+                .iter()
+                .map(|r| serde_json::from_slice(r).unwrap())
+                .collect()
+        };
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while got.len() < 2 {
+                got.extend(pop());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        got.extend(pop());
+        got
+    }
+
+    /// Waits until one of the upstreams has received `n` frames in total.
+    async fn upstream_received(frames: &[Arc<Mutex<Vec<String>>>; 2], n: usize) -> bool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while frames.iter().map(|f| f.lock().unwrap().len()).sum::<usize>() < n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn case(
+        steering: bool,
+        buffering: bool,
+        official: bool,
+        after_delta: bool,
+        ack: Ack,
+        usage: bool,
+    ) -> Result<(), String> {
+        let end = match (ack, after_delta, usage) {
+            (Ack::AcceptedAfter | Ack::AcceptedBefore, false, true) => ZERO_INTERRUPTED,
+            (Ack::AcceptedAfter | Ack::AcceptedBefore, false, false) => BARE_INTERRUPTED,
+            (Ack::AcceptedAfter | Ack::AcceptedBefore, true, true) => PARTIAL_INTERRUPTED,
+            (Ack::AcceptedAfter | Ack::AcceptedBefore, true, false) => BARE_PARTIAL_INTERRUPTED,
+            (_, false, true) => ZERO_COMPLETED,
+            (_, false, false) => BARE_COMPLETED,
+            (_, true, true) => PARTIAL_COMPLETED,
+            (_, true, false) => BARE_PARTIAL_COMPLETED,
+        };
+        let ends: Vec<&'static str> = match ack {
+            Ack::AcceptedAfter => vec![end, ACK_R1],
+            Ack::AcceptedBefore => vec![ACK_R1, end],
+            Ack::FailedBefore => vec![NACK_R1, end],
+            Ack::FailedAfter => vec![end, NACK_R1],
+        };
+        let leading: Vec<&'static str> = if after_delta {
+            vec![CREATED_R1, DELTA_R1]
+        } else {
+            vec![CREATED_R1]
+        };
+        let script = vec![leading.clone(), ends.clone(), vec![CREATED_R2, COMPLETED_R2]];
+        let (a, frames_a, dials_a) = ws_upstream(script.clone()).await;
+        let (b, frames_b, dials_b) = ws_upstream(script).await;
+        let frames = [frames_a, frames_b];
+        let mut config = String::new();
+        if steering {
+            config.push_str(STEERING);
+        }
+        if buffering {
+            config.push_str(if steering { BUFFERING_KEY } else { BUFFERING });
+        }
+        let headers: &[(&str, &str)] = if official { &OFFICIAL } else { &[] };
+        let mut p = pool([&a, &b], &config, headers).await;
+        let send = |text: &str| WsMessage::text(text.to_owned());
+        p.socket
+            .send(send(CREATE))
+            .await
+            .map_err(|e| format!("send create: {e}"))?;
+        // An ordinary buffered turn holds `response.created` until the next upstream
+        // frame; a delta releases it, and steering connections do not buffer.
+        let held = buffering && !steering && !after_delta;
+        let mut got = Vec::new();
+        if held {
+            if !upstream_received(&frames, 1).await {
+                return Err("the create never reached upstream".into());
+            }
+            if let Ok(early) = next(&mut p.socket, Duration::from_millis(300)).await {
+                return Err(format!("buffering delivered {early} before the interrupt"));
+            }
+        } else {
+            got = read_n(&mut p.socket, leading.len()).await?;
+            if got != leading {
+                return Err(format!("leading events changed: {got:?}"));
+            }
+        }
+        p.socket
+            .send(send(INTERRUPT_R1))
+            .await
+            .map_err(|e| format!("send interrupt: {e}"))?;
+        let want: Vec<&str> = if held {
+            leading.iter().chain(&ends).copied().collect()
+        } else {
+            ends.clone()
+        };
+        let ended = read_n(&mut p.socket, want.len()).await?;
+        if ended != want {
+            return Err(format!("terminal and acknowledgement changed: {ended:?}"));
+        }
+        got.extend(ended);
+        p.socket
+            .send(send(CREATE_R2))
+            .await
+            .map_err(|e| format!("send follow-up: {e}"))?;
+        let follow = read_n(&mut p.socket, 2).await?;
+        if follow != [CREATED_R2, COMPLETED_R2] {
+            return Err(format!("follow-up changed: {follow:?}"));
+        }
+        if let Ok(stale) = next(&mut p.socket, Duration::from_millis(300)).await {
+            return Err(format!("stale frame {stale}"));
+        }
+        let sent: Vec<Vec<String>> = frames.iter().map(|f| f.lock().unwrap().clone()).collect();
+        let dials = [*dials_a.lock().unwrap(), *dials_b.lock().unwrap()];
+        let served = match dials {
+            [1, 0] => 0,
+            [0, 1] => 1,
+            other => return Err(format!("dials {other:?}: one socket on one credential")),
+        };
+        if sent[served] != [CREATE, INTERRUPT_R1, CREATE_R2] || !sent[1 - served].is_empty() {
+            return Err(format!("upstream frames {sent:?}"));
+        }
+        for id in &p.credentials {
+            if !p.rt.store().cooldowns(id).is_empty() {
+                return Err(format!("credential {id} cooled"));
+            }
+        }
+        let records = records(&p.rt).await;
+        let first = match (after_delta, usage) {
+            (_, false) => [0, 0, 0],
+            (false, true) => [5, 0, 5],
+            (true, true) => [5, 1, 6],
+        };
+        let mut want_tokens = vec![first, [3, 2, 5]];
+        let mut got_tokens: Vec<[i64; 3]> = records.iter().map(tokens).collect();
+        want_tokens.sort_unstable();
+        got_tokens.sort_unstable();
+        if got_tokens != want_tokens {
+            return Err(format!("records {records:?}"));
+        }
+        let mut executions = std::collections::HashSet::new();
+        for r in &records {
+            if r["failed"] != false || r["fail"]["status_code"] != 200 {
+                return Err(format!("a failed record {r}"));
+            }
+            for field in ["source", "auth_index", "provider", "model"] {
+                if r[field] != records[0][field] {
+                    return Err(format!("{field} differs: {records:?}"));
+                }
+            }
+            if r.get("usage_observed").is_some() || r["provider"] != "codex" {
+                return Err(format!("record shape {r}"));
+            }
+            executions.insert(r["execution_id"].as_str().unwrap_or_default().to_owned());
+        }
+        if executions.len() != 2 {
+            return Err(format!("execution IDs {records:?}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupt_keeps_its_end_acknowledgement_socket_and_credential_through_the_route() {
+        let mut violations = Vec::new();
+        let mut cases = 0;
+        for steering in [false, true] {
+            for buffering in [false, true] {
+                for official in [false, true] {
+                    for after_delta in [false, true] {
+                        for ack in [
+                            Ack::AcceptedAfter,
+                            Ack::AcceptedBefore,
+                            Ack::FailedBefore,
+                            Ack::FailedAfter,
+                        ] {
+                            for usage in [true, false] {
+                                cases += 1;
+                                let label = format!(
+                                    "steering={steering} buffering={buffering} official={official} after_delta={after_delta} ack={ack:?} usage={usage}"
+                                );
+                                if let Err(why) = case(steering, buffering, official, after_delta, ack, usage).await {
+                                    violations.push(format!("{label}: {why}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("interrupt_route_matrix: {cases} cases, {} violations", violations.len());
+        assert!(
+            violations.is_empty(),
+            "{} of {cases} cases violated:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+}
