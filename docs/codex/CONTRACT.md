@@ -534,10 +534,14 @@ turn, each later frame of a `codex.response-steering` connection and each
 `response.interrupt`. It is checked again at the write itself, after every wait for the
 upstream. On an upstream socket that is once the socket is ready to take the frame
 (after its lock, its readiness and any earlier frame's flush) and before the frame is
-handed over; a revocation after the hand-over cannot recall it. On a turn served over
-HTTP it is before each attempt dials, and again when the HTTP client first takes the
-request body, which it does only once it holds a connection. A refusal there sends no
-byte of the request. The check re-runs the upgrade's client-key authentication against
+handed over; a revocation after the hand-over cannot recall it. A turn served over HTTP
+is checked before each attempt dials, and again once its connection is up (TCP, TLS and
+its ALPN choice, any proxy tunnel), before any HTTP byte is written on it. Such an attempt
+always dials a connection of its own and never shares a pooled one, over HTTP/2 or
+HTTP/1.1, so it cannot wait on, or queue its request headers into, another request's
+connection. A refusal sends no HTTP/2 HEADERS or DATA and no HTTP/1.1 request byte; the
+TLS handshake has completed by then. The body is checked once more when the HTTP client
+takes it. The check re-runs the upgrade's client-key authentication against
 the current config. A key removed from `api-keys` stops the next send, and the
 connection never acts as another accepted key it also presents. A refused frame reaches
 no upstream, and the client gets a 401 `error` event that names no key; at admission the

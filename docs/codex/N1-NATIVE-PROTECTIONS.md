@@ -99,7 +99,15 @@ the same branch:
   flushes, for creates, duplex frames and interrupts.
 - The WebSocket HTTP fallback never checked the authority. It now checks before each
   attempt dials and again when the HTTP client takes the body (`proxy::GatedBody`).
-  Revoked during the dial, no request byte left.
+  A review of `5055503b` showed that the body check comes after HTTP/2 HEADERS are
+  submitted. At that head, a key revoked during a fresh HTTP/2 dial let one HEADERS frame
+  reach the upstream, and a gated request on a busy pooled HTTP/2 connection queued its
+  HEADERS there; the earlier zero-byte evidence covered HTTP/1.1 only. Gated attempts now
+  dial a connection of their own and are admitted when that dial completes, before any
+  HTTP byte (`proxy::admit_dials`, `codex_tls::Transport::admitting_for_url`). Over TLS
+  with HTTP/2 or HTTP/1.1, a refusal sends no HEADERS, DATA or HTTP/1.1 byte
+  (`codex::tests::a_key_revoked_during_the_dial_sends_no_request_headers`,
+  `a_gated_request_never_queues_headers_on_a_busy_pooled_http2_connection`).
 - The native HTTP route and the fallback replayed requests the upstream may have read.
   They now track send certainty (`proxy::send_routed_certain`): only a failed connection
   or an unsent deadline fails over.
