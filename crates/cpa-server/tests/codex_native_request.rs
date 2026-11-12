@@ -2566,3 +2566,45 @@ async fn tool_output_media_reaches_the_upstream_byte_for_byte() {
         assert_eq!(sent, [full.clone(), want_buffered.clone()], "api_key={api_key}");
     }
 }
+
+/// N1 (#111) W3, native HTTP streaming: under `stream-bootstrap-buffering`, an upstream
+/// `response.metadata` before an explicit `server_is_overloaded` rejection is held, so the
+/// request fails over to the next account, and the failed attempt's events, its metadata
+/// included, never reach the client; the serving attempt's events, its own metadata
+/// included, reach it byte for byte and in order. The moderation payload follows Go's
+/// upstream capture (Go issue #6856), not verified provider behaviour.
+#[tokio::test]
+async fn bootstrap_buffering_holds_response_metadata_on_http() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"r1"}}"#;
+    const MODERATION: &str = r#"{"type":"response.metadata","response_id":"r1","sequence_number":2,"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{"omnimod":{"protection_type":"omnimod"}}}}}"#;
+    const OVERLOADED: &str =
+        r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"server_is_overloaded","message":null}}}"#;
+    const SERVED: &str = r#"{"type":"response.metadata","response_id":"r2","metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{}}},"future":1.50}"#;
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"r2","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#;
+    let sse = |frames: &[&str]| frames.iter().map(|f| format!("data: {f}\n\n")).collect::<String>();
+    let proxy = native(
+        false,
+        Script {
+            http: vec![
+                Reply::sse(sse(&[CREATED, MODERATION, OVERLOADED])),
+                Reply::sse(sse(&[CREATED, SERVED, DONE])),
+            ],
+            ..Script::default()
+        },
+        "codex:\n  stream-bootstrap-buffering: true\n",
+    )
+    .await;
+    let mut second = credential(false, &proxy.upstream.base_url);
+    second.id = "codex-second.json".into();
+    second.metadata.insert("access_token".into(), "at-SECOND".into());
+    proxy.rt.store().upsert(second);
+    let (status, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!(status, 200);
+    assert_eq!(proxy.upstream.http().len(), 2, "the overload failed over: {answer}");
+    assert_eq!(
+        answer,
+        sse(&[CREATED, SERVED, DONE]),
+        "the serving attempt's events, exactly"
+    );
+    assert!(!answer.contains("omnimod"), "no failed-attempt metadata");
+}

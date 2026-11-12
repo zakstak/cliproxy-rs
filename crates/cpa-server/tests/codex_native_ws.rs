@@ -7493,3 +7493,57 @@ async fn tool_output_media_reaches_the_upstream_socket_byte_for_byte() {
         "the frame without its tag"
     );
 }
+
+// N1 (#111) safety fixes. W1: a request the upstream may already have read is never sent
+// again on another account. W3: `response.metadata` is held during bootstrap buffering.
+// W2: every send is authorized under the client key the connection was opened with.
+
+const N1_IN_PROGRESS: &str = r#"{"type":"response.in_progress","response":{"id":"resp_n1"}}"#;
+/// Prompt-moderation metadata in the shape of Go's upstream capture (Go issue #6856,
+/// `9e79552f`): Go evidence, not verified provider behaviour. The pinned client reads
+/// such a frame as `TurnModerationMetadata` (`sse/responses.rs:262-271` at 44ccf394573c).
+const N1_MODERATION: &str = r#"{"type":"response.metadata","response_id":"resp_n1","sequence_number":2,"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{"omnimod":{"protection_type":"omnimod"}}}}}"#;
+const N1_OVERLOADED: &str =
+    r#"{"type":"response.failed","response":{"id":"resp_n1","error":{"code":"server_is_overloaded","message":null}}}"#;
+
+/// N1 W3, WebSocket: under `stream-bootstrap-buffering`, an upstream `response.metadata`
+/// before an explicit `server_is_overloaded` rejection is held, so the turn still fails
+/// over, and the failed attempt's events, its metadata included, never reach the client.
+/// The serving attempt's events, its own `response.metadata` included, reach the client
+/// as sent and in order.
+#[tokio::test]
+async fn bootstrap_buffering_holds_response_metadata_and_releases_it_in_order() {
+    const SERVED_METADATA: &str = r#"{"type":"response.metadata","response_id":"resp_n1","headers":{"x-codex-turn-state":"ts-served"},"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{}}},"future":1.50}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_n1","delta":"served"}"#;
+    let (url, log) = recording_upstream(|dial, _| {
+        if dial == 0 {
+            (vec![N1_CREATED, N1_IN_PROGRESS, N1_MODERATION, N1_OVERLOADED], false)
+        } else {
+            (vec![N1_CREATED, SERVED_METADATA, N1_IN_PROGRESS, DELTA, N1_DONE], false)
+        }
+    })
+    .await;
+    let proxy = proxy_with(
+        Script::default(),
+        "codex:\n  stream-bootstrap-buffering: true\n",
+        |_| two_accounts(&url),
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let got = read(&mut socket, &TERMINAL).await;
+    assert_eq!(
+        got.frames,
+        [N1_CREATED, SERVED_METADATA, N1_IN_PROGRESS, DELTA, N1_DONE],
+        "the serving attempt's events, exactly"
+    );
+    assert!(
+        !got.frames.iter().any(|f| f == N1_MODERATION),
+        "no failed-attempt metadata"
+    );
+    assert_eq!(got.closed, None);
+    assert_eq!(log.lock().unwrap().len(), 2, "the overload failed over");
+}
