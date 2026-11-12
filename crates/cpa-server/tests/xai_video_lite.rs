@@ -292,37 +292,34 @@ async fn openai_route_resolutions_follow_each_model() {
             Err(
                 "resolution 1080p is not supported by grok-imagine-video-1.5 for reference-to-video; xAI documents up to 720p",
             ),
-            // xAI's capability table: Lite takes no reference images, at any resolution.
-            (
-                "grok-imagine-video-1.5-lite",
-                json!({"resolution": "1080p", "reference_images": references.clone()}),
-                Err(
-                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
-                ),
+        ),
+        // xAI's capability table: Lite takes no reference images, at any resolution.
+        (
+            "grok-imagine-video-1.5-lite",
+            json!({"resolution": "1080p", "reference_images": references.clone()}),
+            Err(
+                "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
             ),
-            // xAI's capability table: Lite takes no reference images, at any resolution.
-            (
-                "x-ai/grok-imagine-video-1.5-lite",
-                json!({"resolution": "1080p", "reference_images": references.clone()}),
-                Err(
-                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
-                ),
+        ),
+        (
+            "x-ai/grok-imagine-video-1.5-lite",
+            json!({"resolution": "1080p", "reference_images": references.clone()}),
+            Err(
+                "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
             ),
-            // xAI's capability table: Lite takes no reference images, at any resolution.
-            (
-                "grok-imagine-video-1.5-lite",
-                json!({"reference_images": references.clone()}),
-                Err(
-                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
-                ),
+        ),
+        (
+            "grok-imagine-video-1.5-lite",
+            json!({"reference_images": references.clone()}),
+            Err(
+                "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
             ),
-            // xAI's capability table: Lite takes no reference images, at any resolution.
-            (
-                "grok-imagine-video-1.5-lite",
-                json!({"resolution": "480p", "reference_image_urls": [CAT]}),
-                Err(
-                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
-                ),
+        ),
+        (
+            "grok-imagine-video-1.5-lite",
+            json!({"resolution": "480p", "reference_image_urls": [CAT]}),
+            Err(
+                "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
             ),
         ),
     ];
