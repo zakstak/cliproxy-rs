@@ -44,9 +44,8 @@ use cpa_common::codex_client::normalize_codex_instructions;
 
 /// Provider string served by this executor.
 pub const PROVIDER: &str = "meta";
-/// `metaUserAgent`.
-pub const USER_AGENT: &str =
-    "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)";
+/// `metaUserAgent`: the captured Muse Code client's (see `crate::meta_identity`).
+pub const USER_AGENT: &str = crate::meta_identity::USER_AGENT;
 /// `metaNotFoundCooldown`: a 404 without `resets_at` cools the model for five minutes.
 const NOT_FOUND_COOLDOWN: Duration = Duration::from_secs(300);
 /// Go's bufio.Scanner limit for the upstream stream.
@@ -215,7 +214,8 @@ impl MetaExecutor {
         // so its first body byte only records the first-packet fallback.
         use crate::helpers::{capture_chunk, capture_error, capture_metadata, capture_request};
         let capture = req.capture();
-        let request_headers = headers(&enriched, &req, &token);
+        let session = crate::meta_identity::session_id(&enriched, &req, original(&req));
+        let request_headers = headers(&enriched, &req, &token, &session, &prepared.effective_model);
         // recordMetaRequest: the enriched credential's account info.
         let (auth_type, auth_value) = cpa_core::registry::dynamic::account_info(&enriched);
         capture_request(
@@ -355,6 +355,9 @@ fn original(req: &ExecRequest) -> &Bytes {
 
 struct Prepared {
     body: Vec<u8>,
+    /// The model the body sends, after aliases and payload rules (Go v8.0.67
+    /// `effectiveModel`, c2f402b4): it decides `X-Tbh-Contributor-Mode`.
+    effective_model: String,
     /// Transforms for the client's response format against the Codex upstream.
     response: &'static Pair,
     /// Go's `ApplyPatchResponsesState` for this request.
@@ -438,8 +441,13 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     body = cpa_common::payload::normalize_codex_tool_integer_types(&body, &req.headers);
     // The payload rules are the last change to the body (868e137).
     body = payload_rules(cfg, req, &base_model, PROVIDER, body, &original_translated);
+    let effective_model = match gj::get(&body, "model").str().trim() {
+        "" => base_model.clone(),
+        model => model.to_owned(),
+    };
     Ok(Prepared {
         body,
+        effective_model,
         response,
         apply_patch,
     })
@@ -491,14 +499,17 @@ fn sanitize_web_search_tools(body: &mut Vec<u8>) {
     }
 }
 
-fn headers(c: &Credential, req: &ExecRequest, token: &str) -> GoHeaders {
+/// `applyMetaAPIHeaders`, with the Muse Code identity of `crate::meta_identity`. The
+/// credential's custom headers come last and replace any of these, as in Go.
+fn headers(c: &Credential, req: &ExecRequest, token: &str, session: &str, effective_model: &str) -> GoHeaders {
     let mut h = GoHeaders::new();
     h.set("Content-Type", "application/json");
     if !token.trim().is_empty() {
         h.set("Authorization", format!("Bearer {token}"));
     }
-    h.set("User-Agent", USER_AGENT);
-    h.set("X-Client-Id", "tbh:tui");
+    for (name, value) in crate::meta_identity::headers(c, session, effective_model) {
+        h.set(name, value);
+    }
     // Meta always streams upstream.
     h.set("Accept", "text/event-stream");
     h.set("Cache-Control", "no-cache");
