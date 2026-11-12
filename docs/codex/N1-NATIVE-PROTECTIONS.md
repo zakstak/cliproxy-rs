@@ -78,6 +78,24 @@ cites a first-party Codex source as a requirement. The orchestrator decides rout
 | W2 | `n1_witness_a_revoked_client_key_admits_no_later_turn` | Go v8.0.67 `b9bb031d`, `3e7a21e2` | A revoked client key keeps its open connection. | Reauthorize each turn against the bound principal, and decide the refusal frame and close behavior. Client keys are not a Codex payload concern. A difference entry is needed either way. |
 | W3 | `n1_witness_moderation_metadata_keeps_bootstrap_failover` | Go v8.0.67 `9e79552f`, upstream capture from 2026-10-21 (Go issue #6856) | Under `stream-bootstrap-buffering`, an overload after `response.metadata` leaks to the client. | Holding a frame changes no bytes. The pinned client reads `response.metadata` headers (`sse/responses.rs:193-222`), so held metadata must still be delivered in order. |
 
+### Disposition in the safety-fix branch
+
+The table and the witnesses above are the audit as reviewed at `0e8463bd` (PR #130). The
+dependent branch `opus/n1-safety-fixes` implements the three missing protections. The
+audit evidence above keeps its original limits: author runs, local mocks, no live
+provider proof.
+
+| ID | Fix | Regression tests (local mocks, author runs) |
+| --- | --- | --- |
+| W1 | Writes report whether the frame provably never left (`codex_ws::WriteFailure`). A read loss after a successful write, and a write that may be partial, are request-scoped (`codex_ws::uncertain`): no failover, no cooldown. The client closes as on any lost socket. Only a provably unsent frame is retried once on a fresh socket. | `codex_native_ws::an_uncertain_loss_is_never_replayed_on_another_account`; `codex_ws::tests::only_refusals_before_queueing_prove_a_write_unsent`, `a_socket_whose_loss_was_recorded_is_not_written`, `an_uncertain_loss_is_request_scoped_and_otherwise_unchanged`; reworked `a_write_the_upstream_never_reads_times_out`, `a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake`, `a_replacement_socket_never_inherits_the_old_sockets_model` |
+| W2 | `websocket::ClientAuthority` re-runs the upgrade's client-key check for every turn, interrupt and duplex frame. The executor session holds it (`codex_ws::Authority`), so it is checked again right before each write. The bound principal is never replaced. | `codex_native_ws::a_revoked_client_key_admits_no_later_send_on_a_reused_socket`, `a_create_queued_before_revocation_is_refused_when_it_would_be_sent`, `a_revoked_client_key_cannot_interrupt`, `another_accepted_key_never_replaces_the_bound_principal`; `codex_duplex::tests::a_revoked_client_cannot_send_a_later_create_and_stays_connected`, `a_create_admitted_before_revocation_is_not_written_after_it` |
+| W3 | `codex_response::bufferable` holds `response.metadata`. | `codex_native_ws::bootstrap_buffering_holds_response_metadata_and_releases_it_in_order`, `codex_native_request::bootstrap_buffering_holds_response_metadata_on_http`, `codex_response::bufferable_tests::response_metadata_is_held_and_output_is_not` |
+
+The WebSocket HTTP fallback (a Codex credential without `websockets`) and the native HTTP
+route keep their transport retry policy. This branch does not establish whether an HTTP
+stream lost after its request was sent is replayed on another credential; that remains a
+gate.
+
 ## Execution evidence
 
 | Item | Value |

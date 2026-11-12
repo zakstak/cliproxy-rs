@@ -387,7 +387,13 @@ The response reaches the client as the upstream sent it:
   failure classification read a copy. The observer splits lines as the shared SSE
   framer does (`\r\n`, `\r` or `\n`) and joins a multiline `data` field in one pass.
 - Leading handshake events are held under `stream-bootstrap-buffering`, using their
-  decoded classification view; positional and object envelopes are held alike. A failure that
+  decoded classification view; positional and object envelopes are held alike. The held
+  events are `response.created`, `response.in_progress`, `codex.rate_limits`,
+  `codex.response.metadata`, `response.metadata`, keepalives and empty output items:
+  the pinned reader takes no response content from `response.metadata`, only headers,
+  turn state and notices (`sse/responses.rs:213-290`, 545). A serving attempt releases
+  them unchanged and in order; a failed attempt's held events never reach the client
+  (N1 #111). A failure that
   arrives before anything was delivered fails over to another credential when its scope
   allows it; otherwise the provider's event is delivered. After something was delivered,
   a failure ends the stream after its event and is never replayed on another credential.
@@ -516,6 +522,19 @@ connection stays open; on an ordinary turn the client receives the error event a
 connection closes. The client continues with a `response.create` and
 `previous_response_id`, as the pinned client does.
 
+Every client frame that would reach an upstream is sent under the client key the
+connection was opened with (N1 #111): each turn as it is admitted and again right before
+its `response.create` is written, each later frame of a `codex.response-steering`
+connection as it is admitted and again right before it is written, and each
+`response.interrupt`. The check re-runs the upgrade's client-key authentication against
+the current config. A key removed from `api-keys` stops the next send, and the
+connection never acts as another accepted key it also presents. A refused frame reaches
+no upstream, and the client gets a 401 `error` event that names no key; at admission the
+connection stays open, and a refusal at the write itself ends the turn or the steering
+stream with that event. With no client keys configured, access is open, as for a new
+connection. Client keys are proxy access control, not a Codex payload rule: the frame
+itself is never changed.
+
 ### Requests
 
 The frame goes upstream as the client sent it, and only `model` changes: the routed
@@ -577,10 +596,23 @@ reconnect. A pick that is lost or released, a credential that Home's snapshot ma
 unavailable, or a continuation for another model drops the pin, and the continuation
 closes with 1012. When it cannot, the connection closes with 1012,
 and the continuation never moves to another socket or account. When the upstream socket
-is lost, the client connection closes, and the client recovers on its own. A loss reported
-while the turn's request has not been served yet is the loss of a socket its own attempt
-already failed on: it does not close the connection, and the turn fails over to another
-credential or delivers that failure itself. Each socket's loss is its own. The loss of the
+is lost, the client connection closes, and the client recovers on its own. A request
+the upstream may already have read is never sent again on another socket or account:
+once its `response.create` was written, a loss before anything reached the client (a
+close with any code, a dropped connection, an idle timeout), and a write that failed
+after it may have sent part of the frame (a timeout, an I/O error or a reset), fail the
+turn with a request-scoped error that neither fails over nor cools the credential, and
+the client connection closes as for any lost socket. That holds under
+`stream-bootstrap-buffering` too, after `response.created` or `response.metadata` was
+held. Only a request that provably never left (the socket's loss was recorded before the
+write, or the WebSocket library refused the frame before queueing it) is retried, once,
+on a fresh socket, and an explicit upstream rejection (a wrapped status error, a
+failure event) keeps its failover. The first-party client reads such a loss as a
+stream error (`responses_websocket.rs:1002-1005`) and retries the sampling request
+itself (`core/src/responses_retry_tests.rs:17-50`); the proxy makes no copy (N1 #111). A loss
+reported while the turn's request has not been served yet is the loss of a socket its own
+attempt already failed on: it does not close the connection, and the turn fails over to
+another credential or delivers that failure itself. Each socket's loss is its own. The loss of the
 socket that then serves closes the connection like any other, idle or during a response,
 and a failure on that socket renders its own error, never the loss let pass during
 failover. A replaced socket's late loss reports nothing. A loss renders only in place of a
@@ -664,7 +696,9 @@ built from the bytes of its members.
   frame: unknown members, `null` and number spellings included. The proxy builds no
   error of its own.
 - A failure before anything was delivered fails over when its classification allows it
-  (a retryable status, an overload). Once the attempts run out, the client receives the
+  (a retryable status, an overload) and the upstream explicitly rejected the request; a
+  lost socket after the write is no rejection and never fails over ([Socket and account
+  ownership](#socket-and-account-ownership)). Once the attempts run out, the client receives the
   last attempt's frame. That includes a Home round that ends with a retry hint, which
   wraps the upstream error in its retry metadata.
 - A failure after the response started reaches the client after the events before it.
