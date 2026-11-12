@@ -1,0 +1,581 @@
+{
+  "written": "2026-11-12T02:43:10Z",
+  "kind": "cargo-groups",
+  "verdict": "pass",
+  "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db",
+  "rust_worktree_clean": true,
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)"
+  },
+  "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, caller uid/gid; CPA_TEST_NO_SKIP=1",
+  "counts": {
+    "groups": 6,
+    "tests": 32,
+    "passed": 32,
+    "failed": 0,
+    "unknown_tests": 0
+  },
+  "unknown_tests": [],
+  "groups": [
+    {
+      "id": "claude-router",
+      "provider": "claude",
+      "tests": [
+        {
+          "name": "claude_messages_end_to_end",
+          "package": "cpa-server",
+          "target": "test:claude_passthrough",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "request_log_masks_upstream_credentials",
+          "package": "cpa-server",
+          "target": "test:claude_passthrough",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+          "package": "cpa-server",
+          "target": "test:routes",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "mid_stream_failure_ends_with_route_error_frame",
+          "package": "cpa-server",
+          "target": "test:routes",
+          "paths": [
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "id": "codex-contract",
+      "provider": "codex",
+      "tests": [
+        {
+          "name": "codex_contract::tests::manifest_and_directory_list_the_same_files",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::every_fixture_records_its_provenance",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::fixtures_hold_no_credentials",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::frames_are_exact_slices",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "native_requests_and_events_pass_through_the_route_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "private_and_unknown_events_reach_codex_clients",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "buffered_clients_get_the_destination_contract",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "upstream_failures_reach_the_client_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "native_creates_and_events_pass_through_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "http_fallback_is_a_separate_explicit_conversion",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "chat_round_trips_keep_meaning",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "claude_round_trips_keep_meaning",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "an_upstream_error_keeps_its_message",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 14,
+      "failed": 0
+    },
+    {
+      "id": "xai",
+      "provider": "xai",
+      "tests": [
+        {
+          "name": "xai_responses_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "xai_chat_completions_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "xai_messages_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "upstream_rate_limits_keep_their_status",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "id": "meta",
+      "provider": "meta",
+      "tests": [
+        {
+          "name": "meta_responses_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "meta_chat_completions_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "meta_messages_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 3,
+      "failed": 0
+    },
+    {
+      "id": "refusals",
+      "provider": "removed",
+      "tests": [
+        {
+          "name": "removed_provider_routes_settings_and_models_stay_refused",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "plugin_settings_stay_refused",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "retired_plugin_routes_answer_gone_behind_the_guard",
+          "package": "cpa-server",
+          "target": "test:management",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "management_writes_refuse_a_plugins_section",
+          "package": "cpa-server",
+          "target": "test:management",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+          "package": "cpa-core",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "removed::tests::removed_settings_fail_with_guidance",
+          "package": "cpa-core",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 6,
+      "failed": 0
+    },
+    {
+      "id": "controls",
+      "provider": "harness",
+      "tests": [
+        {
+          "name": "the_semantic_checks_reject_a_mutated_capture",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 1,
+      "failed": 0
+    }
+  ],
+  "log": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-core",
+        "--lib"
+      ],
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-exec",
+        "--lib"
+      ],
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-server",
+        "--test",
+        "claude_passthrough",
+        "--test",
+        "codex_native_request",
+        "--test",
+        "codex_native_ws",
+        "--test",
+        "codex_translated",
+        "--test",
+        "management",
+        "--test",
+        "retained_providers",
+        "--test",
+        "routes"
+      ],
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-core",
+        "--lib",
+        "--",
+        "--exact",
+        "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+        "removed::tests::removed_settings_fail_with_guidance"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-exec",
+        "--lib",
+        "--",
+        "--exact",
+        "codex_contract::tests::every_fixture_records_its_provenance",
+        "codex_contract::tests::fixtures_hold_no_credentials",
+        "codex_contract::tests::frames_are_exact_slices",
+        "codex_contract::tests::manifest_and_directory_list_the_same_files"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "claude_passthrough",
+        "--",
+        "--exact",
+        "claude_messages_end_to_end",
+        "request_log_masks_upstream_credentials"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "codex_native_request",
+        "--",
+        "--exact",
+        "buffered_clients_get_the_destination_contract",
+        "native_requests_and_events_pass_through_the_route_unchanged",
+        "private_and_unknown_events_reach_codex_clients",
+        "upstream_failures_reach_the_client_unchanged"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "codex_native_ws",
+        "--",
+        "--exact",
+        "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+        "http_fallback_is_a_separate_explicit_conversion",
+        "native_creates_and_events_pass_through_unchanged"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "codex_translated",
+        "--",
+        "--exact",
+        "an_upstream_error_keeps_its_message",
+        "chat_round_trips_keep_meaning",
+        "claude_round_trips_keep_meaning"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "management",
+        "--",
+        "--exact",
+        "management_writes_refuse_a_plugins_section",
+        "retired_plugin_routes_answer_gone_behind_the_guard"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "retained_providers",
+        "--",
+        "--exact",
+        "meta_chat_completions_http_and_stream",
+        "meta_messages_http_and_stream",
+        "meta_responses_http_and_stream",
+        "plugin_settings_stay_refused",
+        "removed_provider_routes_settings_and_models_stay_refused",
+        "the_semantic_checks_reject_a_mutated_capture",
+        "upstream_rate_limits_keep_their_status",
+        "xai_chat_completions_http_and_stream",
+        "xai_messages_http_and_stream",
+        "xai_responses_http_and_stream"
+      ],
+      "isolated": true,
+      "exit": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "cpa-server",
+        "--test",
+        "routes",
+        "--",
+        "--exact",
+        "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+        "mid_stream_failure_ends_with_route_error_frame"
+      ],
+      "isolated": true,
+      "exit": 0
+    }
+  ]
+}

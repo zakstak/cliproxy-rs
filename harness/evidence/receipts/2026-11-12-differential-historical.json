@@ -1,0 +1,703 @@
+{
+  "written": "2026-11-12T02:42:29Z",
+  "kind": "differential",
+  "verdict": "pass",
+  "target": "historical",
+  "tag": "v8.0.10",
+  "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
+  "role": "historical-recording",
+  "suite": "claude-differential",
+  "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db",
+  "rust_worktree_clean": true,
+  "toolchain": {
+    "python": "3.13.5",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "go": "go version go1.27.2 linux/amd64",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)"
+  },
+  "isolation": "new user/net/mount/pid namespace; loopback only; egress ENETUNREACH",
+  "normalizations": [
+    "downstream Date value only",
+    "raw TLS random/session/key/PSK bytes not compared"
+  ],
+  "run": "run-historical-20261112-024205",
+  "counts": {
+    "suite": 50,
+    "run": 50,
+    "passed": 50,
+    "failed": 0,
+    "infrastructure": 0,
+    "named_skips": 0,
+    "unknown_skips": 0,
+    "named_divergences": 5,
+    "stale_divergences": 0
+  },
+  "problems": [],
+  "named_skips": [],
+  "unknown_skips": [],
+  "divergences": {
+    "claude-catalog-v8.0.35": {
+      "differences": 13,
+      "kind": "later-reference"
+    },
+    "claude-responses-compact": {
+      "differences": 17,
+      "kind": "later-reference"
+    },
+    "cors-expose-etag": {
+      "differences": 50,
+      "kind": "later-reference"
+    },
+    "downstream-header-framing": {
+      "differences": 835,
+      "kind": "documented-difference",
+      "ledger": "docs/DIFFERENCES-FROM-GO.md \"Response header field-name case and order\""
+    },
+    "upstream-generated-request-ids": {
+      "differences": 72,
+      "kind": "nondeterministic"
+    }
+  },
+  "stale_divergences": [],
+  "infrastructure": [],
+  "cases": [
+    {
+      "name": "buffered",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "cloak-tools-beta",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "tool-roundtrip",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "tool-stream-roundtrip",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "native-signals",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-fragmented",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-crlf",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-bootstrap-error",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-mid-error",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-truncated",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "stream-after-stop",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "client-disconnect",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "count-tokens",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "upstream-400",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "upstream-401",
+      "verdict": "pass",
+      "differences": 20,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 4,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "upstream-429",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "upstream-500",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "upstream-503",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "empty-500",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "gzip-json",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "gzip-unlabelled",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "gzip-sse",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "deflate-json",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "auth-missing",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "auth-wrong",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "auth-query-first",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "auth-query-encoded",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "models-openai",
+      "verdict": "pass",
+      "differences": 17,
+      "named": {
+        "claude-catalog-v8.0.35": 5,
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "models-anthropic",
+      "verdict": "pass",
+      "differences": 17,
+      "named": {
+        "claude-catalog-v8.0.35": 4,
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "refresh-expired",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "continuity-two-turns",
+      "verdict": "pass",
+      "differences": 36,
+      "named": {
+        "downstream-header-framing": 32,
+        "upstream-generated-request-ids": 4,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "tls-reconnect-two-turns",
+      "verdict": "pass",
+      "differences": 36,
+      "named": {
+        "downstream-header-framing": 32,
+        "upstream-generated-request-ids": 4,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "disabled-credential",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "chat-completions",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "chat-completions-stream",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "chat-upstream-429",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "completions",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "completions-stream",
+      "verdict": "pass",
+      "differences": 23,
+      "named": {
+        "downstream-header-framing": 21,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "unknown-model",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "chat-unknown-model",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "compact-claude",
+      "verdict": "pass",
+      "differences": 24,
+      "named": {
+        "claude-responses-compact": 17,
+        "downstream-header-framing": 16,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "compact-stream-rejected",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "models-anthropic-ua",
+      "verdict": "pass",
+      "differences": 17,
+      "named": {
+        "claude-catalog-v8.0.35": 4,
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "healthz-head",
+      "verdict": "pass",
+      "differences": 7,
+      "named": {
+        "downstream-header-framing": 7,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "wrong-method-chat",
+      "verdict": "pass",
+      "differences": 10,
+      "named": {
+        "downstream-header-framing": 10,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "models-head",
+      "verdict": "pass",
+      "differences": 7,
+      "named": {
+        "downstream-header-framing": 7,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "healthz-post",
+      "verdict": "pass",
+      "differences": 10,
+      "named": {
+        "downstream-header-framing": 10,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "unknown-path",
+      "verdict": "pass",
+      "differences": 10,
+      "named": {
+        "downstream-header-framing": 10,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "root",
+      "verdict": "pass",
+      "differences": 15,
+      "named": {
+        "downstream-header-framing": 15,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    },
+    {
+      "name": "dd-model-messages",
+      "verdict": "pass",
+      "differences": 18,
+      "named": {
+        "downstream-header-framing": 16,
+        "upstream-generated-request-ids": 2,
+        "cors-expose-etag": 1
+      },
+      "failed_assertions": [],
+      "unexpected": [],
+      "unexpected_count": 0
+    }
+  ]
+}

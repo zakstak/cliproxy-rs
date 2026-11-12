@@ -1,0 +1,54 @@
+{
+  "written": "2026-11-12T02:43:02Z",
+  "kind": "mutation-control",
+  "verdict": "pass",
+  "run": "run-historical-20261112-024205",
+  "target": "historical",
+  "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
+  "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db",
+  "baseline_case_verdict": "pass",
+  "controls": [
+    {
+      "mutation": "upstream max_tokens 17 -> 18",
+      "case": "buffered",
+      "case_verdict": "fail",
+      "failed_assertions": [
+        "upstream-body-bytes",
+        "upstream-body-meaning"
+      ],
+      "unexpected_count": 2,
+      "caught": true
+    },
+    {
+      "mutation": "downstream status 200 -> 500",
+      "case": "buffered",
+      "case_verdict": "fail",
+      "failed_assertions": [
+        "status"
+      ],
+      "unexpected_count": 1,
+      "caught": true
+    },
+    {
+      "mutation": "client key forwarded upstream",
+      "case": "buffered",
+      "case_verdict": "fail",
+      "failed_assertions": [
+        "credential-isolation"
+      ],
+      "unexpected_count": 0,
+      "caught": true
+    },
+    {
+      "mutation": "downstream text changed",
+      "case": "buffered",
+      "case_verdict": "fail",
+      "failed_assertions": [
+        "downstream-body-bytes",
+        "downstream-meaning"
+      ],
+      "unexpected_count": 1,
+      "caught": true
+    }
+  ]
+}
