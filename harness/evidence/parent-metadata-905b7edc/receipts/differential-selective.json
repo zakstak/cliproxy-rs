@@ -1,0 +1,1020 @@
+{
+  "written": "2026-11-12T10:49:41Z",
+  "kind": "differential",
+  "verdict": "pass",
+  "partial": false,
+  "target": "selective",
+  "tag": "v8.0.67",
+  "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+  "role": "selective-comparison",
+  "suite": "selective-differential",
+  "run": "run-selective-20261112-104910",
+  "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13",
+  "source": {
+    "head": "905b7edcec014820fd454858d5d89f78d0d62f13",
+    "tree": "12423c0ef2f026bbfdf4ff2cbfca476461c90a1e",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+  },
+  "provenance_verified": true,
+  "provenance": {
+    "driver": {
+      "package": "cpa-differential-driver",
+      "package_dir": "harness/rust",
+      "kind": "bin",
+      "kinds": [
+        "bin"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "name": "cpa-differential-driver",
+      "src_path": "harness/rust/src/main.rs",
+      "profile_test": false,
+      "executable": "harness/rust/target/debug/cpa-differential-driver",
+      "fresh": true,
+      "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
+    },
+    "go": {
+      "path": "harness/.cache/go-8bba7a77",
+      "sha256": "4dd9ff9fad393462f98756ed414680369bbb0e1fad8f11f8fed2e843baf625aa",
+      "vcs.revision": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+      "vcs.time": "2026-11-11T08:50:42Z",
+      "vcs.modified": "false",
+      "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+      "checkout_clean": true
+    },
+    "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447",
+    "after": {
+      "driver": {
+        "package": "cpa-differential-driver",
+        "package_dir": "harness/rust",
+        "kind": "bin",
+        "kinds": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "cpa-differential-driver",
+        "src_path": "harness/rust/src/main.rs",
+        "profile_test": false,
+        "executable": "harness/rust/target/debug/cpa-differential-driver",
+        "fresh": true,
+        "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
+      },
+      "go": {
+        "path": "harness/.cache/go-8bba7a77",
+        "sha256": "4dd9ff9fad393462f98756ed414680369bbb0e1fad8f11f8fed2e843baf625aa",
+        "vcs.revision": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+        "vcs.time": "2026-11-11T08:50:42Z",
+        "vcs.modified": "false",
+        "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+        "checkout_clean": true
+      },
+      "source": {
+        "head": "905b7edcec014820fd454858d5d89f78d0d62f13",
+        "tree": "12423c0ef2f026bbfdf4ff2cbfca476461c90a1e",
+        "clean": true,
+        "status": [],
+        "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+      }
+    },
+    "verified": true,
+    "problems": []
+  },
+  "toolchain": {
+    "python": "3.13.5",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "go": "go version go1.27.2 linux/amd64",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)"
+  },
+  "isolation": "new user/net/mount/pid namespace; loopback only; egress ENETUNREACH",
+  "counts": {
+    "suite": 62,
+    "run": 62,
+    "passed": 62,
+    "failed": 0,
+    "infrastructure": 0,
+    "named_skips": 0,
+    "unknown_skips": 0,
+    "named_divergences": 17,
+    "stale_divergences": 0
+  },
+  "problems": [],
+  "unavailable": [],
+  "named_skips": [],
+  "unknown_skips": [],
+  "divergences": {
+    "C1-claude-client-profile": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/69",
+      "evidence": "Go b4e7dbd2 (Claude Code 2.1.321 fingerprint baseline)."
+    },
+    "C2-claude-native-detection": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/69",
+      "attribution": "Executed classification: the cloaking comes from the version gate of Go b4e7dbd2 (fix(claude): bump Claude Code CLI fingerprint baseline to 2.1.321, C1 #69 scope), not from C2's detection commits. Its parent 19a0a854 already contains 20c9095c, 6d4102f3 and 542a525f and forwards callers 2.1.280, 2.1.290, 2.1.320, 2.1.321 and 2.1.322 natively and cloaks 2.1.279. b4e7dbd2 and 8bba7a77 cloak 2.1.279 through 2.1.320 and forward 2.1.321 and 2.1.322. v8.0.35 (ae3ee3be) forwards 2.1.280 and later. The variants differ from native-signals only in the caller's User-Agent version. This classifies observed Go behaviour only. C1 #69 owns this baseline/version observation under issue #67's recorded decision. Whether cloaking a genuine 2.1.280 client is correct on the wire stays unknown. C2 #70 still owns the separate detection work and client-provenance qualification. The entry grants no adoption (harness/evidence/attribution-20261112.json.gz)."
+    },
+    "I3-unauthenticated-connection-close": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/103"
+    },
+    "I4-cors-allow-headers": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/104"
+    },
+    "K1-claude-catalog": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/68"
+    },
+    "M1-muse-identity-headers": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/81"
+    },
+    "P1-response-compression-vary": {
+      "kind": "deferred-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/106",
+      "evidence": "Go internal/api/response_compression.go merges Vary: Accept-Encoding into every response."
+    },
+    "P2-claude-connection-reuse": {
+      "kind": "deferred-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/107",
+      "evidence": "Go 2c5b01f4 disables default Claude upstream connection reuse (referenced by #107)."
+    },
+    "T2-messages-max-output-tokens": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/80",
+      "evidence": "Go 01b24f1f forwards max_output_tokens across request translators (referenced by #80)."
+    },
+    "X5-grok-user-agent": {
+      "kind": "deferred-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/88"
+    },
+    "claude-cloak-tool-alias": {
+      "kind": "not-adopted",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "evidence": "Go e48d780f (fix(plugin): preserve caller scope for replayed Claude OAuth MCP tool aliases) derives the Claude OAuth MCP alias secret from caller_scope metadata or session.CallerScope(api key) instead of the raw key (claude_executor_request.go resolveClaudeMCPAliasOptions). Executed pair: its parent b2fda98e sends mcp__poem_real__leisure_fixture_lookup (once in cloak-tools-beta, three times in each round trip); e48d780f sends mcp__drive_trade__cycle_fixture_lookup the same number of times.",
+      "attribution": "Not adopted in this batch: tracker #66 decision, not a C1/C2 or plugin feature; cliproxy-rs keeps the frozen v8.0.35 behaviour. Executed v8.0.35 (ae3ee3be) on cloak-tools-beta, tool-roundtrip and tool-stream-roundtrip sends the same alias spelling the same number of times as cliproxy-rs and v8.0.10 (harness/evidence/attribution-20261112.json.gz)."
+    },
+    "claude-cloak-tool-alias-restore": {
+      "kind": "not-adopted",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "evidence": "Same Go e48d780f change: the scripted reply carries the v8.0.10 alias, which v8.0.67 no longer maps back. Executed pair: parent b2fda98e restores the caller's fixture_lookup once per round trip; e48d780f returns the scripted alias unchanged.",
+      "attribution": "Not adopted in this batch (tracker #66 decision). Executed v8.0.35 (ae3ee3be) restores fixture_lookup once in tool-roundtrip and tool-stream-roundtrip, as cliproxy-rs does (harness/evidence/attribution-20261112.json.gz)."
+    },
+    "compaction-capsule-generated": {
+      "kind": "nondeterministic"
+    },
+    "credential-disabled-persist": {
+      "kind": "missing-audit",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/67",
+      "evidence": "Executed first-parent bisect between 8a01bc02 (persists disabled: false) and 4f2e5270 (field absent): the first change is Go 091ff27f (feat(antigravity): persist model capability hints in auth metadata, which reworks shared auth persistence in sdk/cliproxy/auth/conductor_persistence.go and persist_policy.go). Its parent a2718314 persists disabled: false and 091ff27f leaves the field absent, in 3 of 3 runs each. 091ff27f is in v8.0.35: executed v8.0.35 (ae3ee3be) already leaves disabled absent, so cliproxy-rs differs from the frozen default reference here too, recorded as an unresolved missing audit item in docs/parity-audit/checklist.md. H1 #67 owns the audit and parent tracker #66 owns its unresolved decision (harness/evidence/attribution-20261112.json.gz).",
+      "attribution": "Frozen-reference discrepancy: executed v8.0.35 leaves disabled absent after an abandoned stream, while Rust persists false. H1 #67 and parent tracker #66 retain this unresolved missing audit item. No production fix, deliberate-difference policy, or acceptance follows from attribution.",
+      "ledger": "docs/parity-audit/checklist.md#unresolved-frozen-reference-discrepancies"
+    },
+    "error-retry-after": {
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/94",
+      "evidence": "Executed pair: Go 9a35fa12 (fix(codex): treat turn_rate_limit_exceeded as transient capacity with retry hint, which adds trustedRetryAfterError and HasTrustedRetryDeadline) answers all six cases with its own whole-second Retry-After; its parent c3767123 and v8.0.35 (ae3ee3be) send none, as cliproxy-rs and v8.0.10 do. The writer at sdk/api/handlers/handlers_errors.go:127-128 predates v8.0.10; the trusted local deadline it now writes is new. N1 #111 references the commit for Codex; R1 #94 owns production adoption and integration of the Claude-visible Retry-After effect under issue #67's recorded decision. Attribution alone establishes neither provider correctness nor adoption (harness/evidence/attribution-20261112.json.gz)."
+    },
+    "go-openai-model-order": {
+      "kind": "nondeterministic",
+      "evidence": "Go internal/registry/model_registry.go buildAvailableModelsLocked ranges over the r.models map, so /v1/models (OpenAI format) has no stable order."
+    },
+    "plain-upstream-host-label": {
+      "kind": "harness-boundary"
+    }
+  },
+  "stale_divergences": [],
+  "cases": [
+    {
+      "name": "buffered",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "cloak-tools-beta",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "claude-cloak-tool-alias"
+      ]
+    },
+    {
+      "name": "tool-roundtrip",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "claude-cloak-tool-alias",
+        "claude-cloak-tool-alias-restore"
+      ]
+    },
+    {
+      "name": "tool-stream-roundtrip",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 32,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "claude-cloak-tool-alias",
+        "claude-cloak-tool-alias-restore"
+      ]
+    },
+    {
+      "name": "native-signals",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 29,
+      "hits": [
+        "C2-claude-native-detection",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "stream-fragmented",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "stream-crlf",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "stream-bootstrap-error",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "stream-mid-error",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "stream-truncated",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "stream-after-stop",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "client-disconnect",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 31,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "credential-disabled-persist"
+      ]
+    },
+    {
+      "name": "count-tokens",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 22,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "upstream-400",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "upstream-401",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 37,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "P2-claude-connection-reuse",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "upstream-429",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "upstream-500",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "upstream-503",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "error-retry-after"
+      ]
+    },
+    {
+      "name": "empty-500",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "gzip-json",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "gzip-unlabelled",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "gzip-sse",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "deflate-json",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "auth-missing",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I3-unauthenticated-connection-close",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "auth-wrong",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I3-unauthenticated-connection-close",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "auth-query-first",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I3-unauthenticated-connection-close",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "auth-query-encoded",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "models-openai",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I4-cors-allow-headers",
+        "K1-claude-catalog",
+        "P1-response-compression-vary",
+        "go-openai-model-order"
+      ]
+    },
+    {
+      "name": "models-anthropic",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I4-cors-allow-headers",
+        "K1-claude-catalog",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "refresh-expired",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "continuity-two-turns",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 52,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "P2-claude-connection-reuse"
+      ]
+    },
+    {
+      "name": "tls-reconnect-two-turns",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 50,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "disabled-credential",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 16,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "chat-completions",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "chat-completions-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "chat-upstream-429",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "completions",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "completions-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 30,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "unknown-model",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 16,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "chat-unknown-model",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 16,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "compact-claude",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 27,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "compaction-capsule-generated"
+      ]
+    },
+    {
+      "name": "compact-stream-rejected",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 16,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "models-anthropic-ua",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 18,
+      "hits": [
+        "I4-cors-allow-headers",
+        "K1-claude-catalog",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "healthz-head",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 10,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "wrong-method-chat",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 11,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "models-head",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 10,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "healthz-post",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 11,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "unknown-path",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 11,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "root",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 16,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "dd-model-messages",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "C1-claude-client-profile",
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary"
+      ]
+    },
+    {
+      "name": "xai-responses-buffered",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 20,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "xai-responses-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "xai-chat-buffered",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 20,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "xai-chat-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 25,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "xai-messages-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 28,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "T2-messages-max-output-tokens",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "xai-chat-upstream-429",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 20,
+      "hits": [
+        "I4-cors-allow-headers",
+        "P1-response-compression-vary",
+        "X5-grok-user-agent",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-responses-buffered",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 29,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-responses-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 34,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-chat-buffered",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 29,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-chat-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 34,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-messages-stream",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 37,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "T2-messages-max-output-tokens",
+        "plain-upstream-host-label"
+      ]
+    },
+    {
+      "name": "meta-chat-upstream-429",
+      "verdict": "pass",
+      "failed": {},
+      "unexplained": [],
+      "unexplained_count": 0,
+      "differences": 29,
+      "hits": [
+        "I4-cors-allow-headers",
+        "M1-muse-identity-headers",
+        "P1-response-compression-vary",
+        "plain-upstream-host-label"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,425 @@
+{
+  "written": "2026-11-12T10:50:37Z",
+  "kind": "acceptance",
+  "verdict": "pass",
+  "partial": false,
+  "problems": [],
+  "unavailable": [],
+  "current_cargo": {
+    "queried": true,
+    "available": true,
+    "problems": [],
+    "evidence": "cached artifacts cargo reports fresh for this source; nothing was built",
+    "commands": {
+      "cpa-core": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-core",
+        "--lib",
+        "--offline",
+        "--message-format=json"
+      ],
+      "cpa-exec": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-exec",
+        "--lib",
+        "--offline",
+        "--message-format=json"
+      ],
+      "cpa-server": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-server",
+        "--test",
+        "claude_passthrough",
+        "--test",
+        "codex_native_request",
+        "--test",
+        "codex_native_ws",
+        "--test",
+        "codex_translated",
+        "--test",
+        "management",
+        "--test",
+        "retained_providers",
+        "--test",
+        "routes",
+        "--offline",
+        "--message-format=json"
+      ]
+    },
+    "exits": {
+      "cpa-core": 0,
+      "cpa-exec": 0,
+      "cpa-server": 0
+    },
+    "cwd": ".",
+    "environment": {
+      "CARGO_INCREMENTAL": null,
+      "CARGO_BUILD_JOBS": "2",
+      "CARGO_TARGET_DIR": null,
+      "CARGO_BUILD_TARGET_DIR": null,
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "CARGO_BUILD_RUSTFLAGS": null,
+      "RUSTDOCFLAGS": null,
+      "RUSTC": null,
+      "RUSTC_WRAPPER": "/home/agent/git/cliproxy-rs/harness/no-compile-rustc",
+      "RUSTC_WORKSPACE_WRAPPER": null,
+      "RUSTUP_TOOLCHAIN": null,
+      "RUSTUP_HOME": "/usr/local/rustup",
+      "CARGO_HOME": "/home/agent/.cargo",
+      "CARGO_NET_OFFLINE": "true"
+    },
+    "toolchain": {
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)"
+    },
+    "refused": [],
+    "artifacts": {
+      "cpa-core lib": {
+        "package": "cpa-core",
+        "package_dir": "crates/cpa-core",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_core",
+        "src_path": "crates/cpa-core/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_core-bd184f74f32568ca",
+        "sha256": "f7e9289cb2814d3afe0bfcf4db915de3dbb4d8b3cd3837ce7e1311fedf53f264"
+      },
+      "cpa-exec lib": {
+        "package": "cpa-exec",
+        "package_dir": "crates/cpa-exec",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_exec",
+        "src_path": "crates/cpa-exec/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_exec-f9dec0750b590f44",
+        "sha256": "1da08af2b383e598220dfbde5d6d2a2cfa7b7f36743beb280cc3b0ee06f81b6a"
+      },
+      "cpa-server test:claude_passthrough": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "claude_passthrough",
+        "src_path": "crates/cpa-server/tests/claude_passthrough.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/claude_passthrough-ddd7ba5c2e4d0831",
+        "sha256": "0d7546c1061beae3efad6b2eca8520ec5c12bf3d74ff57a0dce58c8990b8626c"
+      },
+      "cpa-server test:codex_native_request": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_request",
+        "src_path": "crates/cpa-server/tests/codex_native_request.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_request-0e85caeff8fb3f6d",
+        "sha256": "75d0bb9d03f1d7b5c93ff61d59b4aff4e5c76e59cfe84a5a29748fbce727f3b6"
+      },
+      "cpa-server test:codex_native_ws": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_ws",
+        "src_path": "crates/cpa-server/tests/codex_native_ws.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_ws-b52879d06a5eb280",
+        "sha256": "ff9100a6adf49bdac38dced0d9581b2a1ac434a04738b842d996511d673c8f13"
+      },
+      "cpa-server test:codex_translated": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_translated",
+        "src_path": "crates/cpa-server/tests/codex_translated.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_translated-12f0d0eb2cd242dc",
+        "sha256": "258f0d23c7907dc0414d272dcf3b25ed53a65181968a78260bc82f20ca62c397"
+      },
+      "cpa-server test:management": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "management",
+        "src_path": "crates/cpa-server/tests/management.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/management-7a1f430637d95a27",
+        "sha256": "4fb226b62e1e9948cb0321371bbeb13d91a072bb0172cd88c433fa6945e52d1d"
+      },
+      "cpa-server test:retained_providers": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "retained_providers",
+        "src_path": "crates/cpa-server/tests/retained_providers.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/retained_providers-972ae07d16e7ee6f",
+        "sha256": "bdff756986fe9827488a3758a254e4c04aec686efe722d1db4f53bad4e0ffffc"
+      },
+      "cpa-server test:routes": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "routes",
+        "src_path": "crates/cpa-server/tests/routes.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/routes-6b0fa4cf200ee891",
+        "sha256": "c9acf06b12d2d50ec85ebfb58f5407b9d4c98c88f044882aa214d00942d83f7b"
+      }
+    },
+    "profiles": {
+      "cpa-core lib": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-exec lib": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:claude_passthrough": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:codex_native_request": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:codex_native_ws": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:codex_translated": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:management": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:retained_providers": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "cpa-server test:routes": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      }
+    },
+    "source_before": {
+      "head": "905b7edcec014820fd454858d5d89f78d0d62f13",
+      "tree": "12423c0ef2f026bbfdf4ff2cbfca476461c90a1e",
+      "clean": true,
+      "status": [],
+      "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+    },
+    "source_after": {
+      "head": "905b7edcec014820fd454858d5d89f78d0d62f13",
+      "tree": "12423c0ef2f026bbfdf4ff2cbfca476461c90a1e",
+      "clean": true,
+      "status": [],
+      "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+    }
+  },
+  "tested_source": {
+    "head": "905b7edcec014820fd454858d5d89f78d0d62f13",
+    "tree": "12423c0ef2f026bbfdf4ff2cbfca476461c90a1e",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+  },
+  "pins": {
+    "go": {
+      "historical": {
+        "tag": "v8.0.10",
+        "commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
+        "role": "historical-recording",
+        "executed": true
+      },
+      "policy": {
+        "tag": "v8.0.35",
+        "commit": "ae3ee3be303fb07fb8173279923413005bf32177",
+        "role": "frozen-default-reference",
+        "executed": false
+      },
+      "selective": {
+        "tag": "v8.0.67",
+        "commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+        "role": "selective-comparison",
+        "executed": true
+      }
+    },
+    "codex": "44ccf394573cabb95e1f751a59f9d76f6f79faf1",
+    "rust_toolchain": "1.99.0"
+  },
+  "receipts": [
+    {
+      "file": "differential-historical.json",
+      "sha256": "b9c9af9781d6342b13c07af963b720b6f56ac90c2e507da25372cb9af9e50342",
+      "kind": "differential",
+      "target": "historical",
+      "verdict": "pass",
+      "counts": {
+        "suite": 50,
+        "run": 50,
+        "passed": 50,
+        "failed": 0,
+        "infrastructure": 0,
+        "named_skips": 0,
+        "unknown_skips": 0,
+        "named_divergences": 4,
+        "stale_divergences": 0
+      },
+      "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13"
+    },
+    {
+      "file": "mutation-historical.json",
+      "sha256": "012267d7ffc513d8be54329c7beb086e32055a00defcd2aa5f3daa4a2f7080db",
+      "kind": "mutation-control",
+      "target": "historical",
+      "verdict": "pass",
+      "counts": {
+        "mutations": 19,
+        "caught": 19
+      },
+      "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13"
+    },
+    {
+      "file": "differential-selective.json",
+      "sha256": "09bde2c27296a239e1dcd002f42e552876e1ebf8aad81a30e34f2178b5e7a222",
+      "kind": "differential",
+      "target": "selective",
+      "verdict": "pass",
+      "counts": {
+        "suite": 62,
+        "run": 62,
+        "passed": 62,
+        "failed": 0,
+        "infrastructure": 0,
+        "named_skips": 0,
+        "unknown_skips": 0,
+        "named_divergences": 17,
+        "stale_divergences": 0
+      },
+      "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13"
+    },
+    {
+      "file": "mutation-selective.json",
+      "sha256": "985e4628576c10f2631d55ba4fda5548365cc6226a81256826bac9c134e29208",
+      "kind": "mutation-control",
+      "target": "selective",
+      "verdict": "pass",
+      "counts": {
+        "mutations": 30,
+        "caught": 30
+      },
+      "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13"
+    },
+    {
+      "file": "cargo-groups.json",
+      "sha256": "5dc8a18102d4b9f789115d05ab709f35b0047237940dcfc5a045e48ff7383d18",
+      "kind": "cargo-groups",
+      "target": null,
+      "verdict": "pass",
+      "counts": {
+        "groups": 6,
+        "tests": 32,
+        "passed": 32,
+        "failed": 0,
+        "unknown_tests": 0
+      },
+      "rust_revision": "905b7edcec014820fd454858d5d89f78d0d62f13"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "acceptance",
+  "verdict": "unavailable",
+  "partial": false
+}
+  unavailable: ["target/debug/deps/cpa_core-bd184f74f32568ca: cannot verify recorded artifact ([Errno 13] Permission denied: '/home/agent/git/cliproxy-rs/target/debug/deps/cpa_core-bd184f74f32568ca')"]
+receipt: /review/cli-unreadable/acceptance.json

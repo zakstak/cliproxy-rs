@@ -204,6 +204,12 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
         run: cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
+      # The revision manifest and the acceptance logic. The Go/Rust differential itself
+      # (harness/accept) needs the Go references and runs locally; see harness/README.md.
+      - name: Harness manifest and acceptance checks
+        run: |
+          python3 harness/manifest.py check
+          python3 -m unittest discover -s harness -p 'test_*.py'
       - name: Media relay and CPU profiler tests, with external network denied
         # The same loopback-only namespace as the tests above. All of cpa-server's unit
         # tests run with the feature on, the 25 behind it included.

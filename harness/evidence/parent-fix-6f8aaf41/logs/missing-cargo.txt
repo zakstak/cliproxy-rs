@@ -1,0 +1,7 @@
+{
+  "kind": "acceptance",
+  "verdict": "unavailable",
+  "partial": false
+}
+  unavailable: ["cargo query for cpa-core exited None: unavailable: [Errno 2] No such file or directory: 'cargo'", 'cpa-core lib: cargo reports no single current test executable', "cargo query for cpa-exec exited None: unavailable: [Errno 2] No such file or directory: 'cargo'", 'cpa-exec lib: cargo reports no single current test executable', "cargo query for cpa-server exited None: unavailable: [Errno 2] No such file or directory: 'cargo'", 'cpa-server test:claude_passthrough: cargo reports no single current test executable', 'cpa-server test:codex_native_request: cargo reports no single current test executable', 'cpa-server test:codex_native_ws: cargo reports no single current test executable', 'cpa-server test:codex_translated: cargo reports no single current test executable', 'cpa-server test:management: cargo reports no single current test executable', 'cpa-server test:retained_providers: cargo reports no single current test executable', 'cpa-server test:routes: cargo reports no single current test executable']
+receipt: /review/missing-cargo-real-receipt.json

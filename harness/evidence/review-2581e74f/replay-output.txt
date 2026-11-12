@@ -1,0 +1,40 @@
+[reviewed 2581e74f] baseline historical capture: pass
+[reviewed 2581e74f] baseline selective capture: pass
+[reviewed 2581e74f] historical compact-claude rust 'Local question' -> 'Wrong question': case pass, run pass
+[reviewed 2581e74f] historical compact-claude rust '"max_tokens":64000' -> '"max_tokens":1': case pass, run pass
+[reviewed 2581e74f] selective native-signals go 'Local question' -> 'Wrong question': case pass, run pass
+[reviewed 2581e74f] combine baseline (reviewed-receipts): pass
+[reviewed 2581e74f] combine missing case, same count: pass
+[reviewed 2581e74f] combine duplicate case, same count: pass
+[reviewed 2581e74f] combine extra case, same count: pass
+[reviewed 2581e74f] combine all groups empty, same count: pass
+[reviewed 2581e74f] combine duplicate test, same count: pass
+[reviewed 2581e74f] combine failed test, same count: pass
+[reviewed 2581e74f] combine missing controls, same count: pass
+[reviewed 2581e74f] combine duplicate control, same count: pass
+[reviewed 2581e74f] combine unknown control, same count: pass
+[reviewed 2581e74f] combine no cargo binary provenance: pass
+[reviewed 2581e74f] combine failed execution, same count: pass
+[reviewed 2581e74f] combine missing driver provenance: pass
+[reviewed 2581e74f] combine wrong driver hash: pass
+[reviewed 2581e74f] combine different rust_revision field: pass
+[fixed] baseline historical capture: pass
+[fixed] baseline selective capture: pass
+[fixed] historical compact-claude rust 'Local question' -> 'Wrong question': case fail, run fail
+[fixed] historical compact-claude rust '"max_tokens":64000' -> '"max_tokens":1': case fail, run fail
+[fixed] selective native-signals go 'Local question' -> 'Wrong question': case fail, run fail
+[fixed] combine baseline (receipts): pass
+[fixed] combine missing case, same count: fail
+[fixed] combine duplicate case, same count: fail
+[fixed] combine extra case, same count: fail
+[fixed] combine all groups empty, same count: fail
+[fixed] combine duplicate test, same count: fail
+[fixed] combine failed test, same count: fail
+[fixed] combine missing controls, same count: fail
+[fixed] combine duplicate control, same count: fail
+[fixed] combine unknown control, same count: fail
+[fixed] combine no cargo binary provenance: fail
+[fixed] combine failed execution, same count: fail
+[fixed] combine missing driver provenance: fail
+[fixed] combine wrong driver hash: fail
+[fixed] combine different rust_revision field: fail

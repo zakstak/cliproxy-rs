@@ -18,6 +18,20 @@ Every checkbox is one independently tracked inventory/contract item. Milestone c
 **Reading rules:** “stream” below means supported transport/handler behavior, not a guarantee that every model/provider supports that operation. Unsupported executor operations retain their native HTTP errors (often 501). OAuth credentials are open-ended flattened metadata objects, not closed structs. Sample values in `config.example.yaml` are not automatically runtime defaults. Rust serde defaults must follow loader defaults, normalization, and use-site fallbacks. Test inventories describe intended assertions from the actual test declarations; no Go tests or live upstream calls were executed for this research.
 
 
+## Unresolved frozen-reference discrepancies
+
+This supplementary audit records confirmed gaps without changing the inventory totals below.
+
+**Missing audit: `credential-disabled-persist`.** After an abandoned Claude stream, Rust and
+historical Go v8.0.10 persist `disabled: false`, while frozen Go v8.0.35 leaves the field absent.
+Executed attribution identifies `091ff27f`, which is already an ancestor of v8.0.35.
+H1 [#67](https://github.com/zakstak/cliproxy-rs/issues/67) owns the comparison and missing audit
+item; parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) owns the unresolved
+decision. Status remains unresolved. This record approves neither a production fix nor a
+deliberate-difference policy. The exact selective comparison predicate stays unchanged.
+See the [selective ledger](selective-v8.0.67.md) and its
+[executed attribution evidence](../../harness/evidence/attribution-20261112.json.gz).
+
 ### Item totals
 
 | Milestone | Checkboxes |

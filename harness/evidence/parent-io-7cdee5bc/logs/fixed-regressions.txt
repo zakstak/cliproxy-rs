@@ -1,0 +1,8 @@
+test_known_record_and_hash_failures_remain_failures (test_acceptance.RecordedArtifactUnavailableTests.test_known_record_and_hash_failures_remain_failures) ... ok
+test_stat_and_hash_io_errors_are_unavailable_before_query (test_acceptance.RecordedArtifactUnavailableTests.test_stat_and_hash_io_errors_are_unavailable_before_query) ... ok
+test_unreadable_recorded_artifact_cli_writes_an_unavailable_receipt (test_acceptance.RecordedArtifactUnavailableTests.test_unreadable_recorded_artifact_cli_writes_an_unavailable_receipt) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.318s
+
+OK
