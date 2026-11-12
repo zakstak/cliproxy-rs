@@ -36,6 +36,8 @@ const SORA_MODEL: &str = "sora-2";
 const XAI_MODEL: &str = "grok-imagine-video";
 const XAI_15_MODEL: &str = "grok-imagine-video-1.5";
 const XAI_15_PREVIEW: &str = "grok-imagine-video-1.5-preview";
+/// Grok Imagine Video 1.5 Lite (Go v8.0.67 f0ddc38f): its own model, no alias.
+const XAI_15_LITE: &str = "grok-imagine-video-1.5-lite";
 const DEFAULT_SECONDS: &str = "4";
 const DEFAULT_SIZE: &str = "720x1280";
 const DEFAULT_RESOLUTION: &str = "720p";
@@ -119,7 +121,7 @@ fn base(model: &str) -> String {
 fn is_xai(model: &str) -> bool {
     let (prefix, b) = model_parts(model);
     let b = b.trim().go_lower();
-    if b != XAI_MODEL && b != XAI_15_MODEL && b != XAI_15_PREVIEW {
+    if ![XAI_MODEL, XAI_15_MODEL, XAI_15_LITE, XAI_15_PREVIEW].contains(&b.as_str()) {
         return false;
     }
     matches!(prefix.trim().go_lower().as_str(), "" | "xai" | "x-ai" | "grok")
@@ -138,6 +140,7 @@ fn canonical(model: &str) -> &'static str {
     }
     match base(model).as_str() {
         XAI_15_MODEL | XAI_15_PREVIEW => XAI_15_MODEL,
+        XAI_15_LITE => XAI_15_LITE,
         _ => XAI_MODEL,
     }
 }
@@ -149,6 +152,7 @@ fn routing(model: &str) -> &'static str {
     }
     match base(model).as_str() {
         XAI_15_MODEL => XAI_15_MODEL,
+        XAI_15_LITE => XAI_15_LITE,
         XAI_15_PREVIEW => XAI_15_PREVIEW,
         _ => XAI_MODEL,
     }
@@ -218,12 +222,46 @@ fn aspect_ratio(raw: &str) -> &'static str {
     }
 }
 
-/// `xaiVideosResolution`.
+/// `xaiVideosResolution`: a resolution xAI's API accepts (`480p`, `720p`, `1080p`),
+/// else "" (the route's default applies).
 fn resolution(raw: &str) -> &'static str {
     match raw.trim().go_lower().as_str() {
         "480p" => "480p",
         "720p" => "720p",
+        "1080p" => "1080p",
         _ => "",
+    }
+}
+
+/// Which video a compatibility request asks for: from a prompt or an image
+/// (text- and image-to-video), or guided by `reference_images` (reference-to-video).
+/// The compatibility route builds no other xAI mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoMode {
+    Generate,
+    References,
+}
+
+/// What xAI documents for a model in a mode: not offered at all, or offered up to a
+/// highest resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeSupport {
+    Unsupported,
+    UpTo(&'static str),
+}
+
+/// xAI's capability table for its video models (docs.x.ai, Video Overview, "model
+/// capabilities"), with the video generation guide's resolution notes:
+/// `grok-imagine-video` generates and takes up to 7 reference images, both at 720p;
+/// `grok-imagine-video-1.5` renders 1080p natively for text- and image-to-video and
+/// takes up to 14 reference images at 720p; `grok-imagine-video-1.5-lite` reaches 1080p
+/// for text- and image-to-video by upscaling 720p, and its reference-images cell reads
+/// "Not supported".
+fn mode_support(model: &str, mode: VideoMode) -> ModeSupport {
+    match (canonical(model), mode) {
+        (XAI_15_LITE, VideoMode::References) => ModeSupport::Unsupported,
+        (XAI_15_MODEL | XAI_15_LITE, VideoMode::Generate) => ModeSupport::UpTo("1080p"),
+        _ => ModeSupport::UpTo("720p"),
     }
 }
 
@@ -320,6 +358,33 @@ fn create_request(body: &[u8], model: &str) -> Result<(Vec<u8>, CreateMeta), Str
     }
     if !image.is_empty() && !references.is_empty() {
         return Err("image and reference_images cannot be combined on xAI".into());
+    }
+    // A mode xAI does not offer for the model is refused before anything is sent, and
+    // 1080p only reaches xAI for a model and mode it documents at 1080p; elsewhere it
+    // is refused rather than silently lowered (#87).
+    let mode = if references.is_empty() {
+        VideoMode::Generate
+    } else {
+        VideoMode::References
+    };
+    match mode_support(model, mode) {
+        ModeSupport::Unsupported => {
+            return Err(format!(
+                "reference_images is not supported by {}; xAI offers reference-to-video on {XAI_MODEL} and {XAI_15_MODEL}",
+                canonical(model)
+            ));
+        }
+        ModeSupport::UpTo("720p") if res == "1080p" => {
+            let mode = match mode {
+                VideoMode::Generate => "",
+                VideoMode::References => " for reference-to-video",
+            };
+            return Err(format!(
+                "resolution 1080p is not supported by {}{mode}; xAI documents up to 720p",
+                canonical(model)
+            ));
+        }
+        ModeSupport::UpTo(_) => {}
     }
     let mut req = b"{}".to_vec();
     gj::set_str(&mut req, "model", canonical(model));
@@ -1001,8 +1066,11 @@ pub async fn retrieve(
     }
     let r = request(rt, caller, peer, matched, &uri, headers);
     let video = id.clone();
+    // A job's own model when xAI omits it (a failed job does): the model the video was
+    // created with, as bound (Go v8.0.67 f0ddc38f), else Go's earlier default.
+    let (_, created_with) = pinned_and_model(&id, SORA_MODEL);
     poll(&r, &id, |payload| async move {
-        json_body(retrieve_response(&video, &payload, SORA_MODEL))
+        json_body(retrieve_response(&video, &payload, &created_with))
     })
     .await
 }

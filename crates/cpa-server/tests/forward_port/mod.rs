@@ -79,6 +79,59 @@ pub mod gpt_image_26 {
     }
 }
 
+/// Grok Imagine Video 1.5 Lite (CLIProxyAPI v8.0.67 f0ddc38f and c69cdd93, #87): an
+/// xAI built-in listed after the 1.5 preview alias.
+pub mod grok_video_lite {
+    use super::Value;
+
+    pub const ID: &str = "grok-imagine-video-1.5-lite";
+
+    /// The preview alias as Go's Grok Shell catalog lists it.
+    const GO_PREVIEW_ENTRY: &str = r#"{"id":"grok-imagine-video-1.5-preview","model":"grok-imagine-video-1.5-preview","name":"Grok Imagine Video 1.5 Preview","api_backend":"responses","supported_in_api":true}"#;
+    const ENTRY: &str = r#"{"id":"grok-imagine-video-1.5-lite","model":"grok-imagine-video-1.5-lite","name":"Grok Imagine Video 1.5 Lite","api_backend":"responses","supported_in_api":true}"#;
+
+    /// The preview alias's model definition (`ModelInfo` JSON, Go's field order).
+    const GO_PREVIEW_DEFINITION: &str = r#"{"id":"grok-imagine-video-1.5-preview","object":"model","created":1735689600,"owned_by":"xai","type":"xai","display_name":"Grok Imagine Video 1.5 Preview","name":"grok-imagine-video-1.5-preview","description":"Compatibility alias for the xAI Grok video generation model."}"#;
+    const DEFINITION: &str = r#"{"id":"grok-imagine-video-1.5-lite","object":"model","created":1787702400,"owned_by":"xai","type":"xai","display_name":"Grok Imagine Video 1.5 Lite","name":"grok-imagine-video-1.5-lite","description":"xAI Grok video generation model."}"#;
+
+    /// A Grok Shell catalog (`GET /v1/models` for the Grok CLI), which lists models by
+    /// ID: Lite comes before the preview alias. Text without the catalog passes
+    /// unchanged.
+    pub fn grok_shell_catalog(go: &str) -> String {
+        if !go.contains(GO_PREVIEW_ENTRY) {
+            return go.to_owned();
+        }
+        assert_eq!(
+            go.matches(GO_PREVIEW_ENTRY).count(),
+            1,
+            "Go's Grok Shell catalog changed"
+        );
+        assert!(!go.contains(ID), "Go already lists {ID}");
+        go.replace(GO_PREVIEW_ENTRY, &format!("{ENTRY},{GO_PREVIEW_ENTRY}"))
+    }
+
+    /// `GET /openai/v1/videos/{id}` for a job created with the 1.5 preview alias whose
+    /// poll answer omits the model: the created model (v8.0.67 f0ddc38f) where v8.0.35
+    /// names the classic model.
+    pub fn retrieve_fallback_model(go: &str) -> String {
+        const GO_MODEL: &str = r#""model":"grok-imagine-video","#;
+        assert_eq!(go.matches(GO_MODEL).count(), 1, "Go's retrieve answer changed: {go}");
+        go.replace(GO_MODEL, r#""model":"grok-imagine-video-1.5","#)
+    }
+
+    /// The xAI channel's model definitions: Lite follows the preview alias.
+    pub fn definitions_list(go: &mut Value) {
+        let list = go.as_array_mut().expect("a model list");
+        let preview: Value = serde_json::from_str(GO_PREVIEW_DEFINITION).unwrap();
+        let at = list
+            .iter()
+            .position(|m| *m == preview)
+            .expect("Go lists the 1.5 preview alias");
+        assert!(list.iter().all(|m| m["id"] != ID), "Go already lists {ID}");
+        list.insert(at + 1, serde_json::from_str(DEFINITION).unwrap());
+    }
+}
+
 /// K1 (#68), retained model catalog additions: Claude Fable 5.2 after Fable 5.1, GPT-6.1
 /// Terra after GPT-6.1 Sol in the Codex catalog, and Muse Ember 1.0 first in the Meta
 /// catalog. Each expected definition is written out from its provider source (see

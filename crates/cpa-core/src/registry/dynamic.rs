@@ -633,7 +633,7 @@ fn with_xai_builtins(models: Vec<Spec>) -> Vec<Spec> {
 }
 
 fn xai_builtins() -> Vec<Spec> {
-    const BUILTINS: [(&str, i64, &str, &str); 8] = [
+    const BUILTINS: [(&str, i64, &str, &str); 9] = [
         (
             "grok-imagine-image",
             1735689600,
@@ -669,6 +669,14 @@ fn xai_builtins() -> Vec<Spec> {
             1735689600,
             "Grok Imagine Video 1.5 Preview",
             "Compatibility alias for the xAI Grok video generation model.",
+        ),
+        // Go v8.0.67 c69cdd93 (created 2026-08-26): the video routes accept it, and it
+        // stays listed when a refreshed catalog omits it.
+        (
+            "grok-imagine-video-1.5-lite",
+            1787702400,
+            "Grok Imagine Video 1.5 Lite",
+            "xAI Grok video generation model.",
         ),
         (
             "grok-tts",
@@ -1832,6 +1840,40 @@ mod tests {
         );
     }
 
+    /// Grok Imagine Video 1.5 Lite (#87, Go v8.0.67 c69cdd93): a built-in xAI model
+    /// listed after the 1.5 preview alias, kept when the catalog's xAI section omits it,
+    /// and registered for xAI credentials only.
+    #[test]
+    fn grok_video_lite_is_an_xai_built_in() {
+        let xai = static_definitions("xai").unwrap();
+        let ids: Vec<&str> = xai.iter().map(|m| m.id.as_str()).collect();
+        let at = |id: &str| ids.iter().position(|i| *i == id).unwrap_or_else(|| panic!("{id}"));
+        assert_eq!(
+            at("grok-imagine-video-1.5-lite"),
+            at("grok-imagine-video-1.5-preview") + 1
+        );
+        let lite = xai.iter().find(|m| m.id == "grok-imagine-video-1.5-lite").unwrap();
+        assert_eq!(
+            (&lite.raw["display_name"], &lite.raw["created"], &lite.raw["owned_by"]),
+            (
+                &serde_json::json!("Grok Imagine Video 1.5 Lite"),
+                &serde_json::json!(1787702400),
+                &serde_json::json!("xai")
+            )
+        );
+        let built_ins = with_xai_builtins(Vec::new());
+        assert!(built_ins.iter().any(|m| m.id == "grok-imagine-video-1.5-lite"));
+        let none = Config::default();
+        let x = file(
+            "x.json",
+            serde_json::json!({"type": "xai", "access_token": "fake"}),
+            &[],
+        );
+        let c = file("c.json", serde_json::json!({"type": "claude"}), &[]);
+        let r = Registry::build(&none, &[x, c]);
+        assert_eq!(r.providers("grok-imagine-video-1.5-lite"), ["xai"]);
+    }
+
     /// K1 (#68): the models added to the embedded catalog, with each value from its
     /// provider source (docs/DIFFERENCES-FROM-GO.md, "Retained model catalog additions"):
     /// - Claude Fable 5.2: platform.claude.com models overview, Fable 5.2 page and effort
@@ -1914,8 +1956,10 @@ mod tests {
             );
         }
         assert!(catalog.lookup("muse-ember-1.0-contributor").is_none());
+        // X4 (#87): Grok Imagine Video 1.5 Lite is an xAI built-in, served with the xAI
+        // definitions whether or not the catalog's xAI section lists it.
         let xai = static_definitions("xai").unwrap();
-        assert!(xai.iter().all(|m| m.id != "grok-imagine-video-1.5-lite"), "X4 (#87)");
+        assert!(xai.iter().any(|m| m.id == "grok-imagine-video-1.5-lite"), "X4 (#87)");
     }
 
     /// K1 (#68): the additions register like their siblings and stay subject to the

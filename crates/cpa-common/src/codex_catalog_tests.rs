@@ -166,3 +166,19 @@ fn gpt_image_built_ins_are_hidden_image_models() {
     }
     assert!(!image_or_video("gpt-image-2.6"));
 }
+
+/// Grok Imagine Video 1.5 Lite (#87) is hidden from Codex clients like the other xAI
+/// video models. Go v8.0.67 added the model without hiding it (docs/DIFFERENCES-FROM-GO.md).
+#[test]
+fn grok_video_lite_is_a_hidden_video_model() {
+    for id in [
+        "grok-imagine-video",
+        "grok-imagine-video-1.5",
+        "grok-imagine-video-1.5-preview",
+        "grok-imagine-video-1.5-lite",
+    ] {
+        assert!(image_or_video(id), "{id}");
+        assert!(image_or_video(&format!("xai/{id}")), "xai/{id}");
+    }
+    assert!(!image_or_video("grok-imagine-video-2-lite"));
+}

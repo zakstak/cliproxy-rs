@@ -642,7 +642,14 @@ mod tests {
             assert!(!has(tier, "gpt-6-chat-thinking"), "{tier}");
         }
         assert_eq!(ids("meta").first().map(String::as_str), Some("muse-ember-1.0"));
-        assert!(!has("xai", "grok-imagine-video-1.5-lite"), "X4 (#87)");
+        // X4 (#87): Grok Imagine Video 1.5 Lite is an xAI built-in, not an embedded
+        // catalog entry; the xAI definitions served while discovery is unavailable list it.
+        let xai = cpa_core::registry::dynamic::static_definitions("xai").expect("the xai channel");
+        assert!(
+            xai.iter().any(|m| m.id == "grok-imagine-video-1.5-lite"),
+            "X4 (#87): {:?}",
+            ids("xai")
+        );
     }
 
     /// Go TestCatalogFetcherSources over local mocks and files: `embed`, a URL and a

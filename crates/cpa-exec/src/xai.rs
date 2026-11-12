@@ -681,6 +681,14 @@ impl XaiExecutor {
 
     /// `executeVideos`: generations, edits and extensions by the inbound route; any other
     /// route with a `request_id` polls `GET /videos/{request_id}`.
+    ///
+    /// The body is sent as the route built it, changed only by operator payload rules:
+    /// Go also rewrites every nested `image_url` member to `url`, re-encoding the whole
+    /// body, but a native client's body must reach xAI as sent (unknown and opaque
+    /// fields, duplicates, spacing and number spellings alike), and xAI's API accepts
+    /// `image_url` for `image`, `reference_images` and keyframe images (REST reference,
+    /// videos: "Also accepts `image_url` for compatibility"). The compatibility route
+    /// builds `url` itself.
     pub async fn videos(
         &self,
         credential: &Credential,
@@ -689,7 +697,7 @@ impl XaiExecutor {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         let cfg = scoped(credential, cfg);
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
+        let payload = media_rules(&req, cfg.as_ref(), req.body.to_vec());
         let route = [VIDEOS_EDITS, VIDEOS_EXTENSIONS, VIDEOS_GENERATIONS]
             .into_iter()
             .find(|p| request_path.ends_with(p));
