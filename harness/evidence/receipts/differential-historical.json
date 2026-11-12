@@ -1,5 +1,5 @@
 {
-  "written": "2026-11-12T05:35:36Z",
+  "written": "2026-11-12T06:39:28Z",
   "kind": "differential",
   "verdict": "pass",
   "partial": false,
@@ -8,21 +8,30 @@
   "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
   "role": "historical-recording",
   "suite": "claude-differential",
-  "run": "run-historical-20261112-053512",
-  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
+  "run": "run-historical-20261112-063902",
+  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
   "source": {
-    "head": "f84b39ae862c539153062c6bea701535f699793e",
-    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
+    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
   },
   "provenance_verified": true,
   "provenance": {
     "driver": {
       "package": "cpa-differential-driver",
+      "package_dir": "harness/rust",
       "kind": "bin",
+      "kinds": [
+        "bin"
+      ],
+      "crate_types": [
+        "bin"
+      ],
       "name": "cpa-differential-driver",
+      "src_path": "harness/rust/src/main.rs",
+      "profile_test": false,
       "executable": "harness/rust/target/debug/cpa-differential-driver",
       "fresh": true,
       "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
@@ -36,12 +45,21 @@
       "checkout_head": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
       "checkout_clean": true
     },
-    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1",
+    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184",
     "after": {
       "driver": {
         "package": "cpa-differential-driver",
+        "package_dir": "harness/rust",
         "kind": "bin",
+        "kinds": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
         "name": "cpa-differential-driver",
+        "src_path": "harness/rust/src/main.rs",
+        "profile_test": false,
         "executable": "harness/rust/target/debug/cpa-differential-driver",
         "fresh": true,
         "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
@@ -56,11 +74,11 @@
         "checkout_clean": true
       },
       "source": {
-        "head": "f84b39ae862c539153062c6bea701535f699793e",
-        "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+        "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
+        "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
         "clean": true,
         "status": [],
-        "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+        "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
       }
     },
     "verified": true,
@@ -82,7 +100,7 @@
     "infrastructure": 0,
     "named_skips": 0,
     "unknown_skips": 0,
-    "named_divergences": 4,
+    "named_divergences": 5,
     "stale_divergences": 0
   },
   "problems": [],
@@ -101,6 +119,9 @@
     "cors-expose-etag": {
       "kind": "later-reference",
       "evidence": "Go v8.0.35 (ae3ee3be) internal/api/server_middleware.go:33 adds ETag to Access-Control-Expose-Headers; v8.0.10 (6fecc6e) lacks it, v8.0.67 keeps it."
+    },
+    "credential-refresh-timestamps": {
+      "kind": "nondeterministic"
     },
     "go-openai-model-order": {
       "kind": "nondeterministic",
@@ -437,9 +458,10 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 18,
+      "differences": 20,
       "hits": [
-        "cors-expose-etag"
+        "cors-expose-etag",
+        "credential-refresh-timestamps"
       ]
     },
     {

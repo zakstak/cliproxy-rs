@@ -1,5 +1,5 @@
 {
-  "written": "2026-11-12T05:36:12Z",
+  "written": "2026-11-12T06:40:13Z",
   "kind": "differential",
   "verdict": "pass",
   "partial": false,
@@ -8,21 +8,30 @@
   "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
   "role": "selective-comparison",
   "suite": "selective-differential",
-  "run": "run-selective-20261112-053540",
-  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
+  "run": "run-selective-20261112-063933",
+  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
   "source": {
-    "head": "f84b39ae862c539153062c6bea701535f699793e",
-    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
+    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
   },
   "provenance_verified": true,
   "provenance": {
     "driver": {
       "package": "cpa-differential-driver",
+      "package_dir": "harness/rust",
       "kind": "bin",
+      "kinds": [
+        "bin"
+      ],
+      "crate_types": [
+        "bin"
+      ],
       "name": "cpa-differential-driver",
+      "src_path": "harness/rust/src/main.rs",
+      "profile_test": false,
       "executable": "harness/rust/target/debug/cpa-differential-driver",
       "fresh": true,
       "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
@@ -36,12 +45,21 @@
       "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
       "checkout_clean": true
     },
-    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1",
+    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184",
     "after": {
       "driver": {
         "package": "cpa-differential-driver",
+        "package_dir": "harness/rust",
         "kind": "bin",
+        "kinds": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
         "name": "cpa-differential-driver",
+        "src_path": "harness/rust/src/main.rs",
+        "profile_test": false,
         "executable": "harness/rust/target/debug/cpa-differential-driver",
         "fresh": true,
         "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
@@ -56,11 +74,11 @@
         "checkout_clean": true
       },
       "source": {
-        "head": "f84b39ae862c539153062c6bea701535f699793e",
-        "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+        "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
+        "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
         "clean": true,
         "status": [],
-        "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+        "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
       }
     },
     "verified": true,
@@ -82,7 +100,7 @@
     "infrastructure": 0,
     "named_skips": 0,
     "unknown_skips": 0,
-    "named_divergences": 19,
+    "named_divergences": 17,
     "stale_divergences": 0
   },
   "problems": [],
@@ -153,9 +171,6 @@
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
       "attribution": "No Go commit located between v8.0.35 and v8.0.67; owner unassigned."
     },
-    "credential-refresh-timestamps": {
-      "kind": "nondeterministic"
-    },
     "error-retry-after": {
       "kind": "unattributed",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
@@ -164,10 +179,6 @@
     "go-openai-model-order": {
       "kind": "nondeterministic",
       "evidence": "Go internal/registry/model_registry.go buildAvailableModelsLocked ranges over the r.models map, so /v1/models (OpenAI format) has no stable order."
-    },
-    "openai-created-timestamps": {
-      "kind": "nondeterministic",
-      "evidence": "Go and cliproxy-rs both stamp translated chat.completion(.chunk) and text_completion objects with the wall-clock second; the collector queries Go then Rust, so they can straddle a second boundary."
     },
     "plain-upstream-host-label": {
       "kind": "harness-boundary"
@@ -572,12 +583,11 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 27,
+      "differences": 25,
       "hits": [
         "C1-claude-client-profile",
         "I4-cors-allow-headers",
-        "P1-response-compression-vary",
-        "credential-refresh-timestamps"
+        "P1-response-compression-vary"
       ]
     },
     {
@@ -638,12 +648,11 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 32,
+      "differences": 30,
       "hits": [
         "C1-claude-client-profile",
         "I4-cors-allow-headers",
-        "P1-response-compression-vary",
-        "openai-created-timestamps"
+        "P1-response-compression-vary"
       ]
     },
     {

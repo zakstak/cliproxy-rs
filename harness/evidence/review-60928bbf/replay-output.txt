@@ -1,0 +1,40 @@
+[reviewed 60928bbf] baseline historical capture: pass
+[reviewed 60928bbf] baseline selective capture: pass
+[reviewed 60928bbf] finding 2: selective compact-claude Go created_at integer -> digit string: case pass, run pass 62/62
+[reviewed 60928bbf] finding 2: selective compact-claude Rust created_at integer -> digit string: case pass, run pass 62/62
+[reviewed 60928bbf] finding 2: selective compact-claude Go capsule cpa-ag-compact-v1:A: case pass, run pass 62/62
+[reviewed 60928bbf] finding 2: selective compact-claude Rust capsule cpa-ag-compact-v1:A: case pass, run pass 62/62
+[reviewed 60928bbf] finding 3: selective client-disconnect Rust disabled false -> 0: case pass, run pass 62/62
+[reviewed 60928bbf] finding 3: selective client-disconnect Go disabled absent -> 0: case pass, run pass 62/62
+[reviewed 60928bbf] finding 3: selective client-disconnect both sides disabled true: case pass, run pass 62/62
+[reviewed 60928bbf] finding 4: historical compact-claude Rust upstream write BrokenPipeError: case pass, run pass 50/50
+[reviewed 60928bbf] finding 4: selective native-signals C2 Go upstream write BrokenPipeError: case pass, run pass 62/62
+[reviewed 60928bbf] finding 4: selective native-signals C2 Rust upstream write BrokenPipeError: case pass, run pass 62/62
+[reviewed 60928bbf] finding types: historical client-disconnect Rust disabled false -> 0 (no predicate): case pass, run pass 50/50
+[reviewed 60928bbf] finding types: selective compact-claude Rust input_tokens 13 -> 13.0: case pass, run pass 62/62
+[reviewed 60928bbf] combine baseline (accept-20261112-055853): pass
+[reviewed 60928bbf] combine 1 another target's existing executable, same hash: pass
+[reviewed 60928bbf] combine 1 another target's execution under these labels: pass
+[reviewed 60928bbf] combine 1 missing/failed/ignored/not_run removed from all nine: pass
+[reviewed 60928bbf] combine 1 nonexistent executable target/does-not-exist: pass
+[reviewed 60928bbf] combine rust_revision removed: pass
+[fixed] baseline historical capture: pass
+[fixed] baseline selective capture: pass
+[fixed] finding 2: selective compact-claude Go created_at integer -> digit string: case fail, run fail 61/62
+[fixed] finding 2: selective compact-claude Rust created_at integer -> digit string: case fail, run fail 61/62
+[fixed] finding 2: selective compact-claude Go capsule cpa-ag-compact-v1:A: case fail, run fail 61/62
+[fixed] finding 2: selective compact-claude Rust capsule cpa-ag-compact-v1:A: case fail, run fail 61/62
+[fixed] finding 3: selective client-disconnect Rust disabled false -> 0: case fail, run fail 61/62
+[fixed] finding 3: selective client-disconnect Go disabled absent -> 0: case fail, run fail 61/62
+[fixed] finding 3: selective client-disconnect both sides disabled true: case fail, run fail 61/62
+[fixed] finding 4: historical compact-claude Rust upstream write BrokenPipeError: case fail, run fail 49/50
+[fixed] finding 4: selective native-signals C2 Go upstream write BrokenPipeError: case fail, run fail 61/62
+[fixed] finding 4: selective native-signals C2 Rust upstream write BrokenPipeError: case fail, run fail 61/62
+[fixed] finding types: historical client-disconnect Rust disabled false -> 0 (no predicate): case fail, run fail 49/50
+[fixed] finding types: selective compact-claude Rust input_tokens 13 -> 13.0: case fail, run fail 61/62
+[fixed] combine baseline (accept-20261112-063856): pass
+[fixed] combine 1 another target's existing executable, same hash: fail
+[fixed] combine 1 another target's execution under these labels: fail
+[fixed] combine 1 missing/failed/ignored/not_run removed from all nine: fail
+[fixed] combine 1 nonexistent executable target/does-not-exist: fail
+[fixed] combine rust_revision removed: fail

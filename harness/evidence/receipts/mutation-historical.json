@@ -1,24 +1,24 @@
 {
-  "written": "2026-11-12T05:35:38Z",
+  "written": "2026-11-12T06:39:30Z",
   "kind": "mutation-control",
   "verdict": "pass",
   "partial": false,
-  "run": "run-historical-20261112-053512",
+  "run": "run-historical-20261112-063902",
   "target": "historical",
   "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
-  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
+  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
   "source": {
-    "head": "f84b39ae862c539153062c6bea701535f699793e",
-    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
+    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
   },
   "provenance_verified": true,
   "baseline_verdict": "pass",
   "counts": {
-    "mutations": 16,
-    "caught": 16
+    "mutations": 19,
+    "caught": 19
   },
   "controls": [
     {
@@ -218,6 +218,44 @@
         "predicates"
       ],
       "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "upstream write never finished",
+      "case": "buffered",
+      "side": "rust",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "upstream-requests"
+      ],
+      "unexplained": 1,
+      "caught": true
+    },
+    {
+      "mutation": "compaction upstream write failed",
+      "case": "compact-claude",
+      "side": "rust",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "predicates"
+      ],
+      "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "credential persisted disabled: 0",
+      "case": "client-disconnect",
+      "side": "rust",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "credential"
+      ],
+      "unexplained": 1,
       "caught": true
     }
   ]
