@@ -1259,6 +1259,11 @@ pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
 
 /// [`scan_auth_dir`] over a listing already taken of `cfg.auth_dir`.
 pub fn scan_listing(cfg: &Config, listing: Listing) -> AuthScan {
+    scan_listing_with(cfg, listing, read_auth_file)
+}
+
+/// [`scan_listing`], reading each file with `read` ([`read_auth_file`] outside tests).
+pub fn scan_listing_with(cfg: &Config, listing: Listing, read: impl Fn(&Path) -> AuthFile) -> AuthScan {
     let mut scan = AuthScan::default();
     if let Some(e) = &listing.failure {
         tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot list auth dir; keeping the credentials of the files not listed");
@@ -1266,7 +1271,7 @@ pub fn scan_listing(cfg: &Config, listing: Listing) -> AuthScan {
     }
     for path in listing.paths {
         scan.listed.insert(path.clone());
-        let data = match read_auth_file(&path) {
+        let data = match read(&path) {
             AuthFile::Bytes(data) => data,
             AuthFile::Absent => continue,
             AuthFile::Unreadable(e) => {

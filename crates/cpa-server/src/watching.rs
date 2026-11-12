@@ -90,6 +90,10 @@ impl HashCache {
         {
             return Some(*hash);
         }
+        #[cfg(test)]
+        if faults::fails(faults::Stage::Look, path) {
+            return None;
+        }
         let data = std::fs::read(path).ok()?;
         let hash: Hash = Sha256::digest(&data).into();
         self.0.insert(path.to_owned(), (Some(stat), hash));
@@ -115,13 +119,29 @@ fn is_auth_json(path: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().go_lower().ends_with(".json"))
 }
 
-fn observe(state: &Management, cache: &mut HashCache) -> Snapshot {
-    let listing = credentials::list_auth_dir(&state.rt.config().auth_dir);
+/// One look at the config file and the auth folder.
+struct Observation {
+    snapshot: Snapshot,
+    /// What this look could not read, so recorded as last seen: auth files whose read
+    /// or metadata failed for a reason other than "not found", and the folder when it
+    /// could not be listed in full. A change hidden behind such a failure shows in no
+    /// snapshot, so the watcher retries these as it retries what a reload could not read.
+    unknown: Pending,
+}
+
+fn observe(state: &Management, cache: &mut HashCache) -> Observation {
+    #[allow(unused_mut)]
+    let mut listing = credentials::list_auth_dir(&state.rt.config().auth_dir);
+    #[cfg(test)]
+    if faults::fails(faults::Stage::LookListing, &listing.dir) {
+        listing.paths.clear();
+        listing.failure = Some(std::io::Error::from_raw_os_error(libc::EIO));
+    }
     observe_listing(state, cache, listing)
 }
 
 /// [`observe`] over a listing already taken of the auth folder.
-fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentials::Listing) -> Snapshot {
+fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentials::Listing) -> Observation {
     let now = SystemTime::now();
     let mut seen = std::collections::HashSet::new();
     let config = std::fs::metadata(&state.path)
@@ -129,6 +149,7 @@ fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentia
         .and_then(|meta| cache.hash(&state.path, &meta, now));
     seen.insert(state.path.clone());
     let mut auth = BTreeMap::new();
+    let mut unknown = Pending::default();
     let complete = listing.complete();
     // The scan's classification (`credentials::read_auth_file`): an entry that is gone
     // or not a regular file is absent; one that cannot be read for now is present with
@@ -139,10 +160,14 @@ fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentia
         listed.insert(path.clone());
         let hash = match std::fs::metadata(&path) {
             Ok(meta) if !meta.is_file() => continue,
-            Ok(meta) => cache.hash(&path, &meta, now).or_else(|| cache.last(&path)),
+            Ok(meta) => cache.hash(&path, &meta, now),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => cache.last(&path),
+            Err(_) => None,
         };
+        let hash = hash.or_else(|| {
+            unknown.files.insert(path.clone());
+            cache.last(&path)
+        });
         seen.insert(path.clone());
         auth.insert(path, hash.unwrap_or_default());
     }
@@ -150,6 +175,7 @@ fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentia
     // in it that the listing did not reach, as last seen: unknown, not removed. An entry
     // the listing reached is settled by what it found, absent included.
     if !complete {
+        unknown.dir = Some(listing.dir.clone());
         for (path, (_, hash)) in &cache.0 {
             // The config file can live in the auth folder too.
             if path.parent() == Some(listing.dir.as_path()) && is_auth_json(path) && !listed.contains(path) {
@@ -159,7 +185,10 @@ fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentia
         }
     }
     cache.0.retain(|path, _| seen.contains(path));
-    Snapshot { config, auth }
+    Observation {
+        snapshot: Snapshot { config, auth },
+        unknown,
+    }
 }
 
 /// Go's per-event log lines for auth files that changed between two snapshots.
@@ -210,14 +239,16 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
         let mut applied: Option<Snapshot> = None;
         let mut observed: Option<Snapshot> = None;
         let mut since = Instant::now();
-        // What the last reload could not read, and whether it can be read now: then the
-        // same observation reloads again, though nothing it records has changed.
+        // What the last reload did not apply and the last look could not read, and
+        // whether any of it can be read now: then the same observation reloads again,
+        // though nothing it records has changed.
         let mut pending = Pending::default();
+        let mut unknown = Pending::default();
         let mut retry = false;
         loop {
             let woke = applied.is_some() && applied == observed && !retry;
             if woke {
-                if pending.is_empty() {
+                if pending.is_empty() && unknown.is_empty() {
                     events.changed().await;
                 } else {
                     tokio::select! {
@@ -239,7 +270,7 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
             // back and notifications stay on.
             let looked = tokio::task::spawn_blocking({
                 let state = state.clone();
-                let pending = (!retry && !pending.is_empty()).then(|| pending.clone());
+                let pending = (!retry).then(|| pending.union(&unknown)).filter(|p| !p.is_empty());
                 move || {
                     let snapshot = catch_unwind(AssertUnwindSafe(|| {
                         if let Some(t) = wake_targets {
@@ -257,9 +288,10 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 Ok((snapshot, returned_cache, returned_events)) => {
                     cache = returned_cache;
                     events = returned_events;
-                    snapshot.map(|(snapshot, ready)| {
+                    snapshot.map(|(observation, ready)| {
                         retry |= ready;
-                        snapshot
+                        unknown = observation.unknown;
+                        observation.snapshot
                     })
                 }
                 // Cancelled at shutdown.
@@ -374,6 +406,11 @@ fn record(cache: &mut HashCache, observed: Snapshot, read: Option<Snapshot>) -> 
     let read = read.unwrap_or_else(|| observed.clone());
     if read != observed {
         cache.forget_metadata();
+        // What the reload read is now the last known content: a look that then fails to
+        // read a file reports these bytes, the applied ones, not older ones of its own.
+        for (path, hash) in &read.auth {
+            cache.0.insert(path.clone(), (None, *hash));
+        }
     }
     read
 }
@@ -481,12 +518,15 @@ pub fn reload(state: &Management) -> Result<(), ReloadError> {
     reload_config(state, true, &Snapshot::default()).0.map(|_| ())
 }
 
-/// What a reload could not read, so did not apply: the auth files whose read failed
-/// and, when it could not list the auth folder in full, that folder. The applied
-/// snapshot records these entries as observed, so a lasting denial is no change and
-/// nothing reloads every tick; the watcher keeps them here instead and reloads once one
-/// can be read, with no new write needed (#89: bytes observed just before the reload's
-/// read failed, a re-login or a revocation, are applied then).
+/// Auth files whose current bytes are not known to be applied, because a read failed
+/// for a reason other than "not found", at whichever stage it failed: the watcher's
+/// look ([`Observation::unknown`]), the reload's scan (unreadable files, a folder it
+/// could not list in full), or the freshness check at publication (a scanned
+/// credential rejected because its file changed, went or could not be read since the
+/// scan). The applied snapshot records these entries as observed, so a lasting denial
+/// is no change and nothing reloads every tick; the watcher keeps them here instead and
+/// reloads once one can be read, with no new write and no file event needed (#89: a
+/// re-login or a revocation hidden behind one transient error is applied then).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Pending {
     files: std::collections::BTreeSet<PathBuf>,
@@ -496,6 +536,13 @@ struct Pending {
 impl Pending {
     fn is_empty(&self) -> bool {
         self.files.is_empty() && self.dir.is_none()
+    }
+
+    fn union(&self, other: &Pending) -> Pending {
+        Pending {
+            files: self.files.union(&other.files).cloned().collect(),
+            dir: self.dir.clone().or_else(|| other.dir.clone()),
+        }
     }
 
     /// Whether a reload could now read something the last one could not: the folder
@@ -566,7 +613,13 @@ fn reload_config(
             hook();
         }
     }
-    let scan = credentials::scan_auth_dir(&config);
+    let listing = credentials::list_auth_dir(&config.auth_dir);
+    let scan = credentials::scan_listing_with(&config, listing, |path| {
+        let file = credentials::read_auth_file(path);
+        #[cfg(test)]
+        let file = faults::read(faults::Stage::Scan, path, file);
+        file
+    });
     read.auth = scan.read.clone();
     // A file the scan could not read, or did not reach in a folder it could not list,
     // stays as observed; recording it as missing would reload it on every tick. What the
@@ -577,17 +630,83 @@ fn reload_config(
             read.auth.entry(path.clone()).or_insert(*hash);
         }
     }
-    let pending = Pending {
+    let mut pending = Pending {
         files: scan.unreadable.iter().cloned().collect(),
         dir: scan.unlisted.clone(),
     };
     let result = accepted.then(|| config.clone());
-    state.publish(config, Some(scan));
+    match state.publish(config, Some(scan)) {
+        // A scanned credential the freshness check rejected (its file changed, went or
+        // could not be read since the scan) was not applied, whatever this records.
+        Some(rejected) => pending.files.extend(rejected),
+        // Unreachable from here today: a config the runtime refuses fails to load
+        // first, and the running config was accepted. Nothing was applied.
+        None => pending
+            .files
+            .extend(observed.auth.keys().chain(read.auth.keys()).cloned()),
+    }
     let result = match config_error {
         Some(error) => Err(error),
         None => Ok(result),
     };
     (result, read, pending)
+}
+
+/// Test-only read faults at each stage that reads an auth file or the auth folder, so
+/// a transient error can be placed exactly, with no file event before or after it.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        /// The watcher's read of an auth file.
+        Look,
+        /// The watcher's listing of the auth folder: fails before any entry.
+        LookListing,
+        /// The reload's scan read of an auth file.
+        Scan,
+        /// The freshness check's read when the scan is published.
+        Freshness,
+    }
+
+    #[allow(clippy::type_complexity)]
+    static ARMED: std::sync::Mutex<Vec<(Stage, PathBuf, Arc<AtomicUsize>)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Fails every read of `path` at `stage` until [`disarm`]; returns the hit count.
+    pub(crate) fn arm(stage: Stage, path: &Path) -> Arc<AtomicUsize> {
+        let hits = Arc::new(AtomicUsize::new(0));
+        ARMED.lock().unwrap().push((stage, path.to_owned(), hits.clone()));
+        hits
+    }
+
+    pub(crate) fn disarm(stage: Stage, path: &Path) {
+        ARMED.lock().unwrap().retain(|(s, p, _)| !(*s == stage && p == path));
+    }
+
+    pub(crate) fn fails(stage: Stage, path: &Path) -> bool {
+        let armed = ARMED.lock().unwrap();
+        let hit = armed.iter().find(|(s, p, _)| *s == stage && p == path);
+        hit.inspect(|(_, _, hits)| {
+            hits.fetch_add(1, Ordering::SeqCst);
+        })
+        .is_some()
+    }
+
+    /// `file`, or an I/O error when a fault is armed for `path` at `stage`.
+    pub(crate) fn read(
+        stage: Stage,
+        path: &Path,
+        file: cpa_core::config::credentials::AuthFile,
+    ) -> cpa_core::config::credentials::AuthFile {
+        if fails(stage, path) {
+            cpa_core::config::credentials::AuthFile::Unreadable(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            file
+        }
+    }
 }
 
 /// Test hook: runs in a reload of the auth folder it names, after the watcher observed
@@ -722,6 +841,11 @@ mod tests {
 
     /// One watcher reload as `start` makes it: reload what was observed, then record
     /// what was applied.
+    /// [`observe`]'s snapshot.
+    fn look(state: &Management, cache: &mut HashCache) -> Snapshot {
+        observe(state, cache).snapshot
+    }
+
     fn step(state: &Management, cache: &mut HashCache, read_config: bool, observed: &Snapshot) -> Snapshot {
         step_pending(state, cache, read_config, observed).0
     }
@@ -752,12 +876,12 @@ mod tests {
         let mut cache = HashCache::default();
         let config = |port| format!("port: {port}\noauth: {{auth-dir: {}}}\n", dir.display());
         std::fs::write(&state.path, config(9001)).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         std::fs::write(&state.path, config(9002)).unwrap(); // Lands before the reload reads.
         let applied = step(&state, &mut cache, true, &observed);
         assert_eq!(state.rt.config().port, 9002);
         std::fs::write(&state.path, config(9001)).unwrap(); // Restores the observed bytes.
-        let restored = observe(&state, &mut cache);
+        let restored = look(&state, &mut cache);
         assert!(restored != applied, "the restore must be reloaded");
         step(&state, &mut cache, true, &restored);
         assert_eq!(state.rt.config().port, 9001);
@@ -772,19 +896,19 @@ mod tests {
         std::fs::write(&file, account("a@example.com")).unwrap();
         reload(&state).unwrap();
         std::fs::write(&file, account("b@example.com")).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         std::fs::write(&file, "").unwrap(); // Truncated before the scan.
         let applied = step(&state, &mut cache, false, &observed);
         assert_eq!(email(&state), "a@example.com"); // Kept while incomplete.
         std::fs::write(&file, account("b@example.com")).unwrap(); // Finished after it.
-        let finished = observe(&state, &mut cache);
+        let finished = look(&state, &mut cache);
         assert!(
             finished == observed && finished != applied,
             "the finished write must be reloaded"
         );
         let applied = step(&state, &mut cache, false, &finished);
         assert_eq!(email(&state), "b@example.com");
-        assert!(observe(&state, &mut cache) == applied, "nothing left to reload");
+        assert!(look(&state, &mut cache) == applied, "nothing left to reload");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -799,10 +923,10 @@ mod tests {
         std::fs::remove_file(&state.path).unwrap();
         // Zero bytes by its metadata, and every read fails (EIO), even for root.
         std::os::unix::fs::symlink("/proc/self/mem", &state.path).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert_eq!(observed.config, None);
         let applied = step(&state, &mut cache, true, &observed);
-        assert!(observe(&state, &mut cache) == applied, "no reload without a change");
+        assert!(look(&state, &mut cache) == applied, "no reload without a change");
         assert_eq!(state.rt.config().port, port);
         std::fs::remove_file(&state.path).unwrap();
         std::fs::write(
@@ -810,7 +934,7 @@ mod tests {
             format!("port: 9005\noauth: {{auth-dir: {}}}\n", dir.display()),
         )
         .unwrap();
-        let changed = observe(&state, &mut cache);
+        let changed = look(&state, &mut cache);
         assert!(changed != applied);
         step(&state, &mut cache, true, &changed);
         assert_eq!(state.rt.config().port, 9005);
@@ -835,7 +959,7 @@ mod tests {
         // Not racy, and cached for an earlier same-size write with the same metadata.
         let meta = std::fs::metadata(&file).unwrap();
         cache.0.insert(file.clone(), (Some(Stat::of(&meta)), [7; 32]));
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert_eq!(observed.auth[&file], [7; 32]);
         let applied = step(&state, &mut cache, false, &observed);
         assert!(
@@ -846,7 +970,7 @@ mod tests {
                 .iter()
                 .any(|c| c.str("email") == Some("b@example.com"))
         );
-        assert!(observe(&state, &mut cache) == applied, "converges after one reload");
+        assert!(look(&state, &mut cache) == applied, "converges after one reload");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1065,7 +1189,7 @@ mod tests {
         let mut cache = HashCache::default();
         let file = dir.join("a.json");
         std::fs::write(&file, r#"{"type":"codex","email":"a@example.com"}"#).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let applied = step(&state, &mut cache, false, &observed);
         let before = state.rt.store().get("a.json").expect("loaded");
         std::fs::remove_file(&file).unwrap();
@@ -1074,15 +1198,15 @@ mod tests {
             credentials::read_auth_file(&file),
             credentials::AuthFile::Unreadable(_)
         ));
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert!(observed == applied, "losing access is no change");
         // A reload for another reason (a config edit, a management save) rescans.
         let applied = step(&state, &mut cache, true, &observed);
         let kept = state.rt.store().get("a.json").expect("kept while unreadable");
         assert_eq!(kept.revision, before.revision);
-        assert!(observe(&state, &mut cache) == applied, "converges");
+        assert!(look(&state, &mut cache) == applied, "converges");
         std::fs::remove_file(&file).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert!(!observed.auth.contains_key(&file), "the deletion is seen");
         step(&state, &mut cache, false, &observed);
         assert!(state.rt.store().get("a.json").is_none(), "deleted");
@@ -1145,7 +1269,7 @@ mod tests {
         };
         std::fs::write(&file, doc("sk-ant-oat-old-fake")).unwrap();
         let mut cache = HashCache::default();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         step(&state, &mut cache, false, &observed);
         let store = state.rt.store();
         let select = |model: &str| store.select(Selection::new("claude", model));
@@ -1159,7 +1283,7 @@ mod tests {
         );
         select("m").unwrap().complete(Outcome::Failure(unauthorized));
         // The 401 saves the credential's status to its file; the watcher reloads that.
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let applied = step(&state, &mut cache, false, &observed);
         let before = store.get("claude-a.json").unwrap();
         let cooldowns = || {
@@ -1178,15 +1302,15 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
             return;
         }
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert!(observed == applied, "losing access is no change");
         reload(&state).unwrap();
         kept("full rescan");
         let applied = step(&state, &mut cache, false, &observed);
         kept("watcher reload");
-        assert!(observe(&state, &mut cache) == applied, "converges");
+        assert!(look(&state, &mut cache) == applied, "converges");
         chmod(&file, 0o600);
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert!(observed == applied, "the same bytes are no change");
         step(&state, &mut cache, false, &observed);
         reload(&state).unwrap();
@@ -1196,7 +1320,7 @@ mod tests {
         let staged = auth.join("claude-a.json.tmp");
         std::fs::write(&staged, doc("sk-ant-oat-new-fake")).unwrap();
         std::fs::rename(&staged, &file).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         step(&state, &mut cache, false, &observed);
         let lease = select("m").expect("the re-login is selectable at once");
         assert_eq!(lease.credential.str("access_token"), Some("sk-ant-oat-new-fake"));
@@ -1205,7 +1329,7 @@ mod tests {
         assert_eq!(cooldowns(), [("q".to_owned(), 429)]);
         chmod(&file, 0o000);
         std::fs::remove_file(&file).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         step(&state, &mut cache, false, &observed);
         assert!(store.get("claude-a.json").is_none(), "deleted while unreadable");
         std::fs::remove_dir_all(dir).unwrap();
@@ -1231,12 +1355,12 @@ mod tests {
             std::fs::write(&upload, r#"{"type":"gemini","email":"u@example.invalid"}"#).unwrap();
             state.fallbacks.lock().unwrap().insert(upload.clone());
             let mut cache = HashCache::default();
-            let observed = observe(&state, &mut cache);
+            let observed = look(&state, &mut cache);
             step(&state, &mut cache, false, &observed);
             // Replaced and deleted before access is lost.
             std::fs::write(auth.join("a.json"), account("new@example.invalid")).unwrap();
             std::fs::remove_file(auth.join("gone.json")).unwrap();
-            let observed = observe(&state, &mut cache);
+            let observed = look(&state, &mut cache);
             let applied = step(&state, &mut cache, false, &observed);
             let ids = || {
                 let mut ids: Vec<(String, u64)> = store
@@ -1265,14 +1389,14 @@ mod tests {
                     }
                     return;
                 }
-                let observed = observe(&state, &mut cache);
+                let observed = look(&state, &mut cache);
                 assert!(observed == applied, "relative: {relative}, {mode:o}: no change");
                 reload(&state).unwrap();
                 assert_eq!(ids(), before, "relative: {relative}, {mode:o}: full rescan");
                 let applied = step(&state, &mut cache, true, &observed);
                 assert_eq!(ids(), before, "relative: {relative}, {mode:o}: watcher reload");
                 assert!(
-                    observe(&state, &mut cache) == applied,
+                    look(&state, &mut cache) == applied,
                     "relative: {relative}, {mode:o}: converges"
                 );
                 assert!(
@@ -1289,7 +1413,7 @@ mod tests {
             }
             chmod(&auth, 0o700);
             std::fs::remove_file(auth.join("b.json")).unwrap();
-            let observed = observe(&state, &mut cache);
+            let observed = look(&state, &mut cache);
             assert!(observed != applied, "the deletion is seen once the folder lists again");
             step(&state, &mut cache, false, &observed);
             let after = ids();
@@ -1312,7 +1436,7 @@ mod tests {
         let (state, dir) = state();
         std::fs::write(dir.join("a.json"), r#"{"type":"codex","email":"a@example.invalid"}"#).unwrap();
         let mut cache = HashCache::default();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let applied = step(&state, &mut cache, true, &observed);
         let before = state.rt.store().get("a.json").unwrap();
         chmod(&dir, 0o300);
@@ -1321,11 +1445,11 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
             return;
         }
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let unchanged = observed == applied;
         let applied = step(&state, &mut cache, true, &observed);
         let kept = state.rt.store().get("a.json").map(|c| c.revision);
-        let converged = observe(&state, &mut cache) == applied;
+        let converged = look(&state, &mut cache) == applied;
         chmod(&dir, 0o755);
         assert!(unchanged, "no change");
         assert_eq!(kept, Some(before.revision));
@@ -1500,6 +1624,259 @@ mod tests {
         }
     }
 
+    /// What a stage-fault case expects once the fault clears.
+    #[derive(Clone, Copy)]
+    enum Want {
+        Email(&'static str),
+        Disabled,
+        Removed,
+    }
+
+    const OLD: &str = r#"{"type":"codex","access_token":"old-fake","email":"old@example.invalid"}"#;
+    const RELOGIN: &str = r#"{"type":"codex","access_token":"new-fake","email":"new@example.invalid"}"#;
+    const DISABLED: &str =
+        r#"{"type":"codex","access_token":"old-fake","email":"old@example.invalid","disabled":true}"#;
+    const REMOVED: &str = r#"{"type":"gemini","email":"g@example.invalid"}"#;
+
+    /// A running watcher over a private auth folder holding `a.json` = [`OLD`], loaded.
+    async fn watched() -> (Arc<Management>, PathBuf, PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let file = auth.join("a.json");
+        std::fs::write(&file, OLD).unwrap();
+        let watcher = start(&state);
+        let store = state.rt.store();
+        wait_until("A loaded", || store.get("a.json").is_some()).await;
+        (state, dir, auth, file, watcher)
+    }
+
+    /// Writes `bytes` to `file` the way a login does: a new file renamed into place.
+    fn replace(file: &Path, bytes: &str) {
+        let staged = file.with_extension("json.tmp");
+        std::fs::write(&staged, bytes).unwrap();
+        std::fs::rename(&staged, file).unwrap();
+    }
+
+    fn holds(store: &crate::runtime::CredentialStore, want: Want) -> bool {
+        let a = store.get("a.json");
+        match want {
+            Want::Email(email) => a.is_some_and(|c| c.str("email") == Some(email) && !c.disabled),
+            Want::Disabled => a.is_some_and(|c| c.disabled),
+            Want::Removed => a.is_none(),
+        }
+    }
+
+    /// One stage-fault case: a write lands while a read of it fails at `stage`; the
+    /// loaded credential stays while the error lasts; the error then clears with no
+    /// file event at all, and the write is applied.
+    async fn stage_case(stage: faults::Stage, case: &str, replacement: &str, want: Want) {
+        let (state, dir, auth, file, watcher) = watched().await;
+        let store = state.rt.store();
+        let before = store.get("a.json").unwrap().revision;
+        let target = if stage == faults::Stage::LookListing {
+            &auth
+        } else {
+            &file
+        };
+        let hits = faults::arm(stage, target);
+        replace(&file, replacement);
+        let what = format!("{stage:?} {case}");
+        wait_until(&format!("{what}: the fault was hit"), || {
+            hits.load(std::sync::atomic::Ordering::SeqCst) > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            store.get("a.json").map(|c| (c.revision, c.disabled)),
+            Some((before, false)),
+            "{what}: A is kept while the error lasts"
+        );
+        faults::disarm(stage, target);
+        wait_until(
+            &format!("{what}: applied with no event after the error cleared"),
+            || holds(store, want),
+        )
+        .await;
+        watcher.abort();
+        let _ = watcher.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sol re-review of eb9a6ec8: a transient read error at any stage of the path from
+    /// the watcher's look to the publication leaves the write pending, and it is applied
+    /// once the error clears, through the idle retry alone (no file event after it), for
+    /// a re-login, a revocation by `disabled`, valid JSON without a credential (`{}`) and
+    /// a removed provider's file. The look stage covers a failed file read and a folder
+    /// listing that fails; the scan stage is the earlier fix, kept as a control. The
+    /// freshness check only runs for a scanned credential that replaces the loaded one,
+    /// so it has no `{}` or removed-provider case.
+    #[tokio::test]
+    async fn a_transient_error_at_any_stage_is_retried_without_an_event() {
+        use faults::Stage::*;
+        let mut cases = Vec::new();
+        for stage in [Look, LookListing, Scan, Freshness] {
+            for (case, replacement, want) in [
+                ("re-login", RELOGIN, Want::Email("new@example.invalid")),
+                ("disabled", DISABLED, Want::Disabled),
+                ("{}", "{}", Want::Removed),
+                ("removed provider", REMOVED, Want::Removed),
+            ] {
+                if stage == Freshness && matches!(want, Want::Removed) {
+                    continue;
+                }
+                cases.push(stage_case(stage, case, replacement, want));
+            }
+        }
+        futures_util::future::join_all(cases).await;
+    }
+
+    /// Counts the reloads of `auth`'s folder.
+    fn count_reloads(auth: &Path) -> Arc<std::sync::atomic::AtomicUsize> {
+        let reloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        BEFORE_SCAN.lock().unwrap().push((auth.to_owned(), {
+            let reloads = reloads.clone();
+            Arc::new(move || {
+                reloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }));
+        reloads
+    }
+
+    /// A fault that lasts: at the freshness check, each idle retry reloads once (about
+    /// every PENDING_RETRY, never every tick) and the loaded credential stays; at the
+    /// look, the scan applies the write and later looks that still fail report the
+    /// applied bytes, so nothing reloads every tick either. The write is applied once the
+    /// fault clears, or at once when only the look fails.
+    #[tokio::test]
+    async fn a_lasting_fault_retries_slowly_and_never_drops_the_credential() {
+        use faults::Stage::*;
+        let run = |stage: faults::Stage| async move {
+            let (state, dir, auth, file, watcher) = watched().await;
+            let store = state.rt.store();
+            let before = store.get("a.json").unwrap().revision;
+            let target = if stage == LookListing {
+                auth.clone()
+            } else {
+                file.clone()
+            };
+            let reloads = count_reloads(&auth);
+            faults::arm(stage, &target);
+            replace(&file, RELOGIN);
+            let window = PENDING_RETRY * 2 + Duration::from_millis(1500);
+            let started = Instant::now();
+            while started.elapsed() < window {
+                if stage == Freshness {
+                    assert_eq!(
+                        store.get("a.json").map(|c| c.revision),
+                        Some(before),
+                        "{stage:?}: A kept"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let n = reloads.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(n <= 5, "{stage:?}: {n} reloads in {window:?}");
+            if stage == Freshness {
+                assert!(n >= 2, "{stage:?}: the idle retry reloads ({n})");
+            } else {
+                assert!(
+                    holds(store, Want::Email("new@example.invalid")),
+                    "{stage:?}: the scan applied it"
+                );
+            }
+            faults::disarm(stage, &target);
+            wait_until(&format!("{stage:?}: applied"), || {
+                holds(store, Want::Email("new@example.invalid"))
+            })
+            .await;
+            watcher.abort();
+            let _ = watcher.await;
+            BEFORE_SCAN.lock().unwrap().retain(|(d, _)| *d != auth);
+            std::fs::remove_dir_all(dir).unwrap();
+        };
+        futures_util::future::join_all([run(Freshness), run(Look), run(LookListing)]).await;
+    }
+
+    /// Races with a write still pending after a failed freshness check: deleting the
+    /// file removes the credential (the fault does not hold it); a second write replaces
+    /// the pending one, and only it is applied once the fault clears; a token refresh
+    /// that rewrites the file in the meantime is kept, and the pending re-login it
+    /// overwrote never comes back.
+    #[tokio::test]
+    async fn a_pending_write_races_with_deletion_replacement_and_refresh() {
+        use faults::Stage::Freshness;
+        let pending = |state: Arc<Management>, file: PathBuf| async move {
+            let hits = faults::arm(Freshness, &file);
+            replace(&file, RELOGIN);
+            wait_until("rejected at publication", || {
+                hits.load(std::sync::atomic::Ordering::SeqCst) > 0
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(holds(state.rt.store(), Want::Email("old@example.invalid")));
+        };
+        // Deletion.
+        let deletion = async {
+            let (state, dir, _, file, watcher) = watched().await;
+            pending(state.clone(), file.clone()).await;
+            std::fs::remove_file(&file).unwrap();
+            wait_until("deleted", || state.rt.store().get("a.json").is_none()).await;
+            faults::disarm(Freshness, &file);
+            tokio::time::sleep(PENDING_RETRY + Duration::from_millis(500)).await;
+            assert!(
+                state.rt.store().get("a.json").is_none(),
+                "a deleted credential stays deleted"
+            );
+            watcher.abort();
+            let _ = watcher.await;
+            std::fs::remove_dir_all(dir).unwrap();
+        };
+        // Replacement.
+        let replacement = async {
+            let (state, dir, _, file, watcher) = watched().await;
+            pending(state.clone(), file.clone()).await;
+            replace(
+                &file,
+                r#"{"type":"codex","access_token":"third-fake","email":"third@example.invalid"}"#,
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                holds(state.rt.store(), Want::Email("old@example.invalid")),
+                "still rejected"
+            );
+            faults::disarm(Freshness, &file);
+            let store = state.rt.store();
+            wait_until("the latest write applied", || {
+                holds(store, Want::Email("third@example.invalid"))
+            })
+            .await;
+            watcher.abort();
+            let _ = watcher.await;
+            std::fs::remove_dir_all(dir).unwrap();
+        };
+        // Refresh.
+        let refresh = async {
+            let (state, dir, _, file, watcher) = watched().await;
+            pending(state.clone(), file.clone()).await;
+            let store = state.rt.store();
+            let revision = store.get("a.json").unwrap().revision;
+            let mut patch = cpa_core::credential::MetadataPatch::default();
+            patch.set.insert("access_token".into(), "refreshed-fake".into());
+            let refreshed = store.apply_patch("a.json", revision, &patch).unwrap().revision;
+            faults::disarm(Freshness, &file);
+            tokio::time::sleep(PENDING_RETRY + Duration::from_millis(700)).await;
+            let now = store.get("a.json").unwrap();
+            assert_eq!(
+                (now.metadata["access_token"].as_str(), now.str("email"), now.revision),
+                (Some("refreshed-fake"), Some("old@example.invalid"), refreshed),
+                "the refresh is kept and the overwritten re-login never comes back"
+            );
+            watcher.abort();
+            let _ = watcher.await;
+            std::fs::remove_dir_all(dir).unwrap();
+        };
+        tokio::join!(deletion, replacement, refresh);
+    }
+
     /// Finding 1 step by step, as the watcher loop drives it: the failed read leaves A
     /// loaded (revision, no removal), the file pending and the applied snapshot equal to
     /// the observation, so a lasting denial is no change; once readable, `ready` says so
@@ -1511,13 +1888,13 @@ mod tests {
         let account = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
         std::fs::write(&file, account("old@example.invalid")).unwrap();
         let mut cache = HashCache::default();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let (_, pending) = step_pending(&state, &mut cache, false, &observed);
         assert!(pending.is_empty());
         let store = state.rt.store();
         let before = store.get("a.json").unwrap().revision;
         std::fs::write(&file, account("new@example.invalid")).unwrap();
-        let observed = observe(&state, &mut cache); // Reads B.
+        let observed = look(&state, &mut cache); // Reads B.
         chmod(&file, 0o000); // Before the reload's read.
         if !denied(&file) {
             std::fs::remove_dir_all(dir).unwrap();
@@ -1526,10 +1903,10 @@ mod tests {
         let (applied, pending) = step_pending(&state, &mut cache, false, &observed);
         assert_eq!(store.get("a.json").map(|c| c.revision), Some(before), "A kept");
         assert_eq!(pending.files.iter().collect::<Vec<_>>(), [&file]);
-        assert!(observe(&state, &mut cache) == applied, "a lasting denial is no change");
+        assert!(look(&state, &mut cache) == applied, "a lasting denial is no change");
         assert!(!pending.ready(), "nothing to retry while unreadable");
         chmod(&file, 0o600);
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         assert!(observed == applied, "B was recorded as observed");
         assert!(pending.ready(), "readable again: retry");
         let (_, pending) = step_pending(&state, &mut cache, false, &observed);
@@ -1547,10 +1924,10 @@ mod tests {
         let file = auth.join("a.json");
         std::fs::write(&file, r#"{"type":"codex","access_token":"old-fake"}"#).unwrap();
         let mut cache = HashCache::default();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         step(&state, &mut cache, false, &observed);
         std::fs::write(&file, r#"{"type":"codex","access_token":"edited-fake"}"#).unwrap();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         chmod(&file, 0o000);
         if !denied(&file) {
             std::fs::remove_dir_all(dir).unwrap();
@@ -1564,7 +1941,7 @@ mod tests {
         patch.set.insert("access_token".into(), "refreshed-fake".into());
         let refreshed = store.apply_patch("a.json", revision, &patch).unwrap().revision;
         assert!(pending.ready(), "the refresh wrote a readable file");
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         let (_, pending) = step_pending(&state, &mut cache, false, &observed);
         let now = store.get("a.json").unwrap();
         assert_eq!(
@@ -1594,7 +1971,7 @@ mod tests {
             .unwrap();
         }
         let mut cache = HashCache::default();
-        let observed = observe(&state, &mut cache);
+        let observed = look(&state, &mut cache);
         step(&state, &mut cache, false, &observed);
         let store = state.rt.store();
         let kept = store.get("kept.json").unwrap().revision;
@@ -1607,7 +1984,7 @@ mod tests {
             paths: ["a", "gone", "null"].map(|n| auth.join(format!("{n}.json"))).to_vec(),
             failure: Some(std::io::Error::from_raw_os_error(libc::EIO)),
         };
-        let observed = observe_listing(&state, &mut cache, partial());
+        let observed = observe_listing(&state, &mut cache, partial()).snapshot;
         assert_eq!(
             observed
                 .auth

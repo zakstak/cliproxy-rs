@@ -2787,7 +2787,10 @@ impl CredentialStore {
                 }
                 // The scan's own rule: a FIFO or device in the file's place is never read
                 // (it could block or never end) and counts as a changed file.
-                let on_disk: Option<[u8; 32]> = match cpa_core::config::credentials::read_auth_file(path) {
+                let file = cpa_core::config::credentials::read_auth_file(path);
+                #[cfg(test)]
+                let file = crate::watching::faults::read(crate::watching::faults::Stage::Freshness, path, file);
+                let on_disk: Option<[u8; 32]> = match file {
                     AuthFile::Bytes(data) if !data.is_empty() => Some(Sha256::digest(&data).into()),
                     _ => None,
                 };

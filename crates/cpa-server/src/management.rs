@@ -221,10 +221,14 @@ impl Management {
     /// has one; its file hashes keep a stale scan from undoing a later write (Go
     /// c4c1d43e). Callers hold `disk`. Infallible on purpose: access settings of a
     /// valid config (a rotated or removed secret) always take effect.
-    pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) {
+    ///
+    /// Returns the files whose scanned credential was not applied because the freshness
+    /// check rejected it (the file changed, went or could not be read since the scan),
+    /// or `None` when the config was refused and nothing was published.
+    pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) -> Option<Vec<PathBuf>> {
         // Nothing below is applied for a config the runtime would refuse to publish.
         if !Runtime::accepts_config(&cfg) {
-            return;
+            return None;
         }
         let mut cfg = cfg;
         self.lock_auth_dir(&mut cfg);
@@ -309,6 +313,7 @@ impl Management {
         }
         // Go's watcher calls redisqueue.NotifyUsageRefresh after every client reload.
         self.rt.usage_queue().notify_usage_refresh();
+        Some(rejected)
     }
 }
 
