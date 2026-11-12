@@ -8,7 +8,6 @@ use chrono::{Local, TimeDelta};
 use cpa_core::config::Config;
 use cpa_core::exec::{ExecError, FailureScope};
 use cpa_core::gostr::GoStr;
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use url::Url;
 
@@ -613,18 +612,99 @@ impl Tokens {
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    #[serde(default)]
-    access_token: String,
-    #[serde(default)]
-    refresh_token: String,
-    #[serde(default)]
-    id_token: String,
-    #[serde(default)]
-    scope: String,
-    #[serde(default)]
-    expires_in: i64,
+/// The longest `expires_in` a token file can carry: Go's `time.Duration` in whole
+/// seconds. Go-compatible readers of the same file compute the expiry with it, and a
+/// longer lifetime would print a year past 9999, which `time.Parse` cannot read back.
+const MAX_EXPIRES_IN: u64 = (i64::MAX / 1_000_000_000) as u64;
+
+/// A 200 answer of the SIWC token endpoint, read at the boundary at `now`, as OpenAI's
+/// token reference documents it: `access_token`, `refresh_token`, `id_token`,
+/// `token_type`, `expires_in` (`3600`: whole seconds), `scope` and
+/// `earliest_refresh_at`. Each successful refresh returns a replacement refresh token,
+/// so one is required. `exchange` is the code exchange, which must also carry the ID
+/// token and the granted scope.
+///
+/// A refresh asks with no `scope`, which keeps the grant (OpenAI "Accounts and
+/// sessions", "omit scope to retain the grant"), and RFC 6749 §5.1 lets the answer omit
+/// a scope identical to the one requested: an absent `scope` keeps the partition's
+/// stored one ([`refresh_patch`] merges over it). A present scope must still hold
+/// `chatgpt.tokens.use.direct`. `expires_in` is a positive JSON integer no longer than
+/// [`MAX_EXPIRES_IN`]: a decimal, exponent or string spelling is not the documented
+/// form, and none is coerced (Go v8.0.67 09b3a579 accepts them). `token_type` has no
+/// documented constraint, and `earliest_refresh_at` has no documented format or meaning,
+/// so neither is read, and the latter is not persisted (#92).
+pub(crate) fn token_response(
+    body: &[u8],
+    client_id: &str,
+    device_id: &str,
+    exchange: bool,
+    now: chrono::DateTime<Local>,
+) -> Result<Tokens, ExecError> {
+    let Ok(Value::Object(answer)) = serde_json::from_slice::<Value>(body) else {
+        return Err(siwc_error(502, "failed to parse SIWC token response"));
+    };
+    let invalid = |field: &str| siwc_error(502, &format!("OpenAI OAuth token response has invalid {field}"));
+    let token = |field: &str| match answer.get(field) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+        _ => Err(invalid(field)),
+    };
+    let access_token = token("access_token")?;
+    let refresh_token = token("refresh_token")?;
+    let id_token = match answer.get("id_token") {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return Err(invalid("id_token")),
+    };
+    if exchange && id_token.trim().is_empty() {
+        return Err(siwc_error(
+            502,
+            "OpenAI OAuth token response did not contain an ID token",
+        ));
+    }
+    let scope = match answer.get("scope") {
+        None if !exchange => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        _ => return Err(invalid("scope")),
+    };
+    let expires_in = answer
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .filter(|s| (1..=MAX_EXPIRES_IN).contains(s))
+        .ok_or_else(|| invalid("expires_in"))?;
+    let scopes: Vec<String> = scope
+        .iter()
+        .flat_map(|s| s.split_whitespace())
+        .map(str::to_owned)
+        .collect();
+    if scope.is_some() && !scopes.iter().any(|s| s == DIRECT_TOKEN_SCOPE) {
+        return Err(siwc_error(
+            502,
+            &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}"),
+        ));
+    }
+    // In range by MAX_EXPIRES_IN: some 292 years.
+    let lifetime = TimeDelta::seconds(expires_in as i64);
+    let ttl = match lifetime - EXPIRY_MARGIN {
+        ttl if ttl > TimeDelta::zero() => ttl,
+        _ => lifetime,
+    };
+    let at = |delta: TimeDelta| {
+        now.checked_add_signed(delta)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .ok_or_else(|| invalid("expires_in"))
+    };
+    Ok(Tokens {
+        access_token,
+        refresh_token,
+        id_token,
+        client_id: client_id.trim().to_owned(),
+        scope: scope.unwrap_or_default(),
+        scopes,
+        expired: at(ttl)?,
+        expires_at: at(lifetime)?,
+        last_refresh: at(TimeDelta::zero())?,
+        device_id: device_id.trim().to_owned(),
+    })
 }
 
 fn siwc_error(status: u16, message: &str) -> ExecError {
@@ -668,47 +748,13 @@ impl CodexOAuth {
         if status != 200 {
             return Err(siwc_error(status, &format!("OpenAI OAuth token request failed ({status})")).into());
         }
-        let parsed: TokenResponse =
-            serde_json::from_slice(&body).map_err(|_| siwc_error(502, "failed to parse SIWC token response"))?;
-        let invalid = |field: &str| siwc_error(502, &format!("OpenAI OAuth token response has invalid {field}"));
-        if parsed.access_token.trim().is_empty() {
-            return Err(invalid("access_token").into());
-        }
-        if parsed.refresh_token.trim().is_empty() {
-            return Err(invalid("refresh_token").into());
-        }
-        if require_id_token && parsed.id_token.trim().is_empty() {
-            return Err(siwc_error(502, "OpenAI OAuth token response did not contain an ID token").into());
-        }
-        if parsed.scope.trim().is_empty() {
-            return Err(invalid("scope").into());
-        }
-        if parsed.expires_in <= 0 {
-            return Err(invalid("expires_in").into());
-        }
-        let scopes: Vec<String> = parsed.scope.split_whitespace().map(str::to_owned).collect();
-        if !scopes.iter().any(|s| s == DIRECT_TOKEN_SCOPE) {
-            return Err(siwc_error(502, &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}")).into());
-        }
-        let now = Local::now();
-        let lifetime = TimeDelta::try_seconds(parsed.expires_in).unwrap_or(TimeDelta::MAX);
-        let ttl = match lifetime - EXPIRY_MARGIN {
-            ttl if ttl > TimeDelta::zero() => ttl,
-            _ => lifetime,
-        };
-        let rfc3339 = |t: chrono::DateTime<Local>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        Ok(Tokens {
-            access_token: parsed.access_token,
-            refresh_token: parsed.refresh_token,
-            id_token: parsed.id_token,
-            client_id: client_id.trim().to_owned(),
-            scope: parsed.scope.trim().to_owned(),
-            scopes,
-            expired: rfc3339(now.checked_add_signed(ttl).unwrap_or(now)),
-            expires_at: rfc3339(now.checked_add_signed(lifetime).unwrap_or(now)),
-            last_refresh: rfc3339(now),
-            device_id: device_id.trim().to_owned(),
-        })
+        Ok(token_response(
+            &body,
+            client_id,
+            device_id,
+            require_id_token,
+            Local::now(),
+        )?)
     }
 
     /// Go `ExchangeSIWCCodeForTokens`: the issued client ID from the callback, never the

@@ -255,8 +255,10 @@ struct Refreshes {
 
 /// Single-flights `run` per `key` on `table`, detached from the caller so a cancelled
 /// request cannot strand a rotated token. A success is retained for 5 minutes, so a stale
-/// snapshot cannot send the rotated refresh token again; a failure only when
-/// `retain_failures` (the outer tokens' backoff).
+/// snapshot cannot send the rotated refresh token again; a transient failure only when
+/// `retain_failures` (the outer tokens' backoff, and a scheduled SIWC refresh's). A
+/// caller that does not retain failures does not take a retained one either: it asks
+/// again.
 fn single_flight<T: Clone + Send + Sync + 'static>(
     table: &Table<T>,
     key: [u8; 32],
@@ -266,7 +268,10 @@ fn single_flight<T: Clone + Send + Sync + 'static>(
     let mut locked = table.lock().expect("refresh table");
     locked.retain(|_, (until, _)| *until > Instant::now());
     if let Some((_, result)) = locked.get(&key) {
-        return result.clone();
+        let retained_failure = result.peek().is_some_and(|r| r.as_ref().is_err_and(|e| !e.terminal));
+        if retain_failures || !retained_failure {
+            return result.clone();
+        }
     }
     // Retained results are a cache, not an admission limit: evict the oldest completed
     // ones. In-flight entries are bounded by the credential count.
@@ -449,6 +454,14 @@ impl CodexOAuth {
         let id_token = parsed.id_token.unwrap_or_default();
         let claims = parse_jwt(&id_token).unwrap_or_default();
         let expires = chrono::TimeDelta::try_seconds(parsed.expires_in.unwrap_or(0)).unwrap_or_default();
+        // An expiry chrono cannot hold leaves `expired` empty, so the access token's JWT
+        // `exp`, else `last_refresh`, schedules the next refresh ([`expiry`]). Adding it
+        // unchecked panicked inside the detached refresh task and lost the rotated token
+        // the endpoint had just issued (#92).
+        let expired = Local::now()
+            .checked_add_signed(expires)
+            .map(rfc3339)
+            .unwrap_or_default();
         Ok(Tokens {
             plan_type: claims.plan_type(),
             account_id: claims.account_id,
@@ -456,7 +469,7 @@ impl CodexOAuth {
             id_token,
             access_token: parsed.access_token.unwrap_or_default(),
             refresh_token: parsed.refresh_token.unwrap_or_default(),
-            expired: rfc3339(Local::now() + expires),
+            expired,
         })
     }
 
@@ -497,12 +510,31 @@ impl CodexOAuth {
     }
 
     /// `RefreshSIWCTokensWithRetry(ctx, token, client, device, 3)`: the `siwc`
-    /// partition's refresh grant, single-flighted per client ID and refresh token.
+    /// partition's refresh grant, single-flighted per client ID and refresh token. An
+    /// explicit refresh: a transient failure is not retained, so the next one asks again
+    /// (Go's singleflight forgets it).
     pub async fn refresh_siwc(
         &self,
         refresh_token: &str,
         client_id: &str,
         device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, GrantError> {
+        self.refresh_siwc_as(refresh_token, client_id, device_id, false).await
+    }
+
+    /// [`Self::refresh_siwc`]. A `scheduled` refresh (a due one) retains a transient
+    /// failure for five minutes, as every outer refresh does. A due refresh that fails
+    /// while the token requests use is still valid is tolerated
+    /// ([`crate::codex_refresh::Refresher::prepare`]), and the scheduler looks again after
+    /// 30 s, so without it the same refresh token was sent three times every 30 s for as
+    /// long as the token endpoint failed. OpenAI asks for backoff on temporary failures
+    /// ("SIWC errors and recovery") (#92).
+    pub(crate) async fn refresh_siwc_as(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+        scheduled: bool,
     ) -> Result<crate::codex_siwc::Tokens, GrantError> {
         let (refresh_token, client_id) = (refresh_token.trim(), client_id.trim());
         if refresh_token.is_empty() {
@@ -519,7 +551,7 @@ impl CodexOAuth {
         let oauth = self.clone();
         let (token, client, device) = (refresh_token.to_owned(), client_id.to_owned(), device_id.to_owned());
         let run = async move { oauth.refresh_siwc_with_retry(&token, &client, &device).await }.boxed();
-        single_flight(&self.refreshes.siwc, key, run, false).await
+        single_flight(&self.refreshes.siwc, key, run, scheduled).await
     }
 
     async fn refresh_siwc_with_retry(

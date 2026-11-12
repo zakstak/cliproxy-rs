@@ -146,7 +146,7 @@ impl Refresher {
     /// Refreshes the due partitions. Go refreshes Codex only in the background and never
     /// blocks a request on it, so a failed refresh while the token requests use is still
     /// valid keeps the credential usable; the failure is cached for five minutes by the
-    /// OAuth service.
+    /// OAuth service, for each token set.
     pub async fn prepare(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let now = Utc::now();
         let (outer, siwc) = due_partitions(credential, now);
@@ -164,7 +164,7 @@ impl Refresher {
         if !outer && !siwc {
             return (Ok(MetadataPatch::default()), Refused::default());
         }
-        let grants = self.grants(credential, outer, siwc).await;
+        let grants = self.grants(credential, outer, siwc, true).await;
         let refused = grants.refused;
         (Self::tolerate(credential, now, grants.result(credential)), refused)
     }
@@ -200,13 +200,13 @@ impl Refresher {
     /// that can (Go's explicit unscheduled refresh). Nothing without a refresh token.
     pub async fn refresh_now(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let (outer, siwc) = rejected_partitions(credential, credential, &DiskRotation::default(), Utc::now());
-        self.grants(credential, outer, siwc).await.result(credential)
+        self.grants(credential, outer, siwc, false).await.result(credential)
     }
 
     /// A management refresh (Go `IsForceRefreshContext`): every partition that can refresh.
     pub async fn refresh_all(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let (outer, siwc) = all_partitions(credential, Utc::now());
-        self.grants(credential, outer, siwc).await.result(credential)
+        self.grants(credential, outer, siwc, false).await.result(credential)
     }
 
     /// Go `refreshLocked` with the credential file (`disk`) read under its lock: a token
@@ -245,7 +245,7 @@ impl Refresher {
         let (refreshed, now_refused) = match mode {
             RefreshMode::Due => self.refresh_due(&adopted, outer, siwc, now).await,
             _ => {
-                let grants = self.grants(&adopted, outer, siwc).await;
+                let grants = self.grants(&adopted, outer, siwc, false).await;
                 let refused = grants.refused;
                 (grants.result(&adopted), refused)
             }
@@ -278,8 +278,10 @@ impl Refresher {
     /// Go `refreshLocked`: the outer tokens, then the Sign in with ChatGPT partition, one
     /// after the other, each with its own outcome: a partition that fails while the other
     /// refreshes keeps the other's patch, and each refresh token refused for good is
-    /// recorded for its partition alone.
-    async fn grants(&self, credential: &Credential, outer: bool, siwc: bool) -> Grants {
+    /// recorded for its partition alone. A `scheduled` (due) refresh retains a transient
+    /// SIWC failure for five minutes, as every outer failure is
+    /// ([`CodexOAuth::refresh_siwc_as`]).
+    async fn grants(&self, credential: &Credential, outer: bool, siwc: bool, scheduled: bool) -> Grants {
         let outer_token = codex_oauth::refresh_token(credential);
         let outer = if outer {
             Some(self.oauth.refresh_patch(outer_token).await)
@@ -290,7 +292,7 @@ impl Refresher {
         let siwc = if siwc {
             Some(
                 self.oauth
-                    .refresh_siwc(siwc_token, client, device)
+                    .refresh_siwc_as(siwc_token, client, device, scheduled)
                     .await
                     .map(|tokens| crate::codex_siwc::refresh_patch(credential, &tokens)),
             )
