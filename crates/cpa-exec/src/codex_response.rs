@@ -53,7 +53,9 @@ pub(crate) fn is_capacity(body: &str) -> bool {
         })
 }
 
-/// `codexStatusErrorClassification`.
+/// `codexStatusErrorClassification`, except that a 5xx is never a context-window failure:
+/// first-party Codex keeps a 5xx transient whatever its code (FP2, `crate::codex_terminal`,
+/// docs/DIFFERENCES-FROM-GO.md).
 pub(crate) fn classification(status: u16, body: &str) -> Option<(&'static str, &'static str)> {
     let mut message = lower(&rawjson::get(body, "error.message"));
     if message.is_empty() {
@@ -63,13 +65,14 @@ pub(crate) fn classification(status: u16, body: &str) -> Option<(&'static str, &
     let code = lower(&rawjson::get(body, "error.code"));
     let kind = lower(&rawjson::get(body, "error.type"));
     let invalid = kind.is_empty() || kind == "invalid_request_error";
-    if status == 413
-        || code == "context_length_exceeded"
-        || code == "context_too_large"
-        || (invalid
-            && ["context length", "context_length", "maximum context", "too many tokens"]
-                .iter()
-                .any(|s| message.contains(s)))
+    if status < 500
+        && (status == 413
+            || code == "context_length_exceeded"
+            || code == "context_too_large"
+            || (invalid
+                && ["context length", "context_length", "maximum context", "too many tokens"]
+                    .iter()
+                    .any(|s| message.contains(s))))
     {
         return Some(("context_too_large", "invalid_request_error"));
     }
@@ -150,9 +153,13 @@ fn usage_retry_after(status: u16, body: &str, now: SystemTime) -> Option<Duratio
 }
 
 /// `clienterror.IsRequestFault`: the caller's request is wrong; no credential can help.
+/// First-party Codex terminal rejections decide first (FP2, `crate::codex_terminal`).
 pub(crate) fn request_fault(status: u16, body: &str) -> bool {
     if status == 402 || status == 429 {
         return false;
+    }
+    if let Some(fault) = crate::codex_terminal::request_fault(status, body) {
+        return fault;
     }
     let field = |paths: &[&str]| {
         paths
@@ -366,13 +373,24 @@ fn terminal_status(body: &str) -> u16 {
 
 /// `codexTerminalFailureErrWithCooling`: an in-stream failure event as an error, with the
 /// body it was built from.
+///
+/// A first-party terminal request rejection takes the status first-party Codex pairs it
+/// with (`crate::codex_terminal::status_for`), whatever status the error object itself
+/// names: first-party Codex reads an `error` or `response.failed` event without any
+/// status (`sse/responses.rs:379-383` and `sse/responses_error.rs:32` at 5c3ff1dabf64).
+/// It is a request fault, so the request stops on this account (FP2).
 pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
     let body = terminal_failure_body(event)?;
     let stream_handled = context_length(&body)
         || is_usage_limit(&body)
         || is_capacity(&body)
         || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
-    let status = if stream_handled { 400 } else { terminal_status(&body) };
+    let first_party = crate::codex_terminal::status_for(rawjson::get(&body, "error.code").str());
+    let status = match first_party {
+        Some(status) => status,
+        None if stream_handled => 400,
+        None => terminal_status(&body),
+    };
     Some((
         status_error(status, body.as_bytes(), HeaderMap::new(), model_level_cooling),
         body,
@@ -1068,6 +1086,169 @@ mod bufferable_tests {
             r#"{"type":"response.metadata.unknown"}"#,
         ] {
             assert!(!bufferable(released), "{released}");
+        }
+    }
+}
+
+/// FP2 (#116): first-party Codex terminal rejections at research main
+/// `5c3ff1dabf644169f4bd74b215719f381e4fdb3f` (`codex-api/src/error.rs:92-162`,
+/// `api_bridge.rs:130-312`, `sse/responses.rs:375-450`, `responses_websocket.rs:747-806`)
+/// on each surface a Codex failure reaches the executor by: an HTTP status, an in-stream
+/// `error` or `response.failed` event without a status, and a wrapped WebSocket status
+/// frame. Each case keeps the provider's bytes; only the classification is asserted.
+#[cfg(test)]
+mod first_party_terminal_tests {
+    use super::*;
+
+    /// Each terminal code with the status first-party Codex pairs it with.
+    const CODES: [(&str, u16); 5] = [
+        ("inference_hook_denied", 403),
+        ("access_program_not_enabled", 403),
+        ("content_policy_violation", 400),
+        ("invalid_access_program", 400),
+        ("unsupported_access_program", 400),
+    ];
+
+    fn http(status: u16, body: &str) -> ExecError {
+        status_error(status, body.as_bytes(), HeaderMap::new(), false)
+    }
+
+    fn error_object(code: &str) -> String {
+        format!(r#"{{"code":"{code}","message":"denied by policy","param":"input","future_field":{{"n":1.50}}}}"#)
+    }
+
+    /// An HTTP rejection with its first-party status stops on this account: a request
+    /// fault, never a cooldown or a failover, and its body is not rewritten. The same code
+    /// on a 503 keeps Go's transient credential failure.
+    #[test]
+    fn http_rejections_stop_on_the_account_with_their_bytes() {
+        for (code, status) in CODES {
+            let body = format!(r#"{{"error":{}}}"#, error_object(code));
+            let error = http(status, &body);
+            assert_eq!((error.status, error.scope), (status, FailureScope::Request), "{code}");
+            assert_eq!(error.body, body.as_bytes(), "{code}: the provider's body");
+            assert_eq!(error.retry_after, None, "{code}");
+            let error = http(503, &body);
+            assert_eq!(
+                (error.status, error.scope),
+                (503, FailureScope::Credential),
+                "{code} on a 503"
+            );
+        }
+    }
+
+    /// `error.rs:110-112`: `context_length_exceeded` is a context-window failure only
+    /// with 400 (or without a status, below). A 5xx keeps its transient meaning and its
+    /// body: Go's rewrite to `context_too_large` stops at 5xx, whether the code or a
+    /// context message would have matched, and the code no longer makes a 5xx a request
+    /// fault, even beside Anthropic's `invalid_request_error` type.
+    #[test]
+    fn a_context_labelled_server_failure_stays_transient() {
+        let coded = r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#;
+        let error = http(400, coded);
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+        assert_eq!(
+            rawjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large"
+        );
+        for body in [
+            coded,
+            r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":null}}"#,
+            r#"{"error":{"message":"maximum context length is 400000 tokens"}}"#,
+        ] {
+            for status in [500, 502, 503, 504] {
+                let error = http(status, body);
+                assert_eq!(
+                    (error.status, error.scope),
+                    (status, FailureScope::Credential),
+                    "{status} {body}"
+                );
+                assert_eq!(
+                    error.body,
+                    body.as_bytes(),
+                    "{status} {body}: not a fabricated context failure"
+                );
+            }
+        }
+    }
+
+    /// `sse/responses.rs:379-383` and `responses_error.rs:32`: an in-stream rejection has
+    /// no status, so it takes the code's first-party status whatever status its error
+    /// object names, and ends the request on this account. The first-party test's retry
+    /// header (`responses_error_tests.rs` `terminal_failure_with_retry_header_ends_stream_immediately`)
+    /// gives no retry delay.
+    #[test]
+    fn in_stream_rejections_take_the_first_party_status() {
+        for (code, status) in CODES {
+            for error in [
+                error_object(code),
+                format!(r#"{{"code":"{code}","plan_type":42,"headers":{{"retry-after":"300"}}}}"#),
+                format!(r#"{{"code":"{code}","status":503,"message":"m"}}"#),
+            ] {
+                for event in [
+                    format!(r#"{{"type":"error","error":{error},"sequence_number":4}}"#),
+                    format!(
+                        r#"{{"type":"response.failed","response":{{"id":"resp_1","status":"failed","error":{error}}}}}"#
+                    ),
+                ] {
+                    let (failure, body) = terminal_failure(&event, false).unwrap();
+                    assert_eq!(
+                        (failure.status, failure.scope),
+                        (status, FailureScope::Request),
+                        "{event}"
+                    );
+                    assert_eq!(failure.retry_after, None, "{event}");
+                    assert_eq!(rawjson::get(&body, "error.code").str(), code, "{event}");
+                    if error.contains(r#""message""#) {
+                        // The classified body keeps the error object as sent. Without a
+                        // message, Go's body names the code as its message.
+                        assert_eq!(rawjson::get(&body, "error").json(), error, "{event}");
+                    }
+                }
+            }
+        }
+        // The in-stream context failure is unchanged: no status, so a context failure.
+        for event in [
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"context_length_exceeded","message":"too long"}}}"#,
+            r#"{"type":"error","error":{"code":"context_length_exceeded","status":503}}"#,
+        ] {
+            let (failure, _) = terminal_failure(event, false).unwrap();
+            assert_eq!((failure.status, failure.scope), (400, FailureScope::Request), "{event}");
+        }
+    }
+
+    /// `responses_websocket.rs:1416-1439` (fixture `ws-error-context-length-status`): a
+    /// wrapped status frame reads like the HTTP status it carries. The 400 is a context
+    /// failure; the 503 is a transient credential failure another account may serve. A
+    /// wrapped 403 rejection is a request fault whose frame a native client never receives
+    /// (the 403 account guard, #6); a wrapped 400 one keeps its delivery.
+    #[test]
+    fn wrapped_websocket_status_frames_follow_the_http_rules() {
+        let frames: Vec<String> = crate::codex_contract::fixture("ws-error-context-length-status")
+            .frames()
+            .iter()
+            .map(|f| String::from_utf8(f.to_vec()).unwrap())
+            .collect();
+        let [context, unavailable] = &frames[..] else {
+            panic!("{frames:?}")
+        };
+        let error = crate::codex_ws::ws_error(context, false).unwrap();
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+        let error = crate::codex_ws::ws_error(unavailable, false).unwrap();
+        assert_eq!((error.status, error.scope), (503, FailureScope::Credential));
+        assert!(!request_fault(503, &String::from_utf8_lossy(&error.body)));
+        for (code, status) in CODES {
+            let frame = format!(r#"{{"type":"error","status":{status},"error":{}}}"#, error_object(code));
+            let error = crate::codex_ws::ws_error(&frame, false).unwrap();
+            assert_eq!((error.status, error.scope), (status, FailureScope::Request), "{frame}");
+            let event = crate::codex_event::decode(&frame);
+            let crate::codex_ws::Reading::Failure { error, .. } =
+                crate::codex_ws::reading(&frame, event.as_ref(), false)
+            else {
+                panic!("{frame}: not a failure")
+            };
+            assert_eq!(error.scope, FailureScope::Request, "{frame}");
+            assert_eq!(error.withheld(), status == 403, "{frame}: the account guard");
         }
     }
 }

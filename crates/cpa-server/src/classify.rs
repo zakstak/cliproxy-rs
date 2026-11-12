@@ -177,10 +177,17 @@ pub fn is_credit_balance_too_low(status: u16, text: &str) -> bool {
     })
 }
 
-/// `clienterror.IsRequestFault`.
+/// `clienterror.IsRequestFault`. First-party Codex terminal rejections decide first
+/// (FP2, `cpa_exec::codex_terminal::request_fault`): an inference-hook, content-policy or
+/// access-program rejection with the status first-party Codex pairs it with is a request
+/// fault, and `context_length_exceeded` with a 5xx is not. The codes are OpenAI's, so
+/// they decide for every retained provider (docs/DIFFERENCES-FROM-GO.md).
 pub fn is_request_fault(status: u16, text: &str) -> bool {
     if status == 402 || status == 429 || is_credit_balance_too_low(status, text) {
         return false;
+    }
+    if let Some(fault) = cpa_exec::codex_terminal::request_fault(status, text) {
+        return fault;
     }
     let body = json_body(text);
     if let Some(body) = &body
@@ -772,6 +779,47 @@ mod tests {
         let transport = ExecError::local(502, FailureScope::Transport, "reset");
         assert!(!is_request_invalid(&transport) && is_retry_round(&transport));
         assert_eq!(response_status(&transport), 500);
+    }
+
+    /// FP2 (#116), first-party Codex at 5c3ff1dabf64: a terminal request rejection with
+    /// the status first-party Codex pairs it with stops the request without a cooldown,
+    /// though a 403 is otherwise a credential retry round; with another status Go's rules
+    /// keep deciding. A context-labelled 5xx keeps its transient meaning even with
+    /// Anthropic's `invalid_request_error` type, which Go reads as a request fault on any
+    /// status. A workspace 403 stays the account's failure.
+    #[test]
+    fn first_party_codex_terminal_rejections_decide_before_go() {
+        for (status, code) in [
+            (403, "inference_hook_denied"),
+            (403, "access_program_not_enabled"),
+            (400, "content_policy_violation"),
+            (400, "invalid_access_program"),
+            (400, "unsupported_access_program"),
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"denied","param":null}}}}"#);
+            let error = upstream(status, &body);
+            assert!(is_request_invalid(&error), "{status} {code}");
+            assert!(skips_cooldown(&error), "{status} {code}");
+            assert!(is_request_fault(status, &body), "{status} {code}");
+            assert!(!is_request_fault(503, &body), "{code} on a 503");
+        }
+        for body in [
+            r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
+            r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error"}}"#,
+            r#"{"status":503,"error":{"code":"context_length_exceeded"}}"#,
+        ] {
+            for status in [500, 502, 503, 504] {
+                let error = upstream(status, body);
+                assert!(!is_request_invalid(&error), "{status} {body}");
+                assert!(!skips_cooldown(&error) && is_retry_round(&error), "{status} {body}");
+            }
+            assert!(is_request_invalid(&upstream(400, body)), "{body}");
+        }
+        for code in ["invalid_workspace_selected", "codex_workspace_access_denied"] {
+            let error = upstream(403, &format!(r#"{{"detail":{{"code":"{code}"}}}}"#));
+            assert!(!is_request_invalid(&error) && is_retry_round(&error), "{code}");
+            assert!(!is_unauthorized(&error), "{code}: no token refresh");
+        }
     }
 
     #[test]
