@@ -325,7 +325,9 @@ pub(crate) struct Cors;
 
 pub async fn cors(mut req: Request, next: Next) -> Response {
     req.extensions_mut().insert(Cors);
+    let mut preflight = None;
     let mut response = if req.method() == Method::OPTIONS {
+        preflight = Some(preflight_allow_headers(req.headers()));
         StatusCode::NO_CONTENT.into_response()
     } else {
         next.run(req).await
@@ -335,19 +337,77 @@ pub async fn cors(mut req: Request, next: Next) -> Response {
         response.headers_mut().remove(header::ALLOW);
     }
     cors_headers(&mut response);
+    if let Some(allow) = preflight {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow);
+    }
     response
 }
 
+/// Request headers that `Access-Control-Allow-Headers` names on every response, in
+/// Go v8.0.67's order (`corsAllowedRequestHeaders`, upstream 058b803b). Fetch
+/// classifies `Authorization` as a CORS non-wildcard request-header name, so a `*`
+/// never covers it in a preflight
+/// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>, steps 7.6 and 7.7).
+const ALLOWED_REQUEST_HEADERS: &str =
+    "Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version, Anthropic-Beta";
+
 /// The inner request-log snapshot must see CORS headers before axum framing.
+/// Only [`cors`] answers a preflight, so the request-independent list is right here.
 pub(crate) fn cors_headers(response: &mut Response) {
     let headers = response.headers_mut();
     for (name, value) in [
         ("Access-Control-Allow-Origin", "*"),
         ("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
-        ("Access-Control-Allow-Headers", "*"),
+        ("Access-Control-Allow-Headers", ALLOWED_REQUEST_HEADERS),
         ("Access-Control-Expose-Headers", EXPOSED_HEADERS),
     ] {
         headers.insert(name, HeaderValue::from_static(value));
+    }
+}
+
+/// Go v8.0.67 `corsAllowHeadersValue` for an OPTIONS request: the fixed list, then
+/// each name from `Access-Control-Request-Headers` the list lacks, in Go's canonical
+/// case. Echoing keeps arbitrary client headers allowed now that `*` is gone, with
+/// the same origin (`*`) and no credentials. Go echoes only the first header line
+/// and passes malformed names through; this reads every line and drops a name
+/// that is not an HTTP token, which a browser could not have sent and which would
+/// make the whole list unparsable to it. One pass with a hash set keeps the work
+/// linear in the header size, which an unauthenticated client controls.
+fn preflight_allow_headers(request: &HeaderMap) -> HeaderValue {
+    let mut seen: std::collections::HashSet<header::HeaderName> = ALLOWED_REQUEST_HEADERS
+        .split(", ")
+        .map(|name| header::HeaderName::from_bytes(name.as_bytes()).expect("fixed token"))
+        .collect();
+    let mut out = String::from(ALLOWED_REQUEST_HEADERS);
+    for line in request.get_all(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+        for raw in line.as_bytes().split(|&b| b == b',') {
+            let raw = raw.trim_ascii();
+            // `HeaderName` accepts exactly the RFC 9110 token bytes, case-folded.
+            let Ok(name) = header::HeaderName::from_bytes(raw) else {
+                continue;
+            };
+            if seen.insert(name) {
+                out.push_str(", ");
+                push_canonical(&mut out, raw);
+            }
+        }
+    }
+    HeaderValue::try_from(out).expect("joined HTTP tokens are a valid header value")
+}
+
+/// Go `http.CanonicalHeaderKey` for a valid token: upper case at the start and after
+/// each `-`, lower case elsewhere. ASCII by definition of a token.
+fn push_canonical(out: &mut String, token: &[u8]) {
+    let mut upper = true;
+    for &b in token {
+        out.push(char::from(if upper {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        }));
+        upper = b == b'-';
     }
 }
 
@@ -458,5 +518,47 @@ mod tests {
             "a"
         );
         assert_eq!(get(&[("authorization", "raw")]), "raw");
+    }
+
+    fn preflight(lines: &[&str]) -> String {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                HeaderValue::from_str(line).unwrap(),
+            );
+        }
+        preflight_allow_headers(&headers).to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn preflight_names_fixed_headers_then_echoes_new_ones_once() {
+        assert_eq!(preflight(&[]), ALLOWED_REQUEST_HEADERS);
+        // Known names, in any case, are not repeated; new names keep request order.
+        assert_eq!(
+            preflight(&["AUTHORIZATION,content-type, x-stainless-os ,X-STAINLESS-OS,x-b"]),
+            format!("{ALLOWED_REQUEST_HEADERS}, X-Stainless-Os, X-B")
+        );
+        // Every request line counts; empty items and non-token names are dropped.
+        assert_eq!(
+            preflight(&["x-a,, ,bad name,b@d,\"q\"", "x-a, x-c"]),
+            format!("{ALLOWED_REQUEST_HEADERS}, X-A, X-C")
+        );
+        // Go `CanonicalHeaderKey` on a valid token, including leading and doubled `-`.
+        assert_eq!(
+            preflight(&["-x--Y_z.9"]),
+            format!("{ALLOWED_REQUEST_HEADERS}, -X--Y_z.9")
+        );
+    }
+
+    #[test]
+    fn preflight_echo_stays_linear_on_a_hostile_header() {
+        // 40k repeats of one name and 10k distinct names: one hash set pass.
+        let repeated = vec!["x-same"; 40_000].join(",");
+        assert_eq!(preflight(&[&repeated]), format!("{ALLOWED_REQUEST_HEADERS}, X-Same"));
+        let distinct: Vec<String> = (0..10_000).map(|i| format!("x-h{i}")).collect();
+        let out = preflight(&[&distinct.join(",")]);
+        assert_eq!(out.matches(", X-H").count(), 10_000);
+        assert!(out.ends_with(", X-H9999"));
     }
 }

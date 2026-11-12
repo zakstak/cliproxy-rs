@@ -670,7 +670,9 @@ async fn a_socket_dropped_without_a_close_frame_reads_as_close_1006() {
         .await
         .expect("the turn ends with the dropped socket");
     let error = events.last().unwrap().as_ref().expect_err("the turn fails");
-    assert_eq!(error.scope, FailureScope::Transport, "{error}");
+    // N1 #111 W1: the request was written, so the loss is uncertain: request-scoped,
+    // never failed over.
+    assert_eq!(error.scope, FailureScope::Request, "{error}");
     assert!(
         String::from_utf8_lossy(&error.body).contains("websocket: close 1006 (abnormal closure): unexpected EOF"),
         "{error}"
@@ -696,13 +698,15 @@ async fn pings_do_not_extend_the_idle_deadline() {
         .unwrap()
         .as_ref()
         .expect_err("the turn ends with the timeout");
-    assert_eq!(error.scope, FailureScope::Transport);
+    // The request was written: an idle timeout is an uncertain loss (N1 #111 W1).
+    assert_eq!(error.scope, FailureScope::Request);
     assert!(String::from_utf8_lossy(&error.body).contains("idle timeout"), "{error}");
 }
 
 /// A socket whose upstream stopped reading (half-open) fails the write after the write
-/// bound instead of holding the turn until the read deadline; the one retry on a fresh
-/// socket is bounded the same way.
+/// bound instead of holding the turn until the read deadline. Part of the frame may
+/// have reached the upstream, so the request is never sent again: no fresh socket, and a
+/// request-scoped failure that does not fail over (N1 #111 W1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_the_upstream_never_reads_times_out() {
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -742,7 +746,7 @@ async fn a_write_the_upstream_never_reads_times_out() {
     let Err(error) = result else {
         panic!("a write that never completes fails the turn");
     };
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(error.body, "codex websockets executor: write timed out");
     // The request log learns it was the proxy's own bound, and for how large a frame
     // (whole seconds at this rate round up to 1 s, past the 300 ms floor).
@@ -757,8 +761,8 @@ async fn a_write_the_upstream_never_reads_times_out() {
     );
     assert_eq!(
         dials.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "one retry on a fresh socket"
+        1,
+        "a partial write is never retried"
     );
     assert_eq!(
         WRITE_LIMIT.deadline(1 << 20),
@@ -813,7 +817,17 @@ async fn reader_failure_before_the_turn_activates_fails_the_turn() {
         .await
         .expect("the turn must not hang on a dead socket");
         let error = outcome.expect("the turn fails");
-        assert_eq!(error.scope, FailureScope::Transport, "{error}");
+        // Either the reader's loss was recorded before every write, so the frame
+        // provably never left (the transport failure may fail over), or a write raced
+        // the reader and the loss is uncertain (request-scoped, never failed over).
+        assert!(
+            matches!(error.scope, FailureScope::Transport | FailureScope::Request),
+            "{error}"
+        );
+        assert!(
+            error.scope == FailureScope::Request || String::from_utf8_lossy(&error.body).contains("unexpected binary"),
+            "{error}"
+        );
     }
 }
 
@@ -1224,14 +1238,14 @@ async fn capture_keeps_why_a_socket_ended() {
     }
 
     let (error, text, cause) = read_failure(vec![Act::SendClose(vec![CREATED], 1011)], None).await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request, "an uncertain loss (N1 #111 W1)");
     assert_eq!(text, "websocket: close 1011 (internal server error): bye");
     assert_eq!(cause, "remote_close: code 1011");
 
     // gorilla's text for a peer that vanished is close 1006, which no peer can send:
     // the cause says it was an end of stream, not a close frame.
     let (error, text, cause) = read_failure(vec![Act::SendDrop(vec![CREATED])], None).await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(text, "websocket: close 1006 (abnormal closure): unexpected EOF");
     assert!(cause.starts_with("eof"), "{cause}");
 
@@ -1240,7 +1254,7 @@ async fn capture_keeps_why_a_socket_ended() {
         Some(Duration::from_millis(300)),
     )
     .await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(text, "codex websockets executor: read idle timeout");
     assert_eq!(cause, "local_timeout: no application message within 300ms");
 }
@@ -1928,10 +1942,12 @@ fn returned_handshake_drops_the_model_the_proxy_rewrote() {
     assert_eq!(rewritten.get("x-codex-turn-state").unwrap(), "ts");
 }
 
-/// #3: a send that fails on the socket the turn just opened is retried once on a fresh
-/// socket, and the turn returns the fresh socket's handshake. The client's
-/// `response.metadata` comes from the socket that serves the turn, never from the one
-/// whose write failed.
+/// #3: a send that provably never left the socket the turn got (its reader already
+/// recorded the loss) is retried once on a fresh socket, and the turn returns the fresh
+/// socket's handshake. The client's `response.metadata` comes from the socket that
+/// serves the turn, never from the one whose write failed. A write that may have sent
+/// part of the frame is never retried (N1 #111 W1,
+/// `a_write_the_upstream_never_reads_times_out`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1972,20 +1988,14 @@ async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let mut executor = CodexExecutor::new().unwrap();
-    // Long enough for the fresh socket to take the whole frame in a debug build.
-    executor.ws = Arc::new(Pool::with_write(WriteLimit {
-        floor: Duration::from_secs(3),
-        rate: usize::MAX,
-    }));
-    // Far larger than loopback socket buffers, so the first write cannot finish.
-    let body = format!(
-        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
-        "x".repeat(32 << 20)
-    );
+    let executor = CodexExecutor::new().unwrap();
+    // The session holds the first socket, whose reader recorded a loss the session has
+    // not dropped yet: a write there provably sends nothing.
+    let stale = pooled(&executor, &url).await;
+    stale.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
     let response = tokio::time::timeout(
         Duration::from_secs(60),
-        executor.execute_in_session(&credential(&url), request(&body), &Config::default(), &session(false)),
+        executor.execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false)),
     )
     .await
     .expect("the retry ends the turn")
@@ -2146,10 +2156,10 @@ async fn a_reused_socket_repeats_only_its_own_upgrade_model() {
     assert_eq!(*frames.lock().unwrap(), sent, "only the client's frames, as sent");
 }
 
-/// #24 (refs #3): a later request whose send fails on the reused socket is retried on a
-/// fresh socket, which reports its own opening metadata: its new turn state, and no model
-/// when its upgrade had none (here a blank value). The replaced socket's model is never
-/// donated, then or on the next request.
+/// #24 (refs #3): a later request whose send provably never left the reused socket (its
+/// loss was already recorded) is retried on a fresh socket, which reports its own opening
+/// metadata: its new turn state, and no model when its upgrade had none (here a blank
+/// value). The replaced socket's model is never donated, then or on the next request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     let (url, dials, frames) = handshake_upstream(
@@ -2160,23 +2170,17 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
         true,
     )
     .await;
-    let mut executor = CodexExecutor::new().unwrap();
-    // Long enough for the fresh socket to take the whole frame in a debug build.
-    executor.ws = Arc::new(Pool::with_write(WriteLimit {
-        floor: Duration::from_secs(3),
-        rate: usize::MAX,
-    }));
+    let executor = CodexExecutor::new().unwrap();
     let (opening, _, _) = metadata_turn(&executor, &url, BODY, "gpt-fixture", false).await;
     assert_eq!(
         opening.as_deref(),
         Some(r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-old","openai-model":"gpt-old"}}"#)
     );
-    // Far larger than loopback socket buffers: the stalled socket cannot take it.
-    let large = format!(
-        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
-        "x".repeat(32 << 20)
-    );
-    let (retried, _, events) = metadata_turn(&executor, &url, &large, "gpt-fixture", false).await;
+    // The reused socket's reader recorded a loss the session has not dropped yet.
+    let reused = executor.ws.session("conn-1").current().expect("the reused socket");
+    reused.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
+    let next = r#"{"model":"gpt-fixture","input":[{"type":"message","role":"user","content":"again"}]}"#;
+    let (retried, _, events) = metadata_turn(&executor, &url, next, "gpt-fixture", false).await;
     assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2, "one fresh socket");
     assert_eq!(
         retried.as_deref(),
@@ -2189,11 +2193,11 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     assert_eq!(later, None, "the new socket has no model to repeat");
     assert!(headers.is_empty(), "{headers:?}");
     assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // The stalled socket read only the first frame; the fresh one read the retried frame
+    // The stale socket read only the first frame; the fresh one read the retried frame
     // once and then the continuation.
     let received = frames.lock().unwrap();
     assert_eq!(received.len(), 3);
-    assert!(received[1].len() > 32 << 20);
+    assert!(received[1].contains("again"));
     assert!(received[2].contains(r#""previous_response_id":"r1""#));
 }
 
@@ -2836,4 +2840,454 @@ async fn an_attempt_owns_only_the_socket_it_acquired() {
         pool.get("never-made").is_none(),
         "starting an attempt creates no session"
     );
+}
+
+/// N1 #111 W1: only the tungstenite refusals returned before the frame is queued prove
+/// that nothing was written. A reset, an I/O error or a protocol error can follow a
+/// partial write (`ConnectionClosed` included: tungstenite maps a reset to it).
+#[test]
+fn only_refusals_before_queueing_prove_a_write_unsent() {
+    use tokio_tungstenite::tungstenite::{Error, Message, error::ProtocolError};
+    for unsent in [
+        Error::AlreadyClosed,
+        Error::Protocol(ProtocolError::SendAfterClosing),
+        Error::WriteBufferFull(Box::new(Message::text("x"))),
+    ] {
+        assert!(super::refused_before_queueing(&unsent), "{unsent}");
+    }
+    for ambiguous in [
+        Error::ConnectionClosed,
+        Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+    ] {
+        assert!(!super::refused_before_queueing(&ambiguous), "{ambiguous}");
+    }
+}
+
+/// N1 #111 W1: a socket whose loss the reader already recorded is not written at all,
+/// so the write provably sent nothing; the failure keeps the loss's classification.
+#[tokio::test]
+async fn a_socket_whose_loss_was_recorded_is_not_written() {
+    let (up, url) = upstream(vec![]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let conn = pooled(&executor, &url).await;
+    conn.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
+    let failure = conn
+        .send_create(Bytes::from_static(br#"{"type":"response.create"}"#), None)
+        .await
+        .expect_err("a lost socket takes no write");
+    assert!(failure.unsent);
+    assert_eq!(failure.error.scope, FailureScope::Transport);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(up.frames.lock().unwrap().is_empty(), "nothing reached the upstream");
+}
+
+/// N1 #111 W1: a failure the upstream may have caused after reading the request is
+/// request-scoped (no failover, no cooldown) and keeps its status, body and diagnostic;
+/// one that is request-scoped already stays as it is.
+#[test]
+fn an_uncertain_loss_is_request_scoped_and_otherwise_unchanged() {
+    let lost = transport("websocket: close 1011 (internal server error): bye");
+    let error = super::uncertain(lost.clone());
+    assert_eq!((error.status, error.scope), (lost.status, FailureScope::Request));
+    assert_eq!(error.body, lost.body);
+    assert!(error.headers.is_empty());
+    let too_big = message_too_big();
+    assert_eq!(super::uncertain(too_big.clone()).body, too_big.body);
+}
+
+// ------------------------------------------------------------------ N1 #111 review: write admission
+
+fn test_refusal() -> Refusal {
+    Refusal {
+        message: "Invalid API key".into(),
+        event: Bytes::from_static(br#"{"type":"error","status":401,"error":{"message":"Invalid API key"}}"#),
+    }
+}
+
+/// One scripted step of [`MockSink`] (ready when the script is empty): an error, pending
+/// and woken at once (after running `on_pending`), or pending forever.
+enum Step {
+    Fail(tokio_tungstenite::tungstenite::Error),
+    Pending,
+    Stall,
+}
+
+/// A sink whose readiness, hand-over and flush follow a script, for the phases of
+/// [`super::write_phases`] that a loopback socket cannot be made to show on demand.
+#[derive(Default)]
+struct MockSink {
+    ready: VecDeque<Step>,
+    start: Option<tokio_tungstenite::tungstenite::Error>,
+    flush: VecDeque<Step>,
+    started: usize,
+    on_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl MockSink {
+    fn step(
+        steps: &mut VecDeque<Step>,
+        on_pending: &Option<Arc<std::sync::atomic::AtomicBool>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tokio_tungstenite::tungstenite::Error>> {
+        use std::task::Poll;
+        match steps.pop_front() {
+            None => Poll::Ready(Ok(())),
+            Some(Step::Fail(error)) => Poll::Ready(Err(error)),
+            Some(Step::Pending) => {
+                if let Some(flag) = on_pending {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Some(Step::Stall) => {
+                steps.push_front(Step::Stall);
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for MockSink {
+    type Error = tokio_tungstenite::tungstenite::Error;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        Self::step(&mut this.ready, &this.on_pending, cx)
+    }
+
+    fn start_send(
+        self: std::pin::Pin<&mut Self>,
+        _: tokio_tungstenite::tungstenite::Message,
+    ) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+        this.started += 1;
+        this.start.take().map_or(Ok(()), Err)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        Self::step(&mut this.flush, &this.on_pending, cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// N1 #111 review: each phase of a write, injected. A failure before the hand-over
+/// (readiness, or a timeout while waiting for it) wrote nothing of the frame; a refusal
+/// of the hand-over itself before queueing too; a failed or stalled flush after the
+/// hand-over may have written part of it. The client authority is asked only once the
+/// sink is ready: a key revoked while the write waited is refused and nothing is handed
+/// over, while a revocation after the hand-over cannot recall the frame.
+#[tokio::test]
+async fn each_write_phase_reports_whether_the_frame_left() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::{Error, Message, error::ProtocolError};
+    let io = || Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    let frame = || Message::text("frame");
+
+    // Readiness fails: nothing handed over, the authority never asked.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counting = {
+        let asked = asked.clone();
+        move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    };
+    let mut sink = MockSink {
+        ready: VecDeque::from([Step::Fail(io())]),
+        ..MockSink::default()
+    };
+    let mut queued = false;
+    let failed = super::write_phases(&mut sink, frame(), Some(&counting), &mut queued).await;
+    assert!(matches!(failed, Err((_, true))), "{failed:?}");
+    assert_eq!((sink.started, queued, asked.load(Ordering::SeqCst)), (0, false, 0));
+
+    // Revoked while waiting for readiness: refused, nothing handed over.
+    let revoked = Arc::new(AtomicBool::new(false));
+    let authority = {
+        let revoked = revoked.clone();
+        move || revoked.load(Ordering::SeqCst).then(test_refusal)
+    };
+    let mut sink = MockSink {
+        ready: VecDeque::from([Step::Pending]),
+        on_pending: Some(revoked.clone()),
+        ..MockSink::default()
+    };
+    let mut queued = false;
+    let refused = super::write_phases(&mut sink, frame(), Some(&authority), &mut queued).await;
+    assert_eq!(refused.unwrap(), Some(test_refusal()));
+    assert_eq!((sink.started, queued), (0, false));
+
+    // The hand-over refused before queueing, or failing after it may have written.
+    for (error, unsent) in [
+        (Error::AlreadyClosed, true),
+        (Error::Protocol(ProtocolError::SendAfterClosing), true),
+        (Error::WriteBufferFull(Box::new(Message::text("x"))), true),
+        (Error::ConnectionClosed, false),
+        (io(), false),
+    ] {
+        let name = error.to_string();
+        let mut sink = MockSink {
+            start: Some(error),
+            ..MockSink::default()
+        };
+        let mut queued = false;
+        let failed = super::write_phases(&mut sink, frame(), None, &mut queued).await;
+        assert!(matches!(failed, Err((_, u)) if u == unsent), "{name}: {failed:?}");
+        assert_eq!((sink.started, queued), (1, true), "{name}");
+    }
+
+    // The flush fails after the hand-over: ambiguous.
+    let mut sink = MockSink {
+        flush: VecDeque::from([Step::Fail(io())]),
+        ..MockSink::default()
+    };
+    let mut queued = false;
+    let failed = super::write_phases(&mut sink, frame(), None, &mut queued).await;
+    assert!(matches!(failed, Err((_, false))), "{failed:?}");
+
+    // Revoked while the handed-over frame flushes: the frame is committed and sent.
+    let revoked = Arc::new(AtomicBool::new(false));
+    let authority = {
+        let revoked = revoked.clone();
+        move || revoked.load(Ordering::SeqCst).then(test_refusal)
+    };
+    let mut sink = MockSink {
+        flush: VecDeque::from([Step::Pending]),
+        on_pending: Some(revoked.clone()),
+        ..MockSink::default()
+    };
+    let mut queued = false;
+    let sent = super::write_phases(&mut sink, frame(), Some(&authority), &mut queued).await;
+    assert_eq!(sent.unwrap(), None);
+    assert!(revoked.load(Ordering::SeqCst) && sink.started == 1);
+
+    // A timeout while waiting for readiness wrote nothing; one during the flush may have.
+    for (stalled_ready, queued_at_timeout) in [(true, false), (false, true)] {
+        let mut sink = MockSink::default();
+        if stalled_ready {
+            sink.ready.push_back(Step::Stall);
+        } else {
+            sink.flush.push_back(Step::Stall);
+        }
+        let mut queued = false;
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            super::write_phases(&mut sink, frame(), None, &mut queued),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        assert_eq!(queued, queued_at_timeout, "stalled_ready={stalled_ready}");
+    }
+}
+
+/// N1 #111 review: a turn's create that waits for the socket (here: another holder of
+/// its sink) is admitted only once it can be written. A key revoked meanwhile stops it:
+/// nothing is written, the turn fails with the refusal, and the socket serves the next
+/// turn once the key is accepted again. Deterministic: the test holds the sink until the
+/// write is parked on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_waiting_for_the_socket_is_refused_after_revocation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (up, url) = upstream(vec![
+        Act::Send(vec![CREATED, COMPLETED]),
+        Act::Send(vec![CREATED, COMPLETED]),
+    ])
+    .await;
+    let executor = Arc::new(CodexExecutor::new().unwrap());
+    let first = executor
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .unwrap();
+    assert!(collect(first).await.iter().all(Result::is_ok));
+    let conn = executor.ws.session("conn-1").current().unwrap();
+    let revoked = Arc::new(AtomicBool::new(false));
+    executor.attach_authority(
+        "conn-1",
+        Arc::new({
+            let revoked = revoked.clone();
+            move || revoked.load(Ordering::SeqCst).then(test_refusal)
+        }),
+    );
+    let mut waits = conn.sink_waits.subscribe();
+    let before = *waits.borrow_and_update();
+    let sink = conn.sink.lock().await;
+    let second = tokio::spawn({
+        let (executor, url) = (executor.clone(), url.clone());
+        async move {
+            executor
+                .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), waits.wait_for(|n| *n > before))
+        .await
+        .expect("the create parks on the sink")
+        .unwrap();
+    revoked.store(true, Ordering::SeqCst);
+    drop(sink);
+    let refused = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("the create is refused");
+    assert_eq!((refused.status, refused.scope), (401, FailureScope::Request));
+    assert_eq!(refused.delivered_event(), Some(&test_refusal().event));
+
+    revoked.store(false, Ordering::SeqCst);
+    let third = executor
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .unwrap();
+    assert!(collect(third).await.iter().all(Result::is_ok));
+    assert!(
+        Arc::ptr_eq(&executor.ws.session("conn-1").current().unwrap(), &conn),
+        "the same socket"
+    );
+    assert_eq!(
+        up.frames.lock().unwrap().len(),
+        2,
+        "only the two accepted creates were written"
+    );
+}
+
+/// N1 #111 review: an interrupt that waits for the socket is admitted only once it can be
+/// written. A key revoked meanwhile stops it: nothing is written, the caller gets the
+/// refusal, and the acknowledgement it would have waited for is not left registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupt_waiting_for_the_socket_is_refused_after_revocation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const REFUSED: &str = r#"{"type":"response.interrupt","response_id":"r-refused","mode":"discard_partial_items"}"#;
+    let (up, url) = upstream(vec![Act::Send(vec![CREATED])]).await;
+    let executor = Arc::new(CodexExecutor::new().unwrap());
+    let response = executor
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .unwrap();
+    let _ = received(&up, 1).await;
+    let conn = executor.ws.session("conn-1").current().unwrap();
+    let revoked = Arc::new(AtomicBool::new(false));
+    executor.attach_authority(
+        "conn-1",
+        Arc::new({
+            let revoked = revoked.clone();
+            move || revoked.load(Ordering::SeqCst).then(test_refusal)
+        }),
+    );
+    let mut waits = conn.sink_waits.subscribe();
+    let before = *waits.borrow_and_update();
+    let sink = conn.sink.lock().await;
+    let interrupt = tokio::spawn({
+        let executor = executor.clone();
+        async move { executor.interrupt_session("conn-1", REFUSED.as_bytes(), |_| true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), waits.wait_for(|n| *n > before))
+        .await
+        .expect("the interrupt parks on the sink")
+        .unwrap();
+    revoked.store(true, Ordering::SeqCst);
+    drop(sink);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), interrupt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Err(InterruptError::Refused(test_refusal())));
+    assert!(!conn.link.lock().unwrap().awaited.contains("r-refused"));
+
+    revoked.store(false, Ordering::SeqCst);
+    executor
+        .interrupt_session("conn-1", INTERRUPT_R1.as_bytes(), |_| true)
+        .await
+        .unwrap();
+    let frames = received(&up, 2).await;
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[1], INTERRUPT_R1, "only the accepted interrupt was written");
+    drop(response);
+}
+
+/// N1 #111 review, W2 on the WebSocket HTTP fallback: an attempt is checked before it
+/// dials and again when the HTTP client takes its body, which the client does only once
+/// it holds a connection. A key revoked between the two (here: during the dial, as the
+/// authority itself records) stops the attempt: the connection was made, no request byte
+/// reached it, and the turn fails with the refusal instead of failing over.
+/// Deterministic: the authority allows its first check and refuses every later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_revoked_while_an_http_turn_dials_sends_no_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let closed = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn({
+        let (accepted, received, closed) = (accepted.clone(), received.clone(), closed.clone());
+        async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0; 4096];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => received.lock().unwrap().extend_from_slice(&buf[..n]),
+                    }
+                }
+                closed.notify_one();
+            }
+        }
+    });
+    let executor = CodexExecutor::new().unwrap();
+    let checks = Arc::new(AtomicUsize::new(0));
+    executor.attach_authority(
+        "conn-1",
+        Arc::new({
+            let checks = checks.clone();
+            move || (checks.fetch_add(1, Ordering::SeqCst) >= 1).then(test_refusal)
+        }),
+    );
+    let mut cred = credential(&url);
+    cred.attributes.remove("websockets");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute_in_session(&cred, request(BODY), &Config::default(), &session(false)),
+    )
+    .await
+    .expect("the attempt ends");
+    let refused = outcome.err().expect("the attempt is refused");
+    assert_eq!(
+        (refused.status, refused.scope),
+        (401, FailureScope::Request),
+        "{refused}"
+    );
+    assert_eq!(refused.delivered_event(), Some(&test_refusal().event));
+    assert_eq!(checks.load(Ordering::SeqCst), 2, "before the dial, and at the body");
+    tokio::time::timeout(Duration::from_secs(5), closed.notified())
+        .await
+        .expect("the abandoned connection closes");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "the attempt dialled");
+    let received = received.lock().unwrap().clone();
+    eprintln!(
+        "dial-window evidence: {} bytes reached the upstream: {:?}",
+        received.len(),
+        String::from_utf8_lossy(&received)
+    );
+    // The client fails the request before it flushes anything: not even the head
+    // leaves, so the upstream has no request at all.
+    assert!(received.is_empty(), "no request bytes reached the upstream");
 }

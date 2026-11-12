@@ -499,6 +499,18 @@ async fn finish_reply(scenario: &Value, ctx: &Ctx<'_>, prepared: &Prepared) -> R
     .await
 }
 
+/// Scenarios recorded at an older Go whose error scope and retry hint this fork takes
+/// from the selective Go v8.0.67 target instead (docs/DIFFERENCES-FROM-GO.md). The
+/// recording keeps its provenance; each entry must differ from it, so an entry cannot
+/// outlive the difference.
+const SELECTIVE_ERRORS: &[(&str, FailureScope, bool, &str)] = &[(
+    "oauth-overage-retry-after-429",
+    FailureScope::Model,
+    false,
+    "#72: a rejected overage claim with an allowed 7d window and no 5h headers is a \
+     model-scoped rejection without a quota reset (0130d6f3)",
+)];
+
 /// The error Rust builds from the scenario's upstream reply matches what Go's conductor
 /// and handlers read from its error: scope, retry hint, and the direct response.
 fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, Value>, error: ExecError) {
@@ -519,8 +531,19 @@ fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, 
     } else {
         crate::upstream::scope_for(error.status)
     };
+    let (scope, retry_hint) = match SELECTIVE_ERRORS.iter().find(|(n, ..)| *n == name) {
+        Some((_, selective, hint, why)) => {
+            assert!(
+                (scope, flag("retry_after")) != (*selective, *hint),
+                "{name}: SELECTIVE_ERRORS entry matches the recording"
+            );
+            eprintln!("{name}: follows v8.0.67 ({why})");
+            (*selective, *hint)
+        }
+        None => (scope, flag("retry_after")),
+    };
     assert_eq!(error.scope, scope, "{name}: scope");
-    assert_eq!(error.retry_after.is_some(), flag("retry_after"), "{name}: retry hint");
+    assert_eq!(error.retry_after.is_some(), retry_hint, "{name}: retry hint");
     assert_eq!(error.direct, flag("direct"), "{name}: direct response");
     if let Some(status) = status {
         assert_eq!(error.status, status, "{name}: status");
@@ -932,7 +955,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             // dates, and whichever ran first used to pin its date for the other.
             std::fs::write(dir.join("auth").join(format!("fixture-{run}.json")), auth).unwrap();
         }
-        let cfg = Config::parse(&text).unwrap();
+        let cfg = super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap());
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")
@@ -2503,4 +2526,97 @@ async fn responses_compaction_matches_go() {
         assert!(usage.contains(&"publish"), "{usage:?}");
     }
     reply.lock().unwrap().clear();
+}
+
+/// #71: Anthropic's server-side refusal fallback is opt-in (Go v8.0.67 fa11a573).
+/// Without `upstream.claude.server-side-fallback` a cloaked request that names no
+/// `fallbacks` reaches Anthropic without them (and without the fallback beta); with it,
+/// Opus 5.5 and Fable 5.1 get Claude Code's chain. A caller's own `fallbacks` (empty,
+/// populated or `"default"`, a documented `BetaFallbacksParam` value) reach the
+/// upstream byte for byte either way.
+#[tokio::test]
+async fn server_side_fallback_is_opt_in_and_keeps_callers_fallbacks() {
+    use axum::response::IntoResponse;
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let seen = sent.clone();
+    let router = axum::Router::new().fallback(move |headers: http::HeaderMap, body: String| {
+        let seen = seen.clone();
+        async move {
+            let beta = headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().unwrap().push((body, beta));
+            let message = serde_json::json!({"id": "msg_fb", "type": "message", "role": "assistant",
+                "model": "claude-opus-5-5", "content": [], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 1}});
+            ([(http::header::CONTENT_TYPE, "application/json")], message.to_string()).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let mut credential = harness_credential();
+    credential.id = "fallback-opt-in.json".into();
+    credential.attributes.insert("base_url".into(), base);
+    let off = Config::parse("").unwrap();
+    let explicit_off = Config::parse("upstream:\n  claude:\n    server-side-fallback: false\n").unwrap();
+    let on = Config::parse("upstream:\n  claude:\n    server-side-fallback: true\n").unwrap();
+    let legacy_on = Config::parse("claude:\n  server-side-fallback: true\n").unwrap();
+    let oauth_on = Config::parse("oauth:\n  providers:\n    claude:\n      server-side-fallback: true\n").unwrap();
+    let oauth_off_over_flat = Config::parse(
+        "claude:\n  server-side-fallback: true\noauth:\n  providers:\n    claude:\n      server-side-fallback: false\n",
+    )
+    .unwrap();
+    let callers = [
+        None,
+        Some("[]"),
+        Some(r#"[{"model":"claude-sonnet-4-6"}]"#),
+        Some(r#""default""#),
+    ];
+    for (model, synthesized) in [
+        ("claude-opus-5-5", r#"[{"model":"claude-opus-4-8"}]"#),
+        ("claude-fable-5-1", r#"[{"model":"claude-opus-5"}]"#),
+    ] {
+        for caller in callers {
+            for (label, cfg, enabled) in [
+                ("absent", &off, false),
+                ("false", &explicit_off, false),
+                ("true", &on, true),
+                ("legacy true", &legacy_on, true),
+                ("oauth true", &oauth_on, true),
+                ("oauth false over flat true", &oauth_off_over_flat, false),
+            ] {
+                let fallbacks = caller.map(|f| format!(r#","fallbacks":{f}"#)).unwrap_or_default();
+                let body = format!(
+                    r#"{{"model":"{model}","max_tokens":16{fallbacks},"messages":[{{"role":"user","content":"hi"}}]}}"#
+                );
+                drain(&executor, &credential, cfg, client_request(body, Default::default())).await;
+                let (upstream, beta) = sent.lock().unwrap().pop().unwrap();
+                let got = rawjson::get(&upstream, "fallbacks");
+                let case = format!("{model} caller {caller:?} setting {label}");
+                match (caller, enabled) {
+                    (Some(raw), _) => assert_eq!(got.json(), raw, "{case}: caller fallbacks kept"),
+                    (None, true) => assert_eq!(got.json(), synthesized, "{case}: synthesized"),
+                    (None, false) => assert!(!got.exists(), "{case}: none synthesized: {upstream}"),
+                }
+                let fallback_beta = beta.split(',').any(|b| b.trim() == betas::SERVER_SIDE_FALLBACK);
+                assert_eq!(fallback_beta, got.exists(), "{case}: beta {beta}");
+            }
+        }
+    }
+    // Models without a Claude Code chain get none, whatever the setting.
+    let body = r#"{"model":"claude-opus-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    drain(
+        &executor,
+        &credential,
+        &on,
+        client_request(body.into(), Default::default()),
+    )
+    .await;
+    let (upstream, _) = sent.lock().unwrap().pop().unwrap();
+    assert!(!rawjson::get(&upstream, "fallbacks").exists(), "{upstream}");
 }

@@ -78,3 +78,102 @@ pub mod gpt_image_26 {
         }
     }
 }
+
+/// K1 (#68), retained model catalog additions: Claude Fable 5.2 after Fable 5.1, GPT-6.1
+/// Terra after GPT-6.1 Sol in the Codex catalog, and Muse Ember 1.0 first in the Meta
+/// catalog. Each expected definition is written out from its provider source (see
+/// docs/DIFFERENCES-FROM-GO.md, "Retained model catalog additions"), in Go's `ModelInfo`
+/// field order, and is not read from the embedded catalog.
+pub mod k1_catalog {
+    use super::Value;
+
+    const FABLE_51: &str = r#"{"id":"claude-fable-5-1","object":"model","created":1788220800,"owned_by":"anthropic","type":"claude","display_name":"Claude Fable 5.1","description":"Claude Fable 5.1 extends Claude Fable 5 at the same input and output prices, with cache reads at a quarter of the cost, and brings stronger long-running agentic coding, multistep research, and document, spreadsheet, and slide work.","context_length":1000000,"max_completion_tokens":128000,"supportedInputModalities":["text","image"],"supportedOutputModalities":["text"],"thinking":{"dynamic_allowed":true,"levels":["low","medium","high","xhigh","max"]}}"#;
+    /// platform.claude.com Fable 5.2 page and effort page, retrieved 2026-11-12.
+    pub const FABLE_52: &str = r#"{"id":"claude-fable-5-2","object":"model","created":1794250800,"owned_by":"anthropic","type":"claude","display_name":"Claude Fable 5.2","description":"For demanding reasoning and long-horizon agentic work","context_length":1000000,"max_completion_tokens":128000,"supportedInputModalities":["text","image"],"supportedOutputModalities":["text"],"thinking":{"dynamic_allowed":true,"levels":["low","medium","high","xhigh","max"]}}"#;
+    const SOL_61: &str = r#"{"id":"gpt-6.1-sol","object":"model","created":1790640000,"owned_by":"openai","type":"openai","display_name":"GPT 6.1 Sol","version":"gpt-6.0","description":"Latest workhorse model for coding and everyday work.","context_length":272000,"max_completion_tokens":128000,"supported_parameters":["tools"],"supportedInputModalities":["text","image"],"supportedOutputModalities":["text"],"thinking":{"levels":["low","medium","high","xhigh","max"]}}"#;
+    /// First-party openai/codex models-manager/models.json at 44ccf394573c; no maximum
+    /// output is stated there, so none is listed.
+    pub const TERRA_61: &str = r#"{"id":"gpt-6.1-terra","object":"model","created":1792972800,"owned_by":"openai","type":"openai","display_name":"GPT 6.1 Terra","version":"gpt-6.0","description":"GPT-6.1 Terra Codex model.","context_length":500000,"supported_parameters":["tools"],"supportedInputModalities":["text","image"],"supportedOutputModalities":["text"],"thinking":{"levels":["low","medium","high","xhigh","max"]}}"#;
+    /// dev.meta.ai/docs/muse-ember and /docs/reasoning, retrieved 2026-11-12.
+    pub const EMBER_10: &str = r#"{"id":"muse-ember-1.0","object":"model","created":1794182400,"owned_by":"meta","type":"meta","display_name":"Muse Ember 1.0","name":"muse-ember-1.0","description":"Meta's smallest, most efficient model, for high-volume agent work.","context_length":1048576,"max_completion_tokens":524288,"supportedInputModalities":["text","image","video","audio"],"supportedOutputModalities":["text"],"thinking":{"levels":["minimal","low","medium","high","xhigh","max"]}}"#;
+
+    /// `(anchor, addition)` for a channel's definitions: the addition follows the anchor,
+    /// or comes first when the anchor is `None`. `None` for a channel K1 leaves alone.
+    fn plan(channel: &str) -> Option<(Option<&'static str>, &'static str)> {
+        match channel {
+            "claude" => Some((Some(FABLE_51), FABLE_52)),
+            "codex" => Some((Some(SOL_61), TERRA_61)),
+            "meta" => Some((None, EMBER_10)),
+            _ => None,
+        }
+    }
+
+    fn id(entry: &str) -> String {
+        serde_json::from_str::<Value>(entry).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// A channel's model definition list.
+    pub fn definitions_list(channel: &str, go: &mut Value) {
+        let Some((anchor, addition)) = plan(channel) else {
+            return;
+        };
+        let list = go.as_array_mut().expect("a model list");
+        let new_id = id(addition);
+        assert!(
+            list.iter().all(|m| m["id"] != new_id.as_str()),
+            "Go already lists {new_id}"
+        );
+        let at = match anchor {
+            None => 0,
+            Some(anchor) => {
+                let anchor: Value = serde_json::from_str(anchor).unwrap();
+                1 + list
+                    .iter()
+                    .position(|m| *m == anchor)
+                    .expect("Go's anchor definition changed")
+            }
+        };
+        list.insert(at, serde_json::from_str(addition).unwrap());
+    }
+
+    /// A `{"channel":…,"models":[…]}` definitions response as raw JSON.
+    pub fn definitions_raw(channel: &str, go: &str) -> String {
+        let Some((anchor, addition)) = plan(channel) else {
+            return go.to_owned();
+        };
+        assert!(
+            !go.contains(&format!(r#""id":"{}""#, id(addition))),
+            "Go already lists it"
+        );
+        match anchor {
+            Some(anchor) => {
+                assert_eq!(go.matches(anchor).count(), 1, "Go's anchor definition changed");
+                go.replace(anchor, &format!("{anchor},{addition}"))
+            }
+            None => {
+                let head = r#""models":["#;
+                assert_eq!(go.matches(head).count(), 1);
+                go.replace(head, &format!("{head}{addition},"))
+            }
+        }
+    }
+
+    /// An OpenAI `/v1/models` list served by a Codex credential: Terra is appended.
+    pub fn codex_openai_models(go: &mut Value) {
+        let data = go["data"].as_array_mut().expect("an OpenAI model list");
+        assert!(data.iter().any(|m| m["id"] == "gpt-6.1-sol"), "Go lists gpt-6.1-sol");
+        assert!(
+            data.iter().all(|m| m["id"] != "gpt-6.1-terra"),
+            "Go already lists Terra"
+        );
+        data.push(serde_json::json!({
+            "created": 1792972800,
+            "id": "gpt-6.1-terra",
+            "object": "model",
+            "owned_by": "openai",
+        }));
+    }
+}

@@ -712,6 +712,21 @@ mod routes {
                 if want.contains_key("X-CPA-SUPPORT-PLUGIN") {
                     want.insert("X-CPA-SUPPORT-PLUGIN".into(), "0".into());
                 }
+                // Go v8.0.35 recorded `*`, which never covers Authorization in a Fetch
+                // preflight; cliproxy-rs names the accepted headers as Go v8.0.67 does
+                // (docs/DIFFERENCES-FROM-GO.md "CORS allowed request headers"). These
+                // steps send no Access-Control-Request-Headers, so nothing is echoed.
+                if want.get("Access-Control-Allow-Headers").is_some_and(|v| v == "*") {
+                    assert!(!step["headers"].as_object().is_some_and(|h| {
+                        h.keys()
+                            .any(|k| k.eq_ignore_ascii_case("Access-Control-Request-Headers"))
+                    }));
+                    want.insert(
+                        "Access-Control-Allow-Headers".into(),
+                        "Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version, Anthropic-Beta"
+                            .into(),
+                    );
+                }
                 assert_eq!(Value::Object(headers), Value::Object(want), "{name}[{i}] headers");
                 compared += 1;
             }
@@ -1618,6 +1633,16 @@ mod creds {
                         );
                         want["error"] = got["error"].clone();
                     }
+                    // Forward port past v8.0.35 (#91, Go v8.0.67 06fd5b8b,
+                    // docs/DIFFERENCES-FROM-GO.md): each v8 Codex entry carries its local
+                    // `siwc_status`. None of the recorded credentials uses SIWC.
+                    if let Some(files) = got.get_mut("files").and_then(Value::as_array_mut) {
+                        for file in files.iter_mut().filter_map(Value::as_object_mut) {
+                            if let Some(status) = file.remove("siwc_status") {
+                                assert_eq!(status, "off", "{at}");
+                            }
+                        }
+                    }
                     // Go also deletes the Gemini login this fork refused (issue #49).
                     if name == "credential_inventory_and_edits" && step["path"] == "/credentials?all=true" {
                         want["deleted"] = json!(want["deleted"].as_i64().unwrap() - 1);
@@ -1725,12 +1750,20 @@ mod creds {
     }
 
     /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model
-    /// definitions carry the GPT Image 2.6 built-ins.
+    /// definitions carry the GPT Image 2.6 built-ins, and the channels carry the K1
+    /// catalog additions (#68).
     fn forward_ports(mut step: Value) -> Value {
         if step["response"]["channel"] == "codex"
             && let Some(raw) = step["raw_json"].as_str()
         {
             let raw = crate::forward_port::gpt_image_26::definitions_raw(raw);
+            step["response"] = serde_json::from_str(&raw).unwrap();
+            step["raw_json"] = raw.into();
+        }
+        if step["response"]["models"].is_array()
+            && let (Some(channel), Some(raw)) = (step["response"]["channel"].as_str(), step["raw_json"].as_str())
+        {
+            let raw = crate::forward_port::k1_catalog::definitions_raw(channel, raw);
             step["response"] = serde_json::from_str(&raw).unwrap();
             step["raw_json"] = raw.into();
         }

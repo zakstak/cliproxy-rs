@@ -774,8 +774,25 @@ fn response_model_event(line: &[u8], provider: &str) -> (String, bool) {
                 string_at(data, "message.model").and_then(bounded).unwrap_or_default(),
                 false,
             ),
+            // #71 (Go v8.0.67 fa11a573): a server-side fallback hop names the model
+            // that serves from there on, and a `fallback_message` iteration the model
+            // that served the response.
+            "content_block_start" => {
+                let model = (gj::get(data, "content_block.type").str() == "fallback")
+                    .then(|| string_at(data, "content_block.to.model"))
+                    .flatten()
+                    .and_then(bounded)
+                    .unwrap_or_default();
+                (model, false)
+            }
+            "message_delta" => (fallback_iteration_model(data).unwrap_or_default(), false),
             "message_stop" => (String::new(), true),
-            "message" => (string_at(data, "model").and_then(bounded).unwrap_or_default(), true),
+            "message" => (
+                fallback_iteration_model(data)
+                    .or_else(|| string_at(data, "model").and_then(bounded))
+                    .unwrap_or_default(),
+                true,
+            ),
             _ => {
                 if !gj::valid(data) {
                     return (String::new(), false);
@@ -809,6 +826,26 @@ fn response_model_event(line: &[u8], provider: &str) -> (String, bool) {
         }
         _ => generic_response_model(data),
     }
+}
+
+/// Go `extractClaudeFallbackIterationModel`: the model of the last `fallback_message`
+/// entry in `usage.iterations`, which Anthropic documents as the serving model.
+fn fallback_iteration_model(data: &[u8]) -> Option<String> {
+    let iterations = gj::get(data, "usage.iterations");
+    if !iterations.is_array() {
+        return None;
+    }
+    let mut served = None;
+    iterations.each(|_, it| {
+        if it.get("type").str() == "fallback_message"
+            && it.get("model").kind == Kind::String
+            && let Some(model) = bounded(it.get("model").str().trim().to_owned()).filter(|m| !m.is_empty())
+        {
+            served = Some(model);
+        }
+        true
+    });
+    served
 }
 
 /// Go `extractGenericResponseModelEvent`.
@@ -2614,6 +2651,38 @@ mod tests {
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/server_go.json");
+
+    /// #71: usage names the model a server-side fallback served with, from the
+    /// documented signals (a `fallback` block's `to.model`, a `fallback_message`
+    /// iteration), streamed or buffered; without them the reported model stands.
+    #[test]
+    fn claude_usage_reports_the_fallback_serving_model() {
+        let observe = |lines: &[&str]| {
+            let mut model = ResponseModel::default();
+            for line in lines {
+                model.observe(line.as_bytes(), "claude");
+            }
+            model.get().to_owned()
+        };
+        let start = r#"data: {"type":"message_start","message":{"id":"m","model":"claude-opus-4-7","usage":{"input_tokens":1}}}"#;
+        let block = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-4-7"},"to":{"model":"claude-sonnet-4-5"},"trigger":{"type":"refusal","category":null}}}"#;
+        let text = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#;
+        let delta = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}"#;
+        let delta_iterations = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8,"iterations":[{"type":"message","model":"claude-opus-4-7"},{"type":"fallback_message","model":"claude-opus-4-8"}]}}"#;
+        let stop = r#"data: {"type":"message_stop"}"#;
+        assert_eq!(observe(&[start, block, text, delta, stop]), "claude-sonnet-4-5");
+        assert_eq!(observe(&[start, text, delta_iterations, stop]), "claude-opus-4-8");
+        assert_eq!(observe(&[start, text, delta, stop]), "claude-opus-4-7");
+        let buffered = r#"{"type":"message","model":"claude-opus-4-7","content":[],"usage":{"iterations":[{"type":"fallback_message","model":"claude-opus-4-8"}]}}"#;
+        assert_eq!(observe(&[buffered]), "claude-opus-4-8");
+        let plain = r#"{"type":"message","model":"claude-opus-4-7","content":[],"usage":{"iterations":[{"type":"message","model":"claude-opus-4-7"}]}}"#;
+        assert_eq!(observe(&[plain]), "claude-opus-4-7");
+        // A non-fallback block or a malformed iteration names nothing.
+        let tool =
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","to":{"model":"x"}}}"#;
+        let bad = r#"data: {"type":"message_delta","delta":{},"usage":{"iterations":[{"type":"fallback_message","model":7}]}}"#;
+        assert_eq!(observe(&[start, tool, bad, stop]), "claude-opus-4-7");
+    }
 
     /// Go `resolveUsageSource` after d9451cb6: without a project, a Vertex service account
     /// is named by `AccountInfo`, its trimmed `client_email`, not by the client key.

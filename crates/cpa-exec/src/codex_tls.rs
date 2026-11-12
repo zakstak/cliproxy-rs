@@ -32,9 +32,17 @@ const CHATGPT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 type ChatgptKey = (Proxy, bool, Option<std::time::Duration>);
 
+/// A chatgpt.com client for gated requests, by effective proxy and handshake bound.
+type AdmittingKey = (Proxy, Option<std::time::Duration>);
+
 pub(crate) struct Transport {
     standard: GoClients,
+    /// The standard transport for gated requests ([`GoClients::admitting`]).
+    admitting: GoClients,
     hooks: Hooks,
+    /// chatgpt.com clients for gated requests, by effective proxy and handshake bound:
+    /// one connection per request, admitted after its dial ([`crate::proxy::admit_dials`]).
+    chatgpt_admitting: Mutex<Vec<(AdmittingKey, wreq::Client)>>,
     /// chatgpt.com clients by effective proxy, keep-alive setting and TLS handshake
     /// bound, most recent first.
     chatgpt: Mutex<Vec<(ChatgptKey, wreq::Client)>>,
@@ -44,8 +52,10 @@ impl Transport {
     pub fn new(hooks: Hooks) -> Self {
         Self {
             standard: GoClients::new(hooks.clone()),
+            admitting: GoClients::new(hooks.clone()).admitting(),
             hooks,
             chatgpt: Mutex::default(),
+            chatgpt_admitting: Mutex::default(),
         }
     }
 
@@ -53,8 +63,10 @@ impl Transport {
     pub fn with_default(client: wreq::Client) -> Self {
         Self {
             standard: GoClients::with_default(client),
+            admitting: GoClients::new(Hooks::default()).admitting(),
             hooks: Hooks::default(),
             chatgpt: Mutex::default(),
+            chatgpt_admitting: Mutex::default(),
         }
     }
 
@@ -73,6 +85,35 @@ impl Transport {
         } else {
             self.standard.get(proxy)
         }
+    }
+
+    /// [`Self::for_url`] for a gated request ([`crate::proxy::send_routed_certain`]): the
+    /// same TLS client, ALPN and proxy, but the request dials its own connection and its
+    /// gate decides once that connection is up, before any HTTP byte is written
+    /// ([`crate::proxy::admit_dials`]). `keep_alive` does not apply: no gated request may
+    /// share a connection (N1 #111).
+    pub fn admitting_for_url(&self, url: &str, proxy: &Proxy, handshake: Option<std::time::Duration>) -> wreq::Client {
+        if !is_chatgpt(url) {
+            return self.admitting.get(proxy);
+        }
+        let key: AdmittingKey = (proxy.clone(), handshake);
+        let mut cache = self
+            .chatgpt_admitting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+            let entry = cache.remove(i);
+            let client = entry.1.clone();
+            cache.insert(0, entry);
+            return client;
+        }
+        let client = self
+            .build_chatgpt(proxy, false, handshake, true)
+            .or_else(|_| self.build_chatgpt(&Proxy::Direct, false, handshake, true))
+            .expect("chatgpt.com TLS client");
+        cache.insert(0, (key, client.clone()));
+        cache.truncate(CACHE_CAPACITY);
+        client
     }
 
     /// Go's standard transport (the WebSocket dialer honours environment proxies too).
@@ -98,8 +139,8 @@ impl Transport {
         }
         // Go logs an unusable proxy dialer and dials directly.
         let client = self
-            .build_chatgpt(proxy, keep_alive, *handshake)
-            .or_else(|_| self.build_chatgpt(&Proxy::Direct, keep_alive, *handshake))
+            .build_chatgpt(proxy, keep_alive, *handshake, false)
+            .or_else(|_| self.build_chatgpt(&Proxy::Direct, keep_alive, *handshake, false))
             .expect("chatgpt.com TLS client");
         cache.insert(0, (key.clone(), client.clone()));
         cache.truncate(CACHE_CAPACITY);
@@ -111,12 +152,18 @@ impl Transport {
         proxy: &Proxy,
         keep_alive: bool,
         handshake: Option<std::time::Duration>,
+        admit: bool,
     ) -> wreq::Result<wreq::Client> {
         // wreq's default TLS options: BoringSSL as this proxy configures it, ALPN h2 and
         // http/1.1, no emulation profile (codex_tls_tests.rs records the ClientHello).
         let builder =
             crate::tls::bound_handshake(wreq::Client::builder(), handshake).redirect(wreq::redirect::Policy::none());
-        let builder = if keep_alive {
+        let builder = if admit {
+            crate::proxy::admit_dials(builder)
+        } else {
+            builder
+        };
+        let builder = if keep_alive && !admit {
             // Opt-in: the same ClientHello and headers, without a handshake per request.
             builder
                 .pool_max_idle_per_host(CHATGPT_IDLE_PER_HOST)

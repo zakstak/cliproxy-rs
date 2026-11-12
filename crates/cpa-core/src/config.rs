@@ -1442,6 +1442,89 @@ mod tests {
         assert_eq!(err.to_string(), "oauth.providers.xai must be a mapping");
     }
 
+    /// #71: `upstream.claude.server-side-fallback` loads from its canonical, historical
+    /// `oauth.providers.claude` and flat `claude` spellings with the shared-setting
+    /// precedence: the canonical path wins by presence, then the historical OAuth path,
+    /// then the flat one, so an explicit `false` there beats a `true` further down. The
+    /// alias migrates without being archived, and a saved document reloads the same.
+    #[test]
+    fn server_side_fallback_aliases_follow_shared_precedence() {
+        let fallback = |raw: &str| {
+            let cfg = Config::parse(raw).unwrap();
+            cfg.document["upstream"]["claude"]["server-side-fallback"].clone()
+        };
+        let oauth = |v: &str| {
+            format!(
+                "oauth: {{providers: {{claude: {{server-side-fallback: {v}}}}}}}
+"
+            )
+        };
+        let flat = |v: &str| {
+            format!(
+                "claude: {{server-side-fallback: {v}}}
+"
+            )
+        };
+        let canonical = |v: &str| {
+            format!(
+                "upstream: {{claude: {{server-side-fallback: {v}}}}}
+"
+            )
+        };
+        for (raw, want) in [
+            (String::new(), Value::Null),
+            (oauth("true"), Value::Bool(true)),
+            (flat("true"), Value::Bool(true)),
+            (canonical("true"), Value::Bool(true)),
+            (format!("{}{}", flat("true"), oauth("false")), Value::Bool(false)),
+            (format!("{}{}", oauth("true"), flat("false")), Value::Bool(true)),
+            (format!("{}{}", oauth("true"), canonical("false")), Value::Bool(false)),
+            (
+                format!("{}{}{}", flat("true"), oauth("true"), canonical("false")),
+                Value::Bool(false),
+            ),
+            (format!("{}{}", oauth("false"), canonical("true")), Value::Bool(true)),
+        ] {
+            assert_eq!(fallback(&raw), want, "{raw}");
+            let mut doc = ConfigDocument::parse(&raw).unwrap();
+            assert!(doc.archive_unknown().is_empty(), "nothing archived: {raw}");
+            schema::validate(doc.value(), true).unwrap();
+            let providers = &doc.value()["oauth"]["providers"];
+            assert!(providers.get("claude").is_none(), "alias migrated: {raw}");
+            assert!(doc.value().get("claude").is_none(), "flat alias migrated: {raw}");
+            // Saved and reloaded, the canonical form keeps the value.
+            assert_eq!(fallback(&doc.yaml().unwrap()), want, "reload: {raw}");
+        }
+        // A Management API write that names the historical path lands on the canonical
+        // one, which keeps precedence when both are sent.
+        for (body, want) in [
+            (
+                "oauth: {providers: {claude: {server-side-fallback: true}}}",
+                Value::Bool(true),
+            ),
+            (
+                "oauth: {providers: {claude: {server-side-fallback: true}}}
+upstream: {claude: {server-side-fallback: false}}",
+                Value::Bool(false),
+            ),
+        ] {
+            let mut value: Value = serde_yaml_ng::from_str(body).unwrap();
+            ConfigDocument::normalize_aliases(&mut value);
+            assert_eq!(value["upstream"]["claude"]["server-side-fallback"], want, "{body}");
+            assert!(
+                lookup(value.as_mapping().unwrap(), "oauth.providers.claude").is_none(),
+                "{body}"
+            );
+        }
+        // A read of the historical path sees the canonical value there.
+        let mut doc = ConfigDocument::parse(&canonical("true")).unwrap();
+        doc.project_aliases(&["oauth", "providers", "claude", "server-side-fallback"]);
+        assert_eq!(
+            doc.value()["oauth"]["providers"]["claude"]["server-side-fallback"],
+            Value::Bool(true)
+        );
+    }
+
     /// Go `TestIsV8ConfigLayout` (3be5fa44).
     #[test]
     fn v8_layout_is_recognised_by_version_sections_and_paths() {

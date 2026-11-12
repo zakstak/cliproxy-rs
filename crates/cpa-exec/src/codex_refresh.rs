@@ -10,7 +10,115 @@ use cpa_core::credential::{Credential, MetadataPatch};
 use cpa_core::exec::ExecError;
 use serde_json::{Map, Value};
 
-use crate::codex_oauth::{self, CodexOAuth};
+use crate::codex_oauth::{self, CodexOAuth, GrantError};
+
+/// The refresh tokens of one credential that a token endpoint refused for good (a
+/// terminal [`GrantError`]), by partition, as SHA-256 hashes. A refused token is never
+/// sent again: the partition counts as having no refresh credential until its refresh
+/// token changes (a new sign-in, an upload, another process's rotation). The outer and
+/// Sign in with ChatGPT partitions are separate token sets (OpenAI "Accounts and
+/// sessions": each registration's credentials stay separate), so each is refused alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Refused {
+    pub outer: Option<[u8; 32]>,
+    pub siwc: Option<[u8; 32]>,
+}
+
+fn token_hash(token: &str) -> Option<[u8; 32]> {
+    use sha2::Digest as _;
+    let token = token.trim();
+    (!token.is_empty()).then(|| sha2::Sha256::digest(token.as_bytes()).into())
+}
+
+impl Refused {
+    pub fn is_empty(&self) -> bool {
+        self.outer.is_none() && self.siwc.is_none()
+    }
+
+    /// Whether `credential`'s outer refresh token is the refused one.
+    pub fn outer_refused(&self, credential: &Credential) -> bool {
+        self.outer.is_some() && self.outer == token_hash(codex_oauth::refresh_token(credential))
+    }
+
+    /// Whether `credential`'s Sign in with ChatGPT refresh token is the refused one.
+    pub fn siwc_refused(&self, credential: &Credential) -> bool {
+        self.siwc.is_some() && self.siwc == token_hash(crate::codex_siwc::refresh_inputs(credential).0)
+    }
+
+    /// What still applies to `credential`: a partition whose refresh token changed is no
+    /// longer refused.
+    pub fn current(&self, credential: &Credential) -> Self {
+        Self {
+            outer: self.outer.filter(|_| self.outer_refused(credential)),
+            siwc: self.siwc.filter(|_| self.siwc_refused(credential)),
+        }
+    }
+
+    /// Both records, `later`'s partitions over these.
+    pub fn merged(&self, later: &Self) -> Self {
+        Self {
+            outer: later.outer.or(self.outer),
+            siwc: later.siwc.or(self.siwc),
+        }
+    }
+
+    /// Whether the partition requests use (Sign in with ChatGPT when `use_siwc` is on)
+    /// has its refresh token refused.
+    pub fn active_refused(&self, credential: &Credential) -> bool {
+        if crate::codex_siwc::enabled(credential) {
+            self.siwc_refused(credential)
+        } else {
+            self.outer_refused(credential)
+        }
+    }
+
+    /// `credential` as a refresh sees it: each refused refresh token removed, so the
+    /// partition has no renewal credential (never due, never refreshed). Requests keep
+    /// using its access token until it expires or an upstream refuses it.
+    pub fn mask(&self, credential: &Credential) -> Credential {
+        let mut view = credential.clone();
+        if self.outer_refused(credential) {
+            view.metadata.remove("refresh_token");
+            view.metadata.remove("refreshToken");
+        }
+        if self.siwc_refused(credential)
+            && let Some(Value::Object(siwc)) = view.metadata.get_mut("siwc")
+        {
+            siwc.remove("refresh_token");
+        }
+        view
+    }
+}
+
+/// What one refresh grant per partition produced: the merged patch, and each failure.
+struct Grants {
+    patch: MetadataPatch,
+    refreshed: bool,
+    failures: Vec<(&'static str, GrantError)>,
+    refused: Refused,
+}
+
+impl Grants {
+    /// The patch when any partition refreshed, else the first failure (outer first).
+    fn result(self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
+        if !self.refreshed {
+            return match self.failures.into_iter().next() {
+                Some((_, error)) => Err(error.error),
+                None => Ok(self.patch),
+            };
+        }
+        for (partition, error) in self.failures {
+            tracing::warn!(
+                credential = %credential.id,
+                partition,
+                status = error.error.status,
+                terminal = error.terminal,
+                "codex token refresh failed for one partition; the other refreshed"
+            );
+        }
+        Ok(self.patch)
+    }
+}
 
 /// What a Codex refresh was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +150,7 @@ impl Refresher {
     pub async fn prepare(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let now = Utc::now();
         let (outer, siwc) = due_partitions(credential, now);
-        self.refresh_due(credential, outer, siwc, now).await
+        self.refresh_due(credential, outer, siwc, now).await.0
     }
 
     /// [`Self::prepare`] of the partitions `outer` and `siwc`.
@@ -52,17 +160,28 @@ impl Refresher {
         outer: bool,
         siwc: bool,
         now: chrono::DateTime<Utc>,
-    ) -> Result<MetadataPatch, ExecError> {
+    ) -> (Result<MetadataPatch, ExecError>, Refused) {
         if !outer && !siwc {
-            return Ok(MetadataPatch::default());
+            return (Ok(MetadataPatch::default()), Refused::default());
         }
+        let grants = self.grants(credential, outer, siwc).await;
+        let refused = grants.refused;
+        (Self::tolerate(credential, now, grants.result(credential)), refused)
+    }
+
+    /// A due refresh that failed while the access token requests use is still valid
+    /// keeps the credential usable (Go refreshes Codex only in the background).
+    fn tolerate(
+        credential: &Credential,
+        now: chrono::DateTime<Utc>,
+        result: Result<MetadataPatch, ExecError>,
+    ) -> Result<MetadataPatch, ExecError> {
         let usable = if crate::codex_siwc::enabled(credential) {
             crate::codex_siwc::access_usable(credential, now)
         } else {
             codex_oauth::access_usable(credential, now)
         };
-        match self.partitions(credential, outer, siwc).await {
-            Ok(patch) => Ok(patch),
+        match result {
             Err(error) if usable => {
                 tracing::warn!(
                     credential = %credential.id,
@@ -71,7 +190,7 @@ impl Refresher {
                 );
                 Ok(MetadataPatch::default())
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 
@@ -81,13 +200,13 @@ impl Refresher {
     /// that can (Go's explicit unscheduled refresh). Nothing without a refresh token.
     pub async fn refresh_now(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let (outer, siwc) = rejected_partitions(credential, credential, &DiskRotation::default(), Utc::now());
-        self.partitions(credential, outer, siwc).await
+        self.grants(credential, outer, siwc).await.result(credential)
     }
 
     /// A management refresh (Go `IsForceRefreshContext`): every partition that can refresh.
     pub async fn refresh_all(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let (outer, siwc) = all_partitions(credential, Utc::now());
-        self.partitions(credential, outer, siwc).await
+        self.grants(credential, outer, siwc).await.result(credential)
     }
 
     /// Go `refreshLocked` with the credential file (`disk`) read under its lock: a token
@@ -96,27 +215,42 @@ impl Refresher {
     /// `mode` asks for then runs on the result. The answer names each partition adopted
     /// or refreshed with its baselines, for [`RefreshPatch::apply`], and whether a grant
     /// was attempted; with one adopted, a failed refresh still answers with it.
+    ///
+    /// `refused` are the refresh tokens already refused for good: after the disk
+    /// adoption, a partition still holding one is not refreshed (its token is never sent
+    /// again), whatever `mode` asks. The second value is what is refused now: those still
+    /// held, plus every partition this refresh had refused for good.
     pub async fn refresh_locked(
         &self,
         memory: &Credential,
         disk: &Map<String, Value>,
         mode: RefreshMode,
-    ) -> Result<RefreshPatch, ExecError> {
+        refused: &Refused,
+    ) -> (Result<RefreshPatch, ExecError>, Refused) {
         let rotation = DiskRotation::read(memory, disk);
         let mut adopted = memory.clone();
         rotation.patch.apply(&mut adopted.metadata);
         adopted.refresh_derived();
+        let refused = refused.current(&adopted);
+        // The partitions are picked on the adopted credential with its refused refresh
+        // tokens removed, so no mode spends one.
+        let renewable = refused.mask(&adopted);
         let now = Utc::now();
         let (outer, siwc) = match mode {
-            RefreshMode::Due => due_partitions(&adopted, now),
-            RefreshMode::Rejected => rejected_partitions(memory, &adopted, &rotation, now),
-            RefreshMode::Management => all_partitions(&adopted, now),
+            RefreshMode::Due => due_partitions(&renewable, now),
+            RefreshMode::Rejected => rejected_partitions(&refused.mask(memory), &renewable, &rotation, now),
+            RefreshMode::Management => all_partitions(&renewable, now),
         };
         let granted = outer || siwc;
-        let refreshed = match mode {
+        let (refreshed, now_refused) = match mode {
             RefreshMode::Due => self.refresh_due(&adopted, outer, siwc, now).await,
-            _ => self.partitions(&adopted, outer, siwc).await,
+            _ => {
+                let grants = self.grants(&adopted, outer, siwc).await;
+                let refused = grants.refused;
+                (grants.result(&adopted), refused)
+            }
         };
+        let refused = refused.merged(&now_refused);
         let refresh = match refreshed {
             Ok(refresh) => refresh,
             Err(error) if rotation.outer || rotation.siwc => {
@@ -127,70 +261,69 @@ impl Refresher {
                 );
                 MetadataPatch::default()
             }
-            Err(error) => return Err(error),
+            Err(error) => return (Err(error), refused),
         };
         let mut after = adopted.metadata.clone();
         refresh.apply(&mut after);
         let outer = rotation.outer || fields(&after, &OUTER) != fields(&adopted.metadata, &OUTER);
         let siwc = rotation.siwc || fields(&siwc_map(&after), &SIWC) != fields(&siwc_map(&adopted.metadata), &SIWC);
-        Ok(RefreshPatch {
+        let patch = RefreshPatch {
             granted,
             outer: outer.then(|| Partition::new(&memory.metadata, disk, &after, &OUTER)),
             siwc: siwc.then(|| Partition::new(&siwc_map(&memory.metadata), &siwc_map(disk), &siwc_map(&after), &SIWC)),
-        })
+        };
+        (Ok(patch), refused)
     }
 
     /// Go `refreshLocked`: the outer tokens, then the Sign in with ChatGPT partition, one
-    /// after the other. A partition that fails while the other refreshes is logged and
-    /// the other's patch kept; with neither refreshed, the outer error comes first.
-    async fn partitions(&self, credential: &Credential, outer: bool, siwc: bool) -> Result<MetadataPatch, ExecError> {
-        if !outer && !siwc {
-            return Ok(MetadataPatch::default());
-        }
+    /// after the other, each with its own outcome: a partition that fails while the other
+    /// refreshes keeps the other's patch, and each refresh token refused for good is
+    /// recorded for its partition alone.
+    async fn grants(&self, credential: &Credential, outer: bool, siwc: bool) -> Grants {
+        let outer_token = codex_oauth::refresh_token(credential);
         let outer = if outer {
-            Some(self.oauth.refresh_patch(codex_oauth::refresh_token(credential)).await)
+            Some(self.oauth.refresh_patch(outer_token).await)
         } else {
             None
         };
+        let (siwc_token, client, device) = crate::codex_siwc::refresh_inputs(credential);
         let siwc = if siwc {
-            let (token, client, device) = crate::codex_siwc::refresh_inputs(credential);
             Some(
                 self.oauth
-                    .refresh_siwc(token, client, device)
+                    .refresh_siwc(siwc_token, client, device)
                     .await
                     .map(|tokens| crate::codex_siwc::refresh_patch(credential, &tokens)),
             )
         } else {
             None
         };
-        let mut patch = MetadataPatch::default();
-        let (mut refreshed, mut failures) = (false, Vec::new());
-        for (partition, result) in [("outer", outer), ("SIWC", siwc)] {
+        let mut grants = Grants {
+            patch: MetadataPatch::default(),
+            refreshed: false,
+            failures: Vec::new(),
+            refused: Refused::default(),
+        };
+        for (partition, result, token) in [("outer", outer, outer_token), ("SIWC", siwc, siwc_token)] {
             match result {
                 Some(Ok(part)) => {
-                    refreshed = true;
-                    patch.set.extend(part.set);
-                    patch.remove.extend(part.remove);
+                    grants.refreshed = true;
+                    grants.patch.set.extend(part.set);
+                    grants.patch.remove.extend(part.remove);
                 }
-                Some(Err(error)) => failures.push((partition, error)),
+                Some(Err(error)) => {
+                    if error.terminal {
+                        let hash = token_hash(token);
+                        match partition {
+                            "outer" => grants.refused.outer = hash,
+                            _ => grants.refused.siwc = hash,
+                        }
+                    }
+                    grants.failures.push((partition, error));
+                }
                 None => {}
             }
         }
-        if !refreshed {
-            return match failures.into_iter().next() {
-                Some((_, error)) => Err(error),
-                None => Ok(patch),
-            };
-        }
-        for (partition, error) in failures {
-            tracing::warn!(
-                credential = %credential.id,
-                partition,
-                status = error.status,
-                "codex token refresh failed for one partition; the other refreshed"
-            );
-        }
-        Ok(patch)
+        grants
     }
 }
 
@@ -207,13 +340,14 @@ const OUTER: [&str; 8] = [
 ];
 
 /// Go `codexSIWCCredentialKeys`.
-const SIWC: [&str; 9] = [
+const SIWC: [&str; 10] = [
     "access_token",
     "refresh_token",
     "id_token",
     "client_id",
     "device_id",
     "expired",
+    "expires_at",
     "last_refresh",
     "scope",
     "scopes",
@@ -456,3 +590,7 @@ fn rejected_partitions(
     let siwc = crate::codex_siwc::refresh_due(adopted, now).is_some_and(|due| due || !rotation.siwc);
     (outer, siwc)
 }
+
+#[cfg(test)]
+#[path = "codex_refresh_tests.rs"]
+mod tests;

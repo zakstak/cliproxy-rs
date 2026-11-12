@@ -1574,6 +1574,9 @@ async fn model_definitions_match_go_by_channel() {
     let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
     forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
+    for (channel, models) in go.iter_mut() {
+        forward_port::k1_catalog::definitions_list(channel, models);
+    }
     // The removed providers' channels (issue #49) are unknown here.
     let removed: Vec<String> = go
         .keys()
@@ -2863,6 +2866,83 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     let token = forms.iter().find(|(p, _)| p == "/oauth2/token").unwrap();
     assert!(token.1.contains("device_code=xdc"), "{}", token.1);
     assert!(f.rt.store().snapshot().iter().any(|c| c.provider == "xai"), "published");
+    server.abort();
+    fake_server.abort();
+}
+
+/// xAI (v8.0.67 d65840fb, issue #85): the login saves under the identity-hashed name,
+/// keeps the operator settings of the account's v8.0.35 file, removes that file once
+/// the new one is stored, and leaves another account's file at a colliding old name.
+#[tokio::test]
+async fn xai_login_migrates_the_accounts_v8_0_35_file() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("xaimigrate");
+    let auth = f.dir.join("auth");
+    let old = json!({"type": "xai", "email": "X@example.invalid", "sub": "xai-user-1", "access_token": "old",
+        "proxy-url": "socks5://127.0.0.1:1080", "disabled": true, "priority": 7, "prefix": "team"});
+    // v8.0.35 kept the email's case in the name.
+    std::fs::write(auth.join("xai-X@example.invalid.json"), old.to_string()).unwrap();
+    // Another account owns the name this account's lowercase email had in v8.0.35
+    // (`+x@example.invalid` sanitizes to `x@example.invalid`).
+    let other = json!({"type": "xai", "email": "+x@example.invalid", "access_token": "other"});
+    std::fs::write(auth.join("xai-x@example.invalid.json"), other.to_string()).unwrap();
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=xai").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    assert_eq!(final_status(&base, &state, 10).await, json!({"status": "ok"}));
+    let mut names: Vec<String> = std::fs::read_dir(&auth)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let hashed = cpa_exec::xai_auth::credential_file_name("x@example.invalid", "xai-user-1", 0);
+    let mut want = vec!["xai-x@example.invalid.json".to_owned(), hashed.clone()];
+    want.sort();
+    assert_eq!(names, want);
+    let saved: Value = serde_json::from_slice(&std::fs::read(auth.join(&hashed)).unwrap()).unwrap();
+    for (key, want) in [
+        ("access_token", json!("fake-xai-at")),
+        ("email", json!("x@example.invalid")),
+        ("proxy_url", json!("socks5://127.0.0.1:1080")),
+        ("disabled", json!(true)),
+        ("priority", json!(7)),
+        ("prefix", json!("team")),
+    ] {
+        assert_eq!(saved[key], want, "{key}: {saved}");
+    }
+    let untouched: Value =
+        serde_json::from_slice(&std::fs::read(auth.join("xai-x@example.invalid.json")).unwrap()).unwrap();
+    assert_eq!(untouched, other);
+    server.abort();
+    fake_server.abort();
+}
+
+/// xAI (#85 review): a file at the login's hashed name that holds another account
+/// (same email, another subject) is refused: the session fails with an actionable
+/// message that names no file or account, and the file is untouched.
+#[tokio::test]
+async fn xai_login_refuses_another_accounts_file_at_its_name() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("xairefuse");
+    let auth = f.dir.join("auth");
+    let name = cpa_exec::xai_auth::credential_file_name("x@example.invalid", "xai-user-1", 0);
+    let foreign = json!({"type": "xai", "email": "x@example.invalid", "sub": "someone-else",
+        "access_token": "other", "proxy_url": "http://127.0.0.1:8087"})
+    .to_string();
+    std::fs::write(auth.join(&name), &foreign).unwrap();
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=xai").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    assert_eq!(
+        final_status(&base, &state, 10).await,
+        json!({"status": "error", "error": "Failed to save token to file: a file in the auth directory at this account's credential name is not this account's xAI credential; move it aside and sign in again"})
+    );
+    assert_eq!(std::fs::read_to_string(auth.join(&name)).unwrap(), foreign);
+    let names: Vec<String> = std::fs::read_dir(&auth)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![name]);
     server.abort();
     fake_server.abort();
 }
@@ -5184,7 +5264,8 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
             let siwc = |rt: &str, active: bool| {
                 // A loopback base URL lets the test runtime's guard reach the token mock.
                 json!({"type": "codex", "use_siwc": active, "access_token": "outer-at", "base_url": "http://127.0.0.1:1",
-                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1"}})
+                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1",
+                                "expires_at": "2000-01-01T00:00:00Z"}})
                 .to_string()
             };
             std::fs::write(auth.join("active.json"), siwc("siwc-rt-1", true)).unwrap();
@@ -5265,6 +5346,41 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
         refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
         ["siwc-rt-2", "siwc-rt-new"]
     );
+    // #91: both refresh filters must retain the real grant expiry with the rotated
+    // tokens. Reload the persisted credential so status cannot rely on memory alone.
+    for name in ["active.json", "bound.json"] {
+        let path = f.dir.join("auth").join(name);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let credential =
+            cpa_core::credential::Credential::from_file(&f.dir.join("auth"), &path, saved.as_object().unwrap().clone())
+                .unwrap();
+        let expected_status = if name == "active.json" { "valid" } else { "off" };
+        assert_eq!(
+            cpa_exec::codex_siwc::status(&credential, false, chrono::Utc::now()),
+            expected_status,
+            "{name}: persisted refresh must replace the original grant expiry"
+        );
+        let expiry = chrono::DateTime::parse_from_rfc3339(saved["siwc"]["expires_at"].as_str().unwrap()).unwrap();
+        assert!((expiry.to_utc() - chrono::Utc::now()).num_seconds() > 3500);
+        let loaded =
+            f.rt.store()
+                .snapshot()
+                .into_iter()
+                .find(|c| c.id.ends_with(name))
+                .unwrap();
+        assert_eq!(loaded.metadata["siwc"]["expires_at"], saved["siwc"]["expires_at"]);
+        let response = wreq::Client::new()
+            .get(format!("{base}/v8/management/credentials/siwc/status?name={name}"))
+            .bearer_auth("fake-management-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"status": expected_status})
+        );
+    }
     server.abort();
     upstream.abort();
 }

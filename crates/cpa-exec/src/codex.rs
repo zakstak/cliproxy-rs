@@ -27,7 +27,8 @@ use crate::rawjson;
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{
-    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SessionLosses, SteeringInput, TakenLoss, handshake_metadata_event,
+    Authority, ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, Refusal, SessionLosses, SteeringInput, TakenLoss,
+    handshake_metadata_event,
 };
 pub use native::APPEND_REFUSED;
 
@@ -199,6 +200,12 @@ impl CodexExecutor {
         self.ws.attach_steering(session, input);
     }
 
+    /// Binds a downstream connection's live client authorization to its session: each
+    /// upstream write of a client frame on that session first asks it (N1 #111 W2).
+    pub fn attach_authority(&self, session: &str, authority: std::sync::Arc<Authority>) {
+        self.ws.attach_authority(session, authority);
+    }
+
     /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the
     /// session's upstream socket (see `codex_ws::Pool::interrupt`). `Some` is upstream's
     /// acknowledgement of an interrupt for a response that had already ended, for the
@@ -309,6 +316,32 @@ impl CodexExecutor {
         crate::proxy::send_routed(&route, url, go_headers(headers), body, None, None).await
     }
 
+    /// [`Self::post`], reporting whether a failure provably sent nothing
+    /// ([`crate::proxy::send_routed_certain`]).
+    async fn post_certain(
+        &self,
+        view: &View<'_>,
+        url: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+        gate: Option<crate::proxy::Gate>,
+    ) -> Result<crate::proxy::Upstream, (ExecError, bool)> {
+        let transport = &self.transport;
+        let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
+        // A gated request dials its own connection and is admitted after the dial,
+        // before any HTTP byte (`crate::proxy::admit_dials`); the same TLS, ALPN and proxy.
+        let gated = gate.is_some();
+        let route = |hop: &url::Url| {
+            let client = if gated {
+                transport.admitting_for_url(hop.as_str(), proxy, handshake)
+            } else {
+                transport.for_url(hop.as_str(), proxy, keep_alive, handshake)
+            };
+            Ok(crate::proxy::Route { client, order: None })
+        };
+        crate::proxy::send_routed_certain(&route, url, go_headers(headers), body, gate).await
+    }
+
     /// One POST to the Codex backend, captured as Go's call sites record it: the
     /// request, a transport error, the response metadata and an error body. A non-2xx
     /// answer is the returned error; success bodies are read (and recorded) by the
@@ -336,6 +369,8 @@ impl CodexExecutor {
             error_body,
             &model,
             false,
+            false,
+            None,
         )
         .await
     }
@@ -356,9 +391,40 @@ impl CodexExecutor {
         error_body: ErrorBody,
         model: &str,
         direct: bool,
+        sent_once: bool,
+        authority: Option<Arc<crate::codex_ws::Authority>>,
     ) -> Result<crate::proxy::Upstream, ExecError> {
         wire.request(&url, &headers, &body);
-        let mut upstream = match self.post(view, &url, &headers, body).await {
+        let posted = if sent_once {
+            // A request the upstream may have read is never sent again (N1 #111): only a
+            // failure that provably sent nothing may fail over. The client authority, if
+            // any, decides when the HTTP client takes the body, after the connection
+            // wait (`crate::proxy::GatedBody`).
+            let refused = Arc::new(std::sync::Mutex::new(None));
+            let gate = authority.map(|authority| {
+                let refused = refused.clone();
+                Arc::new(move || match authority() {
+                    Some(refusal) => {
+                        *refused.lock().expect("refusal") = Some(refusal);
+                        false
+                    }
+                    None => true,
+                }) as crate::proxy::Gate
+            });
+            let posted = self.post_certain(view, &url, &headers, body, gate).await;
+            posted.map_err(|(error, unsent)| {
+                if let Some(refusal) = refused.lock().expect("refusal").take() {
+                    refusal.error()
+                } else if unsent {
+                    error
+                } else {
+                    crate::codex_ws::uncertain(error)
+                }
+            })
+        } else {
+            self.post(view, &url, &headers, body).await
+        };
+        let mut upstream = match posted {
             Ok(upstream) => upstream,
             Err(error) => {
                 // ponytail: the text is this executor's transport message, not net/http's

@@ -57,6 +57,7 @@ fn bind_file_keeps_disk_values_and_encodes_like_go() {
         scope: "s chatgpt.tokens.use.direct".into(),
         scopes: vec!["s".into(), "chatgpt.tokens.use.direct".into()],
         expired: "2035-01-01T00:00:00Z".into(),
+        expires_at: String::new(),
         last_refresh: "2026-01-01T00:00:00Z".into(),
         device_id: "e61bbe28-07ef-466d-8e5d-a344f94ab305".into(),
     };

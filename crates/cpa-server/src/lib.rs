@@ -129,7 +129,8 @@ fn api(rt: Arc<Runtime>) -> Router {
         .merge(realtime::routes(&rt))
         // Matched API routes only: management answers its own HEADs (plugin routes).
         .route_layer(middleware::from_fn(head_only_healthz))
-        .method_not_allowed_fallback(|| async { StatusCode::NOT_FOUND })
+        // gin answers a registered path's unregistered method through NoRoute.
+        .method_not_allowed_fallback(|| async { request_logging::unrouted(StatusCode::NOT_FOUND.into_response()) })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn(go_framing))
         .layer(middleware::from_fn(request_logging::response))
@@ -166,7 +167,7 @@ fn removed_routes() -> Router<Arc<Runtime>> {
 /// it is NoRoute's bare 404.
 async fn head_only_healthz(req: axum::extract::Request, next: middleware::Next) -> Response {
     if req.method() == Method::HEAD && req.uri().path() != "/healthz" {
-        return StatusCode::NOT_FOUND.into_response();
+        return request_logging::unrouted(StatusCode::NOT_FOUND.into_response());
     }
     next.run(req).await
 }

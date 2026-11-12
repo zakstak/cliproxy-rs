@@ -648,33 +648,58 @@ fn prune_orphaned_tool_choice(mut body: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// `xaiCountFlattenedTools`.
-fn count_flattened(tools: &Res<'_>) -> usize {
+/// `xaiCountFlattenedToolsWithSeen` (v8.0.67 0c61b12c): tools as xAI would receive
+/// them flattened, a function, custom tool or namespace child counted once by name
+/// across every list that shares `seen`. Tool search is stripped, so not counted.
+fn count_flattened(tools: &Res<'_>, seen: &mut HashSet<String>) -> usize {
     if !tools.is_array() {
         return 0;
     }
-    tools
-        .array()
-        .iter()
-        .map(|tool| match &*tool.get("type").bytes() {
+    let mut count = 0;
+    for tool in tools.array() {
+        match &*tool.get("type").bytes() {
             b"namespace" => {
                 let nested = tool.get("tools");
-                if nested.is_array() { nested.array().len() } else { 1 }
+                if !nested.is_array() {
+                    count += 1;
+                    continue;
+                }
+                let namespace = tool.get("name").str().into_owned();
+                for child in nested.array() {
+                    if &*child.get("type").bytes() == TOOL_SEARCH.as_bytes() {
+                        continue;
+                    }
+                    let qualified = response::qualify(&namespace, &child.get("name").str());
+                    if !qualified.is_empty() && !seen.insert(qualified) {
+                        continue;
+                    }
+                    count += 1;
+                }
             }
-            b"tool_search" => 0,
-            _ => 1,
-        })
-        .sum()
+            b"tool_search" => {}
+            b"function" | b"custom" => {
+                let name = text(&tool.get("name"));
+                if !name.is_empty() && !seen.insert(name) {
+                    continue;
+                }
+                count += 1;
+            }
+            _ => count += 1,
+        }
+    }
+    count
 }
 
-/// `xaiShouldFoldNamespaceTools`: more than 200 tools once namespaces are flattened.
+/// `xaiShouldFoldNamespaceTools`: more than 200 distinct tools once namespaces are
+/// flattened, counting top-level tools and every `additional_tools` item together.
 fn should_fold_namespace_tools(body: &[u8], will_inject: bool) -> bool {
-    let mut count = count_flattened(&gj::get(body, "tools"));
+    let mut seen = HashSet::new();
+    let mut count = count_flattened(&gj::get(body, "tools"), &mut seen);
     let input = gj::get(body, "input");
     if input.is_array() {
         for item in input.array() {
             if &*item.get("type").bytes() == b"additional_tools" {
-                count += count_flattened(&item.get("tools"));
+                count += count_flattened(&item.get("tools"), &mut seen);
             }
         }
     }
@@ -682,6 +707,32 @@ fn should_fold_namespace_tools(body: &[u8], will_inject: bool) -> bool {
         count += 1;
     }
     count > MAX_TOOLS
+}
+
+/// Every list of tool declarations: the top-level tools, then each `additional_tools`
+/// input item's, in input order (the order promotion keeps).
+fn tool_lists(body: &[u8]) -> Vec<Res<'_>> {
+    let mut lists = vec![gj::get(body, "tools")];
+    let input = gj::get(body, "input");
+    if input.is_array() {
+        lists.extend(
+            input
+                .array()
+                .into_iter()
+                .filter(|item| &*item.get("type").bytes() == b"additional_tools")
+                .map(|item| item.get("tools")),
+        );
+    }
+    lists
+}
+
+/// `xaiDeduplicatedToolName`: the name a function, custom tool or namespace may hold
+/// only once in the tools xAI receives; hosted tools have none.
+fn deduplicated_tool_name(tool: &Res<'_>) -> Option<String> {
+    match tool.get("type").str().trim() {
+        FUNCTION | CUSTOM | NAMESPACE => Some(text(&tool.get("name"))).filter(|n| !n.is_empty()),
+        _ => None,
+    }
 }
 
 /// Go `json.Marshal` of a string.
@@ -709,19 +760,33 @@ fn inlined_parameters(raw: &str) -> String {
 /// `buildXAINamespaceDispatcherTool`: one function standing for a whole namespace when
 /// the flattened tool list would exceed xAI's limit. Built as Go's `json.Marshal` of a
 /// map writes it: sorted keys, HTML-escaped strings.
-fn namespace_dispatcher_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
-    let namespace = text(&tool.get("name"));
+///
+/// `declarations` are every declaration of the namespace, top-level tools first (v8.0.67
+/// 0c61b12c): a child appears once, from the first declaration naming it, and the
+/// description is the first non-empty one. Tool search children are stripped.
+fn namespace_dispatcher_tool(declarations: &[Res<'_>]) -> Option<Vec<u8>> {
+    let namespace = text(&declarations.first()?.get("name"));
     if namespace.is_empty() {
         return None;
     }
-    let description = text(&tool.get("description"));
+    let mut description = String::new();
     let mut names = Vec::new();
     let mut entries = Vec::new();
-    let nested = tool.get("tools");
-    if nested.is_array() {
+    let mut seen = HashSet::new();
+    for declaration in declarations {
+        if description.is_empty() {
+            description = text(&declaration.get("description"));
+        }
+        let nested = declaration.get("tools");
+        if !nested.is_array() {
+            continue;
+        }
         for child in nested.array() {
+            if &*child.get("type").bytes() == TOOL_SEARCH.as_bytes() {
+                continue;
+            }
             let child_name = text(&child.get("name"));
-            if child_name.is_empty() {
+            if child_name.is_empty() || !seen.insert(child_name.clone()) {
                 continue;
             }
             names.push(child_name.clone());
@@ -796,20 +861,55 @@ fn namespace_dispatcher_tool(tool: &Res<'_>) -> Option<Vec<u8>> {
     ])))
 }
 
+/// Folded namespaces' dispatchers by namespace name, each built once from all of that
+/// namespace's declarations ([`namespace_dispatcher_tool`]).
+///
+/// Go rebuilds the dispatcher at every occurrence of the namespace, over every
+/// declaration of it, and emits a copy into each tool list; promotion then keeps only
+/// the copy at the first occurrence (first wins by name, top-level tools first). Every
+/// later copy is dropped there, behind either that first copy or an earlier tool of
+/// the same name. So the dispatcher is built once here and emitted only at the
+/// namespace's first occurrence ([`normalize_tool_array`] takes it out of this map):
+/// the tools sent are Go's, without work that grows with the square of a namespace
+/// repeated, or growing, across a long tool history.
+fn namespace_dispatchers(body: &[u8]) -> HashMap<String, Vec<u8>> {
+    let mut declarations: HashMap<String, Vec<Res<'_>>> = HashMap::new();
+    for tools in tool_lists(body) {
+        for tool in tools.array() {
+            if &*tool.get("type").bytes() != NAMESPACE.as_bytes() {
+                continue;
+            }
+            let name = text(&tool.get("name"));
+            if !name.is_empty() {
+                declarations.entry(name).or_default().push(tool);
+            }
+        }
+    }
+    declarations
+        .into_iter()
+        .filter_map(|(name, decls)| namespace_dispatcher_tool(&decls).map(|d| (name, d)))
+        .collect()
+}
+
 /// `normalizeXAIToolsWithFold`: top-level tools and every `additional_tools` input item.
 fn normalize_tools(body: Vec<u8>, fold: bool) -> Vec<u8> {
     if !gj::valid(&body) {
         return body;
     }
     let keep_image = supports_native_image_generation(&gj::get(&body, "model").str());
+    let mut dispatchers = if fold {
+        namespace_dispatchers(&body)
+    } else {
+        HashMap::new()
+    };
     let original = body.clone();
     let mut body = body;
-    let at = |body: &mut Vec<u8>, path: &str| -> bool {
+    let mut at = |body: &mut Vec<u8>, path: &str| -> bool {
         let tools = gj::get(body, path);
         if !tools.is_array() {
             return true;
         }
-        match normalize_tool_array(&tools, keep_image, fold) {
+        match normalize_tool_array(&tools, keep_image, fold, &mut dispatchers) {
             None => false,
             Some(None) => true,
             Some(Some(filtered)) => gj::set_raw(body, path, filtered),
@@ -818,34 +918,72 @@ fn normalize_tools(body: Vec<u8>, fold: bool) -> Vec<u8> {
     if !at(&mut body, "tools") {
         return original;
     }
-    let paths: Vec<String> = gj::get(&body, "input")
-        .array()
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| &*item.get("type").bytes() == b"additional_tools")
-        .map(|(i, _)| format!("input.{i}.tools"))
-        .collect();
-    if !gj::get(&body, "input").is_array() {
+    // Every `additional_tools` item in one walk of `input`, each edited in place and
+    // the array written once: editing the body by path per item would rescan and
+    // rewrite it per item, growing with the square of a long tool history. Only the
+    // separators between `input` items can change, and promotion rewrites `input`
+    // whenever it holds such an item.
+    let input = gj::get(&body, "input");
+    if !input.is_array() {
         return body;
     }
-    for path in paths {
-        if !at(&mut body, &path) {
-            return original;
+    let mut items = Vec::new();
+    let mut changed = false;
+    for item in input.array() {
+        let tools = item.get("tools");
+        if &*item.get("type").bytes() == b"additional_tools" && tools.is_array() {
+            match normalize_tool_array(&tools, keep_image, fold, &mut dispatchers) {
+                None => return original,
+                Some(Some(filtered)) => {
+                    let mut raw = item.raw().to_vec();
+                    if !gj::set_raw(&mut raw, "tools", filtered) {
+                        return original;
+                    }
+                    items.push(raw);
+                    changed = true;
+                    continue;
+                }
+                Some(None) => {}
+            }
         }
+        items.push(item.raw().to_vec());
+    }
+    if changed && !gj::set_raw(&mut body, "input", gj::join(&items)) {
+        return original;
     }
     body
 }
 
-/// `normalizeXAIToolArray`: `None` on failure, `Some(None)` when unchanged.
-fn normalize_tool_array(tools: &Res<'_>, keep_image: bool, fold: bool) -> Option<Option<Vec<u8>>> {
+/// `normalizeXAIToolArrayWithNamespaces`: `None` on failure, `Some(None)` when
+/// unchanged. A function, custom tool or dispatcher whose name an earlier tool of this
+/// list already holds is dropped (first wins, v8.0.67 0c61b12c).
+fn normalize_tool_array(
+    tools: &Res<'_>,
+    keep_image: bool,
+    fold: bool,
+    dispatchers: &mut HashMap<String, Vec<u8>>,
+) -> Option<Option<Vec<u8>>> {
     let mut filtered = Vec::new();
+    let mut seen = HashSet::new();
     let mut changed = false;
+    // Adds `raw` unless its name is taken; reports a drop.
+    let mut push = |raw: Vec<u8>, filtered: &mut Vec<Vec<u8>>| {
+        if let Some(name) = deduplicated_tool_name(&gj::parse(&raw))
+            && !seen.insert(name)
+        {
+            return true;
+        }
+        filtered.push(raw);
+        false
+    };
     for tool in tools.array() {
         if &*tool.get("type").bytes() == NAMESPACE.as_bytes() {
             changed = true;
             if fold {
-                if let Some(dispatcher) = namespace_dispatcher_tool(&tool) {
-                    filtered.push(dispatcher);
+                // Only the namespace's first occurrence, in the order lists are
+                // normalized (top-level, then history), emits its dispatcher.
+                if let Some(dispatcher) = dispatchers.remove(&text(&tool.get("name"))) {
+                    push(dispatcher, &mut filtered);
                 }
                 continue;
             }
@@ -856,7 +994,7 @@ fn normalize_tool_array(tools: &Res<'_>, keep_image: bool, fold: bool) -> Option
                     let (raw, child_changed) = normalize_tool(&child, &namespace, keep_image)?;
                     changed |= child_changed;
                     if !raw.is_empty() {
-                        filtered.push(raw);
+                        changed |= push(raw, &mut filtered);
                     }
                 }
             }
@@ -865,7 +1003,7 @@ fn normalize_tool_array(tools: &Res<'_>, keep_image: bool, fold: bool) -> Option
         let (raw, tool_changed) = normalize_tool(&tool, "", keep_image)?;
         changed |= tool_changed;
         if !raw.is_empty() {
-            filtered.push(raw);
+            changed |= push(raw, &mut filtered);
         }
     }
     Some(changed.then(|| gj::join(&filtered)))
@@ -1079,7 +1217,7 @@ fn promote_additional_tools(body: Vec<u8>) -> Vec<u8> {
             remaining.push(item.raw().to_vec());
             continue;
         }
-        promoted.extend(item.get("tools").array().iter().map(|t| t.raw().to_vec()));
+        promoted.extend(item.get("tools").array());
     }
     if remaining.len() == items.len() {
         return body;
@@ -1090,13 +1228,20 @@ fn promote_additional_tools(body: Vec<u8>) -> Vec<u8> {
     if promoted.is_empty() {
         return updated;
     }
+    // First wins by name (v8.0.67 0c61b12c): top-level tools stay authoritative over
+    // copies promoted from historical `additional_tools`.
     let top = gj::get(&updated, "tools");
-    let mut tools: Vec<Vec<u8>> = if top.is_array() {
-        top.array().iter().map(|t| t.raw().to_vec()).collect()
-    } else {
-        Vec::new()
-    };
-    tools.extend(promoted);
+    let mut seen = HashSet::new();
+    let mut tools: Vec<Vec<u8>> = Vec::new();
+    let top_items = if top.is_array() { top.array() } else { Vec::new() };
+    for tool in top_items.iter().chain(promoted.iter()) {
+        if let Some(name) = deduplicated_tool_name(tool)
+            && !seen.insert(name)
+        {
+            continue;
+        }
+        tools.push(tool.raw().to_vec());
+    }
     gj::try_set_raw(&updated, "tools", response::marshal_raw(&tools)).unwrap_or(body)
 }
 
@@ -1170,58 +1315,82 @@ fn normalize_namespace_tool_choice(body: Vec<u8>, fold: bool) -> Vec<u8> {
     body
 }
 
-/// `collectXAINamespaceToolRefsWithFold`.
+/// `collectXAINamespaceToolRefsWithFold` (v8.0.67 0c61b12c): what each flattened or
+/// folded name sent upstream stands for, first declaration wins. A name a function or
+/// custom tool claims is no namespace child; folded, a later flat function also takes
+/// back a child name, while a dispatcher keeps its namespace and every child name its
+/// declarations list.
 fn collect_namespace_refs(body: &[u8], fold: bool) -> NamespaceRefs {
-    let mut refs = HashMap::new();
-    let mut collect = |tools: &Res<'_>| {
+    let mut refs: NamespaceRefs = HashMap::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+    for tools in tool_lists(body) {
         if !tools.is_array() {
-            return;
+            continue;
         }
         for tool in tools.array() {
-            if &*tool.get("type").bytes() != NAMESPACE.as_bytes() {
+            let kind = tool.get("type").str().trim().to_owned();
+            if kind == FUNCTION || kind == CUSTOM {
+                let name = text(&tool.get("name"));
+                if !name.is_empty() {
+                    if fold && refs.get(&name).is_some_and(|r| !r.dispatcher) {
+                        refs.remove(&name);
+                    }
+                    claimed.insert(name);
+                }
+                continue;
+            }
+            if kind != NAMESPACE {
                 continue;
             }
             let namespace = text(&tool.get("name"));
             if namespace.is_empty() {
                 continue;
             }
-            if fold {
+            if fold && claimed.insert(namespace.clone()) {
                 refs.insert(
                     namespace.clone(),
                     NamespaceRef {
                         namespace: namespace.clone(),
                         name: String::new(),
                         dispatcher: true,
+                        children: HashSet::new(),
                     },
                 );
             }
             for nested in tool.get("tools").array() {
+                if &*nested.get("type").bytes() == TOOL_SEARCH.as_bytes() {
+                    continue;
+                }
                 let name = text(&nested.get("name"));
                 let qualified = response::qualify(&namespace, &name);
                 if qualified.is_empty() {
                     continue;
                 }
-                refs.insert(
-                    qualified,
-                    NamespaceRef {
-                        namespace: namespace.clone(),
-                        name,
-                        dispatcher: false,
-                    },
-                );
-            }
-        }
-    };
-    collect(&gj::get(body, "tools"));
-    let input = gj::get(body, "input");
-    if input.is_array() {
-        for item in input.array() {
-            if &*item.get("type").bytes() == b"additional_tools" {
-                collect(&item.get("tools"));
+                if fold {
+                    if let Some(dispatcher) = refs.get_mut(&namespace).filter(|r| r.dispatcher) {
+                        dispatcher.children.insert(name.clone());
+                    }
+                    if !claimed.contains(&qualified) && !refs.contains_key(&qualified) {
+                        refs.insert(qualified, child_ref(&namespace, name));
+                    }
+                    continue;
+                }
+                if claimed.insert(qualified.clone()) {
+                    refs.insert(qualified, child_ref(&namespace, name));
+                }
             }
         }
     }
     refs
+}
+
+fn child_ref(namespace: &str, name: String) -> NamespaceRef {
+    NamespaceRef {
+        namespace: namespace.to_owned(),
+        name,
+        dispatcher: false,
+        children: HashSet::new(),
+    }
 }
 
 /// `normalizeXAIInputCustomToolCalls`: custom tool history as function calls.
@@ -1444,3 +1613,7 @@ fn image_ref(value: &mut GoValue) -> bool {
     r.remove("image_url");
     true
 }
+
+#[cfg(test)]
+#[path = "xai_request_tests.rs"]
+mod tests;

@@ -183,11 +183,16 @@ async fn refresh_retry_policy_matches_go_attempt_counts() {
         mock.script("/oauth/token", replies);
         let result = oauth.refresh(refresh).await;
         let go = go_exchange(name);
-        assert_eq!(
-            mock.take().len(),
-            go["requests"].as_array().unwrap().len(),
-            "{name} attempts"
-        );
+        // #92, deliberate difference from this v8.0.35 golden: first-party codex-rs at the
+        // contract pin (`request_chatgpt_token_refresh`) treats HTTP 400 `invalid_grant`
+        // as a permanent refusal, so the refused token is sent once, not three times.
+        let first_party = name == "refresh_invalid_grant";
+        let attempts = if first_party {
+            1
+        } else {
+            go["requests"].as_array().unwrap().len()
+        };
+        assert_eq!(mock.take().len(), attempts, "{name} attempts");
         match go["error"].as_str() {
             None => assert!(result.is_ok(), "{name}"),
             Some(go_error) => {
@@ -195,6 +200,11 @@ async fn refresh_retry_policy_matches_go_attempt_counts() {
                 let text = String::from_utf8_lossy(&error.body).into_owned();
                 // Go appends the raw body; only its OAuth error code is kept here.
                 let prefix = go_error.split(": {").next().unwrap();
+                let prefix = if first_party {
+                    prefix.trim_start_matches("token refresh failed after 3 attempts: ")
+                } else {
+                    prefix
+                };
                 assert!(text.starts_with(prefix), "{name}: {text} vs {go_error}");
                 assert_eq!(error.status, 401, "a rejected grant marks the credential unusable");
                 assert_eq!(error.scope, FailureScope::Credential);

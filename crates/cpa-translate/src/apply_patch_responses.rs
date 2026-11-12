@@ -143,11 +143,6 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
         walk(tools, namespace, &winners, &affected, &descriptors)
     };
-    let mut out = raw.to_vec();
-    let tools = root.get("tools");
-    if tools.is_array() {
-        gj::set_raw(&mut out, "tools", normalize_tools(&tools, b""));
-    }
     let input = root.get("input").array();
     let patch_history: HashSet<Vec<u8>> = input
         .iter()
@@ -156,14 +151,20 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
         })
         .map(|item| str_of(&item.get("call_id")))
         .collect();
+    // Each input item is edited on its own bytes and spliced back in one pass, every
+    // other byte kept: editing the request by path per item would rescan and rewrite it
+    // per item, growing with the square of a long history (#86 review).
+    let mut spliced: Vec<(usize, usize, Vec<u8>)> = vec![];
+    let mut by_path: Vec<(String, Vec<u8>)> = vec![];
     for (i, item) in input.iter().enumerate() {
-        let path = format!("input.{i}");
+        let mut edited = item.raw.to_vec();
         match &*item.get("type").bytes() {
             b"additional_tools" => {
                 let tools = item.get("tools");
-                if tools.is_array() {
-                    gj::set_raw(&mut out, &format!("{path}.tools"), normalize_tools(&tools, b""));
+                if !tools.is_array() {
+                    continue;
                 }
+                gj::set_raw(&mut edited, "tools", normalize_tools(&tools, b""));
             }
             b"custom_tool_call" => {
                 if trim_space(&item.get("name").bytes()) != b"apply_patch" {
@@ -173,19 +174,34 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
                 if patch.kind != Kind::String {
                     return Err("apply_patch history input must be a string".into());
                 }
-                gj::set_str(&mut out, &format!("{path}.type"), "function_call");
-                gj::set_str(
-                    &mut out,
-                    &format!("{path}.arguments"),
-                    apply_patch::wrap_input(&patch.s),
-                );
-                gj::delete(&mut out, &format!("{path}.input"));
+                gj::set_str(&mut edited, "type", "function_call");
+                gj::set_str(&mut edited, "arguments", apply_patch::wrap_input(&patch.s));
+                gj::delete(&mut edited, "input");
             }
             b"custom_tool_call_output" if patch_history.contains(&*item.get("call_id").bytes()) => {
-                gj::set_str(&mut out, &format!("{path}.type"), "function_call_output");
+                gj::set_str(&mut edited, "type", "function_call_output");
             }
-            _ => {}
+            _ => continue,
         }
+        match offset_in(raw, &item.raw) {
+            Some(start) => spliced.push((start, start + item.raw.len(), edited)),
+            None => by_path.push((format!("input.{i}"), edited)),
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    for (start, end, edited) in spliced {
+        out.extend_from_slice(&raw[at..start]);
+        out.extend_from_slice(&edited);
+        at = end;
+    }
+    out.extend_from_slice(&raw[at..]);
+    for (path, edited) in by_path {
+        gj::set_raw(&mut out, &path, edited);
+    }
+    let tools = root.get("tools");
+    if tools.is_array() {
+        gj::set_raw(&mut out, "tools", normalize_tools(&tools, b""));
     }
     fn normalize_choice(
         choice: &Res<'_>,
@@ -223,6 +239,12 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
 /// helps NormalizeApplyPatchResponsesRequest: [`normalize_request`] after preferring the
 /// Chat client's ordinary `apply_patch` functions over a custom one (when the executor
 /// passes the client's original Chat request).
+/// Where `value`, a slice borrowed from `raw`, starts in it.
+fn offset_in(raw: &[u8], value: &[u8]) -> Option<usize> {
+    let start = (value.as_ptr() as usize).checked_sub(raw.as_ptr() as usize)?;
+    (start + value.len() <= raw.len()).then_some(start)
+}
+
 pub fn normalize_executor_request(body: &[u8], original: Option<&[u8]>) -> Result<Vec<u8>, String> {
     match original {
         Some(original) => normalize_request(&prefer_chat_function_patch_tools(original, body)),
@@ -299,6 +321,8 @@ impl Record {
 }
 
 const IDENTITY_CONFLICT: &str = "conflicting apply_patch call identity";
+/// The prefix of the events that stream a custom tool call's input.
+const CUSTOM_INPUT_EVENT: &[u8] = b"response.custom_tool_call_input.";
 
 /// common.ApplyPatchResponsesBridge: one response's apply_patch conversion, local to that
 /// response. Identity evidence is kept even before a call receives its name.
@@ -977,6 +1001,8 @@ pub struct State {
     active: bool,
     failed: bool,
     closed: bool,
+    /// Upstream emitted a custom apply_patch call (v8.0.67 `sawPatch`, 949b43b3).
+    saw_patch: bool,
     transport_done: bool,
 }
 
@@ -1046,6 +1072,7 @@ impl State {
             active,
             failed: false,
             closed: false,
+            saw_patch: false,
             transport_done: false,
         }
     }
@@ -1511,10 +1538,22 @@ impl State {
         preceding.extend(expanded);
         let mut out = vec![];
         for e in preceding {
+            if !self.saw_patch && self.is_custom_patch_event(&e) {
+                self.saw_patch = true;
+            }
             let (converted, err) = self.bridge.transform(&e);
+            if !self.saw_patch
+                && !gj::get(&e, "type").bytes().starts_with(CUSTOM_INPUT_EVENT)
+                && converted
+                    .iter()
+                    .any(|c| gj::get(c, "type").bytes().starts_with(CUSTOM_INPUT_EVENT))
+            {
+                self.saw_patch = true;
+            }
             out.extend(converted);
             if err.is_some() {
                 self.failed = true;
+                self.saw_patch = true;
                 self.clear();
                 return (out, err);
             }
@@ -1524,6 +1563,40 @@ impl State {
             self.clear();
         }
         (out, None)
+    }
+
+    /// `isCustomPatchEvent` (v8.0.67): the event names a winning custom patch tool.
+    fn is_custom_patch_event(&self, event: &[u8]) -> bool {
+        if !self.active {
+            return false;
+        }
+        let root = gj::parse(event);
+        let item = root.get("item");
+        let (namespace, name) = if item.exists() {
+            if &*item.get("type").bytes() == b"custom_tool_call" {
+                return false;
+            }
+            (item.get("namespace").bytes(), item.get("name").bytes())
+        } else {
+            let name = root.get("name").bytes();
+            if name.is_empty() {
+                return false;
+            }
+            (root.get("namespace").bytes(), name)
+        };
+        self.tools
+            .get(&qualify_namespace_name(&namespace, &name))
+            .is_some_and(|t| t.patch)
+    }
+
+    /// `HasPatchActivity` (v8.0.67, 949b43b3): upstream emitted a custom apply_patch
+    /// call, or left a patch dispatcher or patch arguments unfinished, before the
+    /// response closed. Without it a body that ends early is no apply_patch failure.
+    pub fn has_patch_activity(&self) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.failed || self.saw_patch || self.unfinished_dispatcher() || self.bridge.finish().is_err()
     }
 
     /// Finish: the source response must have closed (and every patch call completed);

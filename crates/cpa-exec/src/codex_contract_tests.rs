@@ -77,6 +77,54 @@ fn every_fixture_records_its_provenance() {
     }
 }
 
+/// The contract pin stays the authority. A fixture that cites another revision names a
+/// recorded research pin and says it is source-refresh evidence (FP1, #115).
+#[test]
+fn research_revisions_never_replace_the_contract_pin() {
+    let manifest = manifest();
+    assert_eq!(manifest.pin.commit, FIRST_PARTY_COMMIT, "the contract pin is unchanged");
+    let research: BTreeSet<&str> = manifest.research.iter().map(|r| r.commit.as_str()).collect();
+    assert_eq!(
+        research.len(),
+        manifest.research.len(),
+        "a research pin is listed twice"
+    );
+    assert!(research.contains(RESEARCHED_MAIN_COMMIT));
+    for pin in &manifest.research {
+        assert_ne!(
+            pin.commit, FIRST_PARTY_COMMIT,
+            "{}: the contract pin is no research pin",
+            pin.label
+        );
+        assert_eq!(pin.repository, "https://github.com/openai/codex", "{}", pin.label);
+        assert_eq!(pin.commit.len(), 40, "{}: a full commit", pin.label);
+        assert!(pin.status.contains("Not the contract authority"), "{}", pin.label);
+    }
+    for f in &manifest.fixtures {
+        match &f.revision {
+            None => assert_eq!(f.source_commit(), FIRST_PARTY_COMMIT, "{}", f.name),
+            Some(revision) => {
+                assert!(
+                    research.contains(revision.as_str()),
+                    "{}: unknown revision {revision}",
+                    f.name
+                );
+                assert!(
+                    matches!(f.evidence, Evidence::FirstPartySource | Evidence::FirstPartyTest),
+                    "{}: only first-party evidence cites a revision",
+                    f.name
+                );
+                assert!(
+                    f.notes
+                        .contains("Source-refresh evidence at the research pin, not the contract pin"),
+                    "{}: a revisioned fixture must say it does not move the contract pin",
+                    f.name
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn every_frame_is_json() {
     for f in manifest().fixtures {
