@@ -20,12 +20,18 @@ or restoration of removed providers or plugins is authorized.
 | Harness | H1, #67 | Ember | Dedicated Sol review and isolated acceptance receipt |
 | Claude | C4, #72, followed by C3, #71 | Workstation | H1 plus dedicated Sol review |
 | Grok | X1, #84, followed by X2, #85 | Workstation | H1 plus dedicated Sol review |
-| Credentials | A1, #89 | Ember | H1 plus dedicated Sol review |
+| Credentials | A1, #89 | Workstation | H1 plus dedicated Sol review |
 
 Implementations may be authored concurrently in isolated checkouts. Foundation
 acceptance precedes integration of dependent features. Keep changes separated by
 issue where practical. Review findings return to the implementation lane; each
 review or re-check is a fresh review task against an exact commit.
+
+Linked-environment delegation currently uses the existing project checkout and
+does not support isolated worktrees. H1 therefore has exclusive implementation
+ownership of Ember's project checkout. The other three initial lanes use local
+delegation worktrees. Ember serves Opus through its enabled Claude via Pyre
+instance; the requested Opus model and high effort stay the same.
 
 After H1 is accepted, expand toward six lanes as build capacity permits. Add
 Muse/catalog, server boundaries, and Codex work as slots become available.
