@@ -5763,6 +5763,66 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&f.dir).unwrap();
     }
 
+    /// #92: background refreshes of a SIWC partition whose token endpoint keeps failing,
+    /// through the real refresh job, while the native tokens are in use. A transient
+    /// failure (503) is sent three times by the first job; the jobs that follow once its
+    /// 30-second ineffective backoff ends send nothing while the failure is kept (each
+    /// sent three more before). A 200 without a replacement refresh token is sent once
+    /// and not again in the same refresh (three times before). The file keeps its
+    /// tokens, nothing is refused or rejected, and the credential stays selectable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_due_siwc_refresh_backs_off_through_the_refresh_job() {
+        let unrotated =
+            r#"{"access_token":"siwc-unrotated","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#;
+        for (case, answer, first) in [
+            (
+                "temporarily unavailable",
+                (503, r#"{"error":"temporarily_unavailable"}"#),
+                3,
+            ),
+            ("no replacement refresh token", (200, unrotated), 1),
+        ] {
+            let mut file = codex_file(
+                ("b", chrono::Duration::days(10)),
+                ("busy", "oaiapp_fake", chrono::Duration::minutes(-1)),
+            );
+            file["use_siwc"] = false.into();
+            let f = CodexDisk::answering(&[("codex.json", &file)], 1000, OUTER_OK, answer).await;
+            let rt = f.rt.clone();
+            let workers = Arc::new(tokio::sync::Semaphore::new(1));
+            for round in 0..3 {
+                let c = rt.store.get("codex.json").unwrap();
+                run_refresh_job(rt.clone(), rt.config(), workers.clone(), c.clone(), false).await;
+                rt.refresh_state.lock().unwrap().expire(&c);
+                let grants = f.grants();
+                let want = if round == 0 { first } else { 0 };
+                assert_eq!(
+                    partition_grants(&grants, "siwc"),
+                    want,
+                    "{case} round {round}: {grants:?}"
+                );
+                assert_eq!(
+                    partition_grants(&grants, "outer"),
+                    0,
+                    "{case} round {round}: {grants:?}"
+                );
+            }
+            assert_eq!(
+                f.tokens("codex.json", &["/siwc/refresh_token", "/refresh_token"]),
+                [Value::from("siwc-ref-busy"), Value::from("outer-ref-b")],
+                "{case}: the file keeps its tokens"
+            );
+            let c = rt.store.get("codex.json").unwrap();
+            assert!(rt.store.refused_renewal(&c).is_empty(), "{case}: nothing refused");
+            assert!(!rt.store.tokens_rejected(&c), "{case}: nothing rejected");
+            assert!(
+                rt.store.select(Selection::new("codex", "gpt-5")).is_some(),
+                "{case}: the native tokens stay in use"
+            );
+            std::fs::remove_dir_all(&f.dir).unwrap();
+        }
+    }
+
     /// A due or management refresh can refuse the only renewable token before an
     /// upstream rejects its access token. The later 401 must still quarantine it,
     /// without sending the refused refresh token again. A new sign-in recovers it.

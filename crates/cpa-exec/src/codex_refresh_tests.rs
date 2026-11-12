@@ -126,7 +126,9 @@ async fn a_refused_siwc_refresh_token_is_sent_once() {
 
 /// OpenAI's token reference: each successful SIWC refresh returns a replacement refresh
 /// token. A 200 without one is refused (and not mistaken for a dead token): nothing of
-/// the answer is applied, and the stored refresh token stays for a later attempt.
+/// the answer is applied, and the stored refresh token stays for a later attempt. The
+/// endpoint answered 200, so it may have spent that token: the same refresh does not
+/// send it again (it used to, three times), and the next one waits for its backoff.
 #[tokio::test]
 async fn a_siwc_refresh_without_a_replacement_token_is_refused() {
     let mock = Mock::start().await;
@@ -139,13 +141,13 @@ async fn a_siwc_refresh_without_a_replacement_token_is_refused() {
                 200,
                 r#"{"access_token":"siwc-at-unrotated","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#
             );
-            3
+            1
         ],
     );
     let (result, refused) = r
         .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
         .await;
-    assert_eq!(sent_to(&mock), [SIWC; 3], "retried as a transient fault");
+    assert_eq!(sent_to(&mock), [SIWC], "sent once, not again in the same refresh");
     assert!(refused.is_empty(), "not a refused refresh token");
     // The SIWC token is still valid for two minutes, so the due refresh tolerates it.
     let patch = result.unwrap();
@@ -159,7 +161,7 @@ async fn a_siwc_refresh_without_a_replacement_token_is_refused() {
                 200,
                 r#"{"access_token":"siwc-at-unrotated","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#
             );
-            3
+            1
         ],
     );
     let (result, _) = r
@@ -168,9 +170,9 @@ async fn a_siwc_refresh_without_a_replacement_token_is_refused() {
     let error = result.unwrap_err();
     assert_eq!(
         String::from_utf8_lossy(&error.body),
-        "SIWC token refresh failed after 3 attempts: OpenAI OAuth token response has invalid refresh_token"
+        "SIWC token refresh answered without a usable token set; the refresh token was not sent again: OpenAI OAuth token response has invalid refresh_token"
     );
-    mock.take();
+    assert_eq!(sent_to(&mock), [SIWC], "sent once");
 }
 
 /// A management refresh of a credential whose SIWC refresh token is refused for good:
@@ -437,22 +439,14 @@ async fn a_refusal_whose_body_cannot_be_read_keeps_its_status() {
     );
 }
 
-// ---- #92 A4 completion: response and expiry variants, a controlled clock, backoff,
-// cancellation and the native/SIWC partition matrix. Sources: OpenAI SIWC "Token
-// reference" (fields, `expires_in: 3600`, a replacement refresh token on every success),
-// "Accounts and sessions" (the refresh form: issued client, `resource`, no `scope`, which
-// keeps the grant) and "Errors and recovery" (unusable-token codes; temporary failures
-// keep the credentials and back off). Fetched 2026-11-12.
-
-/// A fixed local clock: 2026-11-12T13:33:20Z.
-fn clock() -> chrono::DateTime<chrono::Local> {
-    use chrono::TimeZone as _;
-    chrono::Local.timestamp_opt(1_794_490_400, 0).unwrap()
-}
-
-fn at(seconds: i64) -> chrono::DateTime<Utc> {
-    clock().with_timezone(&Utc) + chrono::TimeDelta::seconds(seconds)
-}
+// ---- #92 A4 completion: refresh-level behaviour, through APIs that also exist before
+// this change, so each test compiles against the earlier production code as a witness or
+// a control. Sources: OpenAI SIWC "Token reference" (fields, `expires_in: 3600`, a
+// replacement refresh token on every success), "Accounts and sessions" (the refresh
+// form: issued client, `resource`, no `scope`, which keeps the grant) and "Errors and
+// recovery" (unusable-token codes; temporary failures keep the credentials and back
+// off). Fetched 2026-11-12. The token-answer reader's own tests are in
+// `codex_siwc_tests.rs`.
 
 const DIRECT: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
@@ -477,267 +471,133 @@ fn answer(expires_in: Option<&str>, scope: Option<&str>, extra: &str) -> String 
     format!("{{{}}}", members.join(","))
 }
 
-fn read(body: &str, exchange: bool) -> Result<crate::codex_siwc::Tokens, String> {
-    crate::codex_siwc::token_response(body.as_bytes(), " oaiapp_fake ", " dev-fake ", exchange, clock())
-        .map_err(|e| String::from_utf8_lossy(&e.body).into_owned())
+/// The documented answer, scope included: what every earlier version also accepts.
+fn documented() -> String {
+    answer(Some("3600"), Some(&format!(r#""{DIRECT}""#)), "")
 }
 
-/// The documented answer reads into a token set at the fixed clock: the real expiry
-/// `expires_in` after it, the scheduling expiry three minutes earlier (Go's margin), and
-/// the replacement refresh token. Every documented field may be present; the ones with
-/// no documented constraint change nothing.
-#[test]
-fn the_documented_siwc_token_answer_reads_at_a_fixed_clock() {
-    let scope = format!(r#""{DIRECT}""#);
-    let tokens = read(&answer(Some("3600"), Some(&scope), ""), false).unwrap();
-    assert_eq!(
+/// A refresh answer whose token set is usable but whose expiry or scope cannot be read
+/// lands its replacement token: the stored refresh token was spent, and losing the
+/// replacement would leave only a reuse. Before, each was refused, retried three times
+/// with the spent token, and the credential reported the failure. An unreadable expiry
+/// clears the stored one, so the new token is due again only after `last_refresh`'s
+/// five minutes (its access token here carries no JWT `exp`), never at once. A reported
+/// scope is stored as reported; an absent or unreadable one keeps the stored grant.
+#[tokio::test]
+async fn a_rotation_is_kept_when_its_expiry_or_scope_cannot_be_read() {
+    let mock = Mock::start().await;
+    let r = refresher(&mock);
+    let direct = format!(r#""{DIRECT}""#);
+    let unstorable = (253_402_300_800i64 - Utc::now().timestamp()).to_string();
+    for (i, (case, expires_in, scope, expiry_known, want_scope)) in [
         (
-            tokens.access_token.as_str(),
-            tokens.refresh_token.as_str(),
-            tokens.id_token.as_str(),
-            tokens.client_id.as_str(),
-            tokens.device_id.as_str(),
-            tokens.scope.as_str(),
-        ),
-        ("siwc-at-2", "siwc-rt-2", "siwc-id-2", "oaiapp_fake", "dev-fake", DIRECT)
-    );
-    let instant = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
-    assert_eq!(instant(&tokens.last_refresh), at(0));
-    assert_eq!(instant(&tokens.expires_at), at(3600));
-    assert_eq!(instant(&tokens.expired), at(3600 - 180));
-    // `earliest_refresh_at` has no documented format or meaning: whatever its spelling,
-    // the token set is the same, and it is never persisted.
-    for earliest in [
-        "1794494000",
-        r#""2026-11-12T14:33:20Z""#,
-        r#""in an hour""#,
-        "null",
-        r#"{"seconds":3600}"#,
-    ] {
-        let with = read(
-            &answer(
-                Some("3600"),
-                Some(&scope),
-                &format!(r#""earliest_refresh_at":{earliest}"#),
-            ),
+            "string expires_in",
+            Some(r#""3600""#),
+            Some(direct.as_str()),
             false,
-        )
-        .unwrap();
-        assert_eq!(with, tokens, "earliest_refresh_at {earliest}");
-        assert!(!with.to_map().contains_key("earliest_refresh_at"));
-    }
-}
-
-/// `expires_in` is the documented positive JSON integer. Other spellings are refused at
-/// the boundary, never coerced (Go v8.0.67 accepts `3600.0`, `3.6e3` and `"3600"`). A
-/// lifetime past Go's `time.Duration` is refused: before, chrono's overflow fell back to
-/// "expires now", so every check found the new token due again.
-#[test]
-fn siwc_expires_in_is_the_documented_integer() {
-    let scope = format!(r#""{DIRECT}""#);
-    let max = (i64::MAX / 1_000_000_000).to_string();
-    let over = (i64::MAX / 1_000_000_000 + 1).to_string();
-    for ok in ["3600", "1", "180", "181", max.as_str()] {
-        assert!(read(&answer(Some(ok), Some(&scope), ""), false).is_ok(), "{ok}");
-    }
-    for refused in [
-        "0",
-        "-1",
-        "3600.0",
-        "3.6e3",
-        "3600.5",
-        r#""3600""#,
-        "null",
-        "true",
-        "1e20",
-        "18446744073709551616",
-        "1000000000000",
-        over.as_str(),
-    ] {
-        assert_eq!(
-            read(&answer(Some(refused), Some(&scope), ""), false).unwrap_err(),
-            "OpenAI OAuth token response has invalid expires_in",
-            "{refused}"
-        );
-    }
-    assert_eq!(
-        read(&answer(None, Some(&scope), ""), false).unwrap_err(),
-        "OpenAI OAuth token response has invalid expires_in",
-        "absent"
-    );
-    // A one-second grant keeps its whole lifetime rather than going negative.
-    let short = read(&answer(Some("1"), Some(&scope), ""), false).unwrap();
-    assert_eq!(short.expired, short.expires_at);
-    // The longest accepted lifetime is far from due, not due at once.
-    let long = read(&answer(Some(&max), Some(&scope), ""), false).unwrap();
-    let c = siwc_credential("long", &long);
-    assert_eq!(crate::codex_siwc::refresh_due(&c, at(0)), Some(false));
-    assert_eq!(crate::codex_siwc::refresh_due(&c, at(366 * 24 * 3600)), Some(false));
-}
-
-/// The other fields: tokens are non-blank strings, and the replacement refresh token is
-/// required (token reference). A refresh may leave out `scope`: it asked with none, which
-/// keeps the grant (Accounts and sessions; RFC 6749 §5.1), and the stored scope stays. A
-/// present scope must be a non-blank string holding `chatgpt.tokens.use.direct`; the code
-/// exchange must carry it and the ID token.
-#[test]
-fn siwc_token_answer_fields_are_read_at_the_boundary() {
-    let scope = format!(r#""{DIRECT}""#);
-    let body = |s: &str| s.to_owned();
-    for (case, text, exchange, want) in [
-        (
-            "no replacement refresh token",
-            body(r#"{"access_token":"a","expires_in":3600,"scope":"chatgpt.tokens.use.direct"}"#),
-            false,
-            Err("OpenAI OAuth token response has invalid refresh_token"),
+            DIRECT,
         ),
         (
-            "blank replacement",
-            body(r#"{"access_token":"a","refresh_token":"  ","expires_in":3600}"#),
+            "decimal expires_in",
+            Some("3600.0"),
+            Some(direct.as_str()),
             false,
-            Err("OpenAI OAuth token response has invalid refresh_token"),
+            DIRECT,
         ),
         (
-            "null replacement",
-            body(r#"{"access_token":"a","refresh_token":null,"expires_in":3600}"#),
+            "exponent expires_in",
+            Some("3.6e3"),
+            Some(direct.as_str()),
             false,
-            Err("OpenAI OAuth token response has invalid refresh_token"),
+            DIRECT,
+        ),
+        ("no expires_in", None, Some(direct.as_str()), false, DIRECT),
+        ("zero expires_in", Some("0"), Some(direct.as_str()), false, DIRECT),
+        (
+            "expiry past year 9999",
+            Some(unstorable.as_str()),
+            Some(direct.as_str()),
+            false,
+            DIRECT,
         ),
         (
-            "numeric access token",
-            body(r#"{"access_token":5,"refresh_token":"r","expires_in":3600}"#),
+            "expires_in past i64",
+            Some("18446744073709551615"),
+            Some(direct.as_str()),
             false,
-            Err("OpenAI OAuth token response has invalid access_token"),
+            DIRECT,
         ),
-        (
-            "null ID token",
-            body(r#"{"access_token":"a","refresh_token":"r","id_token":null,"expires_in":3600}"#),
-            false,
-            Err("OpenAI OAuth token response has invalid id_token"),
-        ),
-        (
-            "refresh without ID token or scope",
-            body(r#"{"access_token":"a","refresh_token":"r","expires_in":3600}"#),
-            false,
-            Ok(""),
-        ),
-        (
-            "blank scope",
-            body(r#"{"access_token":"a","refresh_token":"r","expires_in":3600,"scope":" "}"#),
-            false,
-            Err("OpenAI OAuth token response has invalid scope"),
-        ),
-        (
-            "null scope",
-            body(r#"{"access_token":"a","refresh_token":"r","expires_in":3600,"scope":null}"#),
-            false,
-            Err("OpenAI OAuth token response has invalid scope"),
-        ),
+        ("null scope", Some("3600"), Some("null"), true, "stored-grant"),
+        ("blank scope", Some("3600"), Some(r#"" ""#), true, "stored-grant"),
         (
             "scope without direct use",
-            body(r#"{"access_token":"a","refresh_token":"r","expires_in":3600,"scope":"openid"}"#),
-            false,
-            Err("OpenAI OAuth grant did not include chatgpt.tokens.use.direct"),
-        ),
-        (
-            "exchange without scope",
-            body(r#"{"access_token":"a","refresh_token":"r","id_token":"i","expires_in":3600}"#),
-            true,
-            Err("OpenAI OAuth token response has invalid scope"),
-        ),
-        (
-            "exchange without ID token",
-            format!(r#"{{"access_token":"a","refresh_token":"r","expires_in":3600,"scope":{scope}}}"#),
-            true,
-            Err("OpenAI OAuth token response did not contain an ID token"),
-        ),
-        (
-            "an array",
-            body("[]"),
-            false,
-            Err("failed to parse SIWC token response"),
-        ),
-        ("null", body("null"), false, Err("failed to parse SIWC token response")),
-        (
-            "not JSON",
-            body("not json"),
-            false,
-            Err("failed to parse SIWC token response"),
-        ),
-    ] {
-        let got = read(&text, exchange);
-        match want {
-            Ok(scope) => assert_eq!(got.map(|t| t.scope).as_deref(), Ok(scope), "{case}"),
-            Err(message) => assert_eq!(got.unwrap_err(), message, "{case}"),
-        }
-    }
-    // An omitted scope keeps the partition's stored grant.
-    let tokens = read(r#"{"access_token":"a2","refresh_token":"r2","expires_in":3600}"#, false).unwrap();
-    let mut stored = credential(&doc("scope-kept", true, 60, 60));
-    stored.metadata["siwc"]["scope"] = DIRECT.into();
-    stored.metadata["siwc"]["scopes"] = serde_json::json!(DIRECT.split(' ').collect::<Vec<_>>());
-    let patch = crate::codex_siwc::refresh_patch(&stored, &tokens);
-    let siwc = &patch.set["siwc"];
-    assert_eq!(
-        (&siwc["access_token"], &siwc["refresh_token"]),
-        (&"a2".into(), &"r2".into())
-    );
-    assert_eq!(siwc["scope"], DIRECT);
-    assert_eq!(siwc["scopes"], stored.metadata["siwc"]["scopes"]);
-}
-
-/// A Codex credential whose SIWC partition is `tokens` (what a refresh writes).
-fn siwc_credential(id: &str, tokens: &crate::codex_siwc::Tokens) -> Credential {
-    let mut c = credential(&doc(id, true, 60 * 24 * 30, 60));
-    c.metadata["siwc"] = Value::Object(tokens.to_map());
-    c
-}
-
-/// The renewal schedule of a refreshed SIWC partition on a controlled clock: due five
-/// minutes before the margin-deducted expiry (57 minutes after the grant, so at 52
-/// minutes), usable until that expiry, and reported `valid` until the real one. An
-/// `earliest_refresh_at` in the answer moves none of it. Without a refresh token or an
-/// issued client the partition is never due, at any time: the loop stops.
-#[test]
-fn a_refreshed_siwc_partition_follows_a_controlled_clock() {
-    let tokens = read(
-        &answer(
             Some("3600"),
-            Some(&format!(r#""{DIRECT}""#)),
-            r#""earliest_refresh_at":1794497600"#,
+            Some(r#""openid""#),
+            true,
+            "openid",
         ),
-        false,
-    )
-    .unwrap();
-    let c = siwc_credential("clock", &tokens);
-    let due = |t| crate::codex_siwc::refresh_due(&c, at(t));
-    assert_eq!(
-        (due(0), due(52 * 60 - 1), due(52 * 60)),
-        (Some(false), Some(false), Some(true))
-    );
-    assert!(crate::codex_siwc::access_usable(&c, at(57 * 60 - 1)));
-    assert!(!crate::codex_siwc::access_usable(&c, at(57 * 60)));
-    assert_eq!(crate::codex_siwc::status(&c, false, at(3599)), "valid");
-    assert_eq!(crate::codex_siwc::status(&c, false, at(3600)), "invalid");
-    assert_eq!(crate::codex_siwc::status(&c, true, at(0)), "invalid", "rejected");
-    // The JWT `exp` claim (integer Unix seconds, token reference) schedules a partition
-    // that stores no expiry.
-    use base64::Engine as _;
-    let claims =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{}}}"#, at(3600).timestamp()));
-    let mut jwt = credential(&doc("jwt", true, 60 * 24 * 30, 60));
-    jwt.metadata["siwc"] = serde_json::json!({"access_token": format!("e30.{claims}.c2ln"),
-        "refresh_token": "siwc-rt-jwt", "client_id": "oaiapp_fake"});
-    let due = |t| crate::codex_siwc::refresh_due(&jwt, at(t));
-    assert_eq!((due(55 * 60 - 1), due(55 * 60)), (Some(false), Some(true)));
-    // Missing renewal credentials: never due, at any time.
-    for (case, remove) in [("refresh token", "refresh_token"), ("issued client", "client_id")] {
-        let mut missing = c.clone();
-        missing.metadata["siwc"].as_object_mut().unwrap().remove(remove);
-        for t in [0, 3600, 30 * 24 * 3600, 365 * 24 * 3600] {
-            assert_eq!(crate::codex_siwc::refresh_due(&missing, at(t)), None, "{case} at {t}");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut metadata = doc(&format!("keep-{i}"), true, 60 * 24 * 10, -1);
+        metadata["siwc"]["scope"] = "stored-grant".into();
+        metadata["siwc"]["expires_at"] = (Utc::now() - chrono::TimeDelta::minutes(1)).to_rfc3339().into();
+        mock.script(SIWC, vec![json(200, &answer(expires_in, scope, ""))]);
+        let (result, refused) = r
+            .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
+            .await;
+        assert_eq!(sent_to(&mock), [SIWC], "{case}: sent once");
+        assert!(refused.is_empty(), "{case}: never a refusal");
+        let patch = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        let after = &patch
+            .siwc
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case}: no SIWC change"))
+            .after;
+        assert_eq!(
+            (&after["access_token"], &after["refresh_token"]),
+            (&"siwc-at-2".into(), &"siwc-rt-2".into()),
+            "{case}: the replacement lands"
+        );
+        assert_eq!(after["scope"], want_scope, "{case}");
+        let mut renewed = credential(&metadata);
+        let mut partition = metadata["siwc"].as_object().unwrap().clone();
+        partition.extend(after.clone());
+        renewed.metadata["siwc"] = Value::Object(partition);
+        let now = Utc::now();
+        assert_eq!(
+            crate::codex_siwc::refresh_due(&renewed, now),
+            Some(false),
+            "{case}: not due at once"
+        );
+        if expiry_known {
+            assert!(after["expired"].is_string(), "{case}");
+        } else {
+            assert_eq!(
+                (&after["expired"], &after["expires_at"]),
+                (&Value::Null, &Value::Null),
+                "{case}"
+            );
+            let later = now + chrono::TimeDelta::seconds(301);
+            assert_eq!(
+                crate::codex_siwc::refresh_due(&renewed, later),
+                Some(true),
+                "{case}: due after last_refresh's lead"
+            );
         }
     }
+    // Without a usable access token there is no token set to keep: refused, sent once.
+    let metadata = doc("keep-no-access", true, 60 * 24 * 10, -1);
+    mock.script(
+        SIWC,
+        vec![json(200, r#"{"refresh_token":"siwc-rt-2","expires_in":3600}"#); 3],
+    );
+    let (result, refused) = r
+        .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
+        .await;
+    assert_eq!(sent_to(&mock), [SIWC]);
+    assert!(refused.is_empty() && result.is_err());
 }
 
 /// The SIWC refresh form, byte for byte (Accounts and sessions): form-encoded
@@ -874,7 +734,7 @@ async fn gated_endpoint(answer: String) -> (String, Arc<tokio::sync::Notify>, Ar
 /// same refresh token receives the replacement without sending the spent token again.
 #[tokio::test]
 async fn a_cancelled_siwc_refresh_keeps_its_replacement_token() {
-    let (url, gate, requests) = gated_endpoint(answer(Some("3600"), None, "")).await;
+    let (url, gate, requests) = gated_endpoint(documented()).await;
     let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), "", "", "")
         .with_siwc_token_url(&url)
         .with_retry_delay(std::time::Duration::from_millis(1));
@@ -916,7 +776,7 @@ async fn native_and_siwc_partitions_recover_independently() {
     let r = refresher(&mock);
     let transient = || vec![json(503, r#"{"error":"temporarily_unavailable"}"#); 3];
     let refused = || vec![json(400, r#"{"error":"invalid_grant"}"#)];
-    let siwc_ok = || vec![json(200, &answer(Some("3600"), None, ""))];
+    let siwc_ok = || vec![json(200, &documented())];
     let outer_refused = || vec![json(400, r#"{"error":"invalid_grant"}"#)];
     struct Row {
         case: &'static str,

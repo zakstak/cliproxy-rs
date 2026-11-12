@@ -191,11 +191,19 @@ struct TokenResponse {
 pub struct GrantError {
     pub error: ExecError,
     pub terminal: bool,
+    /// The token endpoint answered 200, but the answer held no usable token set. A
+    /// rotating endpoint may have spent the refresh token by then, so the same refresh
+    /// does not send it again; the failure stays transient, never a refusal (#92).
+    pub answered: bool,
 }
 
 impl GrantError {
     fn transient(error: ExecError) -> Self {
-        Self { error, terminal: false }
+        Self {
+            error,
+            terminal: false,
+            answered: false,
+        }
     }
 }
 
@@ -440,6 +448,7 @@ impl CodexOAuth {
             return Err(GrantError {
                 error: token_error(status, &body),
                 terminal: outer_terminal(status, &grant_code(&body)),
+                answered: false,
             });
         }
         // Go appends the decoder error (`failed to parse token response: %w`); serde's
@@ -585,6 +594,18 @@ impl CodexOAuth {
                 Ok(tokens) => return Ok(tokens),
                 // A refresh token refused for good is not sent again.
                 Err(error) if error.terminal => return Err(error),
+                // Nor is one the endpoint may have spent: it answered 200 without a usable
+                // token set (no replacement refresh token, or no access token). Whether
+                // the token was rotated is unknown; resending a rotated one would be a
+                // reuse. The next refresh tries again after its backoff (#92).
+                Err(mut error) if error.answered => {
+                    error.error.body = format!(
+                        "SIWC token refresh answered without a usable token set; the refresh token was not sent again: {}",
+                        String::from_utf8_lossy(&error.error.body)
+                    )
+                    .into();
+                    return Err(error);
+                }
                 Err(error) => last = Some(error),
             }
         }
