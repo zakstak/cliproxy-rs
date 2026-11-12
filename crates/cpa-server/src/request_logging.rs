@@ -38,6 +38,18 @@ pub(crate) fn current() -> Option<RequestLog> {
 #[derive(Clone)]
 struct Captured;
 
+/// Marks a response from gin's NoRoute equivalents: the management router's fallback
+/// and the API router's unregistered-method fallback. An unrouted 404 with no upstream
+/// activity and no actionable API error is never logged (Go v8.0.67 4b3f2c7e), so
+/// scanners cannot evict real dumps from the `error-logs-max-files` ring.
+#[derive(Clone, Copy)]
+struct Unrouted;
+
+pub(crate) fn unrouted(mut response: Response) -> Response {
+    response.extensions_mut().insert(Unrouted);
+    response
+}
+
 /// Install at the handler boundary, before axum synthesizes Content-Length or
 /// suppresses HEAD bodies. The outer middleware still owns request capture.
 pub(crate) async fn response(request: Request, next: Next) -> Response {
@@ -195,6 +207,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             request_body,
             deferred,
             status: 200,
+            unrouted: false,
             response_headers: HeaderMap::new(),
             response: Vec::new(),
             response_spool: None,
@@ -257,6 +270,7 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
         return response;
     };
     record.status = response.status().as_u16();
+    record.unrouted = response.extensions().get::<Unrouted>().is_some();
     record.response_headers = response.headers().clone();
     record.metadata_ready = true;
     let content_type = response
@@ -864,8 +878,13 @@ impl Drop for Completion {
     fn drop(&mut self) {
         if let Some(sink) = self.0.take() {
             if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                // A cancelled handler has Go's default unwritten 200; release
-                // any connection-close waiter even without response headers.
+                // A handler that panicked before it answered is logged as 500, once
+                // (Go v8.0.67 a5795047); a cancelled one keeps Go's default unwritten
+                // 200. Either way, release any connection-close waiter even without
+                // response headers.
+                if std::thread::panicking() && !record.metadata_ready {
+                    record.status = 500;
+                }
                 record.metadata_ready = true;
             }
             schedule(sink, false);
@@ -1148,6 +1167,8 @@ struct Record {
     request_body: Vec<u8>,
     deferred: Option<Arc<Mutex<Deferred>>>,
     status: u16,
+    /// The response came from a NoRoute fallback ([`Unrouted`]).
+    unrouted: bool,
     response_headers: HeaderMap,
     response: Vec<u8>,
     response_spool: Option<Spool>,
@@ -1176,12 +1197,16 @@ impl Record {
         }
         let config = self.state.rt.config();
         let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
-        let error = self.api_errors.iter().any(|(status, message)| {
+        let api_error = self.api_errors.iter().any(|(status, message)| {
             let lower = message.go_lower();
             *status != 499 && !lower.contains("context canceled") && !lower.contains("client closed request")
-        }) || (self.status >= 400 && self.status != 499);
+        });
+        let error = api_error || (self.status >= 400 && self.status != 499);
         let forced = !self.enabled && error && !enabled;
         if !enabled && !forced {
+            return;
+        }
+        if self.unrouted && self.status == 404 && !api_error && !self.upstream_activity() {
             return;
         }
         if forced && self.api_request.is_empty() {
@@ -1258,6 +1283,16 @@ impl Record {
             }
         })
         .await;
+    }
+
+    /// Go `hasRecordedUpstreamActivity`: anything recorded of an upstream exchange.
+    fn upstream_activity(&self) -> bool {
+        self.upstream.attempts > 0
+            || !self.deferred_api_request.is_empty()
+            || !self.api_request.is_empty()
+            || !self.api_response.is_empty()
+            || !self.api_timeline.is_empty()
+            || self.timeline.is_some()
     }
 
     fn write(self, forced: bool, max: i64, decompress_error: Option<String>) -> io::Result<()> {
@@ -2511,6 +2546,277 @@ mod tests {
             filename("/v1//x:  y?secret=not-in-name", "0198-aaaa-a1b2c3d4", at, true),
             format!("error-v1-x-y-{}-a1b2c3d4.log", at.format("%Y-%m-%dT%H%M%S"))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn send(app: &mut axum::Router, method: &str, uri: &str) -> StatusCode {
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"probe"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        status
+    }
+
+    async fn next_frame(body: &mut Body) -> Option<Result<hyper::body::Frame<Bytes>, axum::Error>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+    }
+
+    /// Waits until every scheduled finalization has written or dropped its record.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn unrouted_404s_are_not_logged_and_cannot_evict_real_error_logs() {
+        for enabled in [false, true] {
+            let dir = scratch();
+            let state = management(&dir, enabled, false);
+            let mut app = router(
+                &state,
+                crate::app(state.rt.clone(), crate::management::router(state.clone())),
+            );
+            // A routed refusal is logged: the removed-provider answer (#49).
+            assert_eq!(
+                send(&mut app, "POST", "/v1beta/models/m:generateContent").await,
+                StatusCode::GONE
+            );
+            settle().await;
+            let first = logs(&dir);
+            assert_eq!(first.len(), 1, "enabled={enabled}");
+            // More probes than the ring keeps: NoRoute paths, an unregistered method on a
+            // registered path, and a HEAD that gin answers through NoRoute.
+            for i in 0..6 {
+                for (method, uri) in [
+                    ("POST", format!("/wp-login-{i}.php")),
+                    ("PUT", "/v1/chat/completions".to_owned()),
+                    ("HEAD", "/v1/messages".to_owned()),
+                ] {
+                    assert_eq!(
+                        send(&mut app, method, &uri).await,
+                        StatusCode::NOT_FOUND,
+                        "{method} {uri}"
+                    );
+                }
+            }
+            settle().await;
+            assert_eq!(
+                logs(&dir),
+                first,
+                "enabled={enabled}: probes leave no log and evict none"
+            );
+            let name = first[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(name.starts_with("error-"), !enabled, "{name}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unrouted_404s_with_upstream_evidence_or_api_errors_are_still_logged() {
+        for evidence in ["api-request", "deferred-request", "api-error"] {
+            let dir = scratch();
+            let state = management(&dir, false, false);
+            let app =
+                axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| async move {
+                    match evidence {
+                        "api-request" => log.api_request(b"=== API REQUEST 1 ===\n"),
+                        "deferred-request" => cpa_core::exec::CaptureObserver::record_request(
+                            &log,
+                            upstream_request("https://api.example.test/v1/messages", &[], b"{}"),
+                            &Bytes::from_static(b"{}"),
+                        ),
+                        _ => log.api_error(502, "upstream failure".into()),
+                    }
+                    unrouted(StatusCode::NOT_FOUND.into_response())
+                });
+            let mut app = router(&state, app);
+            assert_eq!(send(&mut app, "POST", "/anything").await, StatusCode::NOT_FOUND);
+            settle().await;
+            assert_eq!(logs(&dir).len(), 1, "{evidence}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        // Control: a routed 404 without evidence is still an error log.
+        let dir = scratch();
+        let state = management(&dir, false, false);
+        let mut app = router(&state, axum::Router::new().fallback(|| async { StatusCode::NOT_FOUND }));
+        assert_eq!(send(&mut app, "POST", "/anything").await, StatusCode::NOT_FOUND);
+        settle().await;
+        assert_eq!(logs(&dir).len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_handler_panic_is_logged_once_as_500() {
+        for enabled in [false, true] {
+            let dir = scratch();
+            let state = management(&dir, enabled, false);
+            async fn panics() -> StatusCode {
+                panic!("handler panic for the request log test")
+            }
+            let app = axum::Router::new().fallback(panics);
+            let mut app = router(&state, app);
+            let call = tokio::spawn(async move {
+                app.call(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+            });
+            assert!(call.await.unwrap_err().is_panic());
+            settle().await;
+            let files = logs(&dir);
+            assert_eq!(files.len(), 1, "enabled={enabled}: exactly one final record");
+            let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(name.starts_with("error-"), !enabled, "{name}");
+            let content = std::fs::read_to_string(&files[0]).unwrap();
+            assert!(content.contains("Status: 500\n"), "enabled={enabled}:\n{content}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Audit control: a successful stream is never kept whole. Error-only capture keeps
+    /// no response bytes at all; full capture of an event stream spools them to disk.
+    #[tokio::test]
+    async fn successful_streams_are_not_retained_in_memory() {
+        for enabled in [false, true] {
+            let dir = scratch();
+            let state = management(&dir, enabled, false);
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(1);
+            let rx = Arc::new(Mutex::new(Some(rx)));
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+            let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
+                let mut rx = rx.lock().unwrap().take().unwrap();
+                let sink_tx = sink_tx.clone();
+                async move {
+                    sink_tx.send(log).await.unwrap();
+                    let body = Body::from_stream(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+                    ([("content-type", "text/event-stream")], body).into_response()
+                }
+            });
+            let mut app = router(&state, app);
+            let response = app
+                .call(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let log = sink_rx.recv().await.unwrap();
+            let mut body = response.into_body();
+            let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+            for _ in 0..8 {
+                tx.send(Ok(chunk.clone())).await.unwrap();
+                let frame = next_frame(&mut body).await.unwrap().unwrap();
+                assert_eq!(frame.data_ref().map(Bytes::len), Some(chunk.len()));
+                let locked = log.0.lock().unwrap();
+                let record = locked.as_ref().expect("stream still open");
+                assert!(record.response.is_empty(), "enabled={enabled}: no whole-body retention");
+                assert_eq!(record.response_spool.is_some(), enabled);
+            }
+            drop(tx);
+            assert!(next_frame(&mut body).await.is_none());
+            log.finished().await;
+            assert_eq!(logs(&dir).len(), usize::from(enabled), "success: no error log");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Audit control (Go 4cb98e3c): with error-only capture, a WebSocket's record is
+    /// finalized with its upgrade answer, so later turns retain nothing.
+    #[tokio::test]
+    async fn error_only_websocket_turns_retain_nothing_after_the_upgrade() {
+        let dir = scratch();
+        let state = management(&dir, false, false);
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+        let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
+            let sink_tx = sink_tx.clone();
+            async move {
+                assert!(log.detach_websocket().is_none(), "error-only capture keeps no timeline");
+                sink_tx.send(log).await.unwrap();
+                StatusCode::SWITCHING_PROTOCOLS
+            }
+        });
+        let mut app = router(&state, app);
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/responses")
+                    .header("upgrade", "websocket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let log = sink_rx.recv().await.unwrap();
+        drop(response);
+        log.finished().await;
+        let big = Bytes::from(vec![b'{'; 4 << 20]);
+        for _ in 0..64 {
+            cpa_core::exec::CaptureObserver::record_request(
+                &log,
+                upstream_request("https://chatgpt.com/backend-api/codex/responses", &[], &big),
+                &big,
+            );
+        }
+        assert!(
+            log.0.lock().unwrap().is_none(),
+            "nothing is retained after finalization"
+        );
+        assert!(logs(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Audit control (Go 179d43dc): whatever the URL, a log file is created inside the
+    /// log directory. Paths are percent-decoded before they reach `filename`.
+    #[test]
+    fn log_filenames_stay_inside_the_log_directory() {
+        let dir = scratch();
+        let at = Local::now();
+        for url in [
+            "/../../etc/passwd",
+            "/v1/../../../tmp/x",
+            "/..\\..\\windows\\system32",
+            "/./.",
+            "/..",
+            "..",
+            "",
+            "/v1/responses?redirect=/../../x",
+            "/a\u{0}b",
+            "/\u{e9}t\u{e9}/\u{1F600}",
+        ] {
+            for error in [false, true] {
+                let name = filename(url, "0198-aaaa-a1b2c3d4", at, error);
+                assert!(!name.contains('/'), "{url:?} -> {name:?}");
+                assert!(name.ends_with("-a1b2c3d4.log"), "{url:?} -> {name:?}");
+                assert_eq!(Path::new(&name).components().count(), 1, "{url:?} -> {name:?}");
+                if name.contains('\0') {
+                    continue; // The open fails; nothing is written anywhere.
+                }
+                drop(unique_file(&dir, &name).unwrap());
+                assert!(dir.join(&name).is_file(), "{url:?} -> {name:?}");
+            }
+        }
+        let outside: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("etc-passwd"))
+            .collect();
+        assert!(outside.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
