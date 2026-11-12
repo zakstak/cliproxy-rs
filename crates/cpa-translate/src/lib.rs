@@ -63,6 +63,7 @@ mod apply_patch;
 pub mod apply_patch_responses;
 mod claude_chat_request;
 mod claude_chat_response;
+mod claude_fallback;
 mod claude_responses;
 mod claude_responses_response;
 mod codex_chat_request;

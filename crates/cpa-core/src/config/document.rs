@@ -65,6 +65,8 @@ const PATHS: &[(&str, &str)] = &[
     // Go walks the declared fields of ClaudeConfig and ClaudeCode.
     ("claude.model-level-cooling", "upstream.claude.model-level-cooling"),
     ("claude.tool-search", "upstream.claude.tool-search"),
+    // Go v8.0.67 fa11a573 declares this ClaudeConfig field too.
+    ("claude.server-side-fallback", "upstream.claude.server-side-fallback"),
     ("claude.session-date-pin-days", "upstream.claude.session-date-pin-days"),
     (
         "claude-code.disable-cloaking-model-list",
@@ -147,6 +149,13 @@ pub(super) const SHARED_PATHS: &[(&str, &str)] = &[
     (
         "oauth.providers.claude.model-level-cooling",
         "upstream.claude.model-level-cooling",
+    ),
+    // #71: docs/CONFIGURATION.md accepts the historical `oauth.providers.claude`
+    // spelling of every shared Claude setting, with its precedence over the flat
+    // `claude` one. Go v8.0.67 (fa11a573) declares only the flat alias.
+    (
+        "oauth.providers.claude.server-side-fallback",
+        "upstream.claude.server-side-fallback",
     ),
     (
         "oauth.providers.claude.claude-code.disable-cloaking-model-list",

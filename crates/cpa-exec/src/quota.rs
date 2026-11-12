@@ -49,6 +49,17 @@ fn overage_only(headers: &HeaderMap) -> bool {
     {
         return true;
     }
+    // v8.0.67 (0130d6f3): Anthropic omits the 5h utilization entirely when that window
+    // has no usage or does not exist on the tier. A rejected Fable-only or overage claim
+    // with an allowed 7d window and no 5h evidence at all is no account-wide quota
+    // evidence; a 5h utilization that is present but malformed or exhausted still is.
+    if allowed(&seven)
+        && five.is_empty()
+        && status(headers, "") == "rejected"
+        && !headers.contains_key("anthropic-ratelimit-unified-5h-utilization")
+    {
+        return true;
+    }
     // v8.0.27 (8080967): Anthropic omits both shared-window statuses when it did not
     // evaluate them; only a rejected overage claim relies on that absence.
     let absent_or_healthy = |window: &str| {
@@ -416,6 +427,41 @@ mod tests {
         }
     }
 
+    /// #72: a Fable-only weekly (7d_oi) or overage rejection with an allowed 7d window
+    /// and the 5h headers omitted stays model-scoped; present 5h evidence that is
+    /// malformed or exhausted still cools the credential (Go 0130d6f3).
+    #[test]
+    fn fable_only_rejection_without_5h_headers_stays_model_scoped() {
+        for claim in [
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ] {
+            let mut h = headers(&[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.41"),
+                claim,
+            ]);
+            assert!(!shared_rejection(&h), "{claim:?}");
+            let mut error = ExecError::local(429, FailureScope::Credential, r#"{"error":{"message":"limit"}}"#);
+            *error.headers = h.clone();
+            assert_eq!(classify(error.clone(), false).scope, FailureScope::Model, "{claim:?}");
+            for utilization in ["1", "1.0", "bad", ""] {
+                h.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    utilization.parse().unwrap(),
+                );
+                assert!(shared_rejection(&h), "{claim:?} 5h {utilization:?}");
+            }
+            h.insert("anthropic-ratelimit-unified-5h-utilization", "0.2".parse().unwrap());
+            assert!(!shared_rejection(&h), "{claim:?} healthy 5h");
+            // A rejected 7d window is account-wide whatever the 5h headers say.
+            h.remove("anthropic-ratelimit-unified-5h-utilization");
+            h.insert("anthropic-ratelimit-unified-7d-status", "rejected".parse().unwrap());
+            assert!(shared_rejection(&h), "{claim:?} rejected 7d");
+        }
+    }
+
     #[test]
     fn latest_relevant_deadline_fractional_seconds_and_dates() {
         let now = UNIX_EPOCH + Duration::from_secs(1000);
@@ -485,6 +531,9 @@ mod tests {
                     ("anthropic-ratelimit-unified-representative-claim", "overage"),
                     ("anthropic-ratelimit-unified-7d-status", "allowed"),
                     ("anthropic-ratelimit-unified-7d-utilization", "0.69"),
+                    // v8.0.67 0130d6f3: an omitted 5h utilization is no longer
+                    // account-wide evidence, so the fixture names an exhausted one.
+                    ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
                     ("anthropic-ratelimit-unified-reset", &billing),
                     ("anthropic-ratelimit-unified-overage-status", "rejected"),
                     ("anthropic-ratelimit-unified-overage-reset", &billing),
