@@ -670,7 +670,9 @@ async fn a_socket_dropped_without_a_close_frame_reads_as_close_1006() {
         .await
         .expect("the turn ends with the dropped socket");
     let error = events.last().unwrap().as_ref().expect_err("the turn fails");
-    assert_eq!(error.scope, FailureScope::Transport, "{error}");
+    // N1 #111 W1: the request was written, so the loss is uncertain: request-scoped,
+    // never failed over.
+    assert_eq!(error.scope, FailureScope::Request, "{error}");
     assert!(
         String::from_utf8_lossy(&error.body).contains("websocket: close 1006 (abnormal closure): unexpected EOF"),
         "{error}"
@@ -696,13 +698,15 @@ async fn pings_do_not_extend_the_idle_deadline() {
         .unwrap()
         .as_ref()
         .expect_err("the turn ends with the timeout");
-    assert_eq!(error.scope, FailureScope::Transport);
+    // The request was written: an idle timeout is an uncertain loss (N1 #111 W1).
+    assert_eq!(error.scope, FailureScope::Request);
     assert!(String::from_utf8_lossy(&error.body).contains("idle timeout"), "{error}");
 }
 
 /// A socket whose upstream stopped reading (half-open) fails the write after the write
-/// bound instead of holding the turn until the read deadline; the one retry on a fresh
-/// socket is bounded the same way.
+/// bound instead of holding the turn until the read deadline. Part of the frame may
+/// have reached the upstream, so the request is never sent again: no fresh socket, and a
+/// request-scoped failure that does not fail over (N1 #111 W1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_the_upstream_never_reads_times_out() {
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -742,7 +746,7 @@ async fn a_write_the_upstream_never_reads_times_out() {
     let Err(error) = result else {
         panic!("a write that never completes fails the turn");
     };
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(error.body, "codex websockets executor: write timed out");
     // The request log learns it was the proxy's own bound, and for how large a frame
     // (whole seconds at this rate round up to 1 s, past the 300 ms floor).
@@ -757,8 +761,8 @@ async fn a_write_the_upstream_never_reads_times_out() {
     );
     assert_eq!(
         dials.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "one retry on a fresh socket"
+        1,
+        "a partial write is never retried"
     );
     assert_eq!(
         WRITE_LIMIT.deadline(1 << 20),
@@ -813,7 +817,17 @@ async fn reader_failure_before_the_turn_activates_fails_the_turn() {
         .await
         .expect("the turn must not hang on a dead socket");
         let error = outcome.expect("the turn fails");
-        assert_eq!(error.scope, FailureScope::Transport, "{error}");
+        // Either the reader's loss was recorded before every write, so the frame
+        // provably never left (the transport failure may fail over), or a write raced
+        // the reader and the loss is uncertain (request-scoped, never failed over).
+        assert!(
+            matches!(error.scope, FailureScope::Transport | FailureScope::Request),
+            "{error}"
+        );
+        assert!(
+            error.scope == FailureScope::Request || String::from_utf8_lossy(&error.body).contains("unexpected binary"),
+            "{error}"
+        );
     }
 }
 
@@ -1224,14 +1238,14 @@ async fn capture_keeps_why_a_socket_ended() {
     }
 
     let (error, text, cause) = read_failure(vec![Act::SendClose(vec![CREATED], 1011)], None).await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request, "an uncertain loss (N1 #111 W1)");
     assert_eq!(text, "websocket: close 1011 (internal server error): bye");
     assert_eq!(cause, "remote_close: code 1011");
 
     // gorilla's text for a peer that vanished is close 1006, which no peer can send:
     // the cause says it was an end of stream, not a close frame.
     let (error, text, cause) = read_failure(vec![Act::SendDrop(vec![CREATED])], None).await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(text, "websocket: close 1006 (abnormal closure): unexpected EOF");
     assert!(cause.starts_with("eof"), "{cause}");
 
@@ -1240,7 +1254,7 @@ async fn capture_keeps_why_a_socket_ended() {
         Some(Duration::from_millis(300)),
     )
     .await;
-    assert_eq!(error.scope, FailureScope::Transport);
+    assert_eq!(error.scope, FailureScope::Request);
     assert_eq!(text, "codex websockets executor: read idle timeout");
     assert_eq!(cause, "local_timeout: no application message within 300ms");
 }
@@ -1928,10 +1942,12 @@ fn returned_handshake_drops_the_model_the_proxy_rewrote() {
     assert_eq!(rewritten.get("x-codex-turn-state").unwrap(), "ts");
 }
 
-/// #3: a send that fails on the socket the turn just opened is retried once on a fresh
-/// socket, and the turn returns the fresh socket's handshake. The client's
-/// `response.metadata` comes from the socket that serves the turn, never from the one
-/// whose write failed.
+/// #3: a send that provably never left the socket the turn got (its reader already
+/// recorded the loss) is retried once on a fresh socket, and the turn returns the fresh
+/// socket's handshake. The client's `response.metadata` comes from the socket that
+/// serves the turn, never from the one whose write failed. A write that may have sent
+/// part of the frame is never retried (N1 #111 W1,
+/// `a_write_the_upstream_never_reads_times_out`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1972,20 +1988,14 @@ async fn a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let mut executor = CodexExecutor::new().unwrap();
-    // Long enough for the fresh socket to take the whole frame in a debug build.
-    executor.ws = Arc::new(Pool::with_write(WriteLimit {
-        floor: Duration::from_secs(3),
-        rate: usize::MAX,
-    }));
-    // Far larger than loopback socket buffers, so the first write cannot finish.
-    let body = format!(
-        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
-        "x".repeat(32 << 20)
-    );
+    let executor = CodexExecutor::new().unwrap();
+    // The session holds the first socket, whose reader recorded a loss the session has
+    // not dropped yet: a write there provably sends nothing.
+    let stale = pooled(&executor, &url).await;
+    stale.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
     let response = tokio::time::timeout(
         Duration::from_secs(60),
-        executor.execute_in_session(&credential(&url), request(&body), &Config::default(), &session(false)),
+        executor.execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false)),
     )
     .await
     .expect("the retry ends the turn")
@@ -2146,10 +2156,10 @@ async fn a_reused_socket_repeats_only_its_own_upgrade_model() {
     assert_eq!(*frames.lock().unwrap(), sent, "only the client's frames, as sent");
 }
 
-/// #24 (refs #3): a later request whose send fails on the reused socket is retried on a
-/// fresh socket, which reports its own opening metadata: its new turn state, and no model
-/// when its upgrade had none (here a blank value). The replaced socket's model is never
-/// donated, then or on the next request.
+/// #24 (refs #3): a later request whose send provably never left the reused socket (its
+/// loss was already recorded) is retried on a fresh socket, which reports its own opening
+/// metadata: its new turn state, and no model when its upgrade had none (here a blank
+/// value). The replaced socket's model is never donated, then or on the next request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     let (url, dials, frames) = handshake_upstream(
@@ -2160,23 +2170,17 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
         true,
     )
     .await;
-    let mut executor = CodexExecutor::new().unwrap();
-    // Long enough for the fresh socket to take the whole frame in a debug build.
-    executor.ws = Arc::new(Pool::with_write(WriteLimit {
-        floor: Duration::from_secs(3),
-        rate: usize::MAX,
-    }));
+    let executor = CodexExecutor::new().unwrap();
     let (opening, _, _) = metadata_turn(&executor, &url, BODY, "gpt-fixture", false).await;
     assert_eq!(
         opening.as_deref(),
         Some(r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-old","openai-model":"gpt-old"}}"#)
     );
-    // Far larger than loopback socket buffers: the stalled socket cannot take it.
-    let large = format!(
-        r#"{{"model":"gpt-fixture","input":[{{"type":"message","role":"user","content":"{}"}}]}}"#,
-        "x".repeat(32 << 20)
-    );
-    let (retried, _, events) = metadata_turn(&executor, &url, &large, "gpt-fixture", false).await;
+    // The reused socket's reader recorded a loss the session has not dropped yet.
+    let reused = executor.ws.session("conn-1").current().expect("the reused socket");
+    reused.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
+    let next = r#"{"model":"gpt-fixture","input":[{"type":"message","role":"user","content":"again"}]}"#;
+    let (retried, _, events) = metadata_turn(&executor, &url, next, "gpt-fixture", false).await;
     assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2, "one fresh socket");
     assert_eq!(
         retried.as_deref(),
@@ -2189,11 +2193,11 @@ async fn a_replacement_socket_never_inherits_the_old_sockets_model() {
     assert_eq!(later, None, "the new socket has no model to repeat");
     assert!(headers.is_empty(), "{headers:?}");
     assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // The stalled socket read only the first frame; the fresh one read the retried frame
+    // The stale socket read only the first frame; the fresh one read the retried frame
     // once and then the continuation.
     let received = frames.lock().unwrap();
     assert_eq!(received.len(), 3);
-    assert!(received[1].len() > 32 << 20);
+    assert!(received[1].contains("again"));
     assert!(received[2].contains(r#""previous_response_id":"r1""#));
 }
 
@@ -2836,4 +2840,59 @@ async fn an_attempt_owns_only_the_socket_it_acquired() {
         pool.get("never-made").is_none(),
         "starting an attempt creates no session"
     );
+}
+
+/// N1 #111 W1: only the tungstenite refusals returned before the frame is queued prove
+/// that nothing was written. A reset, an I/O error or a protocol error can follow a
+/// partial write (`ConnectionClosed` included: tungstenite maps a reset to it).
+#[test]
+fn only_refusals_before_queueing_prove_a_write_unsent() {
+    use tokio_tungstenite::tungstenite::{Error, Message, error::ProtocolError};
+    for unsent in [
+        Error::AlreadyClosed,
+        Error::Protocol(ProtocolError::SendAfterClosing),
+        Error::WriteBufferFull(Box::new(Message::text("x"))),
+    ] {
+        assert!(super::refused_before_queueing(&unsent), "{unsent}");
+    }
+    for ambiguous in [
+        Error::ConnectionClosed,
+        Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+    ] {
+        assert!(!super::refused_before_queueing(&ambiguous), "{ambiguous}");
+    }
+}
+
+/// N1 #111 W1: a socket whose loss the reader already recorded is not written at all,
+/// so the write provably sent nothing; the failure keeps the loss's classification.
+#[tokio::test]
+async fn a_socket_whose_loss_was_recorded_is_not_written() {
+    let (up, url) = upstream(vec![]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let conn = pooled(&executor, &url).await;
+    conn.link.lock().unwrap().lost = Some(transport("codex websockets executor: stale socket"));
+    let failure = conn
+        .send_create(Bytes::from_static(br#"{"type":"response.create"}"#))
+        .await
+        .expect_err("a lost socket takes no write");
+    assert!(failure.unsent);
+    assert_eq!(failure.error.scope, FailureScope::Transport);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(up.frames.lock().unwrap().is_empty(), "nothing reached the upstream");
+}
+
+/// N1 #111 W1: a failure the upstream may have caused after reading the request is
+/// request-scoped (no failover, no cooldown) and keeps its status, body and diagnostic;
+/// one that is request-scoped already stays as it is.
+#[test]
+fn an_uncertain_loss_is_request_scoped_and_otherwise_unchanged() {
+    let lost = transport("websocket: close 1011 (internal server error): bye");
+    let error = super::uncertain(lost.clone());
+    assert_eq!((error.status, error.scope), (lost.status, FailureScope::Request));
+    assert_eq!(error.body, lost.body);
+    assert!(error.headers.is_empty());
+    let too_big = message_too_big();
+    assert_eq!(super::uncertain(too_big.clone()).body, too_big.body);
 }

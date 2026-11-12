@@ -392,12 +392,18 @@ impl Upstream {
     /// [`Self::send`] for a client's own bytes: one text frame holding them unchanged,
     /// UTF-8 or not, as gorilla writes a `TextMessage`.
     pub(crate) async fn send_raw(&self, payload: Bytes) -> Result<(), ExecError> {
+        self.send_create(payload).await.map_err(WriteFailure::into_error)
+    }
+
+    /// [`Self::send_raw`] for a request whose replay must be decided: the failure says
+    /// whether the frame provably never left ([`WriteFailure::unsent`]).
+    pub(crate) async fn send_create(&self, payload: Bytes) -> Result<(), WriteFailure> {
         use tokio_tungstenite::tungstenite::protocol::frame::{
             Frame,
             coding::{Data, OpCode},
         };
         let len = payload.len();
-        self.write_message(
+        self.write_certain(
             Message::Frame(Frame::message(payload, OpCode::Data(Data::Text), true)),
             len,
         )
@@ -405,20 +411,42 @@ impl Upstream {
     }
 
     async fn write_message(&self, message: Message, len: usize) -> Result<(), ExecError> {
+        self.write_certain(message, len).await.map_err(WriteFailure::into_error)
+    }
+
+    /// One write, and whether a failure provably wrote nothing. A socket whose loss the
+    /// reader already recorded is not written at all. tungstenite refuses a closed or
+    /// closing socket and a full write buffer before it queues the frame
+    /// (`protocol/mod.rs` `WebSocketContext::write` and `frame/mod.rs` `buffer_frame` in
+    /// tungstenite 0.29); every other failure, a timeout included, may follow a partial
+    /// write, and `ConnectionClosed` can be a reset that came after one.
+    async fn write_certain(&self, message: Message, len: usize) -> Result<(), WriteFailure> {
+        if let Some(lost) = self.link.lock().expect("link").lost.clone() {
+            return Err(WriteFailure {
+                error: write_error(Some(&lost), "codex websockets executor: write failed"),
+                unsent: true,
+            });
+        }
         let deadline = self.write.deadline(len);
         let sent = tokio::time::timeout(deadline, async { self.sink.lock().await.send(message).await }).await;
         match sent {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(write_error(
-                self.link.lock().expect("link").lost.as_ref(),
-                "codex websockets executor: write failed",
-            )
-            .with_diagnostic(ws_cause::socket(&error))),
-            Err(_) => Err(write_error(
-                self.link.lock().expect("link").lost.as_ref(),
-                "codex websockets executor: write timed out",
-            )
-            .with_diagnostic(ws_cause::write_timeout(deadline, len))),
+            Ok(Err(error)) => Err(WriteFailure {
+                unsent: refused_before_queueing(&error),
+                error: write_error(
+                    self.link.lock().expect("link").lost.as_ref(),
+                    "codex websockets executor: write failed",
+                )
+                .with_diagnostic(ws_cause::socket(&error)),
+            }),
+            Err(_) => Err(WriteFailure {
+                error: write_error(
+                    self.link.lock().expect("link").lost.as_ref(),
+                    "codex websockets executor: write timed out",
+                )
+                .with_diagnostic(ws_cause::write_timeout(deadline, len)),
+                unsent: false,
+            }),
         }
     }
 
@@ -908,6 +936,45 @@ fn transport(message: &str) -> ExecError {
     ExecError::local(502, FailureScope::Transport, message)
 }
 
+/// A failed upstream write and whether the frame provably never left
+/// ([`Upstream::write_certain`]).
+#[derive(Debug)]
+pub(crate) struct WriteFailure {
+    pub(crate) error: ExecError,
+    /// Nothing of the frame was written: another socket or account may carry it.
+    pub(crate) unsent: bool,
+}
+
+impl WriteFailure {
+    fn into_error(self) -> ExecError {
+        self.error
+    }
+}
+
+/// tungstenite errors returned before the frame is queued for the stream.
+fn refused_before_queueing(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+    matches!(
+        error,
+        Error::AlreadyClosed | Error::Protocol(ProtocolError::SendAfterClosing) | Error::WriteBufferFull(_)
+    )
+}
+
+/// The failure of a request the upstream may already have read: a loss after a write
+/// that succeeded, or a write that failed after it may have sent part of the frame. The
+/// upstream may have run the request, so it is never sent again on another socket or
+/// account: the failure is request-scoped, which stops failover without cooling the
+/// credential, and the client learns of the loss as on any lost socket
+/// (`docs/codex/CONTRACT.md` "Socket and account ownership"). A request-scoped failure
+/// (the 413 of a 1009 close) is already final.
+pub(crate) fn uncertain(mut error: ExecError) -> ExecError {
+    if error.scope != FailureScope::Request {
+        error.scope = FailureScope::Request;
+        error.headers = Box::default();
+    }
+    error
+}
+
 /// What an interrupt's caller learns of the socket's loss: its text, unless the loss
 /// carries the socket's credential ([`crate::codex_secret`]).
 fn rejected_text(lost: &ExecError) -> String {
@@ -1168,13 +1235,16 @@ impl Turn {
         frame
     }
 
+    /// A turn exists only once its request was written, so a read failure is the loss
+    /// of a request the upstream may already have read: it is [`uncertain`] and never
+    /// fails over, whether or not bootstrap buffering still holds `response.created`.
     async fn read(&mut self) -> Frame {
         let text = match self.rx.recv().await {
             Some(Read::Text(text)) => text,
             Some(Read::Failed(error)) => {
                 self.report_deferred();
                 return Frame::Failed {
-                    error,
+                    error: uncertain(error),
                     overload: false,
                     read: true,
                     status_frame: false,
@@ -1185,10 +1255,10 @@ impl Turn {
             // recorded the loss (Go's reader waits to deliver it).
             None => {
                 return Frame::Failed {
-                    error: self.loss().map_or_else(
+                    error: uncertain(self.loss().map_or_else(
                         || transport("codex websockets executor: session read channel closed"),
                         |l| turn_error(&l),
-                    ),
+                    )),
                     overload: false,
                     read: true,
                     status_frame: false,
@@ -2066,7 +2136,7 @@ impl CodexExecutor {
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
         let mut rx = conn.activate(preserves);
-        if let Err(error) = conn.send_raw(frame.clone()).await {
+        if let Err(WriteFailure { error, unsent }) = conn.send_create(frame.clone()).await {
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
             let retry = error.scope != FailureScope::Request;
@@ -2078,8 +2148,13 @@ impl CodexExecutor {
             if !retry {
                 return Err(error);
             }
-            // Retry once on a fresh socket: upstream may have closed it between turns. Its
-            // dial carries this request's values.
+            if !unsent {
+                // Part of the frame may have reached the upstream (N1 #111 W1): never
+                // send it again, here or on another account.
+                return Err(uncertain(error));
+            }
+            // Retry once on a fresh socket: the frame provably never left the socket the
+            // upstream closed between turns. Its dial carries this request's values.
             wire.bind(secrets);
             req.usage.sent_credentials(secrets);
             let (fresh, fresh_handshake) = match self
@@ -2101,10 +2176,10 @@ impl CodexExecutor {
                 wire.ws_handshake(101, handshake);
             }
             // `frame` is borrowed by `body`; a clone is a reference count.
-            if let Err(error) = fresh.send_raw(frame.clone()).await {
+            if let Err(WriteFailure { error, unsent }) = fresh.send_create(frame.clone()).await {
                 wire.ws_exec_error("send_retry", &error);
                 session.invalidate(&fresh, &error, true);
-                return Err(error);
+                return Err(if unsent { error } else { uncertain(error) });
             }
             conn = fresh;
             handshake = fresh_handshake;

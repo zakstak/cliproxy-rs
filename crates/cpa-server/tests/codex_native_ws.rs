@@ -7506,6 +7506,115 @@ const N1_MODERATION: &str = r#"{"type":"response.metadata","response_id":"resp_n
 const N1_OVERLOADED: &str =
     r#"{"type":"response.failed","response":{"id":"resp_n1","error":{"code":"server_is_overloaded","message":null}}}"#;
 
+/// How the N1 losing upstream ends its first socket after reading the create.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    Close(u16),
+    Drop,
+}
+
+/// A loopback upstream whose first socket reads the create, sends `held`, then ends as
+/// `end`; every later socket answers [`N1_CREATED`] and [`N1_DONE`]. Records every
+/// socket's bearer and frames.
+async fn losing_upstream(held: Vec<&'static str>, end: End) -> (String, Arc<std::sync::Mutex<Vec<Dialed>>>) {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    let log = Arc::new(std::sync::Mutex::new(Vec::<Dialed>::new()));
+    let app = {
+        let log = log.clone();
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                let (log, held) = (log.clone(), held.clone());
+                async move {
+                    let dial = {
+                        let mut log = log.lock().unwrap();
+                        log.push(Dialed {
+                            bearer: headers["authorization"].to_str().unwrap().to_owned(),
+                            ..Dialed::default()
+                        });
+                        log.len() - 1
+                    };
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let Upstream::Text(text) = message else { continue };
+                            log.lock().unwrap()[dial].frames.push(text.as_str().to_owned());
+                            if dial == 0 {
+                                for frame in &held {
+                                    let _ = socket.send(Upstream::Text((*frame).into())).await;
+                                }
+                                if let End::Close(code) = end {
+                                    let _ = socket
+                                        .send(Upstream::Close(Some(CloseFrame {
+                                            code,
+                                            reason: "lost".into(),
+                                        })))
+                                        .await;
+                                }
+                                return;
+                            }
+                            for frame in [N1_CREATED, N1_DONE] {
+                                let _ = socket.send(Upstream::Text(frame.into())).await;
+                            }
+                        }
+                    })
+                }
+            }),
+        )
+    };
+    (format!("http://{}", serve(app).await), log)
+}
+
+/// N1 W1: once a create was written and the upstream read it, the upstream may run it.
+/// A loss before anything reached the client (close 1000, close 1011 or a dropped
+/// connection) ends the client connection, as any lost socket does
+/// (`docs/codex/CONTRACT.md` "Socket and account ownership"), and the create is never
+/// sent to another account: with bootstrap buffering, not even after the upstream sent
+/// `response.created` and `response.metadata`, which stay undelivered. The account is not
+/// cooled: the client's next connection is served by it.
+#[tokio::test]
+async fn an_uncertain_loss_is_never_replayed_on_another_account() {
+    for buffering in [false, true] {
+        let helds: &[&[&'static str]] = if buffering {
+            &[&[], &[N1_CREATED], &[N1_CREATED, N1_IN_PROGRESS, N1_MODERATION]]
+        } else {
+            // Without buffering an event is delivered at once: the after-delivery control.
+            &[&[]]
+        };
+        for held in helds {
+            for end in [End::Close(1000), End::Close(1011), End::Drop] {
+                let case = format!("buffering={buffering} held={} end={end:?}", held.len());
+                let (url, log) = losing_upstream(held.to_vec(), end).await;
+                let config = if buffering {
+                    "codex:\n  stream-bootstrap-buffering: true\n"
+                } else {
+                    ""
+                };
+                let proxy = proxy_with(Script::default(), config, |_| two_accounts(&url)).await;
+                let mut socket = connect(&proxy).await;
+                let first = client_frame("ws-create-first", "gpt-5.5");
+                socket.send(Message::text(first.clone())).await.unwrap();
+                let got = read(&mut socket, &TERMINAL).await;
+                assert_eq!(got.frames, Vec::<String>::new(), "{case}: nothing was delivered");
+                assert!(got.closed.is_some(), "{case}: the loss reaches the client");
+                let dialed = log.lock().unwrap().clone();
+                assert_eq!(dialed.len(), 1, "{case}: no other account was dialed: {dialed:?}");
+                assert_eq!(dialed[0].frames, [first.clone()], "{case}: the create was sent once");
+
+                let mut socket = connect(&proxy).await;
+                socket.send(Message::text(first.clone())).await.unwrap();
+                assert_eq!(
+                    read(&mut socket, &TERMINAL).await.frames,
+                    [N1_CREATED, N1_DONE],
+                    "{case}"
+                );
+                let dialed = log.lock().unwrap().clone();
+                assert_eq!(dialed.len(), 2, "{case}");
+                assert_eq!(dialed[1].bearer, "Bearer at-FAKE", "{case}: the account was not cooled");
+            }
+        }
+    }
+}
+
 /// N1 W3, WebSocket: under `stream-bootstrap-buffering`, an upstream `response.metadata`
 /// before an explicit `server_is_overloaded` rejection is held, so the turn still fails
 /// over, and the failed attempt's events, its metadata included, never reach the client.
