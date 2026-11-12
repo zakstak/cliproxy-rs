@@ -1960,11 +1960,33 @@ async fn decode_body(
     limit: Option<u64>,
 ) -> (Vec<u8>, Option<String>, bool) {
     use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
-    let encoding = headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let encoding = if request { encoding.trim() } else { encoding };
+    let encoding = if request {
+        // Repeated fields form one ordered coding list. Invalid fields must not
+        // look absent: their bytes may still conceal SDP credentials.
+        let mut encoding = String::new();
+        for value in headers.get_all("content-encoding") {
+            let Ok(value) = value.to_str() else {
+                return (raw, None, true);
+            };
+            for coding in value.split(',') {
+                let coding = coding.trim();
+                if coding.is_empty() {
+                    return (raw, None, true);
+                }
+                if !encoding.is_empty() {
+                    encoding.push(',');
+                }
+                encoding.push_str(coding);
+            }
+        }
+        encoding
+    } else {
+        headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
     if raw.is_empty() || encoding.is_empty() {
         return (raw, None, false);
     }
@@ -2967,6 +2989,18 @@ mod tests {
         limit: Option<u64>,
         sdp: bool,
     ) -> (Bytes, Vec<u8>) {
+        logged_post_headers(dir, enabled, &[encoding.parse().unwrap()], body, limit, sdp, true).await
+    }
+
+    async fn logged_post_headers(
+        dir: &Path,
+        enabled: bool,
+        encodings: &[axum::http::HeaderValue],
+        body: Vec<u8>,
+        limit: Option<u64>,
+        sdp: bool,
+        declare_length: bool,
+    ) -> (Bytes, Vec<u8>) {
         let state = management(dir, enabled, false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let app = axum::Router::new().fallback(move |request: Request| {
@@ -2981,14 +3015,17 @@ mod tests {
             }
         });
         let mut app = router(&state, app);
-        let mut request = HttpRequest::builder()
+        let mut builder = HttpRequest::builder()
             .method("POST")
             .uri("/v1/responses")
-            .header("content-encoding", encoding)
-            .header("content-length", body.len())
-            .header("authorization", "Bearer sk-fake-0123456789MIDDLEPART9876543210")
-            .body(Body::from(body))
-            .unwrap();
+            .header("authorization", "Bearer sk-fake-0123456789MIDDLEPART9876543210");
+        for encoding in encodings {
+            builder = builder.header("content-encoding", encoding);
+        }
+        if declare_length {
+            builder = builder.header("content-length", body.len());
+        }
+        let mut request = builder.body(Body::from(body)).unwrap();
         if limit.is_some() {
             request.extensions_mut().insert(crate::body_limit::Limit(limit));
         }
@@ -3094,6 +3131,51 @@ mod tests {
                 assert!(!find(&log, b"SECRET"), "{encoding} enabled={enabled}");
                 assert!(find(&log, b"[REQUEST BODY OMITTED"), "{encoding} enabled={enabled}");
             }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_request_encoding_fields_guard_sdp_in_eager_and_deferred_logs() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use axum::http::HeaderValue;
+        let dir = scratch();
+        let sdp = b"v=0\r\na=ice-ufrag:SECRETUFRAG\r\na=ice-pwd:SECRETPASSWORD0123456789\r\n".repeat(64);
+        let mut gzip = Vec::new();
+        GzipEncoder::new(sdp.as_slice()).read_to_end(&mut gzip).await.unwrap();
+        let cases = [
+            vec![HeaderValue::from_static("identity"), HeaderValue::from_static("gzip")],
+            vec![HeaderValue::from_bytes(b"gzip\xff").unwrap()],
+            vec![
+                HeaderValue::from_static("identity"),
+                HeaderValue::from_bytes(b"gzip\xff").unwrap(),
+            ],
+            vec![HeaderValue::from_static("identity,")],
+            vec![HeaderValue::from_static("")],
+        ];
+        for (case, encodings) in cases.iter().enumerate() {
+            for enabled in [false, true] {
+                // No declared length with logging off exercises deferred capture.
+                let (forwarded, log) =
+                    logged_post_headers(&dir, enabled, encodings, gzip.clone(), None, true, enabled).await;
+                assert_eq!(forwarded, gzip, "case {case}: forwarded bytes");
+                assert!(find(&log, b"[REQUEST BODY OMITTED"), "case {case} enabled={enabled}");
+                assert!(
+                    !find(&log, &gzip),
+                    "case {case} enabled={enabled}: compressed SDP withheld"
+                );
+            }
+        }
+        // A valid repeated list is decoded in reverse field order, then redacted.
+        let zstd = zstd_frame(&sdp, 20, false);
+        let encodings = [HeaderValue::from_static("identity"), HeaderValue::from_static("zstd")];
+        for enabled in [false, true] {
+            let (forwarded, log) =
+                logged_post_headers(&dir, enabled, &encodings, zstd.clone(), None, true, enabled).await;
+            assert_eq!(forwarded, zstd);
+            assert!(!find(&log, b"SECRET"));
+            assert!(!find(&log, b"[REQUEST BODY OMITTED"), "supported coding decoded");
+            assert!(find(&log, b"v=0"));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
