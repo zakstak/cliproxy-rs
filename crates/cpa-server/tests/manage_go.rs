@@ -712,6 +712,21 @@ mod routes {
                 if want.contains_key("X-CPA-SUPPORT-PLUGIN") {
                     want.insert("X-CPA-SUPPORT-PLUGIN".into(), "0".into());
                 }
+                // Go v8.0.35 recorded `*`, which never covers Authorization in a Fetch
+                // preflight; cliproxy-rs names the accepted headers as Go v8.0.67 does
+                // (docs/DIFFERENCES-FROM-GO.md "CORS allowed request headers"). These
+                // steps send no Access-Control-Request-Headers, so nothing is echoed.
+                if want.get("Access-Control-Allow-Headers").is_some_and(|v| v == "*") {
+                    assert!(!step["headers"].as_object().is_some_and(|h| {
+                        h.keys()
+                            .any(|k| k.eq_ignore_ascii_case("Access-Control-Request-Headers"))
+                    }));
+                    want.insert(
+                        "Access-Control-Allow-Headers".into(),
+                        "Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version, Anthropic-Beta"
+                            .into(),
+                    );
+                }
                 assert_eq!(Value::Object(headers), Value::Object(want), "{name}[{i}] headers");
                 compared += 1;
             }
