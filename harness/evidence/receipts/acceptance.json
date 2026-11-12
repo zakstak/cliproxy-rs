@@ -1,8 +1,16 @@
 {
-  "written": "2026-11-12T02:43:10Z",
+  "written": "2026-11-12T03:22:20Z",
   "kind": "acceptance",
   "verdict": "pass",
-  "missing_receipts": [],
+  "partial": false,
+  "problems": [],
+  "tested_source": {
+    "head": "0773136aa0bab48880d0899872247a5d327b2597",
+    "tree": "47235d35fbc0a82bbc92ccf1b873f44fc4618513",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+  },
   "pins": {
     "go": {
       "historical": {
@@ -29,7 +37,7 @@
   },
   "receipts": [
     {
-      "file": "20261112-024229-differential-historical.json",
+      "file": "differential-historical.json",
       "kind": "differential",
       "target": "historical",
       "verdict": "pass",
@@ -41,13 +49,24 @@
         "infrastructure": 0,
         "named_skips": 0,
         "unknown_skips": 0,
-        "named_divergences": 5,
+        "named_divergences": 4,
         "stale_divergences": 0
       },
-      "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db"
+      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
     },
     {
-      "file": "20261112-024302-differential-selective.json",
+      "file": "mutation-historical.json",
+      "kind": "mutation-control",
+      "target": "historical",
+      "verdict": "pass",
+      "counts": {
+        "mutations": 13,
+        "caught": 13
+      },
+      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+    },
+    {
+      "file": "differential-selective.json",
       "kind": "differential",
       "target": "selective",
       "verdict": "pass",
@@ -59,21 +78,24 @@
         "infrastructure": 0,
         "named_skips": 0,
         "unknown_skips": 0,
-        "named_divergences": 17,
+        "named_divergences": 18,
         "stale_divergences": 0
       },
-      "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db"
+      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
     },
     {
-      "file": "20261112-024302-mutation-historical.json",
+      "file": "mutation-selective.json",
       "kind": "mutation-control",
-      "target": "historical",
+      "target": "selective",
       "verdict": "pass",
-      "counts": null,
-      "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db"
+      "counts": {
+        "mutations": 18,
+        "caught": 18
+      },
+      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
     },
     {
-      "file": "20261112-024310-cargo-groups.json",
+      "file": "cargo-groups.json",
       "kind": "cargo-groups",
       "target": null,
       "verdict": "pass",
@@ -84,7 +106,7 @@
         "failed": 0,
         "unknown_tests": 0
       },
-      "rust_revision": "ba2229b5617ff87ceb683dc884975d3ed9c184db"
+      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
     }
   ]
 }
