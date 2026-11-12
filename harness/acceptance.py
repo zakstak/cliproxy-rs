@@ -166,8 +166,8 @@ def _brief_provenance(record):
 
 # --- cargo groups ------------------------------------------------------------------------
 
-SUMMARY = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
-                     r"(\d+) measured; (\d+) filtered out", re.M)
+SUMMARY = re.compile(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+                     r"(\d+) measured; (\d+) filtered out; finished in \d+(?:\.\d+)?s")
 
 
 def parse_libtest(output):
@@ -194,7 +194,9 @@ def judge_execution(names, listing, execution):
         return out
     missing = sorted(set(names) - listing["names"])
     results = parse_libtest(execution.get("stdout", ""))
-    summaries = SUMMARY.findall(execution.get("stdout", ""))
+    summary_lines = [line for line in execution.get("stdout", "").splitlines()
+                     if line.startswith("test result:")]
+    summaries = [match.groups() for line in summary_lines if (match := SUMMARY.fullmatch(line))]
     failed = sorted(n for n in names if results.get(n) == "FAILED")
     ignored = sorted(n for n in names if results.get(n) == "ignored")
     not_run = sorted(n for n in names if n not in results and n not in missing)
@@ -207,7 +209,7 @@ def judge_execution(names, listing, execution):
         out["problems"].append("execution timed out or was killed")
     elif execution["exit"] != 0:
         out["problems"].append(f"execution exited {execution['exit']}")
-    if len(summaries) != 1:
+    if len(summaries) != 1 or len(summary_lines) != 1:
         out["problems"].append(f"{len(summaries)} libtest summary lines (truncated or extra output)")
     else:
         result, passed, n_failed, n_ignored = summaries[0][0], int(summaries[0][1]), int(summaries[0][2]), int(summaries[0][3])
@@ -245,7 +247,13 @@ def _run(command, cwd, env, timeout):
         done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
         return {"exit": done.returncode, "stdout": done.stdout, "stderr": done.stderr, "timeout": False}
     except subprocess.TimeoutExpired as exc:
-        return {"exit": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timeout": True}
+        # TimeoutExpired retains bytes even when subprocess.run requested text.
+        stdout, stderr = exc.stdout or "", exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        return {"exit": None, "stdout": stdout, "stderr": stderr, "timeout": True}
 
 
 def run_cargo(pins):

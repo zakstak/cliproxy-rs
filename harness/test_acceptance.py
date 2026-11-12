@@ -7,6 +7,7 @@ import copy
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -413,6 +414,30 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.status({"exit": -9, "stdout": OK, "timeout": False}), "unavailable")
         self.assertNotEqual(self.status({"exit": 0, "stdout": "running 1 test\ntest a ... ok\n", "timeout": False}), "pass")
         self.assertNotEqual(self.status({"exit": 0, "stdout": OK.replace("1 passed", "2 passed"), "timeout": False}), "pass")
+
+    def test_real_timeout_output_remains_text_and_is_unavailable(self):
+        code = "import sys,time; print('test a ... ok', flush=True); print('partial stderr', file=sys.stderr, flush=True); time.sleep(10)"
+        execution = acceptance._run([sys.executable, "-c", code], ROOT, None, 0.5)
+        self.assertTrue(execution["timeout"])
+        self.assertIsInstance(execution["stdout"], str)
+        self.assertIsInstance(execution["stderr"], str)
+        self.assertIn("test a ... ok", execution["stdout"])
+        self.assertIn("partial stderr", execution["stderr"])
+        self.assertEqual(self.status(execution), "unavailable")
+
+    def test_complete_summary_line_is_required(self):
+        summary = OK.splitlines()[-1]
+        malformed = [
+            summary.replace("; finished in 0.01s", "INVALID"),
+            summary.replace("; finished in 0.01s", ""),
+            summary + "INVALID",
+            summary.replace("0.01s", "nans"),
+            summary + "\n" + summary.replace("; finished in 0.01s", ""),
+        ]
+        for line in malformed:
+            with self.subTest(summary=line):
+                self.assertNotEqual(self.status({"exit": 0, "stdout": OK.replace(summary, line),
+                                                "timeout": False}), "pass")
 
     def test_failed_ignored_and_missing_tests_fail(self):
         self.assertEqual(self.status({"exit": 101, "stdout": OK.replace("a ... ok", "a ... FAILED"), "timeout": False}), "fail")
