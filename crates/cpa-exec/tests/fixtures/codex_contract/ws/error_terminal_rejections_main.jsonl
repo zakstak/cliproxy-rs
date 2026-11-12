@@ -1,0 +1,2 @@
+{"error":{"code":"content_policy_violation","message":"This request was rejected."},"type":"error","status":400}
+{"error":{"code":"inference_hook_denied","message":"This request was rejected."},"type":"error","status":403}

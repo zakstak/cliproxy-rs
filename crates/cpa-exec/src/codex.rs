@@ -700,9 +700,16 @@ fn compact_error(mut error: ExecError) -> ExecError {
         return error;
     }
     let body = String::from_utf8_lossy(&error.body);
-    error.scope = if matches!(error.status, 400 | 404 | 405 | 409 | 413 | 422 | 501)
-        || response::request_fault(error.status, &body)
-    {
+    // FP2: a first-party reading (`ExecError::sourced`) decides before Go's rules.
+    let request = match error.sourced {
+        Some(cpa_core::exec::SourcedFault::RequestTerminal) => true,
+        Some(cpa_core::exec::SourcedFault::Retryable) => false,
+        None => {
+            matches!(error.status, 400 | 404 | 405 | 409 | 413 | 422 | 501)
+                || response::request_fault(error.status, &body)
+        }
+    };
+    error.scope = if request {
         FailureScope::Request
     } else {
         FailureScope::Transport

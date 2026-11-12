@@ -586,6 +586,7 @@ fn upstream_error(status: u16, body: &[u8]) -> ExecError {
         delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
+        sourced: None,
     }
 }
 

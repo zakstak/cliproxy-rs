@@ -6,11 +6,12 @@ Tracking issue: [#116](https://github.com/zakstak/cliproxy-rs/issues/116), under
 [FP1-SOURCE-REFRESH.md](FP1-SOURCE-REFRESH.md)) and R1
 ([#94](https://github.com/zakstak/cliproxy-rs/issues/94)).
 
-This slice changes failure classification only. The proxy does not rewrite, add or drop
-any request or response bytes. The contract pin stays `44ccf394573c`. The rules come
-from researched main and are labelled as source-refresh evidence, as FP1 decided.
-Message budgets, HTTP fallback and lane policy belong to FP4
-([#118](https://github.com/zakstak/cliproxy-rs/issues/118)), and are out of scope here.
+This slice changes failure classification only, and only for Codex credentials. The
+proxy does not rewrite, add or drop any request or response bytes. The contract pin
+stays `44ccf394573c`. The rules come from researched main and are labelled as
+source-refresh evidence, as FP1 decided. Message budgets, HTTP fallback and lane policy
+belong to FP4 ([#118](https://github.com/zakstak/cliproxy-rs/issues/118)) and are out of
+scope.
 
 ## Sources
 
@@ -19,36 +20,69 @@ All references are to `openai/codex` at research main
 
 | Source | What it decides |
 | --- | --- |
-| `codex-rs/codex-api/src/error.rs:92-162` `parse_terminal_provider_error` | The terminal code and status pairs: `inference_hook_denied` (none or 403), `context_length_exceeded` (none or 400), `invalid_access_program` and `unsupported_access_program` (none), `content_policy_violation` (none or 400), `access_program_not_enabled` (none). |
-| `codex-rs/codex-api/src/api_bridge.rs:130-312` | HTTP and wrapped WebSocket statuses: the same parser with the status, then `access_program_not_enabled` on 403 (`/detail/code` or `/error/code`), and the workspace 403 (`invalid_workspace_selected`, `codex_workspace_access_denied`). |
-| `codex-rs/codex-api/src/sse/responses.rs:375-450`, `sse/responses_error.rs:26-34` | In-stream `error` and `response.failed` events use the parser with no status. |
-| `codex-rs/codex-api/src/endpoint/responses_websocket.rs:747-806`, `1416-1439` | A wrapped status frame is an HTTP error with its status. The context-length 400 is a context failure; the 503 can be retried. |
-| `codex-rs/protocol/src/error.rs:470-534` `retry_policy` | Each of these rejections, and the workspace denial, is `RetryPolicy::Never`. A 5xx `UnexpectedStatus` gets `Backoff`. |
-| Commits `1885417cd45a`, `65f27090521b`, `0811df397684`, `d9446b4b01aa`, `5b98eaafeb34`, `4b345a8de9b3`, `bb360e5db88c` | The changes since the pin that #116 lists. |
+| `codex-api/src/error.rs:92-162` `parse_terminal_provider_error` | Code and status pairs: `inference_hook_denied` (none or 403), `context_length_exceeded` (none or 400), `invalid_access_program` and `unsupported_access_program` (none), `content_policy_violation` (none or 400), `access_program_not_enabled` (none). |
+| `codex-api/src/api_bridge.rs:130-312`, `342-354` | HTTP and wrapped WebSocket statuses: the parser with the status, then for a 403 the code from `/detail/code`, else `/error/code`, else the base64 `x-error-json` header. `invalid_workspace_selected`, `codex_workspace_access_denied` and `access_program_not_enabled` are terminal there. |
+| `codex-api/src/sse/responses.rs:375-450`, `sse/responses_error.rs:26-34` | In-stream `error` and `response.failed` events use the parser with no status. |
+| `codex-api/src/endpoint/responses_websocket.rs:747-806`, `906-925` | A WebSocket `error` frame is first offered to the wrapped mapping. Only an error status (100 to 999, not 2xx) makes it an HTTP error. Every other frame (no status, a 2xx, a status past 999, or one the struct cannot read) goes to `process_responses_event`, which reads no status. |
+| `protocol/src/error.rs:470-534` `retry_policy` | Each rejection above, and `WorkspaceAccessDenied`, is `RetryPolicy::Never`. A `context_length_exceeded` with another status is `UnexpectedStatus`, which is retried with backoff. |
+| `protocol/src/error.rs:703-732` `is_runtime_auth_denial` | Runtime-agent authentication denials (`runtime_assertion_invalid`, `runtime_instance_revoked`, ...). They are authentication failures, not FP2 rejections. |
+| `core/tests/suite/websocket_fallback.rs:133-176` | A 403 with `{"detail":{"code":…}}` on the WebSocket upgrade and on HTTP is not retried and does not fall back. |
+| Commit `4b345a8de9b3` | "A `403` with `codex_workspace_access_denied` indicates that the account cannot use Codex in the selected workspace. Retrying or falling back to HTTP does not resolve that denial." |
 
 ## Endpoint profiles
 
-The rules apply on the `chatgpt` and `api-key` profiles, where the first-party source
-reads these codes. `siwc` and `compatible` endpoints are not covered by any source for
-these codes. The proxy uses the same classification there, because a request fault that
-cannot fail over is the conservative reading. Loopback mocks stand for `chatgpt` and
-`compatible`.
+The fixtures cover `chatgpt`, and `api-key` where the first-party test is
+transport-neutral. No source covers these codes on `siwc` or `compatible` endpoints; the
+proxy applies the same reading to every Codex credential, which is a decision, not
+evidence. Loopback mocks stand for `chatgpt`.
 
 ## Decisions
 
-| Failure | Proxy classification | Why |
+| Failure | Reading | Proxy classification |
 | --- | --- | --- |
-| A terminal rejection with its first-party status, on HTTP, a wrapped status frame, or an in-stream event | Request fault: no failover, no cooldown, no token refresh | First-party never retries it. It concerns the request, or the workspace policy for that request. It does not show that the account is unhealthy. |
-| The same codes with any other status | Unchanged, as Go v8.0.35 classifies them | First-party also reads them as ordinary statuses then. |
-| An in-stream event with one of these codes | It takes the code's first-party status: 403 for `inference_hook_denied` and `access_program_not_enabled`, 400 for the others | The event has no status. A 403 keeps the native WebSocket account guard (#6), because the frame describes the account's workspace. |
-| `context_length_exceeded` with a 5xx (HTTP or wrapped) | Transient. Go's 503 classification applies: retry round, failover, cooldown. The body is not rewritten to `context_too_large`. | `error.rs:110-112`. This prevents a context-window failure that the provider did not report. |
-| `context_length_exceeded` in-stream, or with 400 | Unchanged context failure | First-party Codex reads no status in-stream. |
-| Workspace 403 | Unchanged credential failure: failover and cooldown, no refresh | The proxy selects the workspace from the account's own credential, so the denial concerns that account. |
+| An HTTP error, or a wrapped WebSocket status frame or upgrade refusal, with a terminal code and its first-party status | `Surface::Status` | `SourcedFault::RequestTerminal`: request fault. No failover, no cooldown, no token refresh. |
+| A 403 workspace or access-program denial, in `/detail/code`, `/error/code` or `x-error-json` | `Surface::Status` | `RequestTerminal`. First-party does not retry it, and nothing in the source shows that the account is unhealthy for other requests. A 503 with the same body is an ordinary 503. |
+| An in-stream event, or an unmapped WebSocket `error` frame, with a new code | `Surface::Stream` (no status) | `RequestTerminal`, classified with the code's first-party status: 403 for `inference_hook_denied` and `access_program_not_enabled`, 400 for the others. The pinned reader read on past such a notice; main fails it. |
+| `context_length_exceeded` with any HTTP status except 400 | `Surface::Status` | `SourcedFault::Retryable`: no request fault, and no `context_too_large` rewrite. Its status decides (a 503 fails over and cools). |
+| `context_length_exceeded` without a status, or with 400 | either | Unchanged context failure. An unmapped notice with this code, which the pinned reader read on, now fails as main does. |
+| Workspace codes in a stream event | `Surface::Stream` | Unchanged. First-party has no stream reading for them. |
+| 401, a bare 403, another 403 code, a runtime authentication denial | none | Unchanged credential failure. |
 
-`cpa_exec::codex_terminal` holds the rules. The executor (`codex_response`) and the
-server's request-fault check (`cpa_server::classify::is_request_fault`) both read them.
-The server check applies to every retained provider, because these codes are OpenAI's
-(docs/DIFFERENCES-FROM-GO.md).
+`cpa_exec::codex_terminal` reads the rules. The Codex executor carries the result on
+`ExecError::sourced`, and the server's `classify` functions read it before Go's
+provider-neutral request-fault rules: `is_request_invalid`, `is_unauthorized`,
+`is_compact_fault`, and the WebSocket `exposed` check. Claude, xAI and Meta never set
+`sourced`, so their failures keep Go's rules exactly.
+
+## Delivery and account confidentiality
+
+- The native HTTP route delivers the provider's status, body and IDs, as it does for
+  every upstream error (CONTRACT.md "Native HTTP route"). In-stream events reach an HTTP
+  client as sent.
+- A native WebSocket client never receives a rejection classified as 403. That covers a
+  workspace or access-program denial, an inference-hook denial, and an upgrade refusal.
+  The #6 guard withholds the frame, and `exposed` keeps account statuses unexposed
+  even when they are request faults. The client gets a silent close.
+- Known limitation, unchanged by FP2: after a silent close, a first-party client treats
+  the loss as a stream error. It reconnects and resends until its own retry budget ends.
+  The proxy does not cool the account and does not fail over, so each resend is a new
+  request, and the scheduler may pick another account for it. The client never sees a
+  terminal frame for these rejections.
+
+## Fixtures
+
+| Fixture | First-party test |
+| --- | --- |
+| `sse-terminal-rejections` | `sse/responses_error_tests.rs:112-140`, with the FP2 codes only |
+| `ws-error-terminal-rejections` | `api_bridge_tests.rs:364-409`, the wrapped form with the first message |
+| `http-error-workspace-detail` | `api_bridge_tests.rs:831`, `core/tests/suite/websocket_fallback.rs:133-152` |
+| `http-error-workspace-provider` | `api_bridge_tests.rs:830-836`, also the `x-error-json` payload |
+| `ws-error-context-length-status` | `responses_websocket.rs:1416-1439` (FP1) |
+
+The pinned-reader oracle fixtures (`codex_pinned_failure_readings.json` and
+`codex_pinned_notice_readings.json`) stay as recorded at the pin. Their 143 decoded
+`context_length_exceeded` frames that the pinned reader read on (62 and 81) are asserted
+as failures, labelled as the main departure (`codex_ws_tests` `main_context_failure`).
 
 ## Mock evidence
 
@@ -56,26 +90,24 @@ All tests use loopback upstreams, fake tokens and private `auth-dir`s.
 
 | Test | Asserts |
 | --- | --- |
-| `cpa-exec` `codex_terminal::tests::*` | Code and status pairs, exact codes, the 5xx context rule, and that a workspace denial is left to the credential rules. |
-| `cpa-exec` `codex_response::first_party_terminal_tests::*` | HTTP status errors keep their bodies and get the right scope. In-stream events take the first-party status whatever inner status they name, and get no retry delay. The `ws-error-context-length-status` fixture: the 400 is a request fault and the 503 is a credential failure. A wrapped 403 rejection is withheld and a wrapped 400 one is not. |
-| `cpa-server` `classify::tests::first_party_codex_terminal_rejections_decide_before_go` | Request-invalid, cooldown and retry-round decisions, the 5xx context rule beside Anthropic's type, and no refresh for a workspace 403. |
-| `codex_native_request::first_party_terminal_rejections_stop_on_the_selected_account` | With a second account available: HTTP 403 and 400 rejections, and `error` and `response.failed` events as the first event and after output. Each has one upstream attempt with the selected token, no cooldown, one failed usage record, and the provider's status and bytes. |
-| `codex_native_request::transient_and_workspace_failures_move_to_another_account` | A context-labelled 503 (with and without a type) and both workspace 403 forms each move once to the second account, which serves the answer. The first account is cooled. |
-| `codex_native_ws::first_party_terminal_rejections_never_fail_over_on_websocket_turns` | On a socket and on a turn served over HTTP: one upstream frame or request, no cooldown, one failed usage record. 403 frames are withheld. Other frames, including the 400 fixture frame, arrive as sent. |
-| `codex_native_ws::a_context_labelled_503_fails_over_on_websocket_turns` | The 503 fixture frame and a typed 503 move once to the second account. The client receives that account's answer and never the 503 frame, and only the first account is cooled. |
+| `cpa-exec` `codex_terminal::tests::*` | Stream and status readings, the 403 match case for case with `only_an_explicit_workspace_403_stops_retries`, `x-error-json`, exact codes, the context rule, and runtime-auth controls. |
+| `cpa-exec` `codex_response::first_party_terminal_tests::*` | HTTP bodies kept as sent, with scope and `sourced`. The context code at 403, 404, 413 and 5xx. Every `sse-terminal-rejections` event. Wrapped frames, `x-error-json` in frame headers, and notices at `200`, `1000`, `"503"`, `429.0` and `"403"`, with withholding. |
+| `cpa-exec` `codex_ws_tests` pinned-reading tests | The recorded pinned decisions, with the 143 main departures counted. |
+| `cpa-server` `classify::tests::sourced_codex_readings_decide_before_go`, `unsourced_failures_keep_go_rules` | Sourced readings decide, including no refresh for a body naming 401. Unsourced (non-Codex) failures keep Go's rules for the same bodies. |
+| `codex_native_request::first_party_terminal_rejections_stop_on_the_selected_account` | With a second account available: 8 HTTP cases, plus 24 in-stream cases (as the first event and after output). Each has one attempt with the selected token, no cooldown, exactly one failed usage record, and the provider's status and bytes. |
+| `codex_native_request::retryable_and_account_failures_move_to_another_account` | Context 503 (with and without a type), context 403, workspace 503, bare 403, another 403 code beside a workspace header, and a runtime denial each move once to the second account. |
+| `codex_native_request::a_context_labelled_503_is_retried_once_per_account` | With `request-retry: 0`, one attempt per account, both accounts cooled, and the last body delivered. |
+| `codex_native_ws::first_party_terminal_rejections_never_fail_over_on_websocket_turns` | 18 frames, on a socket and on a turn served over HTTP: one upstream frame or request, no cooldown, one failed record. 403 frames are withheld; the others arrive as sent. |
+| `codex_native_ws::a_workspace_upgrade_refusal_stops_on_the_selected_account` | A 403 workspace upgrade refusal: one upgrade, no HTTP request, no cooldown, one failed record, silent close. The bare 403 control fails over. |
+| `codex_native_ws::a_context_labelled_503_fails_over_on_websocket_turns` | The 503 fixture frame and a typed 503 move once to the second account. Only the first account is cooled. |
 
 ## Unresolved gates
 
-- Live acceptance on any profile. Local mocks cannot show which status the provider sends
-  with each code, or whether `siwc` or `compatible` endpoints send these codes at all.
-- A withheld 403 rejection gives a native WebSocket client a silent close. The pinned
-  client then reconnects and resends until its own retry budget ends. Delivering the frame
-  needs evidence that a workspace-hook or access-program message never names the
-  account.
-- The `x-error-json` header code, which first-party reads for 403 workspace and
-  access-program denials, is not read. A 403 access-program denial that only the header
-  names stays a credential failure.
-- A wrapped notice (a 2xx or non-HTTP status), or a decoded `error` frame with a status
-  the wrapped reader refuses, is still checked only against the pinned terminal codes
-  (`codex_ws::terminal_provider_error`). Main raises the new codes there too.
+- Live acceptance on any profile. Local mocks cannot show which status the provider
+  sends with each code, or whether `siwc` or `compatible` endpoints send these codes.
+- The silent-close reconnect limitation described above. Delivering a terminal frame
+  needs evidence that these messages never name the account.
+- An unmapped notice with `context_length_exceeded` is delivered as sent, or as #5's
+  `response.failed` when its integer status reads as zero. The pinned client still reads
+  on past the `error` frame it receives.
 - No pin bump. CONTRACT.md line references stay at `44ccf394573c`.

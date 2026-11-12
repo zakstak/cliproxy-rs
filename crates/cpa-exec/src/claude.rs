@@ -810,6 +810,7 @@ fn upstream_error(
             delivery: cpa_core::exec::Delivery::Classified,
             addon: None,
             diagnostic: None,
+            sourced: None,
         };
     }
     let error = ExecError {
@@ -827,6 +828,7 @@ fn upstream_error(
         delivery: cpa_core::exec::Delivery::Classified,
         addon: None,
         diagnostic: None,
+        sourced: None,
     };
     quota::classify(error, model_level_cooling)
 }

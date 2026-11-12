@@ -5,7 +5,7 @@
 //! the error text (`err.Error()`, which is the upstream body or `status N`). Both feed
 //! retry, failover and cooldown decisions here so they cannot drift apart.
 
-use cpa_core::exec::{ExecError, FailureScope};
+use cpa_core::exec::{ExecError, FailureScope, SourcedFault};
 use cpa_core::gostr::GoStr;
 use serde_json::Value;
 
@@ -76,9 +76,10 @@ pub fn upstream_attempted(e: &ExecError) -> bool {
     !e.headers.is_empty() || e.scope == FailureScope::Transport || e.status == 0
 }
 
-/// Go `isUnauthorizedError` for an attempt that was not an explicit request fault.
+/// Go `isUnauthorizedError` for an attempt that was not an explicit request fault, nor a
+/// sourced terminal request rejection, which never refreshes a token (FP2).
 pub fn is_unauthorized(e: &ExecError) -> bool {
-    !explicit_request_scoped(e) && names_unauthorized(e)
+    !explicit_request_scoped(e) && sourced_request_fault(e) != Some(true) && names_unauthorized(e)
 }
 
 /// Go `isUnauthorizedError` itself: a 401 status or text, whatever the scope. Result
@@ -177,17 +178,12 @@ pub fn is_credit_balance_too_low(status: u16, text: &str) -> bool {
     })
 }
 
-/// `clienterror.IsRequestFault`. First-party Codex terminal rejections decide first
-/// (FP2, `cpa_exec::codex_terminal::request_fault`): an inference-hook, content-policy or
-/// access-program rejection with the status first-party Codex pairs it with is a request
-/// fault, and `context_length_exceeded` with a 5xx is not. The codes are OpenAI's, so
-/// they decide for every retained provider (docs/DIFFERENCES-FROM-GO.md).
+/// `clienterror.IsRequestFault`, Go's provider-neutral rules. A provider's own sourced
+/// reading of one failure ([`sourced_request_fault`]) decides ahead of it where the
+/// failure is at hand.
 pub fn is_request_fault(status: u16, text: &str) -> bool {
     if status == 402 || status == 429 || is_credit_balance_too_low(status, text) {
         return false;
-    }
-    if let Some(fault) = cpa_exec::codex_terminal::request_fault(status, text) {
-        return fault;
     }
     let body = json_body(text);
     if let Some(body) = &body
@@ -260,8 +256,21 @@ pub fn is_cloudflare(status: u16, text: &str) -> bool {
             || (lower.contains("just a moment") && lower.contains("cloudflare")))
 }
 
-/// `isRequestInvalidError`: never failed over, never cooled.
+/// The executor's reading of `e` from its provider's own first-party sources
+/// ([`cpa_core::exec::SourcedFault`]), which decides ahead of Go's request-fault rules:
+/// `Some(true)` a terminal request rejection, `Some(false)` a failure the provider's
+/// client retries. Only the Codex executor sets it (FP2, #116); every other provider's
+/// failures keep Go's rules unchanged.
+pub fn sourced_request_fault(e: &ExecError) -> Option<bool> {
+    e.sourced.map(|s| s == SourcedFault::RequestTerminal)
+}
+
+/// `isRequestInvalidError`: never failed over, never cooled. A sourced reading decides
+/// first ([`sourced_request_fault`]).
 pub fn is_request_invalid(e: &ExecError) -> bool {
+    if let Some(fault) = sourced_request_fault(e) {
+        return fault;
+    }
     if explicit_request_scoped(e) {
         return true;
     }
@@ -273,8 +282,12 @@ pub fn is_request_invalid(e: &ExecError) -> bool {
     is_request_fault(status, &text)
 }
 
-/// Faults that stop a `responses/compact` request without failover.
+/// Faults that stop a `responses/compact` request without failover. A sourced reading
+/// decides first ([`sourced_request_fault`]).
 pub fn is_compact_fault(e: &ExecError) -> bool {
+    if let Some(fault) = sourced_request_fault(e) {
+        return fault;
+    }
     let status = go_status(e);
     let text = error_text(e);
     if credential_scoped(e)
@@ -781,45 +794,89 @@ mod tests {
         assert_eq!(response_status(&transport), 500);
     }
 
-    /// FP2 (#116), first-party Codex at 5c3ff1dabf64: a terminal request rejection with
-    /// the status first-party Codex pairs it with stops the request without a cooldown,
-    /// though a 403 is otherwise a credential retry round; with another status Go's rules
-    /// keep deciding. A context-labelled 5xx keeps its transient meaning even with
-    /// Anthropic's `invalid_request_error` type, which Go reads as a request fault on any
-    /// status. A workspace 403 stays the account's failure.
+    /// FP2 (#116): the Codex executor's sourced reading decides ahead of Go's rules, and
+    /// only where the executor set it. A terminal rejection stops the request without a
+    /// cooldown or a token refresh, though its 403 is otherwise a credential retry round
+    /// and its body names no Go request fault. A retryable `context_length_exceeded` on a
+    /// 5xx is no request fault, beside Anthropic's type or not, and fails over on the
+    /// compact route too.
     #[test]
-    fn first_party_codex_terminal_rejections_decide_before_go() {
-        for (status, code) in [
-            (403, "inference_hook_denied"),
-            (403, "access_program_not_enabled"),
-            (400, "content_policy_violation"),
-            (400, "invalid_access_program"),
-            (400, "unsupported_access_program"),
+    fn sourced_codex_readings_decide_before_go() {
+        let sourced = |status: u16, body: &str, s: SourcedFault| {
+            let mut e = upstream(status, body);
+            e.sourced = Some(s);
+            e
+        };
+        for (status, body) in [
+            (403, r#"{"error":{"code":"inference_hook_denied"}}"#),
+            (403, r#"{"detail":{"code":"invalid_workspace_selected"}}"#),
+            (403, ""),
+            (400, r#"{"error":{"code":"content_policy_violation"}}"#),
+            // Even a body that names a 401: a sourced rejection never refreshes.
+            (403, "status 401 401 Unauthorized"),
         ] {
-            let body = format!(r#"{{"error":{{"code":"{code}","message":"denied","param":null}}}}"#);
-            let error = upstream(status, &body);
-            assert!(is_request_invalid(&error), "{status} {code}");
-            assert!(skips_cooldown(&error), "{status} {code}");
-            assert!(is_request_fault(status, &body), "{status} {code}");
-            assert!(!is_request_fault(503, &body), "{code} on a 503");
+            let e = sourced(status, body, SourcedFault::RequestTerminal);
+            assert_eq!(sourced_request_fault(&e), Some(true), "{status} {body}");
+            assert!(is_request_invalid(&e) && skips_cooldown(&e), "{status} {body}");
+            assert!(!is_unauthorized(&e), "{status} {body}: no token refresh");
+            assert!(is_compact_fault(&e), "{status} {body}");
         }
         for body in [
             r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
             r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error"}}"#,
-            r#"{"status":503,"error":{"code":"context_length_exceeded"}}"#,
         ] {
-            for status in [500, 502, 503, 504] {
-                let error = upstream(status, body);
-                assert!(!is_request_invalid(&error), "{status} {body}");
-                assert!(!skips_cooldown(&error) && is_retry_round(&error), "{status} {body}");
+            for status in [403, 413, 500, 503] {
+                let e = sourced(status, body, SourcedFault::Retryable);
+                assert_eq!(sourced_request_fault(&e), Some(false));
+                assert!(
+                    !is_request_invalid(&e) && is_retry_round(&e) == (status != 413),
+                    "{status} {body}"
+                );
+                assert!(!skips_cooldown(&e), "{status} {body}");
+                assert!(!is_compact_fault(&e), "{status} {body}");
             }
-            assert!(is_request_invalid(&upstream(400, body)), "{body}");
         }
-        for code in ["invalid_workspace_selected", "codex_workspace_access_denied"] {
-            let error = upstream(403, &format!(r#"{{"detail":{{"code":"{code}"}}}}"#));
-            assert!(!is_request_invalid(&error) && is_retry_round(&error), "{code}");
-            assert!(!is_unauthorized(&error), "{code}: no token refresh");
+    }
+
+    /// FP2 controls: a failure without a sourced reading, which every other provider's
+    /// executor reports (Claude, xAI, Meta), keeps Go's rules exactly. The same bodies the
+    /// Codex executor reads otherwise stay where Go put them: a 403 rejection code is a
+    /// credential retry round with a cooldown, a context-labelled 5xx is a request fault,
+    /// and Go's own vectors are unchanged.
+    #[test]
+    fn unsourced_failures_keep_go_rules() {
+        for (status, body) in [
+            (403, r#"{"error":{"code":"inference_hook_denied"}}"#),
+            (403, r#"{"error":{"code":"access_program_not_enabled"}}"#),
+            (403, r#"{"detail":{"code":"invalid_workspace_selected"}}"#),
+        ] {
+            let e = upstream(status, body);
+            assert_eq!(sourced_request_fault(&e), None);
+            assert!(
+                !is_request_invalid(&e) && is_retry_round(&e) && !skips_cooldown(&e),
+                "{body}"
+            );
+            assert!(!is_request_fault(status, body), "{body}");
         }
+        for status in [500, 502, 503, 504] {
+            for body in [
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+                r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+            ] {
+                assert!(is_request_fault(status, body), "{status} {body}: Go's code rule");
+                assert!(is_request_invalid(&upstream(status, body)), "{status} {body}");
+            }
+        }
+        // Go's own vectors, unchanged.
+        assert!(is_request_fault(
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#
+        ));
+        assert!(is_request_fault(
+            400,
+            r#"{"error":{"code":"content_policy_violation"}}"#
+        ));
+        assert!(!is_request_fault(503, "unavailable"));
     }
 
     #[test]

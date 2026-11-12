@@ -387,6 +387,84 @@
       ],
       "contract": "Wrapped WebSocket context_length_exceeded errors with status 400 and 503. At the research pin the 400 is a context-window failure and the 503 keeps its transient, retryable meaning.",
       "notes": "Source-refresh evidence at the research pin, not the contract pin (openai/codex 1885417cd45a). Classification belongs to FP2 (#116); FP1 asserts no behaviour for it. The member order follows the test's json! literal; serialized order is not part of the contract."
+    },
+    {
+      "name": "sse-terminal-rejections",
+      "file": "sse/terminal_rejections_main.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": [
+        "chatgpt",
+        "api-key"
+      ],
+      "evidence": "first-party-test",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses_error_tests.rs:112-140 terminal_failure_with_retry_header_ends_stream_immediately (the FP2 codes; the pinned codes left out)",
+        "codex-rs/codex-api/src/error.rs:92-162 parse_terminal_provider_error with no status",
+        "codex-rs/codex-api/src/sse/responses.rs:379-383 an error event is read with no status"
+      ],
+      "contract": "An error event and a response.failed for each code research main raises without a status, with the test's retry-after header in the error object. Each ends the response with no retry; the headers give no delay.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin. Classification belongs to FP2 (#116). The member order follows the test's json! literal; serialized order is not part of the contract."
+    },
+    {
+      "name": "ws-error-terminal-rejections",
+      "file": "ws/error_terminal_rejections_main.jsonl",
+      "format": "jsonl",
+      "transport": "websocket",
+      "direction": "to-client",
+      "endpoints": [
+        "chatgpt",
+        "api-key"
+      ],
+      "evidence": "first-party-test",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/codex-api/src/api_bridge_tests.rs:364-409 map_api_error_maps_http_and_wrapped_websocket_typed_errors (wrapped, first message)",
+        "codex-rs/codex-api/src/error.rs:103-128 inference_hook_denied with 403, content_policy_violation with 400",
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:755-806 a wrapped status frame is an HTTP error with its status"
+      ],
+      "contract": "Wrapped WebSocket frames: content_policy_violation with status 400 and inference_hook_denied with status 403. Both are terminal with no retry.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin. Classification belongs to FP2 (#116). The member order follows the test's json! literal; serialized order is not part of the contract."
+    },
+    {
+      "name": "http-error-workspace-detail",
+      "file": "http/error_workspace_detail_main.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": [
+        "chatgpt"
+      ],
+      "evidence": "first-party-test",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/codex-api/src/api_bridge_tests.rs:831 detail body in only_an_explicit_workspace_403_stops_retries",
+        "codex-rs/core/tests/suite/websocket_fallback.rs:133-152 the same detail body on a 403 WebSocket upgrade and HTTP POST",
+        "codex-rs/codex-api/src/api_bridge.rs:293-304 a 403 with this /detail/code is WorkspaceAccessDenied"
+      ],
+      "contract": "A 403 body naming invalid_workspace_selected in /detail/code. With 403, first-party Codex never retries it; with 503 it is ordinary.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin. Classification belongs to FP2 (#116); first-party commit 4b345a8de9b3."
+    },
+    {
+      "name": "http-error-workspace-provider",
+      "file": "http/error_workspace_provider_main.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": [
+        "chatgpt"
+      ],
+      "evidence": "first-party-test",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/codex-api/src/api_bridge_tests.rs:830-836 provider body, also the base64 x-error-json header payload",
+        "codex-rs/codex-api/src/api_bridge.rs:293-304 /error/code, or the x-error-json code, on a 403",
+        "codex-rs/codex-api/src/api_bridge.rs:342-354 the x-error-json header decoding"
+      ],
+      "contract": "A 403 body naming invalid_workspace_selected in /error/code. Encoded as base64 in x-error-json, the same JSON names the code for a 403 with an empty body.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin. Classification belongs to FP2 (#116); first-party commit 4b345a8de9b3."
     }
   ]
 }

@@ -1201,6 +1201,7 @@ fn turn_error(lost: &ExecError) -> ExecError {
     if lost.status == 413 {
         ExecError {
             diagnostic: lost.diagnostic.clone(),
+            sourced: None,
             ..message_too_big()
         }
     } else {
@@ -1298,7 +1299,12 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     .any(|p| rawjson::get(payload, p).str().trim() == "websocket_connection_limit_reached");
     // Go `statusErrWithHeaders`: the frame's headers reach the client under passthrough.
     let addon = (!headers.is_empty()).then(|| Box::new(headers.clone()));
-    let mut error = response::status_error_raw(status, &out, headers, model_level_cooling);
+    // FP2: the first-party wrapped mapping reads the whole frame as the HTTP body of its
+    // status, and the frame's `headers` as its headers (`responses_websocket.rs:755-806`
+    // at 5c3ff1dabf64), so `x-error-json` too.
+    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), payload, &headers);
+    let error = response::status_error_raw(status, &out, headers, model_level_cooling);
+    let mut error = response::with_sourced(error, sourced);
     error.addon = addon;
     if error.retry_after.is_none() && connection_limit {
         error.retry_after = Some(Duration::ZERO);
@@ -1693,8 +1699,9 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
 ///   `previous_response_not_found`) fails it whatever the status: as a status frame when
 ///   the status is an error status, otherwise by `response::terminal_failure`.
 /// - A status that maps to no error (2xx, or not an HTTP status) makes the frame a
-///   notice. A decoded one fails the turn only when the pinned `error` branch raises it
-///   anyway (a terminal provider code, `error.rs:79-127`); otherwise it is passed.
+///   notice. A decoded one fails the turn only when the first-party `error` branch raises
+///   it anyway (a terminal provider code of the pin, `error.rs:79-127`, or of research
+///   main, FP2), read with no status; otherwise it is passed.
 /// - Without a status or a recognised code, a decoded `error` keeps the status-less
 ///   failure reading ([`ws_error`], then `response::terminal_failure`), and an
 ///   undecoded frame is passed.
@@ -1751,8 +1758,15 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         // unless its logical code is a terminal provider code. Go's integer reading of
         // the status ([`ws_error`]) decides nothing here; it only keeps the scheduler's
         // status for a terminal provider failure the pinned reader raises anyway.
+        //
+        // FP2: a code only research main raises there (`main_terminal_code`) is read as
+        // main reads it, with no status at all (`responses_websocket.rs:906-925` at
+        // 5c3ff1dabf64, then `parse_terminal_provider_error(.., None)`): Go's integer
+        // reading of the status must not turn it into an HTTP-status reading.
         (Some(event), _) if event.kind == "error" && crate::codex_event::status_present(payload) => {
-            if terminal_provider_error(event) {
+            if main_terminal_code(event) {
+                terminal(&view())
+            } else if terminal_provider_error(event) {
                 let view = view();
                 match status_frame(&view) {
                     Some(Reading::Failure { error, body }) if crate::codex_event::error_status(error.status) => {
@@ -1799,25 +1813,38 @@ pub(super) enum Reading {
     Passed { decoded: bool },
 }
 
-/// Whether the pinned `error` branch fails the response on a decoded `error` event
-/// without a status (`parse_terminal_provider_error`, `codex-api/src/error.rs:79-127`):
-/// its last `error.code` is a terminal provider code.
+/// Whether the first-party `error` branch fails the response on a decoded `error` event
+/// read without a status (`parse_terminal_provider_error`): its last `error.code` is a
+/// terminal provider code, of the contract pin (`codex-api/src/error.rs:79-127` at
+/// 44ccf394573c) or of research main ([`main_terminal_code`]).
 fn terminal_provider_error(event: &crate::codex_event::Event<'_>) -> bool {
     let code = event.error_str("code");
-    matches!(
-        code.as_deref(),
-        Some(
-            "budget_reached"
-                | "audio_too_large"
-                | "audio_too_short"
-                | "invalid_audio"
-                | "invalid_audio_data"
-                | "invalid_audio_format"
-                | "missing_audio_sample_rate"
-                | "flex_unavailable"
-                | "model_not_found"
+    main_terminal_code(event)
+        || matches!(
+            code.as_deref(),
+            Some(
+                "budget_reached"
+                    | "audio_too_large"
+                    | "audio_too_short"
+                    | "invalid_audio"
+                    | "invalid_audio_data"
+                    | "invalid_audio_format"
+                    | "missing_audio_sample_rate"
+                    | "flex_unavailable"
+                    | "model_not_found"
+            )
         )
-    )
+}
+
+/// Whether the last `error.code` of a decoded `error` event is one research main's
+/// `parse_terminal_provider_error` raises without a status and the contract pin's does
+/// not (FP2, #116, `codex-api/src/error.rs:103-134` at 5c3ff1dabf64):
+/// `context_length_exceeded` and `crate::codex_terminal::STREAM_TERMINAL`. The pinned
+/// reader reads on past such a notice; main fails the response, and so does the proxy.
+fn main_terminal_code(event: &crate::codex_event::Event<'_>) -> bool {
+    event.error_str("code").is_some_and(|code| {
+        code == "context_length_exceeded" || crate::codex_terminal::STREAM_TERMINAL.contains(&code.as_str())
+    })
 }
 
 /// A frame [`reading`] passes: delivered as sent, as content. A frame that would read as

@@ -2285,6 +2285,14 @@ fn statusless(raw: &str) -> bool {
 /// Go's integer reading of a status (`gjson` `Int`, which also takes `"429"` or `429.0`)
 /// decides nothing: a status the wrapped struct does not read is no wrapped status, and
 /// the pinned `error` branch reads no status at all.
+///
+/// FP2 (#116) is the one deliberate departure from the recorded pinned decisions: research
+/// main `5c3ff1dabf64` added `context_length_exceeded` to the codes
+/// `parse_terminal_provider_error` raises without a status (`error.rs:110-112`), and its
+/// WebSocket reader reads every frame the wrapped mapping leaves unmapped that way
+/// (`responses_websocket.rs:906-925`). So every decoded frame of these fixtures named
+/// for that code (`-context_length_exceeded-`, plain or private), which the pinned
+/// reader read on, fails ([`MAIN_CONTEXT_FAILURES`] counts them per fixture).
 fn assert_pinned_reading(case: &Value) -> bool {
     let name = case["name"].as_str().unwrap();
     let raw = case["raw"].as_str().unwrap();
@@ -2293,6 +2301,13 @@ fn assert_pinned_reading(case: &Value) -> bool {
     let failed = matches!(reading(raw, event.as_ref(), false), Reading::Failure { .. });
     if case["ws"] == "fail" {
         assert!(failed, "{name}: the pinned reader fails it ({})", case["pinned"]);
+        return true;
+    }
+    if main_context_failure(case) {
+        assert!(
+            failed,
+            "{name}: research main fails it (FP2), the pinned reader went on"
+        );
         return true;
     }
     let decoded_error = event.as_ref().is_some_and(|e| e.kind == "error");
@@ -2305,6 +2320,18 @@ fn assert_pinned_reading(case: &Value) -> bool {
     false
 }
 
+/// Whether research main fails a fixture frame the pinned reader read on (FP2, see
+/// [`assert_pinned_reading`]): a decoded frame named for `context_length_exceeded`.
+fn main_context_failure(case: &Value) -> bool {
+    case["ws"] != "fail"
+        && case["accepted"] == true
+        && case["name"].as_str().unwrap().contains("-context_length_exceeded-")
+}
+
+/// The frames of each pinned fixture that [`main_context_failure`] turns into failures:
+/// the failure readings, then the `status` group of the notice readings.
+const MAIN_CONTEXT_FAILURES: [usize; 2] = [62, 81];
+
 /// #25, #6 and #7 against the pinned readers ([`assert_pinned_reading`]): every status
 /// that is present is a notice unless the wrapped struct reads it as an error status,
 /// zero, negative, too large and type-wrong ones included, whether or not a private
@@ -2312,9 +2339,12 @@ fn assert_pinned_reading(case: &Value) -> bool {
 #[test]
 fn readings_follow_the_pinned_readers() {
     let mut checked = [0usize; 2];
+    let mut main = 0;
     for case in pinned_readings() {
+        main += usize::from(main_context_failure(&case));
         checked[usize::from(!assert_pinned_reading(&case))] += 1;
     }
+    assert_eq!(main, MAIN_CONTEXT_FAILURES[0]);
     assert!(checked[0] > 150 && checked[1] > 150, "{checked:?}");
 }
 
@@ -2330,8 +2360,10 @@ fn readings_follow_the_pinned_readers() {
 #[test]
 fn notice_readings_follow_the_pinned_readers() {
     let mut checked = [0usize; 3];
+    let mut main = 0;
     for case in notice_readings().iter().filter(|c| c["group"] == "status") {
         let raw = case["raw"].as_str().unwrap();
+        main += usize::from(main_context_failure(case));
         if assert_pinned_reading(case) {
             checked[0] += 1;
         } else if statusless(raw) {
@@ -2346,7 +2378,8 @@ fn notice_readings_follow_the_pinned_readers() {
             checked[1] += 1;
         }
     }
-    assert!(checked[0] > 150 && checked[1] > 300 && checked[2] > 5, "{checked:?}");
+    assert_eq!(main, MAIN_CONTEXT_FAILURES[1]);
+    assert!(checked[0] > 150 && checked[1] > 200 && checked[2] > 5, "{checked:?}");
 }
 
 /// #25 and #6: a decoded `response.failed`'s `response.error` is read as

@@ -2609,61 +2609,69 @@ async fn bootstrap_buffering_holds_response_metadata_on_http() {
     assert!(!answer.contains("omnimod"), "no failed-attempt metadata");
 }
 
+/// FP2 (#116): the base64 `x-error-json` header first-party Codex reads a 403's code from
+/// (`api_bridge.rs:342-354` at 5c3ff1dabf64), naming the `http-error-workspace-provider`
+/// fixture's JSON.
+fn x_error_json(json: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(json.trim())
+}
+
 /// FP2 (#116) on the native HTTP route, with a second account available. First-party
-/// Codex at research main `5c3ff1dabf644169f4bd74b215719f381e4fdb3f` never retries an
-/// inference-hook, content-policy or access-program rejection (`codex-api/src/error.rs:92-162`,
-/// `api_bridge.rs:130-312`, `protocol/src/error.rs` `retry_policy`). Each one arrives as an
-/// HTTP status and as an in-stream `error` or `response.failed` event, before and after
-/// output. Each ends the request on the selected account: one upstream attempt with that
-/// account's token, so no failover and no refresh-and-retry, no cooldown, and one failed
-/// usage record. The client gets the provider's status and bytes, unknown fields included.
-/// The 400 `context_length_exceeded` is the control Go already stopped on.
+/// Codex at research main `5c3ff1dabf644169f4bd74b215719f381e4fdb3f` never retries these
+/// (`protocol/src/error.rs` `retry_policy`, `RetryPolicy::Never`):
+///
+/// - HTTP: `inference_hook_denied` on a 403, `content_policy_violation` on a 400, and a
+///   403 whose `/detail/code`, `/error/code` or `x-error-json` code is a workspace or
+///   access-program denial (`api_bridge.rs:138-143`, `293-311`; the workspace bodies
+///   are the `http-error-workspace-*` fixtures);
+/// - in-stream: every event of the `sse-terminal-rejections` fixture, read with no outer
+///   status (`sse/responses.rs:379-383`), as the first event and after output.
+///
+/// Each ends the request on the selected account: one upstream attempt carrying that
+/// account's token (no failover, no refresh-and-retry), no cooldown on any account, and
+/// exactly one failed usage record. The client gets the provider's status and bytes,
+/// unknown fields and IDs included, as the native HTTP route delivers every upstream
+/// error (docs/codex/CONTRACT.md "Native HTTP route"). The 400 `context_length_exceeded`
+/// is the control Go already stopped on.
 #[tokio::test]
 async fn first_party_terminal_rejections_stop_on_the_selected_account() {
     const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_fp2","output":[]}}"#;
     const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_fp2","delta":"partial"}"#;
     let sse = |events: &[&str]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
-    let error = |code: &str| {
-        format!(r#"{{"code":"{code}","message":"denied by policy","param":"input","future_field":{{"n":1.50}}}}"#)
-    };
+    let provider = text_of("http-error-workspace-provider");
     let mut cases: Vec<(String, Reply, u16, String)> = Vec::new();
-    for (code, status) in [
-        ("inference_hook_denied", 403),
-        ("access_program_not_enabled", 403),
-        ("content_policy_violation", 400),
-        ("invalid_access_program", 400),
-        ("unsupported_access_program", 400),
-        ("context_length_exceeded", 400),
+    for (status, body) in [
+        (403, r#"{"error":{"code":"inference_hook_denied","message":"denied by policy","param":"input","future_field":{"n":1.50}}}"#.to_owned()),
+        (400, r#"{"error":{"code":"content_policy_violation","message":"denied by policy","param":"input"}}"#.to_owned()),
+        (403, r#"{"error":{"code":"access_program_not_enabled","message":"denied by policy"}}"#.to_owned()),
+        (403, text_of("http-error-workspace-detail")),
+        (403, provider.clone()),
+        (403, r#"{"detail":{"code":"codex_workspace_access_denied"}}"#.to_owned()),
+        (400, r#"{"error":{"code":"context_length_exceeded","message":"too long","param":"input"}}"#.to_owned()),
     ] {
-        let body = format!(r#"{{"error":{}}}"#, error(code));
-        cases.push((
-            format!("HTTP {status} {code}"),
-            Reply::json(status, body.clone()),
-            status,
-            body,
-        ));
-        if code == "context_length_exceeded" {
-            continue;
-        }
-        let failed = format!(
-            r#"{{"type":"response.failed","sequence_number":3,"response":{{"id":"resp_fp2","status":"failed","error":{}}}}}"#,
-            error(code)
-        );
-        let event = format!(r#"{{"type":"error","error":{},"sequence_number":3}}"#, error(code));
-        for (shape, frame) in [("response.failed", &failed), ("error", &event)] {
-            for (stage, leading) in [("first", &[][..]), ("after output", &[CREATED, DELTA][..])] {
-                let mut events = leading.to_vec();
-                events.push(frame);
-                let upstream = sse(&events);
-                cases.push((
-                    format!("{shape} {code} {stage}"),
-                    Reply::sse(upstream.clone()),
-                    200,
-                    upstream,
-                ));
-            }
+        cases.push((format!("HTTP {status} {body}"), Reply::json(status, body.clone()), status, body));
+    }
+    cases.push((
+        "HTTP 403 x-error-json".to_owned(),
+        Reply {
+            status: 403,
+            headers: vec![("x-error-json".into(), x_error_json(&provider))],
+            body: Bytes::new(),
+        },
+        403,
+        String::new(),
+    ));
+    for frame in fixture("sse-terminal-rejections").frames() {
+        let frame = String::from_utf8(frame.to_vec()).unwrap();
+        for (stage, leading) in [("first", &[][..]), ("after output", &[CREATED, DELTA][..])] {
+            let mut events = leading.to_vec();
+            events.push(&frame);
+            let upstream = sse(&events);
+            cases.push((format!("{stage}: {frame}"), Reply::sse(upstream.clone()), 200, upstream));
         }
     }
+    assert_eq!(cases.len(), 8 + 24);
     for (name, reply, status, want) in cases {
         let (proxy, _) = native_accounts(
             Script {
@@ -2695,41 +2703,70 @@ async fn first_party_terminal_rejections_stop_on_the_selected_account() {
     }
 }
 
-/// FP2 (#116): failures first-party Codex retries, or that belong to the account, still
-/// fail over before anything was delivered. A `context_length_exceeded` 503 keeps its
-/// transient meaning (`error.rs:110-112`, `responses_websocket.rs:1416-1439` at
-/// 5c3ff1dabf64), with or without Anthropic's `invalid_request_error` type: it is not a
-/// fabricated context-window failure. A workspace 403 (`api_bridge.rs:300-304`) names the
-/// workspace the selected account's own credential picks, so it is that account's
-/// failure. Each moves once to the second account, which serves the answer as sent. The
-/// first account is cooled and is never retried with a refreshed token.
+/// FP2 (#116) controls: failures first-party Codex retries, or that are the account's
+/// own, still move to the second account before anything was delivered, once. A
+/// `context_length_exceeded` with a status other than 400 is no context-window failure
+/// (`error.rs:110-112`, `responses_websocket.rs:1416-1439` at 5c3ff1dabf64), with or
+/// without Anthropic's `invalid_request_error` type; a 503 workspace body is an ordinary
+/// 503 (`only_an_explicit_workspace_403_stops_retries`); a bare 403, a 403 naming another
+/// code beside a workspace `x-error-json`, and a first-party runtime authentication denial
+/// (`protocol/src/error.rs:703-732`) stay credential failures. The first account is
+/// cooled, and the second serves the answer as sent.
 #[tokio::test]
-async fn transient_and_workspace_failures_move_to_another_account() {
-    for (name, status, body) in [
+async fn retryable_and_account_failures_move_to_another_account() {
+    let provider = text_of("http-error-workspace-provider");
+    let header = vec![("x-error-json".to_owned(), x_error_json(&provider))];
+    for (name, status, headers, body) in [
         (
             "context 503",
             503,
+            vec![],
             r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
         ),
         (
             "typed context 503",
             503,
+            vec![],
             r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":null}}"#,
         ),
         (
-            "workspace detail 403",
+            "context 403",
             403,
-            r#"{"detail":{"code":"codex_workspace_access_denied"}}"#,
+            vec![],
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
         ),
         (
-            "workspace error 403",
+            "workspace 503",
+            503,
+            vec![],
+            r#"{"detail":{"code":"codex_workspace_access_denied"}}"#,
+        ),
+        ("bare 403", 403, vec![], ""),
+        (
+            "other 403 code",
             403,
-            r#"{"error":{"code":"invalid_workspace_selected"}}"#,
+            header.clone(),
+            r#"{"detail":{"code":"route_rate_limited"}}"#,
+        ),
+        (
+            "runtime denial 403",
+            403,
+            vec![],
+            r#"{"error":{"code":"runtime_instance_revoked"}}"#,
         ),
     ] {
+        let reply = Reply {
+            status,
+            headers: [
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+                headers,
+            ]
+            .concat(),
+            body: Bytes::from(body),
+        };
         let (proxy, _) = native_accounts(
             Script {
-                http: vec![Reply::json(status, body), Reply::sse(fixture("sse-completed").bytes())],
+                http: vec![reply, Reply::sse(fixture("sse-completed").bytes())],
                 ..Script::default()
             },
             &[SELECTED, SECOND],
@@ -2755,5 +2792,34 @@ async fn transient_and_workspace_failures_move_to_another_account() {
             "{name}"
         );
         assert!(cooldowns(&proxy) > 0, "{name}: the failing account is cooled");
+    }
+}
+
+/// FP2 (#116): the transient retry stays bounded. With `request-retry: 0` and both
+/// accounts answering a context-labelled 503, each account is tried exactly once, both are
+/// cooled, and the client gets the last provider status and body as sent.
+#[tokio::test]
+async fn a_context_labelled_503_is_retried_once_per_account() {
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model.","param":"input"}}"#;
+    let (proxy, _) = native_accounts(
+        Script {
+            http: vec![Reply::json(503, body), Reply::json(503, body)],
+            ..Script::default()
+        },
+        &[SELECTED, SECOND],
+        "routing:\n  retry:\n    request-retry: 0\n",
+        false,
+    )
+    .await;
+    let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((got, answer.as_str()), (503, body));
+    assert_eq!(proxy.upstream.http().len(), 2, "one attempt per account");
+    let store = proxy.rt.store();
+    for credential in store.snapshot() {
+        assert!(
+            !store.cooldowns(&credential.id).is_empty(),
+            "{} is cooled",
+            credential.id
+        );
     }
 }

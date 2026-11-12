@@ -42,7 +42,7 @@ mod codex_secret;
 pub mod codex_siwc;
 pub mod codex_siwc_bind;
 mod codex_sse;
-pub mod codex_terminal;
+mod codex_terminal;
 #[cfg(test)]
 mod codex_testkit;
 mod codex_tls;
