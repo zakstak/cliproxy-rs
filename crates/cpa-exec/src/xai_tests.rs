@@ -250,7 +250,7 @@ async fn go_reference_scenarios() {
         let op = s["op"].as_str().unwrap();
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
         let result = match op {
-            "images" => executor.images(&cred, req, &path, &cfg).await,
+            "images" => executor.images(&cred, req, &path, &cfg, None).await,
             "videos" => executor.videos(&cred, req, &path, &cfg).await,
             _ => {
                 executor
@@ -904,4 +904,86 @@ async fn transport_faults_and_upstream_408_are_not_stream_faults() {
         .err()
         .expect("the 408");
     assert_eq!((e.status, e.scope), (408, FailureScope::Credential));
+}
+
+// --- historical additional_tools deduplication (v8.0.67 0c61b12c, issue #86) -------------
+
+/// Go TestXAIExecutorDeduplicatesToolsAcrossAdditionalTools: a namespaced tool in the
+/// top-level tools and again in a historical `additional_tools` item reaches xAI once,
+/// as the top-level declaration, for Responses and Codex clients, buffered and streamed;
+/// the buffered answer restores the call to the client's namespace.
+#[tokio::test]
+async fn historical_additional_tools_are_sent_once() {
+    let top = r#"{"type":"namespace","name":"clock","tools":[{"type":"function","name":"sleep","description":"top declaration","parameters":{"type":"object","properties":{"duration_ms":{"type":"string"}},"required":["duration_ms"]}}]}"#;
+    let different = r#"{"type":"namespace","name":"clock","tools":[{"type":"function","name":"sleep","description":"history declaration","parameters":{"type":"object","properties":{"seconds":{"type":"string"}},"required":["seconds"]}}]}"#;
+    let reply = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"clock__sleep\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"duration_ms\\\":\\\"10\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.7\",\"output\":[{\"type\":\"function_call\",\"name\":\"clock__sleep\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"duration_ms\\\":\\\"10\\\"}\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    );
+    for source in ["openai-response", "codex"] {
+        for op in ["execute", "stream"] {
+            for history in [top, different] {
+                let label = format!("{source}/{op}/{}", if history == top { "same" } else { "different" });
+                let mock = Mock::start(&serde_json::json!({
+                    "status": 200,
+                    "headers": [["Content-Type", "text/event-stream"]],
+                    "body": reply,
+                }))
+                .await;
+                let addr = mock.addr.clone();
+                let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+                let s = serde_json::json!({
+                    "config_auth": -1,
+                    "attributes": {"api_key": "sk-fake-xai"},
+                    "model": "grok-4.7",
+                    "payload": format!(r#"{{"model":"grok-4.7","tools":[{top}],"input":[{{"type":"additional_tools","role":"developer","tools":[{history}]}},{{"role":"user","content":"say hello"}}]}}"#),
+                    "source": source,
+                    "response": "openai-response",
+                    "op": op,
+                });
+                let cfg = Config::default();
+                let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
+                let response = executor
+                    .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                match response.body {
+                    ResponseBody::Buffered(bytes) => {
+                        let out: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(
+                            (&out["output"][0]["name"], &out["output"][0]["namespace"]),
+                            (&Value::from("sleep"), &Value::from("clock")),
+                            "{label}: {out}"
+                        );
+                    }
+                    ResponseBody::Stream(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            item.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                        }
+                    }
+                }
+                let raw = mock.request().unwrap();
+                let sent: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let tools = sent["tools"].as_array().unwrap();
+                assert_eq!(
+                    tools.iter().filter(|t| t["name"] == "clock__sleep").count(),
+                    1,
+                    "{label}: {sent}"
+                );
+                assert_eq!(sent["tools"][0]["description"], "top declaration", "{label}");
+                assert!(
+                    sent["tools"][0]["parameters"]["properties"]["duration_ms"].is_object(),
+                    "{label}"
+                );
+                assert!(
+                    sent["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|i| i["type"] != "additional_tools"),
+                    "{label}: {sent}"
+                );
+            }
+        }
+    }
 }
