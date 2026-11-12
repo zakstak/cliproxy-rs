@@ -443,3 +443,80 @@ fn paused_search_history_scales_linearly() {
     let content = out["messages"][1]["content"].as_array().unwrap();
     assert_eq!(content.len(), 20_000);
 }
+
+/// The web search blocks of a translated request, in order.
+fn search_blocks(out: &Value) -> Vec<Value> {
+    out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter(|b| matches!(b["type"].as_str(), Some("server_tool_use" | "web_search_tool_result")))
+        .cloned()
+        .collect()
+}
+
+/// A chain of continuations of one search: the last item replays it, with the latest
+/// query any item of the chain carried (a later explicit query replaces an earlier
+/// one), and a completed continuation sends its result.
+#[test]
+fn paused_search_chain_keeps_the_latest_query() {
+    let open = |q: Option<&str>| paused_search("ws_srvtoolu_1", q);
+    let completed = json!({"type":"web_search_call","id":"ws_srvtoolu_1","status":"completed","action":{"type":"search"},"results":[{"type":"web_search_result","url":"https://e.com","title":"E","encrypted_content":"ENC"}]});
+    let user = json!({"role":"user","content":"go"});
+    for (input, query, result) in [
+        // Inherited across several continuations without a query.
+        (
+            vec![user.clone(), open(Some("first")), open(None), open(None)],
+            Some("first"),
+            false,
+        ),
+        // A later explicit query replaces the earlier one for the rest of the chain.
+        (
+            vec![user.clone(), open(Some("first")), open(Some("second")), open(None)],
+            Some("second"),
+            false,
+        ),
+        (
+            vec![user.clone(), open(Some("first")), open(None), open(Some("third"))],
+            Some("third"),
+            false,
+        ),
+        // The completed continuation sends the pair with the inherited query.
+        (
+            vec![user.clone(), open(Some("first")), open(None), completed.clone()],
+            Some("first"),
+            true,
+        ),
+        // No item carried a query.
+        (vec![user.clone(), open(None), open(None)], None, false),
+    ] {
+        let out = claude_request("claude-test", Value::Array(input.clone()));
+        let blocks = search_blocks(&out);
+        assert_eq!(blocks.len(), if result { 2 } else { 1 }, "{input:?}: {out}");
+        assert_eq!(blocks[0]["type"], "server_tool_use");
+        assert_eq!(blocks[0]["id"], "srvtoolu_1");
+        assert_eq!(
+            blocks[0]["input"].get("query").and_then(Value::as_str),
+            query,
+            "{input:?}"
+        );
+        if result {
+            assert_eq!(blocks[1]["content"][0]["encrypted_content"], "ENC");
+        }
+    }
+    // After a completed continuation the ID starts afresh: a later open item with the
+    // same ID in the same run is its own search.
+    let input = vec![user.clone(), open(Some("first")), completed.clone(), open(None)];
+    let blocks = search_blocks(&claude_request("claude-test", Value::Array(input)));
+    assert_eq!(blocks.len(), 3, "{blocks:?}");
+    assert_eq!(blocks[0]["input"]["query"], "first");
+    assert!(blocks[2]["input"].get("query").is_none(), "{blocks:?}");
+    // A user turn ends the run: the query does not cross it, and the earlier item keeps
+    // its pair.
+    let input = vec![user.clone(), open(Some("first")), user.clone(), open(None), open(None)];
+    let blocks = search_blocks(&claude_request("claude-test", Value::Array(input)));
+    assert_eq!(blocks.len(), 3, "{blocks:?}");
+    assert_eq!(blocks[1]["type"], "web_search_tool_result");
+    assert!(blocks[2]["input"].get("query").is_none(), "{blocks:?}");
+}

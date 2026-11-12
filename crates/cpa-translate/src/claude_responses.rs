@@ -174,7 +174,7 @@ pub(crate) fn convert(
                 }
             }
             b"web_search_call" => {
-                let blocks = web_search_history.claude_blocks(index, item);
+                let blocks = web_search_history.claude_blocks(index, &items);
                 if !blocks.is_empty() {
                     pending.parts(b"assistant", blocks);
                 }
@@ -1677,12 +1677,21 @@ fn web_search_tool_use_id(item_id: &[u8]) -> Vec<u8> {
     [SERVER_TOOL_ID_PREFIX, &sanitized].concat()
 }
 
+const WEB_SEARCH_QUERY_PATHS: [&str; 3] = ["action.query", "action.queries.0", "action.url"];
+
 fn web_search_call_query(item: &Res<'_>) -> Vec<u8> {
-    ["action.query", "action.queries.0", "action.url"]
+    WEB_SEARCH_QUERY_PATHS
         .iter()
         .map(|p| trim_space(&item.get(p).bytes()).to_vec())
         .find(|q| !q.is_empty())
         .unwrap_or_default()
+}
+
+/// Whether [`web_search_call_query`] is non-empty, without keeping a copy.
+fn has_web_search_query(item: &Res<'_>) -> bool {
+    WEB_SEARCH_QUERY_PATHS
+        .iter()
+        .any(|p| !trim_space(&item.get(p).bytes()).is_empty())
 }
 
 /// Go `responsesWebSearchHistory` (v8.0.67 aadb34f9, df860eb9). A search that a
@@ -1696,12 +1705,16 @@ fn web_search_call_query(item: &Res<'_>) -> Vec<u8> {
 ///   open item's query when it has none.
 ///
 /// Every other `web_search_call` keeps its one-pair-per-item replay. One pass each
-/// way keeps the scan linear in the number of items.
+/// way keeps the scan linear in the number of items. An inherited query is kept as the
+/// index of the item that carries it, moved along a chain of continuations and read
+/// once for the one block that sends it, so a long chain neither copies nor retains a
+/// large query per item.
 struct WebSearchHistory {
     /// Whether a user turn follows each index.
     boundary_after: Vec<bool>,
     skip: HashSet<usize>,
-    open_query: HashMap<usize, Vec<u8>>,
+    /// Continuation index -> index of the item whose query it inherits.
+    query_source: HashMap<usize, usize>,
 }
 
 fn is_open_web_search(item: &Res<'_>) -> bool {
@@ -1728,7 +1741,7 @@ impl WebSearchHistory {
             boundary |= is_user_turn(item);
         }
         let mut skip = HashSet::new();
-        let mut open_query: HashMap<usize, Vec<u8>> = HashMap::new();
+        let mut query_source: HashMap<usize, usize> = HashMap::new();
         // The open search of the current run for each ID.
         let mut open: HashMap<Vec<u8>, usize> = HashMap::new();
         for (index, item) in items.iter().enumerate() {
@@ -1745,11 +1758,16 @@ impl WebSearchHistory {
             }
             if let Some(previous) = open.remove(&id) {
                 skip.insert(previous);
-                let mut query = web_search_call_query(&items[previous]);
-                if query.is_empty() {
-                    query = open_query.get(&previous).cloned().unwrap_or_default();
+                // The skipped item's own inheritance moves on; it is never read again.
+                let inherited = query_source.remove(&previous);
+                let source = if has_web_search_query(&items[previous]) {
+                    Some(previous)
+                } else {
+                    inherited
+                };
+                if let Some(source) = source {
+                    query_source.insert(index, source);
                 }
-                open_query.insert(index, query);
             }
             if is_open_web_search(item) {
                 open.insert(id, index);
@@ -1758,17 +1776,21 @@ impl WebSearchHistory {
         Self {
             boundary_after,
             skip,
-            open_query,
+            query_source,
         }
     }
 
-    fn claude_blocks(&self, index: usize, item: &Res<'_>) -> Vec<Vec<u8>> {
+    fn claude_blocks(&self, index: usize, items: &[Res<'_>]) -> Vec<Vec<u8>> {
         if self.skip.contains(&index) {
             return vec![];
         }
-        let fallback = self.open_query.get(&index).map(Vec::as_slice).unwrap_or_default();
+        let item = &items[index];
+        let fallback = match self.query_source.get(&index) {
+            Some(&source) if !has_web_search_query(item) => web_search_call_query(&items[source]),
+            _ => vec![],
+        };
         let tail = !self.boundary_after.get(index).copied().unwrap_or(false);
-        web_search_call_to_claude(item, fallback, !(tail && is_open_web_search(item)))
+        web_search_call_to_claude(item, &fallback, !(tail && is_open_web_search(item)))
     }
 }
 
