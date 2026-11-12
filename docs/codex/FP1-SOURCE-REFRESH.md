@@ -84,7 +84,7 @@ means only researched main does it. **Docs** means OpenAI documentation covers i
 | `response.steer` | Not used | Docs, GPT-6 family | Unknown | Unknown | Pass-through, no claim it works: `codex_native_ws::operator_rules_cannot_rewrite_native_frames`, `steering_later_frames_reach_the_socket_as_sent` |
 | Interruption | FP, no delta | FP | Unknown | Unknown | `codex_ws::tests::interrupt::*`, `codex_qualify::interrupted_and_truncated_streams_across_profiles`, `websocket_interrupt_tests::*` |
 | Compaction v2 and `/responses/compact` | FP, no delta / not used | FP / Docs | Unknown | Unknown | `codex_qualify::compaction_across_profiles`, `codex_native_request::compaction_passes_through_the_route_unchanged` |
-| Account replacement (failover before delivery, a disabled account, socket replacement) | Proxy policy, no first-party source | same | same | same | `codex_native_ws::an_early_overload_fails_over_and_the_continuation_stays_on_the_serving_socket`, `an_account_disabled_between_turns_serves_no_later_turn`, `a_replacement_socket_owns_its_loss_after_failover`. N1 witness W1 shows that a create can be replayed after an uncertain loss. |
+| Account replacement (failover before delivery, a disabled account, socket replacement) | Proxy policy, no first-party source | same | same | same | `codex_native_ws::an_early_overload_fails_over_and_the_continuation_stays_on_the_serving_socket`, `an_account_disabled_between_turns_serves_no_later_turn`, `a_replacement_socket_owns_its_loss_after_failover`. N1 witness W1 recorded uncertain replay at the audit baseline (`0e8463bd`). Merged PR [#135](https://github.com/zakstak/cliproxy-rs/pull/135) fixes that gap ([N1 disposition](N1-NATIVE-PROTECTIONS.md#disposition-in-the-safety-fix-branch)): `an_uncertain_loss_is_never_replayed_on_another_account` and `an_uncertain_http_loss_is_never_replayed_on_another_account` assert that an attempt the upstream may have read is request-scoped and never replayed on another account. Only a provably unsent attempt may fail over. |
 | Large WebSocket messages | FP main: 1 MiB fragments | FP main, Docs | Unknown | Unknown | Owned elsewhere: FP3 (#117). The proxy sends one frame today. |
 | Peer message budget and 1009 before text | FP main | FP main | Unknown | Unknown | Owned elsewhere: FP4 (#118). |
 | New terminal error codes and status-aware context length | FP main | FP main | FP5 docs add SIWC codes | Unknown | Owned elsewhere: FP2 (#116). Fixture `ws-error-context-length-status`. |
@@ -139,3 +139,16 @@ bytes and copies none of their state machines:
 | Lint | `cargo fmt --all -- --check`. `cargo clippy -p cpa-exec --lib --tests --features test-support -- -D warnings`. `cargo clippy -p cpa-server --test codex_native_ws --test codex_native_request --test codex_qualify -- -D warnings`. All clean. |
 | Results | `cpa-exec` `codex_contract` 6 passed, `boundary` 16 passed (the new request fixture passes the request boundary), `codex_native_request` 34 passed, `codex_native_ws` 87 passed, `codex_qualify` 6 passed. All ran in the network-denied namespace described in N1. |
 | Not run | Full workspace build and `clippy --all-targets`, the Go differential harness, any live provider traffic |
+
+The rows above are the FP1 author's runs at the time of PR #130. They are kept as
+recorded and are not independent evidence.
+
+A later integration run covers the current tree. Merge-train session J ran on
+`a2eea19c`, whose tree `37f2dab9` is the tree of `fork` merge commit `005118f0`
+(PR [#141](https://github.com/zakstak/cliproxy-rs/pull/141)), and includes the N1 fixes
+from PR #135. Its per-target verdict is PASS for 75 of 75 expected targets, with no
+problems. The Codex targets in this document report `codex_native_ws` 98 passed,
+`codex_native_request` 35 passed and `codex_qualify` 6 passed, including both uncertain-loss
+regressions. The run used local mocks only. It did not run Rust 1.99.0, PostgreSQL, the Go
+differential harness or any live provider traffic. This evidence leaves the contract pin,
+the unknowns above, and the FP2, FP3, FP4 and FP5 ownership unchanged.
