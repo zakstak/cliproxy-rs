@@ -1,0 +1,174 @@
+{
+  "written": "2026-11-12T05:14:23Z",
+  "kind": "mutation-control",
+  "verdict": "pass",
+  "partial": false,
+  "run": "run-historical-20261112-051357",
+  "target": "historical",
+  "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
+  "rust_revision": "2581e74fe4e47dfa78d684c6a40433093c2555d4",
+  "source": {
+    "head": "2581e74fe4e47dfa78d684c6a40433093c2555d4",
+    "tree": "82a1ad33f4c6b95e170418ebd461267603a9e67a",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+  },
+  "provenance_verified": true,
+  "baseline_verdict": "pass",
+  "counts": {
+    "mutations": 13,
+    "caught": 13
+  },
+  "controls": [
+    {
+      "mutation": "upstream max_tokens 17 -> 18",
+      "case": "buffered",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "upstream-body"
+      ],
+      "unexplained": 2,
+      "caught": true
+    },
+    {
+      "mutation": "downstream status 200 -> 500",
+      "case": "buffered",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "status"
+      ],
+      "unexplained": 2,
+      "caught": true
+    },
+    {
+      "mutation": "client key forwarded upstream",
+      "case": "buffered",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "upstream-headers"
+      ],
+      "unexplained": 6,
+      "caught": true
+    },
+    {
+      "mutation": "downstream text changed",
+      "case": "buffered",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "downstream-body"
+      ],
+      "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "native body model changed",
+      "case": "native-signals",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "upstream-body"
+      ],
+      "unexplained": 2,
+      "caught": true
+    },
+    {
+      "mutation": "Grok credential in the Claude Authorization",
+      "case": "native-signals",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "upstream-headers"
+      ],
+      "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "tool arguments corrupted",
+      "case": "tool-roundtrip",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "downstream-body"
+      ],
+      "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "TLS ClientHello ciphers changed",
+      "case": "continuity-two-turns",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "tls"
+      ],
+      "unexplained": 18,
+      "caught": true
+    },
+    {
+      "mutation": "credential persisted disabled: true",
+      "case": "client-disconnect",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "credential"
+      ],
+      "unexplained": 1,
+      "caught": true
+    },
+    {
+      "mutation": "unexpected downstream header",
+      "case": "upstream-429",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "downstream-headers"
+      ],
+      "unexplained": 18,
+      "caught": true
+    },
+    {
+      "mutation": "created timestamp skewed by an hour",
+      "case": "chat-completions",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "downstream-body",
+        "predicates"
+      ],
+      "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "compaction answer shape changed",
+      "case": "compact-claude",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:rust",
+        "predicates"
+      ],
+      "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "catalog entry dropped",
+      "case": "models-openai",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "downstream-body"
+      ],
+      "unexplained": 3,
+      "caught": true
+    }
+  ]
+}

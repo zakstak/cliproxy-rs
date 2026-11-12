@@ -1,29 +1,30 @@
 {
-  "written": "2026-11-12T03:21:55Z",
+  "written": "2026-11-12T05:36:14Z",
   "kind": "mutation-control",
   "verdict": "pass",
   "partial": false,
-  "run": "run-selective-20261112-032114",
+  "run": "run-selective-20261112-053540",
   "target": "selective",
   "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
-  "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597",
+  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
   "source": {
-    "head": "0773136aa0bab48880d0899872247a5d327b2597",
-    "tree": "47235d35fbc0a82bbc92ccf1b873f44fc4618513",
+    "head": "f84b39ae862c539153062c6bea701535f699793e",
+    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
   },
   "provenance_verified": true,
   "baseline_verdict": "pass",
   "counts": {
-    "mutations": 18,
-    "caught": 18
+    "mutations": 20,
+    "caught": 20
   },
   "controls": [
     {
       "mutation": "upstream max_tokens 17 -> 18",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -35,6 +36,7 @@
     {
       "mutation": "downstream status 200 -> 500",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -47,6 +49,7 @@
     {
       "mutation": "client key forwarded upstream",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -59,6 +62,7 @@
     {
       "mutation": "downstream text changed",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -70,10 +74,12 @@
     {
       "mutation": "native body model changed",
       "case": "native-signals",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
-        "invariant:rust"
+        "invariant:rust",
+        "predicates"
       ],
       "unexplained": 0,
       "caught": true
@@ -81,10 +87,12 @@
     {
       "mutation": "Grok credential in the Claude Authorization",
       "case": "native-signals",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
-        "invariant:rust"
+        "invariant:rust",
+        "predicates"
       ],
       "unexplained": 0,
       "caught": true
@@ -92,6 +100,7 @@
     {
       "mutation": "tool arguments corrupted",
       "case": "tool-roundtrip",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -103,6 +112,7 @@
     {
       "mutation": "TLS ClientHello ciphers changed",
       "case": "continuity-two-turns",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -114,6 +124,7 @@
     {
       "mutation": "credential persisted disabled: true",
       "case": "client-disconnect",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -125,6 +136,7 @@
     {
       "mutation": "unexpected downstream header",
       "case": "upstream-429",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -136,6 +148,7 @@
     {
       "mutation": "created timestamp skewed by an hour",
       "case": "chat-completions",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -148,6 +161,7 @@
     {
       "mutation": "C1 Rust User-Agent drifts",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -159,6 +173,7 @@
     {
       "mutation": "tool schema changed outside the alias",
       "case": "cloak-tools-beta",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -170,6 +185,7 @@
     {
       "mutation": "M1 Rust client id drifts",
       "case": "meta-chat-stream",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -181,6 +197,7 @@
     {
       "mutation": "Muse credential sent to Grok",
       "case": "xai-chat-stream",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -193,6 +210,7 @@
     {
       "mutation": "Rust also sends max_output_tokens",
       "case": "xai-messages-stream",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -204,6 +222,7 @@
     {
       "mutation": "credential expiry skewed by an hour",
       "case": "upstream-401",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -216,6 +235,7 @@
     {
       "mutation": "compaction capsule prefix changed",
       "case": "compact-claude",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -223,6 +243,30 @@
         "predicates"
       ],
       "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "C2 Go caller text changed",
+      "case": "native-signals",
+      "side": "go",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "predicates"
+      ],
+      "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "C2 Go header changed",
+      "case": "native-signals",
+      "side": "go",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "predicates"
+      ],
+      "unexplained": 0,
       "caught": true
     }
   ]

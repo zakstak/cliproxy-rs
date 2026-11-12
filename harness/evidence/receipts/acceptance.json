@@ -1,15 +1,15 @@
 {
-  "written": "2026-11-12T03:22:20Z",
+  "written": "2026-11-12T05:36:41Z",
   "kind": "acceptance",
   "verdict": "pass",
   "partial": false,
   "problems": [],
   "tested_source": {
-    "head": "0773136aa0bab48880d0899872247a5d327b2597",
-    "tree": "47235d35fbc0a82bbc92ccf1b873f44fc4618513",
+    "head": "f84b39ae862c539153062c6bea701535f699793e",
+    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
   },
   "pins": {
     "go": {
@@ -38,6 +38,7 @@
   "receipts": [
     {
       "file": "differential-historical.json",
+      "sha256": "938f05ca8ac552052188b003369ada2269c6aa89ef5077d40f40ace4dcea370a",
       "kind": "differential",
       "target": "historical",
       "verdict": "pass",
@@ -52,21 +53,23 @@
         "named_divergences": 4,
         "stale_divergences": 0
       },
-      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+      "rust_revision": "f84b39ae862c539153062c6bea701535f699793e"
     },
     {
       "file": "mutation-historical.json",
+      "sha256": "e08c4b1ccaddc153ef8a7674d013764991427bdb734ead1db128fd2afef7b611",
       "kind": "mutation-control",
       "target": "historical",
       "verdict": "pass",
       "counts": {
-        "mutations": 13,
-        "caught": 13
+        "mutations": 16,
+        "caught": 16
       },
-      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+      "rust_revision": "f84b39ae862c539153062c6bea701535f699793e"
     },
     {
       "file": "differential-selective.json",
+      "sha256": "afacc13b3f2b1dd6429067fa1a00451f6de46c94d7650d774e3e3d2ef84d0692",
       "kind": "differential",
       "target": "selective",
       "verdict": "pass",
@@ -78,24 +81,26 @@
         "infrastructure": 0,
         "named_skips": 0,
         "unknown_skips": 0,
-        "named_divergences": 18,
+        "named_divergences": 19,
         "stale_divergences": 0
       },
-      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+      "rust_revision": "f84b39ae862c539153062c6bea701535f699793e"
     },
     {
       "file": "mutation-selective.json",
+      "sha256": "5633fa144add05ad7beb2fdbdb04a7a2c4d8f43445826a4130f30a96cf12f091",
       "kind": "mutation-control",
       "target": "selective",
       "verdict": "pass",
       "counts": {
-        "mutations": 18,
-        "caught": 18
+        "mutations": 20,
+        "caught": 20
       },
-      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+      "rust_revision": "f84b39ae862c539153062c6bea701535f699793e"
     },
     {
       "file": "cargo-groups.json",
+      "sha256": "150b8c031bfe9faaaf4e1952232ee68842af1c0f65c9011ee8ea30f723cd4147",
       "kind": "cargo-groups",
       "target": null,
       "verdict": "pass",
@@ -106,7 +111,7 @@
         "failed": 0,
         "unknown_tests": 0
       },
-      "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597"
+      "rust_revision": "f84b39ae862c539153062c6bea701535f699793e"
     }
   ]
 }

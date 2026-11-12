@@ -1,29 +1,30 @@
 {
-  "written": "2026-11-12T03:21:12Z",
+  "written": "2026-11-12T05:35:38Z",
   "kind": "mutation-control",
   "verdict": "pass",
   "partial": false,
-  "run": "run-historical-20261112-032045",
+  "run": "run-historical-20261112-053512",
   "target": "historical",
   "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
-  "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597",
+  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
   "source": {
-    "head": "0773136aa0bab48880d0899872247a5d327b2597",
-    "tree": "47235d35fbc0a82bbc92ccf1b873f44fc4618513",
+    "head": "f84b39ae862c539153062c6bea701535f699793e",
+    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
   },
   "provenance_verified": true,
   "baseline_verdict": "pass",
   "counts": {
-    "mutations": 13,
-    "caught": 13
+    "mutations": 16,
+    "caught": 16
   },
   "controls": [
     {
       "mutation": "upstream max_tokens 17 -> 18",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -35,6 +36,7 @@
     {
       "mutation": "downstream status 200 -> 500",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -47,6 +49,7 @@
     {
       "mutation": "client key forwarded upstream",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -59,6 +62,7 @@
     {
       "mutation": "downstream text changed",
       "case": "buffered",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -70,6 +74,7 @@
     {
       "mutation": "native body model changed",
       "case": "native-signals",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -82,6 +87,7 @@
     {
       "mutation": "Grok credential in the Claude Authorization",
       "case": "native-signals",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -94,6 +100,7 @@
     {
       "mutation": "tool arguments corrupted",
       "case": "tool-roundtrip",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -105,6 +112,7 @@
     {
       "mutation": "TLS ClientHello ciphers changed",
       "case": "continuity-two-turns",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -116,6 +124,7 @@
     {
       "mutation": "credential persisted disabled: true",
       "case": "client-disconnect",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -127,6 +136,7 @@
     {
       "mutation": "unexpected downstream header",
       "case": "upstream-429",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -138,6 +148,7 @@
     {
       "mutation": "created timestamp skewed by an hour",
       "case": "chat-completions",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -150,6 +161,7 @@
     {
       "mutation": "compaction answer shape changed",
       "case": "compact-claude",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
@@ -162,12 +174,50 @@
     {
       "mutation": "catalog entry dropped",
       "case": "models-openai",
+      "side": "rust",
       "baseline": "pass",
       "verdict": "fail",
       "failed": [
         "downstream-body"
       ],
       "unexplained": 3,
+      "caught": true
+    },
+    {
+      "mutation": "compaction request caller text changed",
+      "case": "compact-claude",
+      "side": "rust",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "predicates"
+      ],
+      "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "compaction request max_tokens 64000 -> 1",
+      "case": "compact-claude",
+      "side": "rust",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "predicates"
+      ],
+      "unexplained": 0,
+      "caught": true
+    },
+    {
+      "mutation": "Go 501 body changed",
+      "case": "compact-claude",
+      "side": "go",
+      "baseline": "pass",
+      "verdict": "fail",
+      "failed": [
+        "invariant:go",
+        "predicates"
+      ],
+      "unexplained": 0,
       "caught": true
     }
   ]

@@ -1,5 +1,5 @@
 {
-  "written": "2026-11-12T03:21:52Z",
+  "written": "2026-11-12T05:36:12Z",
   "kind": "differential",
   "verdict": "pass",
   "partial": false,
@@ -8,14 +8,14 @@
   "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
   "role": "selective-comparison",
   "suite": "selective-differential",
-  "run": "run-selective-20261112-032114",
-  "rust_revision": "0773136aa0bab48880d0899872247a5d327b2597",
+  "run": "run-selective-20261112-053540",
+  "rust_revision": "f84b39ae862c539153062c6bea701535f699793e",
   "source": {
-    "head": "0773136aa0bab48880d0899872247a5d327b2597",
-    "tree": "47235d35fbc0a82bbc92ccf1b873f44fc4618513",
+    "head": "f84b39ae862c539153062c6bea701535f699793e",
+    "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
     "clean": true,
     "status": [],
-    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367"
+    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
   },
   "provenance_verified": true,
   "provenance": {
@@ -36,7 +36,34 @@
       "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
       "checkout_clean": true
     },
-    "manifest_sha256": "5f45c735130305789e81b16a5b05dd5f55dadbe097d647c8ee56470b4b732367",
+    "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1",
+    "after": {
+      "driver": {
+        "package": "cpa-differential-driver",
+        "kind": "bin",
+        "name": "cpa-differential-driver",
+        "executable": "harness/rust/target/debug/cpa-differential-driver",
+        "fresh": true,
+        "sha256": "88894e191e970ff59447436bde33b16ebdd8001c3330500a2da2d038236b3a0f"
+      },
+      "go": {
+        "path": "harness/.cache/go-8bba7a77",
+        "sha256": "4dd9ff9fad393462f98756ed414680369bbb0e1fad8f11f8fed2e843baf625aa",
+        "vcs.revision": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+        "vcs.time": "2026-11-11T08:50:42Z",
+        "vcs.modified": "false",
+        "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
+        "checkout_clean": true
+      },
+      "source": {
+        "head": "f84b39ae862c539153062c6bea701535f699793e",
+        "tree": "a873dbb67e0e58930412081584138c7a7a08a73c",
+        "clean": true,
+        "status": [],
+        "manifest_sha256": "acede508bde4be83ebd1952cb2823d17e47f83b77ca21f325755dc1702e4bce1"
+      }
+    },
+    "verified": true,
     "problems": []
   },
   "toolchain": {
@@ -55,7 +82,7 @@
     "infrastructure": 0,
     "named_skips": 0,
     "unknown_skips": 0,
-    "named_divergences": 18,
+    "named_divergences": 19,
     "stale_divergences": 0
   },
   "problems": [],
@@ -125,6 +152,9 @@
       "kind": "unattributed",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
       "attribution": "No Go commit located between v8.0.35 and v8.0.67; owner unassigned."
+    },
+    "credential-refresh-timestamps": {
+      "kind": "nondeterministic"
     },
     "error-retry-after": {
       "kind": "unattributed",
@@ -542,11 +572,12 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 25,
+      "differences": 27,
       "hits": [
         "C1-claude-client-profile",
         "I4-cors-allow-headers",
-        "P1-response-compression-vary"
+        "P1-response-compression-vary",
+        "credential-refresh-timestamps"
       ]
     },
     {
@@ -607,11 +638,12 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 30,
+      "differences": 32,
       "hits": [
         "C1-claude-client-profile",
         "I4-cors-allow-headers",
-        "P1-response-compression-vary"
+        "P1-response-compression-vary",
+        "openai-created-timestamps"
       ]
     },
     {
@@ -646,12 +678,11 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 32,
+      "differences": 30,
       "hits": [
         "C1-claude-client-profile",
         "I4-cors-allow-headers",
-        "P1-response-compression-vary",
-        "openai-created-timestamps"
+        "P1-response-compression-vary"
       ]
     },
     {
