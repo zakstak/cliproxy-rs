@@ -31,6 +31,7 @@ use crate::xai_auth::{self, CLI_CHAT_PROXY_BASE_URL, DEFAULT_API_BASE_URL, metad
 use crate::xai_replay::{self as replay, ReplayScope};
 use crate::xai_request::{self as request, Prepared};
 use crate::xai_response::{self as response, NamespaceRestorer, OutputItems, XSearchFilter, text};
+use crate::xai_sse as sse;
 use cpa_translate::apply_patch_responses as apply_patch;
 
 pub const PROVIDER: &str = "xai";
@@ -38,7 +39,6 @@ pub const PROVIDER: &str = "xai";
 pub(crate) const COMPACT_ALT: &str = "responses/compact";
 /// `scanner.Buffer(nil, 52_428_800)`.
 const MAX_LINE: usize = 52_428_800;
-const DISCONNECTED: &str = "xai stream error: stream disconnected before response.completed or response.incomplete";
 /// Keep in sync with the Grok CLI version the chat proxy expects (`xaiClientVersionValue`).
 const CLIENT_VERSION: &str = "1.0.44";
 const IMAGES_GENERATIONS: &str = "/images/generations";
@@ -484,7 +484,7 @@ impl XaiExecutor {
             capture.read(&data);
             let data = data?;
             let writes = prepared.replay_scope.writes.clone();
-            let body = buffered(&req, prepared, &self.replay, &data);
+            let body = buffered(&req, prepared, &self.replay, &headers, &data);
             writes.settle().await;
             ResponseBody::Buffered(body?)
         };
@@ -885,17 +885,51 @@ fn speech_model_unavailable(body: &[u8]) -> bool {
     .any(|path| names(&gj::get(body, path).str()))
 }
 
-/// The Execute scan over a buffered SSE body: the first completed or incomplete
-/// response, with streamed output items restored, translated for the client.
-fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u8]) -> Result<Bytes, ExecError> {
+/// The Execute scan over a buffered SSE body (Go v8.0.67 949b43b3, xai_sse.rs): the
+/// first completed or incomplete response, with streamed output items restored,
+/// translated for the client. A terminal failure the body carries (an `error` event,
+/// `response.failed`, or a JSON error body without SSE data) is reported with the status
+/// it names, like an upstream error status. A body that ends without a terminal event
+/// is a request-scoped 502: the provider served this request badly, so no credential
+/// is cooled and the client sees neither a timeout nor, unless upstream emitted
+/// apply_patch activity, an apply_patch error.
+fn buffered(
+    req: &ExecRequest,
+    mut p: Prepared,
+    store: &replay::Store,
+    headers: &HeaderMap,
+    data: &[u8],
+) -> Result<Bytes, ExecError> {
     let mut items = OutputItems::default();
     let mut filter = XSearchFilter::new(p.filter_internal_x_search, std::mem::take(&mut p.client_declared_tools));
     let mut restorer = NamespaceRestorer::new(std::mem::take(&mut p.namespace_tools));
-    for line in data.split(|b| *b == b'\n') {
-        let Some(rest) = line.strip_prefix(b"data:") else {
+    let failure = |event: &[u8], data: &[u8]| {
+        sse::terminal_failure(event, data).map(|(status, doc)| {
+            let mut error = response::status_error(status, &doc);
+            // The upstream answered: the error is classified by its status and body
+            // like an upstream error status, not as an explicit local request fault.
+            error.headers = Box::new(headers.clone());
+            error
+        })
+    };
+    let mut saw_data = false;
+    for frame in sse::Frames::new(data) {
+        let raw = trim_space(&frame.data);
+        if raw.is_empty() || raw == b"[DONE]" {
             continue;
-        };
-        let event = response::normalize_summary_data(trim_space(rest).to_vec());
+        }
+        saw_data = true;
+        if !gj::valid(raw) {
+            if let Some(error) = failure(frame.event, raw) {
+                return Err(error);
+            }
+            continue;
+        }
+        let event = response::normalize_summary_data(raw.to_vec());
+        if let Some(error) = failure(frame.event, &event) {
+            req.usage.response_model_line(&event);
+            return Err(error);
+        }
         p.apply_patch.remember_dispatcher_event(&event);
         let mut event = restorer.restore(event);
         if !p.web_search_alias.is_empty() {
@@ -933,8 +967,24 @@ fn buffered(req: &ExecRequest, mut p: Prepared, store: &replay::Store, data: &[u
             }
         }
     }
-    p.apply_patch.finish().map_err(|_| apply_patch_error())?;
-    Err(status_err(408, DISCONNECTED))
+    if !saw_data && let Some(error) = failure(b"", data) {
+        return Err(error);
+    }
+    if p.apply_patch.has_patch_activity() && p.apply_patch.finish().is_err() {
+        return Err(stream_fault(cpa_translate::APPLY_PATCH_UPSTREAM_ERROR));
+    }
+    Err(stream_fault(if saw_data {
+        sse::INCOMPLETE_STREAM
+    } else {
+        sse::EMPTY_STREAM
+    }))
+}
+
+/// Go `xaiRequestScopedStreamError`: a 2xx body that ended unusable. A local request
+/// fault (no upstream headers, classify::explicit_request_scoped): not retried on
+/// another credential and no credential cooled.
+fn stream_fault(message: &str) -> ExecError {
+    ExecError::local(502, FailureScope::Request, message)
 }
 
 /// Same-format passthrough when no pair is registered (Go's TranslateStream returns

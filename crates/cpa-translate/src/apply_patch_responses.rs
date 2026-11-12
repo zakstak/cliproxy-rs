@@ -299,6 +299,8 @@ impl Record {
 }
 
 const IDENTITY_CONFLICT: &str = "conflicting apply_patch call identity";
+/// The prefix of the events that stream a custom tool call's input.
+const CUSTOM_INPUT_EVENT: &[u8] = b"response.custom_tool_call_input.";
 
 /// common.ApplyPatchResponsesBridge: one response's apply_patch conversion, local to that
 /// response. Identity evidence is kept even before a call receives its name.
@@ -977,6 +979,8 @@ pub struct State {
     active: bool,
     failed: bool,
     closed: bool,
+    /// Upstream emitted a custom apply_patch call (v8.0.67 `sawPatch`, 949b43b3).
+    saw_patch: bool,
     transport_done: bool,
 }
 
@@ -1046,6 +1050,7 @@ impl State {
             active,
             failed: false,
             closed: false,
+            saw_patch: false,
             transport_done: false,
         }
     }
@@ -1511,10 +1516,22 @@ impl State {
         preceding.extend(expanded);
         let mut out = vec![];
         for e in preceding {
+            if !self.saw_patch && self.is_custom_patch_event(&e) {
+                self.saw_patch = true;
+            }
             let (converted, err) = self.bridge.transform(&e);
+            if !self.saw_patch
+                && !gj::get(&e, "type").bytes().starts_with(CUSTOM_INPUT_EVENT)
+                && converted
+                    .iter()
+                    .any(|c| gj::get(c, "type").bytes().starts_with(CUSTOM_INPUT_EVENT))
+            {
+                self.saw_patch = true;
+            }
             out.extend(converted);
             if err.is_some() {
                 self.failed = true;
+                self.saw_patch = true;
                 self.clear();
                 return (out, err);
             }
@@ -1524,6 +1541,40 @@ impl State {
             self.clear();
         }
         (out, None)
+    }
+
+    /// `isCustomPatchEvent` (v8.0.67): the event names a winning custom patch tool.
+    fn is_custom_patch_event(&self, event: &[u8]) -> bool {
+        if !self.active {
+            return false;
+        }
+        let root = gj::parse(event);
+        let item = root.get("item");
+        let (namespace, name) = if item.exists() {
+            if &*item.get("type").bytes() == b"custom_tool_call" {
+                return false;
+            }
+            (item.get("namespace").bytes(), item.get("name").bytes())
+        } else {
+            let name = root.get("name").bytes();
+            if name.is_empty() {
+                return false;
+            }
+            (root.get("namespace").bytes(), name)
+        };
+        self.tools
+            .get(&qualify_namespace_name(&namespace, &name))
+            .is_some_and(|t| t.patch)
+    }
+
+    /// `HasPatchActivity` (v8.0.67, 949b43b3): upstream emitted a custom apply_patch
+    /// call, or left a patch dispatcher or patch arguments unfinished, before the
+    /// response closed. Without it a body that ends early is no apply_patch failure.
+    pub fn has_patch_activity(&self) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.failed || self.saw_patch || self.unfinished_dispatcher() || self.bridge.finish().is_err()
     }
 
     /// Finish: the source response must have closed (and every patch call completed);

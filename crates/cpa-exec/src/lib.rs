@@ -86,6 +86,7 @@ pub mod xai_auth;
 mod xai_replay;
 mod xai_request;
 mod xai_response;
+mod xai_sse;
 pub mod xai_url;
 mod xai_ws;
 
