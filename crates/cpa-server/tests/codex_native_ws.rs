@@ -7138,3 +7138,302 @@ async fn a_continuation_needs_the_socket_that_holds_its_response() {
         }
     }
 }
+
+// N1 (#111): assertions the native-protection audit found missing
+// (docs/codex/N1-NATIVE-PROTECTIONS.md). Each test pins a protection the
+// proxy already has; none of them changes behaviour. Frames are hand-authored in the
+// shapes of the pinned first-party decoders cited on each test.
+
+/// One upstream socket as the N1 recording upstream saw it.
+#[derive(Debug, Clone, Default)]
+struct Dialed {
+    bearer: String,
+    frames: Vec<String>,
+    /// The proxy closed the socket or dropped its connection.
+    ended: bool,
+}
+
+/// A loopback Codex upstream for the N1 tests. Socket `dial` (in dial order) answers its
+/// `n`th text frame with `answer(dial, n)`: the frames to send, then whether to drop the
+/// connection without a close frame. It records each socket's bearer, every text frame
+/// and whether the proxy ended the socket.
+async fn recording_upstream(
+    answer: impl Fn(usize, usize) -> (Vec<&'static str>, bool) + Clone + Send + Sync + 'static,
+) -> (String, Arc<std::sync::Mutex<Vec<Dialed>>>) {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    let log = Arc::new(std::sync::Mutex::new(Vec::<Dialed>::new()));
+    let app = {
+        let log = log.clone();
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                let (log, answer) = (log.clone(), answer.clone());
+                async move {
+                    let dial = {
+                        let mut log = log.lock().unwrap();
+                        log.push(Dialed {
+                            bearer: headers["authorization"].to_str().unwrap().to_owned(),
+                            ..Dialed::default()
+                        });
+                        log.len() - 1
+                    };
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let mut n = 0;
+                        loop {
+                            match socket.recv().await {
+                                Some(Ok(Upstream::Text(text))) => {
+                                    log.lock().unwrap()[dial].frames.push(text.as_str().to_owned());
+                                    let (frames, drop_after) = answer(dial, n);
+                                    n += 1;
+                                    for frame in frames {
+                                        let _ = socket.send(Upstream::Text(frame.into())).await;
+                                    }
+                                    if drop_after {
+                                        // The proxy did not end this socket: the upstream did.
+                                        return;
+                                    }
+                                }
+                                Some(Ok(Upstream::Close(_))) | Some(Err(_)) | None => break,
+                                Some(Ok(_)) => {}
+                            }
+                        }
+                        log.lock().unwrap()[dial].ended = true;
+                    })
+                }
+            }),
+        )
+    };
+    (format!("http://{}", serve(app).await), log)
+}
+
+/// Two ChatGPT accounts on `url`, tried in order: `at-FAKE`, then `at-SECOND`.
+fn two_accounts(url: &str) -> Vec<Credential> {
+    (0..2)
+        .map(|i| {
+            let mut c = credential(Profile::Chatgpt, url, true);
+            if i > 0 {
+                c.id = "codex-second.json".into();
+                c.metadata.insert("access_token".into(), "at-SECOND".into());
+            }
+            c.attributes.insert("priority".into(), (9 - i).to_string());
+            c
+        })
+        .collect()
+}
+
+/// Waits until `check` holds for the recording upstream's log, or panics after 5 s.
+async fn upstream_until(log: &std::sync::Mutex<Vec<Dialed>>, what: &str, check: impl Fn(&[Dialed]) -> bool) {
+    for _ in 0..500 {
+        if check(&log.lock().unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what}: {:?}", log.lock().unwrap());
+}
+
+const N1_CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_n1"}}"#;
+const N1_DONE: &str = r#"{"type":"response.completed","response":{"id":"resp_n1","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+
+/// N1 per-turn ownership: each turn is admitted on its own. An account disabled between
+/// two turns of one connection serves nothing more: a full `response.create` is admitted
+/// on the next account and opens that account's socket, and a continuation, which only
+/// the disabled account's socket could serve (first-party `core/src/client.rs:1675-1706`
+/// and 2354-2376 at 44ccf394573c send `previous_response_id` only on the connection that
+/// holds the previous response), closes with 1012 and writes nothing upstream. Nothing
+/// more is written to the disabled account's socket in either case
+/// (`docs/codex/CONTRACT.md` "Socket and account ownership").
+#[tokio::test]
+async fn an_account_disabled_between_turns_serves_no_later_turn() {
+    for continuation in [false, true] {
+        let case = format!("continuation={continuation}");
+        let (url, log) = recording_upstream(|_, _| (vec![N1_CREATED, N1_DONE], false)).await;
+        let proxy = proxy_with(Script::default(), "", |_| two_accounts(&url)).await;
+        let mut socket = connect(&proxy).await;
+        let first = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(first.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            [N1_CREATED, N1_DONE],
+            "{case}"
+        );
+
+        let mut disabled = proxy
+            .rt
+            .store()
+            .snapshot()
+            .into_iter()
+            .find(|c| c.id != "codex-second.json" && c.metadata.get("access_token").is_some())
+            .map(|c| Credential::clone(&c))
+            .expect("the first account");
+        disabled.disabled = true;
+        proxy.rt.store().upsert(disabled);
+
+        let next = if continuation {
+            client_frame("ws-create-continuation", "gpt-5.5")
+        } else {
+            client_frame("ws-create-first", "gpt-5.5")
+        };
+        socket.send(Message::text(next.clone())).await.unwrap();
+        let got = read(&mut socket, &TERMINAL).await;
+        let dialed = log.lock().unwrap().clone();
+        assert_eq!(dialed[0].bearer, "Bearer at-FAKE", "{case}");
+        assert_eq!(
+            dialed[0].frames,
+            std::slice::from_ref(&first),
+            "{case}: the disabled account's socket got nothing more"
+        );
+        if continuation {
+            assert_eq!(got.frames, Vec::<String>::new(), "{case}: {got:?}");
+            assert_eq!(got.closed, Some(1012), "{case}: the replay close");
+            assert_eq!(dialed.len(), 1, "{case}: no socket for the continuation: {dialed:?}");
+        } else {
+            assert_eq!(got.frames, [N1_CREATED, N1_DONE], "{case}");
+            assert_eq!(got.closed, None, "{case}");
+            assert_eq!(dialed.len(), 2, "{case}: {dialed:?}");
+            assert_eq!(dialed[1].bearer, "Bearer at-SECOND", "{case}");
+            assert_eq!(
+                dialed[1].frames,
+                [next],
+                "{case}: the create, as sent, on the next account"
+            );
+        }
+    }
+}
+
+/// N1 early overload: a `response.failed` with `server_is_overloaded` as the first
+/// upstream event (the shape first-party Codex reads as `ServerOverloaded`,
+/// `sse/responses_error.rs:90` and `api_bridge.rs:70` at 44ccf394573c) fails the turn over
+/// to the next account before anything reaches the client, with and without
+/// `stream-bootstrap-buffering`. The client sees only the serving account's events and
+/// no error, its connection stays open, and its continuation runs on the serving socket;
+/// the overloaded socket receives nothing after its create
+/// (`docs/codex/CONTRACT.md` "Responses and failures").
+#[tokio::test]
+async fn an_early_overload_fails_over_and_the_continuation_stays_on_the_serving_socket() {
+    const OVERLOADED: &str = r#"{"type":"response.failed","response":{"id":"resp_over","error":{"code":"server_is_overloaded","message":null}}}"#;
+    for buffering in [false, true] {
+        let case = format!("buffering={buffering}");
+        let (url, log) = recording_upstream(|dial, _| {
+            if dial == 0 {
+                (vec![OVERLOADED], false)
+            } else {
+                (vec![N1_CREATED, N1_DONE], false)
+            }
+        })
+        .await;
+        let config = if buffering {
+            "codex:\n  stream-bootstrap-buffering: true\n"
+        } else {
+            ""
+        };
+        let proxy = proxy_with(Script::default(), config, |_| two_accounts(&url)).await;
+        let mut socket = connect(&proxy).await;
+        let first = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(first.clone())).await.unwrap();
+        let got = read(&mut socket, &TERMINAL).await;
+        assert_eq!(
+            got.frames,
+            [N1_CREATED, N1_DONE],
+            "{case}: no error before the serving answer"
+        );
+        assert_eq!(got.closed, None, "{case}");
+
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        let next = read(&mut socket, &TERMINAL).await;
+        assert_eq!(next.frames, [N1_CREATED, N1_DONE], "{case}");
+        let dialed = log.lock().unwrap().clone();
+        assert_eq!(dialed.len(), 2, "{case}: {dialed:?}");
+        assert_eq!(
+            (dialed[0].bearer.as_str(), dialed[0].frames.as_slice()),
+            ("Bearer at-FAKE", std::slice::from_ref(&first)),
+            "{case}: the overloaded socket got only its create"
+        );
+        assert_eq!(
+            (dialed[1].bearer.as_str(), dialed[1].frames.as_slice()),
+            ("Bearer at-SECOND", &[first, continuation][..]),
+            "{case}: the create, then the continuation, on the serving socket"
+        );
+    }
+}
+
+/// N1 uncertain loss, the protected half: once the client has received an upstream event
+/// of the turn, losing the upstream socket ends the client connection and the create is
+/// never sent to another account. First-party Codex ends the turn with "websocket closed
+/// by server before response.completed" (`endpoint/responses_websocket.rs:1002-1005` at
+/// 44ccf394573c) and resends on its own. Without `stream-bootstrap-buffering` the
+/// `response.created` is delivered at once, so the loss comes after delivery.
+///
+/// A loss before anything was delivered is the unprotected half: the audit records a
+/// bounded witness for it instead of an assertion here.
+#[tokio::test]
+async fn a_loss_after_delivery_never_replays_the_create_on_another_account() {
+    let (url, log) = recording_upstream(|_, _| (vec![N1_CREATED], true)).await;
+    let proxy = proxy_with(Script::default(), "", |_| two_accounts(&url)).await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    let got = read(&mut socket, &TERMINAL).await;
+    assert_eq!(got.frames, [N1_CREATED], "the delivered event, as sent");
+    assert!(got.closed.is_some(), "the loss reaches the client: {got:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let dialed = log.lock().unwrap().clone();
+    assert_eq!(dialed.len(), 1, "no second account was dialed: {dialed:?}");
+    assert_eq!(dialed[0].frames, [first], "the create was sent once");
+}
+
+/// N1 terminal teardown: the proxy releases the upstream socket of a turn that ended.
+/// An ordinary turn's failure after the response started reaches the client as sent,
+/// then the proxy closes both the client connection and that upstream socket, and writes
+/// nothing more to it. A client that leaves after a completed turn, with or without
+/// `codex.response-steering`, takes its upstream socket with it: no socket outlives its
+/// connection, so no later turn can find it.
+#[tokio::test]
+async fn a_terminal_end_releases_the_upstream_socket() {
+    const STARTED_FAILED: &str = r#"{"type":"response.failed","response":{"id":"resp_n1","status":"failed","error":{"code":"server_error","message":null},"usage":null}}"#;
+    let (url, log) = recording_upstream(|_, _| (vec![N1_CREATED, STARTED_FAILED], false)).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &url, true)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    let got = read(&mut socket, &[]).await;
+    assert_eq!(got.frames, [N1_CREATED, STARTED_FAILED], "as sent");
+    assert!(got.closed.is_some(), "an ordinary turn's failure ends the connection");
+    upstream_until(&log, "the failed turn's upstream socket is closed", |d| {
+        d.len() == 1 && d[0].ended
+    })
+    .await;
+    assert_eq!(log.lock().unwrap()[0].frames, [first], "nothing more was written");
+
+    for steering in [false, true] {
+        let case = format!("steering={steering}");
+        let (url, log) = recording_upstream(|_, _| (vec![N1_CREATED, N1_DONE], false)).await;
+        let proxy = proxy_with(Script::default(), if steering { STEERING } else { "" }, |_| {
+            vec![credential(Profile::Chatgpt, &url, true)]
+        })
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            [N1_CREATED, N1_DONE],
+            "{case}"
+        );
+        assert!(
+            !log.lock().unwrap()[0].ended,
+            "{case}: the idle socket stays for the next turn"
+        );
+        let _ = socket.close(1000, "done").await;
+        upstream_until(&log, &format!("{case}: the client's upstream socket is closed"), |d| {
+            d.len() == 1 && d[0].ended
+        })
+        .await;
+    }
+}
