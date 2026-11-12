@@ -27,6 +27,21 @@ use crate::observability::{RequestId, hide_key, mask_query};
 
 const SMALL_BODY: u64 = 1 << 20;
 const DEFERRED_BODY: u64 = 32 << 20;
+/// The largest zstd window a captured request body is decoded with: 2^23 bytes, 8 MiB,
+/// enough for every compression level up to 19 (Go v8.0.67 ad8bdd3f
+/// `maxCapturedZstdWindowBytes`). libzstd's own limit is 2^27
+/// (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`, 128 MiB), and its streaming decoder allocates the
+/// declared window, or for a single-segment frame the declared content size, before it
+/// writes a byte. A frame that declares more is not decoded: the log keeps the raw bytes.
+/// Only the log's copy is decoded here; the handler reads the request on its own.
+const CAPTURE_ZSTD_WINDOW_LOG: u32 = 23;
+
+/// The most decoded bytes a captured request body is logged with: the request's own
+/// `server.max-request-body-bytes`, never above `ceiling`. Without a configured limit
+/// the ceiling applies, so a small compressed body cannot expand without bound.
+fn decoded_limit(configured: Option<u64>, ceiling: u64) -> u64 {
+    configured.map_or(ceiling, |limit| limit.min(ceiling))
+}
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! { static CURRENT: RequestLog; }
@@ -143,8 +158,9 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         .and_then(|s| s.parse::<u64>().ok());
     let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
     let mut request_body = Vec::new();
+    let mut request_undecoded = false;
+    let body_limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
     if eager {
-        let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
         let body = std::mem::replace(request.body_mut(), Body::empty());
         let bytes = match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => bytes,
@@ -160,7 +176,9 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             }
         };
         *request.body_mut() = Body::from(bytes.clone());
-        request_body = decode(bytes.to_vec(), request.headers(), true, limit).await.0;
+        // Eager capture logs what the handler may accept: at most its own decoded limit.
+        let limit = decoded_limit(body_limit, crate::MAX_REQUEST_BYTES as u64);
+        (request_body, request_undecoded) = decode_request(bytes.to_vec(), request.headers(), limit).await;
     }
     let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
         Spool::new(&state.dir, "request-body").ok().map(|spool| {
@@ -205,6 +223,8 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             timestamp: Local::now(),
             headers: request.headers().clone(),
             request_body,
+            request_undecoded,
+            body_limit,
             deferred,
             status: 200,
             unrouted: false,
@@ -1165,6 +1185,11 @@ struct Record {
     timestamp: DateTime<Local>,
     headers: HeaderMap,
     request_body: Vec<u8>,
+    /// The logged request body is still in a `Content-Encoding` the log could not
+    /// decode: it holds raw bytes no text redaction can see into.
+    request_undecoded: bool,
+    /// The request's `server.max-request-body-bytes`, if one applied.
+    body_limit: Option<u64>,
     deferred: Option<Arc<Mutex<Deferred>>>,
     status: u16,
     /// The response came from a NoRoute fallback ([`Unrouted`]).
@@ -1216,7 +1241,8 @@ impl Record {
         if let Some(deferred) = &self.deferred {
             let body = deferred.lock().unwrap_or_else(PoisonError::into_inner).bytes();
             if let Ok((body, marker)) = body {
-                self.request_body = decode(body, &self.headers, true, Some(DEFERRED_BODY)).await.0;
+                let limit = decoded_limit(self.body_limit, DEFERRED_BODY);
+                (self.request_body, self.request_undecoded) = decode_request(body, &self.headers, limit).await;
                 if !marker.is_empty() {
                     if !self.request_body.is_empty() && !self.request_body.ends_with(b"\n") {
                         self.request_body.push(b'\n');
@@ -1233,6 +1259,10 @@ impl Record {
             None
         };
         if self.redact_sdp {
+            if self.request_undecoded {
+                // Raw compressed SDP would carry its ICE credentials past redaction.
+                self.request_body = UNDECODED_SDP.to_vec();
+            }
             for body in [&mut self.request_body, &mut self.response] {
                 if let std::borrow::Cow::Owned(redacted) = cpa_exec::codex_live::redact_sdp(body) {
                     *body = redacted;
@@ -1905,15 +1935,60 @@ fn retain_errors(dir: &Path, max: i64) -> io::Result<()> {
     Ok(())
 }
 
+/// What a redacted request log shows for a body it could not decode.
+const UNDECODED_SDP: &[u8] =
+    b"[REQUEST BODY OMITTED: its Content-Encoding could not be decoded, so its SDP could not be redacted]";
+
+/// A captured request body as the log shows it, decoded to at most `limit` bytes, and
+/// whether it is still encoded (unsupported encoding, refused window, corrupt data).
+async fn decode_request(raw: Vec<u8>, headers: &HeaderMap, limit: u64) -> (Vec<u8>, bool) {
+    let (body, _, undecoded) = decode_body(raw, headers, true, Some(limit)).await;
+    (body, undecoded)
+}
+
+/// A captured response body as the log shows it, and the decompression error Go writes.
 async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<u64>) -> (Vec<u8>, Option<String>) {
+    let (body, error, _) = decode_body(raw, headers, request, limit).await;
+    (body, error)
+}
+
+/// Shared decoder; the flag is true when encoded bytes come back undecoded.
+async fn decode_body(
+    raw: Vec<u8>,
+    headers: &HeaderMap,
+    request: bool,
+    limit: Option<u64>,
+) -> (Vec<u8>, Option<String>, bool) {
     use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
-    let encoding = headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let encoding = if request { encoding.trim() } else { encoding };
+    let encoding = if request {
+        // Repeated fields form one ordered coding list. Invalid fields must not
+        // look absent: their bytes may still conceal SDP credentials.
+        let mut encoding = String::new();
+        for value in headers.get_all("content-encoding") {
+            let Ok(value) = value.to_str() else {
+                return (raw, None, true);
+            };
+            for coding in value.split(',') {
+                let coding = coding.trim();
+                if coding.is_empty() {
+                    return (raw, None, true);
+                }
+                if !encoding.is_empty() {
+                    encoding.push(',');
+                }
+                encoding.push_str(coding);
+            }
+        }
+        encoding
+    } else {
+        headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
     if raw.is_empty() || encoding.is_empty() {
-        return (raw, None);
+        return (raw, None, false);
     }
     // Go's response logger accepts one exact encoding, not stacked encodings.
     if !request
@@ -1922,14 +1997,24 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             "gzip" | "deflate" | "br" | "zstd"
         )
     {
-        return (raw, None);
+        return (raw, None, true);
     }
     let mut body = raw.clone();
-    for encoding in encoding.split(',').rev().map(|s| s.trim().to_ascii_lowercase()) {
+    let stages: Vec<String> = encoding
+        .split(',')
+        .rev()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    for (stage, encoding) in stages.iter().enumerate() {
         let mut reader: Pin<Box<dyn AsyncRead + Send + '_>> = match encoding.as_str() {
             "" | "identity" => continue,
             "zstd" => {
-                let mut decoder = ZstdDecoder::new(body.as_slice());
+                let mut decoder = if request {
+                    let window = async_compression::zstd::DParameter::window_log_max(CAPTURE_ZSTD_WINDOW_LOG);
+                    ZstdDecoder::with_params(body.as_slice(), &[window])
+                } else {
+                    ZstdDecoder::new(body.as_slice())
+                };
                 decoder.multiple_members(true);
                 Box::pin(decoder)
             }
@@ -1940,7 +2025,7 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             }
             "deflate" if !request => Box::pin(DeflateDecoder::new(body.as_slice())),
             "br" if !request => Box::pin(BrotliDecoder::new(body.as_slice())),
-            _ => return (raw, None),
+            _ => return (raw, None, true),
         };
         let mut output = Vec::new();
         let result = if let Some(limit) = limit {
@@ -1957,6 +2042,7 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
             return (
                 raw,
                 (!request).then(|| format!("failed to decompress {encoding} data: {error}")),
+                true,
             );
         }
         if limit.is_some_and(|limit| output.len() as u64 > limit) {
@@ -1965,11 +2051,15 @@ async fn decode(raw: Vec<u8>, headers: &HeaderMap, request: bool, limit: Option<
                 output.push(b'\n');
             }
             output.extend_from_slice(b"[DECOMPRESSED REQUEST BODY TRUNCATED]");
-            return (output, None);
+            // Cut short before an outer encoding was undone: still encoded.
+            let encoded = stages[stage + 1..]
+                .iter()
+                .any(|e| !matches!(e.as_str(), "" | "identity"));
+            return (output, None, encoded);
         }
         body = output;
     }
-    (body, None)
+    (body, None, false)
 }
 
 #[cfg(test)]
@@ -2818,6 +2908,333 @@ mod tests {
             .collect();
         assert!(outside.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A zstd frame of `data` with a `window_log` window; `pledged` declares the content
+    /// size, which makes a frame no larger than its window single-segment.
+    fn zstd_frame(data: &[u8], window_log: u32, pledged: bool) -> Vec<u8> {
+        use zstd::stream::raw::CParameter;
+        let mut raw = zstd::stream::raw::Encoder::new(1).unwrap();
+        raw.set_parameter(CParameter::WindowLog(window_log)).unwrap();
+        if pledged {
+            raw.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+        }
+        let mut out = zstd::stream::write::Encoder::with_encoder(Vec::new(), raw);
+        out.write_all(data).unwrap();
+        out.finish().unwrap()
+    }
+
+    /// RFC 8878 frame header: (single-segment, the window the decoder must allocate).
+    fn zstd_window(frame: &[u8]) -> (bool, u64) {
+        assert_eq!(frame[..4], [0x28, 0xB5, 0x2F, 0xFD], "zstd magic");
+        let descriptor = frame[4];
+        if descriptor & 0x20 == 0 {
+            let window = frame[5];
+            let base = 1u64 << (10 + u32::from(window >> 3));
+            return (false, base + base / 8 * u64::from(window & 7));
+        }
+        let start = 5 + [0, 1, 2, 4][usize::from(descriptor & 3)];
+        let width = [1, 2, 4, 8][usize::from(descriptor >> 6)];
+        let mut size = frame[start..start + width]
+            .iter()
+            .rev()
+            .fold(0u64, |size, byte| size << 8 | u64::from(*byte));
+        if width == 2 {
+            size += 256;
+        }
+        (true, size)
+    }
+
+    /// Text that compresses but never repeats a long run, so a decoded copy is
+    /// recognisable in a log and its first bytes locate it.
+    fn sample_text(len: usize) -> Vec<u8> {
+        const WORDS: [&str; 8] = ["model", "tool", "delta", "usage", "token", "input", "cache", "patch"];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            out.extend_from_slice(WORDS[(seed >> 61) as usize].as_bytes());
+            out.extend_from_slice(format!("{} ", (seed >> 40) & 0xfff).as_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect()
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> bool {
+        let head = &needle[..needle.len().min(64)];
+        haystack
+            .windows(head.len())
+            .enumerate()
+            .any(|(at, window)| window == head && haystack[at..].starts_with(needle))
+    }
+
+    /// Sends one captured POST and returns (what the handler read, the one log written).
+    async fn logged_post(
+        dir: &Path,
+        enabled: bool,
+        encoding: &str,
+        body: Vec<u8>,
+        limit: Option<u64>,
+        sdp: bool,
+    ) -> (Bytes, Vec<u8>) {
+        logged_post_headers(dir, enabled, &[encoding.parse().unwrap()], body, limit, sdp, true).await
+    }
+
+    async fn logged_post_headers(
+        dir: &Path,
+        enabled: bool,
+        encodings: &[axum::http::HeaderValue],
+        body: Vec<u8>,
+        limit: Option<u64>,
+        sdp: bool,
+        declare_length: bool,
+    ) -> (Bytes, Vec<u8>) {
+        let state = management(dir, enabled, false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().fallback(move |request: Request| {
+            let tx = tx.clone();
+            async move {
+                if sdp && let Some(log) = request.extensions().get::<RequestLog>() {
+                    log.redact_sdp();
+                }
+                tx.send(axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+                StatusCode::BAD_REQUEST
+            }
+        });
+        let mut app = router(&state, app);
+        let mut builder = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-fake-0123456789MIDDLEPART9876543210");
+        for encoding in encodings {
+            builder = builder.header("content-encoding", encoding);
+        }
+        if declare_length {
+            builder = builder.header("content-length", body.len());
+        }
+        let mut request = builder.body(Body::from(body)).unwrap();
+        if limit.is_some() {
+            request.extensions_mut().insert(crate::body_limit::Limit(limit));
+        }
+        let response = app.call(request).await.unwrap();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        let forwarded = rx.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let files = logs(dir);
+        assert_eq!(files.len(), 1, "exactly one record");
+        let log = std::fs::read(&files[0]).unwrap();
+        std::fs::remove_file(&files[0]).unwrap();
+        assert!(!find(&log, b"MIDDLEPART"), "credentials stay masked");
+        (forwarded, log)
+    }
+
+    #[tokio::test]
+    async fn zstd_request_logs_refuse_large_windows_and_forward_the_sent_bytes() {
+        let dir = scratch();
+        let text = sample_text(4 << 20);
+        let cases = [
+            ("8 MiB window", zstd_frame(&text, 23, false), true),
+            ("16 MiB declared window", zstd_frame(&text, 24, false), false),
+            (
+                "64 MiB single-segment bomb",
+                zstd_frame(&vec![0; 64 << 20], 26, true),
+                false,
+            ),
+        ];
+        assert_eq!(zstd_window(&cases[0].1), (false, 8 << 20));
+        assert_eq!(zstd_window(&cases[1].1), (false, 16 << 20));
+        assert_eq!(zstd_window(&cases[2].1), (true, 64 << 20));
+        for (name, frame, decoded) in cases {
+            let (forwarded, log) = logged_post(&dir, true, "zstd", frame.clone(), None, false).await;
+            assert_eq!(forwarded, frame, "{name}: the handler reads the bytes as sent");
+            if decoded {
+                assert!(find(&log, &text), "{name}: decoded in the log");
+            } else {
+                assert!(find(&log, &frame), "{name}: raw bytes in the log");
+                assert!(log.len() < frame.len() + (64 << 10), "{name}: {} log bytes", log.len());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zstd_request_logs_stay_bounded_without_a_configured_limit() {
+        let dir = scratch();
+        let bomb = zstd_frame(&vec![0; 80 << 20], 20, false);
+        let chained = zstd_frame(&bomb, 20, false);
+        for (encoding, body) in [("zstd", bomb.clone()), ("zstd, zstd", chained)] {
+            let (forwarded, log) = logged_post(&dir, true, encoding, body.clone(), None, false).await;
+            assert_eq!(forwarded, body);
+            assert!(
+                find(&log, b"[DECOMPRESSED REQUEST BODY TRUNCATED]"),
+                "{encoding}: truncated"
+            );
+            assert!(
+                log.len() <= (64 << 20) + (64 << 10),
+                "{encoding}: {} log bytes",
+                log.len()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zstd_request_logs_honour_a_configured_small_limit() {
+        let dir = scratch();
+        let mut data = noise(3 << 19);
+        data.resize(data.len() + (8 << 20), 0);
+        let frame = zstd_frame(&data, 20, false);
+        assert!(frame.len() as u64 > SMALL_BODY, "error-only capture defers this body");
+        for enabled in [false, true] {
+            let limit = 2u64 << 20;
+            let (forwarded, log) = logged_post(&dir, enabled, "zstd", frame.clone(), Some(limit), false).await;
+            assert_eq!(forwarded, frame);
+            assert!(
+                find(&log, b"[DECOMPRESSED REQUEST BODY TRUNCATED]"),
+                "enabled={enabled}"
+            );
+            assert!(
+                (log.len() as u64) < limit + (64 << 10),
+                "enabled={enabled}: {} log bytes",
+                log.len()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn undecodable_sdp_bodies_never_reach_the_log_raw() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        let dir = scratch();
+        let sdp = b"v=0\r\na=ice-ufrag:SECRETUFRAG\r\na=ice-pwd:SECRETPASSWORD0123456789\r\n".repeat(64);
+        let mut gzip = Vec::new();
+        GzipEncoder::new(sdp.as_slice()).read_to_end(&mut gzip).await.unwrap();
+        // gzip is never decoded for a captured request; the 16 MiB window is refused.
+        for (encoding, body) in [("gzip", gzip), ("zstd", zstd_frame(&sdp, 24, false))] {
+            for enabled in [false, true] {
+                let (forwarded, log) = logged_post(&dir, enabled, encoding, body.clone(), None, true).await;
+                assert_eq!(forwarded, body);
+                assert!(!find(&log, &body), "{encoding} enabled={enabled}: raw body withheld");
+                assert!(!find(&log, b"SECRET"), "{encoding} enabled={enabled}");
+                assert!(find(&log, b"[REQUEST BODY OMITTED"), "{encoding} enabled={enabled}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_request_encoding_fields_guard_sdp_in_eager_and_deferred_logs() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use axum::http::HeaderValue;
+        let dir = scratch();
+        let sdp = b"v=0\r\na=ice-ufrag:SECRETUFRAG\r\na=ice-pwd:SECRETPASSWORD0123456789\r\n".repeat(64);
+        let mut gzip = Vec::new();
+        GzipEncoder::new(sdp.as_slice()).read_to_end(&mut gzip).await.unwrap();
+        let cases = [
+            vec![HeaderValue::from_static("identity"), HeaderValue::from_static("gzip")],
+            vec![HeaderValue::from_bytes(b"gzip\xff").unwrap()],
+            vec![
+                HeaderValue::from_static("identity"),
+                HeaderValue::from_bytes(b"gzip\xff").unwrap(),
+            ],
+            vec![HeaderValue::from_static("identity,")],
+            vec![HeaderValue::from_static("")],
+        ];
+        for (case, encodings) in cases.iter().enumerate() {
+            for enabled in [false, true] {
+                // No declared length with logging off exercises deferred capture.
+                let (forwarded, log) =
+                    logged_post_headers(&dir, enabled, encodings, gzip.clone(), None, true, enabled).await;
+                assert_eq!(forwarded, gzip, "case {case}: forwarded bytes");
+                assert!(find(&log, b"[REQUEST BODY OMITTED"), "case {case} enabled={enabled}");
+                assert!(
+                    !find(&log, &gzip),
+                    "case {case} enabled={enabled}: compressed SDP withheld"
+                );
+            }
+        }
+        // A valid repeated list is decoded in reverse field order, then redacted.
+        let zstd = zstd_frame(&sdp, 20, false);
+        let encodings = [HeaderValue::from_static("identity"), HeaderValue::from_static("zstd")];
+        for enabled in [false, true] {
+            let (forwarded, log) =
+                logged_post_headers(&dir, enabled, &encodings, zstd.clone(), None, true, enabled).await;
+            assert_eq!(forwarded, zstd);
+            assert!(!find(&log, b"SECRET"));
+            assert!(!find(&log, b"[REQUEST BODY OMITTED"), "supported coding decoded");
+            assert!(find(&log, b"v=0"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// libzstd allocates outside Rust's allocator, so its context reports the cost:
+    /// what decoding a frame's header allocates with and without the capture limit.
+    fn zstd_context_bytes(frame: &[u8], window_log_max: Option<u32>) -> (bool, usize) {
+        use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+        let mut context = DCtx::create();
+        if let Some(log) = window_log_max {
+            context.set_parameter(DParameter::WindowLogMax(log)).unwrap();
+        }
+        let mut out = vec![0u8; 64 << 10];
+        let mut output = OutBuffer::around(&mut out[..]);
+        let mut input = InBuffer::around(frame);
+        let ok = context.decompress_stream(&mut output, &mut input).is_ok();
+        (ok, context.sizeof())
+    }
+
+    #[tokio::test]
+    async fn capture_window_limit_refuses_before_the_decoder_allocates() {
+        let mut zstd = HeaderMap::new();
+        zstd.insert("content-encoding", "zstd".parse().unwrap());
+        let text = sample_text(64 << 10);
+        let fits = zstd_frame(&text, CAPTURE_ZSTD_WINDOW_LOG, false);
+        let wide = zstd_frame(&text, CAPTURE_ZSTD_WINDOW_LOG + 1, false);
+        let single = zstd_frame(&vec![0; 64 << 20], 26, true);
+        assert_eq!(
+            decode_request(fits.clone(), &zstd, 1 << 20).await,
+            (text.clone(), false)
+        );
+        assert_eq!(decode_request(wide.clone(), &zstd, 1 << 20).await, (wide.clone(), true));
+        assert_eq!(
+            decode_request(single.clone(), &zstd, 1 << 20).await,
+            (single.clone(), true)
+        );
+        for (frame, window) in [(&wide, 16usize << 20), (&single, 64 << 20)] {
+            let (ok, unbounded) = zstd_context_bytes(frame, None);
+            assert!(
+                ok && unbounded >= window,
+                "libzstd's default allocates {unbounded} bytes"
+            );
+            let (ok, bounded) = zstd_context_bytes(frame, Some(CAPTURE_ZSTD_WINDOW_LOG));
+            assert!(!ok && bounded < 1 << 20, "the capture limit allocates {bounded} bytes");
+            eprintln!("declared window {window}: libzstd default {unbounded} bytes, capture limit {bounded} bytes");
+        }
+        // Configured limits only lower the ceiling; chained zstd stays bounded and a
+        // truncation before an outer encoding was undone counts as still encoded.
+        assert_eq!(decoded_limit(None, DEFERRED_BODY), DEFERRED_BODY);
+        assert_eq!(decoded_limit(Some(1), DEFERRED_BODY), 1);
+        assert_eq!(decoded_limit(Some(u64::MAX), DEFERRED_BODY), DEFERRED_BODY);
+        let inner = zstd_frame(&vec![0; 4 << 20], 20, false);
+        let twice = zstd_frame(&inner, 20, false);
+        zstd.insert("content-encoding", "zstd, zstd".parse().unwrap());
+        let (body, undecoded) = decode_request(twice, &zstd, 1 << 20).await;
+        assert!(!undecoded && body.len() < (1 << 20) + 64 && body.ends_with(b"TRUNCATED]"));
+        let incompressible = zstd_frame(&noise(4096), 20, false);
+        let (_, undecoded) = decode_request(zstd_frame(&incompressible, 20, false), &zstd, 64).await;
+        assert!(undecoded, "the outer frame was cut before the inner one was undone");
     }
 
     #[tokio::test]
