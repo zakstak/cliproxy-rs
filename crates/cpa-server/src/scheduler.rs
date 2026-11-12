@@ -1874,6 +1874,7 @@ impl Scheduler {
     /// Go `restoreCooldownRecordLocked` for one live record of `c`. A model-less record
     /// restores the credential-wide quota; other model-less records aggregate the model
     /// records (Go recomputes them) and apply only when `c` has no model records.
+    #[cfg(test)]
     pub fn restore(
         &mut self,
         c: &Credential,

@@ -443,6 +443,19 @@ mod tests {
             // The one deliberate difference (docs/DIFFERENCES-FROM-GO.md): every quota
             // record cliproxy-rs writes carries `trust_windows`, which Go's decoder skips.
             for record in actual["records"].as_array_mut().unwrap() {
+                // #95: Go v8.0.67's force provenance (9d7d012b), which this v8.0.35
+                // recording predates: every record carries the evaluated mark, and none
+                // of this sequence was forced.
+                let fields = record.as_object_mut().unwrap();
+                assert_eq!(
+                    fields.remove("force_cooldown_evaluated"),
+                    Some(serde_json::Value::Bool(true)),
+                    "{name}: force provenance on every record"
+                );
+                assert!(
+                    fields.remove("force_cooldown_until").is_none(),
+                    "{name}: nothing forced"
+                );
                 if record["quota"]["exceeded"] == true {
                     let removed = record["quota"].as_object_mut().unwrap().remove("trust_windows");
                     assert!(

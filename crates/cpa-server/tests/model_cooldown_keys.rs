@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Request, State};
+use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_exec::Executors;
@@ -330,5 +330,233 @@ async fn an_ordinary_failure_under_disable_cooling_cools_nothing() {
     assert_eq!(post(&url, "claude-opus-4-6").await.0, 503);
     assert!(calls.lock().unwrap().len() >= 2, "the upstream is tried again");
     assert!(rt.store().cooldowns("claude-f.json").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mock that records `key model` per call and answers each API key with its own reply.
+async fn keyed_mock(
+    reply: impl Fn(&str, &str) -> (u16, Vec<(&'static str, String)>, &'static str) + Send + Sync + 'static,
+) -> (String, Calls) {
+    let calls: Calls = Arc::default();
+    let seen = calls.clone();
+    let reply = Arc::new(reply);
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let (seen, reply) = (seen.clone(), reply.clone());
+        async move {
+            let key = req
+                .headers()
+                .get("x-api-key")
+                .or_else(|| req.headers().get("authorization"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .trim_start_matches("Bearer ")
+                .to_owned();
+            let body_in = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            let model = serde_json::from_slice::<Value>(&body_in).unwrap()["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().unwrap().push(format!("{key} {model}"));
+            let (status, headers, body) = reply(&key, &model);
+            let mut res = (StatusCode::from_u16(status).unwrap(), body).into_response();
+            res.headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            for (name, value) in headers {
+                res.headers_mut().insert(name, value.parse().unwrap());
+            }
+            res
+        }
+    });
+    (serve(app).await, calls)
+}
+
+const OK: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"Claude-Opus-4-6","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+async fn post_with(url: &str, model: &str, session: Option<&str>) -> (u16, String) {
+    let body = json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+    let mut request = wreq::Client::new()
+        .post(format!("{url}/v1/messages"))
+        .header("x-api-key", "client-key")
+        .header("content-type", "application/json");
+    if let Some(session) = session {
+        request = request.header("x-claude-code-session-id", session);
+    }
+    let response = request.body(body.to_string()).send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// A saved quota record of `id` under `model`, `secs` from now.
+fn quota_record(id: &str, model: &str, secs: u64) -> cpa_server::cooldown_store::Record {
+    use cpa_server::cooldown_store::{Quota, Record};
+    let at = SystemTime::now() + Duration::from_secs(secs);
+    Record {
+        provider: "claude".into(),
+        auth_id: id.into(),
+        model: model.into(),
+        status: "cooling".into(),
+        next_retry_after: Some(at),
+        reason: "quota".into(),
+        quota: Quota {
+            exceeded: true,
+            reason: "quota".into(),
+            next_recover_at: Some(at),
+            trust_windows: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Two configured keys for one case-only aliased model; `sk-fake-a` takes precedence
+/// under fill-first.
+fn two_keys(dir: &Path, upstream: &str, routing: &str) -> Config {
+    Config::parse(&format!(
+        "api-keys: [client-key]\nauth-dir: {}\nrouting:\n  cooldown:\n    save-cooldown-status: true\n{routing}\
+         claude-api-key:\n  - api-key: sk-fake-a\n    base-url: {upstream}\n    priority: 1\n    \
+         models: [{{name: Claude-Opus-4-6, alias: claude-opus-4-6}}]\n  - api-key: sk-fake-b\n    \
+         base-url: {upstream}\n    models: [{{name: Claude-Opus-4-6, alias: claude-opus-4-6}}]\n",
+        dir.display()
+    ))
+    .unwrap()
+}
+
+/// A cooldown migrated from a record saved under an older spelling keeps its credential
+/// out of every spelling's selection, with fill-first and soonest-reset, with and
+/// without a sticky session: the other key serves, and the session stays with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migrated_cooldown_holds_for_sticky_sessions_and_soonest_reset() {
+    for (strategy, routing, session) in [
+        ("fill-first", "  strategy: fill-first\n", None),
+        (
+            "fill-first sticky",
+            "  strategy: fill-first\n  session-affinity: true\n",
+            Some("6f0e8a51-3c2d-4b7a-9e10-2a4b6c8d0e1f"),
+        ),
+        ("soonest-reset", "  strategy: soonest-reset\n", None),
+        (
+            "soonest-reset sticky",
+            "  strategy: soonest-reset\n  session-affinity: true\n",
+            Some("6f0e8a51-3c2d-4b7a-9e10-2a4b6c8d0e1f"),
+        ),
+    ] {
+        let dir = auth_dir(&format!("migrated-{}", strategy.replace(' ', "-")));
+        let (upstream, calls) = keyed_mock(|key, _| {
+            if key == "sk-fake-a" {
+                (429, vec![("retry-after", "3600".into())], LIMIT)
+            } else {
+                (200, vec![], OK)
+            }
+        })
+        .await;
+        let config = two_keys(&dir, &upstream, routing);
+        let a = cpa_core::config::credentials::load(&config)
+            .into_iter()
+            .find(|c| c.attributes.get("api_key").map(String::as_str) == Some("sk-fake-a"))
+            .expect("key a")
+            .id;
+        cpa_server::cooldown_store::save(&dir, vec![quota_record(&a, "CLAUDE-OPUS-4-6", 1800)], SystemTime::now())
+            .unwrap();
+        let (rt, _) = configured_runtime(config);
+        let url = app(&rt).await;
+        for spelling in [
+            "claude-opus-4-6",
+            "Claude-Opus-4-6",
+            "CLAUDE-OPUS-4-6",
+            "claude-opus-4-6(high)",
+        ] {
+            let (status, body) = post_with(&url, spelling, session).await;
+            assert_eq!(status, 200, "{strategy} {spelling}: {body}");
+        }
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4, "{strategy}: {seen:?}");
+        assert!(
+            seen.iter().all(|c| c.starts_with("sk-fake-b ")),
+            "{strategy}: the cooling key was never contacted: {seen:?}"
+        );
+        let cooling = rt.store().cooldowns(&a);
+        assert_eq!(
+            cooling.iter().map(|c| c.model.as_str()).collect::<Vec<_>>(),
+            ["Claude-Opus-4-6"],
+            "{strategy}: migrated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+const FABLE_WEEKLY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"weekly limit"}}"#;
+
+/// A Fable-only weekly rejection is model-scoped: it cools the configured Fable model
+/// for every spelling of it, the other configured model on the same key still serves,
+/// and a restart restores it under the same key, still model-scoped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_scoped_exhaustion_shares_its_key_and_spares_siblings() {
+    let dir = auth_dir("fable-scoped");
+    let (upstream, calls) = keyed_mock(|_, model| {
+        if model.eq_ignore_ascii_case("claude-fable-5-1") {
+            (
+                429,
+                vec![
+                    ("anthropic-ratelimit-unified-status", "rejected".into()),
+                    ("anthropic-ratelimit-unified-7d-status", "allowed".into()),
+                    ("anthropic-ratelimit-unified-7d-utilization", "0.40".into()),
+                    ("anthropic-ratelimit-unified-7d_oi-status", "rejected".into()),
+                    ("retry-after", "1800".into()),
+                ],
+                FABLE_WEEKLY,
+            )
+        } else {
+            (200, vec![], OK)
+        }
+    })
+    .await;
+    let config = || {
+        Config::parse(&format!(
+            "api-keys: [client-key]\nauth-dir: {}\nrouting:\n  cooldown:\n    save-cooldown-status: true\n\
+             claude-api-key:\n  - api-key: sk-fake-a\n    base-url: {upstream}\n    models:\n      \
+             - {{name: Claude-Fable-5-1, alias: claude-fable-5-1}}\n      - {{name: claude-opus-4-6, alias: opus}}\n",
+            dir.display()
+        ))
+        .unwrap()
+    };
+    let (rt, id) = configured_runtime(config());
+    let url = app(&rt).await;
+    assert_eq!(post_with(&url, "claude-fable-5-1", None).await.0, 429);
+    for spelling in ["CLAUDE-FABLE-5-1", "Claude-Fable-5-1"] {
+        let (status, body) = post_with(&url, spelling, None).await;
+        assert_eq!(status, 429, "{spelling}: {body}");
+        assert!(body.contains("cooling down"), "{spelling}: {body}");
+    }
+    assert_eq!(
+        post_with(&url, "opus", None).await.0,
+        200,
+        "a sibling model still serves"
+    );
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        ["sk-fake-a Claude-Fable-5-1", "sk-fake-a claude-opus-4-6"]
+    );
+    let cooling = rt.store().cooldowns(&id);
+    assert_eq!(
+        cooling.iter().map(|c| c.model.as_str()).collect::<Vec<_>>(),
+        ["Claude-Fable-5-1"],
+        "model-scoped, one key: {cooling:?}"
+    );
+    drop(rt);
+    let (restarted, _) = configured_runtime(config());
+    let cooling = restarted.store().cooldowns(&id);
+    assert_eq!(
+        cooling.iter().map(|c| c.model.as_str()).collect::<Vec<_>>(),
+        ["Claude-Fable-5-1"],
+        "restored model-scoped: {cooling:?}"
+    );
+    let url = app(&restarted).await;
+    assert_eq!(post_with(&url, "claude-fable-5-1", None).await.0, 429);
+    assert_eq!(post_with(&url, "opus", None).await.0, 200);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "only the sibling reached the upstream again"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
