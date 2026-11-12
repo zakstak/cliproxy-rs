@@ -1176,6 +1176,83 @@ class NoCompileWrapperTests(unittest.TestCase):
                 self.assertTrue(refused)
 
 
+class RecordedArtifactUnavailableTests(unittest.TestCase):
+    def test_stat_and_hash_io_errors_are_unavailable_before_query(self):
+        for stage in ("stat", "hash"):
+            for error in (PermissionError("permission denied"), FileNotFoundError("disappeared"), OSError("read failed")):
+                with self.subTest(stage=stage, error=error), tempfile.TemporaryDirectory() as tmp:
+                    paths = receipts(tmp)
+                    executable = complete_receipts()[4]["executions"][0]["artifact"]["executable"]
+                    artifact = Path(tmp) / "artifacts" / executable
+                    original_stat, original_hash = Path.is_file, provenance.sha256
+
+                    def stat(path):
+                        if stage == "stat" and path == artifact:
+                            raise error
+                        return original_stat(path)
+
+                    def sha(path):
+                        if stage == "hash" and path == artifact:
+                            raise error
+                        return original_hash(path)
+
+                    with mock.patch.object(Path, "is_file", stat), \
+                            mock.patch.object(provenance, "sha256", sha), \
+                            mock.patch.object(acceptance, "current_cargo_targets", side_effect=AssertionError("queried")):
+                        result = acceptance.combine(paths, PINS, current_source=SOURCE,
+                                                    artifact_root=Path(tmp) / "artifacts")
+                    self.assertEqual(result["verdict"], "unavailable", result)
+                    self.assertFalse(result["problems"], result["problems"])
+                    self.assertFalse(result["current_cargo"]["queried"])
+                    self.assertTrue(any(executable in p and str(error) in p for p in result["unavailable"]))
+
+    def test_known_record_and_hash_failures_remain_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp, lambda r: r[4]["executions"][0].update(summary={}))
+            with mock.patch.object(provenance, "sha256", side_effect=PermissionError("unreadable")):
+                result = acceptance.combine(paths, PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts")
+            self.assertEqual(result["verdict"], "fail", result)
+            self.assertTrue(any("summary" in p for p in result["problems"]))
+            self.assertTrue(result["unavailable"])
+            self.assertFalse(result["current_cargo"]["queried"])
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp)
+            artifact = complete_receipts()[4]["executions"][0]["artifact"]["executable"]
+            (Path(tmp) / "artifacts" / artifact).write_bytes(b"changed bytes")
+            result = acceptance.combine(paths, PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts")
+            self.assertEqual(result["verdict"], "fail", result)
+            self.assertTrue(any("recorded SHA-256" in p for p in result["problems"]))
+            self.assertFalse(result["unavailable"])
+
+    def test_unreadable_recorded_artifact_cli_writes_an_unavailable_receipt(self):
+        # Only the synthetic executable's permissions change. The child uses the real
+        # CLI, stat/hash boundary, receipt writer and exit classification.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp)
+            executable = complete_receipts()[4]["executions"][0]["artifact"]["executable"]
+            (Path(tmp) / "artifacts" / executable).chmod(0)
+            out = Path(tmp) / "out.json"
+            script = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import acceptance, test_acceptance as fixture
+acceptance.provenance.source_identity = lambda: dict(fixture.SOURCE)
+combine = acceptance.combine
+acceptance.combine = lambda paths, pins: combine(paths, pins, current_source=fixture.SOURCE,
+                                                artifact_root=Path(sys.argv[2]) / 'artifacts')
+sys.exit(acceptance.main(sys.argv[3:]))
+"""
+            done = subprocess.run([sys.executable, "-c", script, str(ROOT / "harness"), tmp,
+                                   "combine", *paths, "--receipt", str(out)], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 2, done.stderr)
+            result = json.loads(out.read_text())
+            self.assertEqual(result["verdict"], "unavailable")
+            self.assertFalse(result["problems"], result["problems"])
+            self.assertFalse(result["current_cargo"]["queried"])
+            self.assertTrue(any(executable in p and "Permission denied" in p for p in result["unavailable"]))
+            self.assertNotIn("Traceback", done.stderr)
+
+
 class CargoQueryUnavailableTests(unittest.TestCase):
     def test_tool_startup_and_artifact_io_errors_are_unavailable(self):
         for error in (FileNotFoundError("cargo missing"), PermissionError("artifact unreadable")):

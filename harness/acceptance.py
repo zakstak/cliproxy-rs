@@ -881,7 +881,7 @@ EXECUTION_KEYS = {"package", "target", "artifact", "fresh_before", "artifact_aft
                   "failed", "ignored", "not_run", "output_tail"}
 
 
-def _check_execution(execution, requested, owned, artifact_root):
+def _check_execution(execution, requested, owned, artifact_root, unavailable):
     """Problems with one test target's execution record, and the listed names outside the
     manifest on an owned target. Everything is re-derived from the record's parts: the
     artifact cargo named, the exact commands, the complete listing, each result line and
@@ -899,8 +899,11 @@ def _check_execution(execution, requested, owned, artifact_root):
             or not isinstance(execution["fresh_before"], bool):
         problems.append("the artifact after the run is not the same fresh test binary")
     path = Path(artifact_root) / executable
-    if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
-        problems.append(f"{executable} is not on disk with the recorded SHA-256")
+    try:
+        if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
+            problems.append(f"{executable} is not on disk with the recorded SHA-256")
+    except OSError as exc:
+        unavailable.append(f"{executable}: cannot verify recorded artifact ({exc})")
     if execution["requested"] != requested:
         problems.append(f"requested tests {execution['requested']} are not the manifest's {requested}")
     listing, run = execution["listing"], execution["execution"]
@@ -943,7 +946,7 @@ def _check_execution(execution, requested, owned, artifact_root):
     return problems, unknown
 
 
-def _check_cargo(receipt, pins, current, problems, artifact_root):
+def _check_cargo(receipt, pins, current, problems, artifact_root, unavailable):
     targets = {}
     for group in pins["groups"]:
         for test in group["tests"]:
@@ -958,7 +961,7 @@ def _check_cargo(receipt, pins, current, problems, artifact_root):
     for execution, key in zip(executions, got):
         if key not in requested:
             continue
-        found, extra = _check_execution(execution, requested[key], key in owned, artifact_root)
+        found, extra = _check_execution(execution, requested[key], key in owned, artifact_root, unavailable)
         unknown += [f"{key[0]} {key[1]} {n}" for n in extra]
         if not found:
             for field in ("executable", "sha256"):
@@ -1009,7 +1012,7 @@ def combine(paths, pins, current_source=None, artifact_root=ROOT, current_target
     build of the same crate is not enough). If that query is unavailable the verdict is
     unavailable, never pass. Records that already fail do not query cargo. current_targets
     replaces the query in tests only; the CLI never passes it."""
-    receipts, problems = [], []
+    receipts, problems, unavailable = [], [], []
     for p in paths:
         try:
             raw = Path(p).read_bytes()
@@ -1036,18 +1039,20 @@ def combine(paths, pins, current_source=None, artifact_root=ROOT, current_target
         elif receipt["kind"] == "mutation-control":
             _check_mutation(receipt, pins, differentials.get(receipt.get("target")), found)
         elif receipt["kind"] == "cargo-groups":
-            _check_cargo(receipt, pins, current, found, artifact_root)
+            _check_cargo(receipt, pins, current, found, artifact_root, unavailable)
         problems += [f"{name}: {f}" for f in found]
-    if problems:
-        cargo = {"queried": False, "available": None, "reason": "the receipts already fail on their records"}
+    if problems or unavailable:
+        cargo = {"queried": False, "available": None,
+                 "reason": "the receipts already fail on their records" if problems else "recorded artifacts unavailable"}
     else:
         cargo = current_targets if current_targets is not None else current_cargo_targets(pins, current)
         if cargo.get("available") is True:
             for name, receipt, _ in receipts:
                 if receipt["kind"] == "cargo-groups":
                     problems += [f"{name}: {p}" for p in current_artifact_problems(receipt, cargo)]
-    verdict = "fail" if problems else ("pass" if cargo.get("available") is True else "unavailable")
-    unavailable = (cargo.get("problems") or ["current cargo artifacts unavailable"]) if verdict == "unavailable" else []
+    verdict = "fail" if problems else ("pass" if not unavailable and cargo.get("available") is True else "unavailable")
+    if verdict == "unavailable" and not unavailable:
+        unavailable = cargo.get("problems") or ["current cargo artifacts unavailable"]
     return {"kind": "acceptance", "verdict": verdict, "partial": False, "problems": problems,
             "unavailable": unavailable, "current_cargo": cargo, "tested_source": current,
             "pins": {"go": {n: {k: t[k] for k in ("tag", "commit", "role", "executed")}
