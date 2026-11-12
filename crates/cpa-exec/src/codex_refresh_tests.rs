@@ -919,3 +919,33 @@ async fn native_and_siwc_partitions_recover_independently() {
         assert_eq!(now_refused.active_refused(&c), row.active_refused, "{case}: active");
     }
 }
+
+/// A SIWC refresh answered 200 whose body is cut short: the endpoint accepted the grant
+/// and may have spent the refresh token, so the refresh does not send it again (it did,
+/// three times). The failure is transient and ambiguous, not a refusal: nothing is
+/// refused or applied and the stored token stays. A due refresh keeps the failure as a
+/// backoff, so the scheduler's next check sends nothing either. The outer refresh keeps
+/// its own, separately sourced handling (`a_refusal_whose_body_cannot_be_read_keeps_its_status`).
+#[tokio::test]
+async fn a_siwc_200_cut_short_is_sent_once_and_backs_off() {
+    let (url, connections) =
+        raw_endpoint("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close", "partial").await;
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), "", "", "")
+        .with_siwc_token_url(&url)
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    let r = Refresher::new(oauth);
+    let metadata = doc("cut", true, 60 * 24 * 10, -1);
+    let sent = || connections.load(std::sync::atomic::Ordering::SeqCst);
+    let (result, refused) = r
+        .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
+        .await;
+    assert_eq!(sent(), 1, "sent once, not again in the same refresh");
+    assert!(refused.is_empty(), "not a refusal");
+    let error = result.expect_err("the SIWC token in use has expired, so the failure is reported");
+    assert_eq!(error.status, 502);
+    let (again, refused) = r
+        .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
+        .await;
+    assert!(again.is_err() && refused.is_empty());
+    assert_eq!(sent(), 1, "the next due check waits for the backoff");
+}

@@ -578,3 +578,70 @@ fn a_refreshed_siwc_partition_follows_a_controlled_clock() {
         }
     }
 }
+
+/// A refreshed grant that reports scopes without `chatgpt.tokens.use.direct` keeps the
+/// sign-in (OpenAI "errors and recovery": retain it, mark ChatGPT plan usage disabled):
+/// the replacement tokens stay and renew on their usual schedule, the status reads
+/// `invalid`, and requests are refused before they are built with a 403, never a 401,
+/// so nothing starts a refresh or a sign-in loop. An unknown grant (no stored scope, or
+/// a refresh that reported none) is the bound one and stays usable. The outer tokens of
+/// a credential with `use_siwc` off are untouched.
+#[test]
+fn a_grant_without_direct_use_disables_plan_usage() {
+    let denied = siwc_credential(&read(&answer(Some("3600"), Some(r#""openid offline_access""#), ""), false).unwrap());
+    assert!(plan_use_denied(&denied));
+    assert_eq!(
+        denied.metadata["siwc"]["refresh_token"], "siwc-rt-2",
+        "the replacement stays"
+    );
+    let error = require_token(&denied).unwrap_err();
+    assert_eq!((error.status, error.scope), (403, FailureScope::Credential));
+    assert!(!String::from_utf8_lossy(&error.body).contains("401"));
+    assert_eq!(status(&denied, false, at(0)), "invalid");
+    assert!(
+        access_usable(&denied, at(0)),
+        "the token itself is valid; only its plan use is refused"
+    );
+    assert_eq!(
+        (refresh_due(&denied, at(0)), refresh_due(&denied, at(52 * 60))),
+        (Some(false), Some(true)),
+        "it renews on its usual schedule, not at once"
+    );
+    // The scopes list alone decides when no scope string is stored.
+    let mut listed = denied.clone();
+    listed.metadata["siwc"].as_object_mut().unwrap().remove("scope");
+    assert!(plan_use_denied(&listed));
+    // Unknown grants stay usable.
+    for (case, siwc) in [
+        (
+            "no stored scope",
+            serde_json::json!({"access_token": "a", "refresh_token": "r", "client_id": "c"}),
+        ),
+        ("blank scope", serde_json::json!({"access_token": "a", "scope": " "})),
+        ("empty scopes", serde_json::json!({"access_token": "a", "scopes": []})),
+        (
+            "scopes not strings",
+            serde_json::json!({"access_token": "a", "scopes": [1, 2]}),
+        ),
+        (
+            "direct use granted",
+            serde_json::json!({"access_token": "a", "scope": DIRECT}),
+        ),
+    ] {
+        let mut c = denied.clone();
+        c.metadata["siwc"] = siwc;
+        assert!(!plan_use_denied(&c), "{case}");
+        assert!(require_token(&c).is_ok(), "{case}");
+    }
+    // A refresh that reports no readable scope keeps a stored grant with direct use.
+    let granted = siwc_credential(&read(&answer(Some("3600"), Some(&format!(r#""{DIRECT}""#)), ""), false).unwrap());
+    let unreported = read(r#"{"access_token":"a2","refresh_token":"r2","expires_in":3600}"#, false).unwrap();
+    let mut merged = granted.clone();
+    merged.metadata["siwc"] = refresh_patch(&granted, &unreported).set["siwc"].clone();
+    assert!(!plan_use_denied(&merged) && require_token(&merged).is_ok());
+    // With `use_siwc` off the requests use the outer tokens: nothing is refused.
+    let mut native = denied.clone();
+    native.metadata["use_siwc"] = false.into();
+    assert!(require_token(&native).is_ok());
+    assert_eq!(status(&native, false, at(0)), "off");
+}

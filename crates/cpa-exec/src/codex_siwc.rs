@@ -69,7 +69,9 @@ pub fn access_token(credential: &cpa_core::credential::Credential) -> &str {
 }
 
 /// Go `ensureCodexSIWCCredentials`: an SIWC credential without its token fails before
-/// any request is built.
+/// any request is built. So does one whose grant does not allow ChatGPT plan usage
+/// ([`plan_use_denied`]): a 403 that cools the credential, never a 401, so it starts no
+/// refresh after an upstream 401 and no sign-in loop (#92).
 pub fn require_token(credential: &cpa_core::credential::Credential) -> Result<(), ExecError> {
     if enabled(credential) && access_token(credential).is_empty() {
         return Err(siwc_error(
@@ -77,7 +79,36 @@ pub fn require_token(credential: &cpa_core::credential::Credential) -> Result<()
             "codex executor: use_siwc is enabled but siwc access_token is missing",
         ));
     }
+    if enabled(credential) && plan_use_denied(credential) {
+        return Err(siwc_error(
+            403,
+            "codex executor: the Sign in with ChatGPT grant does not include chatgpt.tokens.use.direct, so ChatGPT plan usage is not enabled for this credential; bind it again and allow ChatGPT plan usage",
+        ));
+    }
     Ok(())
+}
+
+/// Whether the SIWC partition's stored grant explicitly leaves out
+/// `chatgpt.tokens.use.direct`: its `scope` (else its `scopes` list) names scopes and
+/// that one is not among them. OpenAI's "errors and recovery": such a sign-in is kept,
+/// but ChatGPT plan usage is disabled. A partition that stores no scope is not denied:
+/// an unknown grant is the one that was bound, and binding requires direct use
+/// ([`token_response`]). A refresh that reports no readable scope keeps the stored one.
+pub fn plan_use_denied(credential: &cpa_core::credential::Credential) -> bool {
+    let Some(siwc) = partition(credential) else {
+        return false;
+    };
+    if let Some(Value::String(scope)) = siwc.get("scope")
+        && !scope.trim().is_empty()
+    {
+        return !scope.split_whitespace().any(|s| s == DIRECT_TOKEN_SCOPE);
+    }
+    match siwc.get("scopes") {
+        Some(Value::Array(scopes)) if !scopes.is_empty() && scopes.iter().all(Value::is_string) => {
+            !scopes.iter().any(|s| s.as_str() == Some(DIRECT_TOKEN_SCOPE))
+        }
+        _ => false,
+    }
 }
 
 fn partition(credential: &cpa_core::credential::Credential) -> Option<&Map<String, Value>> {
@@ -399,12 +430,13 @@ fn real_expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
 /// Go v8.0.67 `CodexSIWCStatus` (06fd5b8b): a Codex credential's local SIWC status at
 /// `now`, read from the credential alone, with no refresh or upstream request. `off`
 /// unless SIWC is in use; `invalid` without an access token, with an unknown or past
-/// real expiry, or when `rejected` (an upstream refused the token); else `valid`.
+/// real expiry, when `rejected` (an upstream refused the token), or when its grant does
+/// not allow ChatGPT plan usage ([`plan_use_denied`], #92); else `valid`.
 pub fn status(credential: &cpa_core::credential::Credential, rejected: bool, now: Time) -> &'static str {
     if !enabled(credential) {
         return "off";
     }
-    if access_token(credential).is_empty() || rejected {
+    if access_token(credential).is_empty() || rejected || plan_use_denied(credential) {
         return "invalid";
     }
     match partition(credential).and_then(real_expiry) {
@@ -665,13 +697,18 @@ fn expiry_after(now: chrono::DateTime<Local>, expires_in: u64) -> Option<(String
 ///   §5.1 lets the answer omit an unchanged scope) or not a non-blank string, the
 ///   stored grant stays. A reported scope is stored as reported, also without
 ///   `chatgpt.tokens.use.direct`: OpenAI's "errors and recovery" says to retain such a
-///   sign-in, and an upstream then refuses requests the grant does not allow.
+///   sign-in and mark ChatGPT plan usage disabled, which [`plan_use_denied`] does, so
+///   requests are refused before they are built ([`require_token`]).
 /// - `id_token`: a string is kept; any other value is left out.
 ///
-/// The code exchange (`exchange` true) binds a new sign-in and spends nothing stored,
-/// so it keeps its inherited strict reading: an ID token, a granted scope holding
-/// `chatgpt.tokens.use.direct`, and a positive integer `expires_in`. An expiry that
-/// cannot be stored is unknown there too, not a refusal. `token_type` has no documented constraint, and `earliest_refresh_at` has no
+/// The code exchange (`exchange` true) is the SIWC binding (`--siwc-bind` and the
+/// Management API bind), which exists only to add direct-inference credentials to a
+/// Codex credential; the proxy has no general SIWC sign-in to retain. It spends nothing
+/// stored, so it keeps its inherited strict reading: an ID token, a granted scope
+/// holding `chatgpt.tokens.use.direct` (without it the bind fails and nothing is
+/// written; the user binds again and allows ChatGPT plan usage), and a positive integer
+/// `expires_in`. An expiry that cannot be stored is unknown there too, not a refusal.
+/// `token_type` has no documented constraint, and `earliest_refresh_at` has no
 /// documented format or meaning, so neither is read or persisted.
 pub(crate) fn token_response(
     body: &[u8],
@@ -755,13 +792,30 @@ impl CodexOAuth {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
-        let (status, body) = self
-            .post(
+        let (status, body) = match self
+            .post_status(
                 self.siwc_token_url(),
                 "application/x-www-form-urlencoded",
                 body.into_bytes(),
             )
-            .await?;
+            .await?
+        {
+            (status, Some(body)) => (status, body),
+            // A refresh answered 200 whose body could not be read: the endpoint accepted
+            // the grant and may have spent the refresh token, so this refresh does not
+            // send it again. Transient and ambiguous, never a refusal (#92). The code
+            // exchange keeps its transport failure.
+            (200, None) if !require_id_token => {
+                return Err(crate::codex_oauth::GrantError {
+                    error: siwc_error(502, "OpenAI OAuth token response could not be read"),
+                    terminal: false,
+                    answered: true,
+                });
+            }
+            (_, None) => {
+                return Err(ExecError::local(502, FailureScope::Transport, "codex oauth request failed").into());
+            }
+        };
         if status != 200 && !require_id_token {
             // A refresh keeps the OAuth error code (Go echoes the body), and a documented
             // unusable-token code stops the retries; bodies may echo request material.

@@ -390,7 +390,7 @@ impl CodexOAuth {
     /// [`Self::post`], keeping the answer's HTTP status when its body cannot be read
     /// (`None`), as first-party codex-rs's `TokenRejection` does ("HTTP status survives
     /// even when its body cannot be read").
-    async fn post_status(
+    pub(crate) async fn post_status(
         &self,
         url: &str,
         content_type: &str,
