@@ -1438,6 +1438,82 @@ async fn user_identity_does_not_become_a_muse_conversation() {
     );
 }
 
+/// Plain user identities must not hide a named conversation, including the legacy
+/// root/envelope spellings. Body conversations also outrank transport fallback.
+#[tokio::test]
+async fn plain_user_ids_do_not_shadow_explicit_conversation_fields() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for nested in [false, true] {
+        for path in [
+            "conversation_id",
+            "conversationId",
+            "chat_id",
+            "chatId",
+            "metadata.conversation_id",
+            "extra_body.conversation_id",
+        ] {
+            let turn = |conversation: String, transport: String, user: &str| {
+                let mut fields = json!({"metadata": {"user_id": user}});
+                if let Some((root, key)) = path.split_once('.') {
+                    if fields.get(root).is_none() {
+                        fields[root] = json!({});
+                    }
+                    fields[root][key] = conversation.into();
+                } else {
+                    fields[path] = conversation.into();
+                }
+                let fields = if nested { json!({"request": fields}) } else { fields };
+                sent_request(
+                    ACCOUNT,
+                    move |req, _| {
+                        let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+                        body.as_object_mut()
+                            .unwrap()
+                            .extend(fields.as_object().unwrap().clone());
+                        req.body = serde_json::to_vec(&body).unwrap().into();
+                        req.original_body = req.body.clone();
+                        req.execution_session = (!transport.is_empty()).then_some(transport);
+                    },
+                    &cfg,
+                )
+            };
+            let conversation = format!("{unique}-{nested}-{path}");
+            let first = turn(conversation.clone(), String::new(), "user-a").await;
+            let next = turn(conversation.clone(), "transport-b".into(), "user-b").await;
+            let id = assert_session_headers(path, &first);
+            assert_eq!(id, assert_session_headers(path, &next), "{nested}: {path}");
+            let other = turn(format!("other-{conversation}"), "transport-b".into(), "user-b").await;
+            assert_ne!(id, assert_session_headers(path, &other), "{nested}: {path}");
+        }
+    }
+
+    // A session encoded in Claude metadata retains its higher priority.
+    for user in [
+        json!({"session_id": unique}).to_string(),
+        format!("user_account_session_{unique}"),
+    ] {
+        let turn = |conversation: String| {
+            let user = user.clone();
+            sent_request(
+                ACCOUNT,
+                move |req, _| {
+                    let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+                    body["metadata"] = json!({"user_id": user});
+                    body["conversation_id"] = conversation.into();
+                    req.body = serde_json::to_vec(&body).unwrap().into();
+                    req.original_body = req.body.clone();
+                },
+                &cfg,
+            )
+        };
+        assert_eq!(
+            assert_session_headers("encoded first", &turn("first".into()).await),
+            assert_session_headers("encoded next", &turn("next".into()).await),
+        );
+    }
+}
+
 /// Session retention follows the authorization root, not the reusable filename or a
 /// short-lived minted key. Caller namespaces also keep equal session names apart.
 #[tokio::test]

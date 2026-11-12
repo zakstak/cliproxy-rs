@@ -76,34 +76,17 @@ pub(crate) fn uuid_v7() -> String {
 /// Only the client's own conversation signals count (Go `extractExplicitSessionIDs`). The
 /// derived, first-messages and conversation-prefix sessions are guesses that can join
 /// unrelated clients, so a request without an explicit session is its own Muse session,
-/// as in Go v8.0.67. A plain user identity is not a conversation; in that case a
-/// transport-owned execution session can still supply the conversation identity.
+/// as in Go v8.0.67. A plain user identity is skipped while searching for a
+/// conversation, before falling back to a transport-owned execution session.
 /// Credential authorization and caller fingerprints fence retained sessions without
 /// retaining credentials. A DCA token survives ordinary minted-key refresh, whereas
 /// another account's DCA token (or a changed API key) starts a separate session.
 pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &[u8]) -> String {
-    let meta = cpa_common::session::Meta {
-        execution_session: req.execution_session.as_deref(),
-        derived: None,
-    };
-    let (explicit, _, _, source) = cpa_common::session::explicit_session(&req.headers, original, &meta);
-    let explicit = match source {
-        "header" | "metadata" | "body" | "execution" => explicit,
-        "user_id" => {
-            let execution =
-                cpa_common::session::normalize_explicit_id(req.execution_session.as_deref().unwrap_or_default());
-            if execution.is_empty() {
-                String::new()
-            } else {
-                format!("execution:{execution}")
-            }
-        }
-        _ => String::new(),
-    };
-    let explicit = explicit.trim();
-    if explicit.is_empty() {
+    let Some(info) =
+        cpa_common::session::extract_conversation_info(&req.headers, original, req.execution_session.as_deref())
+    else {
         return uuid_v7();
-    }
+    };
     let Some(authorization) = authorization_scope(credential) else {
         return uuid_v7();
     };
@@ -111,7 +94,7 @@ pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &
         credential: credential.id.clone(),
         authorization,
         caller: cpa_common::session::caller_scope(&req.caller.principal),
-        session: explicit.to_owned(),
+        session: info.session_id,
     };
     let mut sessions = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(id) = sessions.ids.get(&key) {
