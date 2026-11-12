@@ -2867,6 +2867,53 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     fake_server.abort();
 }
 
+/// xAI (v8.0.67 d65840fb, issue #85): the login saves under the identity-hashed name,
+/// keeps the operator settings of the account's v8.0.35 file, removes that file once
+/// the new one is stored, and leaves another account's file at a colliding old name.
+#[tokio::test]
+async fn xai_login_migrates_the_accounts_v8_0_35_file() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("xaimigrate");
+    let auth = f.dir.join("auth");
+    let old = json!({"type": "xai", "email": "X@example.invalid", "sub": "xai-user-1", "access_token": "old",
+        "proxy-url": "socks5://127.0.0.1:1080", "disabled": true, "priority": 7, "prefix": "team"});
+    // v8.0.35 kept the email's case in the name.
+    std::fs::write(auth.join("xai-X@example.invalid.json"), old.to_string()).unwrap();
+    // Another account owns the name this account's lowercase email had in v8.0.35
+    // (`+x@example.invalid` sanitizes to `x@example.invalid`).
+    let other = json!({"type": "xai", "email": "+x@example.invalid", "access_token": "other"});
+    std::fs::write(auth.join("xai-x@example.invalid.json"), other.to_string()).unwrap();
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=xai").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    assert_eq!(final_status(&base, &state, 10).await, json!({"status": "ok"}));
+    let mut names: Vec<String> = std::fs::read_dir(&auth)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let hashed = cpa_exec::xai_auth::credential_file_name("x@example.invalid", "xai-user-1", 0);
+    let mut want = vec!["xai-x@example.invalid.json".to_owned(), hashed.clone()];
+    want.sort();
+    assert_eq!(names, want);
+    let saved: Value = serde_json::from_slice(&std::fs::read(auth.join(&hashed)).unwrap()).unwrap();
+    for (key, want) in [
+        ("access_token", json!("fake-xai-at")),
+        ("email", json!("x@example.invalid")),
+        ("proxy_url", json!("socks5://127.0.0.1:1080")),
+        ("disabled", json!(true)),
+        ("priority", json!(7)),
+        ("prefix", json!("team")),
+    ] {
+        assert_eq!(saved[key], want, "{key}: {saved}");
+    }
+    let untouched: Value =
+        serde_json::from_slice(&std::fs::read(auth.join("xai-x@example.invalid.json")).unwrap()).unwrap();
+    assert_eq!(untouched, other);
+    server.abort();
+    fake_server.abort();
+}
+
 /// A login worker that panics fails its session at once, with a fixed message,
 /// instead of leaving the dashboard waiting until the session expires: here the panic
 /// is on the blocking task that saves the credential, which the worker passes on.
