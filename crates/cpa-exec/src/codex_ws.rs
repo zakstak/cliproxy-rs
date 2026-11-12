@@ -467,7 +467,7 @@ impl Upstream {
             Ok(Ok(Some(refusal))) => Err(WriteFailure {
                 error: refusal.error(),
                 unsent: true,
-                refusal: Some(refusal),
+                refusal: Some(Box::new(refusal)),
             }),
             Ok(Err((error, unsent))) => Err(WriteFailure {
                 unsent,
@@ -906,7 +906,7 @@ impl Pool {
                 if link.late.as_ref().is_some_and(|(_, tx)| tx.is_closed()) {
                     link.late = None;
                 }
-                return Err(InterruptError::Refused(refusal));
+                return Err(InterruptError::Refused(*refusal));
             }
             session.invalidate(&conn, &error, true);
             return Err(InterruptError::Rejected(
@@ -1054,7 +1054,7 @@ pub(crate) struct WriteFailure {
     pub(crate) unsent: bool,
     /// The client authority refused the write once the socket was ready for it; nothing
     /// was written and the socket is as it was.
-    pub(crate) refusal: Option<Refusal>,
+    pub(crate) refusal: Option<Box<Refusal>>,
 }
 
 impl WriteFailure {

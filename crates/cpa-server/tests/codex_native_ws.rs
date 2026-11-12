@@ -7598,7 +7598,11 @@ async fn an_uncertain_loss_is_never_replayed_on_another_account() {
                 assert!(got.closed.is_some(), "{case}: the loss reaches the client");
                 let dialed = log.lock().unwrap().clone();
                 assert_eq!(dialed.len(), 1, "{case}: no other account was dialed: {dialed:?}");
-                assert_eq!(dialed[0].frames, [first.clone()], "{case}: the create was sent once");
+                assert_eq!(
+                    dialed[0].frames,
+                    std::slice::from_ref(&first),
+                    "{case}: the create was sent once"
+                );
 
                 let mut socket = connect(&proxy).await;
                 socket.send(Message::text(first.clone())).await.unwrap();
