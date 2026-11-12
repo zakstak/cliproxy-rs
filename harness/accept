@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# The selective acceptance command (issue #67, H1). Runs, in order:
+#   1. the historical 50-case Claude differential against Go v8.0.10 and its evaluation,
+#   2. the selective differential (Claude, Grok, Muse) against Go v8.0.67 and its evaluation,
+#   3. the mutation control on the historical capture,
+#   4. the retained-provider cargo groups (Claude, Codex, Grok, Muse, refusals, controls),
+#      built first and then run offline in a loopback-only namespace,
+# and writes one combined receipt. Pins come from harness/manifest.json.
+#
+# Exit 0: accepted. 1: an assertion failed, a difference or skip was not named, or a
+# test failed or was missing. 2: execution was unavailable. A step that cannot run
+# never counts as a pass.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+python3 harness/manifest.py check || exit 2
+cache=harness/.cache
+receipts=()
+worst=0
+record() {  # record EXIT: keep the most severe outcome (2 > 1 > 0)
+    local code=$1
+    if ((code == 2 || (code == 1 && worst == 0))); then worst=$code; fi
+}
+latest_receipt() { ls -1t "$cache"/receipts/*-"$1".json 2>/dev/null | head -1; }
+
+captured=()
+for target in historical selective; do
+    ./harness/run --target "$target"
+    code=$?
+    if ((code != 0)); then
+        echo "differential $target: collector exit $code (execution unavailable)" >&2
+        record 2
+        continue
+    fi
+    captured+=("$target")
+    python3 harness/acceptance.py evaluate "$cache/latest-$target"
+    record $?
+    receipts+=("$(latest_receipt "differential-$target")")
+done
+# Only on a capture from this invocation, never an older run left in the cache.
+if [[ " ${captured[*]} " == *" historical "* ]]; then
+    python3 harness/acceptance.py mutation-control "$cache/latest-historical"
+    record $?
+    receipts+=("$(latest_receipt mutation-historical)")
+fi
+python3 harness/acceptance.py cargo
+record $?
+receipts+=("$(latest_receipt cargo-groups)")
+python3 harness/acceptance.py combine "${receipts[@]}"
+record $?
+exit "$worst"

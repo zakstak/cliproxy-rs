@@ -17,7 +17,8 @@ import threading
 import time
 import zlib
 
-from fixtures import CREDENTIAL, PROFILE_REPLY, TOKEN_REPLY, cases
+from fixtures import CREDENTIAL, PROFILE_REPLY, PROVIDER_KEYS, TOKEN_REPLY, cases, selective_cases
+import manifest as revisions
 from tls_capture import peek_hello
 
 
@@ -62,20 +63,35 @@ def certificates(directory):
         (directory / name).chmod(0o600)
 
 
+class Recorder:
+    """The script and observations both upstream listeners share for one case."""
+    def __init__(self):
+        self.script = {}
+        self.observations = {"go": {"tls": [], "http": [], "errors": []},
+                             "rust": {"tls": [], "http": [], "errors": []}}
+
+
+# Plain-HTTP upstream for the selective Grok and Muse cases (harness/fixtures.py
+# selective_cases): each proxy's configured base URL names its own loopback address,
+# so captures stay labelled by local destination as on the TLS listener.
+PLAIN_PORT = 8080
+PLAIN_HOSTS = {"go": f"127.0.0.2:{PLAIN_PORT}", "rust": f"127.0.0.3:{PLAIN_PORT}"}
+
+
 class FakeUpstream(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, directory):
-        super().__init__(("0.0.0.0", 443), Capture)
-        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.context.load_cert_chain(directory / "server.pem", directory / "server.key")
-        # The oracle uses HTTP/1.1; advertise only that. Capture the client's full
-        # offered ALPN, including h2, before negotiation instead of forcing it away.
-        self.context.set_alpn_protocols(["http/1.1"])
-        self.script = {}
-        self.observations = {"go": {"tls": [], "http": [], "errors": []},
-                             "rust": {"tls": [], "http": [], "errors": []}}
+    def __init__(self, directory, recorder, plain=False):
+        super().__init__(("0.0.0.0", PLAIN_PORT if plain else 443), Capture)
+        self.recorder = recorder
+        self.context = None
+        if not plain:
+            self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.context.load_cert_chain(directory / "server.pem", directory / "server.key")
+            # The oracle uses HTTP/1.1; advertise only that. Capture the client's full
+            # offered ALPN, including h2, before negotiation instead of forcing it away.
+            self.context.set_alpn_protocols(["http/1.1"])
 
 
 class Capture(socketserver.BaseRequestHandler):
@@ -83,8 +99,16 @@ class Capture(socketserver.BaseRequestHandler):
         side = {"127.0.0.2": "go", "127.0.0.3": "rust"}.get(self.request.getsockname()[0])
         if side is None:
             return
-        log = self.server.observations[side]
+        log = self.server.recorder.observations[side]
         self.request.settimeout(10)
+        if self.server.context is None:
+            try:
+                self.serve(self.request, log, {PLAIN_HOSTS[side]}, {"/v1/responses"})
+            except (socket.timeout, ConnectionResetError):
+                return
+            except Exception as exc:
+                log["errors"].append(f"{type(exc).__name__}: {exc}")
+            return
         try:
             raw, hello = peek_hello(self.request)
             if hello["sni"] not in ("api.anthropic.com", "platform.claude.com"):
@@ -101,63 +125,70 @@ class Capture(socketserver.BaseRequestHandler):
                 entry["negotiated_alpn"] = conn.selected_alpn_protocol()
                 entry["negotiated_version"] = conn.version()
                 entry["session_reused"] = conn.session_reused
-                file = conn.makefile("rb")
-                while True:
-                    line = file.readline(65537)
-                    if not line:
-                        return
-                    if len(line) > 65536:
-                        raise ValueError("request line too long")
-                    raw_headers = b""
-                    headers = []
-                    while True:
-                        header = file.readline(65537)
-                        if not header or len(header) > 65536:
-                            raise ValueError("incomplete/oversized header")
-                        raw_headers += header
-                        if header == b"\r\n":
-                            break
-                        name, value = header[:-2].split(b":", 1)
-                        headers.append([name.decode("ascii"), value.decode("latin1").strip()])
-                    lookup = {k.lower(): v for k, v in headers}
-                    if lookup.get("host") not in ("api.anthropic.com", "platform.claude.com"):
-                        raise ValueError("non-allowlisted Host")
-                    if "transfer-encoding" in lookup:
-                        raise ValueError("chunked request capture is not implemented")
-                    size = int(lookup.get("content-length", 0))
-                    if not 0 <= size <= 64 * 1024 * 1024:
-                        raise ValueError("request body too large")
-                    body = file.read(size)
-                    if len(body) != size:
-                        raise ValueError("truncated request body")
-                    capture = {"request_line": line.decode("latin1").rstrip("\r\n"), "headers": headers,
-                               "raw_head_hex": (line + raw_headers).hex(), "body_hex": body.hex(),
-                               "body_text": body.decode("utf-8", errors="replace"), "write_result": "pending"}
-                    log["http"].append(capture)
-                    path = line.split()[1].decode("ascii").split("?", 1)[0]
-                    if path == "/v1/oauth/token":
-                        script = {"status": 200, "body": TOKEN_REPLY}
-                    elif path == "/api/oauth/profile":
-                        script = {"status": 200, "body": PROFILE_REPLY}
-                    elif path == "/api/oauth/claude_cli/roles":
-                        script = {"status": 200, "body": "{}"}
-                    elif path in ("/v1/messages", "/v1/messages/count_tokens"):
-                        script = self.server.script
-                    else:
-                        raise ValueError(f"unscripted upstream path: {path}")
-                    try:
-                        self.respond(conn, script)
-                        capture["write_result"] = "complete"
-                    except (BrokenPipeError, ConnectionResetError, ssl.SSLError) as exc:
-                        capture["write_result"] = type(exc).__name__
-                        return
-                    if script.get("truncate") or script.get("close_connection"):
-                        return
+                self.serve(conn, log, {"api.anthropic.com", "platform.claude.com"},
+                           {"/v1/messages", "/v1/messages/count_tokens"})
         except (socket.timeout, ConnectionResetError):
             # Idle keep-alive close and process shutdown are not capture failures.
             return
         except Exception as exc:
             log["errors"].append(f"{type(exc).__name__}: {exc}")
+
+    def serve(self, conn, log, hosts, inference_paths):
+        """Read requests from one connection until it closes, answering each."""
+        file = conn.makefile("rb")
+        while True:
+            line = file.readline(65537)
+            if not line:
+                return
+            if len(line) > 65536:
+                raise ValueError("request line too long")
+            raw_headers = b""
+            headers = []
+            while True:
+                header = file.readline(65537)
+                if not header or len(header) > 65536:
+                    raise ValueError("incomplete/oversized header")
+                raw_headers += header
+                if header == b"\r\n":
+                    break
+                name, value = header[:-2].split(b":", 1)
+                headers.append([name.decode("ascii"), value.decode("latin1").strip()])
+            lookup = {k.lower(): v for k, v in headers}
+            if lookup.get("host") not in hosts:
+                raise ValueError("non-allowlisted Host")
+            if "transfer-encoding" in lookup:
+                raise ValueError("chunked request capture is not implemented")
+            size = int(lookup.get("content-length", 0))
+            if not 0 <= size <= 64 * 1024 * 1024:
+                raise ValueError("request body too large")
+            body = file.read(size)
+            if len(body) != size:
+                raise ValueError("truncated request body")
+            capture = {"request_line": line.decode("latin1").rstrip("\r\n"), "headers": headers,
+                       "raw_head_hex": (line + raw_headers).hex(), "body_hex": body.hex(),
+                       "body_text": body.decode("utf-8", errors="replace"), "write_result": "pending"}
+            log["http"].append(capture)
+            path = line.split()[1].decode("ascii").split("?", 1)[0]
+            if path in inference_paths:
+                script = self.server.recorder.script
+            elif self.server.context is None:
+                raise ValueError(f"unscripted upstream path: {path}")
+            elif path == "/v1/oauth/token":
+                script = {"status": 200, "body": TOKEN_REPLY}
+            elif path == "/api/oauth/profile":
+                script = {"status": 200, "body": PROFILE_REPLY}
+            elif path == "/api/oauth/claude_cli/roles":
+                script = {"status": 200, "body": "{}"}
+            else:
+                raise ValueError(f"unscripted upstream path: {path}")
+            try:
+                self.respond(conn, script)
+                capture["write_result"] = "complete"
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLError) as exc:
+                capture["write_result"] = type(exc).__name__
+                return
+            if script.get("truncate") or script.get("close_connection"):
+                return
 
     def respond(self, conn, script):
         payload = script["body"].encode()
@@ -332,12 +363,13 @@ def wait_ready(process, port, registration_log=None):
     raise TimeoutError("proxy did not become ready")
 
 
-def run_case(root, output, upstream, case):
+def run_case(root, output, recorder, case, go_binary):
     directory = output / case["name"]
     directory.mkdir()
     write_json(directory / "fixture.json", case)
-    upstream.observations = {side: {"tls": [], "http": [], "errors": []} for side in ("go", "rust")}
-    upstream.script = case["script"]
+    recorder.observations = {side: {"tls": [], "http": [], "errors": []} for side in ("go", "rust")}
+    recorder.script = case["script"]
+    provider = case.get("provider")
     processes = []
     handles = []
     ports = {"go": 18317, "rust": 18318}
@@ -358,14 +390,15 @@ def run_case(root, output, upstream, case):
                               'access:\n  api-keys: [fixture-client-key]\n'
                               f'oauth:\n  auth-dir: "{auth_dir}"\n'
                               'management:\n  disable-control-panel: true\n  disable-auto-update-panel: true\n'
-                              'routing:\n  retry:\n    request-retry: 0\n    max-retry-interval: 0\n')
+                              'routing:\n  retry:\n    request-retry: 0\n    max-retry-interval: 0\n'
+                              + provider_keys(provider, side))
             # Whitelist environment: no real credentials, storage backends, proxy
             # URLs, Home settings or unrelated runner secrets reach either proxy.
             env = {"PATH": os.defpath, "HOME": str(working), "TZ": "UTC", "LANG": "C.UTF-8",
                    "SSL_CERT_FILE": str(output / "certs" / "ca.pem"), "SSL_CERT_DIR": str(output / "empty-trust"),
                    "NO_PROXY": "*", "RUST_LOG": "off"}
             if side == "go":
-                command = [str(root / "harness/.cache/go-reference"), "-config", str(config), "-local-model"]
+                command = [str(go_binary), "-config", str(config), "-local-model"]
             else:
                 command = [str(root / "harness/rust/target/debug/cpa-differential-driver"),
                            str(config), str(output / "certs/ca.pem")]
@@ -393,7 +426,7 @@ def run_case(root, output, upstream, case):
             time.sleep(2.5)
         # Snapshot before shutdown; namespace cleanup/process exit is not cancellation.
         for side in ports:
-            observations[side]["upstream"] = copy.deepcopy(upstream.observations[side])
+            observations[side]["upstream"] = copy.deepcopy(recorder.observations[side])
             observations[side]["credential_after"] = json.loads((directory / side / "auth/fixture.json").read_text())
             write_json(directory / f"{side}.json", observations[side])
         diff = differences(comparable(observations["go"]), comparable(observations["rust"]))
@@ -401,9 +434,10 @@ def run_case(root, output, upstream, case):
         errors = [error for side in ports for error in observations[side]["upstream"]["errors"]]
         expected_traffic = not case.get("no_upstream") and case["name"] not in {
             "auth-missing", "auth-wrong", "auth-query-first", "models-openai", "models-anthropic", "disabled-credential"}
+        inference = "POST /v1/responses " if provider else "POST /v1/messages"
         if expected_traffic:
             for side in ports:
-                if not any(request["request_line"].startswith("POST /v1/messages")
+                if not any(request["request_line"].startswith(inference)
                            for request in observations[side]["upstream"]["http"]):
                     errors.append(f"{side}: fixture did not reach the inference upstream")
         if case.get("wait_refresh") and not any("/v1/oauth/token " in request["request_line"]
@@ -428,15 +462,51 @@ def run_case(root, output, upstream, case):
             handle.close()
 
 
+def provider_keys(provider, side):
+    """The selective Grok/Muse cases' one API key, at this proxy's plain upstream."""
+    if provider is None:
+        return ""
+    return (f"api-keys:\n  {provider}:\n    - name: {provider}-fixture\n"
+            f"      base-url: http://{PLAIN_HOSTS[side]}/v1\n"
+            f"      keys:\n        - api-key: {PROVIDER_KEYS[provider]}\n")
+
+
+def suite(name):
+    """The cases of a manifest suite, in order."""
+    if name == "claude-differential":
+        return cases()
+    if name == "selective-differential":
+        return cases() + selective_cases()
+    raise ValueError(f"unknown suite {name}")
+
+
+def toolchain():
+    """Versions of the tools that built and ran this capture, as reported."""
+    out = {"python": sys.version.split()[0]}
+    for name, command in [("rustc", ["rustc", "--version"]), ("cargo", ["cargo", "--version"]),
+                          ("go", ["go", "version"]), ("openssl", ["openssl", "version"])]:
+        try:
+            out[name] = subprocess.check_output(command, stderr=subprocess.STDOUT).decode().strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            out[name] = f"unavailable: {exc}"
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
+    parser.add_argument("--target", required=True, help="executed Go target in harness/manifest.json")
+    parser.add_argument("--go-binary", type=Path, required=True)
     parser.add_argument("--case", action="append", help="run only named fixture(s)")
     parser.add_argument("--strict", action="store_true", help="exit 1 if any difference remains")
     args = parser.parse_args()
     assert_isolated()
     root = args.root.resolve()
-    output = root / "harness/.cache" / ("run-" + time.strftime("%Y%m%d-%H%M%S"))
+    pins = revisions.load(revisions.suite_sizes())
+    target = pins["go"]["targets"][args.target]
+    if not target["executed"]:
+        raise ValueError(f"{args.target} is not an executed Go target")
+    output = root / "harness/.cache" / (f"run-{args.target}-" + time.strftime("%Y%m%d-%H%M%S"))
     output.mkdir()
     os.umask(0o077)
     certs = output / "certs"
@@ -446,29 +516,39 @@ def main():
     hosts = output / "hosts"
     hosts.write_text("127.0.0.1 localhost\n127.0.0.2 api.anthropic.com platform.claude.com\n")
     subprocess.run(["mount", "--bind", str(hosts), "/etc/hosts"], check=True)
-    selected = [case for case in cases() if not args.case or case["name"] in args.case]
+    selected = [case for case in suite(target["suite"]) if not args.case or case["name"] in args.case]
     if not selected or (args.case and set(args.case) - {case["name"] for case in selected}):
         raise ValueError("unknown or empty case selection")
     results = []
-    with FakeUpstream(certs) as upstream:
-        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    recorder = Recorder()
+    with FakeUpstream(certs, recorder) as tls, FakeUpstream(certs, recorder, plain=True) as plain:
+        for server in (tls, plain):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
         for case in selected:
-            result = run_case(root, output, upstream, case)
+            result = run_case(root, output, recorder, case, args.go_binary)
             results.append(result)
             print(f"{result['name']}: Go {result['go_status']} Rust {result['rust_status']}; "
                   f"{result['differences']} differing fields", flush=True)
-        upstream.shutdown()
+        tls.shutdown()
+        plain.shutdown()
     failed = any(result["capture_errors"] or result["transport_errors"] for result in results)
-    summary = {"reference": "6fecc6e5567912661654a4eaf9b8f5436facd1c2", "cases": results,
+    summary = {"target": args.target, "tag": target["tag"], "reference": target["commit"],
+               "role": target["role"], "suite": target["suite"],
+               "suite_cases": [case["name"] for case in suite(target["suite"])],
+               "selected": [case["name"] for case in selected], "cases": results,
+               "toolchain": toolchain(),
+               "rust_worktree_clean": not subprocess.check_output(
+                   ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"]).strip(),
                "rust_revision": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip(),
                "isolation": "new user/net/mount/pid namespace; loopback only; egress ENETUNREACH",
                "normalizations": ["downstream Date value only", "raw TLS random/session/key/PSK bytes not compared"],
                "infrastructure_failed": failed}
     write_json(output / "summary.json", summary)
-    latest = root / "harness/.cache/latest"
-    if latest.is_symlink():
-        latest.unlink()
-    latest.symlink_to(output.name)
+    for name in ("latest", f"latest-{args.target}"):
+        latest = root / "harness/.cache" / name
+        if latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(output.name)
     # Test keys are disposable. Retain public test CA/server certificates only.
     for key in certs.glob("*.key"):
         key.unlink()

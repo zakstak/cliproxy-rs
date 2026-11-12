@@ -3,12 +3,31 @@
 From the repository root, run:
 
 ```sh
-./harness/run
+./harness/accept                      # the acceptance command: every step below, one verdict
+./harness/run                         # capture only: historical target
+./harness/run --target selective      # capture only: selective target
 ```
 
-The command clones and builds the **unmodified** Go reference at
-`6fecc6e5567912661654a4eaf9b8f5436facd1c2`, builds the Rust test driver, runs collector
-regression tests, and starts both proxies against one scripted local TLS upstream.
+## Revisions
+
+[`manifest.json`](manifest.json) is the one revision manifest. `manifest.py check` refuses it
+when a pin disagrees with the source it mirrors: the CI Rust toolchain, the Codex fixture
+manifest and `FIRST_PARTY_COMMIT`, or the fixture counts.
+
+| Target | Go revision | Role | Suite |
+| --- | --- | --- | --- |
+| `historical` | v8.0.10, `6fecc6e5567912661654a4eaf9b8f5436facd1c2` | The revision the 50 Claude cases were recorded against | 50 Claude cases (`cases()`) |
+| `policy` | v8.0.35, `ae3ee3be303fb07fb8173279923413005bf32177` | AGENTS.md's frozen default reference; not run by the harness | none |
+| `selective` | v8.0.67, `8bba7a77c6bcbfd993516d26606bfecaa4ff49d0` | Separate selective comparison ([ledger](../docs/parity-audit/selective-v8.0.67.md)) | the 50 cases plus 12 Grok and Muse cases (`selective_cases()`) |
+
+No target is a relabelled copy of another, and no golden fixture changes provenance. Codex
+has no Go target. Its contract is first-party `openai/codex` at `44ccf394573c`, checked by
+the `codex-contract` cargo group.
+
+For each executed target, `run` clones and builds the **unmodified** Go revision. It also
+builds the Rust test driver, runs the collector's regression tests, and starts both proxies
+against one scripted local TLS upstream. The selective Grok and Muse cases add a plain-HTTP
+loopback upstream.
 No production source or workspace manifest is changed. The Rust driver uses the
 production config loader, credential loader, runtime, routes and Claude executor;
 `ClaudeExecutor::with_hooks` injects test trust and dial routing only. It is not a
@@ -33,7 +52,7 @@ remain first-party, including OAuth refresh. TLS verification stays enabled usin
 an ephemeral test CA, not an insecure TLS setting. No real credentials are read.
 Each proxy gets a whitelist-only environment and its own generated working/auth
 directory. The input credentials, caller key, device/account identity and request
-bytes are identical. Config differs only in bind port and writable auth path.
+bytes are identical. Config differs only in bind port and writable auth path, and, for the selective Grok and Muse cases, in the loopback address of the configured base URL (`127.0.0.2` for Go, `127.0.0.3` for Rust).
 
 The Go binary's unrelated background update attempts can appear as denied network
 errors in its log. They cannot leave the network namespace. `-local-model` and
@@ -45,16 +64,65 @@ An existing clean reference checkout can avoid cloning:
 
 ```sh
 CPA_GO_REFERENCE=/absolute/path/to/CLIProxyAPI ./harness/run
+CPA_GO_REFERENCE_SELECTIVE=/absolute/path/to/CLIProxyAPI-v8.0.67 ./harness/run --target selective
 ```
 
-The wrapper refuses a different revision, modifications or untracked files. It never
+Without them, the historical checkout is `harness/.cache/CLIProxyAPI` and the selective one
+`harness/.cache/CLIProxyAPI-8bba7a77`. The wrapper refuses a different revision, modifications
+or untracked files, including any the Go build itself would leave. It never
 changes an existing reference checkout. Build output goes in `harness/.cache/`
 and `harness/rust/target/`, both ignored by Git. The driver's separate workspace
 and lockfile keep Go/network requirements out of `cargo test --workspace`.
 
+## Acceptance
+
+`./harness/accept` runs both differential targets, evaluates each, applies the mutation
+control, runs the cargo groups and combines their receipts. `acceptance.py` decides; the
+collector only records. A capture without semantic assertions is never a pass.
+
+- **Semantic assertions** per case, Go against Rust: status, content type, inference
+  traffic (a refused client or unusable credential must reach no provider), request lines,
+  ordered upstream headers with generated values masked, upstream body bytes and meaning,
+  downstream field values (case-insensitive), downstream body bytes and meaning (SSE event
+  types, text and terminal marker; JSON without generated IDs).
+- **Credential isolation** is absolute: no client key upstream and no upstream secret
+  downstream. No divergence can excuse it.
+- **Named divergences**: every raw collector difference must match a manifest entry for its
+  target and case, by path. An entry can also excuse a named assertion, downstream field,
+  upstream header or upstream body pattern. Kinds: `pending-feature` and `deferred-feature`
+  (with the owning issue), `documented-difference` (with its ledger entry), `later-reference`
+  (historical only, with Go evidence), `nondeterministic`, `harness-boundary` and
+  `unclassified` (still names an issue; stays visible in every receipt). An entry that matches
+  nothing in a complete run is stale and fails, unless it is marked `may_be_absent`.
+- **Skips**: a suite case that did not run fails unless the manifest's `skips` names it with
+  a reason and issue.
+- **Cargo groups**: `claude-router`, `codex-contract`, `xai`, `meta`, `refusals` and `controls`
+  list exact test names. They are built first and then run offline in a loopback-only namespace
+  (`ui/scripts/isolated.sh`, caller uid) with `CPA_TEST_NO_SKIP=1`. A missing, ignored or
+  failing test fails the group, and so does an unlisted test in a target the harness owns
+  (`tests/retained_providers.rs`).
+- **Mutation control**: the evaluator re-runs on copies of the historical `buffered` capture
+  with one Rust-side change each: upstream `max_tokens`, downstream status, a forwarded client
+  key, downstream text. Each must fail, otherwise the control fails.
+  `the_semantic_checks_reject_a_mutated_capture` does the same for the Rust contract checks.
+
+Receipts go to `harness/.cache/receipts/`. Each records the Go and Rust revisions, whether the
+Rust worktree was clean, the toolchain, case counts, passes, failures, named and unknown skips,
+divergence hits and stale entries. The `combine` receipt requires all four kinds. Exit codes:
+0 accepted, 1 failed, 2 execution unavailable.
+
+```sh
+python3 harness/acceptance.py evaluate harness/.cache/latest-selective
+python3 harness/acceptance.py cargo --group xai --group meta
+python3 harness/manifest.py check
+```
+
+Committed receipts live in [`evidence/receipts/`](evidence/receipts/).
+
 ## Results and exit codes
 
-`harness/.cache/latest` points to the last completed run. Each fixture directory
+`harness/.cache/latest` points to the last completed run, and `latest-historical` and
+`latest-selective` to the last run of each target. Each fixture directory
 contains `fixture.json`, `go.json`, `rust.json`, and `diff.json`, plus per-proxy
 config, fake auth file and process log. `summary.json` lists statuses, difference
 counts and capture/transport errors. Review all differences, not just statuses:
@@ -70,7 +138,8 @@ Raw ClientHello TLS records, raw HTTP request heads, exact upstream body bytes,
 downstream status/header/body bytes and chunked transfer framing are retained as
 hex. Ordered/cased headers and parsed TLS fields are also readable JSON. JA3 and
 JA4 are calculated from the observed ClientHello, not the advertised User-Agent.
-The harness has 57 cases (`cases()` in `fixtures.py`). The committed
+The historical suite has 50 Claude cases (`cases()` in `fixtures.py`); the selective suite
+adds 12 Grok and Muse cases (`selective_cases()`). The committed
 [evidence archive](evidence/2026-10-02.json.gz) is from the first baseline run, when
 there were 33 cases, and holds their fixtures, observations, diffs and summary; use
 `gzip -dc` and `jq` to inspect it offline.
@@ -80,7 +149,7 @@ The collector's Go-derived 508-byte fixture asserts JA3
 Forced reconnect captures both cold and resumed handshakes, including PSK identity
 and binder lengths and server-confirmed session reuse.
 
-Exit **0** means capture completed, **not** parity. Exit **1**, with `--strict`,
+For `run`, exit **0** means capture completed, **not** parity; use `accept` for a verdict. Exit **1**, with `--strict`,
 means at least one captured field differs. Exit **2** means a prerequisite,
 capture or transport failure; an unexpected startup failure also exits nonzero.
 Cases that should exercise inference require an observed upstream request, so a
@@ -119,8 +188,10 @@ and Anthropic quota headers, declared/unlabelled gzip, gzip SSE, deflate,
 model catalog negotiation, auth failures/query precedence, disabled credentials,
 expired-token refresh, two-turn continuity, and TLS reconnect/resumption.
 
-This is a Claude-first tested slice, not full drop-in parity. It does not exercise
-Management v8, other providers/translations, OAuth login/code exchange, concurrent
+This is a Claude-first tested slice, not full drop-in parity. Grok and Muse are compared
+on Responses, Chat Completions and Messages over a plain-HTTP upstream only; Codex is
+covered by its contract tests, not by Go. It does not exercise
+Management v8, other translations, OAuth login/code exchange, concurrent
 refresh, credential deletion races, multi-credential retries/cooldowns, HTTP/2
 upstream requests, chunked upstream request bodies, proxy transport modes,
 Brotli/zstd, TLS 1.2 or performance/timing parity. The upstream intentionally
