@@ -560,3 +560,159 @@ async fn model_scoped_exhaustion_shares_its_key_and_spares_siblings() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sol review of #136, through the credential store a request uses: a forced 60 s
+/// bounded window survives a shorter ordinary answer and then `disable-cooling`; a
+/// credential-wide 429 keeps a model's own forced deadline; a key migration keeps a
+/// live probe reservation.
+mod store_witnesses {
+    use super::*;
+    use cpa_core::exec::{ExecError, FailureScope};
+    use cpa_server::runtime::{CredentialStore, Outcome, Selection};
+    use cpa_server::scheduler::Policy;
+
+    fn credential(dir: &Path, rule: Value) -> Credential {
+        let meta = json!({"type": "claude", "api_key": "FAKE", "request_scoped_errors": rule});
+        Credential::from_file(dir, &dir.join("a.json"), meta.as_object().unwrap().clone()).unwrap()
+    }
+
+    fn failure(status: u16, scope: FailureScope, text: &str, retry: Option<u64>) -> Outcome {
+        let mut e = ExecError::local(status, scope, text.to_owned());
+        e.retry_after = retry.map(Duration::from_secs);
+        Outcome::Failure(e)
+    }
+
+    fn cooling_off(c: &Credential) -> Credential {
+        let mut off = c.clone();
+        off.metadata.insert("disable_cooling".into(), true.into());
+        off
+    }
+
+    #[test]
+    fn a_shorter_ordinary_answer_never_cuts_a_forced_deadline() {
+        let dir = auth_dir("store-forced");
+        let c = credential(
+            &dir,
+            json!([{"status": 429, "match": ["forced"], "action": "stop-and-cooldown"}]),
+        );
+        let store = CredentialStore::new(vec![c.clone()]);
+        let p = Arc::new(Policy {
+            max_trusted_cooldown: Duration::from_secs(60),
+            ..Policy::default()
+        });
+        let admit = |_: &Credential| Some("m".to_owned());
+        let forced = store
+            .select_with(Selection::new("claude", "m"), p.clone(), &admit)
+            .unwrap();
+        let ordinary = store.select_with(Selection::new("claude", "m"), p, &admit).unwrap();
+        forced.complete(failure(429, FailureScope::Model, "forced", Some(3600)));
+        ordinary.complete(failure(429, FailureScope::Model, "ordinary", Some(10)));
+        let states = store.cooldowns(&c.id);
+        assert!(states[0].remaining > Duration::from_secs(50), "{states:?}");
+        store.upsert(cooling_off(&c));
+        let states = store.cooldowns(&c.id);
+        assert!(
+            states.len() == 1 && states[0].remaining > Duration::from_secs(50) && !states[0].quota,
+            "the forced portion, no ordinary quota window: {states:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_credential_quota_keeps_a_models_forced_deadline() {
+        for (scope, retry) in [(FailureScope::Credential, 3600), (FailureScope::Model, 1800)] {
+            let dir = auth_dir(&format!("store-account-{scope:?}"));
+            let c = credential(
+                &dir,
+                json!([{"status": 503, "match": ["forced"], "action": "stop-and-cooldown"}]),
+            );
+            let store = CredentialStore::new(vec![c.clone()]);
+            let p = Arc::new(Policy::default());
+            let admit = |_: &Credential| Some("m".to_owned());
+            let forced = store
+                .select_with(Selection::new("claude", "m"), p.clone(), &admit)
+                .unwrap();
+            let ordinary = store.select_with(Selection::new("claude", "m"), p, &admit).unwrap();
+            forced.complete(failure(503, FailureScope::Model, "forced", None));
+            ordinary.complete(failure(429, scope, "ordinary", Some(retry)));
+            store.upsert(cooling_off(&c));
+            let states = store.cooldowns(&c.id);
+            assert_eq!(
+                states.len(),
+                1,
+                "{scope:?}: only the model's forced portion: {states:?}"
+            );
+            assert_eq!(states[0].model, "m", "{scope:?}");
+            assert!(
+                states[0].remaining > Duration::from_secs(50) && states[0].remaining <= Duration::from_secs(60),
+                "{scope:?}: {states:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_key_migration_keeps_a_live_probe_reservation() {
+        use cpa_server::cooldown_store::{Quota, Record};
+        let dir = auth_dir("store-probe");
+        let config = Config::parse(&format!(
+            "auth-dir: {}\nclaude-api-key:\n  - api-key: FAKE\n    base-url: http://127.0.0.1:9\n    \
+             models: [{{name: M, alias: m}}]\n",
+            dir.display()
+        ))
+        .unwrap();
+        let configured = cpa_core::config::credentials::load(&config).remove(0);
+        let mut c = configured.clone();
+        c.metadata.remove("models");
+        c.metadata.remove("model_aliases");
+        let now = SystemTime::now();
+        let record = |model: &str, secs: u64, bounded: bool| Record {
+            provider: "claude".into(),
+            auth_id: c.id.clone(),
+            model: model.into(),
+            status: "cooling".into(),
+            next_retry_after: Some(now + Duration::from_secs(secs)),
+            quota: if bounded {
+                Quota {
+                    exceeded: true,
+                    reason: "quota".into(),
+                    next_recover_at: Some(now + Duration::from_secs(3600)),
+                    trust_windows: Some(1),
+                    ..Default::default()
+                }
+            } else {
+                Quota::default()
+            },
+            ..Default::default()
+        };
+        cpa_server::cooldown_store::save(&dir, vec![record("m", 1, true), record("M", 2, false)], now).unwrap();
+        let store = CredentialStore::new(vec![c]);
+        store.configure_cooldown_store(Some(dir.clone()));
+        std::thread::sleep(Duration::from_millis(1100));
+        let p = Arc::new(Policy::default());
+        let first = store
+            .select_with(Selection::new("claude", "m"), p.clone(), &|_: &Credential| {
+                Some("m".into())
+            })
+            .expect("the bounded window's probe");
+        assert!(
+            store
+                .select_with(Selection::new("claude", "m"), p.clone(), &|_: &Credential| Some(
+                    "m".into()
+                ))
+                .is_err(),
+            "control: one probe at a time"
+        );
+        store.upsert(configured);
+        assert_eq!(
+            store.cooldowns(&first.credential.id).len(),
+            1,
+            "control: the keys merged"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        let second = store.select_with(Selection::new("claude", "M"), p, &|_: &Credential| Some("M".into()));
+        assert!(second.is_err(), "the migration kept the live probe reservation");
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

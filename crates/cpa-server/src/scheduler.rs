@@ -631,23 +631,37 @@ pub(crate) struct QuotaKind {
 }
 
 impl Cooldown {
-    /// Reduces this cooldown to its live forced portion (Go
-    /// `clearDisabledCooldownStateForAuth`): the forced deadline, without an ordinary
-    /// extension or the quota window, bounded trust and evidence that belonged to the
-    /// longer ordinary deadline. False when nothing forced is live.
+    /// Reduces this cooldown to exactly its live forced portion (Go
+    /// `clearDisabledCooldownStateForAuth`): the forced deadline, without the ordinary
+    /// quota window, bounded trust and evidence that belonged to ordinary answers. A live
+    /// probe reservation stays with its generation, so its own lease still answers it
+    /// and an older one cannot. False when nothing forced is live.
     fn keep_forced_portion(&mut self, now: Instant) -> bool {
         let Some(force) = self.force_until.filter(|f| *f > now) else {
             return false;
         };
-        if self.deadline > force {
-            self.deadline = force;
-            self.trust = Trust::default();
-            self.quota = false;
-            self.quota_kind = None;
-            self.signals.clear();
-            self.signals_account.clear();
-        }
+        self.deadline = force;
+        let reservation = self.trust.probe.filter(|p| *p > now);
+        self.trust = Trust {
+            generation: if reservation.is_some() {
+                self.trust.generation
+            } else {
+                0
+            },
+            probe: reservation,
+            ..Trust::default()
+        };
+        self.quota = false;
+        self.quota_kind = None;
+        self.quota_under = None;
+        self.signals.clear();
+        self.signals_account.clear();
         true
+    }
+
+    /// The live forced deadline, which no ordinary answer may undercut.
+    fn live_force(&self, now: Instant) -> Option<Instant> {
+        self.force_until.filter(|f| *f > now)
     }
 
     /// The live quota block this entry is or carries.
@@ -713,8 +727,11 @@ impl Cooldown {
     /// lease's answer does not answer it.
     fn newer_than(&self, picked: u32) -> bool {
         // Serial-number order, so the wrapping counter compares right while a lease is
-        // fewer than 2^31 generations old.
-        (self.trust.bounded || self.trust.accepted) && (self.trust.generation.wrapping_sub(picked) as i32) > 0
+        // fewer than 2^31 generations old. A probe reservation counts by itself: one
+        // carried over a merge or a forced reduction keeps its gate without the bounded
+        // window it was reserved on (#95). Before, a reservation implied `bounded`.
+        (self.trust.bounded || self.trust.accepted || self.trust.probe.is_some())
+            && (self.trust.generation.wrapping_sub(picked) as i32) > 0
     }
 }
 
@@ -1518,7 +1535,8 @@ impl Scheduler {
                             // moves the probe up to it.
                             let reset = now.checked_add(stated);
                             let old = window.deadline;
-                            let deadline = reset.map_or(old, |r| old.min(r));
+                            // An earlier reset never undercuts a live forced deadline.
+                            let deadline = reset.map_or(old, |r| old.min(r)).max(prev_force.unwrap_or(now));
                             let mut window_trust = window.trust;
                             if let Some(slot) = self.cooldowns.get_mut(&key) {
                                 slot.deadline = deadline;
@@ -1535,7 +1553,7 @@ impl Scheduler {
                                 // independent cooldowns stand.
                                 for ((id, m), state) in &mut self.cooldowns {
                                     if *id == c.id && !m.is_empty() && state.trust.bounded && state.deadline == old {
-                                        state.deadline = deadline;
+                                        state.deadline = deadline.max(state.live_force(now).unwrap_or(deadline));
                                         state.trust.stated = window_trust.stated;
                                         state.trust.window = state.trust.window.max(window_trust.window);
                                     }
@@ -1603,7 +1621,8 @@ impl Scheduler {
             return;
         };
         // This failure's own forced deadline, merged with a live one it does not shorten.
-        let force = action.force_cooldown.then_some(next).max(prev_force);
+        let this_force = action.force_cooldown.then_some(next);
+        let force = this_force.max(prev_force);
         let deadline = prev_live.map_or(next, |p| p.max(next));
         // An answer from a request already in flight (a 503, a 401) inside a live bounded
         // quota window that outlasts it: the window stands as it is, quota and all, so
@@ -1702,6 +1721,10 @@ impl Scheduler {
                     .filter(|s| s.deadline > now)
                     .map_or(deadline, |s| s.deadline);
                 let own_trust = self.cooldowns.get(&own).map(|s| s.trust).unwrap_or_default();
+                // The model's own live forced deadline stays with it; the credential's
+                // force (or its absence) is not the model's (#95).
+                let own_force = this_force.max(self.cooldowns.get(&own).and_then(|s| s.live_force(now)));
+                let own_deadline = own_deadline.max(own_force.unwrap_or(own_deadline));
                 let own_evidence = self
                     .cooldowns
                     .get(&own)
@@ -1727,6 +1750,7 @@ impl Scheduler {
                     own_state.trust = provenance(deadline);
                 }
                 own_state.trust.window = own_state.trust.window.max(own_window);
+                own_state.force_until = own_force;
                 self.cooldowns.insert(own, own_state);
             }
         }
@@ -2026,6 +2050,12 @@ impl Scheduler {
             trust.generation = self.generation;
         }
         let (quota, status, credential) = quota;
+        // The restored forced deadline (never shortened by a live one), which no deadline
+        // restored with it undercuts.
+        let restored_force = force
+            .map(|f| now + f.duration_since(wall).unwrap_or_default())
+            .max(prev_force);
+        let deadline = deadline.max(restored_force.unwrap_or(deadline));
         // The evidence follows the entry that supplies the deadline; a saved file is
         // sanitized again, so it can restore nothing a 429 could not have recorded.
         let account = evidence_account(c);
@@ -2065,9 +2095,7 @@ impl Scheduler {
                 recorded,
                 signals,
                 signals_account,
-                force_until: force
-                    .map(|f| now + f.duration_since(wall).unwrap_or_default())
-                    .max(prev_force),
+                force_until: restored_force,
             },
         );
         true
@@ -2080,7 +2108,7 @@ impl Scheduler {
     /// moves onto another model: an alias recorded before its mapping existed was
     /// earned by sending the alias itself and stays where it is. Two entries for one key
     /// merge ([`merge_cooldowns`]). Returns whether anything moved.
-    pub fn migrate_model_keys(&mut self, c: &Credential, key_of: impl Fn(&str) -> String) -> bool {
+    pub fn migrate_model_keys(&mut self, c: &Credential, key_of: impl Fn(&str) -> String, now: Instant) -> bool {
         use cpa_core::gostr::GoStr;
         let moves: Vec<(String, String)> = self
             .cooldowns
@@ -2098,7 +2126,7 @@ impl Scheduler {
             };
             let key = (c.id.clone(), to.clone());
             let merged = match self.cooldowns.remove(&key) {
-                Some(existing) => merge_cooldowns(existing, moved),
+                Some(existing) => merge_cooldowns(existing, moved, now),
                 None => moved,
             };
             self.cooldowns.insert(key, merged);
@@ -2124,9 +2152,9 @@ impl Scheduler {
             if !c.disabled && !policy.cooling_disabled(c) {
                 return true;
             }
-            let before = (s.deadline, s.trust);
+            let before = (s.deadline, s.trust, s.quota);
             let keep = !c.disabled && s.keep_forced_portion(now);
-            changed |= !keep || before != (s.deadline, s.trust);
+            changed |= !keep || before != (s.deadline, s.trust, s.quota);
             keep
         });
         changed
@@ -2145,12 +2173,26 @@ impl Scheduler {
 /// Two cooldowns of one key after a migration (Go `mergeModelState`): the entry with
 /// the later deadline keeps its provenance, quota kind and evidence, which belong to that
 /// deadline; the forced deadline, backoff level and dispatch watermark keep the most of
-/// both, so neither is shortened.
-fn merge_cooldowns(a: Cooldown, b: Cooldown) -> Cooldown {
+/// both, so neither is shortened. A live probe reservation is protection, not
+/// provenance: the later-ending one stays, with the newer of the two generations, so
+/// the deadline owner never frees it and an older lease cannot answer it (#95).
+fn merge_cooldowns(a: Cooldown, b: Cooldown, now: Instant) -> Cooldown {
     let (mut owner, other) = if b.deadline > a.deadline { (b, a) } else { (a, b) };
     owner.force_until = owner.force_until.max(other.force_until);
     owner.level = owner.level.max(other.level);
     owner.recorded = owner.recorded.max(other.recorded);
+    owner.trust.window = owner.trust.window.max(other.trust.window);
+    let live = |t: &Trust| t.probe.filter(|p| *p > now);
+    if let Some(held) = live(&other.trust).filter(|p| live(&owner.trust).is_none_or(|own| p > &own)) {
+        owner.trust.probe = Some(held);
+        let (g, o) = (owner.trust.generation, other.trust.generation);
+        if (o.wrapping_sub(g) as i32) > 0 {
+            owner.trust.generation = o;
+        }
+    }
+    if let Some(force) = owner.live_force(now) {
+        owner.deadline = owner.deadline.max(force);
+    }
     owner
 }
 
@@ -4277,7 +4319,7 @@ mod tests {
                 _ => m.to_owned(),
             }
         };
-        assert!(s.migrate_model_keys(&c, key_of));
+        assert!(s.migrate_model_keys(&c, key_of, now));
         let mut keys: Vec<&str> = s.cooldowns.keys().map(|(_, m)| m.as_str()).collect();
         keys.sort();
         assert_eq!(keys, ["Claude-Opus-4-6", "Claude-\u{d6}pus", "claude-k", "opus"]);
@@ -4287,7 +4329,7 @@ mod tests {
             "the later deadline"
         );
         assert_eq!(s.wait(&c, "opus", now), Some(secs(1200)), "another name stays");
-        assert!(!s.migrate_model_keys(&c, key_of), "idempotent");
+        assert!(!s.migrate_model_keys(&c, key_of, now), "idempotent");
         // The forced deadline merged in survives cooling being turned off.
         let mut off = cred("a", serde_json::json!({"request_scoped_errors": rule}));
         off.metadata.insert("disable_cooling".into(), true.into());
@@ -4296,12 +4338,188 @@ mod tests {
         // A target that does not map to itself is never moved to.
         let mut s = Scheduler::default();
         s.record(&c, "Claude-X", &fail(429, "limit", 600), &p, now);
-        assert!(!s.migrate_model_keys(&c, |m| if m == "Claude-X" {
-            "claude-x".into()
-        } else {
-            "elsewhere".into()
-        }));
+        assert!(!s.migrate_model_keys(
+            &c,
+            |m| if m == "Claude-X" {
+                "claude-x".into()
+            } else {
+                "elsewhere".into()
+            },
+            now
+        ));
         assert_eq!(s.wait(&c, "Claude-X", now), Some(secs(600)));
+    }
+
+    /// Sol review of #136 (finding 1): an ordinary 429 answering inside a live bounded
+    /// window moves the probe up to its earlier reset, but never below a live forced
+    /// deadline, on the key or on a model key that inherited the credential window;
+    /// turning cooling off then keeps exactly the forced portion, without the ordinary
+    /// quota window. Without a forced deadline the earlier reset still applies.
+    #[test]
+    fn an_ordinary_answer_never_undercuts_a_live_forced_deadline() {
+        use std::sync::Arc;
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let rule = serde_json::json!([{"status": 429, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let c = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        let limit = |scope: FailureScope, text: &str, retry: u64| {
+            let mut e = ExecError::local(429, scope, text.to_owned());
+            e.retry_after = Some(secs(retry));
+            Outcome::Failure(e)
+        };
+        let mut s = Scheduler::default();
+        s.record(&c, "m", &limit(FailureScope::Model, "forced", 3600), &p, now);
+        assert_eq!(s.wait(&c, "m", now), Some(secs(60)), "a forced bounded window");
+        s.record(&c, "m", &limit(FailureScope::Model, "slow down", 10), &p, now);
+        assert_eq!(
+            s.wait(&c, "m", now),
+            Some(secs(60)),
+            "the earlier ordinary reset stops at the forced deadline"
+        );
+        let mut off = c.clone();
+        off.metadata.insert("disable_cooling".into(), true.into());
+        let off = Arc::new(off);
+        assert!(s.clear_disabled(std::slice::from_ref(&off), &p, now));
+        assert_eq!(s.wait(&off, "m", now), Some(secs(60)));
+        let saved = s.records(&off, now, wall).remove(0);
+        assert_eq!(saved.force_cooldown_until, Some(wall + secs(60)));
+        assert!(!saved.quota.exceeded, "no ordinary quota window");
+        // A model key that inherited a credential window keeps its own forced deadline
+        // when that window moves up.
+        let mut s = Scheduler::default();
+        s.record(&c, "m", &limit(FailureScope::Credential, "slow down", 3600), &p, now);
+        s.record(&c, "m", &limit(FailureScope::Model, "forced", 3600), &p, now);
+        s.record(&c, "m", &limit(FailureScope::Credential, "slow down", 10), &p, now);
+        assert_eq!(s.wait(&c, "", now), Some(secs(10)), "the credential window moved up");
+        assert_eq!(
+            s.wait(&c, "m", now),
+            Some(secs(60)),
+            "the model's forced deadline stands"
+        );
+        // Control: without a forced deadline the earlier reset applies.
+        let plain = cred("b", serde_json::json!({}));
+        let mut s = Scheduler::default();
+        s.record(&plain, "m", &limit(FailureScope::Model, "slow down", 3600), &p, now);
+        s.record(&plain, "m", &limit(FailureScope::Model, "slow down", 10), &p, now);
+        assert_eq!(s.wait(&plain, "m", now), Some(secs(10)));
+    }
+
+    /// Sol review of #136 (finding 2): a credential-wide 429 rewrites the failing
+    /// model's own state, which keeps its own live forced deadline; the credential key
+    /// and a sibling model get no force they did not earn, so turning cooling off keeps
+    /// the model's forced portion and nothing else.
+    #[test]
+    fn a_credential_quota_keeps_the_models_own_forced_deadline() {
+        use std::sync::Arc;
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let p = Policy::default();
+        let rule = serde_json::json!([{"status": 503, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let c = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        let fail = |status: u16, scope: FailureScope, text: &str, retry: u64| {
+            let mut e = ExecError::local(status, scope, text.to_owned());
+            e.retry_after = (retry > 0).then(|| secs(retry));
+            Outcome::Failure(e)
+        };
+        let mut s = Scheduler::default();
+        s.record(&c, "x", &fail(429, FailureScope::Model, "slow down", 600), &p, now);
+        s.record(&c, "m", &fail(503, FailureScope::Model, "forced", 0), &p, now);
+        assert_eq!(s.wait(&c, "m", now), Some(secs(60)));
+        s.record(
+            &c,
+            "m",
+            &fail(429, FailureScope::Credential, "slow down", 1800),
+            &p,
+            now,
+        );
+        assert_eq!(s.wait(&c, "m", now), Some(secs(1800)));
+        let forced: Vec<(String, Option<SystemTime>)> = s
+            .records(&c, now, wall)
+            .into_iter()
+            .map(|r| (r.model, r.force_cooldown_until))
+            .collect();
+        assert_eq!(
+            forced,
+            [
+                (String::new(), None),
+                ("m".to_owned(), Some(wall + secs(60))),
+                ("x".to_owned(), None),
+            ],
+            "only the model keeps a forced deadline"
+        );
+        let mut off = c.clone();
+        off.metadata.insert("disable_cooling".into(), true.into());
+        let off = Arc::new(off);
+        assert!(s.clear_disabled(std::slice::from_ref(&off), &p, now));
+        assert_eq!(s.wait(&off, "m", now), Some(secs(60)), "the model's forced portion");
+        assert_eq!(s.wait(&off, "x", now), None, "no force introduced");
+        assert_eq!(
+            s.records(&off, now, wall)
+                .into_iter()
+                .map(|r| r.model)
+                .collect::<Vec<_>>(),
+            ["m"]
+        );
+    }
+
+    /// Sol review of #136 (finding 3): when a migration merges two keys, a live probe
+    /// reservation on either one survives, whichever owns the later deadline, in both
+    /// collision orders and with equal deadlines. Its own lease frees it, an older lease
+    /// cannot, and it still ends when the hold expires.
+    #[test]
+    fn a_key_merge_keeps_a_live_probe_reservation() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let bounded = {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = |hint: u64| {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(hint));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String {
+            if m.eq_ignore_ascii_case("m") {
+                "M".into()
+            } else {
+                m.to_owned()
+            }
+        };
+        let t1 = t0 + secs(61);
+        // (reserved key, other key, other deadline from t0)
+        for (reserved, other, other_secs) in [("m", "M", 65), ("M", "m", 65), ("m", "M", 60), ("M", "m", 60)] {
+            let case = format!("reserved {reserved}, other {other} at {other_secs}s");
+            let setup = || {
+                let mut s = Scheduler::default();
+                s.record(&c, reserved, &bounded, &p, t0);
+                s.record(&c, other, &transient(other_secs), &p, t0);
+                let g = s.reserve_probe(&c, reserved, t1);
+                assert!(s.wait(&c, reserved, t1).is_some(), "{case}: the probe is held");
+                assert!(s.migrate_model_keys(&c, key_of, t1), "{case}");
+                assert_eq!(s.cooldowns.len(), 1, "{case}: one key");
+                (s, g)
+            };
+            let (s, _) = setup();
+            let held = t0 + secs(70);
+            assert!(s.wait(&c, "M", held).is_some(), "{case}: still held after the deadline");
+            assert!(!s.retry_eligible(&c, "M", held), "{case}");
+            assert_eq!(s.wait(&c, "M", t1 + secs(31)), None, "{case}: the hold expires");
+            // An older lease's answer neither frees the hold nor ends the entry.
+            let (mut s, g) = setup();
+            s.record_picked(&c, "M", &Outcome::Success, &p, g.wrapping_sub(1), held);
+            assert!(s.wait(&c, "M", held).is_some(), "{case}: an older lease cannot free it");
+            // The reserving lease's answer does.
+            s.record_picked(&c, "M", &Outcome::Success, &p, g, held);
+            assert_eq!(s.wait(&c, "M", held), None, "{case}: its own lease frees it");
+        }
     }
 
     #[test]

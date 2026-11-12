@@ -1627,8 +1627,9 @@ impl CredentialStore {
         let inner = self.read();
         let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
         let mut moved = false;
+        let now = Instant::now();
         for c in &inner.creds {
-            moved |= scheduler.migrate_model_keys(c, |m| crate::registry::cooldown_key(&aliases, c, m));
+            moved |= scheduler.migrate_model_keys(c, |m| crate::registry::cooldown_key(&aliases, c, m), now);
         }
         moved
     }
