@@ -1088,11 +1088,18 @@ fn ready<'a>(
             .filter_map(|(c, m)| scheduler.last_error(c, m))
             .max_by_key(|s| s.deadline)
             .map(|s| s.error.clone());
-        let wait = eligible.iter().filter_map(|(c, m)| scheduler.wait(c, m, now)).min();
+        let soonest = eligible
+            .iter()
+            .filter_map(|(c, m)| scheduler.wait(c, m, now).map(|w| (w, c, m)))
+            .min_by_key(|(w, ..)| *w);
+        let wait = soonest.map(|(w, ..)| w);
         if !eligible.is_empty() && eligible.iter().all(|(c, m)| scheduler.quota_cooling(c, m, now)) {
             return Err(AcquireError::Cooldown {
                 wait: wait.unwrap_or_default(),
                 cause,
+                signals: soonest
+                    .map(|(_, c, m)| scheduler.cooldown_signals(c, m, now).clone())
+                    .unwrap_or_default(),
             });
         }
         return Err(AcquireError::Unavailable {
@@ -1111,10 +1118,13 @@ pub enum AcquireError {
         retry_after: Option<Duration>,
         cause: Option<String>,
     },
-    /// Every eligible candidate is quota-cooling for this model.
+    /// Every eligible candidate is quota-cooling for this model. `signals` is the
+    /// retained Claude quota evidence of the cooldown that ends first (the one `wait`
+    /// names), empty when it has none.
     Cooldown {
         wait: Duration,
         cause: Option<String>,
+        signals: std::collections::BTreeMap<String, String>,
     },
     Prepare {
         id: String,
@@ -2116,13 +2126,17 @@ impl CredentialStore {
             );
             // Go MarkResult: a 401 that cools the credential schedules a background
             // refresh of the rejected token (feb63984; the runtime checks for a refresh
-            // credential). A forced cooldown counts even on a request-scoped 401.
+            // credential). A 401 a request-scoped rule matched condemns no token, even
+            // when a `*-and-cooldown` rule cools the credential (Go v8.0.67 4138edb1).
             // ponytail: Codex only for now; other providers (Claude's included) still
             // refresh after a 401 inline only, until the post-replay port.
             let rejected = matches!(outcome, Outcome::Failure(error)
-                if lease.credential.provider == "codex"
-                    && crate::classify::names_unauthorized(error)
-                    && lease.policy.error_action(&lease.credential, error).cooldown);
+            if lease.credential.provider == "codex"
+                && crate::classify::names_unauthorized(error)
+                && {
+                    let action = lease.policy.error_action(&lease.credential, error);
+                    action.cooldown && !action.matched
+                });
             // Go `publishErrorEvent` after MarkResult (and the availability-neutral record).
             if let (Outcome::Failure(error) | Outcome::Neutral(error), Some(queue)) = (outcome, self.error_events.get())
                 && queue.wants_errors()
@@ -6333,10 +6347,11 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Which 401s schedule a background refresh: Codex ones that cool the credential,
-    /// including a request-scoped 401 a `*-and-cooldown` rule cools; not Claude's (that
-    /// waits for the post-replay port). A scan whose snapshot predates a newer revision
-    /// keeps the 401 recorded on it.
+    /// Which 401s schedule a background refresh: Codex ones that cool the credential;
+    /// not one a request-scoped rule matched, even a `*-and-cooldown` rule that cools
+    /// the credential (Go v8.0.67 4138edb1); not Claude's (that waits for the
+    /// post-replay port). A scan whose snapshot predates a newer revision keeps the 401
+    /// recorded on it.
     #[test]
     fn which_401s_schedule_a_background_refresh() {
         let codex = |note: &str| {
@@ -6372,8 +6387,12 @@ pub(crate) mod tests {
         fail("codex", "m", FailureScope::Request, "bad request");
         assert_eq!(pending(), [], "Claude, and an unforced request-scoped 401");
         fail("codex", "m", FailureScope::Request, "token revoked");
+        assert_eq!(pending(), [], "a forced cooldown condemns no token");
+        assert!(!store.cooldowns("codex.json").is_empty(), "but the rule still cools");
+        // Model `m` cools now; an unmatched 401 on another model schedules the refresh.
+        fail("codex", "o", FailureScope::Credential, "unauthorized");
         let first = store.get("codex.json").unwrap().revision;
-        assert_eq!(pending(), [("codex.json".to_owned(), first)], "a forced cooldown");
+        assert_eq!(pending(), [("codex.json".to_owned(), first)], "an unmatched 401");
         // The scan's snapshot holds the first revision; a refresh commits a newer one,
         // which an upstream rejects too, before the scan reads the rejections.
         let old = store.snapshot();
@@ -6383,7 +6402,7 @@ pub(crate) mod tests {
         ]);
         let second = store.get("codex.json").unwrap().revision;
         assert!(second > first);
-        fail("codex", "n", FailureScope::Request, "token revoked");
+        fail("codex", "n", FailureScope::Credential, "unauthorized");
         store.forget_stale_unauthorized(&store.unauthorized(), &old);
         assert_eq!(
             pending(),

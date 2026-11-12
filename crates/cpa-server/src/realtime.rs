@@ -351,12 +351,13 @@ async fn select_oauth(
                     retry_after: failure.retry_after(),
                 }
             }
-            AcquireError::Cooldown { wait, cause } => {
+            AcquireError::Cooldown { wait, cause, .. } => {
                 let failure = crate::dispatch::Failure::Cooldown {
                     model: String::new(),
                     provider: "codex".into(),
                     wait,
                     cause,
+                    signals: Default::default(),
                 };
                 Rejection {
                     status: 429,

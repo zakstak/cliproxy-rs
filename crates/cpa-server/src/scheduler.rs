@@ -587,6 +587,10 @@ pub(crate) struct Cooldown {
     /// `cooldownRecordedSeq`): a success from a dispatch at or before it predates the
     /// failure and leaves a live cooldown alone. Zero after a restart, as in Go.
     pub recorded: u64,
+    /// The rejected Anthropic unified quota headers of the Claude 429 that set this
+    /// quota cooldown (Go v8.0.67 `cooldownSignals`, cb70eacf), shown on local cooldown
+    /// 429s and saved with the cooldown; empty for every other cause.
+    pub signals: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,6 +814,26 @@ impl Scheduler {
                 .get(&(c.id.clone(), m.to_owned()))
                 .is_some_and(|s| s.deadline > now)
         })
+    }
+
+    /// The retained quota evidence of the live quota cooldown that sets `model`'s wait
+    /// ([`Self::wait`]: the later of the model's and the credential-wide deadline; on a
+    /// tie, the entry that has evidence). Empty when that cooldown has none.
+    pub fn cooldown_signals(
+        &self,
+        c: &Credential,
+        model: &str,
+        now: Instant,
+    ) -> &std::collections::BTreeMap<String, String> {
+        static NONE: std::sync::LazyLock<std::collections::BTreeMap<String, String>> =
+            std::sync::LazyLock::new(Default::default);
+        let model = canonical_model(model);
+        [model, ""]
+            .into_iter()
+            .filter_map(|m| self.cooldowns.get(&(c.id.clone(), m.to_owned())))
+            .filter(|s| s.quota && s.until(now).is_some())
+            .max_by_key(|s| (s.deadline, !s.signals.is_empty()))
+            .map_or(&*NONE, |s| &s.signals)
     }
 
     /// The last failure recorded for this credential and model, if any.
@@ -1403,7 +1427,11 @@ impl Scheduler {
                 level = next;
                 d.max(Duration::from_secs(10))
             })
-        } else if crate::classify::is_invalid_grant(status, &text) {
+        } else if crate::classify::is_invalid_grant(status, &text)
+            || crate::classify::is_credit_balance_too_low(status, &text)
+        {
+            // Go v8.0.67 d00267c3: an exhausted credit balance waits 30 minutes, like
+            // a refused refresh token.
             (!disabled).then_some(Duration::from_secs(1800))
         } else {
             match status {
@@ -1535,6 +1563,14 @@ impl Scheduler {
             })
         };
         let own_reason = if cloudflare { "cloudflare challenge" } else { "quota" };
+        // Only a Claude quota rejection is evidence a client can act on; a Cloudflare
+        // challenge, a per-minute limit or a 429 without a rejected window is none.
+        let signals = if quota && !cloudflare && error.status == 429 && c.provider.trim().eq_ignore_ascii_case("claude")
+        {
+            cpa_exec::claude::rejected_cooldown_signals(&error.headers, &error.body)
+        } else {
+            Default::default()
+        };
         let state = |deadline, reason| Cooldown {
             deadline,
             level,
@@ -1547,6 +1583,7 @@ impl Scheduler {
             quota_kind: kind(reason),
             quota_under: quota_under.filter(|_| !quota),
             recorded: 0,
+            signals: signals.clone(),
         };
         let reason = if credential_quota {
             "credential_quota"
@@ -1684,6 +1721,11 @@ impl Scheduler {
                         Quota::default()
                     },
                     reason,
+                    cooldown_signals: if state.quota {
+                        state.signals.clone()
+                    } else {
+                        Default::default()
+                    },
                     last_error: Some(LastError {
                         message: state.error.clone(),
                         http_status: u32::from(state.status),
@@ -1816,6 +1858,15 @@ impl Scheduler {
             trust.generation = self.generation;
         }
         let (quota, status, credential) = quota;
+        // The evidence follows the entry that supplies the deadline; a saved file is
+        // sanitized again, so it can restore nothing a 429 could not have recorded.
+        let signals = match prev.filter(|_| prev_wins) {
+            Some(prev) => prev.signals.clone(),
+            None if quota && c.provider.trim().eq_ignore_ascii_case("claude") => {
+                cpa_exec::claude::sanitize_cooldown_signals(record.cooldown_signals.clone())
+            }
+            None => Default::default(),
+        };
         self.cooldowns.insert(
             key,
             Cooldown {
@@ -1835,6 +1886,7 @@ impl Scheduler {
                 quota_under: quota_under.filter(|_| !quota),
                 // Go `mergeModelState` keeps the live state's watermark.
                 recorded,
+                signals,
             },
         );
         true
@@ -2048,6 +2100,7 @@ mod tests {
             quota_kind: None,
             quota_under: None,
             recorded: 0,
+            signals: Default::default(),
         };
         let mut s = Scheduler::default();
         for (id, model, c) in [
@@ -3081,6 +3134,99 @@ mod tests {
     /// `.cds` records: the probe time is the retry, the stated reset Go's recovery time,
     /// and the count is its own field. Restores never escalate, and Go's records get
     /// the first bound whatever their backoff level.
+    /// #94 (Go v8.0.67 cb70eacf): a Claude quota 429 that rejected a unified window
+    /// keeps that evidence with its cooldown, saved and restored with it (sanitized
+    /// again on restore); a Cloudflare challenge, another provider or an allowed-only 429
+    /// keeps none. A credential-wide rejection answers every model it cools.
+    #[test]
+    fn rejected_claude_quota_evidence_follows_its_cooldown() {
+        use crate::cooldown_store::Record;
+        let p = Policy::default();
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let rejected = |scope: FailureScope, status: u16, body: &str, headers: &[(&str, &str)]| {
+            let mut e = ExecError::local(status, scope, body.to_owned());
+            e.retry_after = Some(secs(600));
+            for (k, v) in headers {
+                let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
+                e.headers.insert(name, v.parse().unwrap());
+            }
+            Outcome::Failure(e)
+        };
+        let evidence = [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", "1800000000"),
+            ("request-id", "req_x"),
+        ];
+        let c = cred("a", serde_json::json!({}));
+        let mut s = Scheduler::default();
+        s.record(
+            &c,
+            "m",
+            &rejected(FailureScope::Model, 429, "limit", &evidence),
+            &p,
+            now,
+        );
+        let names = |m: &std::collections::BTreeMap<String, String>| m.keys().cloned().collect::<Vec<_>>();
+        let want = [
+            "Anthropic-Ratelimit-Unified-5h-Reset",
+            "Anthropic-Ratelimit-Unified-5h-Status",
+            "Anthropic-Ratelimit-Unified-Status",
+        ];
+        assert_eq!(names(s.cooldown_signals(&c, "m", now)), want);
+        assert!(s.cooldown_signals(&c, "other", now).is_empty(), "model-scoped");
+        let saved = s.records(&c, now, wall);
+        assert_eq!(names(&saved[0].cooldown_signals), want);
+        let mut back = Scheduler::default();
+        assert!(back.restore(&c, &saved[0], true, secs(H), now, wall));
+        assert_eq!(names(back.cooldown_signals(&c, "m", now)), want);
+        // A tampered or foreign saved file restores nothing a 429 could not have recorded.
+        let mut tampered: Record = saved[0].clone();
+        tampered.cooldown_signals = [("Set-Cookie", "x"), ("anthropic-ratelimit-unified-status", "allowed")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let mut back = Scheduler::default();
+        assert!(back.restore(&c, &tampered, true, secs(H), now, wall));
+        assert!(back.cooldown_signals(&c, "m", now).is_empty());
+        // No evidence: a Cloudflare challenge, another provider, an allowed-only 429.
+        let challenge = "<html>Just a moment... cloudflare challenge-platform</html>";
+        let mut s = Scheduler::default();
+        s.record(
+            &c,
+            "m",
+            &rejected(FailureScope::Model, 403, challenge, &evidence),
+            &p,
+            now,
+        );
+        assert!(s.cooling(&c, "m", now) && s.cooldown_signals(&c, "m", now).is_empty());
+        let mut codex = cred("x", serde_json::json!({}));
+        codex.provider = "codex".into();
+        s.record(
+            &codex,
+            "m",
+            &rejected(FailureScope::Model, 429, "limit", &evidence),
+            &p,
+            now,
+        );
+        assert!(s.cooldown_signals(&codex, "m", now).is_empty());
+        let allowed = [("anthropic-ratelimit-unified-status", "allowed")];
+        let b = cred("b", serde_json::json!({}));
+        s.record(&b, "m", &rejected(FailureScope::Model, 429, "limit", &allowed), &p, now);
+        assert!(s.cooling(&b, "m", now) && s.cooldown_signals(&b, "m", now).is_empty());
+        // A credential-wide rejection answers its sibling models too.
+        let d = cred("d", serde_json::json!({}));
+        s.record(
+            &d,
+            "m",
+            &rejected(FailureScope::Credential, 429, "limit", &evidence),
+            &p,
+            now,
+        );
+        assert_eq!(names(s.cooldown_signals(&d, "m", now)), want);
+        assert_eq!(names(s.cooldown_signals(&d, "sibling", now)), want);
+    }
+
     #[test]
     fn restored_quota_resets_are_bounded_too() {
         use crate::cooldown_store::{Quota, Record};

@@ -329,6 +329,54 @@ pub fn claude_signals(headers: &HeaderMap) -> std::collections::BTreeMap<String,
     signals.into_iter().take(MAX_SIGNALS).collect()
 }
 
+/// Go v8.0.67 `rejectedClaudeSignalsForCooldown` (cb70eacf): the Anthropic unified quota
+/// headers of a 429 that rejected a quota window, kept with the cooldown it causes so a
+/// local cooldown 429 can show the client the provider's own evidence. Only
+/// `Anthropic-Ratelimit-Unified-*` headers under [`claude_signals`]' bounds; nothing
+/// when no window or overall status is `rejected`, or when the body is an ordinary
+/// per-minute limit, which is no subscription quota.
+pub fn rejected_cooldown_signals(headers: &HeaderMap, body: &[u8]) -> std::collections::BTreeMap<String, String> {
+    if per_minute_body(body) {
+        return Default::default();
+    }
+    sanitize_cooldown_signals(claude_signals(headers))
+}
+
+/// Go `sanitizePersistedClaudeCooldownSignals`: `signals` reduced to unified quota
+/// headers with bounded values, or nothing unless they show a rejection. Applied to
+/// what a saved cooldown file restores too.
+pub fn sanitize_cooldown_signals(
+    signals: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    const MAX_VALUE: usize = 512;
+    let kept: std::collections::BTreeMap<String, String> = signals
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let lower = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            (lower.starts_with("anthropic-ratelimit-unified-")
+                && lower
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && !value.is_empty()
+                && value.len() <= MAX_VALUE
+                && !value.chars().any(|c| c < '\u{20}' || c == '\u{7f}'))
+            .then(|| (crate::proxy::canonical_header(&lower), value.to_owned()))
+        })
+        .take(64)
+        .collect();
+    let rejected = kept.iter().any(|(name, value)| {
+        let lower = name.to_ascii_lowercase();
+        let window = lower
+            .strip_prefix("anthropic-ratelimit-unified-")
+            .and_then(|rest| rest.strip_suffix("-status"));
+        let names_status =
+            lower == "anthropic-ratelimit-unified-status" || window.is_some_and(|w| !w.is_empty() && w != "overage");
+        names_status && value.eq_ignore_ascii_case("rejected")
+    });
+    if rejected { kept } else { Default::default() }
+}
+
 /// The latest passive quota snapshots per Claude credential and per model (Go
 /// `QuotaState.ObserveResponseHeadersForProvider` for provider `claude` on `Auth.Quota`
 /// and the result model's `ModelState.Quota`): each upstream Messages response that
@@ -460,6 +508,79 @@ mod tests {
             h.insert("anthropic-ratelimit-unified-7d-status", "rejected".parse().unwrap());
             assert!(shared_rejection(&h), "{claim:?} rejected 7d");
         }
+    }
+
+    /// #94 (Go v8.0.67 cb70eacf): a cooldown keeps only the rejected unified quota
+    /// headers, bounded like passive signals; `Retry-After` and every other header stay
+    /// out, and allowed-only, overage-only, per-minute and malformed evidence keeps
+    /// nothing.
+    #[test]
+    fn cooldown_keeps_only_rejected_unified_quota_headers() {
+        let h = headers(&[
+            ("anthropic-ratelimit-unified-status", " rejected "),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", "1800000000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+            ("retry-after", "60"),
+            ("request-id", "req_x"),
+            ("anthropic-organization-id", "org-x"),
+            ("anthropic-ratelimit-unified-empty", " "),
+        ]);
+        let kept = rejected_cooldown_signals(&h, br#"{"error":{"type":"rate_limit_error","message":"limit"}}"#);
+        assert_eq!(
+            kept.into_iter().collect::<Vec<_>>(),
+            [
+                (
+                    "Anthropic-Ratelimit-Unified-5h-Reset".to_owned(),
+                    "1800000000".to_owned()
+                ),
+                (
+                    "Anthropic-Ratelimit-Unified-5h-Status".to_owned(),
+                    "rejected".to_owned()
+                ),
+                (
+                    "Anthropic-Ratelimit-Unified-7d-Utilization".to_owned(),
+                    "0.4".to_owned()
+                ),
+                ("Anthropic-Ratelimit-Unified-Status".to_owned(), "rejected".to_owned()),
+            ]
+        );
+        let per_minute = br#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the requests per minute rate limit. Please try again later."}}"#;
+        assert!(
+            rejected_cooldown_signals(&h, per_minute).is_empty(),
+            "a per-minute limit"
+        );
+        for values in [
+            vec![("anthropic-ratelimit-unified-status", "allowed")],
+            vec![("anthropic-ratelimit-unified-overage-status", "rejected")],
+            vec![("retry-after", "60")],
+        ] {
+            assert!(
+                rejected_cooldown_signals(&headers(&values), b"{}").is_empty(),
+                "{values:?}"
+            );
+        }
+        let model_scoped = headers(&[("anthropic-ratelimit-unified-7d_oi-status", "rejected")]);
+        assert_eq!(rejected_cooldown_signals(&model_scoped, b"{}").len(), 1);
+        // What a saved file restores is filtered the same way: no foreign or malformed
+        // names, no oversized or control-character values.
+        let saved: std::collections::BTreeMap<String, String> = [
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("Set-Cookie", "session=x"),
+            ("anthropic-ratelimit-unified-x\r\nset-cookie", "rejected"),
+            ("anthropic-ratelimit-unified-7d-reset", "1\n2"),
+            ("anthropic-ratelimit-unified-7d-status", &"r".repeat(600)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        assert_eq!(
+            sanitize_cooldown_signals(saved).into_iter().collect::<Vec<_>>(),
+            [(
+                "Anthropic-Ratelimit-Unified-5h-Status".to_owned(),
+                "rejected".to_owned()
+            )]
+        );
     }
 
     #[test]

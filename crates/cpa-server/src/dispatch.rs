@@ -271,6 +271,9 @@ pub enum Failure {
         provider: String,
         wait: Duration,
         cause: Option<String>,
+        /// Retained Claude quota evidence ([`crate::scheduler::Cooldown::signals`]),
+        /// boxed to keep route errors small.
+        signals: Box<std::collections::BTreeMap<String, String>>,
     },
 }
 
@@ -317,6 +320,7 @@ impl Failure {
                 provider,
                 wait,
                 cause,
+                ..
             } => {
                 let shown = if model.is_empty() { "requested model" } else { model };
                 let mut message = format!("All credentials for model {shown} are cooling down");
@@ -1083,7 +1087,7 @@ async fn run_routed(
                     last = Some(Fault { error, bootstrap: None });
                     continue;
                 }
-                Err(AcquireError::Cooldown { wait, cause }) => {
+                Err(AcquireError::Cooldown { wait, cause, signals }) => {
                     let provider = if providers.len() == 1 {
                         providers[0].clone()
                     } else {
@@ -1094,6 +1098,7 @@ async fn run_routed(
                         provider,
                         wait,
                         cause,
+                        signals: Box::new(signals),
                     });
                 }
                 Err(AcquireError::Unavailable { retry_after, cause }) => {
@@ -2064,11 +2069,13 @@ async fn attempt(
         let mut executed = execute(lease.credential.clone(), req.clone()).await;
         // Go `tryRefreshAfterUnauthorized`: one refresh-and-retry per credential. Home
         // credentials never refresh here (Go home_unauthorized_refresh): the 401 goes to
-        // Home and the round moves on, even when a local credential shares the ID.
+        // Home and the round moves on, even when a local credential shares the ID. A 401
+        // a request-scoped rule matches is the rule's to handle (Go v8.0.67 4138edb1).
         if let Err(error) = &executed
             && !refreshed
             && !lease.is_remote()
             && classify::is_unauthorized(error)
+            && !policy.error_action(&lease.credential, error).matched
             && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
         {
             refreshed = true;
@@ -2116,14 +2123,17 @@ async fn attempt(
                 }
                 Err(fault) => {
                     if let Some(t) = tracker.take() {
-                        t.fail(&fault.error);
+                        t.fail_classified(
+                            &fault.error,
+                            rule_code(&policy.error_action(&lease.credential, &fault.error)),
+                        );
                     }
                     fault
                 }
             },
             Err(error) => {
                 if let Some(t) = tracker.take() {
-                    t.fail(&error);
+                    t.fail_classified(&error, rule_code(&policy.error_action(&lease.credential, &error)));
                 }
                 Fault { error, bootstrap: None }
             }
@@ -2185,6 +2195,16 @@ async fn attempt(
         last = Some(fault);
     }
     Attempt::Next(last.expect("at least one model was attempted"))
+}
+
+/// Go v8.0.67 `failFromErrorsWithRules` (18883a57): usage `fail.code` for a failure a
+/// request-scoped rule matched.
+fn rule_code(action: &crate::scheduler::ErrorAction) -> &'static str {
+    match (action.matched, action.force_cooldown) {
+        (true, true) => "force_cooldown",
+        (true, false) => "request_scoped",
+        (false, _) => "",
+    }
 }
 
 /// Go `retainHomeWebsocketSelection`: after a successful turn, the Home lease moves to
@@ -2905,6 +2925,7 @@ mod tests {
             provider: "claude".into(),
             wait: Duration::from_millis(59_400),
             cause: Some(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#.into()),
+            signals: Default::default(),
         };
         assert_eq!(
             cooldown.text(),
