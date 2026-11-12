@@ -588,9 +588,36 @@ pub(crate) struct Cooldown {
     /// failure and leaves a live cooldown alone. Zero after a restart, as in Go.
     pub recorded: u64,
     /// The rejected Anthropic unified quota headers of the Claude 429 that set this
-    /// quota cooldown (Go v8.0.67 `cooldownSignals`, cb70eacf), shown on local cooldown
-    /// 429s and saved with the cooldown; empty for every other cause.
+    /// quota cooldown's deadline (Go v8.0.67 `cooldownSignals`, cb70eacf), shown on local
+    /// cooldown 429s and saved with the cooldown; empty for every other cause, and
+    /// dropped when another failure takes the deadline over.
     pub signals: std::collections::BTreeMap<String, String>,
+    /// [`evidence_account`] of the account those signals came from: evidence answers
+    /// only while the same account holds the credential ID.
+    pub signals_account: String,
+}
+
+/// The account a credential's quota evidence belongs to, as a one-way fingerprint (no
+/// identifier or key is kept): a Claude OAuth login's `account_uuid`, else its API key.
+/// Empty when neither is known, and then no evidence is kept. A token refresh keeps the
+/// account, so its evidence stays; a different account under the same file name does
+/// not inherit it.
+pub(crate) fn evidence_account(c: &Credential) -> String {
+    use sha2::{Digest, Sha256};
+    let value = |key: &str| {
+        c.attributes
+            .get(key)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .or_else(|| c.str(key).map(str::trim).filter(|s| !s.is_empty()))
+    };
+    let identity = match (value("account_uuid"), value("api_key")) {
+        (Some(account), _) => format!("account_uuid\0{account}"),
+        (None, Some(key)) => format!("api_key\0{key}"),
+        (None, None) => return String::new(),
+    };
+    let digest = Sha256::digest(format!("cliproxy-rs claude quota evidence\0{identity}").as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,12 +855,16 @@ impl Scheduler {
         static NONE: std::sync::LazyLock<std::collections::BTreeMap<String, String>> =
             std::sync::LazyLock::new(Default::default);
         let model = canonical_model(model);
-        [model, ""]
+        let account = evidence_account(c);
+        let governing = [model, ""]
             .into_iter()
             .filter_map(|m| self.cooldowns.get(&(c.id.clone(), m.to_owned())))
             .filter(|s| s.quota && s.until(now).is_some())
-            .max_by_key(|s| (s.deadline, !s.signals.is_empty()))
-            .map_or(&*NONE, |s| &s.signals)
+            .max_by_key(|s| (s.deadline, !s.signals.is_empty() && s.signals_account == account));
+        match governing {
+            Some(s) if !account.is_empty() && s.signals_account == account => &s.signals,
+            _ => &NONE,
+        }
     }
 
     /// The last failure recorded for this credential and model, if any.
@@ -1406,6 +1437,11 @@ impl Scheduler {
         let prev_deadline = prev.map(|s| s.deadline);
         let prev_live = prev.filter(|s| s.deadline > now).map(|s| s.deadline);
         let prev_trust = prev.map(|s| s.trust).unwrap_or_default();
+        // The live entry's evidence, which stays only with the deadline it set.
+        let prev_evidence = prev
+            .filter(|s| s.deadline > now)
+            .map(|s| (s.signals.clone(), s.signals_account.clone()))
+            .unwrap_or_default();
         // A live quota block this failure answers, if it is not a quota failure itself.
         let quota_under = prev.and_then(|p| p.quota_block(now));
         let mut level = prev.filter(|s| s.quota).map(|s| s.level).unwrap_or(0);
@@ -1565,11 +1601,27 @@ impl Scheduler {
         let own_reason = if cloudflare { "cloudflare challenge" } else { "quota" };
         // Only a Claude quota rejection is evidence a client can act on; a Cloudflare
         // challenge, a per-minute limit or a 429 without a rejected window is none.
-        let signals = if quota && !cloudflare && error.status == 429 && c.provider.trim().eq_ignore_ascii_case("claude")
+        let account = evidence_account(c);
+        let signals = if quota
+            && !cloudflare
+            && error.status == 429
+            && !account.is_empty()
+            && c.provider.trim().eq_ignore_ascii_case("claude")
         {
             cpa_exec::claude::rejected_cooldown_signals(&error.headers, &error.body)
         } else {
             Default::default()
+        };
+        // Evidence goes with the deadline it set: this failure's when its own deadline
+        // stands, the live entry's when that longer deadline stands, else none.
+        let evidence = |deadline: Instant| {
+            if deadline == next {
+                (signals.clone(), account.clone())
+            } else if prev_live == Some(deadline) {
+                prev_evidence.clone()
+            } else {
+                Default::default()
+            }
         };
         let state = |deadline, reason| Cooldown {
             deadline,
@@ -1583,7 +1635,8 @@ impl Scheduler {
             quota_kind: kind(reason),
             quota_under: quota_under.filter(|_| !quota),
             recorded: 0,
-            signals: signals.clone(),
+            signals: evidence(deadline).0,
+            signals_account: evidence(deadline).1,
         };
         let reason = if credential_quota {
             "credential_quota"
@@ -1605,8 +1658,20 @@ impl Scheduler {
                     .filter(|s| s.deadline > now)
                     .map_or(deadline, |s| s.deadline);
                 let own_trust = self.cooldowns.get(&own).map(|s| s.trust).unwrap_or_default();
+                let own_evidence = self
+                    .cooldowns
+                    .get(&own)
+                    .filter(|s| s.deadline > now)
+                    .map(|s| (s.signals.clone(), s.signals_account.clone()))
+                    .unwrap_or_default();
                 let own_window = own_trust.window;
                 let mut own_state = state(own_deadline, own_reason);
+                // The model's own longer window keeps its own evidence.
+                (own_state.signals, own_state.signals_account) = if own_deadline == next {
+                    (signals.clone(), account.clone())
+                } else {
+                    own_evidence
+                };
                 if own_deadline != deadline {
                     // The model's own window (longer, or bounded) wins: its provenance
                     // goes with it.
@@ -1648,6 +1713,12 @@ impl Scheduler {
                     if deadline >= state.deadline {
                         state.trust = Trust { probe: None, ..trust };
                     }
+                    if deadline > state.deadline {
+                        // The credential's window owns this deadline now; the model's
+                        // own evidence described the shorter one.
+                        state.signals.clear();
+                        state.signals_account.clear();
+                    }
                     state.deadline = state.deadline.max(deadline);
                 }
                 // A model further along its own escalation keeps its count.
@@ -1684,6 +1755,7 @@ impl Scheduler {
     /// model (the credential-wide quota is the model-less record).
     pub fn records(&self, c: &Credential, now: Instant, wall: SystemTime) -> Vec<crate::cooldown_store::Record> {
         use crate::cooldown_store::{LastError, Quota, Record};
+        let account = evidence_account(c);
         let mut out: Vec<Record> = self
             .cooldowns
             .iter()
@@ -1721,10 +1793,18 @@ impl Scheduler {
                         Quota::default()
                     },
                     reason,
-                    cooldown_signals: if state.quota {
+                    cooldown_signals: if state.quota && !state.signals.is_empty() && state.signals_account == account {
                         state.signals.clone()
                     } else {
                         Default::default()
+                    },
+                    cooldown_signals_account: if state.quota
+                        && !state.signals.is_empty()
+                        && state.signals_account == account
+                    {
+                        account.clone()
+                    } else {
+                        String::new()
                     },
                     last_error: Some(LastError {
                         message: state.error.clone(),
@@ -1860,10 +1940,19 @@ impl Scheduler {
         let (quota, status, credential) = quota;
         // The evidence follows the entry that supplies the deadline; a saved file is
         // sanitized again, so it can restore nothing a 429 could not have recorded.
-        let signals = match prev.filter(|_| prev_wins) {
-            Some(prev) => prev.signals.clone(),
-            None if quota && c.provider.trim().eq_ignore_ascii_case("claude") => {
-                cpa_exec::claude::sanitize_cooldown_signals(record.cooldown_signals.clone())
+        let account = evidence_account(c);
+        let (signals, signals_account) = match prev.filter(|_| prev_wins) {
+            Some(prev) => (prev.signals.clone(), prev.signals_account.clone()),
+            // Saved evidence answers only for the account it was saved for.
+            None if quota
+                && c.provider.trim().eq_ignore_ascii_case("claude")
+                && !account.is_empty()
+                && record.cooldown_signals_account == account =>
+            {
+                (
+                    cpa_exec::claude::sanitize_cooldown_signals(record.cooldown_signals.clone()),
+                    account,
+                )
             }
             None => Default::default(),
         };
@@ -1887,6 +1976,7 @@ impl Scheduler {
                 // Go `mergeModelState` keeps the live state's watermark.
                 recorded,
                 signals,
+                signals_account,
             },
         );
         true
@@ -2101,6 +2191,7 @@ mod tests {
             quota_under: None,
             recorded: 0,
             signals: Default::default(),
+            signals_account: String::new(),
         };
         let mut s = Scheduler::default();
         for (id, model, c) in [
@@ -3158,7 +3249,7 @@ mod tests {
             ("anthropic-ratelimit-unified-5h-reset", "1800000000"),
             ("request-id", "req_x"),
         ];
-        let c = cred("a", serde_json::json!({}));
+        let c = cred("a", serde_json::json!({"api_key": "fake-a"}));
         let mut s = Scheduler::default();
         s.record(
             &c,
@@ -3200,7 +3291,7 @@ mod tests {
             now,
         );
         assert!(s.cooling(&c, "m", now) && s.cooldown_signals(&c, "m", now).is_empty());
-        let mut codex = cred("x", serde_json::json!({}));
+        let mut codex = cred("x", serde_json::json!({"api_key": "fake-x"}));
         codex.provider = "codex".into();
         s.record(
             &codex,
@@ -3211,11 +3302,11 @@ mod tests {
         );
         assert!(s.cooldown_signals(&codex, "m", now).is_empty());
         let allowed = [("anthropic-ratelimit-unified-status", "allowed")];
-        let b = cred("b", serde_json::json!({}));
+        let b = cred("b", serde_json::json!({"api_key": "fake-b"}));
         s.record(&b, "m", &rejected(FailureScope::Model, 429, "limit", &allowed), &p, now);
         assert!(s.cooling(&b, "m", now) && s.cooldown_signals(&b, "m", now).is_empty());
         // A credential-wide rejection answers its sibling models too.
-        let d = cred("d", serde_json::json!({}));
+        let d = cred("d", serde_json::json!({"api_key": "fake-d"}));
         s.record(
             &d,
             "m",
@@ -3225,6 +3316,145 @@ mod tests {
         );
         assert_eq!(names(s.cooldown_signals(&d, "m", now)), want);
         assert_eq!(names(s.cooldown_signals(&d, "sibling", now)), want);
+        // No account identity, no evidence.
+        let anonymous = cred("n", serde_json::json!({}));
+        s.record(
+            &anonymous,
+            "m",
+            &rejected(FailureScope::Model, 429, "limit", &evidence),
+            &p,
+            now,
+        );
+        assert!(s.cooling(&anonymous, "m", now) && s.cooldown_signals(&anonymous, "m", now).is_empty());
+    }
+
+    /// Sol review of #128: evidence goes with the deadline it set. A longer
+    /// credential-wide cooldown without evidence that extends a model's short quota
+    /// cooldown takes that evidence away; a shorter later failure leaves the longer
+    /// cooldown's evidence alone; an expired cooldown has none.
+    #[test]
+    fn quota_evidence_follows_the_deadline_it_set() {
+        let p = Policy::default();
+        let now = Instant::now();
+        let failure = |scope: FailureScope, retry: u64, body: &str, headers: &[(&str, &str)]| {
+            let mut e = ExecError::local(429, scope, body.to_owned());
+            e.retry_after = Some(secs(retry));
+            for (k, v) in headers {
+                let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
+                e.headers.insert(name, v.parse().unwrap());
+            }
+            Outcome::Failure(e)
+        };
+        let fable = [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ];
+        let per_minute = "This request would exceed the requests per minute rate limit. Please try again later.";
+        let per_minute =
+            format!(r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{per_minute}"}}}}"#);
+        let c = cred("a", serde_json::json!({"api_key": "fake-a"}));
+        let mut s = Scheduler::default();
+        s.record(
+            &c,
+            "fable",
+            &failure(FailureScope::Model, 30, "weekly", &fable),
+            &p,
+            now,
+        );
+        assert!(!s.cooldown_signals(&c, "fable", now).is_empty());
+        // A credential-wide per-minute limit with a longer retry takes the deadline over.
+        s.record(
+            &c,
+            "opus",
+            &failure(FailureScope::Credential, 600, &per_minute, &[]),
+            &p,
+            now,
+        );
+        assert!(
+            s.wait(&c, "fable", now) > Some(secs(500)),
+            "the model now waits for the credential"
+        );
+        assert!(
+            s.cooldown_signals(&c, "fable", now).is_empty(),
+            "the short quota's evidence does not stand beside the longer retry"
+        );
+        // A longer quota keeps its evidence when a shorter failure follows.
+        let d = cred("d", serde_json::json!({"api_key": "fake-d"}));
+        let mut s = Scheduler::default();
+        s.record(&d, "m", &failure(FailureScope::Model, 3000, "weekly", &fable), &p, now);
+        s.record(&d, "m", &failure(FailureScope::Model, 20, "slow down", &[]), &p, now);
+        assert!(
+            !s.cooldown_signals(&d, "m", now).is_empty(),
+            "the longer deadline keeps its evidence"
+        );
+        // A newer longer quota replaces it with its own.
+        let five = [("anthropic-ratelimit-unified-5h-status", "rejected")];
+        s.record(&d, "m", &failure(FailureScope::Model, 3500, "limit", &five), &p, now);
+        assert_eq!(
+            s.cooldown_signals(&d, "m", now).keys().collect::<Vec<_>>(),
+            ["Anthropic-Ratelimit-Unified-5h-Status"]
+        );
+        assert!(s.cooldown_signals(&d, "m", now + secs(4 * H)).is_empty(), "expired");
+    }
+
+    /// Sol review of #128: evidence belongs to the account that received it. A token
+    /// refresh of the same OAuth account keeps it; another account under the same
+    /// credential ID, live or restored, gets none. The fingerprint keeps no identifier.
+    #[test]
+    fn quota_evidence_is_fenced_by_account() {
+        let p = Policy::default();
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut e = ExecError::local(429, FailureScope::Model, "limit".to_owned());
+        e.retry_after = Some(secs(600));
+        e.headers
+            .insert("anthropic-ratelimit-unified-status", "rejected".parse().unwrap());
+        e.headers
+            .insert("anthropic-ratelimit-unified-5h-utilization", "0.92345".parse().unwrap());
+        let login =
+            |token: &str, account: &str| cred("a", serde_json::json!({"access_token": token, "account_uuid": account}));
+        let a = login("tok-1", "account-a");
+        let mut s = Scheduler::default();
+        s.record(&a, "m", &Outcome::Failure(e), &p, now);
+        assert!(!s.cooldown_signals(&a, "m", now).is_empty());
+        let refreshed = login("tok-2", "account-a");
+        assert!(
+            !s.cooldown_signals(&refreshed, "m", now).is_empty(),
+            "same account after a refresh"
+        );
+        let replaced = login("tok-3", "account-b");
+        assert!(
+            s.cooling(&replaced, "m", now),
+            "the cooldown itself is the scheduler's to keep"
+        );
+        assert!(
+            s.cooldown_signals(&replaced, "m", now).is_empty(),
+            "another account's evidence"
+        );
+        let saved = s.records(&a, now, wall);
+        assert!(!saved[0].cooldown_signals.is_empty());
+        let account = &saved[0].cooldown_signals_account;
+        assert_eq!(account.len(), 64);
+        assert!(!serde_json::to_string(&saved[0]).unwrap().contains("account-a"));
+        assert!(
+            s.records(&replaced, now, wall)[0].cooldown_signals.is_empty(),
+            "not saved for another account"
+        );
+        for (holder, kept) in [(&refreshed, true), (&replaced, false)] {
+            let mut back = Scheduler::default();
+            assert!(back.restore(holder, &saved[0], true, secs(H), now, wall));
+            assert_eq!(!back.cooldown_signals(holder, "m", now).is_empty(), kept);
+        }
+        // A record saved without its account (older or tampered) restores no evidence.
+        let mut unfenced = saved[0].clone();
+        unfenced.cooldown_signals_account.clear();
+        let mut back = Scheduler::default();
+        assert!(back.restore(&a, &unfenced, true, secs(H), now, wall));
+        assert!(back.cooldown_signals(&a, "m", now).is_empty());
+        // An expired record restores nothing at all.
+        let mut expired = saved[0].clone();
+        expired.next_retry_after = Some(wall - secs(1));
+        expired.quota.next_recover_at = Some(wall - secs(1));
+        assert!(!Scheduler::default().restore(&a, &expired, true, secs(H), now, wall));
     }
 
     #[test]

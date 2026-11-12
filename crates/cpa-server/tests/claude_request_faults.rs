@@ -622,3 +622,279 @@ async fn retained_quota_evidence_survives_a_restart() {
     assert_eq!(calls(&m).len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Sol review of #128: a prefixed header that is no provider quota field (credentials,
+/// cookies, personal data) is neither replayed nor saved, even beside a rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_quota_prefixed_fields_are_never_replayed_or_saved() {
+    let dir = auth_dir("non-quota");
+    let (upstream_url, _) = mock(|_, _| {
+        error(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"quota"}}"#,
+            vec![
+                ("retry-after", "600".into()),
+                ("anthropic-ratelimit-unified-status", "rejected".into()),
+                ("anthropic-ratelimit-unified-authorization", "Bearer fake-secret".into()),
+                ("anthropic-ratelimit-unified-cookie", "fake-session=private".into()),
+                (
+                    "anthropic-ratelimit-unified-user-email",
+                    "private@example.invalid".into(),
+                ),
+            ],
+        )
+    })
+    .await;
+    let a = api_key(&dir, "claude-a.json", "fake-key", &upstream_url, json!({}));
+    let rt = runtime(
+        &dir,
+        "routing:\n  cooldown:\n    save-cooldown-status: true\n",
+        vec![a],
+        executors(ClaudeExecutor::new("http://127.0.0.1:1").unwrap()),
+    );
+    let url = app(&rt).await;
+    assert_eq!(post(&url, "/v1/messages", messages(MODEL, "first", false)).await.0, 429);
+    let (status, headers, body) = post(&url, "/v1/messages", messages(MODEL, "second", false)).await;
+    assert_local_cooldown(status, &headers, &body, "non-quota");
+    assert_eq!(
+        unified(&headers),
+        [("anthropic-ratelimit-unified-status".to_owned(), "rejected".to_owned())]
+    );
+    let saved = std::fs::read_to_string(dir.join("claude-a.cds")).unwrap();
+    for secret in ["fake-secret", "fake-session", "private@example.invalid", "fake-key"] {
+        assert!(!saved.contains(secret), "{secret} saved: {saved}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sol review of #128: a different account under the same credential ID never answers
+/// with its predecessor's quota evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_account_never_replays_its_predecessors_evidence() {
+    let dir = auth_dir("replaced");
+    let (upstream_url, _) = mock(|key, _| {
+        if key == "account-a-key" {
+            error(
+                429,
+                r#"{"error":{"type":"rate_limit_error","message":"quota"}}"#,
+                vec![
+                    ("retry-after", "600".into()),
+                    ("anthropic-ratelimit-unified-status", "rejected".into()),
+                    ("anthropic-ratelimit-unified-5h-utilization", "0.92345".into()),
+                ],
+            )
+        } else {
+            ok()
+        }
+    })
+    .await;
+    let a = api_key(
+        &dir,
+        "claude-a.json",
+        "account-a-key",
+        &upstream_url,
+        json!({"account_uuid": "account-a"}),
+    );
+    let rt = runtime(
+        &dir,
+        "",
+        vec![a],
+        executors(ClaudeExecutor::new("http://127.0.0.1:1").unwrap()),
+    );
+    let url = app(&rt).await;
+    assert_eq!(post(&url, "/v1/messages", messages(MODEL, "a", false)).await.0, 429);
+    let (_, headers, _) = post(&url, "/v1/messages", messages(MODEL, "a again", false)).await;
+    assert!(!unified(&headers).is_empty(), "account A's own evidence");
+    let b = api_key(
+        &dir,
+        "claude-a.json",
+        "account-b-key",
+        &upstream_url,
+        json!({"account_uuid": "account-b"}),
+    );
+    rt.store().upsert(b);
+    let (status, headers, body) = post(&url, "/v1/messages", messages(MODEL, "b", false)).await;
+    assert!(
+        unified(&headers).is_empty(),
+        "account B got account A's evidence: {status} {:?} {body}",
+        unified(&headers)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sol review of #128: what a saved cooldown file restores goes through the same
+/// boundary as a live 429. An unbounded name, a non-quota field and a rewritten value
+/// are dropped.
+#[test]
+fn restored_evidence_names_and_values_are_bounded() {
+    let long = format!("anthropic-ratelimit-unified-{}", "x".repeat(1_000_000));
+    let kept = cpa_exec::claude::sanitize_cooldown_signals(
+        [
+            ("anthropic-ratelimit-unified-status".to_owned(), "rejected".to_owned()),
+            (long, "private".to_owned()),
+            ("anthropic-ratelimit-unified-cookie".to_owned(), "session".to_owned()),
+            (
+                "anthropic-ratelimit-unified-representative-claim".to_owned(),
+                "\u{fffd}".to_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        kept.into_iter().collect::<Vec<_>>(),
+        [("Anthropic-Ratelimit-Unified-Status".to_owned(), "rejected".to_owned())]
+    );
+}
+
+/// Sol review of #128: a value that is not printable ASCII (invalid UTF-8 here) is
+/// dropped, not rewritten into new evidence.
+#[test]
+fn invalid_text_is_dropped_not_rewritten() {
+    let mut h = HeaderMap::new();
+    h.insert("anthropic-ratelimit-unified-status", "rejected".parse().unwrap());
+    h.insert(
+        "anthropic-ratelimit-unified-representative-claim",
+        axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    let kept = cpa_exec::claude::rejected_cooldown_signals(&h, b"{}");
+    assert!(
+        !kept.contains_key("Anthropic-Ratelimit-Unified-Representative-Claim"),
+        "{kept:?}"
+    );
+    assert!(kept.values().all(|v| !v.contains('\u{fffd}')));
+}
+
+/// Sol review of #128: a longer credential-wide per-minute cooldown that extends a
+/// model's short quota cooldown leaves that model no stale evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_longer_per_minute_window_does_not_inherit_model_evidence() {
+    let dir = auth_dir("per-minute-extends");
+    let (upstream_url, _) = mock(|_, body| {
+        if body.contains("claude-fable-5-1") {
+            error(
+                429,
+                r#"{"error":{"type":"rate_limit_error","message":"weekly limit"}}"#,
+                vec![
+                    ("retry-after", "30".into()),
+                    ("anthropic-ratelimit-unified-status", "rejected".into()),
+                    ("anthropic-ratelimit-unified-7d-status", "allowed".into()),
+                    ("anthropic-ratelimit-unified-7d_oi-status", "rejected".into()),
+                ],
+            )
+        } else {
+            error(
+                429,
+                r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the requests per minute rate limit. Please try again later."}}"#,
+                vec![
+                    ("retry-after", "600".into()),
+                    ("anthropic-ratelimit-unified-status", "rejected".into()),
+                    ("anthropic-ratelimit-unified-5h-status", "rejected".into()),
+                ],
+            )
+        }
+    })
+    .await;
+    let a = api_key(&dir, "claude-a.json", "fake", &upstream_url, json!({}));
+    let rt = runtime(
+        &dir,
+        "",
+        vec![a],
+        executors(ClaudeExecutor::new("http://127.0.0.1:1").unwrap()),
+    );
+    let url = app(&rt).await;
+    assert_eq!(
+        post(&url, "/v1/messages", messages("claude-fable-5-1", "a", false))
+            .await
+            .0,
+        429
+    );
+    let (_, headers, _) = post(&url, "/v1/messages", messages("claude-fable-5-1", "a again", false)).await;
+    assert!(!unified(&headers).is_empty(), "the model's own short quota evidence");
+    assert_eq!(post(&url, "/v1/messages", messages(MODEL, "b", false)).await.0, 429);
+    let (status, headers, body) = post(&url, "/v1/messages", messages("claude-fable-5-1", "c", false)).await;
+    assert_local_cooldown(status, &headers, &body, "extended");
+    assert!(retry_after(&headers) > 100, "the credential's longer window governs");
+    assert!(unified(&headers).is_empty(), "stale evidence: {:?}", unified(&headers));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Control: a token refresh of the same OAuth account keeps its quota evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_account_refresh_keeps_its_evidence() {
+    let dir = auth_dir("same-account");
+    let (upstream_url, _) = mock(|_, _| {
+        error(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"quota"}}"#,
+            vec![
+                ("retry-after", "600".into()),
+                ("anthropic-ratelimit-unified-status", "rejected".into()),
+                ("anthropic-ratelimit-unified-5h-status", "rejected".into()),
+            ],
+        )
+    })
+    .await;
+    let login = |token: &str| {
+        let meta = json!({"type": "claude", "access_token": token, "account_uuid": "acct-fake",
+            "email": "a@example.invalid", "claude_device_ids": ["b".repeat(64)]});
+        std::fs::write(dir.join("claude.json"), meta.to_string()).unwrap();
+        cpa_server::testing::local(
+            Credential::from_file(&dir, &dir.join("claude.json"), meta.as_object().unwrap().clone()).unwrap(),
+        )
+    };
+    let rt = runtime(
+        &dir,
+        "",
+        vec![login("sk-ant-oat01-first-fake")],
+        executors(ClaudeExecutor::new(&upstream_url).unwrap()),
+    );
+    let url = app(&rt).await;
+    assert_eq!(post(&url, "/v1/messages", messages(MODEL, "a", false)).await.0, 429);
+    rt.store().upsert(login("sk-ant-oat01-refreshed-fake"));
+    let (status, headers, body) = post(&url, "/v1/messages", messages(MODEL, "after refresh", false)).await;
+    assert_local_cooldown(status, &headers, &body, "same account");
+    assert_eq!(unified(&headers).len(), 2, "{:?}", unified(&headers));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Control: `continue` rules fail over without a refresh, with one usage record per
+/// attempt and the rule's code on the failed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continue_rules_fail_over_without_refresh() {
+    for (action, cools, code) in [
+        ("continue", false, "request_scoped"),
+        ("continue-and-cooldown", true, "force_cooldown"),
+    ] {
+        let (rt, upstream_url, m, dir) = oauth_login(&format!("continue-{action}"), Some(action)).await;
+        let b = api_key(&dir, "claude-b.json", "fake-funded-key", &upstream_url, json!({}));
+        let mut a = (*rt.store().get("claude.json").unwrap()).clone();
+        a.metadata.insert("priority".into(), json!(1));
+        rt.store().upsert(a);
+        rt.store().upsert(b);
+        let url = app(&rt).await;
+        let (status, _, body) = post(&url, "/v1/messages", messages(MODEL, "hi", false)).await;
+        assert_eq!(status, 200, "{action}: {body}");
+        assert_eq!(
+            calls(&m),
+            ["/v1/messages sk-ant-oat01-old-fake", "/v1/messages fake-funded-key"],
+            "{action}"
+        );
+        assert_eq!(!rt.store().cooldowns("claude.json").is_empty(), cools, "{action}");
+        let current = rt.store().get("claude.json").unwrap();
+        assert!(!rt.store().tokens_rejected(&current), "{action}");
+        let records = usage(&rt, 2).await;
+        assert_eq!(records.len(), 2, "{action}: {records:?}");
+        let failed: Vec<&Value> = records.iter().filter(|r| r["failed"] == true).collect();
+        assert_eq!(failed.len(), 1, "{action}");
+        assert_eq!(failed[0]["fail"]["status_code"], 401);
+        assert_eq!(failed[0]["fail"]["code"], code, "{action}");
+        assert!(
+            records
+                .iter()
+                .filter(|r| r["failed"] == false)
+                .all(|r| r["fail"].get("code").is_none())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

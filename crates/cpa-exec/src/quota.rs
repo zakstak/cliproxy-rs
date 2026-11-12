@@ -329,52 +329,107 @@ pub fn claude_signals(headers: &HeaderMap) -> std::collections::BTreeMap<String,
     signals.into_iter().take(MAX_SIGNALS).collect()
 }
 
+/// The Anthropic unified quota fields a cooldown may keep as evidence: those Go
+/// v8.0.67 (8bba7a77) or this repository reads, top-level and per window. Anything else
+/// under the `Anthropic-Ratelimit-Unified-` prefix is not quota evidence and is never
+/// kept, replayed or saved.
+const QUOTA_FIELDS: [&str; 8] = [
+    "status",
+    "reset",
+    "representative-claim",
+    "fallback-percentage",
+    "overage-status",
+    "overage-reset",
+    "overage-utilization",
+    "overage-disabled-reason",
+];
+const QUOTA_WINDOWS: [&str; 4] = ["5h", "7d", "7d_oi", "7d_sonnet"];
+const QUOTA_WINDOW_FIELDS: [&str; 4] = ["status", "reset", "utilization", "surpassed-threshold"];
+/// Bounds on what a cooldown keeps: one short value per allowlisted field, and in all
+/// at most every allowlisted name (64 bytes at most) with its longest value, so the
+/// aggregate bound never drops a legitimate field.
+const MAX_EVIDENCE_VALUE: usize = 128;
+const MAX_EVIDENCE_BYTES: usize =
+    (QUOTA_FIELDS.len() + QUOTA_WINDOWS.len() * QUOTA_WINDOW_FIELDS.len()) * (64 + MAX_EVIDENCE_VALUE);
+
+/// The canonical name of an allowlisted quota field, if `name` (any case) is one.
+fn quota_field(name: &str) -> Option<String> {
+    // The longest allowlisted name is 54 bytes; anything longer is no quota field.
+    const MAX_NAME: usize = 64;
+    let name = name.trim();
+    if name.len() > MAX_NAME {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let field = lower.strip_prefix("anthropic-ratelimit-unified-")?;
+    let known = QUOTA_FIELDS.contains(&field)
+        || QUOTA_WINDOWS.iter().any(|window| {
+            field
+                .strip_prefix(window)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|rest| QUOTA_WINDOW_FIELDS.contains(&rest))
+        });
+    known.then(|| crate::proxy::canonical_header(&lower))
+}
+
+/// A quota value kept exactly as Anthropic sent it: printable ASCII, bounded, after
+/// trimming. Anything else (invalid UTF-8, other bytes, control characters) is dropped,
+/// never rewritten.
+fn quota_value(raw: &[u8]) -> Option<String> {
+    let value = raw.trim_ascii();
+    (!value.is_empty() && value.len() <= MAX_EVIDENCE_VALUE && value.iter().all(|b| (0x20..0x7f).contains(b)))
+        .then(|| String::from_utf8(value.to_vec()).expect("printable ASCII is UTF-8"))
+}
+
+/// The kept fields, if they show a rejection (Go `hasRejectedClaudeUnifiedSignals`: the
+/// overall status or a window status `rejected`), within the aggregate bound.
+fn rejected_evidence(fields: impl Iterator<Item = (String, String)>) -> std::collections::BTreeMap<String, String> {
+    let mut kept = std::collections::BTreeMap::new();
+    let mut bytes = 0;
+    for (name, value) in fields {
+        if kept.contains_key(&name) || bytes + name.len() + value.len() > MAX_EVIDENCE_BYTES {
+            continue;
+        }
+        bytes += name.len() + value.len();
+        kept.insert(name, value);
+    }
+    let rejected = kept.iter().any(|(name, value)| {
+        let field = name.to_ascii_lowercase();
+        let field = field.trim_start_matches("anthropic-ratelimit-unified-");
+        let status = field == "status" || QUOTA_WINDOWS.iter().any(|w| field == format!("{w}-status"));
+        status && value.eq_ignore_ascii_case("rejected")
+    });
+    if rejected { kept } else { Default::default() }
+}
+
 /// Go v8.0.67 `rejectedClaudeSignalsForCooldown` (cb70eacf): the Anthropic unified quota
-/// headers of a 429 that rejected a quota window, kept with the cooldown it causes so a
-/// local cooldown 429 can show the client the provider's own evidence. Only
-/// `Anthropic-Ratelimit-Unified-*` headers under [`claude_signals`]' bounds; nothing
-/// when no window or overall status is `rejected`, or when the body is an ordinary
-/// per-minute limit, which is no subscription quota.
+/// fields of a 429 that rejected a quota window, kept with the cooldown it causes so a
+/// local cooldown 429 can show the client the provider's own evidence. Only allowlisted
+/// fields with their last value as sent; nothing when no window or overall status is
+/// `rejected`, or when the body is an ordinary per-minute limit, which is no
+/// subscription quota.
 pub fn rejected_cooldown_signals(headers: &HeaderMap, body: &[u8]) -> std::collections::BTreeMap<String, String> {
     if per_minute_body(body) {
         return Default::default();
     }
-    sanitize_cooldown_signals(claude_signals(headers))
+    rejected_evidence(headers.keys().filter_map(|name| {
+        let field = quota_field(name.as_str())?;
+        let value = quota_value(headers.get_all(name).iter().next_back()?.as_bytes())?;
+        Some((field, value))
+    }))
 }
 
-/// Go `sanitizePersistedClaudeCooldownSignals`: `signals` reduced to unified quota
-/// headers with bounded values, or nothing unless they show a rejection. Applied to
-/// what a saved cooldown file restores too.
+/// What a saved cooldown file restores, reduced by the same boundary a live 429 gets
+/// ([`rejected_cooldown_signals`]), so a file can bring back nothing a 429 could not
+/// have recorded.
 pub fn sanitize_cooldown_signals(
     signals: std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
-    const MAX_VALUE: usize = 512;
-    let kept: std::collections::BTreeMap<String, String> = signals
-        .into_iter()
-        .filter_map(|(name, value)| {
-            let lower = name.trim().to_ascii_lowercase();
-            let value = value.trim();
-            (lower.starts_with("anthropic-ratelimit-unified-")
-                && lower
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                && !value.is_empty()
-                && value.len() <= MAX_VALUE
-                && !value.chars().any(|c| c < '\u{20}' || c == '\u{7f}'))
-            .then(|| (crate::proxy::canonical_header(&lower), value.to_owned()))
-        })
-        .take(64)
-        .collect();
-    let rejected = kept.iter().any(|(name, value)| {
-        let lower = name.to_ascii_lowercase();
-        let window = lower
-            .strip_prefix("anthropic-ratelimit-unified-")
-            .and_then(|rest| rest.strip_suffix("-status"));
-        let names_status =
-            lower == "anthropic-ratelimit-unified-status" || window.is_some_and(|w| !w.is_empty() && w != "overage");
-        names_status && value.eq_ignore_ascii_case("rejected")
-    });
-    if rejected { kept } else { Default::default() }
+    rejected_evidence(
+        signals
+            .into_iter()
+            .filter_map(|(name, value)| Some((quota_field(&name)?, quota_value(value.as_bytes())?))),
+    )
 }
 
 /// The latest passive quota snapshots per Claude credential and per model (Go
@@ -581,6 +636,78 @@ mod tests {
                 "rejected".to_owned()
             )]
         );
+    }
+
+    /// Sol review of #128: only allowlisted provider quota fields are evidence. A
+    /// prefixed name that is no quota field (credentials, cookies, personal data), an
+    /// unbounded name or value, and a value that is not printable ASCII (invalid UTF-8
+    /// included) are dropped on capture and on restore alike, never rewritten; the kept
+    /// set stays within its aggregate bound.
+    #[test]
+    fn cooldown_evidence_is_an_allowlisted_bounded_exact_copy() {
+        let mut h = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-authorization", "Bearer fake-secret"),
+            ("anthropic-ratelimit-unified-cookie", "fake-session=private"),
+            ("anthropic-ratelimit-unified-user-email", "private@example.invalid"),
+            ("anthropic-ratelimit-unified-7d_sonnet-reset", "1800000000"),
+            ("anthropic-ratelimit-unified-7d_oi-surpassed-threshold", "0.75"),
+        ]);
+        h.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            http::HeaderValue::from_bytes("1800000000\u{e9}".as_bytes()).unwrap(),
+        );
+        let kept = rejected_cooldown_signals(&h, b"{}");
+        assert_eq!(
+            kept.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Anthropic-Ratelimit-Unified-7d_oi-Surpassed-Threshold",
+                "Anthropic-Ratelimit-Unified-7d_sonnet-Reset",
+                "Anthropic-Ratelimit-Unified-Status",
+            ]
+        );
+        let long_name = format!("anthropic-ratelimit-unified-{}", "x".repeat(1_000_000));
+        let saved: std::collections::BTreeMap<String, String> = [
+            ("anthropic-ratelimit-unified-status".to_owned(), "rejected".to_owned()),
+            (long_name, "private".to_owned()),
+            ("anthropic-ratelimit-unified-cookie".to_owned(), "x".to_owned()),
+            (
+                "Anthropic-Ratelimit-Unified-5h-Utilization".to_owned(),
+                "\u{fffd}".to_owned(),
+            ),
+            ("anthropic-ratelimit-unified-5h-reset".to_owned(), "9".repeat(129)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            sanitize_cooldown_signals(saved).into_iter().collect::<Vec<_>>(),
+            [("Anthropic-Ratelimit-Unified-Status".to_owned(), "rejected".to_owned())]
+        );
+        // Every allowlisted field at its longest value fits the aggregate bound.
+        let mut all = std::collections::BTreeMap::new();
+        for field in QUOTA_FIELDS {
+            all.insert(
+                format!("anthropic-ratelimit-unified-{field}"),
+                "r".repeat(MAX_EVIDENCE_VALUE),
+            );
+        }
+        for window in QUOTA_WINDOWS {
+            for field in QUOTA_WINDOW_FIELDS {
+                all.insert(
+                    format!("anthropic-ratelimit-unified-{window}-{field}"),
+                    "r".repeat(MAX_EVIDENCE_VALUE),
+                );
+            }
+        }
+        all.insert("anthropic-ratelimit-unified-status".into(), "rejected".into());
+        let kept = sanitize_cooldown_signals(all);
+        let bytes: usize = kept.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert!(bytes <= MAX_EVIDENCE_BYTES && kept.contains_key("Anthropic-Ratelimit-Unified-Status"));
+        assert!(kept.keys().all(|k| k.len() <= 64));
     }
 
     #[test]

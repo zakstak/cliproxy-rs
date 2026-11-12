@@ -31,6 +31,11 @@ pub struct Record {
     /// after the same sanitizing a live 429 gets.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub cooldown_signals: std::collections::BTreeMap<String, String>,
+    /// cliproxy-rs only: the one-way account fingerprint those signals belong to
+    /// (`scheduler::evidence_account`); a restore drops them for another account. Go's
+    /// decoder ignores it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cooldown_signals_account: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LastError>,
     #[serde(default, with = "go_time")]
