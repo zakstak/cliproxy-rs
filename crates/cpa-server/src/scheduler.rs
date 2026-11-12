@@ -595,6 +595,10 @@ pub(crate) struct Cooldown {
     /// [`evidence_account`] of the account those signals came from: evidence answers
     /// only while the same account holds the credential ID.
     pub signals_account: String,
+    /// The exact deadline a request-scoped `*-and-cooldown` rule forced (Go v8.0.67
+    /// `forceCooldownUntil`, 9d7d012b). It outlives `disable-cooling`, reloads and
+    /// restarts, and an ordinary failure that extends the cooldown never inflates it.
+    pub force_until: Option<Instant>,
 }
 
 /// The account a credential's quota evidence belongs to, as a one-way fingerprint (no
@@ -627,6 +631,39 @@ pub(crate) struct QuotaKind {
 }
 
 impl Cooldown {
+    /// Reduces this cooldown to exactly its live forced portion (Go
+    /// `clearDisabledCooldownStateForAuth`): the forced deadline, without the ordinary
+    /// quota window, bounded trust and evidence that belonged to ordinary answers. A live
+    /// probe reservation stays with its generation, so its own lease still answers it
+    /// and an older one cannot. False when nothing forced is live.
+    fn keep_forced_portion(&mut self, now: Instant) -> bool {
+        let Some(force) = self.force_until.filter(|f| *f > now) else {
+            return false;
+        };
+        self.deadline = force;
+        let reservation = self.trust.probe.filter(|p| *p > now);
+        self.trust = Trust {
+            generation: if reservation.is_some() {
+                self.trust.generation
+            } else {
+                0
+            },
+            probe: reservation,
+            ..Trust::default()
+        };
+        self.quota = false;
+        self.quota_kind = None;
+        self.quota_under = None;
+        self.signals.clear();
+        self.signals_account.clear();
+        true
+    }
+
+    /// The live forced deadline, which no ordinary answer may undercut.
+    fn live_force(&self, now: Instant) -> Option<Instant> {
+        self.force_until.filter(|f| *f > now)
+    }
+
     /// The live quota block this entry is or carries.
     fn quota_block(&self, now: Instant) -> Option<(Instant, QuotaKind)> {
         let block = if self.quota {
@@ -690,8 +727,11 @@ impl Cooldown {
     /// lease's answer does not answer it.
     fn newer_than(&self, picked: u32) -> bool {
         // Serial-number order, so the wrapping counter compares right while a lease is
-        // fewer than 2^31 generations old.
-        (self.trust.bounded || self.trust.accepted) && (self.trust.generation.wrapping_sub(picked) as i32) > 0
+        // fewer than 2^31 generations old. A probe reservation counts by itself: one
+        // carried over a merge or a forced reduction keeps its gate without the bounded
+        // window it was reserved on (#95). Before, a reservation implied `bounded`.
+        (self.trust.bounded || self.trust.accepted || self.trust.probe.is_some())
+            && (self.trust.generation.wrapping_sub(picked) as i32) > 0
     }
 }
 
@@ -712,9 +752,15 @@ pub(crate) struct Scheduler {
     /// The live policy turned session affinity off: results of leases picked while it
     /// was on no longer bind anything (Go's replacement selector has no affinity).
     affinity_off: bool,
-    /// Bounded windows opened plus probes reserved; each lease carries the value at its
-    /// pick ([`Trust::generation`]).
+    /// Bounded windows opened, probes reserved and key migrations; each lease carries
+    /// the value at its pick ([`Trust::generation`]).
     generation: u32,
+    /// Where model-key migrations moved each credential's cooldowns (#95): `(credential,
+    /// from)` to its moves, oldest first. A lease picked before a move answers the key
+    /// its cooldown moved to ([`Self::result_key`]), whatever aliases were published
+    /// since. Kept for the credential revision it moved under; dropped with that revision,
+    /// the credential, or after 2^30 generations.
+    moved: HashMap<(String, String), Vec<Moved>>,
     /// Upstream dispatches so far (Go `Manager.executionSeq`): each dispatch takes the
     /// next value ([`Self::dispatch`]); a recorded failure stamps the current one.
     dispatched: u64,
@@ -724,6 +770,20 @@ pub(crate) struct Scheduler {
     /// selected nor refreshed until their tokens change ([`Self::tokens_rejected`]).
     rejected: HashMap<String, std::sync::Arc<Credential>>,
 }
+
+/// One model-key migration of a credential's cooldown ([`Scheduler::migrate_model_keys`]).
+#[derive(Debug, Clone)]
+struct Moved {
+    /// The scheduler generation the migration took: leases picked before it follow it.
+    generation: u32,
+    /// The credential revision it moved under; results come only from that revision.
+    revision: u64,
+    to: String,
+}
+
+/// History older than this many generations is dropped, so the wrapping generation
+/// counter never compares it the wrong way round.
+const MOVED_HORIZON: u32 = 1 << 30;
 
 /// A selection's affinity keys: the session, and its parent or alias when distinct.
 struct SessionKeys {
@@ -900,21 +960,33 @@ impl Scheduler {
     /// are not newer than the lease change; their count stays until the stream's own
     /// outcome is recorded. When the credential-wide window ended, the model keys that
     /// share its deadline (its copies) are disarmed too; a model's own window is not.
+    /// A probe reservation a key migration carried onto another deadline owner (#95) is
+    /// released the same way, generation-fenced, whatever owns the deadline: the owner's
+    /// deadline, provenance and evidence stay as they are.
     /// Cost: two lookups, and a scan of the cooldown table only when the credential-wide
     /// window ended.
     pub fn accept_probe_picked(&mut self, c: &Credential, model: &str, picked: u32, now: Instant) {
-        let model = canonical_model(model);
+        let key = self.result_key(c, canonical_model(model), picked);
+        let model = key.as_ref();
         let mut credential_window = None;
         for m in [model, ""] {
-            if let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned()))
-                && s.trust.bounded
-                && s.deadline <= now
-                && !s.newer_than(picked)
-            {
+            let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned())) else {
+                continue;
+            };
+            if s.newer_than(picked) {
+                continue;
+            }
+            if s.trust.bounded && s.deadline <= now {
                 s.trust.accept();
                 if m.is_empty() {
                     credential_window = Some(s.deadline);
                 }
+            } else if s.trust.probe.is_some() {
+                // A reservation carried onto another deadline owner: answered, so it keeps
+                // its generation as a fence against older leases, as an accepted bounded
+                // window does. The owner's deadline, quota and evidence stay.
+                s.trust.probe = None;
+                s.trust.accepted = true;
             }
         }
         if let Some(ended) = credential_window {
@@ -1321,7 +1393,8 @@ impl Scheduler {
         seq: u64,
         now: Instant,
     ) {
-        let model = canonical_model(model);
+        let key = self.result_key(c, canonical_model(model), picked);
+        let model = key.as_ref();
         self.apply(c, model, outcome, policy, picked, seq, now);
         // Go stamps the failing state with the dispatch watermark; a credential-wide 429
         // also stamps the credential and every sibling state. A credential-level failure
@@ -1444,6 +1517,8 @@ impl Scheduler {
             .filter(|s| s.deadline > now)
             .map(|s| (s.signals.clone(), s.signals_account.clone()))
             .unwrap_or_default();
+        // The live entry's exact forced deadline, kept apart from ordinary extensions.
+        let prev_force = prev.and_then(|s| s.force_until).filter(|f| *f > now);
         // A live quota block this failure answers, if it is not a quota failure itself.
         let quota_under = prev.and_then(|p| p.quota_block(now));
         let mut level = prev.filter(|s| s.quota).map(|s| s.level).unwrap_or(0);
@@ -1495,10 +1570,14 @@ impl Scheduler {
                             // moves the probe up to it.
                             let reset = now.checked_add(stated);
                             let old = window.deadline;
-                            let deadline = reset.map_or(old, |r| old.min(r));
+                            // An earlier reset never undercuts a live forced deadline.
+                            let deadline = reset.map_or(old, |r| old.min(r)).max(prev_force.unwrap_or(now));
                             let mut window_trust = window.trust;
                             if let Some(slot) = self.cooldowns.get_mut(&key) {
                                 slot.deadline = deadline;
+                                if action.force_cooldown {
+                                    slot.force_until = slot.force_until.max(Some(deadline));
+                                }
                                 slot.error = stored;
                                 slot.trust.stated = reset.or(slot.trust.stated);
                                 window_trust = slot.trust;
@@ -1509,7 +1588,7 @@ impl Scheduler {
                                 // independent cooldowns stand.
                                 for ((id, m), state) in &mut self.cooldowns {
                                     if *id == c.id && !m.is_empty() && state.trust.bounded && state.deadline == old {
-                                        state.deadline = deadline;
+                                        state.deadline = deadline.max(state.live_force(now).unwrap_or(deadline));
                                         state.trust.stated = window_trust.stated;
                                         state.trust.window = state.trust.window.max(window_trust.window);
                                     }
@@ -1539,6 +1618,9 @@ impl Scheduler {
                         let deadline = prev.deadline;
                         if let Some(slot) = self.cooldowns.get_mut(&key) {
                             slot.error = stored;
+                            if action.force_cooldown {
+                                slot.force_until = slot.force_until.max(Some(deadline));
+                            }
                         }
                         if credential_quota {
                             self.extend_siblings(c, deadline, None, now);
@@ -1561,9 +1643,21 @@ impl Scheduler {
             d => d,
         };
         let Some(next) = duration.and_then(|d| now.checked_add(d)) else {
-            self.cooldowns.remove(&key);
+            // A failure that sets no cooldown (cooling disabled, transient cooldowns off)
+            // ends an ordinary cooldown, but a live forced one keeps exactly its forced
+            // portion (Go v8.0.67 9d7d012b, interleaved errors).
+            let forced = self
+                .cooldowns
+                .get_mut(&key)
+                .is_some_and(|slot| slot.keep_forced_portion(now));
+            if !forced {
+                self.cooldowns.remove(&key);
+            }
             return;
         };
+        // This failure's own forced deadline, merged with a live one it does not shorten.
+        let this_force = action.force_cooldown.then_some(next);
+        let force = this_force.max(prev_force);
         let deadline = prev_live.map_or(next, |p| p.max(next));
         // An answer from a request already in flight (a 503, a 401) inside a live bounded
         // quota window that outlasts it: the window stands as it is, quota and all, so
@@ -1572,6 +1666,7 @@ impl Scheduler {
         if prev_live == Some(deadline)
             && let Some(slot) = self.cooldowns.get_mut(&key).filter(|s| s.quota && s.trust.bounded)
         {
+            slot.force_until = force;
             slot.error = stored;
             // Go's level still counts a Cloudflare challenge (unchanged for other causes).
             slot.level = level;
@@ -1639,6 +1734,7 @@ impl Scheduler {
             recorded: 0,
             signals: evidence(deadline).0,
             signals_account: evidence(deadline).1,
+            force_until: force,
         };
         let reason = if credential_quota {
             "credential_quota"
@@ -1660,6 +1756,10 @@ impl Scheduler {
                     .filter(|s| s.deadline > now)
                     .map_or(deadline, |s| s.deadline);
                 let own_trust = self.cooldowns.get(&own).map(|s| s.trust).unwrap_or_default();
+                // The model's own live forced deadline stays with it; the credential's
+                // force (or its absence) is not the model's (#95).
+                let own_force = this_force.max(self.cooldowns.get(&own).and_then(|s| s.live_force(now)));
+                let own_deadline = own_deadline.max(own_force.unwrap_or(own_deadline));
                 let own_evidence = self
                     .cooldowns
                     .get(&own)
@@ -1685,6 +1785,7 @@ impl Scheduler {
                     own_state.trust = provenance(deadline);
                 }
                 own_state.trust.window = own_state.trust.window.max(own_window);
+                own_state.force_until = own_force;
                 self.cooldowns.insert(own, own_state);
             }
         }
@@ -1808,6 +1909,10 @@ impl Scheduler {
                     } else {
                         String::new()
                     },
+                    // Go v8.0.67 `ForceCooldownUntil`/`ForceCooldownEvaluated`: the exact
+                    // forced deadline, and a mark that a missing one means ordinary.
+                    force_cooldown_until: state.force_until.filter(|f| *f > now).map(|f| wall + (f - now)),
+                    force_cooldown_evaluated: true,
                     last_error: Some(LastError {
                         message: state.error.clone(),
                         http_status: u32::from(state.status),
@@ -1828,6 +1933,7 @@ impl Scheduler {
     /// Go `restoreCooldownRecordLocked` for one live record of `c`. A model-less record
     /// restores the credential-wide quota; other model-less records aggregate the model
     /// records (Go recomputes them) and apply only when `c` has no model records.
+    #[cfg(test)]
     pub fn restore(
         &mut self,
         c: &Credential,
@@ -1837,6 +1943,43 @@ impl Scheduler {
         now: Instant,
         wall: SystemTime,
     ) -> bool {
+        self.restore_with(c, record, has_model_records, cap, now, wall, false)
+    }
+
+    /// [`Self::restore`] for a credential whose cooling the policy may disable (Go
+    /// v8.0.67 9d7d012b `restoreCooldownRecordLocked`). With cooling disabled only a
+    /// record with a live forced deadline restores, as its forced portion: no quota
+    /// window, no evidence. A record without Go's `force_cooldown_evaluated` mark (an
+    /// older one) is ordinary, never forced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_with(
+        &mut self,
+        c: &Credential,
+        record: &crate::cooldown_store::Record,
+        has_model_records: bool,
+        cap: Duration,
+        now: Instant,
+        wall: SystemTime,
+        cooling_disabled: bool,
+    ) -> bool {
+        let force = record
+            .force_cooldown_until
+            .filter(|_| record.force_cooldown_evaluated)
+            .filter(|f| *f > wall);
+        if cooling_disabled {
+            let Some(force) = force else {
+                return false;
+            };
+            let mut forced = record.clone();
+            forced.next_retry_after = Some(record.next_retry_after.map_or(force, |r| r.min(force)));
+            forced.quota = crate::cooldown_store::Quota {
+                reason: record.quota.reason.clone(),
+                ..Default::default()
+            };
+            forced.cooldown_signals.clear();
+            forced.cooldown_signals_account.clear();
+            return self.restore_with(c, &forced, has_model_records, cap, now, wall, false);
+        }
         // Go blocks until the later of the retry deadline and, for a quota state, the
         // quota recovery time (`availabilityBlock`); one deadline here.
         // Go restores only records whose retry deadline is still ahead.
@@ -1916,6 +2059,8 @@ impl Scheduler {
         // A live quota block under the entry this merges with stays: a record saved while
         // a 401 answered a quota is the 401's alone.
         let quota_under = prev.and_then(|p| p.quota_block(now));
+        // A live forced deadline under the entry this merges with stays (never shortened).
+        let prev_force = prev.and_then(|p| p.force_until).filter(|f| *f > now);
         let mut trust = trust;
         // With bounded trust on either side, provenance and the quota classification come
         // from the entry that supplies the deadline, and the counts merge. Without it the
@@ -1940,6 +2085,12 @@ impl Scheduler {
             trust.generation = self.generation;
         }
         let (quota, status, credential) = quota;
+        // The restored forced deadline (never shortened by a live one), which no deadline
+        // restored with it undercuts.
+        let restored_force = force
+            .map(|f| now + f.duration_since(wall).unwrap_or_default())
+            .max(prev_force);
+        let deadline = deadline.max(restored_force.unwrap_or(deadline));
         // The evidence follows the entry that supplies the deadline; a saved file is
         // sanitized again, so it can restore nothing a 429 could not have recorded.
         let account = evidence_account(c);
@@ -1979,32 +2130,168 @@ impl Scheduler {
                 recorded,
                 signals,
                 signals_account,
+                force_until: restored_force,
             },
         );
         true
     }
 
-    /// Go `clearDisabledCooldownStates`: drops cooldowns of credentials that are disabled
-    /// or whose cooling the policy disables. Returns whether anything was cleared.
-    pub fn clear_disabled(&mut self, credentials: &[std::sync::Arc<Credential>], policy: &Policy) -> bool {
-        let before = self.cooldowns.len();
-        self.cooldowns.retain(|(id, _), _| {
-            credentials
-                .iter()
-                .find(|c| c.id == *id)
-                .is_none_or(|c| !c.disabled && !policy.cooling_disabled(c))
+    /// The key a result for `model` from a lease of `c` picked at generation `picked`
+    /// answers: `model`, or where the migrations since that pick moved its cooldown,
+    /// followed in the order they happened ([`Self::migrate_model_keys`]). Only moves
+    /// under `c`'s revision count, so a replaced credential's history never applies; the
+    /// caller has checked that the lease's revision is current. Resolution and the
+    /// result's application happen under the scheduler lock, as migrations do, so a
+    /// result never lands between a migration and its record. Cost: nothing without
+    /// history; one lookup per move followed otherwise.
+    fn result_key<'a>(&self, c: &Credential, model: &'a str, picked: u32) -> std::borrow::Cow<'a, str> {
+        let mut key = std::borrow::Cow::Borrowed(model);
+        if self.moved.is_empty() {
+            return key;
+        }
+        let mut since = picked;
+        let current = self.generation;
+        // Each step follows a strictly later move, so this ends.
+        while let Some(next) = self
+            .moved
+            .get(&(c.id.clone(), key.clone().into_owned()))
+            .and_then(|history| {
+                history
+                    .iter()
+                    .filter(|m| {
+                        m.revision == c.revision
+                            && current.wrapping_sub(m.generation) < MOVED_HORIZON
+                            && (m.generation.wrapping_sub(since) as i32) > 0
+                    })
+                    .min_by_key(|m| m.generation.wrapping_sub(since))
+            })
+        {
+            since = next.generation;
+            key = std::borrow::Cow::Owned(next.to.clone());
+        }
+        key
+    }
+
+    /// Moves `c`'s model cooldowns to the keys their spellings resolve to now (#95, Go
+    /// v8.0.67 098af7d5): `key_of` is the key a route model's cooldown lives under
+    /// ([`crate::registry::cooldown_key`]). A key moves only to a spelling that is the
+    /// same name under Go's `strings.ToLower` and maps to itself, so a cooldown never
+    /// moves onto another model: an alias recorded before its mapping existed was
+    /// earned by sending the alias itself and stays where it is. Two entries for one key
+    /// merge ([`merge_cooldowns`]). Returns whether anything moved.
+    pub fn migrate_model_keys(&mut self, c: &Credential, key_of: impl Fn(&str) -> String, now: Instant) -> bool {
+        let moves: Vec<(String, String)> = self
+            .cooldowns
+            .keys()
+            .filter(|(id, _)| *id == c.id)
+            .filter_map(|(_, m)| migrated_key(m, &key_of).map(|to| (m.clone(), to)))
+            .collect();
+        let current = self.generation;
+        self.moved.retain(|(id, _), history| {
+            if *id == c.id {
+                history.retain(|m| m.revision == c.revision && current.wrapping_sub(m.generation) < MOVED_HORIZON);
+            }
+            !history.is_empty()
         });
-        self.cooldowns.len() != before
+        if !moves.is_empty() {
+            // Leases picked before this migration follow it; later ones were picked under
+            // the new keys.
+            self.generation = self.generation.wrapping_add(1);
+        }
+        for (from, to) in &moves {
+            self.moved.entry((c.id.clone(), from.clone())).or_default().push(Moved {
+                generation: self.generation,
+                revision: c.revision,
+                to: to.clone(),
+            });
+            let Some(moved) = self.cooldowns.remove(&(c.id.clone(), from.clone())) else {
+                continue;
+            };
+            let key = (c.id.clone(), to.clone());
+            let merged = match self.cooldowns.remove(&key) {
+                Some(existing) => merge_cooldowns(existing, moved, now),
+                None => moved,
+            };
+            self.cooldowns.insert(key, merged);
+        }
+        !moves.is_empty()
+    }
+
+    /// Go `clearDisabledCooldownStates` (v8.0.67 9d7d012b): drops every cooldown of a
+    /// disabled credential, and of a credential whose cooling the policy disables keeps
+    /// only live forced cooldowns, reduced to their forced portion. Returns whether
+    /// anything changed.
+    pub fn clear_disabled(
+        &mut self,
+        credentials: &[std::sync::Arc<Credential>],
+        policy: &Policy,
+        now: Instant,
+    ) -> bool {
+        let mut changed = false;
+        self.cooldowns.retain(|(id, _), s| {
+            let Some(c) = credentials.iter().find(|c| c.id == *id) else {
+                return true;
+            };
+            if !c.disabled && !policy.cooling_disabled(c) {
+                return true;
+            }
+            let before = (s.deadline, s.trust, s.quota);
+            let keep = !c.disabled && s.keep_forced_portion(now);
+            changed |= !keep || before != (s.deadline, s.trust, s.quota);
+            keep
+        });
+        changed
     }
 
     pub fn reconcile(&mut self, credentials: &[std::sync::Arc<Credential>]) {
         self.cooldowns
             .retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
+        self.moved.retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
         self.affinity.retain(|id| credentials.iter().any(|c| c.id == id));
         self.lcp.retain(|id| credentials.iter().any(|c| c.id == id));
         self.probes.retain(|id, _| credentials.iter().any(|c| c.id == *id));
         self.rejected.retain(|id, _| credentials.iter().any(|c| c.id == *id));
     }
+}
+
+/// The key a cooldown kept under model key `key` moves to now
+/// ([`Scheduler::migrate_model_keys`]), or `None` when it stays: only to a spelling that
+/// is the same name under Go's `strings.ToLower` and that `key_of` maps to itself.
+pub(crate) fn migrated_key(key: &str, key_of: impl Fn(&str) -> String) -> Option<String> {
+    use cpa_core::gostr::GoStr;
+    let key = canonical_model(key);
+    if key.is_empty() {
+        return None;
+    }
+    let to = canonical_model(&key_of(key)).to_owned();
+    (!to.is_empty() && to != key && to.go_lower() == key.go_lower() && canonical_model(&key_of(&to)) == to)
+        .then_some(to)
+}
+
+/// Two cooldowns of one key after a migration (Go `mergeModelState`): the entry with
+/// the later deadline keeps its provenance, quota kind and evidence, which belong to that
+/// deadline; the forced deadline, backoff level and dispatch watermark keep the most of
+/// both, so neither is shortened. A live probe reservation is protection, not
+/// provenance: the later-ending one stays, with the newer of the two generations, so
+/// the deadline owner never frees it and an older lease cannot answer it (#95).
+fn merge_cooldowns(a: Cooldown, b: Cooldown, now: Instant) -> Cooldown {
+    let (mut owner, other) = if b.deadline > a.deadline { (b, a) } else { (a, b) };
+    owner.force_until = owner.force_until.max(other.force_until);
+    owner.level = owner.level.max(other.level);
+    owner.recorded = owner.recorded.max(other.recorded);
+    owner.trust.window = owner.trust.window.max(other.trust.window);
+    let live = |t: &Trust| t.probe.filter(|p| *p > now);
+    if let Some(held) = live(&other.trust).filter(|p| live(&owner.trust).is_none_or(|own| p > &own)) {
+        owner.trust.probe = Some(held);
+        let (g, o) = (owner.trust.generation, other.trust.generation);
+        if (o.wrapping_sub(g) as i32) > 0 {
+            owner.trust.generation = o;
+        }
+    }
+    if let Some(force) = owner.live_force(now) {
+        owner.deadline = owner.deadline.max(force);
+    }
+    owner
 }
 
 /// Time left until a bounded cooldown's stated reset, while it is ahead.
@@ -2194,6 +2481,7 @@ mod tests {
             recorded: 0,
             signals: Default::default(),
             signals_account: String::new(),
+            force_until: None,
         };
         let mut s = Scheduler::default();
         for (id, model, c) in [
@@ -4019,6 +4307,590 @@ mod tests {
         assert!(s.rotations.is_empty());
         assert!(s.affinity.is_empty());
         assert_eq!(s.wait(&a, "other", now), Some(Duration::from_secs(1)));
+    }
+
+    /// #95 (Go v8.0.67 9d7d012b): a forced cooldown keeps its exact deadline apart from
+    /// an ordinary extension, and with `disable-cooling` (clear on reload, an ordinary
+    /// failure that sets no cooldown, save and restore) survives as exactly its forced
+    /// portion. An ordinary cooldown does not, a disabled credential keeps nothing, and a
+    /// record without force provenance is never forced.
+    #[test]
+    fn forced_cooldown_survives_disable_cooling_as_its_forced_portion() {
+        use std::sync::Arc;
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let rule = serde_json::json!([{"status": 503, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let forced_cred = |off: bool| {
+            cred(
+                "a",
+                serde_json::json!({"disable_cooling": off, "request_scoped_errors": rule}),
+            )
+        };
+        let plain_cred = |off: bool| cred("b", serde_json::json!({"disable_cooling": off}));
+        let p = Policy::default();
+        let fail = |status: u16, text: &str, retry: Option<u64>| {
+            let mut e = ExecError::local(status, FailureScope::Model, text.to_owned());
+            e.retry_after = retry.map(secs);
+            Outcome::Failure(e)
+        };
+        let (a, b) = (forced_cred(false), plain_cred(false));
+        let mut s = Scheduler::default();
+        s.record(&a, "m", &fail(503, "forced", None), &p, now);
+        assert_eq!(s.wait(&a, "m", now), Some(secs(60)));
+        // An ordinary failure extends the cooldown, never its forced deadline.
+        s.record(&a, "m", &fail(429, "slow down", Some(1800)), &p, now);
+        assert_eq!(s.wait(&a, "m", now), Some(secs(1800)));
+        s.record(&b, "m", &fail(429, "slow down", Some(1800)), &p, now);
+        let saved = s.records(&a, now, wall).remove(0);
+        assert_eq!(saved.force_cooldown_until, Some(wall + secs(60)));
+        assert!(saved.force_cooldown_evaluated);
+        let ordinary = s.records(&b, now, wall).remove(0);
+        assert_eq!(ordinary.force_cooldown_until, None);
+        assert!(ordinary.force_cooldown_evaluated, "explicitly ordinary");
+        // Cooling turns off: the forced portion stays, the ordinary cooldown goes.
+        let off = [Arc::new(forced_cred(true)), Arc::new(plain_cred(true))];
+        assert!(s.clear_disabled(&off, &p, now));
+        assert_eq!(s.wait(&off[0], "m", now), Some(secs(60)));
+        assert_eq!(s.wait(&off[1], "m", now), None);
+        assert!(!s.clear_disabled(&off, &p, now), "nothing more to clear");
+        // An ordinary failure that sets no cooldown leaves the forced one in place.
+        s.record(&off[0], "m", &fail(503, "plain", None), &p, now);
+        assert_eq!(s.wait(&off[0], "m", now), Some(secs(60)));
+        assert_eq!(
+            s.records(&off[0], now, wall)[0].force_cooldown_until,
+            Some(wall + secs(60))
+        );
+        // Restored with cooling off: the forced portion only; nothing ordinary.
+        let mut back = Scheduler::default();
+        assert!(back.restore_with(&off[0], &saved, false, secs(H), now, wall, true));
+        assert_eq!(back.wait(&off[0], "m", now), Some(secs(60)));
+        assert!(!back.restore_with(&off[1], &ordinary, false, secs(H), now, wall, true));
+        let mut legacy = saved.clone();
+        legacy.force_cooldown_evaluated = false;
+        let mut back = Scheduler::default();
+        assert!(
+            !back.restore_with(&off[0], &legacy, false, secs(H), now, wall, true),
+            "an older record is ordinary"
+        );
+        // Restored with cooling on, the force provenance comes back with the cooldown.
+        let mut back = Scheduler::default();
+        assert!(back.restore_with(&a, &saved, false, secs(H), now, wall, false));
+        assert_eq!(back.wait(&a, "m", now), Some(secs(1800)));
+        assert!(back.clear_disabled(&off, &p, now));
+        assert_eq!(back.wait(&off[0], "m", now), Some(secs(60)));
+        // A disabled credential keeps nothing, forced or not.
+        let mut disabled = forced_cred(true);
+        disabled.disabled = true;
+        assert!(back.clear_disabled(&[Arc::new(disabled)], &p, now));
+        assert_eq!(back.wait(&off[0], "m", now), None);
+    }
+
+    /// #95: cooldowns kept under a spelling that now resolves to another key move to it
+    /// only when the two are the same name under Go's `strings.ToLower` (Unicode
+    /// included) and the new key maps to itself. Entries for one key merge: the later
+    /// deadline keeps its provenance, a forced deadline survives. Another name (an
+    /// alias recorded before its mapping existed) never moves.
+    #[test]
+    fn model_keys_migrate_only_case_variants_of_the_resolved_key() {
+        use cpa_core::gostr::GoStr;
+        use std::sync::Arc;
+        let now = Instant::now();
+        let p = Policy::default();
+        let rule = serde_json::json!([{"status": 503, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let c = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        let fail = |status: u16, text: &str, retry: u64| {
+            let mut e = ExecError::local(status, FailureScope::Model, text.to_owned());
+            e.retry_after = Some(secs(retry));
+            Outcome::Failure(e)
+        };
+        let mut s = Scheduler::default();
+        s.record(&c, "claude-opus-4-6", &fail(429, "limit", 600), &p, now);
+        s.record(&c, "CLAUDE-OPUS-4-6(high)", &fail(429, "limit", 900), &p, now);
+        s.record(&c, "Claude-Opus-4-6", &fail(503, "forced", 0), &p, now);
+        s.record(&c, "opus", &fail(429, "limit", 1200), &p, now);
+        s.record(&c, "claude-\u{f6}pus", &fail(429, "limit", 300), &p, now);
+        s.record(&c, "claude-\u{212a}", &fail(429, "limit", 300), &p, now);
+        let key_of = |m: &str| -> String {
+            match m.go_lower().as_str() {
+                "claude-opus-4-6" | "opus" => "Claude-Opus-4-6".into(),
+                "claude-\u{f6}pus" => "Claude-\u{d6}pus".into(),
+                "claude-k" => "claude-k".into(),
+                _ => m.to_owned(),
+            }
+        };
+        assert!(s.migrate_model_keys(&c, key_of, now));
+        let mut keys: Vec<&str> = s.cooldowns.keys().map(|(_, m)| m.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["Claude-Opus-4-6", "Claude-\u{d6}pus", "claude-k", "opus"]);
+        assert_eq!(
+            s.wait(&c, "Claude-Opus-4-6", now),
+            Some(secs(900)),
+            "the later deadline"
+        );
+        assert_eq!(s.wait(&c, "opus", now), Some(secs(1200)), "another name stays");
+        assert!(!s.migrate_model_keys(&c, key_of, now), "idempotent");
+        // The forced deadline merged in survives cooling being turned off.
+        let mut off = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        off.metadata.insert("disable_cooling".into(), true.into());
+        assert!(s.clear_disabled(&[Arc::new(off.clone())], &p, now));
+        assert_eq!(s.wait(&off, "Claude-Opus-4-6", now), Some(secs(60)));
+        // A target that does not map to itself is never moved to.
+        let mut s = Scheduler::default();
+        s.record(&c, "Claude-X", &fail(429, "limit", 600), &p, now);
+        assert!(!s.migrate_model_keys(
+            &c,
+            |m| if m == "Claude-X" {
+                "claude-x".into()
+            } else {
+                "elsewhere".into()
+            },
+            now
+        ));
+        assert_eq!(s.wait(&c, "Claude-X", now), Some(secs(600)));
+    }
+
+    /// Sol review of #136 (finding 1): an ordinary 429 answering inside a live bounded
+    /// window moves the probe up to its earlier reset, but never below a live forced
+    /// deadline, on the key or on a model key that inherited the credential window;
+    /// turning cooling off then keeps exactly the forced portion, without the ordinary
+    /// quota window. Without a forced deadline the earlier reset still applies.
+    #[test]
+    fn an_ordinary_answer_never_undercuts_a_live_forced_deadline() {
+        use std::sync::Arc;
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let rule = serde_json::json!([{"status": 429, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let c = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        let limit = |scope: FailureScope, text: &str, retry: u64| {
+            let mut e = ExecError::local(429, scope, text.to_owned());
+            e.retry_after = Some(secs(retry));
+            Outcome::Failure(e)
+        };
+        let mut s = Scheduler::default();
+        s.record(&c, "m", &limit(FailureScope::Model, "forced", 3600), &p, now);
+        assert_eq!(s.wait(&c, "m", now), Some(secs(60)), "a forced bounded window");
+        s.record(&c, "m", &limit(FailureScope::Model, "slow down", 10), &p, now);
+        assert_eq!(
+            s.wait(&c, "m", now),
+            Some(secs(60)),
+            "the earlier ordinary reset stops at the forced deadline"
+        );
+        let mut off = c.clone();
+        off.metadata.insert("disable_cooling".into(), true.into());
+        let off = Arc::new(off);
+        assert!(s.clear_disabled(std::slice::from_ref(&off), &p, now));
+        assert_eq!(s.wait(&off, "m", now), Some(secs(60)));
+        let saved = s.records(&off, now, wall).remove(0);
+        assert_eq!(saved.force_cooldown_until, Some(wall + secs(60)));
+        assert!(!saved.quota.exceeded, "no ordinary quota window");
+        // A model key that inherited a credential window keeps its own forced deadline
+        // when that window moves up.
+        let mut s = Scheduler::default();
+        s.record(&c, "m", &limit(FailureScope::Credential, "slow down", 3600), &p, now);
+        s.record(&c, "m", &limit(FailureScope::Model, "forced", 3600), &p, now);
+        s.record(&c, "m", &limit(FailureScope::Credential, "slow down", 10), &p, now);
+        assert_eq!(s.wait(&c, "", now), Some(secs(10)), "the credential window moved up");
+        assert_eq!(
+            s.wait(&c, "m", now),
+            Some(secs(60)),
+            "the model's forced deadline stands"
+        );
+        // Control: without a forced deadline the earlier reset applies.
+        let plain = cred("b", serde_json::json!({}));
+        let mut s = Scheduler::default();
+        s.record(&plain, "m", &limit(FailureScope::Model, "slow down", 3600), &p, now);
+        s.record(&plain, "m", &limit(FailureScope::Model, "slow down", 10), &p, now);
+        assert_eq!(s.wait(&plain, "m", now), Some(secs(10)));
+    }
+
+    /// Sol review of #136 (finding 2): a credential-wide 429 rewrites the failing
+    /// model's own state, which keeps its own live forced deadline; the credential key
+    /// and a sibling model get no force they did not earn, so turning cooling off keeps
+    /// the model's forced portion and nothing else.
+    #[test]
+    fn a_credential_quota_keeps_the_models_own_forced_deadline() {
+        use std::sync::Arc;
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let p = Policy::default();
+        let rule = serde_json::json!([{"status": 503, "match": ["forced"], "action": "stop-and-cooldown"}]);
+        let c = cred("a", serde_json::json!({"request_scoped_errors": rule}));
+        let fail = |status: u16, scope: FailureScope, text: &str, retry: u64| {
+            let mut e = ExecError::local(status, scope, text.to_owned());
+            e.retry_after = (retry > 0).then(|| secs(retry));
+            Outcome::Failure(e)
+        };
+        let mut s = Scheduler::default();
+        s.record(&c, "x", &fail(429, FailureScope::Model, "slow down", 600), &p, now);
+        s.record(&c, "m", &fail(503, FailureScope::Model, "forced", 0), &p, now);
+        assert_eq!(s.wait(&c, "m", now), Some(secs(60)));
+        s.record(
+            &c,
+            "m",
+            &fail(429, FailureScope::Credential, "slow down", 1800),
+            &p,
+            now,
+        );
+        assert_eq!(s.wait(&c, "m", now), Some(secs(1800)));
+        let forced: Vec<(String, Option<SystemTime>)> = s
+            .records(&c, now, wall)
+            .into_iter()
+            .map(|r| (r.model, r.force_cooldown_until))
+            .collect();
+        assert_eq!(
+            forced,
+            [
+                (String::new(), None),
+                ("m".to_owned(), Some(wall + secs(60))),
+                ("x".to_owned(), None),
+            ],
+            "only the model keeps a forced deadline"
+        );
+        let mut off = c.clone();
+        off.metadata.insert("disable_cooling".into(), true.into());
+        let off = Arc::new(off);
+        assert!(s.clear_disabled(std::slice::from_ref(&off), &p, now));
+        assert_eq!(s.wait(&off, "m", now), Some(secs(60)), "the model's forced portion");
+        assert_eq!(s.wait(&off, "x", now), None, "no force introduced");
+        assert_eq!(
+            s.records(&off, now, wall)
+                .into_iter()
+                .map(|r| r.model)
+                .collect::<Vec<_>>(),
+            ["m"]
+        );
+    }
+
+    /// Sol review of #136 (finding 3): when a migration merges two keys, a live probe
+    /// reservation on either one survives, whichever owns the later deadline, in both
+    /// collision orders and with equal deadlines. Its own lease frees it, an older lease
+    /// cannot, and it still ends when the hold expires.
+    #[test]
+    fn a_key_merge_keeps_a_live_probe_reservation() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let bounded = {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = |hint: u64| {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(hint));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String {
+            if m.eq_ignore_ascii_case("m") {
+                "M".into()
+            } else {
+                m.to_owned()
+            }
+        };
+        let t1 = t0 + secs(61);
+        // (reserved key, other key, other deadline from t0)
+        for (reserved, other, other_secs) in [("m", "M", 65), ("M", "m", 65), ("m", "M", 60), ("M", "m", 60)] {
+            let case = format!("reserved {reserved}, other {other} at {other_secs}s");
+            let setup = || {
+                let mut s = Scheduler::default();
+                s.record(&c, reserved, &bounded, &p, t0);
+                s.record(&c, other, &transient(other_secs), &p, t0);
+                let g = s.reserve_probe(&c, reserved, t1);
+                assert!(s.wait(&c, reserved, t1).is_some(), "{case}: the probe is held");
+                assert!(s.migrate_model_keys(&c, key_of, t1), "{case}");
+                assert_eq!(s.cooldowns.len(), 1, "{case}: one key");
+                (s, g)
+            };
+            let (s, _) = setup();
+            let held = t0 + secs(70);
+            assert!(s.wait(&c, "M", held).is_some(), "{case}: still held after the deadline");
+            assert!(!s.retry_eligible(&c, "M", held), "{case}");
+            assert_eq!(s.wait(&c, "M", t1 + secs(31)), None, "{case}: the hold expires");
+            // An older lease's answer neither frees the hold nor ends the entry.
+            let (mut s, g) = setup();
+            s.record_picked(&c, "M", &Outcome::Success, &p, g.wrapping_sub(1), held);
+            assert!(s.wait(&c, "M", held).is_some(), "{case}: an older lease cannot free it");
+            // The reserving lease's answer does.
+            s.record_picked(&c, "M", &Outcome::Success, &p, g, held);
+            assert_eq!(s.wait(&c, "M", held), None, "{case}: its own lease frees it");
+        }
+    }
+
+    /// Sol review of #136 at `3efe4c52` (finding 1): a reservation a merge carried onto a
+    /// later, unbounded deadline owner is released by its own lease's accepted stream,
+    /// in both collision orders. The owner keeps its own live deadline, provenance and
+    /// evidence, and an older lease's acceptance releases nothing.
+    #[test]
+    fn an_accepted_stream_releases_a_reservation_carried_onto_an_unbounded_owner() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let bounded = {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = |hint: u64| {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(hint));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String {
+            if m.eq_ignore_ascii_case("m") {
+                "M".into()
+            } else {
+                m.to_owned()
+            }
+        };
+        let t1 = t0 + secs(61);
+        // (reserved key, other key, the unbounded owner's deadline from t0): 60 s has
+        // ended at the pick, 70 s is still live at the acceptance.
+        for (reserved, other, owner) in [("m", "M", 60), ("M", "m", 60), ("m", "M", 70), ("M", "m", 70)] {
+            let case = format!("reserved {reserved}, unbounded {other} until {owner}s");
+            let setup = || {
+                let mut s = Scheduler::default();
+                s.record(&c, reserved, &bounded, &p, t0);
+                s.record(&c, other, &transient(owner), &p, t0 + secs(1));
+                let g = s.reserve_probe(&c, reserved, t1);
+                assert!(s.migrate_model_keys(&c, key_of, t1), "{case}");
+                let merged = &s.cooldowns[&(c.id.clone(), "M".to_owned())];
+                assert!(!merged.trust.bounded && merged.trust.probe.is_some(), "{case}: carried");
+                (s, g)
+            };
+            let accepted = t1 + secs(1);
+            let (mut s, g) = setup();
+            let provenance = |s: &Scheduler| {
+                let e = &s.cooldowns[&(c.id.clone(), "M".to_owned())];
+                (e.deadline, e.status, e.quota, e.trust.bounded, e.trust.window)
+            };
+            let before = provenance(&s);
+            s.accept_probe_picked(&c, "M", g.wrapping_sub(1), accepted);
+            assert!(s.wait(&c, "M", accepted).is_some(), "{case}: an older lease's stream");
+            assert!(s.wait(&c, "M", t0 + secs(80)).is_some(), "{case}: still held");
+            s.accept_probe_picked(&c, "M", g, accepted);
+            assert_eq!(
+                s.cooldowns[&(c.id.clone(), "M".to_owned())].trust.probe,
+                None,
+                "{case}: its own lease's stream releases it"
+            );
+            assert_eq!(
+                provenance(&s),
+                before,
+                "{case}: the owner's deadline and provenance stay"
+            );
+            let live = (before.0 > accepted).then(|| before.0 - accepted);
+            assert_eq!(
+                s.wait(&c, "M", accepted),
+                live,
+                "{case}: only a live deadline still waits"
+            );
+            assert_eq!(s.wait(&c, "M", t0 + secs(80)), None, "{case}");
+        }
+    }
+
+    /// The migration rule results follow (`migrated_key`): only to the same name under
+    /// Go's `strings.ToLower`, only when the target maps to itself, never from the
+    /// credential-wide key.
+    #[test]
+    fn migrated_keys_follow_only_case_variants_that_map_to_themselves() {
+        let alias = |m: &str| -> String {
+            match m {
+                "m" => "M(high)".into(),
+                other => other.to_owned(),
+            }
+        };
+        assert_eq!(migrated_key("m", alias), Some("M".to_owned()));
+        assert_eq!(
+            migrated_key("m(low)", alias),
+            Some("M".to_owned()),
+            "suffixes are not keys"
+        );
+        assert_eq!(migrated_key("M", alias), None, "the target stays");
+        assert_eq!(migrated_key("", alias), None);
+        assert_eq!(migrated_key("x", |_| "y".to_owned()), None, "never onto another model");
+        assert_eq!(
+            migrated_key("m", |m| if m == "m" { "M".into() } else { "m".into() }),
+            None,
+            "not a fixpoint"
+        );
+    }
+
+    /// Sol review of #136 at `abcbac05` (findings 1 and 2): a lease's results follow the
+    /// migrations since its pick, in order, whatever aliases were published later, and
+    /// only under the revision they moved under. Leases picked after a migration answer
+    /// their own key. Both event orders around a migration answer the reservation.
+    #[test]
+    fn results_follow_the_migration_history_of_their_pick() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let quota = || {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = || {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(40));
+            Outcome::Failure(e)
+        };
+        let to_upper = |m: &str| -> String { if m == "m" { "M".into() } else { m.to_owned() } };
+        let to_lower = |m: &str| -> String { if m == "M" { "m".into() } else { m.to_owned() } };
+        let unchanged = |m: &str| -> String { m.to_owned() };
+        let t1 = t0 + secs(61);
+        let later = t1 + secs(1);
+        // A probe reserved under `m`, then moved to `M`.
+        let reserved = |start: u32| {
+            let mut s = Scheduler {
+                generation: start,
+                ..Scheduler::default()
+            };
+            s.record(&c, "m", &quota(), &p, t0);
+            let g = s.reserve_probe(&c, "m", t1);
+            (s, g)
+        };
+        let held = |s: &Scheduler, key: &str| s.wait(&c, key, later).is_some();
+        // Wraps the generation counter on the way, and again for the history below.
+        for start in [0, u32::MAX - 1] {
+            let case = format!("generation {start}");
+            // Alias removed, or the spelling mapped to another model, after the move:
+            // acceptance, success, cancellation and failure all answer `M`.
+            for answer in 0..4 {
+                let (mut s, g) = reserved(start);
+                assert!(s.migrate_model_keys(&c, to_upper, t1), "{case}");
+                assert!(
+                    !s.migrate_model_keys(&c, unchanged, t1),
+                    "{case}: a removal moves nothing"
+                );
+                assert!(held(&s, "M"), "{case}");
+                match answer {
+                    0 => s.accept_probe_picked(&c, "m", g, later),
+                    1 => s.record_picked(&c, "m", &Outcome::Success, &p, g, later),
+                    2 => s.record_picked(&c, "m", &Outcome::Cancelled, &p, g, later),
+                    _ => s.record_picked(&c, "m", &transient(), &p, g, later),
+                }
+                let keys: Vec<&str> = s.cooldowns.keys().map(|(_, m)| m.as_str()).collect();
+                assert!(
+                    !keys.contains(&"m"),
+                    "{case}, answer {answer}: nothing under the old key: {keys:?}"
+                );
+                if answer == 3 {
+                    assert_eq!(s.wait(&c, "M", later), Some(secs(40)), "{case}: the failure cools M");
+                } else {
+                    assert!(!held(&s, "M"), "{case}, answer {answer}: released");
+                }
+            }
+            // Reversed: the state moved back, and so does the answer.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            assert!(s.migrate_model_keys(&c, to_lower, t1), "{case}: moved back");
+            s.record_picked(&c, "m", &Outcome::Success, &p, g, later);
+            assert!(!held(&s, "m") && s.cooldowns.is_empty(), "{case}: reversed");
+            // A lease picked after the move answers the key it was picked under.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            let fresh = s.generation;
+            assert!((fresh.wrapping_sub(g) as i32) > 0, "{case}: the move took a generation");
+            s.record_picked(&c, "m", &transient(), &p, fresh, later);
+            assert_eq!(s.wait(&c, "m", later), Some(secs(40)), "{case}: its own key");
+            assert!(held(&s, "M"), "{case}: the moved reservation is not its own");
+            // History of a replaced revision never applies.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            let mut replaced = c.clone();
+            replaced.revision += 1;
+            s.migrate_model_keys(&replaced, unchanged, t1);
+            assert!(s.moved.is_empty(), "{case}: pruned with its revision");
+            s.record_picked(&replaced, "m", &Outcome::Success, &p, g, later);
+            assert!(held(&s, "M"), "{case}: no history for the new revision");
+        }
+        // Both orders of one answer and one migration: the answer reaches the state.
+        for accept in [false, true] {
+            for answer_first in [false, true] {
+                let case = format!("accept {accept}, answer first {answer_first}");
+                let (mut s, g) = reserved(0);
+                let answer = |s: &mut Scheduler| {
+                    if accept {
+                        s.accept_probe_picked(&c, "m", g, later);
+                    } else {
+                        s.record_picked(&c, "m", &Outcome::Success, &p, g, later);
+                    }
+                };
+                if answer_first {
+                    answer(&mut s);
+                    s.migrate_model_keys(&c, to_upper, later);
+                } else {
+                    s.migrate_model_keys(&c, to_upper, later);
+                    answer(&mut s);
+                }
+                assert!(!held(&s, "M") && !held(&s, "m"), "{case}");
+            }
+        }
+    }
+
+    /// Sol review of #136 at `abcbac05` (finding 3): accepting a carried reservation keeps
+    /// its generation as a fence, so an older lease's late failure cannot re-cool the
+    /// recovered key, as with an accepted bounded window. A newer lease's failure still
+    /// cools it.
+    #[test]
+    fn an_accepted_carried_hold_keeps_its_fence_against_older_leases() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let fail = |status: u16, retry: u64| {
+            let mut e = ExecError::local(status, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(retry));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String { if m == "m" { "M".into() } else { m.to_owned() } };
+        let t1 = t0 + secs(61);
+        let late = t0 + secs(80);
+        for carried in [true, false] {
+            let mut s = Scheduler::default();
+            let old = s.generation;
+            s.record(&c, "m", &fail(429, 3600), &p, t0);
+            if carried {
+                s.record(&c, "M", &fail(503, 60), &p, t0 + secs(1));
+            }
+            let g = s.reserve_probe(&c, "m", t1);
+            if carried {
+                assert!(s.migrate_model_keys(&c, key_of, t1));
+                assert!(
+                    !s.cooldowns[&(c.id.clone(), "M".to_owned())].trust.bounded,
+                    "an unbounded owner"
+                );
+            }
+            let key = if carried { "M" } else { "m" };
+            s.accept_probe_picked(&c, "m", g, t1 + secs(1));
+            assert_eq!(s.wait(&c, key, late), None, "carried {carried}: accepted");
+            s.record_picked(&c, "m", &fail(503, 65), &p, old, late);
+            assert_eq!(
+                s.wait(&c, key, late),
+                None,
+                "carried {carried}: an older lease's failure"
+            );
+            // A lease picked now is picked under the current key.
+            let newer = s.generation;
+            s.record_picked(&c, key, &fail(503, 65), &p, newer, late);
+            assert_eq!(
+                s.wait(&c, key, late),
+                Some(secs(65)),
+                "carried {carried}: a newer lease's"
+            );
+        }
     }
 
     #[test]

@@ -330,21 +330,27 @@ pub fn config_models(c: &Credential) -> Vec<ConfigModel> {
     let Some(Value::Array(items)) = raw else {
         return Vec::new();
     };
+    const SNAKE: [&str; 7] = [
+        "display_name",
+        "max_context_length",
+        "force_mapping",
+        "is_compat",
+        "support_configuration_update",
+        "input_modalities",
+        "output_modalities",
+    ];
     items
         .iter()
         .filter_map(|v| {
+            // Entries synthesized from the config use its kebab-case keys: read them in
+            // place. Resolving a request's models runs this per request.
+            if !matches!(v, Value::Object(m) if SNAKE.iter().any(|k| m.contains_key(*k))) {
+                return ConfigModel::deserialize(v).ok();
+            }
             let mut v = v.clone();
             // Accept snake_case spellings from JSON metadata too.
             if let Value::Object(m) = &mut v {
-                for key in [
-                    "display_name",
-                    "max_context_length",
-                    "force_mapping",
-                    "is_compat",
-                    "support_configuration_update",
-                    "input_modalities",
-                    "output_modalities",
-                ] {
+                for key in SNAKE {
                     if let Some(x) = m.remove(key) {
                         m.entry(key.replace('_', "-")).or_insert(x);
                     }
@@ -1476,9 +1482,36 @@ pub fn selection_model(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Crede
     }
 }
 
-/// Go `stateModelForExecution`.
+/// The model key a credential's cooldowns for `route_model` live under: the state
+/// model dispatch records an attempt under ([`state_model`] of the first execution
+/// model). Selection checks, probe holds and cooldown migration use it, so a cooldown
+/// is found under the key it was recorded under. Two spellings share a key only when
+/// this proxy resolves both to the same upstream model; spellings sent upstream
+/// differently stay apart (the provider decides whether they are one model).
+pub fn cooldown_key(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credential, route_model: &str) -> String {
+    let selection = selection_model(cfg_aliases, c, route_model);
+    cooldown_key_for(cfg_aliases, c, route_model, &selection)
+}
+
+/// [`cooldown_key`] for a caller that already holds `selection`, the
+/// [`selection_model`] of `route_model` for `c`.
+pub fn cooldown_key_for(
+    cfg_aliases: &HashMap<String, Vec<OAuthAlias>>,
+    c: &Credential,
+    route_model: &str,
+    selection: &str,
+) -> String {
+    let (models, _) = execution_models(cfg_aliases, c, route_model);
+    let upstream = models.first().map(String::as_str).unwrap_or_default();
+    state_model(selection, route_model, upstream, models.len() > 1)
+}
+
+/// Go `stateModelForExecution`. Go v8.0.67 (098af7d5 `sameCanonicalModelKey`)
+/// compares the selection and upstream models under `strings.ToLower`: when they
+/// differ only in case, the proxy has chosen the upstream spelling, so the state is
+/// keyed by what is sent.
 pub fn state_model(selection: &str, route_model: &str, upstream: &str, pooled: bool) -> String {
-    if !selection.trim().is_empty() && canonical_model(selection) == canonical_model(upstream) {
+    if !selection.trim().is_empty() && same_go_lower(canonical_model(selection), canonical_model(upstream)) {
         return upstream.trim().to_owned();
     }
     if pooled && !upstream.trim().is_empty() {
@@ -1491,10 +1524,39 @@ pub fn state_model(selection: &str, route_model: &str, upstream: &str, pooled: b
     }
 }
 
+/// `strings.ToLower(a) == strings.ToLower(b)` without allocating when both are ASCII,
+/// where Go's `ToLower` is ASCII lowercasing. Otherwise the exact rune-wise comparison:
+/// a non-ASCII rune can lower to an ASCII one (the Kelvin sign to `k`).
+fn same_go_lower(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.go_lower() == b.go_lower()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Go `strings.ToLower` equality, allocation-free for ASCII (#95 cost): a non-ASCII
+    /// rune that Go lowers to ASCII still matches, and different names stay route-keyed.
+    #[test]
+    fn state_keys_compare_under_go_lower() {
+        assert_eq!(state_model("Claude-X", "route", "claude-x", false), "claude-x");
+        assert_eq!(
+            state_model("\u{212A}imi", "route", "kimi", false),
+            "kimi",
+            "the Kelvin sign"
+        );
+        assert_eq!(
+            state_model("\u{dc}n\u{ef}", "route", "\u{fc}n\u{ef}", false),
+            "\u{fc}n\u{ef}"
+        );
+        assert_eq!(state_model("a", "route", "b", false), "route");
+        assert_eq!(state_model("\u{212A}", "route", "x", false), "route");
+    }
 
     fn file(id: &str, meta: Value, attrs: &[(&str, &str)]) -> Arc<Credential> {
         let mut c = Credential::from_file(
@@ -1755,6 +1817,51 @@ mod tests {
             &Config::parse("oauth:\n  model-alias:\n    claude:\n      - {name: one, alias: σ}\n").unwrap(),
         );
         assert_eq!(execution_models(&only_sigma, &global, "ς").0, ["ς"]);
+    }
+
+    /// #95 (Go v8.0.67 098af7d5, issue 7360 shape 1): a configured model whose name
+    /// differs from its alias only in case is sent under the configured name, so every
+    /// client spelling of it shares that key (Go `strings.ToLower`, Unicode included).
+    /// Another alias stays keyed by the route (Go `stateModelForExecution`), and an
+    /// OAuth credential sends each client spelling as typed, so those stay apart.
+    #[test]
+    fn cooldown_keys_follow_the_spelling_sent_upstream() {
+        let none = HashMap::new();
+        let c = config(
+            "claude",
+            "claude:apikey:1",
+            serde_json::json!({"models":[
+                {"name":"Claude-Opus-4-6","alias":"claude-opus-4-6"},
+                {"name":"Claude-\u{d6}pus","alias":"claude-\u{f6}pus"},
+                {"name":"claude-sonnet-5","alias":"sonnet"}]}),
+            &[],
+        );
+        for route in ["claude-opus-4-6", "CLAUDE-OPUS-4-6", "Claude-Opus-4-6(high)"] {
+            assert_eq!(
+                canonical_model(&cooldown_key(&none, &c, route)),
+                "Claude-Opus-4-6",
+                "{route}"
+            );
+        }
+        assert_eq!(
+            canonical_model(&cooldown_key(&none, &c, "CLAUDE-\u{d6}PUS")),
+            "Claude-\u{d6}pus"
+        );
+        assert_eq!(cooldown_key(&none, &c, "sonnet"), "sonnet");
+        assert_eq!(
+            cooldown_key(&none, &c, "SONNET"),
+            "SONNET",
+            "an alias route keeps its spelling"
+        );
+        let oauth = file("a.json", serde_json::json!({"type":"claude"}), &[]);
+        assert_eq!(cooldown_key(&none, &oauth, "Claude-Opus-4-6"), "Claude-Opus-4-6");
+        assert_eq!(cooldown_key(&none, &oauth, "claude-opus-4-6"), "claude-opus-4-6");
+        // The comparison itself (Go `sameCanonicalModelKey`).
+        assert_eq!(
+            state_model("claude-opus-4-6", "claude-opus-4-6", "Claude-Opus-4-6", false),
+            "Claude-Opus-4-6"
+        );
+        assert_eq!(state_model("opus", "opus", "claude-opus-4-6", false), "opus");
     }
 
     #[test]
