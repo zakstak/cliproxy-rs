@@ -2914,6 +2914,36 @@ async fn xai_login_migrates_the_accounts_v8_0_35_file() {
     fake_server.abort();
 }
 
+/// xAI (#85 review): a file at the login's hashed name that holds another account
+/// (same email, another subject) is refused: the session fails with an actionable
+/// message that names no file or account, and the file is untouched.
+#[tokio::test]
+async fn xai_login_refuses_another_accounts_file_at_its_name() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let f = Fixture::new("xairefuse");
+    let auth = f.dir.join("auth");
+    let name = cpa_exec::xai_auth::credential_file_name("x@example.invalid", "xai-user-1", 0);
+    let foreign = json!({"type": "xai", "email": "x@example.invalid", "sub": "someone-else",
+        "access_token": "other", "proxy_url": "http://127.0.0.1:8087"})
+    .to_string();
+    std::fs::write(auth.join(&name), &foreign).unwrap();
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let started = oauth_get(&base, "/oauth/auth-url?provider=xai").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    assert_eq!(
+        final_status(&base, &state, 10).await,
+        json!({"status": "error", "error": "Failed to save token to file: a file in the auth directory at this account's credential name is not this account's xAI credential; move it aside and sign in again"})
+    );
+    assert_eq!(std::fs::read_to_string(auth.join(&name)).unwrap(), foreign);
+    let names: Vec<String> = std::fs::read_dir(&auth)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![name]);
+    server.abort();
+    fake_server.abort();
+}
+
 /// A login worker that panics fails its session at once, with a fixed message,
 /// instead of leaving the dashboard waiting until the session expires: here the panic
 /// is on the blocking task that saves the credential, which the worker passes on.

@@ -847,3 +847,296 @@ async fn cli_login_migrates_the_v8_0_35_file() {
     assert_settings_kept(&saved);
     assert_ne!(saved["access_token"], "old");
 }
+
+// --- review fixes for #85: destination ownership, interrupted adoption, alias order ------
+
+/// Every file in `dir`, with its bytes (symlinks as their target path).
+fn snapshot(dir: &AuthDir) -> Vec<(String, Vec<u8>)> {
+    dir.names()
+        .into_iter()
+        .map(|name| {
+            let path = dir.0.join(&name);
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = if meta.file_type().is_symlink() {
+                std::fs::read_link(&path).unwrap().into_os_string().into_encoded_bytes()
+            } else if meta.is_dir() {
+                b"<dir>".to_vec()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// Puts something at the destination path.
+type Plant<'a> = Box<dyn Fn(&Path) + 'a>;
+
+/// A file at the path a login would write that is not provably this account's is
+/// refused before anything is merged, written or deleted. The first case needs no
+/// hash collision: account B's subject reads like A's hashed name, and v8.0.35 saved B
+/// as `xai-<subject>.json`, which is exactly A's new name.
+#[test]
+fn destinations_not_provably_this_accounts_are_refused() {
+    let (email, subject) = ("dev@x.ai", "sub-A");
+    let name = credential_file_name(email, subject, 0);
+    let b_subject = name
+        .strip_prefix("xai-")
+        .unwrap()
+        .strip_suffix(".json")
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        legacy_credential_file_name("", &b_subject),
+        name,
+        "B's v8.0.35 name is A's new name"
+    );
+    let foreign = |doc: Value| {
+        with(
+            doc,
+            serde_json::json!({"access_token": "b-token", "proxy_url": "http://127.0.0.1:8087"}),
+        )
+    };
+    let cases: Vec<(&str, Plant<'_>)> = vec![
+        (
+            "another account's v8.0.35 subject file",
+            Box::new(|p: &Path| {
+                std::fs::write(
+                    p,
+                    foreign(serde_json::json!({"type": "xai", "sub": b_subject})).to_string(),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "same email under another subject",
+            Box::new(|p: &Path| {
+                std::fs::write(
+                    p,
+                    foreign(serde_json::json!({"type": "xai", "email": email, "sub": "sub-B"})).to_string(),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "no stored identity",
+            Box::new(|p: &Path| std::fs::write(p, foreign(serde_json::json!({"type": "xai"})).to_string()).unwrap()),
+        ),
+        (
+            "another provider",
+            Box::new(|p: &Path| {
+                std::fs::write(
+                    p,
+                    foreign(serde_json::json!({"type": "codex", "email": email})).to_string(),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "not JSON",
+            Box::new(|p: &Path| std::fs::write(p, b"{\"type\":\"xai\",").unwrap()),
+        ),
+        ("empty", Box::new(|p: &Path| std::fs::write(p, b"").unwrap())),
+        (
+            "symlink to this account's own document",
+            Box::new(|p: &Path| {
+                let elsewhere = p.with_file_name("operator.txt");
+                std::fs::write(
+                    &elsewhere,
+                    serde_json::json!({"type": "xai", "email": email, "sub": subject}).to_string(),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(&elsewhere, p).unwrap();
+            }),
+        ),
+        ("directory", Box::new(|p: &Path| std::fs::create_dir(p).unwrap())),
+    ];
+    for (label, plant) in cases {
+        let dir = AuthDir::new("owned");
+        plant(&dir.0.join(&name));
+        // A matching earlier file of A stays too: nothing is deleted after a refusal.
+        dir.write(
+            "xai-dev@x.ai.json",
+            with(
+                serde_json::json!({"type": "xai", "email": email, "sub": subject, "access_token": "a-old"}),
+                settings(),
+            ),
+        );
+        let before = snapshot(&dir);
+        let result = save_login(&dir.0, record("at-new", email, subject), crate::login::write_private);
+        let error = result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        assert!(result.is_err(), "{label}: saved over it: {result:?}");
+        assert!(
+            error.contains(&name) && error.contains("move it aside"),
+            "{label}: {error}"
+        );
+        assert!(
+            !error.contains("b-token") && !error.contains("8087"),
+            "{label}: {error}"
+        );
+        assert_eq!(snapshot(&dir), before, "{label}: auth directory changed");
+    }
+}
+
+/// An existing file that cannot be read is not mistaken for an absent one.
+#[test]
+fn an_unreadable_destination_is_not_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = AuthDir::new("unreadable");
+    let name = credential_file_name("dev@x.ai", "s", 0);
+    let path = dir.write(
+        &name,
+        serde_json::json!({"type": "xai", "email": "dev@x.ai", "sub": "s", "note": "kept"}),
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        // Running with CAP_DAC_OVERRIDE: permissions cannot make the file unreadable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+    let result = save_login(&dir.0, record("at-new", "dev@x.ai", "s"), crate::login::write_private);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let error = result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+    assert!(error.contains("cannot read"), "{result:?}");
+    assert_eq!(dir.read(&name)["note"], "kept");
+}
+
+/// A migration from the subject-named file to the email-named one was interrupted
+/// before its cleanup, and the next login returns only the subject: it refreshes the
+/// email-named file and hands back the superseded subject-named file for deletion, so
+/// one credential loads. Repeating that login changes nothing more, and another
+/// account's file is never handed back.
+#[test]
+fn subject_only_retry_finishes_an_interrupted_migration() {
+    let dir = AuthDir::new("adopt-retry");
+    let subject_name = credential_file_name("", "s", 0);
+    // An enabled credential: a subject-named file with `"disabled": true` keeps the
+    // account on that file instead (subject_only_login_keeps_the_email_named_file).
+    dir.write(
+        &subject_name,
+        serde_json::json!({"type": "xai", "sub": "s", "access_token": "old", "disabled": false,
+            "proxy-url": "socks5://127.0.0.1:1080", "prefix": "team"}),
+    );
+    let other = dir.write(
+        "xai-other@x.ai.json",
+        serde_json::json!({"type": "xai", "email": "other@x.ai", "sub": "o"}),
+    );
+    let (email_path, pending) = save_login(&dir.0, record("at-1", "e@x.ai", "s"), crate::login::write_private).unwrap();
+    assert_eq!(pending, Some(dir.0.join(&subject_name)));
+    // The process stops here; the subject-named file is still on disk.
+    let loaded = |dir: &AuthDir| {
+        let cfg = cpa_core::config::Config {
+            auth_dir: dir.0.clone(),
+            ..Default::default()
+        };
+        let mut ids: Vec<String> = cpa_core::config::credentials::from_auth_dir(&cfg)
+            .into_iter()
+            .filter(|c| c.metadata.get("sub").and_then(Value::as_str) == Some("s"))
+            .map(|c| c.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(loaded(&dir).len(), 2);
+    for access in ["at-2", "at-3"] {
+        let path = save(&dir, record(access, "", "s"));
+        assert_eq!(path, email_path, "{access}");
+        assert_eq!(loaded(&dir).len(), 1, "{access}: {:?}", dir.names());
+        let saved = dir.read(&file_name(&email_path));
+        assert_eq!(
+            (saved["access_token"].clone(), saved["email"].clone()),
+            (access.into(), "e@x.ai".into())
+        );
+        assert_eq!(saved["proxy_url"], "socks5://127.0.0.1:1080", "{saved}");
+        assert_eq!(
+            (saved["prefix"].clone(), saved["disabled"].clone()),
+            ("team".into(), false.into())
+        );
+        assert!(other.exists(), "{access}: another account's file removed");
+    }
+}
+
+/// Each document's legacy keys are renamed before the merge, so its order (the new
+/// login, the file at the new name, the earlier file) holds whatever spelling each file
+/// uses. Within one file the canonical spelling wins, as Go's normalization does.
+#[test]
+fn aliases_keep_the_merge_order() {
+    for (existing, earlier, want) in [
+        (
+            serde_json::json!({"proxy-url": "http://dest"}),
+            serde_json::json!({"proxy_url": "http://earlier"}),
+            "http://dest",
+        ),
+        (
+            serde_json::json!({"proxy_url": "http://dest"}),
+            serde_json::json!({"proxy-url": "http://earlier"}),
+            "http://dest",
+        ),
+        (
+            serde_json::json!({}),
+            serde_json::json!({"proxy-url": "http://alias", "proxy_url": "http://canonical"}),
+            "http://canonical",
+        ),
+        (
+            serde_json::json!({"proxy_url": "http://canonical", "proxy-url": "http://alias"}),
+            serde_json::json!({"proxy_url": "http://earlier"}),
+            "http://canonical",
+        ),
+    ] {
+        let dir = AuthDir::new("aliases");
+        let identity = serde_json::json!({"type": "xai", "email": "dev@x.ai", "sub": "s"});
+        let name = credential_file_name("dev@x.ai", "s", 0);
+        dir.write(
+            &name,
+            with(
+                with(identity.clone(), existing.clone()),
+                serde_json::json!({"access_token": "stale", "excluded-models": ["dest"], "disabled": false}),
+            ),
+        );
+        dir.write(
+            "xai-dev@x.ai.json",
+            with(
+                with(identity, earlier.clone()),
+                serde_json::json!({"excluded_models": ["earlier"], "disabled": true}),
+            ),
+        );
+        let path = save(&dir, record("at-new", "dev@x.ai", "s"));
+        let saved = dir.read(&file_name(&path));
+        assert_eq!(saved["proxy_url"], want, "{existing} / {earlier}: {saved}");
+        assert_eq!(saved.get("proxy-url"), None, "{saved}");
+        assert_eq!(saved["excluded_models"], serde_json::json!(["dest"]), "{saved}");
+        assert_eq!(saved.get("excluded-models"), None, "{saved}");
+        assert_eq!(
+            (saved["access_token"].clone(), saved["disabled"].clone()),
+            ("at-new".into(), false.into())
+        );
+        assert_eq!(dir.names(), vec![name]);
+    }
+}
+
+/// The CLI login refuses the same way, with the file named for the local operator and
+/// no byte of the foreign file changed.
+#[tokio::test]
+async fn cli_login_refuses_another_accounts_file_at_its_name() {
+    let f = fixture();
+    let case = f["login"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "success_after_pending")
+        .unwrap();
+    let dir = AuthDir::new("cli-refuse");
+    let name = credential_file_name("Dev.User+test@Example.com", "", 0);
+    let foreign = serde_json::json!({"type": "codex", "email": "dev.user+test@example.com", "access_token": "other"});
+    dir.write(&name, foreign.clone());
+    let mock = Mock::start(&case["script"]).await;
+    let error = login_with(mock.auth(), &dir.0, true).await.expect_err("refused");
+    let message = String::from_utf8_lossy(&error.body).into_owned();
+    assert!(
+        message.contains(&name) && message.contains("move it aside"),
+        "{message}"
+    );
+    assert!(!message.contains("other"), "{message}");
+    assert_eq!(dir.read(&name), foreign);
+    assert_eq!(dir.names(), vec![name]);
+}

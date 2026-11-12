@@ -861,9 +861,13 @@ async fn start_meta(state: Arc<Management>) -> Response {
     response
 }
 
+/// Session error details for an xAI login whose save was refused (#85).
+const XAI_DESTINATION_CONFLICT: &str = "a file in the auth directory at this account's credential name is not this account's xAI credential; move it aside and sign in again";
+const XAI_AUTH_DIR_UNREADABLE: &str = "the auth directory or an existing credential file could not be read";
+
 /// Go `RequestXAIToken`: device flow; the poller saves the credential file.
 async fn start_xai(state: Arc<Management>) -> Response {
-    use cpa_exec::xai_auth::{MAX_POLL_DURATION, XaiAuth, login_record, save_login};
+    use cpa_exec::xai_auth::{MAX_POLL_DURATION, SaveError, XaiAuth, login_record, save_login};
     let sid = format!("xai-{}", unix_nanos());
     let mut auth = XaiAuth::new(login_client(&state));
     if let Some(base) = &state.login_base {
@@ -909,20 +913,36 @@ async fn start_xai(state: Arc<Management>) -> Response {
                 // deleted through the store only once the new one is stored.
                 let legacy = Arc::new(Mutex::new(None));
                 let slot = legacy.clone();
+                // Why a refused save wrote nothing, for the session error. The detailed
+                // reason (which names the file, and so the account) goes only to the log:
+                // session errors are readable by anyone holding the state.
+                let refusal = Arc::new(Mutex::new(None));
+                let refused = refusal.clone();
                 let write = move |dir: PathBuf, record| {
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    let (path, old) =
-                        save_login(&dir, record, super::auth_files::write_file).map_err(|e| e.to_string())?;
+                    let (path, old) = save_login(&dir, record, super::auth_files::write_file).map_err(|e| {
+                        let public = match &e {
+                            SaveError::Conflict(_) => Some(XAI_DESTINATION_CONFLICT),
+                            SaveError::Unreadable(_) => Some(XAI_AUTH_DIR_UNREADABLE),
+                            SaveError::Refused(_) | SaveError::Write(_) => None,
+                        };
+                        *refused.lock().unwrap_or_else(PoisonError::into_inner) = public;
+                        e.to_string()
+                    })?;
                     *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
                     Ok(path)
                 };
                 let saved = save_if_pending(&worker, &sid, "xai", record, write, "Failed to save token to file").await;
                 let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
-                match (saved, old) {
-                    (Outcome::Saved, Some(old)) => {
+                let refusal = refusal.lock().unwrap_or_else(PoisonError::into_inner).take();
+                match (saved, old, refusal) {
+                    (Outcome::Saved, Some(old), _) => {
                         remove_legacy(&worker, old, "xAI", "Failed to save token to file").await
                     }
-                    (saved, _) => saved,
+                    (Outcome::Failed(_), _, Some(reason)) => {
+                        Outcome::Failed(format!("Failed to save token to file: {reason}"))
+                    }
+                    (saved, _, _) => saved,
                 }
             }
         };
