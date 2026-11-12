@@ -139,6 +139,10 @@ fn eligible(request: &Request, path: &str) -> bool {
                 .is_some_and(|v| trim(v.as_bytes()).eq_ignore_ascii_case(b"websocket")))
 }
 
+/// Opens the request's log. Nothing here reads the request body: the client-key
+/// middlewares hand an admitted request to [`authenticated_body`], so a client that
+/// never authenticates cannot hold a connection open by never finishing its body (Go
+/// v8.0.67 477605dc, GHSA-j4xx-x47j-7h54).
 async fn capture(State(state): State<CaptureState>, mut request: Request, next: Next) -> Response {
     let path = crate::management::percent_decode(request.uri().path());
     if !eligible(&request, &path) {
@@ -146,62 +150,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     }
     let config = state.rt.config();
     let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
-    let multipart = request.headers().get("content-type").is_some_and(|v| {
-        String::from_utf8_lossy(trim(v.as_bytes()))
-            .go_lower()
-            .starts_with("multipart/form-data")
-    });
-    let length = request
-        .headers()
-        .get("content-length")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    let eager = enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY));
-    let mut request_body = Vec::new();
-    let mut request_undecoded = false;
     let body_limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
-    if eager {
-        let body = std::mem::replace(request.body_mut(), Body::empty());
-        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => bytes,
-            // Go answers before it logs anything.
-            Err(error) if crate::body_limit::is_too_large(&error) => return crate::body_limit::too_large(),
-            Err(error) => {
-                // Preserve the transport error downstream; never turn it into
-                // a successful empty body when capture cannot read the input.
-                *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
-                    Err::<Bytes, _>(io::Error::other(error.to_string()))
-                }));
-                return next.run(request).await;
-            }
-        };
-        *request.body_mut() = Body::from(bytes.clone());
-        // Eager capture logs what the handler may accept: at most its own decoded limit.
-        let limit = decoded_limit(body_limit, crate::MAX_REQUEST_BYTES as u64);
-        (request_body, request_undecoded) = decode_request(bytes.to_vec(), request.headers(), limit).await;
-    }
-    let deferred = if !eager && !multipart && length != Some(0) && !request.body().is_end_stream() {
-        Spool::new(&state.dir, "request-body").ok().map(|spool| {
-            Arc::new(Mutex::new(Deferred {
-                spool,
-                length,
-                read: 0,
-                captured: 0,
-                eof: false,
-                truncated: false,
-                failed: false,
-            }))
-        })
-    } else {
-        None
-    };
-    if let Some(deferred) = &deferred {
-        let body = std::mem::replace(request.body_mut(), Body::empty());
-        *request.body_mut() = Body::new(RequestBody {
-            body,
-            deferred: deferred.clone(),
-        });
-    }
     let query = mask_query(request.uri().query().unwrap_or_default());
     let url = if query.is_empty() {
         path
@@ -222,10 +171,11 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
             id,
             timestamp: Local::now(),
             headers: request.headers().clone(),
-            request_body,
-            request_undecoded,
+            request_body: Vec::new(),
+            request_undecoded: false,
             body_limit,
-            deferred,
+            deferred: None,
+            body_pending: true,
             status: 200,
             unrouted: false,
             response_headers: HeaderMap::new(),
@@ -254,6 +204,87 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     let response = CURRENT.scope(sink.clone(), next.run(request)).await;
     guard.0 = None;
     capture_response(sink, head, response).await
+}
+
+/// The request body capture [`capture`] leaves until client authentication admits the
+/// request: the client-key middlewares call this before the handler runs. A body of at
+/// most 1 MiB with a declared length, or any body while `request-log` is on, is read
+/// whole here and logged as read; any other body is copied to the log as the handler
+/// reads it. A request that is never admitted is never read for the log, so its log has
+/// no request body. `Err` is the answer when the read stops at
+/// `server.max-request-body-bytes`. Runs once per request; later calls do nothing.
+pub(crate) async fn authenticated_body(mut request: Request) -> Result<Request, Box<Response>> {
+    let Some(sink) = request.extensions().get::<RequestLog>().cloned() else {
+        return Ok(request);
+    };
+    let (enabled, dir, body_limit) = {
+        let mut locked = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(record) = locked.as_mut().filter(|record| record.body_pending) else {
+            return Ok(request);
+        };
+        record.body_pending = false;
+        (record.enabled, record.state.dir.clone(), record.body_limit)
+    };
+    let multipart = request.headers().get("content-type").is_some_and(|v| {
+        String::from_utf8_lossy(trim(v.as_bytes()))
+            .go_lower()
+            .starts_with("multipart/form-data")
+    });
+    let length = request
+        .headers()
+        .get("content-length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if enabled || (!multipart && length.is_some_and(|n| n > 0 && n <= SMALL_BODY)) {
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            // Go answers before it logs anything.
+            Err(error) if crate::body_limit::is_too_large(&error) => {
+                sink.discard();
+                return Err(Box::new(crate::body_limit::too_large()));
+            }
+            Err(error) => {
+                // Preserve the transport error downstream; never turn it into
+                // a successful empty body when capture cannot read the input.
+                sink.discard();
+                *request.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                    Err::<Bytes, _>(io::Error::other(error.to_string()))
+                }));
+                return Ok(request);
+            }
+        };
+        *request.body_mut() = Body::from(bytes.clone());
+        // Eager capture logs what the handler may accept: at most its own decoded limit.
+        let limit = decoded_limit(body_limit, crate::MAX_REQUEST_BYTES as u64);
+        let (body, undecoded) = decode_request(bytes.to_vec(), request.headers(), limit).await;
+        if let Some(record) = sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+            (record.request_body, record.request_undecoded) = (body, undecoded);
+        }
+        return Ok(request);
+    }
+    if multipart || length == Some(0) || request.body().is_end_stream() {
+        return Ok(request);
+    }
+    let Ok(spool) = Spool::new(&dir, "request-body") else {
+        return Ok(request);
+    };
+    let deferred = Arc::new(Mutex::new(Deferred {
+        spool,
+        length,
+        read: 0,
+        captured: 0,
+        eof: false,
+        truncated: false,
+        failed: false,
+    }));
+    match sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+        Some(record) => record.deferred = Some(deferred.clone()),
+        None => return Ok(request),
+    }
+    let body = std::mem::replace(request.body_mut(), Body::empty());
+    *request.body_mut() = Body::new(RequestBody { body, deferred });
+    Ok(request)
 }
 
 async fn capture_response(sink: RequestLog, head: bool, mut response: Response) -> Response {
@@ -445,6 +476,16 @@ impl RequestLog {
         }
         if websocket {
             self.finished().await;
+        }
+    }
+
+    /// Drops the record unlogged and finalizes it, as when request capture cannot read
+    /// the body.
+    fn discard(&self) {
+        let record = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if record.is_some() {
+            self.1.done.store(true, Ordering::Release);
+            self.1.notify.notify_waiters();
         }
     }
 
@@ -1191,6 +1232,8 @@ struct Record {
     /// The request's `server.max-request-body-bytes`, if one applied.
     body_limit: Option<u64>,
     deferred: Option<Arc<Mutex<Deferred>>>,
+    /// [`authenticated_body`] has not run: nothing has read the body for the log.
+    body_pending: bool,
     status: u16,
     /// The response came from a NoRoute fallback ([`Unrouted`]).
     unrouted: bool,
@@ -2111,6 +2154,17 @@ mod tests {
         )
     }
 
+    /// `app` behind client-key authentication, as the API serves it: an admitted
+    /// request reaches [`authenticated_body`] before its handler.
+    fn authed(app: axum::Router) -> axum::Router {
+        app.layer(axum::middleware::from_fn(|request: Request, next: Next| async move {
+            match authenticated_body(request).await {
+                Ok(request) => next.run(request).await,
+                Err(response) => *response,
+            }
+        }))
+    }
+
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cpa-request-log-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2247,7 +2301,7 @@ mod tests {
                     "ok"
                 }
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let response = app
                 .call(
                     HttpRequest::builder()
@@ -2315,7 +2369,7 @@ mod tests {
                 let _ = tx.send(log);
                 async { (StatusCode::INTERNAL_SERVER_ERROR, "fixture error") }
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let mut request = HttpRequest::builder()
                 .method("POST")
                 .uri("/fixture")
@@ -2422,7 +2476,7 @@ mod tests {
                 StatusCode::SWITCHING_PROTOCOLS
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let response = app
             .call(
                 HttpRequest::builder()
@@ -2490,7 +2544,7 @@ mod tests {
                 );
                 response
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let length = case["body_length"].as_u64().unwrap() as usize;
             let body = if consume >= 0 {
                 Body::from_stream(futures_util::stream::iter([
@@ -2562,7 +2616,7 @@ mod tests {
                 StatusCode::SWITCHING_PROTOCOLS.into_response()
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let mut request = HttpRequest::builder()
             .uri("/v1/responses")
             .header("upgrade", "websocket")
@@ -2727,7 +2781,7 @@ mod tests {
                     }
                     unrouted(StatusCode::NOT_FOUND.into_response())
                 });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             assert_eq!(send(&mut app, "POST", "/anything").await, StatusCode::NOT_FOUND);
             settle().await;
             assert_eq!(logs(&dir).len(), 1, "{evidence}");
@@ -2736,7 +2790,10 @@ mod tests {
         // Control: a routed 404 without evidence is still an error log.
         let dir = scratch();
         let state = management(&dir, false, false);
-        let mut app = router(&state, axum::Router::new().fallback(|| async { StatusCode::NOT_FOUND }));
+        let mut app = router(
+            &state,
+            authed(axum::Router::new().fallback(|| async { StatusCode::NOT_FOUND })),
+        );
         assert_eq!(send(&mut app, "POST", "/anything").await, StatusCode::NOT_FOUND);
         settle().await;
         assert_eq!(logs(&dir).len(), 1);
@@ -2752,7 +2809,7 @@ mod tests {
                 panic!("handler panic for the request log test")
             }
             let app = axum::Router::new().fallback(panics);
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let call = tokio::spawn(async move {
                 app.call(
                     HttpRequest::builder()
@@ -2794,7 +2851,7 @@ mod tests {
                     ([("content-type", "text/event-stream")], body).into_response()
                 }
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let response = app
                 .call(
                     HttpRequest::builder()
@@ -2840,7 +2897,7 @@ mod tests {
                 StatusCode::SWITCHING_PROTOCOLS
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let response = app
             .call(
                 HttpRequest::builder()
@@ -3014,7 +3071,7 @@ mod tests {
                 StatusCode::BAD_REQUEST
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let mut builder = HttpRequest::builder()
             .method("POST")
             .uri("/v1/responses")
@@ -3246,7 +3303,7 @@ mod tests {
                 assert_eq!(request.extensions().get::<RequestLog>().is_none(), commercial);
                 StatusCode::BAD_REQUEST
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let new = cpa_core::config::Config::parse(&format!(
                 "server: {{commercial-mode: {}}}\nobservability: {{logs: {{request-log: true}}}}\n",
                 !commercial
@@ -3279,7 +3336,7 @@ mod tests {
             assert!(axum::body::to_bytes(request.into_body(), usize::MAX).await.is_err());
             StatusCode::BAD_REQUEST
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let body = Body::from_stream(futures_util::stream::iter([
             Ok(Bytes::from_static(b"partial")),
             Err(io::Error::other("broken transport")),
@@ -3316,7 +3373,7 @@ mod tests {
                     log.api_error(status, error.into());
                     StatusCode::OK
                 });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let response = app
                 .call(
                     HttpRequest::builder()
@@ -3331,6 +3388,67 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert_eq!(logs(&dir).len(), usize::from(expected));
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// #103 (Go v8.0.67 477605dc): a request that client authentication refuses is
+    /// never read for the log, whatever its framing and whether `request-log` is on.
+    /// Its answer does not wait for a body that never ends, no spool file is created,
+    /// and its error or request log has an empty request body.
+    #[tokio::test]
+    async fn refused_requests_are_never_read_for_the_log() {
+        for enabled in [false, true] {
+            for (length, chunked) in [(Some(16), false), (Some(SMALL_BODY + 1), false), (None, true)] {
+                let case = format!("enabled={enabled} length={length:?} chunked={chunked}");
+                let dir = scratch();
+                let state = management(&dir, enabled, false);
+                // The client-key middleware refuses: `authenticated_body` never runs.
+                let refused = axum::Router::new().fallback(|| async { (StatusCode::UNAUTHORIZED, "refused") });
+                let mut app = router(&state, refused);
+                let polled = Arc::new(AtomicBool::new(false));
+                let seen = polled.clone();
+                let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+                    seen.store(true, Ordering::Relaxed);
+                    Poll::<Option<Result<Bytes, io::Error>>>::Pending
+                }));
+                let mut builder = HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json");
+                if let Some(length) = length {
+                    builder = builder.header("content-length", length);
+                }
+                if chunked {
+                    builder = builder.header("transfer-encoding", "chunked");
+                }
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), app.call(builder.body(body).unwrap()))
+                        .await
+                        .unwrap_or_else(|_| panic!("{case}: the answer waited for the body"))
+                        .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+                let spooled = || {
+                    std::fs::read_dir(&dir)
+                        .unwrap()
+                        .flatten()
+                        .any(|e| e.file_name().to_string_lossy().starts_with("request-body"))
+                };
+                assert!(!spooled(), "{case}: no request-body spool");
+                axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                settle().await;
+                assert!(!polled.load(Ordering::Relaxed), "{case}: the body was polled");
+                assert!(!spooled(), "{case}: no request-body spool");
+                let files = logs(&dir);
+                assert_eq!(files.len(), 1, "{case}");
+                let content = std::fs::read_to_string(&files[0]).unwrap();
+                let body = content
+                    .split_once("=== REQUEST BODY ===\n")
+                    .and_then(|(_, rest)| rest.split_once("=== RESPONSE ==="))
+                    .map(|(body, _)| body)
+                    .unwrap_or_else(|| panic!("{case}: {content}"));
+                assert!(body.trim().is_empty(), "{case}: request body logged: {body:?}");
+                std::fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 
@@ -3358,7 +3476,7 @@ mod tests {
                     StatusCode::BAD_REQUEST
                 }
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let request = HttpRequest::builder()
                 .method("POST")
                 .uri("/v1/responses")
@@ -3454,7 +3572,7 @@ mod tests {
                 Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>())
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let response = app
             .call(
                 HttpRequest::builder()
@@ -3518,7 +3636,7 @@ mod tests {
                     ])))
                     .unwrap()
             });
-            let mut app = router(&state, app);
+            let mut app = router(&state, authed(app));
             let response = app
                 .call(
                     HttpRequest::builder()
@@ -3643,7 +3761,7 @@ mod tests {
                 (status, [("set-cookie", "down=c00kie-down-set")], "done")
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let request = HttpRequest::builder()
             .method("POST")
             .uri("/fixture")
@@ -3787,7 +3905,7 @@ mod tests {
                 (StatusCode::OK, "done")
             }
         });
-        let mut app = router(&state, app);
+        let mut app = router(&state, authed(app));
         let request = HttpRequest::builder()
             .method("POST")
             .uri("/fixture")

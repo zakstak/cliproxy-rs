@@ -112,6 +112,16 @@ const STATUS_ONLY: &[&str] = &[
     "management_chunked GET /v8/management/config",
 ];
 
+/// #103 (docs/DIFFERENCES-FROM-GO.md "Incomplete requests on the main listener"): request
+/// capture reads no body before client authentication admits the request, so with
+/// `request-log` on an unauthenticated request gets the answer Go v8.0.35 recorded with it
+/// off (the second case), and nothing is read. Go v8.0.35 read the body first and
+/// answered `413`; Go v8.0.67 (477605dc) answers as cliproxy-rs does.
+const UNREAD_BEFORE_AUTH: &[(&str, &str)] = &[(
+    "chunked_unauthenticated_request_log",
+    "chunked_unauthenticated_no_request_log",
+)];
+
 #[tokio::test]
 async fn body_limit_answers_match_go() {
     let fixture: Vec<Value> = serde_json::from_str(include_str!("fixtures/body_limit_go.json")).unwrap();
@@ -162,12 +172,21 @@ async fn body_limit_answers_match_go() {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8_lossy(&body).into_owned();
         let got = (status, content_type, normalize(&body));
+        let golden = UNREAD_BEFORE_AUTH
+            .iter()
+            .find(|(differs, _)| *differs == name)
+            .map_or(case, |(_, same)| {
+                fixture
+                    .iter()
+                    .find(|c| c["name"] == *same)
+                    .expect("the matching golden case")
+            });
         let want = (
-            case["status"].as_u64().unwrap() as u16,
-            case["content_type"].as_str().unwrap().to_owned(),
+            golden["status"].as_u64().unwrap() as u16,
+            golden["content_type"].as_str().unwrap().to_owned(),
             // GPT Image 2.6 is a forward port past the recording (docs/DIFFERENCES-FROM-GO.md).
             normalize(&forward_port::gpt_image_26::error_message(
-                case["response"].as_str().unwrap(),
+                golden["response"].as_str().unwrap(),
             )),
         );
         // Handlers dd7b4334 left alone read their body through axum's extractor, whose
@@ -206,7 +225,7 @@ async fn body_limit_answers_match_go() {
             failures.push(format!("{name}: got {got:?}, want {want:?}"));
         }
         // Go reads at most the limit plus one byte; frames arrive whole here.
-        let (go_read, rs_read) = (case["read"].as_u64().unwrap(), read.load(Ordering::Relaxed));
+        let (go_read, rs_read) = (golden["read"].as_u64().unwrap(), read.load(Ordering::Relaxed));
         let bounded = if go_read == 0 {
             rs_read == 0
         } else if go_read < len {
