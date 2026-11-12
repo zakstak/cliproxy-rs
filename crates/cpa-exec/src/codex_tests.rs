@@ -604,9 +604,11 @@ async fn prepare_refreshes_when_due_and_keeps_a_valid_token_on_failure() {
     assert_eq!(mock.take().len(), 3, "Go retries three times");
 
     let expired = cred("rt-2", &gone);
-    mock.script("/oauth/token", vec![json(400, r#"{"error":"invalid_grant"}"#); 3]);
+    mock.script("/oauth/token", vec![json(400, r#"{"error":"invalid_grant"}"#)]);
     let error = executor.prepare(&expired, &cfg).await.unwrap_err();
     assert_eq!((error.status, error.scope), (401, FailureScope::Credential));
+    // #92 (first-party codex-rs): a refusal for good is not retried.
+    assert_eq!(mock.take().len(), 1, "a refused refresh token is sent once");
 
     mock.script(
         "/oauth/token",
