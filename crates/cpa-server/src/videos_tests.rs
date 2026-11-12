@@ -60,25 +60,23 @@ fn lite_is_its_own_model() {
     assert!(!is_xai("grok-imagine-video-1.5-lite-preview"));
 }
 
-/// The documented limits, by model and mode (`references`: reference-to-video).
+/// xAI's capability table, by model and mode: Lite takes no reference images.
 #[test]
-fn documented_resolution_limits() {
+fn documented_mode_support() {
+    use ModeSupport::*;
+    use VideoMode::*;
     let cases = [
-        ("grok-imagine-video", false, Some("720p")),
-        ("grok-imagine-video", true, Some("720p")),
-        ("sora-2", false, Some("720p")),
-        ("grok-imagine-video-1.5", false, Some("1080p")),
-        ("grok-imagine-video-1.5-preview", false, Some("1080p")),
-        ("grok-imagine-video-1.5", true, Some("720p")),
-        ("grok-imagine-video-1.5-lite", false, Some("1080p")),
-        ("grok-imagine-video-1.5-lite", true, None),
+        ("grok-imagine-video", Generate, UpTo("720p")),
+        ("grok-imagine-video", References, UpTo("720p")),
+        ("sora-2", Generate, UpTo("720p")),
+        ("grok-imagine-video-1.5", Generate, UpTo("1080p")),
+        ("grok-imagine-video-1.5-preview", Generate, UpTo("1080p")),
+        ("grok-imagine-video-1.5", References, UpTo("720p")),
+        ("grok-imagine-video-1.5-lite", Generate, UpTo("1080p")),
+        ("xai/grok-imagine-video-1.5-lite", References, Unsupported),
     ];
-    for (model, references, want) in cases {
-        assert_eq!(
-            documented_max_resolution(model, references),
-            want,
-            "{model} {references}"
-        );
+    for (model, mode, want) in cases {
+        assert_eq!(mode_support(model, mode), want, "{model} {mode:?}");
     }
     for (raw, want) in [
         ("1080p", "1080p"),

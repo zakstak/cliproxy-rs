@@ -233,17 +233,35 @@ fn resolution(raw: &str) -> &'static str {
     }
 }
 
-/// The highest resolution xAI documents for `model` generating this kind of video, or
-/// `None` where the documentation states none (docs.x.ai video generation guide):
-/// `grok-imagine-video` "supports up to 720p"; `grok-imagine-video-1.5` renders 1080p
-/// natively for text-to-video and image-to-video, while "reference-to-video goes up to
-/// 720p"; `grok-imagine-video-1.5-lite` "reaches 1080p for text-to-video and
-/// image-to-video by upscaling 720p" and states no limit for reference-to-video.
-fn documented_max_resolution(model: &str, references: bool) -> Option<&'static str> {
-    match (canonical(model), references) {
-        (XAI_15_MODEL, false) | (XAI_15_LITE, false) => Some("1080p"),
-        (XAI_15_LITE, true) => None,
-        _ => Some("720p"),
+/// Which video a compatibility request asks for: from a prompt or an image
+/// (text- and image-to-video), or guided by `reference_images` (reference-to-video).
+/// The compatibility route builds no other xAI mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoMode {
+    Generate,
+    References,
+}
+
+/// What xAI documents for a model in a mode: not offered at all, or offered up to a
+/// highest resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeSupport {
+    Unsupported,
+    UpTo(&'static str),
+}
+
+/// xAI's capability table for its video models (docs.x.ai, Video Overview, "model
+/// capabilities"), with the video generation guide's resolution notes:
+/// `grok-imagine-video` generates and takes up to 7 reference images, both at 720p;
+/// `grok-imagine-video-1.5` renders 1080p natively for text- and image-to-video and
+/// takes up to 14 reference images at 720p; `grok-imagine-video-1.5-lite` reaches 1080p
+/// for text- and image-to-video by upscaling 720p, and its reference-images cell reads
+/// "Not supported".
+fn mode_support(model: &str, mode: VideoMode) -> ModeSupport {
+    match (canonical(model), mode) {
+        (XAI_15_LITE, VideoMode::References) => ModeSupport::Unsupported,
+        (XAI_15_MODEL | XAI_15_LITE, VideoMode::Generate) => ModeSupport::UpTo("1080p"),
+        _ => ModeSupport::UpTo("720p"),
     }
 }
 
@@ -341,18 +359,32 @@ fn create_request(body: &[u8], model: &str) -> Result<(Vec<u8>, CreateMeta), Str
     if !image.is_empty() && !references.is_empty() {
         return Err("image and reference_images cannot be combined on xAI".into());
     }
-    // Only a model and mode xAI documents at 1080p asks for it; 1080p elsewhere is
-    // refused here rather than silently lowered (#87).
-    if res == "1080p" && documented_max_resolution(model, !references.is_empty()) == Some("720p") {
-        let mode = if references.is_empty() {
-            ""
-        } else {
-            " for reference-to-video"
-        };
-        return Err(format!(
-            "resolution 1080p is not supported by {}{mode}; xAI documents up to 720p",
-            canonical(model)
-        ));
+    // A mode xAI does not offer for the model is refused before anything is sent, and
+    // 1080p only reaches xAI for a model and mode it documents at 1080p; elsewhere it
+    // is refused rather than silently lowered (#87).
+    let mode = if references.is_empty() {
+        VideoMode::Generate
+    } else {
+        VideoMode::References
+    };
+    match mode_support(model, mode) {
+        ModeSupport::Unsupported => {
+            return Err(format!(
+                "reference_images is not supported by {}; xAI offers reference-to-video on {XAI_MODEL} and {XAI_15_MODEL}",
+                canonical(model)
+            ));
+        }
+        ModeSupport::UpTo("720p") if res == "1080p" => {
+            let mode = match mode {
+                VideoMode::Generate => "",
+                VideoMode::References => " for reference-to-video",
+            };
+            return Err(format!(
+                "resolution 1080p is not supported by {}{mode}; xAI documents up to 720p",
+                canonical(model)
+            ));
+        }
+        ModeSupport::UpTo(_) => {}
     }
     let mut req = b"{}".to_vec();
     gj::set_str(&mut req, "model", canonical(model));

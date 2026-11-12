@@ -3,10 +3,12 @@
 //! real router against loopback xAI mocks of the generation and poll endpoints. Fake
 //! keys and a private auth-dir; nothing leaves loopback.
 //!
-//! The documented limits: `grok-imagine-video` up to 720p; `grok-imagine-video-1.5`
-//! 1080p natively for text- and image-to-video, up to 720p for reference-to-video;
-//! `grok-imagine-video-1.5-lite` 1080p for text- and image-to-video by upscaling 720p,
-//! with no stated limit for reference-to-video. xAI's request has no upscale field.
+//! The documented capabilities (xAI Video Overview capability table and the video
+//! generation guide): `grok-imagine-video` up to 720p, reference images at 720p;
+//! `grok-imagine-video-1.5` 1080p natively for text- and image-to-video, reference
+//! images at 720p; `grok-imagine-video-1.5-lite` 1080p for text- and image-to-video by
+//! upscaling 720p, reference images "Not supported". xAI's request has no upscale field.
+//! Native routes forward the client's body as sent apart from the canonical model.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +22,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// `install_registry` sets the process-wide registry the routes read: one test at a time.
 static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Requests one mock received: method, path and JSON body.
-type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
+/// Requests one mock received: method, path, JSON body and the body's bytes as sent.
+type Seen = Arc<Mutex<Vec<(String, String, Value, Vec<u8>)>>>;
 
 async fn read_request(conn: &mut TcpStream) -> (String, String, Vec<u8>) {
     let mut buf = Vec::new();
@@ -63,14 +65,14 @@ async fn upstream(tag: &'static str, poll: Value) -> (String, Seen) {
             let (mut conn, _) = listener.accept().await.unwrap();
             let (log, poll) = (log.clone(), poll.clone());
             tokio::spawn(async move {
-                let (method, path, body) = read_request(&mut conn).await;
-                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let (method, path, raw) = read_request(&mut conn).await;
+                let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
                 let reply = if method == "GET" {
                     poll
                 } else {
                     json!({"request_id": format!("{tag}-job")})
                 };
-                log.lock().unwrap().push((method, path, body));
+                log.lock().unwrap().push((method, path, body, raw));
                 let reply = reply.to_string();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -251,11 +253,11 @@ async fn openai_route_resolutions_follow_each_model() {
             json!({"resolution": "1080p", "image": CAT}),
             Ok(("grok-imagine-video-1.5", "1080p")),
         ),
-        // Reference-to-video: Lite has no documented limit, so 1080p goes to xAI.
+        // Reference-to-video: the classic model and 1.5 take reference images (720p).
         (
-            "grok-imagine-video-1.5-lite",
-            json!({"resolution": "1080p", "reference_images": references.clone()}),
-            Ok(("grok-imagine-video-1.5-lite", "1080p")),
+            "grok-imagine-video",
+            json!({"reference_images": references.clone()}),
+            Ok(("grok-imagine-video", "720p")),
         ),
         (
             "grok-imagine-video-1.5",
@@ -289,6 +291,38 @@ async fn openai_route_resolutions_follow_each_model() {
             json!({"resolution": "1080p", "reference_images": references.clone()}),
             Err(
                 "resolution 1080p is not supported by grok-imagine-video-1.5 for reference-to-video; xAI documents up to 720p",
+            ),
+            // xAI's capability table: Lite takes no reference images, at any resolution.
+            (
+                "grok-imagine-video-1.5-lite",
+                json!({"resolution": "1080p", "reference_images": references.clone()}),
+                Err(
+                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
+                ),
+            ),
+            // xAI's capability table: Lite takes no reference images, at any resolution.
+            (
+                "x-ai/grok-imagine-video-1.5-lite",
+                json!({"resolution": "1080p", "reference_images": references.clone()}),
+                Err(
+                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
+                ),
+            ),
+            // xAI's capability table: Lite takes no reference images, at any resolution.
+            (
+                "grok-imagine-video-1.5-lite",
+                json!({"reference_images": references.clone()}),
+                Err(
+                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
+                ),
+            ),
+            // xAI's capability table: Lite takes no reference images, at any resolution.
+            (
+                "grok-imagine-video-1.5-lite",
+                json!({"resolution": "480p", "reference_image_urls": [CAT]}),
+                Err(
+                    "reference_images is not supported by grok-imagine-video-1.5-lite; xAI offers reference-to-video on grok-imagine-video and grok-imagine-video-1.5",
+                ),
             ),
         ),
     ];
@@ -333,7 +367,7 @@ async fn native_route_forwards_lite_requests_unchanged() {
         let (status, out) = send(&p.addr, "POST", "/v1/videos/generations", Some(&body)).await;
         assert_eq!(status, 200, "{model}: {out}");
         assert_eq!(out["request_id"], "n-job");
-        let (method, path, sent) = seen.lock().unwrap().last().unwrap().clone();
+        let (method, path, sent, _) = seen.lock().unwrap().last().unwrap().clone();
         assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/videos/generations"));
         let mut want = body.clone();
         want["model"] = json!("grok-imagine-video-1.5-lite");
@@ -434,4 +468,77 @@ async fn other_video_models_stay_refused() {
         assert_eq!(status, 400, "{model}: {out}");
     }
     assert!(seen.lock().unwrap().is_empty());
+}
+
+/// One request with `payload` sent as these exact bytes; the status.
+async fn send_raw(addr: &str, path: &str, payload: &str) -> u16 {
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer client-key\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+        payload.len()
+    );
+    conn.write_all(head.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    conn.read_to_end(&mut out).await.unwrap();
+    String::from_utf8_lossy(&out)[9..12].parse().unwrap()
+}
+
+/// A native body reaches xAI as the client sent it, apart from the canonical model:
+/// spacing, member order, duplicate members, number spellings, escapes, opaque nested
+/// `image_url` members and the `image_url` alias xAI documents for `image` and
+/// `reference_images` all pass unchanged, on every native path and vendor prefix.
+#[tokio::test]
+async fn native_routes_forward_bodies_byte_for_byte() {
+    let _registry = REGISTRY.lock().await;
+    let (up, seen) = upstream("b", json!({})).await;
+    let p = proxy(&[&up]).await;
+    let models = [
+        ("grok-imagine-video-1.5-lite", "grok-imagine-video-1.5-lite"),
+        ("grok-imagine-video", "grok-imagine-video"),
+        ("grok-imagine-video-1.5-preview", "grok-imagine-video-1.5"),
+    ];
+    for (model, canonical) in models {
+        for prefix in ["", "xai/", "x-ai/", "GROK/"] {
+            for path in [
+                "/v1/videos",
+                "/v1/videos/generations",
+                "/v1/videos/edits",
+                "/v1/videos/extensions",
+            ] {
+                let raw = format!(
+                    r#" {{ "model" : "{prefix}{model}", "prompt":"cat",  "resolution":"1080p", "image" : {{ "image_url" : "https://example.invalid/cat.png" }}, "reference_images":[{{"image_url":{{"url":"https://example.invalid/ref.png"}}}}], "vendor_extension":{{"image":{{"image_url":"opaque-value"}},"images":[{{"image_url":"opaque"}}]}}, "upscale":true, "big":9007199254740993, "exp":1e+07, "esc":"a\/", "same":1, "same":2 }} "#
+                );
+                let status = send_raw(&p.addr, path, &raw).await;
+                assert_eq!(status, 200, "{prefix}{model} {path}");
+                let (method, sent_path, _, bytes) = seen.lock().unwrap().last().unwrap().clone();
+                assert_eq!(method, "POST");
+                let route = if path == "/v1/videos" {
+                    "/v1/videos/generations"
+                } else {
+                    path
+                };
+                assert_eq!(sent_path, route, "{prefix}{model} {path}");
+                let want = raw.replace(&format!("\"{prefix}{model}\""), &format!("\"{canonical}\""));
+                assert_eq!(String::from_utf8(bytes).unwrap(), want, "{prefix}{model} {path}");
+            }
+        }
+    }
+}
+
+/// Control: the compatibility route still builds xAI's own shape (`image.url`,
+/// `reference_images[].url`) from its OpenAI-style inputs.
+#[tokio::test]
+async fn compatibility_route_still_builds_url_references() {
+    let _registry = REGISTRY.lock().await;
+    let (up, seen) = upstream("c", json!({})).await;
+    let p = proxy(&[&up]).await;
+    let image =
+        json!({"model": "grok-imagine-video-1.5-lite", "prompt": "a cat", "input_reference": {"image_url": CAT}});
+    let (status, out) = send(&p.addr, "POST", "/openai/v1/videos", Some(&image)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(last_sent(&seen)["image"], json!({"url": CAT}));
+    let references = json!({"model": "grok-imagine-video-1.5", "prompt": "a cat", "reference_images": [{"image_url": {"url": CAT}}]});
+    let (status, out) = send(&p.addr, "POST", "/openai/v1/videos", Some(&references)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(last_sent(&seen)["reference_images"], json!([{"url": CAT}]));
 }

@@ -19,6 +19,31 @@ const FIXTURE: &str = include_str!("../tests/fixtures/xai_go.json");
 /// 6fecc6e recordings.
 const FIXTURE_V8_0_35: &str = include_str!("../tests/fixtures/xai_go_v8.0.35.json");
 
+/// Native video recordings whose client body Go rewrote (`normalizeXAIImageRefs`:
+/// nested `image_url` to `url`, the body re-encoded). cliproxy-rs sends a native body
+/// as the client sent it, and xAI's API accepts `image_url` there
+/// (docs/DIFFERENCES-FROM-GO.md, "Native xAI video bodies"): the request Go recorded,
+/// with the client's payload as its body.
+const NATIVE_VIDEO_BODIES: &[&str] = &["videos_create_idempotency"];
+
+/// The upstream request scenario `name` must send.
+fn native_video_request(name: &str, s: &Value) -> Option<String> {
+    let go = s["request"].as_str()?;
+    if !NATIVE_VIDEO_BODIES.contains(&name) {
+        return Some(go.to_owned());
+    }
+    let (head, body) = go.split_once("\r\n\r\n").expect("a recorded request");
+    let payload = s["payload"].as_str().unwrap();
+    assert!(
+        payload.contains("\"image_url\"") && !body.contains("image_url"),
+        "{name}: Go's recording changed"
+    );
+    let length = format!("Content-Length: {}\r\n", body.len());
+    assert!(head.contains(&length), "{name}: Go's recording changed");
+    let head = head.replace(&length, &format!("Content-Length: {}\r\n", payload.len()));
+    Some(format!("{head}\r\n\r\n{payload}"))
+}
+
 /// Shared helpers whose real port has not landed: scenarios that need them are skipped
 /// and listed, so integration can remove an entry and see the scenario run.
 const PENDING: &[&str] = &[];
@@ -278,11 +303,9 @@ async fn go_reference_scenarios() {
                 problems.push(format!("url: {url:?} != {:?}", s["url"]));
             }
             let got = mock.request();
-            if got.as_deref() != s["request"].as_str() {
-                problems.push(format!(
-                    "request:\n  rust: {got:?}\n  go:   {:?}",
-                    s["request"].as_str()
-                ));
+            let want = native_video_request(name, s);
+            if got.as_deref() != want.as_deref() {
+                problems.push(format!("request:\n  rust: {got:?}\n  go:   {want:?}"));
             }
         }
         if op != "count"
