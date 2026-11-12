@@ -473,10 +473,10 @@ fn iterations_without_blocks_keep_the_requested_origin() {
     }
 }
 
-/// Repeated usage snapshots neither duplicate nor reverse the hops: a longer one
-/// extends them, the same or a shorter one changes nothing.
+/// Each usage snapshot updates the derived hops and serving model together. Identical
+/// snapshots do not announce the same hops again.
 #[test]
-fn repeated_iteration_snapshots_do_not_duplicate_or_reverse_hops() {
+fn iteration_snapshots_keep_hops_and_serving_model_consistent() {
     let one = json!([it("message", REQUESTED), it("fallback_message", "claude-opus-5")]);
     let two = json!([
         it("message", REQUESTED),
@@ -491,25 +491,31 @@ fn repeated_iteration_snapshots_do_not_duplicate_or_reverse_hops() {
             hops(&[(REQUESTED, "claude-opus-5")]),
         ),
         ("growing", vec![one.clone(), two.clone()], both.clone()),
-        ("shrinking", vec![two.clone(), one.clone()], both.clone()),
+        (
+            "shrinking",
+            vec![two.clone(), one.clone()],
+            hops(&[(REQUESTED, "claude-opus-5")]),
+        ),
+        (
+            "same length with a different serving model",
+            vec![
+                one.clone(),
+                json!([it("message", REQUESTED), it("fallback_message", "claude-sonnet-4-6")]),
+            ],
+            hops(&[(REQUESTED, "claude-sonnet-4-6")]),
+        ),
     ] {
         let events = iteration_events(&snapshots);
-        for (path, _, got) in reported(&events) {
+        for (path, model, got) in reported(&events) {
             assert_eq!(got, want, "{label}: {path}");
+            assert_eq!(model, want.last().unwrap().1, "{label}: {path}: serving model");
         }
-        // The stream announces each new hop set once.
+        // The stream announces each changed hop set once.
         let announced = stream(Format::OpenAI, &events)
             .iter()
             .filter(|(_, c)| c["choices"][0]["delta"].get("fallback").is_some())
             .count();
-        assert_eq!(
-            announced,
-            if label == "same twice" {
-                1
-            } else {
-                1 + usize::from(label == "growing")
-            }
-        );
+        assert_eq!(announced, if label == "same twice" { 1 } else { 2 });
     }
 }
 

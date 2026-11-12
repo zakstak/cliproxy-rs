@@ -297,3 +297,79 @@ async fn fallback_enabled_synthesizes_claude_codes_chain() {
     )
     .await;
 }
+
+/// Synthetic shrinking snapshots exercise consistency, not a claim that Anthropic
+/// emits them: the final serving-model signal governs hops and usage together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shrinking_snapshot_keeps_model_hops_and_usage_together() {
+    const LATEST: &str = "claude-opus-5";
+    let iteration = |kind: &str, model: &str| json!({"type":kind,"model":model});
+    let events = [
+        json!({"type":"message_start","message":{"id":"msg_snapshots","type":"message","role":"assistant","content":[],"model":REQUESTED,"usage":{"input_tokens":1,"output_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2,"iterations":[iteration("message",REQUESTED),iteration("message",LATEST),iteration("fallback_message","claude-sonnet-4-6")]}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"iterations":[iteration("message",REQUESTED),iteration("fallback_message",LATEST)]}}),
+        json!({"type":"message_stop"}),
+    ];
+    let wire: String = events
+        .iter()
+        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+        .collect();
+    let mock = serve(axum::Router::new().fallback(move || {
+        let wire = wire.clone();
+        async move { ([("content-type", "text/event-stream")], wire) }
+    }))
+    .await;
+    let dir = auth_dir("shrinking-snapshot");
+    let (url, rt) = proxy(&dir, &mock, "").await;
+    for streamed in [false, true] {
+        for (path, request, chat) in [
+            (
+                "/v1/chat/completions",
+                json!({"model":REQUESTED,"stream":streamed,"messages":[{"role":"user","content":"hi"}]}),
+                true,
+            ),
+            (
+                "/v1/responses",
+                json!({"model":REQUESTED,"stream":streamed,"input":"hi"}),
+                false,
+            ),
+        ] {
+            let (status, body) = post(&url, path, request).await;
+            assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&body));
+            let (model, hop) = if streamed {
+                let chunks = data(&body);
+                if chat {
+                    let hop = chunks
+                        .iter()
+                        .rev()
+                        .find_map(|chunk| chunk["choices"][0]["delta"].get("fallback"))
+                        .unwrap()
+                        .clone();
+                    (chunks.last().unwrap()["model"].clone(), hop)
+                } else {
+                    let response = &chunks.last().unwrap()["response"];
+                    (response["model"].clone(), response["fallback"].clone())
+                }
+            } else {
+                let response: Value = serde_json::from_slice(&body).unwrap();
+                let hop = if chat {
+                    response["choices"][0]["message"]["fallback"].clone()
+                } else {
+                    response["fallback"].clone()
+                };
+                (response["model"].clone(), hop)
+            };
+            assert_eq!(model, LATEST, "{path} stream={streamed}");
+            assert_eq!(
+                hop_models(&hop),
+                (REQUESTED.to_owned(), LATEST.to_owned()),
+                "{path} stream={streamed}"
+            );
+        }
+    }
+    assert_eq!(usage_models(&rt, 4).await, vec![LATEST; 4]);
+    std::fs::remove_dir_all(dir).unwrap();
+}

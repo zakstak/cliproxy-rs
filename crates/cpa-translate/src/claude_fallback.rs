@@ -97,8 +97,8 @@ impl FallbackChain {
     /// order, to the serving model. The serving model's own `message` entries and
     /// repeats of the model before are not hops, and the first model that ran is the
     /// requested one under whatever name Anthropic reports, so an alias resolving to
-    /// another name never makes a hop. A snapshot with no more hops than the chain has
-    /// already changes nothing, so repeated usage events neither duplicate nor shorten it.
+    /// another name never makes a hop. Each snapshot replaces the derived chain together
+    /// with its serving model; identical snapshots do not announce the same hops again.
     pub(crate) fn iterations(
         &mut self,
         iterations: &Res<'_>,
@@ -145,7 +145,7 @@ impl FallbackChain {
             .windows(2)
             .filter_map(|pair| metadata(None, &pair[0], &pair[1], boundary))
             .collect();
-        if hops.len() <= self.entries.len() {
+        if hops == self.entries {
             return (Some(served), false);
         }
         self.entries = hops;
