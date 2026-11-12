@@ -1607,7 +1607,8 @@ mod tests {
         let live = file("a.json", serde_json::json!({"type":"claude"}), &[]);
         let off = file("b.json", serde_json::json!({"type":"claude","disabled":true}), &[]);
         let r = Registry::build(&cfg, &[live, off]);
-        assert_eq!(r.available().count(), 19, "Go registers the 19-model Claude catalog");
+        // Go v8.0.35's 19 Claude models plus Claude Fable 5.2 (K1, #68).
+        assert_eq!(r.available().count(), 20, "the Claude catalog registers whole");
         assert_eq!(r.providers("claude-sonnet-4-6"), ["claude"]);
         assert!(r.has_client("a.json") && !r.has_client("b.json"));
         assert!(r.providers("gpt-5.5").is_empty());
@@ -1828,6 +1829,184 @@ mod tests {
         assert!(
             codex.iter().all(|m| m.id != "gpt-image-2.6"),
             "PR #7261 adds no bare gpt-image-2.6"
+        );
+    }
+
+    /// K1 (#68): the models added to the embedded catalog, with each value from its
+    /// provider source (docs/DIFFERENCES-FROM-GO.md, "Retained model catalog additions"):
+    /// - Claude Fable 5.2: platform.claude.com models overview, Fable 5.2 page and effort
+    ///   page, retrieved 2026-11-12 (released 2026-11-09; 1M context, 128K output, text
+    ///   and image in, adaptive thinking always on, low to max effort).
+    /// - GPT-6.1 Terra: first-party openai/codex `codex-rs/models-manager/models.json`,
+    ///   identical at the contract pin 44ccf394573c and at 5c3ff1dabf64 (500000-token
+    ///   `context_window`, text and image input, `supports_search_tool`,
+    ///   `supports_reasoning_effort_updates`, low to max effort plus `ultra`).
+    /// - Muse Ember 1.0: dev.meta.ai/docs/muse-ember and /docs/reasoning, retrieved
+    ///   2026-11-12 (1,048,576 context, 524,288 output, text/image/video/audio in,
+    ///   minimal to max effort, no contributor variant).
+    #[test]
+    fn k1_catalog_additions_carry_their_sourced_capabilities() {
+        let levels = |m: &ModelInfo| m.thinking.as_ref().map(|t| t.levels.clone()).unwrap_or_default();
+        let find = |channel: &str, id: &str| {
+            crate::registry::Catalog::parse(crate::registry::MODELS_JSON)
+                .unwrap()
+                .channel(channel)
+                .iter()
+                .find(|m| m.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{channel} lists {id}"))
+        };
+        let five = ["low", "medium", "high", "xhigh", "max"];
+
+        let fable = find("claude", "claude-fable-5-2");
+        assert_eq!(fable.kind, "claude");
+        assert_eq!(fable.raw["owned_by"], "anthropic");
+        assert_eq!(fable.raw["display_name"], "Claude Fable 5.2");
+        assert_eq!(fable.raw["context_length"], 1_000_000);
+        assert_eq!(fable.raw["max_completion_tokens"], 128_000);
+        assert_eq!(
+            fable.raw["supportedInputModalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(fable.raw["supportedOutputModalities"], serde_json::json!(["text"]));
+        let thinking = fable.thinking.as_ref().unwrap();
+        assert!(!thinking.zero_allowed, "adaptive thinking is always on");
+        assert!(thinking.dynamic_allowed);
+        assert_eq!(levels(&fable), five);
+
+        for tier in ["codex-free", "codex-team", "codex-plus", "codex-pro"] {
+            let terra = find(tier, "gpt-6.1-terra");
+            assert_eq!(terra.kind, "openai", "{tier}");
+            assert_eq!(terra.raw["owned_by"], "openai", "{tier}");
+            assert_eq!(terra.raw["context_length"], 500_000, "{tier}");
+            assert_eq!(
+                terra.raw["supportedInputModalities"],
+                serde_json::json!(["text", "image"]),
+                "{tier}"
+            );
+            assert_eq!(terra.raw["native_capabilities"]["web_search"], true, "{tier}");
+            assert_eq!(terra.raw["support_configuration_update"], true, "{tier}");
+            // No first-party source states a maximum output, so none is claimed.
+            assert!(terra.raw.get("max_completion_tokens").is_none(), "{tier}");
+            assert_eq!(levels(&terra), five, "{tier}");
+            // GPT-5.5 stays in every tier (Go v8.0.67 dropped it from its static list).
+            find(tier, "gpt-5.5");
+        }
+
+        let ember = find("meta", "muse-ember-1.0");
+        assert_eq!(ember.kind, "meta");
+        assert_eq!(ember.raw["owned_by"], "meta");
+        assert_eq!(ember.raw["display_name"], "Muse Ember 1.0");
+        assert_eq!(ember.raw["context_length"], 1_048_576);
+        assert_eq!(ember.raw["max_completion_tokens"], 524_288);
+        assert_eq!(
+            ember.raw["supportedInputModalities"],
+            serde_json::json!(["text", "image", "video", "audio"])
+        );
+        assert_eq!(levels(&ember), ["minimal", "low", "medium", "high", "xhigh", "max"]);
+
+        // Candidates without a sufficient source or route stay out of the catalog.
+        let catalog = crate::registry::Catalog::parse(crate::registry::MODELS_JSON).unwrap();
+        for tier in ["codex-free", "codex-team", "codex-plus", "codex-pro"] {
+            assert!(
+                catalog.channel(tier).iter().all(|m| m.id != "gpt-6-chat-thinking"),
+                "{tier}"
+            );
+        }
+        assert!(catalog.lookup("muse-ember-1.0-contributor").is_none());
+        let xai = static_definitions("xai").unwrap();
+        assert!(xai.iter().all(|m| m.id != "grok-imagine-video-1.5-lite"), "X4 (#87)");
+    }
+
+    /// K1 (#68): the additions register like their siblings and stay subject to the
+    /// operator's rules: plan tiers, API-key defaults, exclusions, aliases, prefixes and
+    /// configured model lists. Existing entries keep registering.
+    #[test]
+    fn k1_catalog_additions_follow_registration_and_operator_rules() {
+        let none = Config::default();
+        let claude = file("c.json", serde_json::json!({"type":"claude"}), &[]);
+        let meta = file("m.json", serde_json::json!({"type":"meta"}), &[]);
+        let r = Registry::build(&none, &[claude.clone(), meta.clone()]);
+        assert_eq!(r.providers("claude-fable-5-2"), ["claude"]);
+        assert_eq!(r.providers("claude-fable-5-1"), ["claude"]);
+        assert_eq!(r.providers("muse-ember-1.0"), ["meta"]);
+        assert_eq!(r.providers("muse-wonder-1.0"), ["meta"]);
+        let ember = r.info("muse-ember-1.0", Some("meta")).unwrap();
+        assert_eq!(ember.max_completion_tokens, 524_288);
+
+        for plan in ["free", "plus", "team", "pro", ""] {
+            let codex = file("x.json", serde_json::json!({"type":"codex"}), &[("plan_type", plan)]);
+            let r = Registry::build(&none, std::slice::from_ref(&codex));
+            for id in ["gpt-6.1-terra", "gpt-5.5", "gpt-6-luna"] {
+                assert_eq!(r.providers(id), ["codex"], "plan {plan:?}: {id}");
+            }
+            let terra = r.info("gpt-6.1-terra", Some("codex")).unwrap();
+            assert!(terra.support_configuration_update, "plan {plan:?}");
+            assert_eq!(terra.native_web_search, Some(true), "plan {plan:?}");
+        }
+        // A Codex API key keeps its existing rule: no configuration updates.
+        let key = config("codex", "k", serde_json::json!({}), &[("api_key", "sk-fake")]);
+        let r = Registry::build(&none, std::slice::from_ref(&key));
+        assert!(
+            !r.info("gpt-6.1-terra", Some("codex"))
+                .unwrap()
+                .support_configuration_update
+        );
+
+        // Exclusions, aliases and prefixes apply to the new IDs.
+        let cfg =
+            Config::parse("oauth:\n  model-alias:\n    claude:\n      - {name: claude-fable-5-2, alias: fable-next}\n")
+                .unwrap();
+        let ruled = file(
+            "r.json",
+            serde_json::json!({"type":"claude"}),
+            &[("excluded_models", "claude-fable-5-1"), ("prefix", "team")],
+        );
+        let r = Registry::build(&cfg, std::slice::from_ref(&ruled));
+        let ids: Vec<&str> = r.ids().collect();
+        assert!(!ids.contains(&"claude-fable-5-1"), "{ids:?}");
+        assert!(
+            ids.contains(&"fable-next") && !ids.contains(&"claude-fable-5-2"),
+            "{ids:?}"
+        );
+        assert!(ids.contains(&"team/fable-next"), "{ids:?}");
+        let aliases = global_aliases(&cfg);
+        let (models, _) = execution_models(&aliases, &ruled, "team/fable-next(high)");
+        assert_eq!(models, ["claude-fable-5-2(high)"]);
+        let excluded = file(
+            "e.json",
+            serde_json::json!({"type":"meta"}),
+            &[("excluded_models", "muse-ember-*")],
+        );
+        let r = Registry::build(&none, std::slice::from_ref(&excluded));
+        assert!(r.providers("muse-ember-1.0").is_empty());
+        assert_eq!(r.providers("muse-spark-1.3"), ["meta"]);
+        let forced = Config::parse("routing:\n  force-model-prefix: true\n").unwrap();
+        let r = Registry::build(&forced, std::slice::from_ref(&ruled));
+        assert!(r.ids().all(|id| id.starts_with("team/")));
+
+        // A configured model list replaces the catalog for its credential.
+        let listed = config(
+            "meta",
+            "mk",
+            serde_json::json!({"models":[{"name":"muse-spark-1.3"}]}),
+            &[("api_key", "fake")],
+        );
+        let r = Registry::build(&none, std::slice::from_ref(&listed));
+        assert!(r.providers("muse-ember-1.0").is_empty(), "configured models win");
+        assert_eq!(r.providers("muse-spark-1.3"), ["meta"]);
+        // A configured entry for the new ID inherits its catalog thinking levels.
+        let named = config(
+            "meta",
+            "mn",
+            serde_json::json!({"models":[{"name":"muse-ember-1.0","alias":"ember"}]}),
+            &[("api_key", "fake")],
+        );
+        let r = Registry::build(&none, std::slice::from_ref(&named));
+        let spec = r.client_model("mn", "ember").unwrap();
+        assert_eq!(
+            spec.thinking.as_ref().map(|t| t.levels.clone()).unwrap_or_default(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
         );
     }
 }

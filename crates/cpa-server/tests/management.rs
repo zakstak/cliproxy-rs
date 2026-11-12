@@ -1574,6 +1574,9 @@ async fn model_definitions_match_go_by_channel() {
     let mut go: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
     forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
+    for (channel, models) in go.iter_mut() {
+        forward_port::k1_catalog::definitions_list(channel, models);
+    }
     // The removed providers' channels (issue #49) are unknown here.
     let removed: Vec<String> = go
         .keys()

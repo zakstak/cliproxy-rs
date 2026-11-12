@@ -176,8 +176,8 @@ async fn tool_search_catalog_matches_go() {
 /// A Codex API key without configured models serves the Pro catalog plus the gpt-image-*
 /// built-ins (Go `WithCodexBuiltins`), as Go's `/v1/models` lists them
 /// (tests/reference/codex_models `TestRSFixCodexBuiltins`). Compared as a set: list order
-/// is the registry's concern. GPT Image 2.6 is a forward port past Go's recording
-/// (docs/DIFFERENCES-FROM-GO.md).
+/// is the registry's concern. GPT Image 2.6 and GPT-6.1 Terra (K1, #68) are forward
+/// ports past Go's recording (docs/DIFFERENCES-FROM-GO.md).
 #[tokio::test]
 async fn codex_builtins_match_go_models_list() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_builtins_go.json")).unwrap();
@@ -185,6 +185,7 @@ async fn codex_builtins_match_go_models_list() {
     assert_eq!(status, 200);
     let mut want: Value = serde_json::from_str(fixture["models"].as_str().unwrap()).unwrap();
     forward_port::gpt_image_26::openai_models(&mut want);
+    forward_port::k1_catalog::codex_openai_models(&mut want);
     let sorted = |list: &Value| {
         let mut entries = list["data"].as_array().unwrap().clone();
         entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));

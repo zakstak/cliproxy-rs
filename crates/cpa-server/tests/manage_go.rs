@@ -1725,12 +1725,20 @@ mod creds {
     }
 
     /// Forward ports past v8.0.35 (docs/DIFFERENCES-FROM-GO.md): the Codex model
-    /// definitions carry the GPT Image 2.6 built-ins.
+    /// definitions carry the GPT Image 2.6 built-ins, and the channels carry the K1
+    /// catalog additions (#68).
     fn forward_ports(mut step: Value) -> Value {
         if step["response"]["channel"] == "codex"
             && let Some(raw) = step["raw_json"].as_str()
         {
             let raw = crate::forward_port::gpt_image_26::definitions_raw(raw);
+            step["response"] = serde_json::from_str(&raw).unwrap();
+            step["raw_json"] = raw.into();
+        }
+        if step["response"]["models"].is_array()
+            && let (Some(channel), Some(raw)) = (step["response"]["channel"].as_str(), step["raw_json"].as_str())
+        {
+            let raw = crate::forward_port::k1_catalog::definitions_raw(channel, raw);
             step["response"] = serde_json::from_str(&raw).unwrap();
             step["raw_json"] = raw.into();
         }
