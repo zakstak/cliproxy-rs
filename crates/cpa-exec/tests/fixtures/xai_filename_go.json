@@ -1,0 +1,125 @@
+{
+  "go": "go1.27.3-X:nodwarf5",
+  "names": [
+    {
+      "email": "a@b.com",
+      "subject": "s",
+      "name": "xai-a@b.com-7ff16c99b46dbee4.json",
+      "legacy": "xai-a@b.com.json"
+    },
+    {
+      "email": "  A.B+c@x.ai ",
+      "subject": "",
+      "name": "xai-a.b-c@x.ai-c6313894a7bac8ab.json",
+      "legacy": "xai-A.B-c@x.ai.json"
+    },
+    {
+      "email": "A.B+C@X.AI",
+      "subject": "",
+      "name": "xai-a.b-c@x.ai-c6313894a7bac8ab.json",
+      "legacy": "xai-A.B-C@X.AI.json"
+    },
+    {
+      "email": "a.b+c@x.ai",
+      "subject": "other-subject",
+      "name": "xai-a.b-c@x.ai-c6313894a7bac8ab.json",
+      "legacy": "xai-a.b-c@x.ai.json"
+    },
+    {
+      "email": "",
+      "subject": "user|1",
+      "name": "xai-user-1-ebd60b5e783b5c03.json",
+      "legacy": "xai-user-1.json"
+    },
+    {
+      "email": "",
+      "subject": "user-1",
+      "name": "xai-user-1-dff2ddde92276ffe.json",
+      "legacy": "xai-user-1.json"
+    },
+    {
+      "email": "é@x.ai",
+      "subject": "",
+      "name": "xai-@x.ai-5ce42d7c8bee3977.json",
+      "legacy": "xai-@x.ai.json"
+    },
+    {
+      "email": "---",
+      "subject": "sub",
+      "name": "xai-account-70bb2c702766eedf.json",
+      "legacy": "xai-sub.json"
+    },
+    {
+      "email": "-a b-",
+      "subject": "",
+      "name": "xai-a-b-98156c0f208f0dc9.json",
+      "legacy": "xai-a-b.json"
+    },
+    {
+      "email": "",
+      "subject": " -z- ",
+      "name": "xai-z-1b20dc39c0d6a3fe.json",
+      "legacy": "xai-z.json"
+    },
+    {
+      "email": "a+b@x.ai",
+      "subject": "",
+      "name": "xai-a-b@x.ai-298fa8ad10cdc895.json",
+      "legacy": "xai-a-b@x.ai.json"
+    },
+    {
+      "email": "a/b@x.ai",
+      "subject": "",
+      "name": "xai-a-b@x.ai-01b8dc40bcf07b49.json",
+      "legacy": "xai-a-b@x.ai.json"
+    },
+    {
+      "email": "a b@x.ai",
+      "subject": "",
+      "name": "xai-a-b@x.ai-4fd06a8debe0f998.json",
+      "legacy": "xai-a-b@x.ai.json"
+    },
+    {
+      "email": "",
+      "subject": "acct/7",
+      "name": "xai-acct-7-5d92e3fb5a01519f.json",
+      "legacy": "xai-acct-7.json"
+    },
+    {
+      "email": "",
+      "subject": "acct 7",
+      "name": "xai-acct-7-6e38366adeae975b.json",
+      "legacy": "xai-acct-7.json"
+    },
+    {
+      "email": "+++@",
+      "subject": "",
+      "name": "xai-@-cd85b20a9475acb3.json",
+      "legacy": "xai-@.json"
+    },
+    {
+      "email": "",
+      "subject": "!!!",
+      "name": "xai-account-5fb7341955372bee.json",
+      "legacy": ""
+    },
+    {
+      "email": "",
+      "subject": "Sub-A",
+      "name": "xai-Sub-A-6b96526b8eeb810c.json",
+      "legacy": "xai-Sub-A.json"
+    },
+    {
+      "email": "",
+      "subject": "sub-a",
+      "name": "xai-sub-a-b7310686bbf81924.json",
+      "legacy": "xai-sub-a.json"
+    },
+    {
+      "email": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@x.ai",
+      "subject": "",
+      "name": "xai-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-ef3d5edb9e420860.json",
+      "legacy": "xai-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@x.ai.json"
+    }
+  ]
+}

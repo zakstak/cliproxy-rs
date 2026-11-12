@@ -817,8 +817,15 @@ pub(crate) fn status_error(status: u16, body: &[u8]) -> ExecError {
     if status != 429 {
         return error;
     }
-    let code = gj::get(body, "code").str().go_lower();
-    let mut msg = gj::get(body, "error").str().go_lower();
+    // v8.0.67 (949b43b3) also reads the `{"error":{...}}` shape of terminal SSE failures.
+    let mut code = gj::get(body, "code").str().go_lower();
+    if code.is_empty() {
+        code = gj::get(body, "error.code").str().go_lower();
+    }
+    let mut msg = gj::get(body, "error.message").str().go_lower();
+    if msg.is_empty() {
+        msg = gj::get(body, "error").str().go_lower();
+    }
     if msg.is_empty() {
         msg = String::from_utf8_lossy(body).go_lower();
     }
