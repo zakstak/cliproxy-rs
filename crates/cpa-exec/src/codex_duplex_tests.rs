@@ -2518,3 +2518,68 @@ async fn a_create_admitted_before_revocation_is_not_written_after_it() {
     drop(stream);
     up.finish().await;
 }
+
+/// N1 #111 review: a later create admitted while the key was accepted, then parked on the
+/// socket (another holder of its sink), is checked again once it can be written: revoked
+/// meanwhile, it is never written and the stream ends with the refusal. Deterministic:
+/// the test holds the sink until the writer is parked on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_waiting_for_the_socket_is_refused_after_revocation() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        if let Ok(Some(Ok(axum::extract::ws::Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(5), c.socket.recv()).await
+        {
+            c.error(format!("a frame was written after revocation: {}", text.as_str()));
+        }
+    })
+    .await;
+    let client = Client::new("authority-sink");
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    client.executor.attach_authority(
+        &client.session,
+        Arc::new({
+            let revoked = revoked.clone();
+            move || revoked.load(Ordering::SeqCst).then(refusal)
+        }),
+    );
+    let mut stream = client
+        .start(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex)
+        .await;
+    loop {
+        let chunk = next(&mut stream).await.expect("an event").expect("no failure");
+        if get(&chunk, "type") == "response.completed" {
+            break;
+        }
+    }
+    let conn = client.executor.ws.session(&client.session).current().unwrap();
+    let mut waits = conn.sink_waits.subscribe();
+    let before = *waits.borrow_and_update();
+    let sink = conn.sink.lock().await;
+    client
+        .send(r#"{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"parked"}]}"#)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), waits.wait_for(|n| *n > before))
+        .await
+        .expect("the writer parks on the sink")
+        .unwrap();
+    revoked.store(true, Ordering::SeqCst);
+    drop(sink);
+    let failure = loop {
+        match next(&mut stream).await.expect("the stream ends with the refusal") {
+            Ok(_) => continue,
+            Err(error) => break error,
+        }
+    };
+    assert_eq!((failure.status, failure.scope), (401, FailureScope::Request));
+    assert_eq!(
+        failure.delivered_event().map(|b| &b[..]),
+        Some(REFUSAL_EVENT.as_bytes())
+    );
+    drop(stream);
+    up.finish().await;
+}

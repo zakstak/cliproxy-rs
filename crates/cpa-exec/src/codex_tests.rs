@@ -794,7 +794,14 @@ async fn truncated_error_body_is_a_transport_failure_not_an_auth_failure() {
         .await
         .err()
         .expect("transport error");
-    assert_eq!(error.scope, FailureScope::Transport, "{error}");
+    // Never an auth failure. The mock's reset usually lands before the 401 head leaves,
+    // so the request was sent and got no answer: an uncertain, request-scoped failure
+    // that never fails over (N1 #111). A head that did arrive would leave a transport
+    // failure of the error body instead.
+    assert!(
+        matches!(error.scope, FailureScope::Transport | FailureScope::Request),
+        "{error}"
+    );
     assert_ne!(error.status, 401);
 }
 

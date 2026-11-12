@@ -232,6 +232,9 @@ pub enum InterruptError {
     NoActive,
     /// The socket was lost, the credential is disabled, or the write failed.
     Rejected(String),
+    /// The client's key lost its authority while the interrupt waited for the socket
+    /// (N1 #111 W2): nothing was written.
+    Refused(Refusal),
 }
 
 impl std::fmt::Display for InterruptError {
@@ -239,6 +242,7 @@ impl std::fmt::Display for InterruptError {
         match self {
             Self::NoActive => f.write_str(NO_ACTIVE_UPSTREAM),
             Self::Rejected(text) => f.write_str(text),
+            Self::Refused(refusal) => f.write_str(&refusal.message),
         }
     }
 }
@@ -263,6 +267,10 @@ pub(crate) struct Upstream {
     /// credential guard of everything read from it ([`crate::codex_secret`]). A reused
     /// socket keeps its own handshake's values; a fresh dial gets the request's.
     pub(crate) secrets: cpa_core::exec::SentCredentials,
+    /// Tests: how many writes have come to wait for [`Self::sink`], so a test holding the
+    /// sink knows a write is parked before it changes what the write will find.
+    #[cfg(test)]
+    pub(crate) sink_waits: tokio::sync::watch::Sender<usize>,
 }
 
 /// A socket's upgrade `openai-model` and the upstream model the upgrade was sent for.
@@ -304,6 +312,8 @@ impl Upstream {
             reader: Mutex::default(),
             lease: Mutex::default(),
             upgrade_model: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            sink_waits: tokio::sync::watch::Sender::new(0),
         })
     }
 
@@ -389,15 +399,22 @@ impl Upstream {
         self.write_message(Message::text(frame), len).await
     }
 
-    /// [`Self::send`] for a client's own bytes: one text frame holding them unchanged,
-    /// UTF-8 or not, as gorilla writes a `TextMessage`.
-    pub(crate) async fn send_raw(&self, payload: Bytes) -> Result<(), ExecError> {
-        self.send_create(payload).await.map_err(WriteFailure::into_error)
+    /// [`Self::send`] for a downstream client's frame (N1 #111 W2): `authority` admits the
+    /// write once the socket is ready to take it ([`write_phases`]).
+    pub(crate) async fn send_authorized(
+        &self,
+        frame: String,
+        authority: Option<&Authority>,
+    ) -> Result<(), WriteFailure> {
+        let len = frame.len();
+        self.write_certain(Message::text(frame), len, authority).await
     }
 
-    /// [`Self::send_raw`] for a request whose replay must be decided: the failure says
-    /// whether the frame provably never left ([`WriteFailure::unsent`]).
-    pub(crate) async fn send_create(&self, payload: Bytes) -> Result<(), WriteFailure> {
+    /// One text frame holding a client's own bytes unchanged, UTF-8 or not, as gorilla
+    /// writes a `TextMessage`, for a request whose replay must be decided: the failure says
+    /// whether the frame provably never left ([`WriteFailure::unsent`]), and whether
+    /// `authority` refused it ([`WriteFailure::refusal`]).
+    pub(crate) async fn send_create(&self, payload: Bytes, authority: Option<&Authority>) -> Result<(), WriteFailure> {
         use tokio_tungstenite::tungstenite::protocol::frame::{
             Frame,
             coding::{Data, OpCode},
@@ -406,38 +423,60 @@ impl Upstream {
         self.write_certain(
             Message::Frame(Frame::message(payload, OpCode::Data(Data::Text), true)),
             len,
+            authority,
         )
         .await
     }
 
     async fn write_message(&self, message: Message, len: usize) -> Result<(), ExecError> {
-        self.write_certain(message, len).await.map_err(WriteFailure::into_error)
+        self.write_certain(message, len, None)
+            .await
+            .map_err(WriteFailure::into_error)
     }
 
     /// One write, and whether a failure provably wrote nothing. A socket whose loss the
-    /// reader already recorded is not written at all. tungstenite refuses a closed or
-    /// closing socket and a full write buffer before it queues the frame
-    /// (`protocol/mod.rs` `WebSocketContext::write` and `frame/mod.rs` `buffer_frame` in
-    /// tungstenite 0.29); every other failure, a timeout included, may follow a partial
-    /// write, and `ConnectionClosed` can be a reset that came after one.
-    async fn write_certain(&self, message: Message, len: usize) -> Result<(), WriteFailure> {
+    /// reader already recorded is not written at all. The rest is [`write_phases`]: a
+    /// failure before the frame was handed to tungstenite, a timeout included, wrote
+    /// nothing; tungstenite refuses a closed or closing socket and a full write buffer
+    /// before it queues the frame ([`refused_before_queueing`]); every later failure, and
+    /// a timeout during the flush, may follow a partial write.
+    async fn write_certain(
+        &self,
+        message: Message,
+        len: usize,
+        authority: Option<&Authority>,
+    ) -> Result<(), WriteFailure> {
         if let Some(lost) = self.link.lock().expect("link").lost.clone() {
             return Err(WriteFailure {
                 error: write_error(Some(&lost), "codex websockets executor: write failed"),
                 unsent: true,
+                refusal: None,
             });
         }
         let deadline = self.write.deadline(len);
-        let sent = tokio::time::timeout(deadline, async { self.sink.lock().await.send(message).await }).await;
-        match sent {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(WriteFailure {
-                unsent: refused_before_queueing(&error),
+        let mut queued = false;
+        let outcome = tokio::time::timeout(deadline, async {
+            #[cfg(test)]
+            self.sink_waits.send_modify(|waits| *waits += 1);
+            let mut sink = self.sink.lock().await;
+            write_phases(&mut *sink, message, authority, &mut queued).await
+        })
+        .await;
+        match outcome {
+            Ok(Ok(None)) => Ok(()),
+            Ok(Ok(Some(refusal))) => Err(WriteFailure {
+                error: refusal.error(),
+                unsent: true,
+                refusal: Some(refusal),
+            }),
+            Ok(Err((error, unsent))) => Err(WriteFailure {
+                unsent,
                 error: write_error(
                     self.link.lock().expect("link").lost.as_ref(),
                     "codex websockets executor: write failed",
                 )
                 .with_diagnostic(ws_cause::socket(&error)),
+                refusal: None,
             }),
             Err(_) => Err(WriteFailure {
                 error: write_error(
@@ -445,7 +484,8 @@ impl Upstream {
                     "codex websockets executor: write timed out",
                 )
                 .with_diagnostic(ws_cause::write_timeout(deadline, len)),
-                unsent: false,
+                unsent: !queued,
+                refusal: None,
             }),
         }
     }
@@ -719,6 +759,11 @@ impl Pool {
         *self.session(id).steering.lock().expect("session steering") = Some(Arc::new(input));
     }
 
+    /// Session `id`'s client authority (N1 #111 W2), if one is attached.
+    pub(crate) fn authority_of(&self, id: &str) -> Option<Arc<Authority>> {
+        self.get(id)?.authority()
+    }
+
     /// Binds the downstream connection's client authority to its session (N1 #111 W2).
     pub fn attach_authority(&self, id: &str, authority: Arc<Authority>) {
         *self.session(id).authority.lock().expect("session authority") = Some(authority);
@@ -799,6 +844,8 @@ impl Pool {
         let auth_enabled = enabled(&conn.target.credential);
         let response_id = cpa_common::json::get(payload, "response_id").bytes();
         let response_id = std::str::from_utf8(&response_id).ok().map(str::to_owned);
+        // The acknowledgement this interrupt registered, undone if it is refused.
+        let mut awaiting = None;
         let late = {
             // One snapshot of the socket's state: a completion landing between the
             // checks would otherwise turn a late interrupt into a stale error.
@@ -827,8 +874,8 @@ impl Pool {
             }
             match (reading, response_id) {
                 (true, Some(id)) => {
-                    if link.awaited.len() < MAX_AWAITED {
-                        link.awaited.insert(id);
+                    if link.awaited.len() < MAX_AWAITED && link.awaited.insert(id.clone()) {
+                        awaiting = Some(id);
                     }
                     None
                 }
@@ -842,8 +889,25 @@ impl Pool {
             }
         };
         // A failed or timed-out write may leave a partial frame: the socket is dropped
-        // like after any failed turn write (Go leaves that to its reader).
-        if let Err(error) = conn.send_raw(Bytes::copy_from_slice(payload)).await {
+        // like after any failed turn write (Go leaves that to its reader). The client's
+        // key is checked at the write itself, after the wait for the socket (N1 #111 W2);
+        // a refusal writes nothing and undoes this interrupt's acknowledgement wait.
+        let authority = session.authority();
+        if let Err(WriteFailure { error, refusal, .. }) = conn
+            .send_create(Bytes::copy_from_slice(payload), authority.as_deref())
+            .await
+        {
+            if let Some(refusal) = refusal {
+                drop(late);
+                let mut link = conn.link.lock().expect("link");
+                if let Some(id) = awaiting {
+                    link.awaited.remove(&id);
+                }
+                if link.late.as_ref().is_some_and(|(_, tx)| tx.is_closed()) {
+                    link.late = None;
+                }
+                return Err(InterruptError::Refused(refusal));
+            }
             session.invalidate(&conn, &error, true);
             return Err(InterruptError::Rejected(
                 String::from_utf8_lossy(&error.body).into_owned(),
@@ -988,12 +1052,50 @@ pub(crate) struct WriteFailure {
     pub(crate) error: ExecError,
     /// Nothing of the frame was written: another socket or account may carry it.
     pub(crate) unsent: bool,
+    /// The client authority refused the write once the socket was ready for it; nothing
+    /// was written and the socket is as it was.
+    pub(crate) refusal: Option<Refusal>,
 }
 
 impl WriteFailure {
     fn into_error(self) -> ExecError {
         self.error
     }
+}
+
+/// The phases of one upstream write, in order (N1 #111 W1, W2): wait until `sink` can
+/// take the frame (`poll_ready`, which also flushes earlier frames), let `authority`
+/// admit it, hand it over (`start_send`), and flush it (`poll_flush`). The client
+/// authority is therefore decided after every wait that comes before the frame is
+/// committed: a key revoked while the write waited for the socket, for its lock or for an
+/// earlier frame's flush stops it; a revocation after the frame was handed over cannot
+/// recall it. `queued` turns true just before the hand-over, so a timeout before it
+/// proves nothing was written. An error is returned with whether nothing of this frame
+/// was written.
+pub(crate) async fn write_phases<S>(
+    sink: &mut S,
+    message: Message,
+    authority: Option<&Authority>,
+    queued: &mut bool,
+) -> Result<Option<Refusal>, (tokio_tungstenite::tungstenite::Error, bool)>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    std::future::poll_fn(|cx| sink.poll_ready_unpin(cx))
+        .await
+        .map_err(|error| (error, true))?;
+    if let Some(refusal) = authority.and_then(|authority| authority()) {
+        return Ok(Some(refusal));
+    }
+    *queued = true;
+    sink.start_send_unpin(message).map_err(|error| {
+        let unsent = refused_before_queueing(&error);
+        (error, unsent)
+    })?;
+    std::future::poll_fn(|cx| sink.poll_flush_unpin(cx))
+        .await
+        .map_err(|error| (error, false))?;
+    Ok(None)
 }
 
 /// tungstenite errors returned before the frame is queued for the stream.
@@ -1271,7 +1373,24 @@ impl Drop for Turn {
 
 impl Turn {
     async fn frame(&mut self) -> Frame {
-        let frame = self.read().await;
+        let next = self.rx.recv().await;
+        self.frame_of(next).await
+    }
+
+    /// [`Self::frame`], unless `deadline` passes before the next message arrives: `None`
+    /// then, with nothing taken from the socket (`recv` is cancel safe, and a message is
+    /// handled only once it was received).
+    async fn frame_until(&mut self, deadline: tokio::time::Instant) -> Option<Frame> {
+        let next = tokio::select! {
+            biased;
+            next = self.rx.recv() => next,
+            () = tokio::time::sleep_until(deadline) => return None,
+        };
+        Some(self.frame_of(next).await)
+    }
+
+    async fn frame_of(&mut self, next: Option<Read>) -> Frame {
+        let frame = self.read(next).await;
         if let Frame::Failed { error, read: true, .. } = &frame {
             let binary = error.body.as_ref() == UNEXPECTED_BINARY.as_bytes();
             self.wire
@@ -1283,8 +1402,8 @@ impl Turn {
     /// A turn exists only once its request was written, so a read failure is the loss
     /// of a request the upstream may already have read: it is [`uncertain`] and never
     /// fails over, whether or not bootstrap buffering still holds `response.created`.
-    async fn read(&mut self) -> Frame {
-        let text = match self.rx.recv().await {
+    async fn read(&mut self, next: Option<Read>) -> Frame {
+        let text = match next {
             Some(Read::Text(text)) => text,
             Some(Read::Failed(error)) => {
                 self.report_deferred();
@@ -1878,8 +1997,18 @@ pub(super) fn deliver_as_sent(error: &mut ExecError, frame: &str) {
 async fn bootstrap(mut turn: Turn, timeout: Option<Duration>, started: Instant) -> Result<ExecStream, ExecError> {
     let mut held: Vec<Result<Bytes, ExecError>> = Vec::new();
     let (mut frames, mut bytes) = (0usize, 0usize);
+    // The window closes at the deadline itself, not when the next message arrives: what
+    // is held is released then, unchanged and in order, and the turn goes on as served
+    // (N1 #111 review).
+    let deadline = timeout.map(|t| tokio::time::Instant::from_std(started + t));
     loop {
-        let frame = turn.frame().await;
+        let frame = match deadline {
+            Some(deadline) => match turn.frame_until(deadline).await {
+                Some(frame) => frame,
+                None => return Ok(futures_util::stream::iter(held).chain(rest(turn)).boxed()),
+            },
+            None => turn.frame().await,
+        };
         frames += 1;
         let timed_out = timeout.is_some_and(|t| started.elapsed() >= t);
         let window_open = frames <= response::BOOTSTRAP_MAX_FRAMES && !timed_out;
@@ -2180,13 +2309,17 @@ impl CodexExecutor {
         }
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
-        if let Some(refusal) = session.refusal() {
-            // The client's key lost its authority after the turn was admitted (N1 #111
-            // W2): nothing of this request is written, and the socket stays as it was.
-            return Err(refusal.error());
-        }
+        // The client's key is checked at the write itself, after every wait for the
+        // socket (N1 #111 W2): a refusal writes nothing and leaves the socket as it was.
+        let authority = session.authority();
         let mut rx = conn.activate(preserves);
-        if let Err(WriteFailure { error, unsent }) = conn.send_create(frame.clone()).await {
+        if let Err(WriteFailure { error, unsent, refusal }) =
+            conn.send_create(frame.clone(), authority.as_deref()).await
+        {
+            if refusal.is_some() {
+                conn.deactivate();
+                return Err(error);
+            }
             wire.ws_exec_error("send", &error);
             // `shouldRetryCodexWebsocketSend`: request-scoped failures (413) never retry.
             let retry = error.scope != FailureScope::Request;
@@ -2220,16 +2353,19 @@ impl CodexExecutor {
             fresh.bind(&session, exec_session.lease.as_ref())?;
             wire.bind(&fresh.secrets);
             req.usage.sent_credentials(&fresh.secrets);
-            if let Some(refusal) = session.refusal() {
-                return Err(refusal.error());
-            }
             rx = fresh.activate(preserves);
             wire.ws_request(&target.url, &headers, &frame);
             if let Some(handshake) = &fresh_handshake {
                 wire.ws_handshake(101, handshake);
             }
             // `frame` is borrowed by `body`; a clone is a reference count.
-            if let Err(WriteFailure { error, unsent }) = fresh.send_create(frame.clone()).await {
+            if let Err(WriteFailure { error, unsent, refusal }) =
+                fresh.send_create(frame.clone(), authority.as_deref()).await
+            {
+                if refusal.is_some() {
+                    fresh.deactivate();
+                    return Err(error);
+                }
                 wire.ws_exec_error("send_retry", &error);
                 session.invalidate(&fresh, &error, true);
                 return Err(if unsent { error } else { uncertain(error) });

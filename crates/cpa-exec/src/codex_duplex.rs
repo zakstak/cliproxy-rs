@@ -336,10 +336,12 @@ struct Outgoing {
 }
 
 /// The network half of Go's writer goroutine: frames in order, each after the live
-/// account check (`WebsocketAuthEnabled`) right before `writeCodexWebsocketMessage`, and
-/// after the client authority check (N1 #111 W2): a frame admitted while the client's
-/// key was accepted is not written once it no longer is. The stream then ends with the
-/// refusal, as it does for a disabled account.
+/// account check (`WebsocketAuthEnabled`) right before `writeCodexWebsocketMessage`. The
+/// client authority admits each write once the socket is ready to take it
+/// ([`super::write_phases`], N1 #111 W2): a frame admitted while the client's key was
+/// accepted is not written once it no longer is, however long it waited in this queue or
+/// for the socket. The stream then ends with the refusal, as it does for a disabled
+/// account.
 async fn write_loop(
     conn: Arc<Upstream>,
     input: Arc<SteeringInput>,
@@ -352,11 +354,11 @@ async fn write_loop(
         if !(input.enabled)(&credential) {
             return Err(local("websocket credential is no longer enabled"));
         }
-        if let Some(refusal) = authority.as_ref().and_then(|authority| authority()) {
-            return Err(refusal.error());
-        }
+        // The capture records the frame the writer attempts, as before the write.
         wire.ws_frame(&conn.target.url, frame.as_bytes());
-        conn.send(frame).await?;
+        conn.send_authorized(frame, authority.as_deref())
+            .await
+            .map_err(|failure| failure.error)?;
     }
     Ok(())
 }

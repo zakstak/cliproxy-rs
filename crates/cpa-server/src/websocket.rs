@@ -762,6 +762,14 @@ impl Control {
                 }
                 Local::Refused => return Some(self.reject(frame, InterruptError::NoActive).await),
             },
+            // The key was revoked while the interrupt waited for the socket: nothing was
+            // written (N1 #111 W2).
+            Err(InterruptError::Refused(refusal)) => {
+                self.diagnostic(frame, "rejected");
+                let event = String::from_utf8_lossy(&refusal.event).into_owned();
+                let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
+                return Some(sent.map_err(|e| e.to_string()));
+            }
             Err(error) => return Some(self.reject(frame, error).await),
         };
         self.diagnostic(frame, outcome);
