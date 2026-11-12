@@ -1575,6 +1575,108 @@ async fn muse_sessions_are_fenced_by_authorization_and_caller() {
     assert_ne!(id, assert_session_headers("api b", &other_key));
 }
 
+async fn assert_authorization_override_session_fence(dynamic: bool) {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for fixture in [ACCOUNT, API_KEY] {
+        let turn = |bearer: &'static str, shadow: &'static str| {
+            let session = unique.clone();
+            sent_request(
+                fixture,
+                move |req, credential| {
+                    req.headers.insert("Session-Id", session.parse().unwrap());
+                    // Case variants are applied in attribute order, last wins.
+                    credential
+                        .attributes
+                        .insert("header:Authorization".into(), shadow.into());
+                    credential.attributes.insert(
+                        "header:authorization".into(),
+                        if dynamic { "$X-Upstream-Auth" } else { bearer }.into(),
+                    );
+                    req.headers.insert("X-Upstream-Auth", bearer.parse().unwrap());
+                },
+                &cfg,
+            )
+        };
+        let first = turn("Bearer fake-override-a", "Bearer ignored-a").await;
+        let next = turn("Bearer fake-override-a", "Bearer ignored-b").await;
+        let other = turn("Bearer fake-override-b", "Bearer ignored-b").await;
+        assert_eq!(
+            sent_header(&first, "Authorization").as_deref(),
+            Some("Bearer fake-override-a")
+        );
+        assert_eq!(
+            sent_header(&next, "Authorization").as_deref(),
+            Some("Bearer fake-override-a")
+        );
+        assert_eq!(
+            sent_header(&other, "Authorization").as_deref(),
+            Some("Bearer fake-override-b")
+        );
+        let id = assert_session_headers("override first", &first);
+        assert_eq!(
+            id,
+            assert_session_headers("override next", &next),
+            "the winning bearer is unchanged"
+        );
+        assert_ne!(
+            id,
+            assert_session_headers("override replaced", &other),
+            "{fixture}: effective bearer changed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn muse_sessions_follow_literal_authorization_overrides() {
+    assert_authorization_override_session_fence(false).await;
+}
+
+#[tokio::test]
+async fn muse_sessions_follow_referenced_authorization_overrides() {
+    assert_authorization_override_session_fence(true).await;
+}
+
+/// An unresolved custom header does not replace the credential's default bearer.
+#[tokio::test]
+async fn missing_authorization_reference_keeps_default_session_scope() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for custom in [false, true] {
+        let turn = || {
+            sent_request(
+                ACCOUNT,
+                |req, credential| {
+                    req.headers.insert("Session-Id", unique.parse().unwrap());
+                    if custom {
+                        credential
+                            .attributes
+                            .insert("header:Authorization".into(), "$X-Not-Sent".into());
+                    }
+                },
+                &cfg,
+            )
+        };
+        let first = turn().await;
+        let next = sent_request(
+            ACCOUNT,
+            |req, _| {
+                req.headers.insert("Session-Id", unique.parse().unwrap());
+            },
+            &cfg,
+        )
+        .await;
+        assert_eq!(
+            sent_header(&first, "Authorization"),
+            sent_header(&next, "Authorization")
+        );
+        assert_eq!(
+            assert_session_headers("default first", &first),
+            assert_session_headers("default next", &next)
+        );
+    }
+}
+
 /// #81, Go v8.0.67 c2f402b4: contributor mode follows the model the prepared body sends,
 /// after alias resolution and payload rules, not the client's requested name.
 #[tokio::test]

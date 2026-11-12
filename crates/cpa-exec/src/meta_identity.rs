@@ -81,13 +81,19 @@ pub(crate) fn uuid_v7() -> String {
 /// Credential authorization and caller fingerprints fence retained sessions without
 /// retaining credentials. A DCA token survives ordinary minted-key refresh, whereas
 /// another account's DCA token (or a changed API key) starts a separate session.
-pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &[u8]) -> String {
+/// A resolved custom Authorization header instead supplies the authorization scope.
+pub(crate) fn session_id(
+    credential: &Credential,
+    req: &ExecRequest,
+    original: &[u8],
+    authorization_override: Option<&str>,
+) -> String {
     let Some(info) =
         cpa_common::session::extract_conversation_info(&req.headers, original, req.execution_session.as_deref())
     else {
         return uuid_v7();
     };
-    let Some(authorization) = authorization_scope(credential) else {
+    let Some(authorization) = authorization_scope(credential, authorization_override) else {
         return uuid_v7();
     };
     let key = SessionKey {
@@ -111,13 +117,20 @@ pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &
     id
 }
 
-/// The login root, not a minted key that normal account refresh replaces. Without
-/// a DCA token the effective API key is the only available authorization identity;
-/// changing it conservatively starts a new session.
-fn authorization_scope(credential: &Credential) -> Option<[u8; 32]> {
-    let (kind, secret) = match crate::meta::dca_token(credential) {
-        Some(dca) => ("dca", dca),
-        None => ("api-key", crate::meta::creds(credential).1),
+/// A custom bearer overrides the login's identity. Otherwise use the stable login
+/// root, not a minted key that normal account refresh replaces; without DCA, use
+/// the effective API key. Hash immediately so the session cache retains no secret.
+fn authorization_scope(credential: &Credential, authorization_override: Option<&str>) -> Option<[u8; 32]> {
+    let root;
+    let (kind, secret) = if let Some(value) = authorization_override {
+        ("authorization-override", value)
+    } else {
+        let (kind, secret) = match crate::meta::dca_token(credential) {
+            Some(dca) => ("dca", dca),
+            None => ("api-key", crate::meta::creds(credential).1),
+        };
+        root = secret;
+        (kind, root.as_str())
     };
     if secret.is_empty() {
         return None;

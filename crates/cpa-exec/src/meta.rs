@@ -214,8 +214,15 @@ impl MetaExecutor {
         // so its first body byte only records the first-packet fallback.
         use crate::helpers::{capture_chunk, capture_error, capture_metadata, capture_request};
         let capture = req.capture();
-        let session = crate::meta_identity::session_id(&enriched, &req, original(&req));
-        let request_headers = headers(&enriched, &req, &token, &session, &prepared.effective_model);
+        let custom_headers = credential_headers(&enriched, &req, original(&req));
+        // Resolve once, using the same last-wins header order as the outgoing request.
+        let authorization_override = custom_headers
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+            .map(|(_, value)| value.as_str());
+        let session = crate::meta_identity::session_id(&enriched, &req, original(&req), authorization_override);
+        let request_headers = headers(&enriched, &token, &session, &prepared.effective_model, custom_headers);
         // recordMetaRequest: the enriched credential's account info.
         let (auth_type, auth_value) = cpa_core::registry::dynamic::account_info(&enriched);
         capture_request(
@@ -501,7 +508,13 @@ fn sanitize_web_search_tools(body: &mut Vec<u8>) {
 
 /// `applyMetaAPIHeaders`, with the Muse Code identity of `crate::meta_identity`. The
 /// credential's custom headers come last and replace any of these, as in Go.
-fn headers(c: &Credential, req: &ExecRequest, token: &str, session: &str, effective_model: &str) -> GoHeaders {
+fn headers(
+    c: &Credential,
+    token: &str,
+    session: &str,
+    effective_model: &str,
+    custom_headers: Vec<(String, String)>,
+) -> GoHeaders {
     let mut h = GoHeaders::new();
     h.set("Content-Type", "application/json");
     if !token.trim().is_empty() {
@@ -513,7 +526,7 @@ fn headers(c: &Credential, req: &ExecRequest, token: &str, session: &str, effect
     // Meta always streams upstream.
     h.set("Accept", "text/event-stream");
     h.set("Cache-Control", "no-cache");
-    for (name, value) in credential_headers(c, req, original(req)) {
+    for (name, value) in custom_headers {
         h.set(&name, value);
     }
     h
