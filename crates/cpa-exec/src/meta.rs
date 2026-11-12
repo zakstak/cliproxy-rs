@@ -401,7 +401,10 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     // working one, even when they are equal.
     let original_translated = translate(original(req));
     let mut body = translate(&req.body)?;
-    let original_translated = crate::translate::baseline_or_working(original_translated, &body);
+    let mut original_translated = crate::translate::baseline_or_working(original_translated, &body);
+    // The payload-rule baseline carries the client's explicit retention too, so a
+    // `default` rule does not replace it (Go v8.0.67 f77a3c10).
+    sync_prompt_cache_retention(&mut original_translated, original(req));
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
     let thinking = apply_request_thinking(&RequestThinking {
@@ -420,13 +423,9 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     body = thinking;
     set_string_if_different(&mut body, "model", &base_model);
     set_bool_if_different(&mut body, "stream", stream);
-    for key in [
-        "generate",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "stream_options",
-        "client_metadata",
-    ] {
+    gj::delete(&mut body, "generate");
+    sync_prompt_cache_retention(&mut body, &req.body);
+    for key in ["safety_identifier", "stream_options", "client_metadata"] {
         gj::delete(&mut body, key);
     }
     let apply_patch = apply_patch_responses::State::new(req.source_format, original(req), &original_translated);
@@ -443,6 +442,30 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
         response,
         apply_patch,
     })
+}
+
+/// `syncMetaPromptCacheRetentionDoc` (Go v8.0.67 f77a3c10): the client's top-level
+/// `prompt_cache_retention`, when it is a string that is not blank after Go's
+/// `strings.TrimSpace`, is set on `body` trimmed. Any other value (absent, `null`, blank,
+/// a number, an object) leaves `body` without the field. No default is added; the
+/// payload rules after this are the only way to add one. `source` is the client body
+/// before translation, since the Responses-to-Codex converter drops the field.
+fn sync_prompt_cache_retention(body: &mut Vec<u8>, source: &[u8]) {
+    let value = gj::get(source, "prompt_cache_retention");
+    let retention = if value.kind == Kind::String {
+        go_trim_space(&value.bytes()).to_vec()
+    } else {
+        Vec::new()
+    };
+    if retention.is_empty() {
+        gj::delete(body, "prompt_cache_retention");
+        return;
+    }
+    let current = gj::get(body, "prompt_cache_retention");
+    if current.kind == Kind::String && *current.bytes() == *retention {
+        return;
+    }
+    gj::set_str(body, "prompt_cache_retention", &retention);
 }
 
 /// `SetStringIfDifferent`.
