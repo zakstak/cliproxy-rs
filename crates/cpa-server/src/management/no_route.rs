@@ -45,7 +45,11 @@ fn retired_management(path: &str) -> bool {
 /// methods on known ones) under `/v0/management` and the retired plugin management
 /// routes go through the management guard first, then get a bare 404 or
 /// [`plugins_removed`]; anything else is a bare 404.
-pub(crate) async fn no_route(State(state): State<Arc<Management>>, req: Request) -> Response {
+pub(crate) async fn no_route(state: State<Arc<Management>>, req: Request) -> Response {
+    crate::request_logging::unrouted(answer(state, req).await)
+}
+
+async fn answer(State(state): State<Arc<Management>>, req: Request) -> Response {
     // gin matches NoRoute prefixes on the decoded path.
     let path = super::percent_decode(req.uri().path());
     if path.starts_with("/v0/resource/plugins/") {

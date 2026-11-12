@@ -194,11 +194,73 @@ const PENDING: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Fixtures recorded at an older reference whose behaviour this fork deliberately
+/// takes from the selective Go v8.0.67 target (8bba7a77), each listed in
+/// docs/DIFFERENCES-FROM-GO.md. Like PENDING, every fixture an entry matches must
+/// still fail, so an entry cannot hide a regression elsewhere. The fixtures keep their
+/// recorded provenance; Rust unit tests assert the new behaviour.
+const SELECTIVE: &[(&str, &str, &str)] = &[
+    (
+        "openai-response->claude",
+        "finish/refusal",
+        "#72: refusal ends as response.incomplete, content_filter (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "non-stream/finish/refusal",
+        "#72: refusal ends as response.incomplete, content_filter (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "buffered/finish/refusal",
+        "#72: refusal ends as response.incomplete, content_filter (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestClaudeResponsesServerToolStopReason:66",
+        "#72: pause_turn completes with end_turn false (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestClaudeResponsesServerToolStopReason:66#2",
+        "#72: pause_turn completes with end_turn false (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestClaudeResponsesServerToolStopReason:69:stream",
+        "#72: pause_turn completes with end_turn false (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestClaudeResponsesServerToolStopReason:69:stream#2",
+        "#72: pause_turn completes with end_turn false (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestWebSearchResultWithoutMatchingUseIsIgnored:69:stream",
+        "#72: a continuation's search result keeps its ID (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestClaudeResponsesAdjacentCitedTextBlocksShareMessage:literal#4",
+        "#72: a continuation's search result keeps its ID (aadb34f9)",
+    ),
+    (
+        "openai-response->claude",
+        "TestTextSearchTextOrderPreservedInStreamingAndReplay:literal#5",
+        "#72: a continuation's search result keeps its ID (aadb34f9)",
+    ),
+];
+
 /// A key names one fixture; a key ending in `#*` names that fixture and its numbered repeats
 /// (`name#2`, `name#3`, ...).
 fn pending(pair: &str, fixture: &Value) -> Option<usize> {
+    listed(PENDING, pair, fixture)
+}
+
+fn listed(list: &[(&str, &str, &str)], pair: &str, fixture: &Value) -> Option<usize> {
     let name = fixture["name"].as_str().unwrap_or_default();
-    PENDING.iter().position(|(p, key, _)| {
+    list.iter().position(|(p, key, _)| {
         *p == pair
             && match key.strip_suffix("#*") {
                 Some(base) => name
@@ -413,6 +475,8 @@ fn reference_goldens() {
     // Per pending entry: fixtures matched, and how many of them failed.
     let mut pending_matched = vec![0; PENDING.len()];
     let mut pending_failed = vec![0; PENDING.len()];
+    let mut selective_matched = vec![0; SELECTIVE.len()];
+    let mut selective_failed = vec![0; SELECTIVE.len()];
     for file in files {
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         let client = Format::parse(doc["client"].as_str().unwrap()).unwrap();
@@ -453,25 +517,36 @@ fn reference_goldens() {
                 continue;
             }
             let errors = check(client, upstream, f, bytes, false);
-            let pending = pending(&format!("{}->{}", client.as_str(), upstream.as_str()), f);
+            let pair_name = format!("{}->{}", client.as_str(), upstream.as_str());
+            let pending = pending(&pair_name, f);
             if let Some(i) = pending {
                 pending_matched[i] += 1;
             }
+            let selective = listed(SELECTIVE, &pair_name, f);
+            if let Some(i) = selective {
+                selective_matched[i] += 1;
+            }
             if !errors.is_empty() {
-                match pending {
-                    Some(i) => pending_failed[i] += 1,
-                    None => failures.push(format!("{name}: {}", errors.join("; "))),
+                match (pending, selective) {
+                    (Some(i), _) => pending_failed[i] += 1,
+                    (None, Some(i)) => selective_failed[i] += 1,
+                    (None, None) => failures.push(format!("{name}: {}", errors.join("; "))),
                 }
             }
         }
     }
-    let keys = PENDING.iter().map(|(pair, key, _)| format!("{pair} {key}"));
-    for ((key, matched), failed) in keys.zip(&pending_matched).zip(&pending_failed) {
+    let keys = PENDING
+        .iter()
+        .chain(SELECTIVE)
+        .map(|(pair, key, _)| format!("{pair} {key}"));
+    let matched = pending_matched.iter().chain(&selective_matched);
+    let failed = pending_failed.iter().chain(&selective_failed);
+    for ((key, matched), failed) in keys.zip(matched).zip(failed) {
         if *matched == 0 {
-            failures.push(format!("{key}: pending entry matches no fixture"));
+            failures.push(format!("{key}: listed entry matches no fixture"));
         } else if failed != matched {
             failures.push(format!(
-                "{key}: pending entry matches {matched} fixtures but only {failed} fail; narrow or remove it"
+                "{key}: listed entry matches {matched} fixtures but only {failed} fail; narrow or remove it"
             ));
         }
     }
@@ -522,7 +597,13 @@ fn tool_search_goldens() {
             f["bytes"].as_bool().unwrap_or(false),
             true,
         );
-        if !errors.is_empty() {
+        let selective = listed(SELECTIVE, "openai-response->claude", f);
+        if errors.is_empty() && selective.is_some() {
+            failures.push(format!(
+                "{}: listed in SELECTIVE but matches its recording",
+                f["name"].as_str().unwrap()
+            ));
+        } else if !errors.is_empty() && selective.is_none() {
             failures.push(format!("{}: {}", f["name"].as_str().unwrap(), errors.join("; ")));
         }
     }

@@ -641,7 +641,9 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                     .await;
                     let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
                     match (saved, old) {
-                        (Outcome::Saved, Some(old)) => remove_legacy_claude(&worker, old).await,
+                        (Outcome::Saved, Some(old)) => {
+                            remove_legacy(&worker, old, "Claude", "Failed to save authentication tokens").await
+                        }
                         (saved, _) => saved,
                     }
                 }
@@ -653,10 +655,11 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
     started(url, sid)
 }
 
-/// Go `saveTokenRecord` after the canonical Claude credential is stored: the matching
-/// legacy file is deleted through the token store (`store.Delete`), so a git store
-/// commits the removal its watcher guard would refuse.
-async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outcome {
+/// Go `saveTokenRecord` after the canonical Claude or xAI credential is stored: the
+/// matching legacy file is deleted through the token store (`store.Delete`), so a git
+/// store commits the removal its watcher guard would refuse. `provider` names the
+/// credential in the log; `failure` is the session error when the removal fails.
+async fn remove_legacy(state: &Arc<Management>, legacy: PathBuf, provider: &str, failure: &str) -> Outcome {
     let worker = state.clone();
     let removed = tokio::task::spawn_blocking(move || {
         let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
@@ -672,12 +675,12 @@ async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outco
     match removed {
         Ok(Ok(())) => Outcome::Saved,
         Ok(Err(e)) => {
-            tracing::error!("canonical Claude credential saved but legacy credential cleanup failed: {e}");
-            Outcome::Failed("Failed to save authentication tokens".into())
+            tracing::error!("canonical {provider} credential saved but legacy credential cleanup failed: {e}");
+            Outcome::Failed(failure.into())
         }
         Err(e) => {
             resume_panic(e);
-            Outcome::Failed("Failed to save authentication tokens".into())
+            Outcome::Failed(failure.into())
         }
     }
 }
@@ -858,9 +861,13 @@ async fn start_meta(state: Arc<Management>) -> Response {
     response
 }
 
+/// Session error details for an xAI login whose save was refused (#85).
+const XAI_DESTINATION_CONFLICT: &str = "a file in the auth directory at this account's credential name is not this account's xAI credential; move it aside and sign in again";
+const XAI_AUTH_DIR_UNREADABLE: &str = "the auth directory or an existing credential file could not be read";
+
 /// Go `RequestXAIToken`: device flow; the poller saves the credential file.
 async fn start_xai(state: Arc<Management>) -> Response {
-    use cpa_exec::xai_auth::{LoginRecord, MAX_POLL_DURATION, XaiAuth, login_record, saved_document};
+    use cpa_exec::xai_auth::{MAX_POLL_DURATION, SaveError, XaiAuth, login_record, save_login};
     let sid = format!("xai-{}", unix_nanos());
     let mut auth = XaiAuth::new(login_client(&state));
     if let Some(base) = &state.login_base {
@@ -885,17 +892,6 @@ async fn start_xai(state: Arc<Management>) -> Response {
         MAX_POLL_DURATION.as_secs() as i64
     };
     let response = device_started(url, sid.clone(), &code.user_code, Some(expires));
-    // Go `saveTokenRecord` through the file token store: merged with an existing file.
-    fn save_login(dir: &std::path::Path, record: LoginRecord) -> Result<PathBuf, String> {
-        let path = dir.join(&record.file_name);
-        let existing = std::fs::read(&path).ok().filter(|raw| !raw.is_empty());
-        let document = saved_document(record.metadata, existing.as_deref())?;
-        let text = cpa_common::json::GoValue::Object(document).encode_indented();
-        std::fs::create_dir_all(dir)
-            .and_then(|()| super::auth_files::write_file(&path, &text))
-            .map_err(|e| e.to_string())?;
-        Ok(path)
-    }
     let worker = state.clone();
     let flow_sid = sid.clone();
     spawn_login(&state, &flow_sid, "xai", None, async move {
@@ -912,8 +908,42 @@ async fn start_xai(state: Arc<Management>) -> Response {
                 // Go `WaitForAuthorization`: RFC 3339 seconds in UTC.
                 let last_refresh = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
                 let record = login_record(&tokens, &last_refresh, &code.token_endpoint, now.timestamp_millis());
-                let write = |dir: PathBuf, record| save_login(&dir, record);
-                save_if_pending(&worker, &sid, "xai", record, write, "Failed to save token to file").await
+                // Go `saveTokenRecord` through the file token store: merged with an
+                // existing file and an earlier file of the same account, which is
+                // deleted through the store only once the new one is stored.
+                let legacy = Arc::new(Mutex::new(None));
+                let slot = legacy.clone();
+                // Why a refused save wrote nothing, for the session error. The detailed
+                // reason (which names the file, and so the account) goes only to the log:
+                // session errors are readable by anyone holding the state.
+                let refusal = Arc::new(Mutex::new(None));
+                let refused = refusal.clone();
+                let write = move |dir: PathBuf, record| {
+                    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    let (path, old) = save_login(&dir, record, super::auth_files::write_file).map_err(|e| {
+                        let public = match &e {
+                            SaveError::Conflict(_) => Some(XAI_DESTINATION_CONFLICT),
+                            SaveError::Unreadable(_) => Some(XAI_AUTH_DIR_UNREADABLE),
+                            SaveError::Refused(_) | SaveError::Write(_) => None,
+                        };
+                        *refused.lock().unwrap_or_else(PoisonError::into_inner) = public;
+                        e.to_string()
+                    })?;
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
+                    Ok(path)
+                };
+                let saved = save_if_pending(&worker, &sid, "xai", record, write, "Failed to save token to file").await;
+                let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let refusal = refusal.lock().unwrap_or_else(PoisonError::into_inner).take();
+                match (saved, old, refusal) {
+                    (Outcome::Saved, Some(old), _) => {
+                        remove_legacy(&worker, old, "xAI", "Failed to save token to file").await
+                    }
+                    (Outcome::Failed(_), _, Some(reason)) => {
+                        Outcome::Failed(format!("Failed to save token to file: {reason}"))
+                    }
+                    (saved, _, _) => saved,
+                }
             }
         };
         settle(&worker, &sid, outcome).await;

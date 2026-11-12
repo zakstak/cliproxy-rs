@@ -15,16 +15,24 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use serde::Deserialize;
 
-/// The pinned `openai/codex` commit every first-party fixture cites.
+/// The pinned `openai/codex` commit every first-party fixture cites, unless the fixture
+/// names a [`Fixture::revision`]. It is the contract authority (`docs/codex/CONTRACT.md`).
 pub const FIRST_PARTY_COMMIT: &str = "44ccf394573cabb95e1f751a59f9d76f6f79faf1";
+
+/// The researched `openai/codex` main commit of the FP1 source refresh (#115,
+/// `docs/codex/FP1-SOURCE-REFRESH.md`). A fixture that cites it is source-refresh
+/// evidence. It does not move the contract pin.
+pub const RESEARCHED_MAIN_COMMIT: &str = "5c3ff1dabf644169f4bd74b215719f381e4fdb3f";
 
 /// What a fixture's content rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Evidence {
-    /// Follows a first-party type or request builder at [`FIRST_PARTY_COMMIT`].
+    /// Follows a first-party type or request builder at [`FIRST_PARTY_COMMIT`], or at
+    /// the fixture's [`Fixture::revision`].
     FirstPartySource,
-    /// Copies or follows a payload in a first-party test at [`FIRST_PARTY_COMMIT`].
+    /// Copies or follows a payload in a first-party test at [`FIRST_PARTY_COMMIT`], or at
+    /// the fixture's [`Fixture::revision`].
     FirstPartyTest,
     /// Follows OpenAI's published API documentation.
     ProviderDocs,
@@ -85,6 +93,10 @@ pub struct Fixture {
     pub direction: Direction,
     pub endpoints: Vec<Endpoint>,
     pub evidence: Evidence,
+    /// The first-party commit the sources' line ranges point at, when it is not the
+    /// manifest's contract pin. It must name one of [`Manifest::research`].
+    #[serde(default)]
+    pub revision: Option<String>,
     /// First-party paths with line ranges, or documentation URLs.
     pub sources: Vec<String>,
     /// The contract the payload demonstrates.
@@ -100,10 +112,25 @@ pub struct Pin {
     pub commit: String,
 }
 
+/// A researched first-party revision that some fixtures cite. It is evidence for a
+/// source refresh, never the contract authority.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchPin {
+    pub repository: String,
+    pub commit: String,
+    pub label: String,
+    /// Why the revision is recorded and what it does not establish.
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// The contract pin.
     pub pin: Pin,
+    #[serde(default)]
+    pub research: Vec<ResearchPin>,
     pub fixtures: Vec<Fixture>,
 }
 
@@ -130,6 +157,11 @@ pub fn fixture(name: &str) -> Fixture {
 }
 
 impl Fixture {
+    /// The first-party commit this fixture's sources point at.
+    pub fn source_commit(&self) -> &str {
+        self.revision.as_deref().unwrap_or(FIRST_PARTY_COMMIT)
+    }
+
     pub fn path(&self) -> PathBuf {
         dir().join(&self.file)
     }

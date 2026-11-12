@@ -105,6 +105,8 @@ pub async fn speech(
             on_selected: None,
             sse: false,
             disallow_free: false,
+            original: None,
+            on_format: None,
         })),
     };
     // A speech call's headers are the downstream ones Go hands its handler: the final

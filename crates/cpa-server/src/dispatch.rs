@@ -135,7 +135,18 @@ pub struct Media {
     /// `WithDisallowFreeAuth` (routed images): Codex credentials on the free plan are
     /// never selected (Go `isFreeCodexAuth`), in any round.
     pub disallow_free: bool,
+    /// The request before the route's built-in defaults (Go `WithOriginalRequest`, xAI
+    /// images, v8.0.67 826bb167): the executor's `original_body`, so payload `default`
+    /// rules see which fields the client left out. `None`: the call's body.
+    pub original: Option<Bytes>,
+    /// Called with the `response_format` the executor's payload rules settled on (Go
+    /// `WithFinalizedResponseFormatCallback`, xAI images), right before each attempt is
+    /// sent.
+    pub on_format: Option<OnFormat>,
 }
+
+/// See [`Media::on_format`].
+pub type OnFormat = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The `event: error` frame a route attaches to an error response (as a response
 /// extension), for [`serve`] to write instead when the event stream already committed
@@ -1029,7 +1040,11 @@ async fn run_routed(
         response_format: call.response,
         requested_model: model.clone(),
         model: model.clone(),
-        original_body: call.body.clone(),
+        original_body: call
+            .media
+            .as_ref()
+            .and_then(|m| m.original.clone())
+            .unwrap_or_else(|| call.body.clone()),
         body: call.body.clone(),
         stream: call.stream,
         alt: call.alt.clone(),
@@ -2047,7 +2062,8 @@ async fn attempt(
                 (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
                 (None, Some(MediaKind::Images)) => {
                     let path = req.request_path.clone();
-                    rt.executors.images(&credential, req, &path, cfg).await
+                    let on_format = call.media.as_ref().and_then(|m| m.on_format.as_deref());
+                    rt.executors.images(&credential, req, &path, cfg, on_format).await
                 }
                 (None, Some(MediaKind::Videos)) => {
                     let path = req.request_path.clone();

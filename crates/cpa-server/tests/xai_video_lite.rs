@@ -506,7 +506,7 @@ async fn native_routes_forward_bodies_byte_for_byte() {
                 "/v1/videos/extensions",
             ] {
                 let raw = format!(
-                    r#" {{ "model" : "{prefix}{model}", "prompt":"cat",  "resolution":"1080p", "image" : {{ "image_url" : "https://example.invalid/cat.png" }}, "reference_images":[{{"image_url":{{"url":"https://example.invalid/ref.png"}}}}], "vendor_extension":{{"image":{{"image_url":"opaque-value"}},"images":[{{"image_url":"opaque"}}]}}, "upscale":true, "big":9007199254740993, "exp":1e+07, "esc":"a\/", "same":1, "same":2 }} "#
+                    r#" {{ "model" : "{prefix}{model}", "prompt":"cat",  "resolution":"1080p", "image" : {{ "image_url" : "https://example.invalid/cat.png" }}, "reference_images":[{{"image_url":{{"url":"https://example.invalid/ref.png"}}}}], "vendor_extension":{{"image":{{"image_url":"opaque-value"}},"images":[{{"image_url":"opaque"}}]}}, "upscale":true, "big":9007199254740993, "exp":1e+07, "esc":"\u0061\/", "same":1, "same":2 }} "#
                 );
                 let status = send_raw(&p.addr, path, &raw).await;
                 assert_eq!(status, 200, "{prefix}{model} {path}");

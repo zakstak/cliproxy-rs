@@ -151,7 +151,8 @@ pub(crate) fn convert(
     }
     let mut emitted_results: HashSet<Vec<u8>> = HashSet::new();
     let mut emitted_uses: HashSet<Vec<u8>> = HashSet::new();
-    for item in &items {
+    let web_search_history = WebSearchHistory::scan(&items);
+    for (index, item) in items.iter().enumerate() {
         if is_system_role(&item.get("role")) {
             continue;
         }
@@ -173,7 +174,7 @@ pub(crate) fn convert(
                 }
             }
             b"web_search_call" => {
-                let blocks = web_search_call_to_claude(item);
+                let blocks = web_search_history.claude_blocks(index, &items);
                 if !blocks.is_empty() {
                     pending.parts(b"assistant", blocks);
                 }
@@ -269,7 +270,9 @@ pub(crate) fn convert(
     messages = repair_tool_pairing(messages);
     if !preserve_thinking
         && rejects_assistant_prefill(model)
-        && messages.last().is_some_and(|m| is_role(m, "assistant"))
+        && messages
+            .last()
+            .is_some_and(|m| is_role(m, "assistant") && !ends_with_paused_server_tool(m))
     {
         messages.pop();
     }
@@ -380,6 +383,24 @@ fn is_system_role(role: &Res<'_>) -> bool {
 
 fn is_role(message: &[u8], role: &str) -> bool {
     common::norm(&gj::get(message, "role")) == role
+}
+
+/// Go `claudeAssistantMessageEndsWithPausedServerTool` (v8.0.67 aadb34f9): an
+/// assistant turn that ends on a server-tool block is a `pause_turn` response the
+/// continuation must send back unchanged, so it is not a prefill.
+fn ends_with_paused_server_tool(message: &[u8]) -> bool {
+    let content = gj::get(message, "content");
+    if !content.is_array() {
+        return false;
+    }
+    content.array().last().is_some_and(|part| {
+        matches!(
+            String::from_utf8_lossy(trim_space(&part.get("type").bytes()))
+                .go_lower()
+                .as_str(),
+            "server_tool_use" | "web_search_tool_result"
+        )
+    })
 }
 
 /// claudeModelRejectsAssistantPrefill: Fable, Opus, Sonnet and Haiku 5+ (Haiku since
@@ -1656,7 +1677,124 @@ fn web_search_tool_use_id(item_id: &[u8]) -> Vec<u8> {
     [SERVER_TOOL_ID_PREFIX, &sanitized].concat()
 }
 
-fn web_search_call_to_claude(item: &Res<'_>) -> Vec<Vec<u8>> {
+const WEB_SEARCH_QUERY_PATHS: [&str; 3] = ["action.query", "action.queries.0", "action.url"];
+
+fn web_search_call_query(item: &Res<'_>) -> Vec<u8> {
+    WEB_SEARCH_QUERY_PATHS
+        .iter()
+        .map(|p| trim_space(&item.get(p).bytes()).to_vec())
+        .find(|q| !q.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether [`web_search_call_query`] is non-empty, without keeping a copy.
+fn has_web_search_query(item: &Res<'_>) -> bool {
+    WEB_SEARCH_QUERY_PATHS
+        .iter()
+        .any(|p| !trim_space(&item.get(p).bytes()).is_empty())
+}
+
+/// Go `responsesWebSearchHistory` (v8.0.67 aadb34f9, df860eb9). A search that a
+/// `pause_turn` or `tool_use` stop left open (`in_progress`, no `results`) replays
+/// faithfully:
+/// - while its assistant run is the tail of the history (no user turn follows; tool
+///   outputs do not end the run), it is sent back as a `server_tool_use` without a
+///   result, as Anthropic requires;
+/// - when a later item of the same run carries the same ID (the continuation's
+///   result), the open item is skipped and the later one sends the pair, with the
+///   open item's query when it has none.
+///
+/// Every other `web_search_call` keeps its one-pair-per-item replay. One pass each
+/// way keeps the scan linear in the number of items. An inherited query is kept as the
+/// index of the item that carries it, moved along a chain of continuations and read
+/// once for the one block that sends it, so a long chain neither copies nor retains a
+/// large query per item.
+struct WebSearchHistory {
+    /// Whether a user turn follows each index.
+    boundary_after: Vec<bool>,
+    skip: HashSet<usize>,
+    /// Continuation index -> index of the item whose query it inherits.
+    query_source: HashMap<usize, usize>,
+}
+
+fn is_open_web_search(item: &Res<'_>) -> bool {
+    item.get("type").str() == "web_search_call"
+        && String::from_utf8_lossy(trim_space(&item.get("status").bytes())).go_eq_fold("in_progress")
+        && !item.get("results").exists()
+}
+
+fn is_user_turn(item: &Res<'_>) -> bool {
+    let role = item.get("role").bytes();
+    let mut kind = item.get("type").bytes();
+    if kind.is_empty() && !role.is_empty() {
+        kind = std::borrow::Cow::Borrowed(b"message");
+    }
+    &*kind == b"message" && &*role != b"assistant"
+}
+
+impl WebSearchHistory {
+    fn scan(items: &[Res<'_>]) -> Self {
+        let mut boundary_after = vec![false; items.len()];
+        let mut boundary = false;
+        for (index, item) in items.iter().enumerate().rev() {
+            boundary_after[index] = boundary;
+            boundary |= is_user_turn(item);
+        }
+        let mut skip = HashSet::new();
+        let mut query_source: HashMap<usize, usize> = HashMap::new();
+        // The open search of the current run for each ID.
+        let mut open: HashMap<Vec<u8>, usize> = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
+            if is_user_turn(item) {
+                open.clear();
+                continue;
+            }
+            if item.get("type").str() != "web_search_call" {
+                continue;
+            }
+            let id = trim_space(&item.get("id").bytes()).to_vec();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(previous) = open.remove(&id) {
+                skip.insert(previous);
+                // The skipped item's own inheritance moves on; it is never read again.
+                let inherited = query_source.remove(&previous);
+                let source = if has_web_search_query(&items[previous]) {
+                    Some(previous)
+                } else {
+                    inherited
+                };
+                if let Some(source) = source {
+                    query_source.insert(index, source);
+                }
+            }
+            if is_open_web_search(item) {
+                open.insert(id, index);
+            }
+        }
+        Self {
+            boundary_after,
+            skip,
+            query_source,
+        }
+    }
+
+    fn claude_blocks(&self, index: usize, items: &[Res<'_>]) -> Vec<Vec<u8>> {
+        if self.skip.contains(&index) {
+            return vec![];
+        }
+        let item = &items[index];
+        let fallback = match self.query_source.get(&index) {
+            Some(&source) if !has_web_search_query(item) => web_search_call_query(&items[source]),
+            _ => vec![],
+        };
+        let tail = !self.boundary_after.get(index).copied().unwrap_or(false);
+        web_search_call_to_claude(item, &fallback, !(tail && is_open_web_search(item)))
+    }
+}
+
+fn web_search_call_to_claude(item: &Res<'_>, fallback_query: &[u8], with_result: bool) -> Vec<Vec<u8>> {
     let id = web_search_tool_use_id(&item.get("id").bytes());
     if id.is_empty() {
         return vec![];
@@ -1664,13 +1802,15 @@ fn web_search_call_to_claude(item: &Res<'_>) -> Vec<Vec<u8>> {
     let mut tool_use = br#"{"type":"server_tool_use","id":"","name":"","input":{}}"#.to_vec();
     gj::set_str(&mut tool_use, "id", &id);
     gj::set_str(&mut tool_use, "name", "web_search");
-    let query = ["action.query", "action.queries.0", "action.url"]
-        .iter()
-        .map(|p| trim_space(&item.get(p).bytes()).to_vec())
-        .find(|q| !q.is_empty())
-        .unwrap_or_default();
+    let mut query = web_search_call_query(item);
+    if query.is_empty() {
+        query = fallback_query.to_vec();
+    }
     if !query.is_empty() {
         gj::set_str(&mut tool_use, "input.query", query);
+    }
+    if !with_result {
+        return vec![tool_use];
     }
     let mut result = br#"{"type":"web_search_tool_result","tool_use_id":"","content":[]}"#.to_vec();
     gj::set_str(&mut result, "tool_use_id", &id);

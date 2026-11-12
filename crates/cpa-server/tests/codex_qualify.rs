@@ -184,6 +184,12 @@ fn bodies() -> Vec<(&'static str, String)> {
             client_body("probe-request-unknown-fields"),
         ),
         ("large-schema", large_schema_body()),
+        // FP1 (#115) source-refresh evidence at openai/codex main `5c3ff1dabf64`, not the
+        // contract pin: multimodal tool-output items, file-backed audio included.
+        (
+            "http-request-tool-output-media",
+            client_body("http-request-tool-output-media"),
+        ),
     ]
 }
 

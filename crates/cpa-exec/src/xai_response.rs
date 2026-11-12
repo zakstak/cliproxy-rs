@@ -23,6 +23,9 @@ pub(crate) struct NamespaceRef {
     pub namespace: String,
     pub name: String,
     pub dispatcher: bool,
+    /// For a folded namespace's dispatcher: the child names its declarations list,
+    /// across top-level tools and `additional_tools` (v8.0.67 0c61b12c).
+    pub children: HashSet<String>,
 }
 
 pub(crate) type NamespaceRefs = HashMap<String, NamespaceRef>;
@@ -386,8 +389,19 @@ pub(crate) fn unwrap_dispatcher_arguments(
         return None;
     }
     if !namespace.is_empty() {
-        if refs.get(&qualify(namespace, &child)).is_some_and(|r| r.dispatcher) {
-            return None;
+        // A folded namespace's own children decide (v8.0.67 0c61b12c): a child named
+        // like another dispatcher is still this namespace's child.
+        match refs.get(namespace).filter(|r| r.dispatcher && !r.children.is_empty()) {
+            Some(dispatcher) => {
+                if !dispatcher.children.contains(&child) {
+                    return None;
+                }
+            }
+            None => {
+                if refs.get(&qualify(namespace, &child)).is_some_and(|r| r.dispatcher) {
+                    return None;
+                }
+            }
         }
     } else {
         let is_child = refs
@@ -817,8 +831,15 @@ pub(crate) fn status_error(status: u16, body: &[u8]) -> ExecError {
     if status != 429 {
         return error;
     }
-    let code = gj::get(body, "code").str().go_lower();
-    let mut msg = gj::get(body, "error").str().go_lower();
+    // v8.0.67 (949b43b3) also reads the `{"error":{...}}` shape of terminal SSE failures.
+    let mut code = gj::get(body, "code").str().go_lower();
+    if code.is_empty() {
+        code = gj::get(body, "error.code").str().go_lower();
+    }
+    let mut msg = gj::get(body, "error.message").str().go_lower();
+    if msg.is_empty() {
+        msg = gj::get(body, "error").str().go_lower();
+    }
     if msg.is_empty() {
         msg = String::from_utf8_lossy(body).go_lower();
     }

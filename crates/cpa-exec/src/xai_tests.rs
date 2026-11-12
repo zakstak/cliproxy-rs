@@ -44,6 +44,12 @@ fn native_video_request(name: &str, s: &Value) -> Option<String> {
     Some(format!("{head}\r\n\r\n{payload}"))
 }
 
+/// Recordings whose buffered body ends without a terminal event: v8.0.35 answered 408
+/// and cooled the credential; this fork follows v8.0.67 (949b43b3) with a request-scoped
+/// 502 (docs/DIFFERENCES-FROM-GO.md, "xAI non-streaming responses"). The rest of each
+/// recording (request, usage record) still compares.
+const V8_0_67_ENDINGS: &[&str] = &["disconnected_before_completed", "usage_done_ignored_execute"];
+
 /// Shared helpers whose real port has not landed: scenarios that need them are skipped
 /// and listed, so integration can remove an entry and see the scenario run.
 const PENDING: &[&str] = &[];
@@ -269,7 +275,7 @@ async fn go_reference_scenarios() {
         let op = s["op"].as_str().unwrap();
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
         let result = match op {
-            "images" => executor.images(&cred, req, &path, &cfg).await,
+            "images" => executor.images(&cred, req, &path, &cfg, None).await,
             "videos" => executor.videos(&cred, req, &path, &cfg).await,
             _ => {
                 executor
@@ -404,6 +410,11 @@ async fn go_reference_scenarios() {
                 want_error["status"] = 500.into();
             }
             want_error["plain"] = plain.into();
+            if V8_0_67_ENDINGS.contains(&name) {
+                assert_eq!(want_error["status"], 408, "{name}: recording changed");
+                want_error["status"] = 502.into();
+                want_error["message"] = crate::xai_sse::INCOMPLETE_STREAM.into();
+            }
         }
         let error = error.unwrap_or(Value::Null);
         if error != want_error {
@@ -601,4 +612,401 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
     assert!(wire.unwrap().contains("hello"));
     s["payload"] = s["original"].clone();
     assert_eq!(run(s).await, (false, None));
+}
+
+// --- buffered terminal failures (v8.0.67 949b43b3, issue #84) ------------------------------
+
+const CREATED_EVENT: &str =
+    r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"grok-4.3"}}"#;
+const COMPLETED_READY: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"grok-4.3","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ready"}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}"#;
+
+/// One loopback upstream connection: reads the request, then writes `pieces` one at a
+/// time, flushed and apart, so the client reads them as separate segments. `length`
+/// overrides the announced Content-Length (a larger one ends the body early).
+async fn segmented_upstream(content_type: &str, pieces: Vec<Vec<u8>>, length: Option<usize>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let total: usize = pieces.iter().map(Vec::len).sum();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nX-Request-Id: req-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        length.unwrap_or(total)
+    );
+    tokio::spawn(async move {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        let (read, mut write) = socket.into_split();
+        let mut reader = BufReader::new(read);
+        let mut length = 0;
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let text = String::from_utf8_lossy(&line).to_ascii_lowercase();
+            if let Some(v) = text.strip_prefix("content-length:") {
+                length = v.trim().parse().unwrap_or(0);
+            }
+            if line == b"\r\n" {
+                break;
+            }
+        }
+        let mut payload = vec![0; length];
+        let _ = reader.read_exact(&mut payload).await;
+        let _ = write.write_all(head.as_bytes()).await;
+        for piece in pieces {
+            let _ = write.write_all(&piece).await;
+            let _ = write.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let _ = write.shutdown().await;
+    });
+    addr
+}
+
+/// Splits `body` at each `|` (a marker, never part of the body itself).
+fn segments(body: &str) -> Vec<Vec<u8>> {
+    body.split('|').map(|p| p.as_bytes().to_vec()).collect()
+}
+
+struct Outcome {
+    result: Result<ExecResponse, ExecError>,
+    usage: Option<Value>,
+}
+
+/// A non-streaming Responses request with `payload` against an upstream answering 200
+/// with `pieces`, through an API-key credential and a private recorder.
+async fn buffered_turn(payload: &str, content_type: &str, pieces: Vec<Vec<u8>>, length: Option<usize>) -> Outcome {
+    let addr = segmented_upstream(content_type, pieces, length).await;
+    let s = serde_json::json!({
+        "config_auth": -1,
+        "attributes": {"api_key": "sk-fake-xai"},
+        "model": "grok-4.3",
+        "payload": payload,
+        "source": "openai-response",
+        "op": "execute",
+    });
+    let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+    let cfg = Config::default();
+    let (recorder, _capture, sink) = crate::usage_testkit::sinks();
+    let result = executor
+        .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+        .await;
+    let usage = published(&recorder.0.lock().unwrap(), result.is_err());
+    Outcome { result, usage }
+}
+
+const PLAIN: &str = r#"{"model":"grok-4.3","input":"hi"}"#;
+const WITH_PATCH: &str = r#"{"model":"grok-4.3","input":"hi","tools":[{"type":"custom","name":"apply_patch"}]}"#;
+
+fn sse_error(o: Outcome) -> ExecError {
+    match o.result {
+        Ok(r) => panic!(
+            "want an error, got {}",
+            match r.body {
+                ResponseBody::Buffered(b) => String::from_utf8_lossy(&b).into_owned(),
+                ResponseBody::Stream(_) => "a stream".into(),
+            }
+        ),
+        Err(e) => e,
+    }
+}
+
+/// A body that ends without a terminal event is the provider's failure for this
+/// request: 502, request-scoped with no upstream headers (classify's explicit request
+/// fault: not retried elsewhere, no credential cooled). v8.0.35 answered 408 and cooled.
+#[tokio::test]
+async fn unterminated_and_empty_bodies_are_request_scoped_502() {
+    let cases: [(&str, String, &str); 7] = [
+        // Missing terminal event after a split frame.
+        (
+            PLAIN,
+            format!(
+                "data: {CREATED_EVENT}\n|\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"cu|t\"}}\n\n"
+            ),
+            crate::xai_sse::INCOMPLETE_STREAM,
+        ),
+        // A response.completed frame cut short.
+        (
+            PLAIN,
+            format!("data: {}", &COMPLETED_READY[..60]),
+            crate::xai_sse::INCOMPLETE_STREAM,
+        ),
+        // Empty 200 and a comment-only body.
+        (PLAIN, String::new(), crate::xai_sse::EMPTY_STREAM),
+        (PLAIN, ": keep-alive\n\n".to_owned(), crate::xai_sse::EMPTY_STREAM),
+        // An apply_patch declaration alone is no patch activity.
+        (WITH_PATCH, String::new(), crate::xai_sse::EMPTY_STREAM),
+        (
+            WITH_PATCH,
+            format!("data: {CREATED_EVENT}\n\n"),
+            crate::xai_sse::INCOMPLETE_STREAM,
+        ),
+        // A patch call cut short keeps the apply_patch error, request-scoped.
+        (
+            WITH_PATCH,
+            format!(
+                "data: {CREATED_EVENT}\n\ndata: {}\n\ndata: {}\n\n",
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"a","call_id":"c","name":"apply_patch","arguments":""}}"#,
+                r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"a","call_id":"c","arguments":"{\"input\":\"valid patch\"}"}"#
+            ),
+            cpa_translate::APPLY_PATCH_UPSTREAM_ERROR,
+        ),
+    ];
+    for (payload, body, want) in cases {
+        let o = buffered_turn(payload, "text/event-stream", segments(&body), None).await;
+        let usage = o.usage.clone();
+        let e = sse_error(o);
+        assert_eq!(
+            (e.status, e.scope, String::from_utf8_lossy(&e.body).into_owned()),
+            (502, FailureScope::Request, want.to_owned()),
+            "{body:?}"
+        );
+        assert!(
+            e.headers.is_empty(),
+            "{body:?}: a local request fault carries no upstream headers"
+        );
+        assert_eq!(
+            usage.as_ref().map(|u| u["failed"].clone()),
+            Some(Value::Bool(true)),
+            "{body:?}"
+        );
+    }
+}
+
+type Failure = (&'static str, String, u16, FailureScope, &'static str, Option<u64>);
+
+/// Terminal failures carried by a 200 body take the status they name and stay upstream
+/// errors (headers kept), so credential health follows the status: 401 refreshes, 429
+/// cools the model with the free-usage window, a provider 502/503 cools the credential.
+#[tokio::test]
+async fn terminal_failures_in_a_200_body_keep_their_status() {
+    // (content type, body, status, scope, client message, retry hint in ms)
+    let cases: [Failure; 8] = [
+        (
+            "text/event-stream",
+            "event: error\r\ndata: {\"type\":\"error\",\r\ndata: \"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_argument\",\"message\":\"Multiline error.\"}}\r\n\r\n".to_owned(),
+            400,
+            FailureScope::Request,
+            "Multiline error.",
+            None,
+        ),
+        (
+            "text/event-stream",
+            format!("data: {CREATED_EVENT}\n\ndata: {}\n\n", r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_1","status":"failed","error":{"type":"server_error","code":"server_error","message":"Upstream generation failed."}}}"#),
+            502,
+            FailureScope::Credential,
+            "Upstream generation failed.",
+            None,
+        ),
+        (
+            "application/json",
+            r#"{"code":"permission-denied","error":"Request blocked."}"#.to_owned(),
+            403,
+            FailureScope::Credential,
+            "Request blocked.",
+            None,
+        ),
+        (
+            "text/event-stream",
+            "data: {\"type\":\"error\",\"status\":403,\"error\":{\"code\":\"unauthenticated:bad-credentials\",\"message\":\"The OAuth2 access token could not be validated.\"}}\n\n".to_owned(),
+            401,
+            FailureScope::Credential,
+            "The OAuth2 access token could not be validated.",
+            None,
+        ),
+        (
+            "text/event-stream",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"subscription:free-usage-exhausted\",\"message\":\"You've used all the included free usage for model grok-4.3 for now.\"}}\n\n".to_owned(),
+            429,
+            FailureScope::Model,
+            "You've used all the included free usage for model grok-4.3 for now.",
+            Some(24 * 3600 * 1000),
+        ),
+        (
+            "text/event-stream",
+            "event: error\ndata: upstream gateway error\n\n".to_owned(),
+            502,
+            FailureScope::Credential,
+            "upstream gateway error",
+            None,
+        ),
+        (
+            "text/event-stream",
+            "data: {\"code\":\"invalid_argument\",\"message\":\"Invalid input.\"}\nevent: error\n\n".to_owned(),
+            400,
+            FailureScope::Request,
+            "Invalid input.",
+            None,
+        ),
+        (
+            "text/event-stream",
+            r#"{"error":{"message":"Upstream overloaded","type":"server_error","code":"server_is_overloaded"}}"#.to_owned(),
+            503,
+            FailureScope::Credential,
+            "Upstream overloaded",
+            None,
+        ),
+    ];
+    for (content_type, body, status, scope, message, retry_ms) in cases {
+        let o = buffered_turn(WITH_PATCH, content_type, segments(&body), None).await;
+        let e = sse_error(o);
+        let doc: Value = serde_json::from_slice(&e.body).unwrap_or_else(|_| panic!("{body:?}: {:?}", e.body));
+        assert_eq!(
+            (e.status, e.scope, doc["error"]["message"].as_str()),
+            (status, scope, Some(message)),
+            "{body:?}"
+        );
+        assert_eq!(e.retry_after.map(|d| d.as_millis() as u64), retry_ms, "{body:?}");
+        assert_eq!(
+            e.headers.get("x-request-id").map(|v| v.to_str().unwrap()),
+            Some("req-1"),
+            "{body:?}: the upstream answered"
+        );
+    }
+}
+
+/// Split segments, CRLF and multi-line data still complete a turn with its usage, and
+/// an incomplete terminal event still answers.
+#[tokio::test]
+async fn split_crlf_and_incomplete_terminals_still_answer() {
+    // The data lines split between two members (SSE joins them with `\n`).
+    let at = COMPLETED_READY.find(r#""status":"completed""#).unwrap();
+    let completed = format!(
+        "event: response.created\r\ndata: {CREATED_EVENT}\r\n\r|\nevent: response.completed\r\ndata: {}\r\ndata: {}\r\n\r\n",
+        &COMPLETED_READY[..at],
+        &COMPLETED_READY[at..]
+    );
+    let incomplete = format!(
+        "data: {CREATED_EVENT}\n\ndata: {}\n\n",
+        r#"{"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":"grok-4.3","output":[],"usage":{"input_tokens":5,"output_tokens":9,"total_tokens":14}}}"#
+    );
+    for (body, status, total) in [(completed, "completed", 6), (incomplete, "incomplete", 14)] {
+        let o = buffered_turn(PLAIN, "text/event-stream", segments(&body), None).await;
+        let usage = o.usage.clone().expect("usage published");
+        let out = match o.result {
+            Ok(ExecResponse {
+                body: ResponseBody::Buffered(b),
+                ..
+            }) => b,
+            Ok(_) => panic!("{body:?}: a stream"),
+            Err(e) => panic!("{body:?}: {e:?}"),
+        };
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["status"], status, "{out}");
+        assert_eq!(
+            (usage["failed"].clone(), usage["total"].clone()),
+            (Value::Bool(false), total.into()),
+            "{usage}"
+        );
+    }
+}
+
+/// Failures of the exchange itself keep their own classification: a body cut by the
+/// connection is a transport fault, and an upstream 408 status still cools.
+#[tokio::test]
+async fn transport_faults_and_upstream_408_are_not_stream_faults() {
+    let body = format!("data: {CREATED_EVENT}\n\n");
+    let o = buffered_turn(PLAIN, "text/event-stream", segments(&body), Some(body.len() + 100)).await;
+    let e = sse_error(o);
+    assert_eq!(e.scope, FailureScope::Transport, "{e:?}");
+    assert_ne!(&e.body[..], crate::xai_sse::INCOMPLETE_STREAM.as_bytes());
+
+    let mock = Mock::start(&serde_json::json!({"status": 408, "headers": [["Content-Type", "application/json"]], "body": r#"{"error":"request timeout"}"#})).await;
+    let addr = mock.addr.clone();
+    let s = serde_json::json!({
+        "config_auth": -1, "attributes": {"api_key": "sk-fake-xai"}, "model": "grok-4.3",
+        "payload": PLAIN, "source": "openai-response", "op": "execute",
+    });
+    let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+    let cfg = Config::default();
+    let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
+    let e = executor
+        .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+        .await
+        .err()
+        .expect("the 408");
+    assert_eq!((e.status, e.scope), (408, FailureScope::Credential));
+}
+
+// --- historical additional_tools deduplication (v8.0.67 0c61b12c, issue #86) -------------
+
+/// Go TestXAIExecutorDeduplicatesToolsAcrossAdditionalTools: a namespaced tool in the
+/// top-level tools and again in a historical `additional_tools` item reaches xAI once,
+/// as the top-level declaration, for Responses and Codex clients, buffered and streamed;
+/// the buffered answer restores the call to the client's namespace.
+#[tokio::test]
+async fn historical_additional_tools_are_sent_once() {
+    let top = r#"{"type":"namespace","name":"clock","tools":[{"type":"function","name":"sleep","description":"top declaration","parameters":{"type":"object","properties":{"duration_ms":{"type":"string"}},"required":["duration_ms"]}}]}"#;
+    let different = r#"{"type":"namespace","name":"clock","tools":[{"type":"function","name":"sleep","description":"history declaration","parameters":{"type":"object","properties":{"seconds":{"type":"string"}},"required":["seconds"]}}]}"#;
+    let reply = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"clock__sleep\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"duration_ms\\\":\\\"10\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.7\",\"output\":[{\"type\":\"function_call\",\"name\":\"clock__sleep\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"duration_ms\\\":\\\"10\\\"}\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    );
+    for source in ["openai-response", "codex"] {
+        for op in ["execute", "stream"] {
+            for history in [top, different] {
+                let label = format!("{source}/{op}/{}", if history == top { "same" } else { "different" });
+                let mock = Mock::start(&serde_json::json!({
+                    "status": 200,
+                    "headers": [["Content-Type", "text/event-stream"]],
+                    "body": reply,
+                }))
+                .await;
+                let addr = mock.addr.clone();
+                let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+                let s = serde_json::json!({
+                    "config_auth": -1,
+                    "attributes": {"api_key": "sk-fake-xai"},
+                    "model": "grok-4.7",
+                    "payload": format!(r#"{{"model":"grok-4.7","tools":[{top}],"input":[{{"type":"additional_tools","role":"developer","tools":[{history}]}},{{"role":"user","content":"say hello"}}]}}"#),
+                    "source": source,
+                    "response": "openai-response",
+                    "op": op,
+                });
+                let cfg = Config::default();
+                let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
+                let response = executor
+                    .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                match response.body {
+                    ResponseBody::Buffered(bytes) => {
+                        let out: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(
+                            (&out["output"][0]["name"], &out["output"][0]["namespace"]),
+                            (&Value::from("sleep"), &Value::from("clock")),
+                            "{label}: {out}"
+                        );
+                    }
+                    ResponseBody::Stream(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            item.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                        }
+                    }
+                }
+                let raw = mock.request().unwrap();
+                let sent: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let tools = sent["tools"].as_array().unwrap();
+                assert_eq!(
+                    tools.iter().filter(|t| t["name"] == "clock__sleep").count(),
+                    1,
+                    "{label}: {sent}"
+                );
+                assert_eq!(sent["tools"][0]["description"], "top declaration", "{label}");
+                assert!(
+                    sent["tools"][0]["parameters"]["properties"]["duration_ms"].is_object(),
+                    "{label}"
+                );
+                assert!(
+                    sent["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|i| i["type"] != "additional_tools"),
+                    "{label}: {sent}"
+                );
+            }
+        }
+    }
 }

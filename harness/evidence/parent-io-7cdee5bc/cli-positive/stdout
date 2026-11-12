@@ -1,0 +1,6 @@
+{
+  "kind": "acceptance",
+  "verdict": "pass",
+  "partial": false
+}
+receipt: /review/cli-positive/acceptance.json

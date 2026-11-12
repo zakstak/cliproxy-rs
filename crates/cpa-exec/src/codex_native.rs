@@ -346,6 +346,15 @@ impl CodexExecutor {
         } else {
             ErrorBody::Lossy
         };
+        // A WebSocket turn over HTTP is sent under the client key its connection was
+        // opened with (N1 #111 W2): checked for each attempt before it dials, and again
+        // when the HTTP client takes the body, after the connection wait.
+        let authority = ws_session.and_then(|id| self.ws.authority_of(id));
+        if let Some(refusal) = authority.as_ref().and_then(|authority| authority()) {
+            let error = refusal.error();
+            wire.exec_error(&error);
+            return Err(error);
+        }
         let opened = self
             .open_for(
                 view,
@@ -357,13 +366,22 @@ impl CodexExecutor {
                 error_body,
                 &model,
                 true,
+                true,
+                authority,
             )
             .await;
-        let upstream = match (call, opened) {
+        let mut upstream = match (call, opened) {
             (Call::Compact, Err(error)) => return Err(compact_error(error)),
             (_, Err(error)) => return Err(error),
             (_, Ok(upstream)) => upstream,
         };
+        // A success answer means the upstream read the request: losing its body is an
+        // uncertain failure that never fails over (N1 #111), whether or not bootstrap
+        // buffering still holds `response.created`.
+        upstream.body = upstream
+            .body
+            .map(|chunk| chunk.map_err(crate::codex_ws::uncertain))
+            .boxed();
         let (sse, upstream) = classify_response(upstream, upstream_stream, &wire).await?;
         let observer = Observer {
             usage: req.usage.clone(),

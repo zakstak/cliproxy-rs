@@ -375,6 +375,45 @@ fn expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
         .or_else(|| jwt_exp(text(siwc, "access_token")).filter(|t| *t != ZERO))
 }
 
+/// Go v8.0.67 `SIWCRealExpirationTime` (06fd5b8b): the token's real expiry, never the
+/// margin-deducted `expired`: `expires_at`, else `expires_in` after the last refresh
+/// (or issue time), else the access token's JWT `exp`.
+fn real_expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
+    if let Some(t) = lookup_time(siwc, &["expires_at", "expiresAt"]).filter(|t| *t != ZERO) {
+        return Some(t);
+    }
+    let seconds = ["expires_in", "expiresIn"]
+        .iter()
+        .find_map(|k| siwc.get(*k).and_then(go_int).filter(|s| *s > 0));
+    if let Some(seconds) = seconds
+        && let Some(from) = lookup_time(
+            siwc,
+            &["last_refresh", "lastRefresh", "timestamp", "issued_at", "issuedAt"],
+        )
+        .filter(|t| *t != ZERO)
+    {
+        return Some(from + i128::from(seconds.wrapping_mul(1_000_000_000)));
+    }
+    jwt_exp(text(siwc, "access_token")).filter(|t| *t != ZERO)
+}
+
+/// Go v8.0.67 `CodexSIWCStatus` (06fd5b8b): a Codex credential's local SIWC status at
+/// `now`, read from the credential alone, with no refresh or upstream request. `off`
+/// unless SIWC is in use; `invalid` without an access token, with an unknown or past
+/// real expiry, or when `rejected` (an upstream refused the token); else `valid`.
+pub fn status(credential: &cpa_core::credential::Credential, rejected: bool, now: Time) -> &'static str {
+    if !enabled(credential) {
+        return "off";
+    }
+    if access_token(credential).is_empty() || rejected {
+        return "invalid";
+    }
+    match partition(credential).and_then(real_expiry) {
+        Some(expiry) if expiry > go_now(now) => "valid",
+        _ => "invalid",
+    }
+}
+
 /// Go `CodexSIWCNeedsRefresh`: `None` when the partition cannot refresh (no refresh
 /// token or client ID), else whether it is due at `now`: no access token, five minutes
 /// before its expiry, five minutes after its last refresh, or now when neither is known.
@@ -493,6 +532,39 @@ pub fn authorize_url(
     Ok(url.into())
 }
 
+/// Go v8.0.67 `GenerateSIWCReauthURL` (3891ebaa): [`authorize_url`] for an account
+/// that already holds an issued client, which replaces `dynamic_agent_client`, without
+/// `agent_name_hint`. OpenAI's "Accounts and sessions" guide: reauthorize through the
+/// same endpoint with the selected account's issued `client_id`, keep the host's
+/// `ext_agent_host_id`, and omit `agent_name_hint`.
+pub fn reauth_url(
+    client_id: &str,
+    state: &str,
+    nonce: &str,
+    device_id: &str,
+    redirect: &str,
+    challenge: &str,
+) -> Result<String, ExecError> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() || client_id == DYNAMIC_CLIENT_ID {
+        return Err(siwc_error(
+            400,
+            "SIWC reauthorization requires the saved issued client ID",
+        ));
+    }
+    let url = authorize_url(state, nonce, device_id, redirect, challenge, "")?;
+    let mut url = Url::parse(&url).expect("built above");
+    // `url.Values.Encode` sorts the keys.
+    let pairs: std::collections::BTreeMap<String, String> = url
+        .query_pairs()
+        .into_owned()
+        .filter(|(k, _)| k != "agent_name_hint" && k != "client_id")
+        .chain([("client_id".to_owned(), client_id.to_owned())])
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    Ok(url.into())
+}
+
 /// Go `CodexSIWCTokenData`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tokens {
@@ -503,6 +575,9 @@ pub struct Tokens {
     pub scope: String,
     pub scopes: Vec<String>,
     pub expired: String,
+    /// The real expiry, `expires_in` after the grant with no margin (Go v8.0.67
+    /// `ExpiresAt`, 06fd5b8b); empty when unknown.
+    pub expires_at: String,
     pub last_refresh: String,
     pub device_id: String,
 }
@@ -519,6 +594,9 @@ impl Tokens {
         set("client_id", &self.client_id);
         set("expired", &self.expired);
         set("last_refresh", &self.last_refresh);
+        if !self.expires_at.is_empty() {
+            set("expires_at", &self.expires_at);
+        }
         if !self.id_token.is_empty() {
             set("id_token", &self.id_token);
         }
@@ -562,7 +640,7 @@ impl CodexOAuth {
         client_id: &str,
         device_id: &str,
         require_id_token: bool,
-    ) -> Result<Tokens, ExecError> {
+    ) -> Result<Tokens, crate::codex_oauth::GrantError> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
@@ -575,49 +653,42 @@ impl CodexOAuth {
             )
             .await?;
         if status != 200 && !require_id_token {
-            // A refresh keeps the OAuth error code (Go echoes the body), so
-            // `refresh_token_reused` stops the retries; bodies may echo request material.
-            return Err(crate::codex_oauth::refresh_error(
-                status,
-                &format!(
-                    "OpenAI OAuth token request failed ({status}): {}",
-                    crate::codex_oauth::oauth_code(&body)
+            // A refresh keeps the OAuth error code (Go echoes the body), and a documented
+            // unusable-token code stops the retries; bodies may echo request material.
+            let code = crate::codex_oauth::oauth_code(&body);
+            return Err(crate::codex_oauth::GrantError {
+                error: crate::codex_oauth::refresh_error(
+                    status,
+                    &format!("OpenAI OAuth token request failed ({status}): {code}"),
                 ),
-            ));
+                // Read as the first-party client reads the same issuer's codes.
+                terminal: crate::codex_oauth::siwc_terminal(&crate::codex_oauth::grant_code(&body)),
+            });
         }
         if status != 200 {
-            return Err(siwc_error(
-                status,
-                &format!("OpenAI OAuth token request failed ({status})"),
-            ));
+            return Err(siwc_error(status, &format!("OpenAI OAuth token request failed ({status})")).into());
         }
         let parsed: TokenResponse =
             serde_json::from_slice(&body).map_err(|_| siwc_error(502, "failed to parse SIWC token response"))?;
         let invalid = |field: &str| siwc_error(502, &format!("OpenAI OAuth token response has invalid {field}"));
         if parsed.access_token.trim().is_empty() {
-            return Err(invalid("access_token"));
+            return Err(invalid("access_token").into());
         }
         if parsed.refresh_token.trim().is_empty() {
-            return Err(invalid("refresh_token"));
+            return Err(invalid("refresh_token").into());
         }
         if require_id_token && parsed.id_token.trim().is_empty() {
-            return Err(siwc_error(
-                502,
-                "OpenAI OAuth token response did not contain an ID token",
-            ));
+            return Err(siwc_error(502, "OpenAI OAuth token response did not contain an ID token").into());
         }
         if parsed.scope.trim().is_empty() {
-            return Err(invalid("scope"));
+            return Err(invalid("scope").into());
         }
         if parsed.expires_in <= 0 {
-            return Err(invalid("expires_in"));
+            return Err(invalid("expires_in").into());
         }
         let scopes: Vec<String> = parsed.scope.split_whitespace().map(str::to_owned).collect();
         if !scopes.iter().any(|s| s == DIRECT_TOKEN_SCOPE) {
-            return Err(siwc_error(
-                502,
-                &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}"),
-            ));
+            return Err(siwc_error(502, &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}")).into());
         }
         let now = Local::now();
         let lifetime = TimeDelta::try_seconds(parsed.expires_in).unwrap_or(TimeDelta::MAX);
@@ -634,6 +705,7 @@ impl CodexOAuth {
             scope: parsed.scope.trim().to_owned(),
             scopes,
             expired: rfc3339(now.checked_add_signed(ttl).unwrap_or(now)),
+            expires_at: rfc3339(now.checked_add_signed(lifetime).unwrap_or(now)),
             last_refresh: rfc3339(now),
             device_id: device_id.trim().to_owned(),
         })
@@ -678,6 +750,7 @@ impl CodexOAuth {
             true,
         )
         .await
+        .map_err(|e| e.error)
     }
 }
 

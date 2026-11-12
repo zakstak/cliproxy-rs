@@ -553,6 +553,7 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         upstream.plain,
     );
     let cfg = Config::parse(&config).map_err(|e| format!("config does not parse: {e:?}"))?;
+    let cfg = super::settings::as_recorded_before_fallback_switch(cfg);
     let auth = relocate_json(&record["auth"], &go_origins, upstream.plain);
     let mut credential = Credential {
         id: auth["id"].as_str().unwrap_or_default().to_owned(),

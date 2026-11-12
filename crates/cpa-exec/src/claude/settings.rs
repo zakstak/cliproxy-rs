@@ -45,6 +45,9 @@ pub(crate) struct Settings {
     pub model_level_cooling: bool,
     /// `upstream.claude.tool-search`: Codex client tool_search on Responses routes.
     pub tool_search: bool,
+    /// `upstream.claude.server-side-fallback`: synthesize Anthropic's server-side
+    /// refusal fallbacks on cloaked requests that name none. Off by default.
+    pub server_side_fallback: bool,
     pub keys: Vec<ClaudeKey>,
 }
 
@@ -81,6 +84,7 @@ impl Settings {
         s.disable_cloak_mode = flag(claude.and_then(|c| c.get("disable-claude-cloak-mode")));
         s.model_level_cooling = flag(claude.and_then(|c| c.get("model-level-cooling")));
         s.tool_search = flag(claude.and_then(|c| c.get("tool-search")));
+        s.server_side_fallback = flag(claude.and_then(|c| c.get("server-side-fallback")));
         s
     }
 
@@ -129,4 +133,31 @@ fn keys(doc: &Value) -> Vec<ClaudeKey> {
         }
     }
     out
+}
+
+/// Go before v8.0.67 had no `upstream.claude.server-side-fallback` and always
+/// synthesized the fallbacks; its recordings replay with the switch on (fa11a573), so
+/// they keep proving the opt-in path byte for byte. A recording's own value is kept.
+#[cfg(test)]
+pub(crate) fn as_recorded_before_fallback_switch(mut cfg: Config) -> Config {
+    use serde_yaml_ng::Mapping;
+    let doc = &mut cfg.document;
+    if !doc.is_mapping() {
+        *doc = Value::Mapping(Mapping::new());
+    }
+    let mut node = doc;
+    for key in ["upstream", "claude"] {
+        let map = node.as_mapping_mut().expect("config sections are mappings");
+        node = map
+            .entry(Value::from(key))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !node.is_mapping() {
+            *node = Value::Mapping(Mapping::new());
+        }
+    }
+    node.as_mapping_mut()
+        .expect("mapping")
+        .entry(Value::from("server-side-fallback"))
+        .or_insert(Value::Bool(true));
+    cfg
 }

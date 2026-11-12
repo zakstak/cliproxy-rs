@@ -713,6 +713,29 @@ fn stream_error_class(status: u16) -> (&'static str, &'static str) {
     }
 }
 
+/// Go `applyOpenAIResponsesNestedErrorCode` (v8.0.67 43f27e3a). Anthropic reports a
+/// prompt over the context window as an `invalid_request_error` whose message starts
+/// with `prompt is too long`, with no code; Responses clients such as Codex key their
+/// context-window handling on `context_length_exceeded`. A code the error already has
+/// is kept.
+fn with_overflow_code(mut detail: Value) -> Value {
+    let has_code = match detail.get("code") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(code)) => !gojson::trim(code).is_empty(),
+        Some(_) => true,
+    };
+    if !has_code
+        && detail.get("type").and_then(Value::as_str) == Some("invalid_request_error")
+        && detail
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.starts_with("prompt is too long"))
+    {
+        detail["code"] = "context_length_exceeded".into();
+    }
+    detail
+}
+
 /// Go `openAIResponsesStreamErrorDetail`.
 fn stream_error_detail(status: u16, text: &str) -> Value {
     let (mut code, kind) = stream_error_class(status);
@@ -726,10 +749,10 @@ fn stream_error_detail(status: u16, text: &str) -> Value {
     let code_owned;
     if let Some(p) = &payload {
         if let Some(e) = p.get("error").filter(|e| e.is_object()) {
-            return e.clone();
+            return with_overflow_code(e.clone());
         }
         if let Some(e) = p.get("response").and_then(|r| r.get("error")).filter(|e| e.is_object()) {
-            return e.clone();
+            return with_overflow_code(e.clone());
         }
         if let Some(m) = p
             .get("message")
@@ -1242,5 +1265,35 @@ mod tests {
             r#"{"error":{"api_key":"[REDACTED]","message":"bad Bearer [REDACTED]"}}"#
         );
         assert_eq!(sanitize_error_text(500, "token=abc rest"), "token=[REDACTED] rest");
+    }
+
+    /// #72: Anthropic's prompt overflow carries no code; the Responses stream error
+    /// names it `context_length_exceeded` for both the `error` and the Codex
+    /// `response.failed` frames. Other errors and existing codes are unchanged.
+    #[test]
+    fn prompt_overflow_stream_error_gets_context_length_code() {
+        let code = |codex: bool, text: &str| -> Value {
+            let frame = stream_error_frame(codex, 400, &sanitize_error_text(400, text), 0, false);
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            let data = frame.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            let v: Value = serde_json::from_str(data).unwrap();
+            if codex {
+                v["response"]["error"]["code"].clone()
+            } else {
+                v["error"]["code"].clone()
+            }
+        };
+        let overflow = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"},"request_id":"req_1"}"#;
+        for codex in [false, true] {
+            assert_eq!(code(codex, overflow), "context_length_exceeded", "codex {codex}");
+            let nested = r#"{"response":{"error":{"type":"invalid_request_error","message":"prompt is too long: 1 > 0","code":" "}}}"#;
+            assert_eq!(code(codex, nested), "context_length_exceeded", "codex {codex}");
+            let kept = r#"{"error":{"type":"invalid_request_error","message":"prompt is too long","code":"other"}}"#;
+            assert_eq!(code(codex, kept), "other");
+            let other = r#"{"error":{"type":"invalid_request_error","message":"max_tokens: too large"}}"#;
+            assert_eq!(code(codex, other), Value::Null);
+            let not_request = r#"{"error":{"type":"api_error","message":"prompt is too long"}}"#;
+            assert_eq!(code(codex, not_request), Value::Null);
+        }
     }
 }

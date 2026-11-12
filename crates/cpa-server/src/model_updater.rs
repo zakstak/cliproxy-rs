@@ -598,6 +598,60 @@ mod tests {
         assert_eq!((source(&u), reads.load(Ordering::SeqCst)), (DISABLED.to_owned(), 0));
     }
 
+    /// K1 (#68): when catalog discovery is unavailable (every default source refuses
+    /// the connection), the models.json updater publishes nothing, so the embedded
+    /// catalog stays in effect; that catalog, as `embed` serves it, lists the K1
+    /// additions next to the entries they join, GPT-5.5 included.
+    #[tokio::test]
+    async fn unavailable_discovery_keeps_the_embedded_k1_catalog() {
+        // Port 1 on loopback refuses connections; nothing leaves the host.
+        let fetch = general_fetcher(vec![
+            "http://127.0.0.1:1/models.json".to_owned(),
+            "http://127.0.0.1:1/fallback/models.json".to_owned(),
+        ]);
+        let published = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        let u = Updater::new(
+            fetch.clone(),
+            Box::new(move |data| {
+                sink.lock().unwrap().push(data.to_vec());
+                Ok(())
+            }),
+        );
+        assert!(fetch(String::new()).await.is_err(), "a refused default source was read");
+        u.refresh(&CancellationToken::new(), "", 0).await;
+        assert!(published.lock().unwrap().is_empty(), "an unavailable source published");
+
+        let embedded = fetch(EMBED.to_owned()).await.expect("embed always reads");
+        let catalog = cpa_core::registry::Catalog::parse(std::str::from_utf8(&embedded).unwrap()).unwrap();
+        let ids = |channel: &str| {
+            catalog
+                .channel(channel)
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let has = |channel: &str, id: &str| ids(channel).iter().any(|m| m == id);
+        assert!(has("claude", "claude-fable-5-2") && has("claude", "claude-fable-5-1"));
+        for tier in ["codex-free", "codex-team", "codex-plus", "codex-pro"] {
+            assert!(
+                has(tier, "gpt-6.1-terra") && has(tier, "gpt-5.5"),
+                "{tier}: {:?}",
+                ids(tier)
+            );
+            assert!(!has(tier, "gpt-6-chat-thinking"), "{tier}");
+        }
+        assert_eq!(ids("meta").first().map(String::as_str), Some("muse-ember-1.0"));
+        // X4 (#87): Grok Imagine Video 1.5 Lite is an xAI built-in, not an embedded
+        // catalog entry; the xAI definitions served while discovery is unavailable list it.
+        let xai = cpa_core::registry::dynamic::static_definitions("xai").expect("the xai channel");
+        assert!(
+            xai.iter().any(|m| m.id == "grok-imagine-video-1.5-lite"),
+            "X4 (#87): {:?}",
+            ids("xai")
+        );
+    }
+
     /// Go TestCatalogFetcherSources over local mocks and files: `embed`, a URL and a
     /// path each serve their catalog; an invalid or missing explicit source fails without
     /// falling back to the defaults; the empty source reads the defaults; a file is

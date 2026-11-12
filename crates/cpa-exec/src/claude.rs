@@ -1294,12 +1294,16 @@ impl<'a> Ctx<'a> {
                     explicit,
                 },
             );
-            let model = rawjson::string(&body, "model").trim().go_lower();
-            if cloak::is_opus55(&model) && !probe_before && !rawjson::get(&body, "fallbacks").exists() {
-                body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-4-8"}]"#);
-            }
-            if cloak::is_fable51(&model) && !probe_before && !rawjson::get(&body, "fallbacks").exists() {
-                body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-5"}]"#);
+            // Cross-model refusal fallback is opt-in (Go v8.0.67 fa11a573): without
+            // `upstream.claude.server-side-fallback` the request keeps the caller's
+            // `fallbacks`, or none. A caller's value, even `[]` or `"default"`, is kept.
+            if self.settings.server_side_fallback && !probe_before && !rawjson::get(&body, "fallbacks").exists() {
+                let model = rawjson::string(&body, "model").trim().go_lower();
+                if cloak::is_opus55(&model) {
+                    body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-4-8"}]"#);
+                } else if cloak::is_fable51(&model) {
+                    body = rawjson::set_raw(&body, "fallbacks", r#"[{"model":"claude-opus-5"}]"#);
+                }
             }
             if !probe_before {
                 body = cloak_thinking_display(body);
