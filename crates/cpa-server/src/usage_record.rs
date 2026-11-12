@@ -1097,6 +1097,10 @@ pub struct Record {
     pub failed: bool,
     pub fail_status: i64,
     pub fail_body: String,
+    /// Go v8.0.67 `usage.Failure.Code` (18883a57): how a request-scoped error rule
+    /// classified the failure, `request_scoped` (`stop`, `continue`) or `force_cooldown`
+    /// (`*-and-cooldown`); empty otherwise. A local fact, never upstream text.
+    pub fail_code: &'static str,
     pub detail: Detail,
     pub response_model: String,
     /// Upstream response headers, names as received.
@@ -1139,6 +1143,7 @@ impl Record {
             stream: _,
             failed: _,
             fail_status: _,
+            fail_code: _,
             prompt_prefix_hash: _,
             claude_cache: _,
             usage_observed: _,
@@ -1382,6 +1387,10 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
     w.object("fail", |f| {
         f.int("status_code", fail_status);
         f.str("body", &fail_body);
+        // Go `failDetail.Code`, `json:"code,omitempty"`.
+        if record.failed && !record.fail_code.is_empty() {
+            f.str("code", record.fail_code);
+        }
     });
     if !record.response_headers.is_empty() {
         let mut headers = record.response_headers.clone();
@@ -2192,7 +2201,8 @@ fn finish(
 enum Ending<'a> {
     /// Success, or a stream the client dropped (Go's deferred publish).
     Done,
-    Failed(&'a cpa_core::exec::ExecError),
+    /// The error and its request-scoped rule classification (`Record::fail_code`).
+    Failed(&'a cpa_core::exec::ExecError, &'static str),
 }
 
 /// One upstream attempt's record in progress. It publishes at most once: what the
@@ -2342,8 +2352,14 @@ impl Tracker {
     /// Go `PublishFailure`: the error's status and body without usage. Claude's
     /// executor fails through its stream buffer (`StreamUsageBuffer.PublishFailure`),
     /// which keeps the usage seen so far.
-    pub fn fail(mut self, error: &cpa_core::exec::ExecError) {
-        self.publish(Ending::Failed(error));
+    pub fn fail(self, error: &cpa_core::exec::ExecError) {
+        self.fail_classified(error, "");
+    }
+
+    /// [`Self::fail`] with the failure's request-scoped rule classification
+    /// ([`Record::fail_code`]).
+    pub fn fail_classified(mut self, error: &cpa_core::exec::ExecError, code: &'static str) {
+        self.publish(Ending::Failed(error, code));
     }
 
     fn publish(&mut self, ending: Ending<'_>) {
@@ -2365,6 +2381,9 @@ impl Tracker {
         let mut record = std::mem::take(&mut origin.template);
         if let Some((executor_type, model)) = reported.delegated.clone() {
             (record.executor_type, record.model) = (executor_type, model);
+        }
+        if let Ending::Failed(_, code) = ending {
+            record.fail_code = code;
         }
         let (latency, ttft);
         if let Some(outcome) = reported.outcome.take() {
@@ -2391,7 +2410,7 @@ impl Tracker {
                     Detail::default()
                 }
                 Ending::Done => usage.unwrap_or_default(),
-                Ending::Failed(error) => {
+                Ending::Failed(error, _) => {
                     record.failed = true;
                     record.fail_status = i64::from(crate::classify::go_status(error));
                     record.fail_body = crate::classify::error_text(error);
@@ -2444,7 +2463,7 @@ impl Drop for Tracker {
         } else {
             let canceled =
                 cpa_core::exec::ExecError::local(CANCELED_STATUS, cpa_core::exec::FailureScope::Request, CANCELED_BODY);
-            self.publish(Ending::Failed(&canceled));
+            self.publish(Ending::Failed(&canceled, ""));
         }
     }
 }
@@ -3139,6 +3158,8 @@ mod tests {
                 failed: case["failed"].as_bool().unwrap(),
                 fail_status: case["fail_status"].as_i64().unwrap(),
                 fail_body: s("fail_body"),
+                // Go v8.0.35's records, which predate `fail.code`.
+                fail_code: "",
                 detail,
                 response_model: response_model.get().to_owned(),
                 response_headers: case["response_headers"]

@@ -92,6 +92,11 @@ fn claude_type(status: u16) -> &'static str {
 /// `details.error_code: thread_not_found`, Anthropic's signal to replay the whole
 /// conversation (v8.0.27, 5c959cb).
 pub fn claude_body(status: u16, text: &str) -> String {
+    claude_body_with(status, text, "")
+}
+
+/// [`claude_body`] with `suffix` appended to the message.
+fn claude_body_with(status: u16, text: &str, suffix: &str) -> String {
     let mut message = text_for(status, text);
     let thread_not_found = crate::classify::is_claude_thread_not_found(status, &message);
     let mut kind = claude_type(status).to_owned();
@@ -115,6 +120,7 @@ pub fn claude_body(status: u16, text: &str) -> String {
             }
         }
     }
+    message.push_str(suffix);
     let mut detail = Obj::new().str("type", &kind).str("message", &message);
     if thread_not_found {
         detail = detail.raw("details", r#"{"error_code":"thread_not_found"}"#);
@@ -165,6 +171,9 @@ pub fn openai(failure: &Failure) -> Response {
 }
 
 pub fn claude(failure: &Failure) -> Response {
+    if let Failure::Cooldown { signals, .. } = failure {
+        return claude_cooldown(failure, signals);
+    }
     // Go's Claude `WriteErrorResponse` marks a direct missing-thread answer too.
     write_with(failure, claude_body, |status, raw| {
         let text = String::from_utf8_lossy(raw);
@@ -176,9 +185,75 @@ pub fn claude(failure: &Failure) -> Response {
     })
 }
 
+/// A local cooldown 429 on a Claude route. The message ends with the trusted retry time
+/// (Go v8.0.67 e458999b, `(reset after 1m30s)`), and a cooldown a rejected Anthropic
+/// unified quota caused replays the quota headers Anthropic sent with that rejection,
+/// as sent (cb70eacf). Unlike Go, nothing is synthesized: no claim, window status or
+/// reset Anthropic did not send, and no evidence at all for a per-minute limit, a
+/// Cloudflare challenge or a 429 without a rejected window. `Retry-After` stays the
+/// local retry time.
+fn claude_cooldown(failure: &Failure, signals: &std::collections::BTreeMap<String, String>) -> Response {
+    let status = failure.status();
+    let retry = failure.retry_after().filter(|s| *s > 0);
+    let suffix = retry.map_or(String::new(), |seconds| {
+        format!(
+            " (reset after {})",
+            gojson::duration(std::time::Duration::from_secs(seconds))
+        )
+    });
+    let body = claude_body_with(status, &failure.text(), &suffix);
+    let mut res = crate::respond::json(status, "application/json", body);
+    if let Some(seconds) = failure.retry_after() {
+        res.headers_mut().insert(header::RETRY_AFTER, seconds.into());
+    }
+    if retry.is_some() {
+        for (name, value) in signals {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                res.headers_mut().insert(name, value);
+            }
+        }
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #94 (Go v8.0.67 e458999b, cb70eacf): a Claude route's local cooldown 429 names
+    /// its retry time and replays the retained quota headers; with none retained it
+    /// carries only `Retry-After`.
+    #[tokio::test]
+    async fn claude_cooldown_names_its_retry_time_and_retained_evidence() {
+        let cooldown = |signals: &[(&str, &str)]| Failure::Cooldown {
+            model: "m".into(),
+            provider: "claude".into(),
+            wait: std::time::Duration::from_millis(89_400),
+            cause: Some(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#.into()),
+            signals: Box::new(signals.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+        };
+        let res = claude(&cooldown(&[("Anthropic-Ratelimit-Unified-Status", "rejected")]));
+        assert_eq!(res.status(), 429);
+        assert_eq!(res.headers()["retry-after"], "90");
+        assert_eq!(res.headers()["anthropic-ratelimit-unified-status"], "rejected");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"All credentials for model m are cooling down via provider claude (last error: rate_limit_error: slow down) (reset after 1m30s)"}}"#
+        );
+        let res = claude(&cooldown(&[]));
+        assert!(
+            !res.headers()
+                .keys()
+                .any(|k| k.as_str().starts_with("anthropic-ratelimit-unified-"))
+        );
+        // Other routes keep their bodies and carry no Anthropic headers.
+        let res = openai(&cooldown(&[("Anthropic-Ratelimit-Unified-Status", "rejected")]));
+        assert!(!res.headers().contains_key("anthropic-ratelimit-unified-status"));
+    }
 
     #[test]
     fn openai_envelope_matches_go() {

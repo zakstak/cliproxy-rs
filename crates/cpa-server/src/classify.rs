@@ -154,9 +154,32 @@ pub fn is_claude_thread_not_found(status: u16, text: &str) -> bool {
     }
 }
 
+/// Go `clienterror.IsCreditBalanceTooLow` (v8.0.67 d00267c3): Anthropic answers a
+/// credential whose API credit balance is exhausted with a 400 `invalid_request_error`
+/// whose message starts "Your credit balance is too low". That is the credential's
+/// payment state, not the request's fault.
+pub fn is_credit_balance_too_low(status: u16, text: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let Some(body) = json_body(text) else {
+        return false;
+    };
+    [
+        "error.message",
+        "message",
+        "response.error.message",
+        "body.error.message",
+    ]
+    .iter()
+    .any(|path| {
+        path_str(&body, path).is_some_and(|m| m.trim().go_lower().starts_with("your credit balance is too low"))
+    })
+}
+
 /// `clienterror.IsRequestFault`.
 pub fn is_request_fault(status: u16, text: &str) -> bool {
-    if status == 402 || status == 429 {
+    if status == 402 || status == 429 || is_credit_balance_too_low(status, text) {
         return false;
     }
     let body = json_body(text);
@@ -247,7 +270,11 @@ pub fn is_request_invalid(e: &ExecError) -> bool {
 pub fn is_compact_fault(e: &ExecError) -> bool {
     let status = go_status(e);
     let text = error_text(e);
-    if credential_scoped(e) || is_cloudflare(status, &text) || is_invalid_grant(status, &text) {
+    if credential_scoped(e)
+        || is_cloudflare(status, &text)
+        || is_invalid_grant(status, &text)
+        || is_credit_balance_too_low(status, &text)
+    {
         return false;
     }
     is_request_fault(status, &text) || matches!(status, 400 | 404 | 405 | 409 | 413 | 422 | 501)
@@ -260,13 +287,33 @@ pub fn is_compact_neutral(e: &ExecError) -> bool {
     !(credential_scoped(e)
         || is_cloudflare(status, &text)
         || is_invalid_grant(status, &text)
+        || is_credit_balance_too_low(status, &text)
         || matches!(status, 401 | 402 | 403 | 429))
 }
 
-/// A count_tokens 404 that names no model: the endpoint is missing, not the model.
+/// A count_tokens failure that leaves the model usable through the Messages endpoint
+/// (Go `isCountTokensEndpointNotFoundError`, v8.0.67 1c537211): a 404 or a 501 that
+/// names no model. A 501 that names the model, or says it is unsupported, still counts.
+/// Go's credential, payment, Cloudflare and invalid-grant checks are kept, though each
+/// recognises only its own statuses and so never matches a 501. Go's status-less unsupported-capability codes come only from
+/// plugin executors, which this fork does not load (#47).
 pub fn is_count_endpoint_missing(e: &ExecError, requested_model: &str) -> bool {
     let base = crate::scheduler::canonical_model(requested_model);
-    go_status(e) == 404 && !explicit_model_not_found(&error_text(e), base)
+    let (status, text) = (go_status(e), error_text(e));
+    if explicit_model_not_found(&text, base) {
+        return false;
+    }
+    match status {
+        404 => true,
+        501 => {
+            !(credential_scoped(e)
+                || is_cloudflare(status, &text)
+                || is_invalid_grant(status, &text)
+                || is_credit_balance_too_low(status, &text)
+                || model_support_message(&text))
+        }
+        _ => false,
+    }
 }
 
 /// Executor-reported credential-wide quota (`IsCredentialScoped`).
@@ -587,6 +634,96 @@ mod tests {
         let mut e = ExecError::local(status, FailureScope::Request, body.to_owned());
         e.headers.insert("content-type", "application/json".parse().unwrap());
         e
+    }
+
+    /// #94 (Go v8.0.67 d00267c3): Anthropic's exhausted-credit 400 is the credential's
+    /// payment failure, found at any of Go's message paths; any other 400, a credit
+    /// message on another status or an unparsable body stays what it was.
+    #[test]
+    fn exhausted_credit_is_a_credential_failure_not_a_request_fault() {
+        let credit = |path: &str| {
+            let message = "  Your credit balance is too low to access the Anthropic API.";
+            let mut body = serde_json::json!({});
+            let parts: Vec<&str> = path.split('.').collect();
+            let mut node = &mut body;
+            for part in &parts[..parts.len() - 1] {
+                node = node
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(*part)
+                    .or_insert(serde_json::json!({}));
+            }
+            node[parts[parts.len() - 1]] = message.into();
+            body["error"]["type"] = "invalid_request_error".into();
+            body.to_string()
+        };
+        for path in [
+            "error.message",
+            "message",
+            "response.error.message",
+            "body.error.message",
+        ] {
+            let body = credit(path);
+            assert!(is_credit_balance_too_low(400, &body), "{path}");
+            assert!(!is_request_fault(400, &body), "{path}");
+            let e = upstream(400, &body);
+            assert!(!is_request_invalid(&e) && !skips_cooldown(&e), "{path}");
+            assert!(!is_compact_fault(&e) && !is_compact_neutral(&e), "{path}");
+        }
+        let upper = r#"{"error":{"type":"invalid_request_error","message":"YOUR CREDIT BALANCE IS TOO LOW"}}"#;
+        assert!(is_credit_balance_too_low(400, upper));
+        for (status, body) in [
+            (402, credit("error.message")),
+            (403, credit("error.message")),
+            (400, "Your credit balance is too low".to_owned()),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"credit balance is too low"}}"#.to_owned(),
+            ),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"max_tokens: too large"}}"#.to_owned(),
+            ),
+        ] {
+            assert!(!is_credit_balance_too_low(status, &body), "{status} {body}");
+        }
+        assert!(is_request_fault(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"max_tokens: too large"}}"#
+        ));
+    }
+
+    /// #94 (Go v8.0.67 1c537211): a count_tokens 501 leaves the model available, like a
+    /// 404 that names no model; credential, payment, Cloudflare and model-support
+    /// evidence still counts, and other statuses are unchanged.
+    #[test]
+    fn count_tokens_501_is_availability_neutral() {
+        let neutral = |status: u16, body: &str| is_count_endpoint_missing(&upstream(status, body), "claude-x");
+        assert!(neutral(
+            501,
+            r#"{"type":"error","error":{"type":"api_error","message":"Not Implemented"}}"#
+        ));
+        assert!(neutral(501, ""));
+        assert!(neutral(
+            404,
+            r#"{"error":{"type":"not_found_error","message":"Not Found"}}"#
+        ));
+        // Go also checks credential, payment, Cloudflare and invalid-grant evidence, but
+        // each is recognised only on its own statuses (429, 400, below 500, 0/400/401),
+        // so on a 501 only a named model counts.
+        for body in [
+            r#"{"error":{"type":"not_found_error","message":"model: claude-x"}}"#,
+            r#"{"error":{"message":"The requested model is not supported"}}"#,
+        ] {
+            assert!(!neutral(501, body), "{body}");
+        }
+        for status in [400, 403, 429, 500, 502, 503] {
+            assert!(!neutral(status, r#"{"error":{"message":"x"}}"#), "{status}");
+        }
+        let mut quota = upstream(501, "limit");
+        quota.scope = FailureScope::Credential;
+        quota.status = 429;
+        assert!(!is_count_endpoint_missing(&quota, "claude-x"), "a credential quota");
     }
 
     #[test]
