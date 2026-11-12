@@ -1618,6 +1618,16 @@ mod creds {
                         );
                         want["error"] = got["error"].clone();
                     }
+                    // Forward port past v8.0.35 (#91, Go v8.0.67 06fd5b8b,
+                    // docs/DIFFERENCES-FROM-GO.md): each v8 Codex entry carries its local
+                    // `siwc_status`. None of the recorded credentials uses SIWC.
+                    if let Some(files) = got.get_mut("files").and_then(Value::as_array_mut) {
+                        for file in files.iter_mut().filter_map(Value::as_object_mut) {
+                            if let Some(status) = file.remove("siwc_status") {
+                                assert_eq!(status, "off", "{at}");
+                            }
+                        }
+                    }
                     // Go also deletes the Gemini login this fork refused (issue #49).
                     if name == "credential_inventory_and_edits" && step["path"] == "/credentials?all=true" {
                         want["deleted"] = json!(want["deleted"].as_i64().unwrap() - 1);

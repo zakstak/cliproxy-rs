@@ -584,6 +584,9 @@ pub fn router(state: Arc<Management>) -> Router {
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),
         ("oauth/import", methods().post(guarded!(s, oauth::import))),
         ("oauth/siwc/bind", methods().post(guarded!(s, siwc::bind))),
+        // Go v8.0.67 06fd5b8b: read-only, under the same management key.
+        ("oauth/siwc/status", methods().get(guarded!(s, siwc::status))),
+        ("credentials/siwc/status", methods().get(guarded!(s, siwc::status))),
         (
             "observability/logs",
             methods()
