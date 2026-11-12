@@ -1475,10 +1475,21 @@ pub fn selection_model(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Crede
 /// this proxy resolves both to the same upstream model; spellings sent upstream
 /// differently stay apart (the provider decides whether they are one model).
 pub fn cooldown_key(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credential, route_model: &str) -> String {
-    let (models, _) = execution_models(cfg_aliases, c, route_model);
     let selection = selection_model(cfg_aliases, c, route_model);
+    cooldown_key_for(cfg_aliases, c, route_model, &selection)
+}
+
+/// [`cooldown_key`] for a caller that already holds `selection`, the
+/// [`selection_model`] of `route_model` for `c`.
+pub fn cooldown_key_for(
+    cfg_aliases: &HashMap<String, Vec<OAuthAlias>>,
+    c: &Credential,
+    route_model: &str,
+    selection: &str,
+) -> String {
+    let (models, _) = execution_models(cfg_aliases, c, route_model);
     let upstream = models.first().map(String::as_str).unwrap_or_default();
-    state_model(&selection, route_model, upstream, models.len() > 1)
+    state_model(selection, route_model, upstream, models.len() > 1)
 }
 
 /// Go `stateModelForExecution`. Go v8.0.67 (098af7d5 `sameCanonicalModelKey`)
@@ -1486,7 +1497,7 @@ pub fn cooldown_key(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credenti
 /// differ only in case, the proxy has chosen the upstream spelling, so the state is
 /// keyed by what is sent.
 pub fn state_model(selection: &str, route_model: &str, upstream: &str, pooled: bool) -> String {
-    if !selection.trim().is_empty() && canonical_model(selection).go_lower() == canonical_model(upstream).go_lower() {
+    if !selection.trim().is_empty() && same_go_lower(canonical_model(selection), canonical_model(upstream)) {
         return upstream.trim().to_owned();
     }
     if pooled && !upstream.trim().is_empty() {
@@ -1499,10 +1510,39 @@ pub fn state_model(selection: &str, route_model: &str, upstream: &str, pooled: b
     }
 }
 
+/// `strings.ToLower(a) == strings.ToLower(b)` without allocating when both are ASCII,
+/// where Go's `ToLower` is ASCII lowercasing. Otherwise the exact rune-wise comparison:
+/// a non-ASCII rune can lower to an ASCII one (the Kelvin sign to `k`).
+fn same_go_lower(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.go_lower() == b.go_lower()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Go `strings.ToLower` equality, allocation-free for ASCII (#95 cost): a non-ASCII
+    /// rune that Go lowers to ASCII still matches, and different names stay route-keyed.
+    #[test]
+    fn state_keys_compare_under_go_lower() {
+        assert_eq!(state_model("Claude-X", "route", "claude-x", false), "claude-x");
+        assert_eq!(
+            state_model("\u{212A}imi", "route", "kimi", false),
+            "kimi",
+            "the Kelvin sign"
+        );
+        assert_eq!(
+            state_model("\u{dc}n\u{ef}", "route", "\u{fc}n\u{ef}", false),
+            "\u{fc}n\u{ef}"
+        );
+        assert_eq!(state_model("a", "route", "b", false), "route");
+        assert_eq!(state_model("\u{212A}", "route", "x", false), "route");
+    }
 
     fn file(id: &str, meta: Value, attrs: &[(&str, &str)]) -> Arc<Credential> {
         let mut c = Credential::from_file(

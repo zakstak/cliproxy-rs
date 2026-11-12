@@ -1296,7 +1296,7 @@ pub fn admission<'a>(
         (registry.client_supports(&c.id, route)
             || (selection_key != route && registry.client_supports(&c.id, selection_key)))
         // Cooldowns are found under the key dispatch records them under (#95).
-        .then(|| crate::registry::cooldown_key(aliases, c, &selection.model))
+        .then(|| crate::registry::cooldown_key_for(aliases, c, &selection.model, &key))
     }
 }
 
@@ -1988,10 +1988,11 @@ impl CredentialStore {
                 .expect("ready candidates exist");
             let (c, m) = eligible.iter().find(|(c, _)| c.id == picked.id).unwrap();
             let generation = scheduler.reserve_probe(c, m, now);
-            (Arc::clone(c), lcp, generation, scheduler.dispatch())
+            // The key admission gave the pick, which its probe reservation used: admitting
+            // the credential again would resolve its models a second time per request.
+            (Arc::clone(c), m.clone(), lcp, generation, scheduler.dispatch())
         };
-        let (credential, lcp, picked, seq) = credential;
-        let execution_model = admit(&credential).unwrap_or_else(|| selection.model.clone());
+        let (credential, execution_model, lcp, picked, seq) = credential;
         Ok(Lease {
             store: self.clone(),
             credential,

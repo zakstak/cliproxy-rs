@@ -967,7 +967,7 @@ impl Scheduler {
     /// window ended.
     pub fn accept_probe_picked(&mut self, c: &Credential, model: &str, picked: u32, now: Instant) {
         let key = self.result_key(c, canonical_model(model), picked);
-        let model = key.as_str();
+        let model = key.as_ref();
         let mut credential_window = None;
         for m in [model, ""] {
             let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned())) else {
@@ -1394,7 +1394,7 @@ impl Scheduler {
         now: Instant,
     ) {
         let key = self.result_key(c, canonical_model(model), picked);
-        let model = key.as_str();
+        let model = key.as_ref();
         self.apply(c, model, outcome, policy, picked, seq, now);
         // Go stamps the failing state with the dispatch watermark; a credential-wide 429
         // also stamps the credential and every sibling state. A credential-level failure
@@ -2144,26 +2144,30 @@ impl Scheduler {
     /// result's application happen under the scheduler lock, as migrations do, so a
     /// result never lands between a migration and its record. Cost: nothing without
     /// history; one lookup per move followed otherwise.
-    fn result_key(&self, c: &Credential, model: &str, picked: u32) -> String {
-        let mut key = model.to_owned();
+    fn result_key<'a>(&self, c: &Credential, model: &'a str, picked: u32) -> std::borrow::Cow<'a, str> {
+        let mut key = std::borrow::Cow::Borrowed(model);
         if self.moved.is_empty() {
             return key;
         }
         let mut since = picked;
         let current = self.generation;
         // Each step follows a strictly later move, so this ends.
-        while let Some(next) = self.moved.get(&(c.id.clone(), key.clone())).and_then(|history| {
-            history
-                .iter()
-                .filter(|m| {
-                    m.revision == c.revision
-                        && current.wrapping_sub(m.generation) < MOVED_HORIZON
-                        && (m.generation.wrapping_sub(since) as i32) > 0
-                })
-                .min_by_key(|m| m.generation.wrapping_sub(since))
-        }) {
+        while let Some(next) = self
+            .moved
+            .get(&(c.id.clone(), key.clone().into_owned()))
+            .and_then(|history| {
+                history
+                    .iter()
+                    .filter(|m| {
+                        m.revision == c.revision
+                            && current.wrapping_sub(m.generation) < MOVED_HORIZON
+                            && (m.generation.wrapping_sub(since) as i32) > 0
+                    })
+                    .min_by_key(|m| m.generation.wrapping_sub(since))
+            })
+        {
             since = next.generation;
-            key = next.to.clone();
+            key = std::borrow::Cow::Owned(next.to.clone());
         }
         key
     }
