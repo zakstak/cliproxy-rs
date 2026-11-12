@@ -330,21 +330,27 @@ pub fn config_models(c: &Credential) -> Vec<ConfigModel> {
     let Some(Value::Array(items)) = raw else {
         return Vec::new();
     };
+    const SNAKE: [&str; 7] = [
+        "display_name",
+        "max_context_length",
+        "force_mapping",
+        "is_compat",
+        "support_configuration_update",
+        "input_modalities",
+        "output_modalities",
+    ];
     items
         .iter()
         .filter_map(|v| {
+            // Entries synthesized from the config use its kebab-case keys: read them in
+            // place. Resolving a request's models runs this per request.
+            if !matches!(v, Value::Object(m) if SNAKE.iter().any(|k| m.contains_key(*k))) {
+                return ConfigModel::deserialize(v).ok();
+            }
             let mut v = v.clone();
             // Accept snake_case spellings from JSON metadata too.
             if let Value::Object(m) = &mut v {
-                for key in [
-                    "display_name",
-                    "max_context_length",
-                    "force_mapping",
-                    "is_compat",
-                    "support_configuration_update",
-                    "input_modalities",
-                    "output_modalities",
-                ] {
+                for key in SNAKE {
                     if let Some(x) = m.remove(key) {
                         m.entry(key.replace('_', "-")).or_insert(x);
                     }
