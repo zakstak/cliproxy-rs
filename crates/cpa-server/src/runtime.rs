@@ -601,10 +601,13 @@ impl Runtime {
     // due, and Claude's prepare already refreshed on demand before 50d5fe18. A provider
     // whose prepare refreshes only inside its lead cannot recover a revoked token here.
     pub async fn refresh_after_unauthorized(&self, credential: &Credential, cfg: &Config) -> Option<Arc<Credential>> {
-        // A refresh token refused for good is no refresh credential; with none left the
-        // 401 is final until the tokens change.
+        // A known active renewal refusal still needs the fenced preparation path to
+        // quarantine the access token this 401 rejected. It masks the refused refresh
+        // token before any grant, so handling the rejection does not resend it.
         let renewable = self.store.renewable(&Arc::new(credential.clone()));
-        if !self.executors.has_refresh_credential(&renewable) {
+        if !self.executors.has_refresh_credential(&renewable)
+            && !self.store.refused_renewal(credential).active_refused(credential)
+        {
             return None;
         }
         let refreshed = match self
@@ -5684,6 +5687,97 @@ pub(crate) mod tests {
             assert_eq!(partition_grants(&grants, "outer"), 0, "round {round}: {grants:?}");
         }
         std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// A due or management refresh can refuse the only renewable token before an
+    /// upstream rejects its access token. The later 401 must still quarantine it,
+    /// without sending the refused refresh token again. A new sign-in recovers it.
+    async fn known_refusal_after_unauthorized(siwc: bool, management: bool) {
+        let mut file = codex_file(
+            ("dead", chrono::Duration::minutes(2)),
+            ("dead", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        file["use_siwc"] = siwc.into();
+        if siwc {
+            file.as_object_mut().unwrap().remove("refresh_token");
+        } else {
+            file.as_object_mut().unwrap().remove("siwc");
+        }
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, SIWC_REFUSED, SIWC_REFUSED).await;
+        let rt = &f.rt;
+        let c = rt.store.get("codex.json").unwrap();
+        if management {
+            assert_eq!(rt.refresh_credential(&c.id).await.unwrap_err().status, 401);
+        } else {
+            run_refresh_job(
+                rt.clone(),
+                rt.config(),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                c,
+                false,
+            )
+            .await;
+        }
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(rt.store.refused_renewal(&c).active_refused(&c));
+        assert!(!rt.executors.has_refresh_credential(&rt.store.renewable(&c)));
+        assert!(
+            !rt.store.tokens_rejected(&c),
+            "a renewal refusal alone does not reject usable access tokens"
+        );
+        assert_eq!(f.grants().len(), 1);
+        assert!(rt.refresh_after_unauthorized(&c, &rt.config()).await.is_none());
+        assert!(f.grants().is_empty(), "the refused refresh token was sent again");
+        assert!(
+            rt.store.tokens_rejected(&rt.store.get(&c.id).unwrap()),
+            "known refusal then upstream 401 must quarantine: siwc={siwc}, management={management}"
+        );
+        assert!(rt.store.select(Selection::new("codex", "gpt-5")).is_none());
+
+        let mut relogin = file;
+        if siwc {
+            relogin["siwc"]["access_token"] = "siwc-new-signin".into();
+            relogin["siwc"]["refresh_token"] = "siwc-refresh-new-signin".into();
+        } else {
+            relogin["access_token"] = "outer-new-signin".into();
+            relogin["refresh_token"] = "outer-refresh-new-signin".into();
+        }
+        std::fs::write(f.dir.join(&c.id), relogin.to_string()).unwrap();
+        rt.store.reconcile(
+            cpa_core::config::credentials::from_auth_dir(&rt.config())
+                .into_iter()
+                .map(crate::testing::local)
+                .collect(),
+        );
+        let current = rt.store.get(&c.id).unwrap();
+        assert!(!rt.store.tokens_rejected(&current));
+        assert!(!rt.store.refused_renewal(&current).active_refused(&current));
+        assert!(rt.store.select(Selection::new("codex", "gpt-5")).is_some());
+        // A late 401 for the old tokens cannot quarantine the new sign-in.
+        rt.refresh_after_unauthorized(&c, &rt.config()).await;
+        assert!(!rt.store.tokens_rejected(&current));
+        assert!(f.grants().is_empty());
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_due_outer_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_management_outer_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(false, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_due_siwc_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_management_siwc_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(true, true).await;
     }
 
     /// #92 (Go v8.0.67 5f38d557, baec297f): with `use_siwc` off, a refused SIWC refresh
