@@ -1,0 +1,2211 @@
+{
+  "written": "2026-11-12T11:11:23Z",
+  "kind": "cargo-groups",
+  "verdict": "pass",
+  "partial": false,
+  "rust_revision": "7cdee5bc946c116acce9425a258bb6ef14139ec1",
+  "source": {
+    "head": "7cdee5bc946c116acce9425a258bb6ef14139ec1",
+    "tree": "3ee90ccf4b3a9fb69a7667b19652196fc72e8e17",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+  },
+  "source_after": {
+    "head": "7cdee5bc946c116acce9425a258bb6ef14139ec1",
+    "tree": "3ee90ccf4b3a9fb69a7667b19652196fc72e8e17",
+    "clean": true,
+    "status": [],
+    "manifest_sha256": "c0ef7513661d215b0d99299edeaf46f52eeb274dbc9164e082169348f7a2c447"
+  },
+  "provenance_verified": true,
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)"
+  },
+  "build": {
+    "commands": {
+      "cpa-core": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-core",
+        "--lib",
+        "--message-format=json"
+      ],
+      "cpa-exec": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-exec",
+        "--lib",
+        "--message-format=json"
+      ],
+      "cpa-server": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-server",
+        "--test",
+        "claude_passthrough",
+        "--test",
+        "codex_native_request",
+        "--test",
+        "codex_native_ws",
+        "--test",
+        "codex_translated",
+        "--test",
+        "management",
+        "--test",
+        "retained_providers",
+        "--test",
+        "routes",
+        "--message-format=json"
+      ]
+    },
+    "cwd": ".",
+    "environment": {
+      "CARGO_INCREMENTAL": null,
+      "CARGO_BUILD_JOBS": "2",
+      "CARGO_TARGET_DIR": null,
+      "CARGO_BUILD_TARGET_DIR": null,
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "CARGO_BUILD_RUSTFLAGS": null,
+      "RUSTDOCFLAGS": null,
+      "RUSTC": null,
+      "RUSTC_WRAPPER": "/review/outer-rustc-guard.sh",
+      "RUSTC_WORKSPACE_WRAPPER": null,
+      "RUSTUP_TOOLCHAIN": null,
+      "RUSTUP_HOME": "/usr/local/rustup",
+      "CARGO_HOME": "/home/agent/.cargo",
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, caller uid/gid; test binaries run directly with CPA_TEST_NO_SKIP=1",
+  "counts": {
+    "groups": 6,
+    "tests": 32,
+    "passed": 32,
+    "failed": 0,
+    "unknown_tests": 0
+  },
+  "unavailable": [],
+  "unknown_tests": [],
+  "groups": [
+    {
+      "id": "claude-router",
+      "provider": "claude",
+      "tests": [
+        {
+          "name": "claude_messages_end_to_end",
+          "package": "cpa-server",
+          "target": "test:claude_passthrough",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "request_log_masks_upstream_credentials",
+          "package": "cpa-server",
+          "target": "test:claude_passthrough",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+          "package": "cpa-server",
+          "target": "test:routes",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "mid_stream_failure_ends_with_route_error_frame",
+          "package": "cpa-server",
+          "target": "test:routes",
+          "paths": [
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "id": "codex-contract",
+      "provider": "codex",
+      "tests": [
+        {
+          "name": "codex_contract::tests::manifest_and_directory_list_the_same_files",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::every_fixture_records_its_provenance",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::fixtures_hold_no_credentials",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "codex_contract::tests::frames_are_exact_slices",
+          "package": "cpa-exec",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "native_requests_and_events_pass_through_the_route_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "private_and_unknown_events_reach_codex_clients",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "buffered_clients_get_the_destination_contract",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "upstream_failures_reach_the_client_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_request",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "native_creates_and_events_pass_through_unchanged",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "http_fallback_is_a_separate_explicit_conversion",
+          "package": "cpa-server",
+          "target": "test:codex_native_ws",
+          "paths": [
+            "websocket",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "chat_round_trips_keep_meaning",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "claude_round_trips_keep_meaning",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "an_upstream_error_keeps_its_message",
+          "package": "cpa-server",
+          "target": "test:codex_translated",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 14,
+      "failed": 0
+    },
+    {
+      "id": "xai",
+      "provider": "xai",
+      "tests": [
+        {
+          "name": "xai_responses_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "xai_chat_completions_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "xai_messages_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "upstream_rate_limits_keep_their_status",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "id": "meta",
+      "provider": "meta",
+      "tests": [
+        {
+          "name": "meta_responses_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "meta_chat_completions_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "meta_messages_http_and_stream",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http",
+            "stream"
+          ],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 3,
+      "failed": 0
+    },
+    {
+      "id": "refusals",
+      "provider": "removed",
+      "tests": [
+        {
+          "name": "removed_provider_routes_settings_and_models_stay_refused",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "plugin_settings_stay_refused",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "retired_plugin_routes_answer_gone_behind_the_guard",
+          "package": "cpa-server",
+          "target": "test:management",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "management_writes_refuse_a_plugins_section",
+          "package": "cpa-server",
+          "target": "test:management",
+          "paths": [
+            "http"
+          ],
+          "outcome": "passed"
+        },
+        {
+          "name": "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+          "package": "cpa-core",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        },
+        {
+          "name": "removed::tests::removed_settings_fail_with_guidance",
+          "package": "cpa-core",
+          "target": "lib",
+          "paths": [],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 6,
+      "failed": 0
+    },
+    {
+      "id": "controls",
+      "provider": "harness",
+      "tests": [
+        {
+          "name": "the_semantic_checks_reject_a_mutated_capture",
+          "package": "cpa-server",
+          "target": "test:retained_providers",
+          "paths": [],
+          "outcome": "passed"
+        }
+      ],
+      "passed": 1,
+      "failed": 0
+    }
+  ],
+  "executions": [
+    {
+      "package": "cpa-core",
+      "target": "lib",
+      "artifact": {
+        "package": "cpa-core",
+        "package_dir": "crates/cpa-core",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_core",
+        "src_path": "crates/cpa-core/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_core-bd184f74f32568ca",
+        "sha256": "f7e9289cb2814d3afe0bfcf4db915de3dbb4d8b3cd3837ce7e1311fedf53f264"
+      },
+      "fresh_before": true,
+      "requested": [
+        "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+        "removed::tests::removed_settings_fail_with_guidance"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/cpa_core-bd184f74f32568ca",
+          "--list"
+        ],
+        "cwd": "crates/cpa-core",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "config::credentials::tests::api_key_config_proxy_takes_the_first_matching_entry",
+          "config::credentials::tests::config_models_reach_the_registry_like_go",
+          "config::credentials::tests::excluded_models_read_from_credential_metadata",
+          "config::credentials::tests::file_credentials_store_only_their_own_excluded_models",
+          "config::credentials::tests::file_type_and_exclusions_lowercase_like_go",
+          "config::credentials::tests::resolve_api_key_entry_prefers_the_matching_config_index",
+          "config::credentials::tests::retired_quota_probe_is_refused_without_dropping_unknown_metadata",
+          "config::credentials::tests::scalar_model_names_keep_their_yaml_text",
+          "config::document::tests::legacy_entries_are_not_coalesced",
+          "config::document::tests::legacy_migration_and_nested_block_sequences_roundtrip",
+          "config::document::tests::migration_keeps_provider_and_field_key_foot_comments_once",
+          "config::document::tests::migration_moves_legacy_lines_with_their_comments_and_bytes",
+          "config::document::tests::mixed_layout_merges_leaves_and_keeps_presence",
+          "config::document::tests::paths_are_mapping_keys_and_patch_null_is_not_deletion",
+          "config::document::tests::re_emitted_number_like_strings_stay_strings",
+          "config::document::tests::syntax_edits_create_nested_sections_and_empty_lists",
+          "config::document::tests::writes_keep_string_settings_written_as_numbers",
+          "config::go_url::tests::accepts_and_rejects_like_go",
+          "config::go_url::tests::new_request_removes_an_empty_port",
+          "config::go_url::tests::request_uri_follows_go",
+          "config::go_url::tests::resolve_path_matches_go",
+          "config::schema::tests::chatgpt_keep_alive_is_a_known_codex_bool",
+          "config::schema::tests::claude_cache_telemetry_survives_strict_writes_and_migration",
+          "config::schema::tests::null_web_search_result_cache_loads",
+          "config::tests::a_leading_bom_is_skipped",
+          "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+          "config::tests::defaults_match_go_loader",
+          "config::tests::dropped_alias_copies_are_bounded",
+          "config::tests::image_generation_mode_reads_go_spellings",
+          "config::tests::integers_beyond_64_bits_read_as_in_go",
+          "config::tests::legacy_session_date_pin_days_migrates",
+          "config::tests::legacy_spellings_still_work",
+          "config::tests::null_or_scalar_parents_are_rejected",
+          "config::tests::plain_timestamps_read_as_in_go",
+          "config::tests::prepare_for_upload_refuses_a_file_it_cannot_write",
+          "config::tests::re_emitted_strings_read_back_as_strings",
+          "config::tests::scalar_settings_keep_their_yaml_text",
+          "config::tests::scheduler_legacy_keys_and_v8_presence_share_one_typed_view",
+          "config::tests::shared_upstream_layouts_agree_and_migrate",
+          "config::tests::shared_upstream_presence_wins_and_empty_containers_move",
+          "config::tests::underscore_numbers_read_as_in_go",
+          "config::tests::unused_number_aliases_do_not_expand_too_far",
+          "config::tests::v8_layout_is_recognised_by_version_sections_and_paths",
+          "config::tests::v8_upstream_key_map_is_not_client_keys",
+          "config::tests::v8_wins_by_presence_even_when_null_or_empty",
+          "config::tests::worker_threads_is_a_known_int",
+          "config::tests::written_numbers_do_not_count_toward_the_alias_limit",
+          "config::tests::yaml_literals_scale_linearly",
+          "config::text::tests::emitted_blocks_parse_back_to_the_value",
+          "config::trusted::tests::mapped_entries_and_v4_cidrs_follow_go_byte_lengths",
+          "config::validate::tests::absolute_paths_follow_go_filepath_is_abs",
+          "config::validate::tests::codex_is_compat_is_refused",
+          "config::validate::tests::codex_user_agent_default_is_refused",
+          "config::validate::tests::durations_parse_like_go",
+          "config::validate::tests::in_flight_bounds_follow_go",
+          "config::validate::tests::relay_arithmetic_never_overflows",
+          "gostr::tests::matches_go_case_rules",
+          "registry::dynamic::tests::account_info_matches_go",
+          "registry::dynamic::tests::api_key_aliases_use_lowercase_keys_before_fold",
+          "registry::dynamic::tests::codex_builtins_include_gpt_image_25_and_26",
+          "registry::dynamic::tests::config_models_and_force_mapping",
+          "registry::dynamic::tests::exclusions_aliases_forks_and_prefixes_follow_go",
+          "registry::dynamic::tests::exclusions_match_with_go_lowercasing",
+          "registry::dynamic::tests::oauth_aliases_fold_per_credential_and_key_globally",
+          "registry::dynamic::tests::oauth_claude_registers_go_catalog_minus_disabled",
+          "registry::dynamic::tests::static_channel_lookup_matches_go",
+          "registry::dynamic::tests::wildcard_matches_go",
+          "registry::tests::claude_variants_use_their_catalog_entry",
+          "registry::tests::detect_changed_providers_codex_configuration_update",
+          "registry::tests::detect_changed_providers_reports_retained_providers",
+          "registry::tests::embedded_catalog_matches_go_channel_sizes",
+          "registry::tests::lookup_follows_go_search_order_across_providers",
+          "registry::tests::models_decode_like_go_model_info",
+          "registry::tests::raw_definition_keeps_published_key_order",
+          "registry::tests::validate_catalog_follows_go",
+          "removed::tests::empty_and_retained_settings_pass",
+          "removed::tests::providers_fold_like_go",
+          "removed::tests::removed_channels_fail_in_settings_and_request_scoped_errors",
+          "removed::tests::removed_settings_fail_with_guidance",
+          "removed::tests::stripping_follows_the_loader_paths",
+          "removed::tests::stripping_keeps_unrelated_user_data",
+          "sent::tests::a_value_inside_another_is_redacted_whole",
+          "sent::tests::empty_and_repeated_values_are_none",
+          "sent::tests::scrub_keeps_only_the_length_of_an_escaped_spelling",
+          "sent::tests::scrub_keeps_safe_bytes_and_replaces_values_written_as_sent"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/cpa_core-bd184f74f32568ca",
+          "--exact",
+          "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+          "removed::tests::removed_settings_fail_with_guidance"
+        ],
+        "cwd": "crates/cpa-core",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "removed::tests::removed_settings_fail_with_guidance",
+          "outcome": "ok"
+        },
+        {
+          "name": "config::tests::a_plugins_section_is_refused_with_the_migration_error",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 83
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-core",
+        "package_dir": "crates/cpa-core",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_core",
+        "src_path": "crates/cpa-core/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_core-bd184f74f32568ca",
+        "sha256": "f7e9289cb2814d3afe0bfcf4db915de3dbb4d8b3cd3837ce7e1311fedf53f264"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-exec",
+      "target": "lib",
+      "artifact": {
+        "package": "cpa-exec",
+        "package_dir": "crates/cpa-exec",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_exec",
+        "src_path": "crates/cpa-exec/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_exec-f9dec0750b590f44",
+        "sha256": "1da08af2b383e598220dfbde5d6d2a2cfa7b7f36743beb280cc3b0ee06f81b6a"
+      },
+      "fresh_before": true,
+      "requested": [
+        "codex_contract::tests::every_fixture_records_its_provenance",
+        "codex_contract::tests::fixtures_hold_no_credentials",
+        "codex_contract::tests::frames_are_exact_slices",
+        "codex_contract::tests::manifest_and_directory_list_the_same_files"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/cpa_exec-f9dec0750b590f44",
+          "--list"
+        ],
+        "cwd": "crates/cpa-exec",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "claude::alias::tests::caller_mcp_tool_wrapped_in_the_virtual_server_restores_like_go",
+          "claude::alias::tests::harness_alias_matches_clean_go_capture",
+          "claude::betas::tests::harness_profiles_match_go_captures",
+          "claude::cloak::tests::billing_header_matches_go_capture",
+          "claude::cloak::tests::cache_control_walk_reads_each_block_in_go_order",
+          "claude::cloak::tests::sensitive_words_split_first_rune",
+          "claude::detect::tests::newer_release_helpers_follow_the_main_requests",
+          "claude::detect::tests::newer_release_needs_valid_stainless_versions",
+          "claude::detect::tests::stabilized_profiles_keep_go_detection",
+          "claude::go_unit::apply_patch_integration_claude",
+          "claude::go_unit::go_assertions_held_while_recording",
+          "claude::go_unit::m1_0072_cloaked_cache_repro",
+          "claude::go_unit::m1_0074_executor_auth",
+          "claude::go_unit::m1_0076_beta_policy",
+          "claude::go_unit::m1_0078_diagnostics",
+          "claude::go_unit::m1_0079_fable_ratelimit",
+          "claude::go_unit::m1_0080_fast_error",
+          "claude::go_unit::m1_0081_native_helper",
+          "claude::go_unit::m1_0082_ratelimit",
+          "claude::go_unit::m1_0083_request_remap",
+          "claude::go_unit::m1_0084_stream_terminal",
+          "claude::go_unit::m1_0085_subagent_ttl",
+          "claude::go_unit::m1_0086_executor",
+          "claude::go_unit::m1_0087_thinking_signature",
+          "claude::go_unit::m1_0089_fingerprint_policy",
+          "claude::go_unit::m1_0093_mid_system_model",
+          "claude::go_unit::m1_0095_thinking_replay",
+          "claude::go_unit::unverified_go_cancellation_cases",
+          "claude::go_unit::v8_0_27_cloaked_date_pin",
+          "claude::go_unit::v8_0_27_effort_directive",
+          "claude::go_unit::v8_0_27_executor",
+          "claude::go_unit::v8_0_27_prompt_cache_options",
+          "claude::go_unit::v8_0_35_cloaked_date_pin",
+          "claude::go_unit::v8_0_35_executor",
+          "claude::go_unit::v8_0_35_mid_system_model",
+          "claude::go_unit::v8_0_35_payload_barrier",
+          "claude::go_unit::v8_0_35_payload_review",
+          "claude::go_unit::v8_0_35_tool_search",
+          "claude::headers::tests::canonical_matches_go",
+          "claude::headers::tests::harness_unconfirmed_oauth_messages_headers_match_go_capture",
+          "claude::headers::tests::passthrough_skips_the_cached_session_like_go",
+          "claude::headers::version_tests::newer_native_releases_keep_their_own_versions",
+          "claude::identity::tests::error_class_is_typed_not_matched_on_text",
+          "claude::identity::tests::rebuild_keeps_caller_extras_after_identity",
+          "claude::profile::tests::billing_version_follows_a_confirmed_newer_release",
+          "claude::profile::tests::home_kv_profiles_match_go",
+          "claude::profile::tests::stabilized_profiles_keep_go_patch_rule",
+          "claude::profile::tests::stainless_host_names",
+          "claude::profile::tests::version_parsing_and_patch_floor",
+          "claude::replay::tests::a_session_keeps_at_most_64_turns",
+          "claude::replay::tests::expired_entries_are_swept_and_their_generations_stop_accepting_writes",
+          "claude::replay::tests::home_kv_replay_matches_go",
+          "claude::replay::tests::model_family_hashes_the_credential_identity",
+          "claude::replay::tests::only_classified_upstream_rejections_clear",
+          "claude::replay::tests::sessions_keep_distinct_turns_and_writes_need_the_read_generation",
+          "claude::replay::tests::the_gate_classifies_credentials_like_go_auth_kind",
+          "claude::session::tests::harness_message_hash_identity_matches_go_capture",
+          "claude::session::tests::home_kv_ids_match_go",
+          "claude::signals::tests::probe_helper_and_tags",
+          "claude::signing::tests::fallback_billing_is_prepended_to_string_system",
+          "claude::signing::tests::signs_the_go_captured_body",
+          "claude::signing::tests::xxh64_reference_vectors",
+          "claude::stream::tests::crlf_terminal_and_truncation_follow_go",
+          "claude::stream::tests::every_upstream_line_is_reported_before_alias_restore",
+          "claude::stream::tests::request_logs_record_lines_then_the_ending_error",
+          "claude::stream::tests::translated_streams_end_on_the_message_stop_line",
+          "claude::tests::api_key_cloak_keeps_the_caller_prompt_in_place_across_turns",
+          "claude::tests::claude_rate_limit_cooldown_and_scope_match_go",
+          "claude::tests::cloaked_conversation_prefix_holds_for_warm_changed_and_idle_turns",
+          "claude::tests::compat_replay_sequence_matches_go",
+          "claude::tests::count_defaults_read_the_original_request",
+          "claude::tests::custom_origin_counts_locally_without_sending_credentials",
+          "claude::tests::executor_scenarios_match_go",
+          "claude::tests::m1_0041_to_m1_0056_config_keys_match_go",
+          "claude::tests::messages_responses_record_the_quota_snapshot",
+          "claude::tests::native_tool_search_support_matches_go",
+          "claude::tests::pipeline_reproduces_go_upstream_captures",
+          "claude::tests::refused_versions_log_only_when_the_identity_is_replaced",
+          "claude::tests::request_logs_follow_go_capture_sites",
+          "claude::tests::responses_compaction_matches_go",
+          "claude::tests::shared_window_429_follows_model_level_cooling",
+          "claude::tests::sjson_cases_generated_by_go_match",
+          "claude::tests::tool_search_responses_match_go",
+          "claude::tests::tool_search_scenarios_match_go",
+          "claude::tests::unrestorable_tool_alias_publishes_no_tokens",
+          "claude::tests::usage_reports_follow_go_reporter_calls",
+          "claude::tests::v8_0_27_cache_and_prompt_shaping_scenarios_match_go",
+          "claude::tests::v8_0_35_payload_barrier_scenarios_match_go",
+          "claude::thread::tests::declared_tools_and_other_threads_take_the_normal_path",
+          "claude::thread::tests::oldest_turn_is_evicted_past_the_limit",
+          "claude::tool_search::tests::detects_and_strips_client_tool_search_like_go",
+          "claude::tool_search::tests::legacy_models_lack_tool_search",
+          "claude_login::tests::a_busy_port_is_go_port_in_use",
+          "claude_login::tests::a_wrong_state_fails_the_login_without_writing",
+          "claude_login::tests::an_empty_paste_keeps_waiting_for_the_browser",
+          "claude_login::tests::browser_login_writes_go_file_and_migrates_the_legacy_one",
+          "claude_login::tests::callback_server_answers_like_go",
+          "claude_login::tests::file_names_match_go",
+          "claude_login::tests::legacy_matching_follows_go_identity_rules",
+          "claude_login::tests::pasted_callback_completes_the_login",
+          "claude_login::tests::pasted_callbacks_parse_like_go",
+          "claude_login::tests::success_page_escapes_the_platform_url",
+          "codex::boundary_tests::contract_request_fixtures_pass_the_boundary",
+          "codex::boundary_tests::images_direct_form_names_are_literal",
+          "codex::boundary_tests::images_form_controls_are_refused_not_dropped",
+          "codex::boundary_tests::images_form_controls_keep_their_values",
+          "codex::boundary_tests::images_forms_are_read_without_loss",
+          "codex::boundary_tests::images_json_is_read_without_loss",
+          "codex::boundary_tests::images_json_n_is_one_only_exactly",
+          "codex::boundary_tests::images_json_passes_the_boundary_before_the_send",
+          "codex::boundary_tests::images_tool_stream_delivers_partial_and_completed_images",
+          "codex::boundary_tests::refused_bodies_never_reach_the_upstream",
+          "codex::boundary_tests::token_counts_read_responses_bodies_through_the_boundary",
+          "codex::boundary_tests::translated_formats_are_outside_the_boundary",
+          "codex::boundary_tests::valid_fixture_bodies_still_reach_the_upstream",
+          "codex::identity_tests::alpha_search_sends_the_callers_identity_or_the_proxys",
+          "codex::identity_tests::http_identity_follows_the_policy_and_never_borrows_caller_credentials",
+          "codex::identity_tests::operator_headers_cannot_bypass_the_policy",
+          "codex::identity_tests::siwc_requests_follow_the_policy_not_the_configured_identifier",
+          "codex::identity_tests::the_model_catalog_cannot_set_identity",
+          "codex::identity_tests::websocket_handshake_follows_the_policy",
+          "codex::native::tests::a_completed_stream_dropped_before_its_end_records_no_cancellation",
+          "codex::native::tests::a_disabled_image_tool_is_refused_not_stripped",
+          "codex::native::tests::a_dropped_unfinished_stream_records_one_cancellation",
+          "codex::native::tests::a_home_is_compat_model_is_refused_for_the_credential",
+          "codex::native::tests::a_large_multiline_event_parses_linearly",
+          "codex::native::tests::a_model_suffix_is_refused_before_the_upstream",
+          "codex::native::tests::a_processing_error_ends_a_buffered_answer_only_at_a_clean_end",
+          "codex::native::tests::a_stream_without_its_terminal_event_stays_truncated",
+          "codex::native::tests::an_alias_changes_only_the_model_value",
+          "codex::native::tests::an_open_final_event_is_closed",
+          "codex::native::tests::an_upstream_failure_is_never_recorded_as_a_cancellation",
+          "codex::native::tests::api_key_buffered_requests_pass_unchanged_both_ways",
+          "codex::native::tests::chatgpt_buffered_clients_get_the_terminal_response_object",
+          "codex::native::tests::compaction_passes_unchanged_both_ways",
+          "codex::native::tests::credential_failures_before_content_fail_over",
+          "codex::native::tests::every_incomplete_passes_unchanged_at_every_stage",
+          "codex::native::tests::every_sse_line_ending_and_split_passes_unchanged",
+          "codex::native::tests::failures_deliver_the_raw_error_object",
+          "codex::native::tests::harmless_repeats_keep_the_decoded_outcome",
+          "codex::native::tests::initial_bom_is_framing_for_http_delivery_and_aggregation",
+          "codex::native::tests::missing_mime_classifies_framing_and_preserves_original_chunks",
+          "codex::native::tests::missing_mime_does_not_buffer_a_whole_stream_or_override_explicit_json",
+          "codex::native::tests::missing_mime_keeps_native_http_streaming_and_chatgpt_buffered_aggregation",
+          "codex::native::tests::missing_mime_preserves_body_errors_and_bounds_inspection",
+          "codex::native::tests::observed_events_keep_duplicates_number_spellings_and_escapes",
+          "codex::native::tests::payload_rules_do_not_apply",
+          "codex::native::tests::request_faults_reach_the_client_as_the_provider_event",
+          "codex::native::tests::sign_in_with_chatgpt_takes_the_native_route",
+          "codex::native::tests::split_data_lines_pass_unchanged",
+          "codex::native::tests::streaming_requests_and_events_pass_unchanged",
+          "codex::native::tests::the_api_openai_com_profile_maps_without_traffic",
+          "codex::native::tests::undecodable_events_never_end_fail_or_convert_the_response",
+          "codex::native::tests::unknown_events_and_missing_usage_pass_unchanged",
+          "codex::native::tests::upstream_events_skip_the_request_boundary",
+          "codex::native::tests::upstream_http_errors_reach_the_client_unchanged",
+          "codex::native::tests::upstream_http_status_is_delivered_apart_from_classification",
+          "codex::tests::alpha_search_body_rules_match_go_marshal",
+          "codex::tests::alpha_search_reads_at_most_32_mib_whatever_the_status",
+          "codex::tests::capture_keeps_each_sites_read_error_policy",
+          "codex::tests::capture_records_a_transport_failure",
+          "codex::tests::capture_records_each_attempt_as_go_does",
+          "codex::tests::capture_stops_at_the_terminal_line",
+          "codex::tests::codex_cache_identity_reads_strings_without_gjson_coercion",
+          "codex::tests::codex_headers_read_raw_translated_schemas",
+          "codex::tests::compact_failures_follow_gos_availability_neutral_policy",
+          "codex::tests::count_tokens_ignores_the_payload_rules_and_is_marked_local",
+          "codex::tests::direct_images_return_the_read_error_of_a_broken_error_body",
+          "codex::tests::direct_images_send_the_configured_upstream_model",
+          "codex::tests::executor_matches_go_on_every_fixture_case",
+          "codex::tests::image_references_are_kept_or_refused",
+          "codex::tests::images_match_go_on_every_fixture_case",
+          "codex::tests::native_codex_websocket_turns_keep_service_tier_in_body_and_routing_hint",
+          "codex::tests::payload_filters_remove_late_codex_additions",
+          "codex::tests::prepare_refreshes_when_due_and_keeps_a_valid_token_on_failure",
+          "codex::tests::quota_events_and_signals_match_go",
+          "codex::tests::refresh_uses_the_credential_proxy_before_the_global_one",
+          "codex::tests::replayed_web_search_history_matches_go",
+          "codex::tests::siwc_partition_refreshes_like_go",
+          "codex::tests::siwc_requests_match_go",
+          "codex::tests::split_sse_events_read_as_one_event",
+          "codex::tests::split_sse_events_spend_the_bootstrap_budget",
+          "codex::tests::the_image_tool_adapter_adds_nothing",
+          "codex::tests::translated_header_observation_keeps_independent_first_matches",
+          "codex::tests::truncated_error_body_is_a_transport_failure_not_an_auth_failure",
+          "codex::tests::usage_records_see_upstream_payloads",
+          "codex::tests::usage_records_the_payload_override_reasoning_effort",
+          "codex::translated::tests::an_empty_upstream_is_not_a_cancellation",
+          "codex::translated::tests::an_observed_terminal_event_is_not_a_cancellation",
+          "codex::translated::tests::an_observed_upstream_failure_is_never_a_cancellation",
+          "codex::translated::tests::an_unfinished_stream_dropped_records_one_cancellation",
+          "codex_ambiguous::tests::any_occurrence_of_a_repeated_member_counts",
+          "codex_ambiguous::tests::body_error_occurrences_and_their_ancestors_are_read",
+          "codex_ambiguous::tests::capacity_messages_composed_from_several_members_count",
+          "codex_ambiguous::tests::many_composed_pieces_are_checked_in_linear_time",
+          "codex_ambiguous::tests::many_repeated_members_are_checked_in_linear_time",
+          "codex_ambiguous::tests::no_composed_reading_of_a_repeated_member_escapes_the_check",
+          "codex_ambiguous::tests::no_reading_of_a_repeated_member_escapes_the_check",
+          "codex_ambiguous::tests::occurrences_are_the_members_the_failure_readings_read",
+          "codex_ambiguous::tests::only_a_repeated_path_is_a_repeated_member",
+          "codex_capture::tests::upgrade_url_maps_websocket_schemes",
+          "codex_client::tests::orphan_delegation_is_shared_with_api_keys",
+          "codex_client::tests::replays_go_translation_and_optimization",
+          "codex_contract::tests::every_fixture_records_its_provenance",
+          "codex_contract::tests::every_frame_is_json",
+          "codex_contract::tests::fixtures_hold_no_credentials",
+          "codex_contract::tests::frames_are_exact_slices",
+          "codex_contract::tests::manifest_and_directory_list_the_same_files",
+          "codex_event::tests::completed_identity_follows_the_completed_reading",
+          "codex_event::tests::completed_reads_as_the_pinned_struct_does",
+          "codex_event::tests::decode_accepts_exactly_what_the_pinned_event_shape_decodes",
+          "codex_event::tests::decode_keeps_numbers_of_any_size",
+          "codex_event::tests::decode_reads_the_unique_members_as_sent",
+          "codex_event::tests::last_wins_keeps_the_last_of_each_repeated_key",
+          "codex_event::tests::member_reads_the_last_key_as_value_get_does",
+          "codex_event::tests::outcome_and_accounted_follow_the_pinned_reader",
+          "codex_event::tests::pinned_view_resolves_private_values_as_the_first_party_value_does",
+          "codex_event::tests::positional_context_window_events_are_preserved_as_their_object_form",
+          "codex_event::tests::positional_frames_are_classified_by_their_members",
+          "codex_event::tests::private_tokens_count_toward_nesting_as_the_pinned_value_does",
+          "codex_event::tests::private_tokens_decode_as_the_first_party_value_does",
+          "codex_event::tests::response_ids_read_as_the_pinned_value_reads_them",
+          "codex_event::tests::the_corpus_straddles_the_recursion_limit",
+          "codex_event::tests::wrapped_frames_map_as_the_pinned_reader_maps_them",
+          "codex_event::tests::wrapped_header_values_decode_at_their_own_level",
+          "codex_identity::tests::model_overrides_cannot_set_identity_or_credentials",
+          "codex_identity::tests::operator_headers_cannot_set_identity_or_borrow_caller_credentials",
+          "codex_identity::tests::origin_follows_the_formats_not_the_claimed_client",
+          "codex_identity::tests::proxy_identity_names_this_proxy_and_its_version",
+          "codex_images::tests::direct_images_keep_the_resolved_upstream_model",
+          "codex_images::tests::form_routing_reads_model_and_stream_once",
+          "codex_images::tests::gpt_image_25_and_26_are_direct_models",
+          "codex_images::tests::one_image_is_compared_by_decimal_digits",
+          "codex_json::tests::delete_matches_sjson_comma_and_whitespace_rules",
+          "codex_json::tests::remarshal_sorts_compacts_and_escapes",
+          "codex_json::tests::set_replaces_in_place_or_appends_like_sjson",
+          "codex_json::tests::set_str_uses_go_marshal_only_when_needed",
+          "codex_live::tests::fixture_covers_error_and_panic_paths",
+          "codex_live::tests::live_requests_carry_the_proxy_identity_and_the_selected_credential",
+          "codex_live::tests::protocol_headers_keep_values_and_canonical_names",
+          "codex_live::tests::redact_sdp_follows_json_escapes_to_the_end_of_the_credential",
+          "codex_live::tests::redact_sdp_hides_ice_credentials_in_every_wrapping",
+          "codex_live::tests::redact_sdp_recognises_an_escaped_equals_sign",
+          "codex_live::tests::redact_sdp_scans_many_markers_in_one_pass",
+          "codex_live::tests::shaping_matches_go",
+          "codex_oauth::tests::abandoned_prompt_does_not_block_runtime_shutdown",
+          "codex_oauth::tests::callback_routes_match_go_listener",
+          "codex_oauth::tests::concurrent_refreshes_of_one_token_share_one_exchange",
+          "codex_oauth::tests::device_flow_polls_through_pending_and_exchanges_like_go",
+          "codex_oauth::tests::exchange_and_refresh_wire_and_results_match_go",
+          "codex_oauth::tests::existing_file_keeps_user_fields_but_never_old_tokens",
+          "codex_oauth::tests::existing_non_boolean_disabled_is_reset_like_go",
+          "codex_oauth::tests::jwt_claims_file_names_and_authorize_url_match_go",
+          "codex_oauth::tests::login_file_bytes_match_go_storage_serializer",
+          "codex_oauth::tests::pasted_callbacks_parse_like_go",
+          "codex_oauth::tests::refresh_due_uses_jwt_exp_before_metadata_and_a_96h_lead",
+          "codex_oauth::tests::refresh_patch_matches_go_executor_refresh",
+          "codex_oauth::tests::refresh_retry_policy_matches_go_attempt_counts",
+          "codex_oauth::tests::retained_results_never_block_a_new_refresh",
+          "codex_oauth::tests::token_parse_failure_keeps_go_prefix_without_the_decoder_diagnostic",
+          "codex_request::tests::chatgpt_keep_alive_is_off_unless_configured",
+          "codex_request::tests::codex_tool_integer_types_match_go",
+          "codex_request::tests::durations_follow_go_parse_duration",
+          "codex_request::tests::home_codex_is_compat_reads_the_credential_options",
+          "codex_request::tests::lite_inspection_preserves_unknown_metadata_and_requires_a_marker_type",
+          "codex_response::empty_incomplete_tests::named_reasons_are_not_silent_aborts",
+          "codex_secret::tests::a_buffered_answer_with_a_value_fails_request_scoped",
+          "codex_secret::tests::a_failure_keeps_its_classification_and_loses_its_delivery",
+          "codex_secret::tests::a_stream_drops_frames_that_carry_a_value_and_goes_on",
+          "codex_secret::tests::an_omission_is_recorded_before_the_next_item",
+          "codex_secret::tests::cookie_quotes_are_syntax_and_an_empty_quoted_cookie_matches_nothing",
+          "codex_secret::tests::every_spelling_of_the_original_bytes_counts",
+          "codex_secret::tests::non_direct_handshake_headers_are_guarded_before_limit_rendering",
+          "codex_secret::tests::values_come_from_what_the_request_carried",
+          "codex_siwc::tests::authorize_url_matches_go",
+          "codex_siwc::tests::bind_file_keeps_disk_values_and_encodes_like_go",
+          "codex_siwc::tests::exchange_sends_the_issued_client_and_validates_the_grant",
+          "codex_siwc::tests::identifier_reads_scalars_as_go_strings",
+          "codex_siwc::tests::refresh_due_matches_go_expiry_parsing",
+          "codex_siwc_bind::tests::bind_saves_the_issued_client_tokens",
+          "codex_siwc_bind::tests::siwc_bind_matches_go",
+          "codex_sse::tests::an_invalid_split_event_stays_invalid",
+          "codex_sse::tests::assembles_an_event_of_thousands_of_lines",
+          "codex_sse::tests::assembles_event_data",
+          "codex_sse::tests::bounds_an_event_to_the_line_limit",
+          "codex_sse::tests::matches_line_splitting_on_well_formed_streams",
+          "codex_tls::tests::chatgpt_client_keeps_at_most_two_idle_connections",
+          "codex_tls::tests::chatgpt_client_keeps_no_idle_connection_by_default",
+          "codex_tls::tests::chatgpt_client_multiplexes_concurrent_http2_requests",
+          "codex_tls::tests::chatgpt_client_replaces_a_connection_the_server_closed",
+          "codex_tls::tests::chatgpt_client_reuses_connections",
+          "codex_tls::tests::chatgpt_clienthello_has_no_browser_fingerprint",
+          "codex_tls::tests::chatgpt_keep_alive_switch_applies_per_request",
+          "codex_tls::tests::chatgpt_pools_are_isolated_per_proxy",
+          "codex_tls::tests::only_https_chatgpt_uses_the_chatgpt_client",
+          "codex_tokens::tests::count_tokens_matches_go",
+          "codex_tokens::tests::encodings_follow_go_model_prefixes",
+          "codex_ws::close_text_tests::close_errors_read_like_gorilla",
+          "codex_ws::deflate::tests::inflated_messages_are_bounded",
+          "codex_ws::deflate::tests::offer_and_negotiation_match_gorilla",
+          "codex_ws::deflate::tests::server_frames_read_like_gorilla",
+          "codex_ws::deflate::tests::without_agreement_frames_pass_through",
+          "codex_ws::tests::a_dial_diagnostic_stays_out_of_the_public_error",
+          "codex_ws::tests::a_global_proxy_reload_keeps_the_open_socket",
+          "codex_ws::tests::a_replacement_socket_never_inherits_the_old_sockets_model",
+          "codex_ws::tests::a_reused_socket_repeats_only_its_own_upgrade_model",
+          "codex_ws::tests::a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake",
+          "codex_ws::tests::a_socket_dropped_without_a_close_frame_reads_as_close_1006",
+          "codex_ws::tests::a_turn_activating_after_the_reader_stopped_gets_its_error",
+          "codex_ws::tests::a_write_the_upstream_never_reads_times_out",
+          "codex_ws::tests::an_abandoned_preserving_turn_leaves_no_loss_unreported",
+          "codex_ws::tests::an_abandoned_turn_keeps_its_session_until_its_observation_returns",
+          "codex_ws::tests::an_attempt_owns_only_the_socket_it_acquired",
+          "codex_ws::tests::bootstrap_overload_fails_over_without_disconnect_notice",
+          "codex_ws::tests::capture_keeps_why_a_socket_ended",
+          "codex_ws::tests::capture_labels_a_tls_dial_failure",
+          "codex_ws::tests::capture_records_a_dial_failure",
+          "codex_ws::tests::capture_records_a_refused_upgrade_as_an_http_attempt",
+          "codex_ws::tests::capture_records_an_upstream_error_event",
+          "codex_ws::tests::capture_records_websocket_turns_as_go_does",
+          "codex_ws::tests::close_1009_is_a_request_scoped_413_and_notifies",
+          "codex_ws::tests::close_1009_on_a_full_turn_channel_keeps_the_413",
+          "codex_ws::tests::closing_the_session_ends_the_kept_pick",
+          "codex_ws::tests::compressed_upstream_events_read_like_plain_ones",
+          "codex_ws::tests::continuation_without_a_socket_requires_replay",
+          "codex_ws::tests::duplex::a_failure_settles_the_response_it_names",
+          "codex_ws::tests::duplex::a_failure_waits_for_the_observed_message",
+          "codex_ws::tests::duplex::a_progress_failure_stops_client_input_during_an_observation",
+          "codex_ws::tests::duplex::a_slow_observer_does_not_hold_client_input",
+          "codex_ws::tests::duplex::a_stalled_upstream_backpressures_client_frames",
+          "codex_ws::tests::duplex::accepted_steers_awaiting_their_successor_count_toward_the_ceiling",
+          "codex_ws::tests::duplex::an_acknowledgement_for_another_response_never_reaches_the_stream",
+          "codex_ws::tests::duplex::an_interrupt_after_the_terminal_event_is_acknowledged_on_the_stream",
+          "codex_ws::tests::duplex::an_outcome_observed_when_the_consumer_leaves_still_settles",
+          "codex_ws::tests::duplex::append_is_refused_on_the_open_connection",
+          "codex_ws::tests::duplex::automatic_successor_metadata",
+          "codex_ws::tests::duplex::bootstrap_cancellation_preserves_input",
+          "codex_ws::tests::duplex::capture_records_duplex_frames",
+          "codex_ws::tests::duplex::initial_failure",
+          "codex_ws::tests::duplex::input_failure_is_a_connection_error",
+          "codex_ws::tests::duplex::later_creates_get_the_sockets_model_before_they_start",
+          "codex_ws::tests::duplex::later_creates_keep_unknown_bytes_after_a_boundary_refusal",
+          "codex_ws::tests::duplex::outstanding_and_held_creates_stay_bounded",
+          "codex_ws::tests::duplex::pinned_settings_last_only_while_a_steer_names_their_parent",
+          "codex_ws::tests::duplex::queued_create_does_not_block_subsequent_steer",
+          "codex_ws::tests::duplex::rejected_create_metadata",
+          "codex_ws::tests::duplex::released_steers_free_their_room",
+          "codex_ws::tests::duplex::siwc_creates_and_steers_pass_unchanged",
+          "codex_ws::tests::duplex::standalone_create_does_not_inherit_parent_id",
+          "codex_ws::tests::duplex::steer_frames_ignore_the_payload_rules",
+          "codex_ws::tests::duplex::steering_lifecycle",
+          "codex_ws::tests::duplex::unacknowledged_steers_stop_at_the_ceiling",
+          "codex_ws::tests::duplex::unsolicited_acceptances_stay_under_the_ceiling",
+          "codex_ws::tests::duplex_delivers_upstream_events_while_a_write_is_blocked",
+          "codex_ws::tests::each_socket_reports_its_own_loss_once",
+          "codex_ws::tests::error_frames_match_go",
+          "codex_ws::tests::explicit_status_account_errors_keep_their_status_and_are_withheld",
+          "codex_ws::tests::explicit_zero_status_is_a_notice",
+          "codex_ws::tests::failed_errors_read_as_the_pinned_error_struct",
+          "codex_ws::tests::handshake_metadata_event_carries_only_the_allowlist",
+          "codex_ws::tests::handshake_rejection_is_classified",
+          "codex_ws::tests::handshake_usage_limit_honours_model_level_cooling",
+          "codex_ws::tests::interrupt::a_buffered_turn_waits_for_the_acknowledgement_too",
+          "codex_ws::tests::interrupt::a_late_acknowledgement_never_reaches_the_next_turn",
+          "codex_ws::tests::interrupt::a_late_interrupt_on_a_closing_socket_is_rejected",
+          "codex_ws::tests::interrupt::a_rejected_interrupt_reaches_the_client_and_keeps_the_socket",
+          "codex_ws::tests::interrupt::a_socket_lost_while_waiting_for_the_acknowledgement_ends_the_turn_cleanly",
+          "codex_ws::tests::interrupt::a_zero_token_interrupted_response_is_a_normal_end",
+          "codex_ws::tests::interrupt::an_acknowledgement_after_the_terminal_event_reaches_the_turn",
+          "codex_ws::tests::interrupt::an_acknowledgement_before_the_terminal_event_passes_through",
+          "codex_ws::tests::interrupt::an_acknowledgement_for_another_response_is_dropped",
+          "codex_ws::tests::interrupt::an_interrupt_after_the_terminal_event_is_forwarded_and_acknowledged",
+          "codex_ws::tests::interrupt::an_unacknowledged_late_interrupt_returns_within_the_bound",
+          "codex_ws::tests::interrupt::an_unexplained_zero_output_incomplete_passes_unchanged_at_every_stage",
+          "codex_ws::tests::interrupt_for_a_response_finished_during_the_auth_check_goes_upstream",
+          "codex_ws::tests::interrupt_needs_a_turn_reading_on_the_socket",
+          "codex_ws::tests::large_upstream_frames_are_delivered",
+          "codex_ws::tests::late_interrupts_for_finished_responses",
+          "codex_ws::tests::live_context_window_error_reaches_a_codex_client_as_a_failure",
+          "codex_ws::tests::nested_positional_errors_are_withheld_and_relayed_as_their_struct",
+          "codex_ws::tests::notice_readings_follow_the_pinned_readers",
+          "codex_ws::tests::observers_read_first_duplicates_and_keep_raw_numbers",
+          "codex_ws::tests::pings_do_not_extend_the_idle_deadline",
+          "codex_ws::tests::pinned_account_kinds_follow_the_slots_each_frame_type_reads",
+          "codex_ws::tests::pooled_socket_keeps_the_home_pick_until_it_closes",
+          "codex_ws::tests::positional_frames_read_by_their_decoded_members",
+          "codex_ws::tests::proxy_settings_match_as_go_compares_them",
+          "codex_ws::tests::reader_failure_before_the_turn_activates_fails_the_turn",
+          "codex_ws::tests::reader_leaves_the_loss_after_a_preserved_context_failure_to_the_turn",
+          "codex_ws::tests::readings_follow_the_pinned_readers",
+          "codex_ws::tests::refused_failure_slots_are_read_for_account_safety",
+          "codex_ws::tests::returned_handshake_drops_the_model_the_proxy_rewrote",
+          "codex_ws::tests::turns_reuse_the_socket_and_close_session_releases_it",
+          "codex_ws::tests::withheld_failures_keep_their_original_frame_for_the_credential_guard",
+          "codex_ws::tests::write_errors_keep_the_message_too_big_413",
+          "codex_ws::tests::ws_url_follows_go",
+          "compaction_capsule::tests::capsules_round_trip_and_reject_tampering",
+          "device_fixture::log_capture_sees_callsites_another_thread_registered_first",
+          "go_std::tests::trim_space_is_unicode_aware",
+          "helpers::tests::refresh_due_uses_jwt_exp_before_metadata_and_lead",
+          "helpers::tests::response_headers_take_go_response_header_shape",
+          "home_replay::tests::envelopes_marshal_like_go",
+          "home_replay::tests::gated_streams_wait_for_their_writes",
+          "meta::tests::a_refused_baseline_alone_does_not_refuse_the_request",
+          "meta::tests::apply_patch_failures_end_meta_streams_like_go",
+          "meta::tests::auth_records_decode_like_go_json_unmarshal",
+          "meta::tests::creds_resolution_matches_go",
+          "meta::tests::device_flow_errors_and_slow_down_follow_go",
+          "meta::tests::empty_original_request_falls_back_to_the_payload",
+          "meta::tests::error_signals_follow_go_scopes_and_retry_hints",
+          "meta::tests::execution_matches_go_byte_for_byte",
+          "meta::tests::failed_error_body_read_is_not_classified_by_status",
+          "meta::tests::failed_login_mint_logs_no_response_body",
+          "meta::tests::file_names_and_writer_match_go",
+          "meta::tests::login_matches_go_requests_and_file",
+          "meta::tests::login_merge_skips_an_existing_file_go_cannot_decode",
+          "meta::tests::login_skips_existing_file_with_an_overwritten_overflow",
+          "meta::tests::mint_errors_follow_go",
+          "meta::tests::needs_prepare_matches_should_prepare_request_auth",
+          "meta::tests::poll_errors_use_go_partial_decoding_and_key_folding",
+          "meta::tests::prepare_remints_and_matches_go_refresh",
+          "meta::tests::remint_patch_matches_go_metadata",
+          "meta::tests::request_capture_matches_go",
+          "meta::tests::retry_hint_follows_resets_at",
+          "meta::tests::strict_error_body_read_surfaces_errors_past_the_kept_prefix",
+          "meta::tests::syntax_errors_quote_every_byte_like_go",
+          "meta::tests::usage_reports_match_go_records",
+          "meta_auth::tests::go_float_matches_strconv",
+          "meta_auth::tests::go_map_from_json_handles_the_depth_limit",
+          "meta_auth::tests::merge_skips_token_payload_and_meta_key_material",
+          "meta_codex::tests::trim_space_matches_bytes_trim_space",
+          "multipart::tests::boundary_prefix_inside_body_is_data_and_final_delimiter_is_strict",
+          "multipart::tests::header_errors_read_as_go_prints_them",
+          "multipart::tests::header_names_with_spaces_are_kept_and_controls_rejected",
+          "multipart::tests::media_type_rules",
+          "multipart::tests::reads_fields_and_files_and_writes_go_layout",
+          "multipart::tests::reads_forms_as_go_does",
+          "multipart::tests::rfc2231_filename_makes_a_file_part",
+          "oauth::tests::a_canceled_caller_stops_retrying",
+          "oauth::tests::a_late_joiner_keeps_its_own_retry_budget",
+          "oauth::tests::a_refused_refresh_keeps_only_a_known_error_code",
+          "oauth::tests::an_unreadable_refresh_answer_is_not_retried",
+          "oauth::tests::code_exchange_login_layout_and_atomic_permissions",
+          "oauth::tests::home_device_pools_match_go",
+          "oauth::tests::many_credentials_refresh_without_an_admission_limit",
+          "oauth::tests::missing_rotated_refresh_and_profile_fields_keep_saved_values",
+          "oauth::tests::pkce_and_authorize_url",
+          "oauth::tests::prepare_forces_a_refresh_outside_the_lead_window",
+          "oauth::tests::raw_oauth_token_and_inspection_header_order_and_case",
+          "oauth::tests::refresh_429_backoff_and_error_redaction",
+          "oauth::tests::refresh_lead_and_legacy_refresh_spelling",
+          "oauth::tests::refresh_rotation_preserves_identity_on_optional_profile_failure",
+          "oauth::tests::token_key_singleflight_survives_canceled_waiter",
+          "openai_payload::tests::claude_code_session_from_payload_user_id",
+          "proxy::tests::canonical_header_matches_go",
+          "proxy::tests::client_cache_is_bounded_lru",
+          "proxy::tests::effective_proxy_precedence",
+          "proxy::tests::environment_proxies_follow_go_httpproxy",
+          "proxy::tests::environment_proxy_bypasses_loopback_and_proxies_the_rest",
+          "proxy::tests::go_clients_negotiate_http2_like_go",
+          "proxy::tests::go_clients_reuse_connections",
+          "proxy::tests::lines_follow_go_bufio_scanner",
+          "proxy::tests::no_hop_is_sent_after_the_deadline",
+          "proxy::tests::proxy_parsing_scheme_mapping_and_redaction",
+          "proxy::tests::redirects_follow_go_http_client",
+          "proxy::tests::scanned_bodies_name_only_an_early_end_unexpected_eof",
+          "proxy::tests::timed_requests_send_the_same_bytes_and_report_their_stages",
+          "proxy::tests::timeout_bounds_all_redirect_hops_together",
+          "quota::tests::claude_observation_keeps_go_measured_watermarks",
+          "quota::tests::claude_signals_cap_at_64_by_name",
+          "quota::tests::latest_relevant_deadline_fractional_seconds_and_dates",
+          "quota::tests::model_shared_and_fast_entitlement_scopes",
+          "quota::tests::observations_replace_keep_advance_and_reject_like_go",
+          "quota::tests::overage_billing_resets_and_far_deadlines_are_ignored_like_go",
+          "quota::tests::overage_only_excludes_retry_after_and_unhealthy_missing_windows_do_not",
+          "readiness_tests::only_missing_identity_blocks_requests",
+          "readiness_tests::prepare_due_finds_each_providers_deadline",
+          "readiness_tests::refresh_credentials_follow_go",
+          "replay::tests::accumulator_rebuilds_blocks_and_rejects_unknown_deltas",
+          "replay::tests::execution_session_follows_claude_code_session_and_skips_caller_isolation",
+          "replay::tests::restore_replaces_only_the_matching_unsigned_assistant_turn",
+          "replay::tests::wrapper_stores_complete_content_and_clears_only_applied_errors",
+          "tls::tests::capture_both_clienthellos_against_go_source_profile",
+          "tls::tests::handshake_timeout_reads_the_root_key_and_its_legacy_spelling",
+          "tls::tests::native_client_reuses_its_connection",
+          "tls::tests::silent_handshake_fails_only_with_the_bound",
+          "tls::tests::transport_lru_bound",
+          "tokenizer::tests::each_encoding_is_built_once_and_shared",
+          "tokenizer::tests::encoders_are_built_only_here",
+          "tokens::tests::count_validation_is_request_scoped",
+          "tokens::tests::estimate_matches_independent_o200k_counts_and_excludes_images_and_controls",
+          "tokens::tests::only_exact_first_party_origin_counts_upstream",
+          "translate::tests::a_refused_baseline_alone_does_not_refuse_the_request",
+          "translate::tests::apply_patch_and_translator_failures_are_not_request_scoped",
+          "translate::tests::apply_patch_failure_at_eof_replaces_transport_error",
+          "translate::tests::native_identity_keeps_request_bytes_and_rewrites_only_a_different_model",
+          "translate::tests::nonstream_apply_patch_rejection_publishes_no_tokens",
+          "translate::tests::nonstream_buffers_sse_and_count_uses_count_transform",
+          "translate::tests::pending_frames_flush_before_a_terminal_error",
+          "translate::tests::stream_zero_many_finish_and_errors_are_terminal",
+          "upstream::tests::compression_decodes_fragmented_gzip_zstd_brotli_and_deflate",
+          "upstream::tests::declared_encodings_follow_go_decode_response_body",
+          "upstream::tests::error_body_read_is_bounded",
+          "upstream::tests::framed_stream_stops_after_first_error",
+          "upstream::tests::lifecycle_failure_is_transport_not_quota_or_request",
+          "ws_cause::tests::local_and_remote_endings_are_distinct",
+          "ws_cause::tests::socket_errors_are_labelled_from_their_types",
+          "ws_cause::tests::untyped_text_is_not_evidence",
+          "xai::tests::a_refused_baseline_alone_does_not_refuse_the_request",
+          "xai::tests::compact_keeps_a_configured_top_k",
+          "xai::tests::empty_error_body_starts_ttft_without_first_byte",
+          "xai::tests::go_reference_scenarios",
+          "xai::tests::speech_errors_keep_go_scope",
+          "xai_auth::tests::credential_file_names_match_go",
+          "xai_auth::tests::endpoint_validation_matches_go_net_url",
+          "xai_auth::tests::login_matches_go_manager_and_file_store",
+          "xai_auth::tests::metadata_strings_follow_go_fmt_sprint",
+          "xai_auth::tests::number_mismatch_never_quotes_the_value",
+          "xai_auth::tests::poll_interval_follows_go",
+          "xai_auth::tests::refresh_is_single_flighted_per_token",
+          "xai_auth::tests::refresh_matches_go_executor",
+          "xai_auth::tests::slow_down_adds_the_poll_step",
+          "xai_auth::tests::token_expiry_wraps_like_go_durations",
+          "xai_replay::tests::home_kv_replay_matches_go",
+          "xai_replay::tests::long_call_ids_shorten_like_go",
+          "xai_url::tests::a_bracket_inside_the_host_is_go_s_invalid_ip_literal",
+          "xai_url::tests::string_follows_go",
+          "xai_url::tests::transport_must_agree_with_go_on_the_authority",
+          "xai_ws::tests::a_global_proxy_reload_keeps_the_open_socket",
+          "xai_ws::tests::a_removal_during_a_turn_keeps_the_replacement_sessions_ids",
+          "xai_ws::tests::disabled_capture_keeps_no_frame",
+          "xai_ws::tests::empty_full_reset_clears_pending_compaction_replay",
+          "xai_ws::tests::missing_required_session_is_replay_without_attempt",
+          "xai_ws::tests::ping_is_answered_while_the_writer_is_held",
+          "xai_ws::tests::post_compaction_append_replays_compacted_transcript",
+          "xai_ws::tests::post_compaction_warmup_preserves_transcript",
+          "xai_ws::tests::rejected_handshake_is_an_upstream_attempt",
+          "xai_ws::tests::request_frame_runs_the_payload_rules_last",
+          "xai_ws::tests::request_frame_sets_store_and_keeps_prompt_cache_key",
+          "xai_ws::tests::terminal_error_survives_a_full_queue",
+          "xai_ws::tests::turns_match_go",
+          "xai_ws::tests::upstream_frames_reach_the_websocket_observer",
+          "xai_ws::tests::validate_compaction_response_follows_go",
+          "xai_ws::tests::websockets_enabled_for_config_api_key",
+          "xai_ws::tests::websockets_flag_follows_go",
+          "xai_ws::tests::write_error_after_message_too_big_stops_retry",
+          "xai_ws::tests::ws_url_follows_go",
+          "xai_ws::tests::xai_sockets_have_no_read_deadline"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/cpa_exec-f9dec0750b590f44",
+          "--exact",
+          "codex_contract::tests::every_fixture_records_its_provenance",
+          "codex_contract::tests::fixtures_hold_no_credentials",
+          "codex_contract::tests::frames_are_exact_slices",
+          "codex_contract::tests::manifest_and_directory_list_the_same_files"
+        ],
+        "cwd": "crates/cpa-exec",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "codex_contract::tests::every_fixture_records_its_provenance",
+          "outcome": "ok"
+        },
+        {
+          "name": "codex_contract::tests::manifest_and_directory_list_the_same_files",
+          "outcome": "ok"
+        },
+        {
+          "name": "codex_contract::tests::fixtures_hold_no_credentials",
+          "outcome": "ok"
+        },
+        {
+          "name": "codex_contract::tests::frames_are_exact_slices",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 544
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-exec",
+        "package_dir": "crates/cpa-exec",
+        "kind": "lib",
+        "kinds": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "cpa_exec",
+        "src_path": "crates/cpa-exec/src/lib.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/cpa_exec-f9dec0750b590f44",
+        "sha256": "1da08af2b383e598220dfbde5d6d2a2cfa7b7f36743beb280cc3b0ee06f81b6a"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:claude_passthrough",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "claude_passthrough",
+        "src_path": "crates/cpa-server/tests/claude_passthrough.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/claude_passthrough-ddd7ba5c2e4d0831",
+        "sha256": "0d7546c1061beae3efad6b2eca8520ec5c12bf3d74ff57a0dce58c8990b8626c"
+      },
+      "fresh_before": true,
+      "requested": [
+        "claude_messages_end_to_end",
+        "request_log_masks_upstream_credentials"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/claude_passthrough-ddd7ba5c2e4d0831",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "claude_cache_telemetry_is_final_content_free_and_observational",
+          "claude_cache_telemetry_lookup_boundaries_and_automatic_targets",
+          "claude_messages_end_to_end",
+          "request_log_masks_upstream_credentials",
+          "unregistered_and_unserved_models_follow_go_error_contracts",
+          "usage_record_names_the_conversation_and_prompt_prefix",
+          "usage_record_times_each_stage"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/claude_passthrough-ddd7ba5c2e4d0831",
+          "--exact",
+          "claude_messages_end_to_end",
+          "request_log_masks_upstream_credentials"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "request_log_masks_upstream_credentials",
+          "outcome": "ok"
+        },
+        {
+          "name": "claude_messages_end_to_end",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 5
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "claude_passthrough",
+        "src_path": "crates/cpa-server/tests/claude_passthrough.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/claude_passthrough-ddd7ba5c2e4d0831",
+        "sha256": "0d7546c1061beae3efad6b2eca8520ec5c12bf3d74ff57a0dce58c8990b8626c"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:codex_native_request",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_request",
+        "src_path": "crates/cpa-server/tests/codex_native_request.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_request-0e85caeff8fb3f6d",
+        "sha256": "75d0bb9d03f1d7b5c93ff61d59b4aff4e5c76e59cfe84a5a29748fbce727f3b6"
+      },
+      "fresh_before": true,
+      "requested": [
+        "buffered_clients_get_the_destination_contract",
+        "native_requests_and_events_pass_through_the_route_unchanged",
+        "private_and_unknown_events_reach_codex_clients",
+        "upstream_failures_reach_the_client_unchanged"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/codex_native_request-0e85caeff8fb3f6d",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "a_confidential_bootstrap_failure_hands_the_client_no_upstream_headers",
+          "a_rate_limit_failure_keeps_the_message_codex_reads_its_delay_from",
+          "a_withheld_stream_keeps_the_served_outcome_without_a_replay",
+          "a_zstd_body_reaches_the_upstream_decoded_and_unchanged",
+          "an_oauth_alias_and_the_buffered_adaptation_change_only_their_fields",
+          "buffered_answers_end_on_a_processing_error_only_at_a_clean_end",
+          "buffered_clients_get_the_destination_contract",
+          "codex_client_paths_take_the_same_native_routes",
+          "codex_request_boundary_refuses_before_the_upstream_send",
+          "compaction_passes_through_the_route_unchanged",
+          "compaction_v2_answers_pass_unchanged",
+          "decodable_events_keep_their_outcomes_on_http_responses",
+          "every_incomplete_reaches_http_clients_as_sent",
+          "http_failures_are_classified_with_the_last_repeated_key",
+          "http_logs_and_usage_records_never_keep_the_selected_credential",
+          "issue2_parallelism_and_output_replay_pass_unchanged_for_every_client",
+          "native_requests_and_events_pass_through_the_route_unchanged",
+          "native_siwc_forwards_the_client_body",
+          "operator_rules_cannot_rewrite_native_bodies",
+          "oversized_bodies_get_the_server_limit_before_the_boundary",
+          "pinned_non_terminal_events_never_end_http_responses",
+          "positional_events_classify_as_their_object_form_on_http",
+          "private_and_unknown_events_reach_codex_clients",
+          "read_on_events_end_http_responses_only_at_the_upstream_end",
+          "read_on_events_leave_http_responses_to_the_real_completion",
+          "reported_zero_and_missing_usage_pass_unchanged",
+          "responses_lite_keeps_its_body_and_marker",
+          "the_final_failure_keeps_the_upstream_status_and_body",
+          "the_selected_credential_never_reaches_a_streaming_http_client",
+          "the_selected_credential_never_reaches_an_http_answer",
+          "undecodable_upstream_events_never_end_or_fail_http_responses",
+          "unsupported_native_inputs_are_refused_before_the_send",
+          "upstream_failures_reach_the_client_unchanged"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/codex_native_request-0e85caeff8fb3f6d",
+          "--exact",
+          "buffered_clients_get_the_destination_contract",
+          "native_requests_and_events_pass_through_the_route_unchanged",
+          "private_and_unknown_events_reach_codex_clients",
+          "upstream_failures_reach_the_client_unchanged"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "private_and_unknown_events_reach_codex_clients",
+          "outcome": "ok"
+        },
+        {
+          "name": "buffered_clients_get_the_destination_contract",
+          "outcome": "ok"
+        },
+        {
+          "name": "upstream_failures_reach_the_client_unchanged",
+          "outcome": "ok"
+        },
+        {
+          "name": "native_requests_and_events_pass_through_the_route_unchanged",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 29
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_request",
+        "src_path": "crates/cpa-server/tests/codex_native_request.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_request-0e85caeff8fb3f6d",
+        "sha256": "75d0bb9d03f1d7b5c93ff61d59b4aff4e5c76e59cfe84a5a29748fbce727f3b6"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:codex_native_ws",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_ws",
+        "src_path": "crates/cpa-server/tests/codex_native_ws.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_ws-b52879d06a5eb280",
+        "sha256": "ff9100a6adf49bdac38dced0d9581b2a1ac434a04738b842d996511d673c8f13"
+      },
+      "fresh_before": true,
+      "requested": [
+        "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+        "http_fallback_is_a_separate_explicit_conversion",
+        "native_creates_and_events_pass_through_unchanged"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/codex_native_ws-b52879d06a5eb280",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "a_binary_frame_keeps_its_bytes_until_the_boundary",
+          "a_codex_turn_over_http_forwards_what_the_fallback_refused",
+          "a_continuation_needs_the_socket_that_holds_its_response",
+          "a_failed_continuation_never_fails_over",
+          "a_failover_that_ends_without_a_socket_renders_its_last_failure",
+          "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+          "a_failure_before_the_response_starts_reaches_the_client_as_sent",
+          "a_first_terminal_keeps_local_refusals_recoverable",
+          "a_first_terminal_keeps_upstream_rejections_recoverable",
+          "a_home_continuation_stays_on_its_pick_and_socket",
+          "a_home_continuation_that_cannot_stay_never_moves",
+          "a_home_cooldown_after_a_native_failure_keeps_the_frame",
+          "a_home_prewarm_before_the_first_pick_is_refused",
+          "a_later_steering_failure_that_reads_as_an_account_failure_is_withheld",
+          "a_lost_socket_logs_no_credential",
+          "a_lost_socket_never_replays_a_continuation",
+          "a_native_frame_never_depends_on_fallback_preparation",
+          "a_prewarm_reaches_upstream_and_its_continuation_stays_on_the_socket",
+          "a_prewarmed_socket_reports_its_model_on_every_later_request",
+          "a_refusal_before_any_socket_fails_with_its_own_error",
+          "a_replacement_socket_owns_its_loss_after_failover",
+          "a_retained_socket_loss_does_not_end_a_turn_served_elsewhere",
+          "a_turn_over_http_asks_for_the_event_stream_whatever_the_frame_says",
+          "a_turn_over_http_refuses_an_answer_without_an_event_stream",
+          "ambiguous_account_frames_are_withheld_under_every_duplicate_reading",
+          "ambiguous_body_errors_do_not_expose_a_pooled_account",
+          "an_alias_routes_only_the_model",
+          "an_append_is_refused_on_a_codex_connection",
+          "an_http_attempt_after_a_lost_socket_fails_with_its_own_error",
+          "an_http_turn_answers_an_interrupt_without_inventing_output",
+          "an_initial_account_failure_fails_over_while_its_socket_loss_is_reported",
+          "bootstrap_errors_use_only_the_serving_sockets_credential",
+          "compaction_v2_answers_pass_unchanged_on_websocket_turns",
+          "composed_capacity_frames_are_withheld_on_every_native_path",
+          "decoded_private_values_classify_as_the_pinned_value_reads_them",
+          "decoded_response_ids_settle_as_the_pinned_value_reads_them",
+          "each_request_on_a_reused_socket_judges_the_alias_rule_itself",
+          "each_socket_guards_the_values_its_handshake_carried",
+          "every_incomplete_reaches_websocket_clients_as_sent",
+          "explicit_status_account_errors_are_withheld_on_every_native_path",
+          "explicit_zero_status_notices_keep_the_real_completion",
+          "first_response_ends_without_created_on_a_steering_connection",
+          "handshake_metadata_reaches_each_turn_and_event_metadata_passes_unchanged",
+          "http_fallback_is_a_separate_explicit_conversion",
+          "initial_bom_does_not_hide_the_only_terminal_event_on_websocket_fallback",
+          "interrupt_then_a_new_create_follows_the_first_party_sequence",
+          "invalid_status_notices_keep_the_real_completion",
+          "keepalive_pings_only_the_client",
+          "later_responses_keep_the_socket_values_after_the_first_publishes",
+          "later_steering_account_failures_check_their_original_frame_for_the_credential",
+          "later_steering_responses_keep_refused_slots_from_the_client",
+          "later_steering_responses_never_carry_the_selected_credential",
+          "logical_context_failures_are_preserved_without_an_extra_error",
+          "logs_and_usage_records_never_keep_the_selected_credential",
+          "logs_follow_the_values_each_socket_carried",
+          "native_creates_and_events_pass_through_unchanged",
+          "nested_positional_failed_errors_classify_as_their_object_form",
+          "non_terminal_events_leave_the_record_to_the_real_completion",
+          "operator_rules_cannot_rewrite_native_frames",
+          "pinned_account_kinds_are_withheld_without_a_token",
+          "pinned_readings_decide_websocket_turns",
+          "positional_completion_events_settle_their_own_response",
+          "positional_completions_settle_their_own_response",
+          "positional_events_classify_as_their_object_form",
+          "positional_handshakes_keep_bootstrap_failover_before_delivery",
+          "positional_wrapped_status_errors_classify_as_their_object_form",
+          "private_terminal_provider_codes_classify_as_resolved",
+          "quoted_cookie_values_are_guarded_but_empty_cookies_preserve_events",
+          "read_on_events_end_websocket_turns_as_the_websocket_reader_does",
+          "refused_failure_slots_never_reach_the_client",
+          "steering_later_frames_reach_the_socket_as_sent",
+          "steering_responses_pass_unchanged_before_and_after_the_first_delta",
+          "steering_stops_forwarding_steers_at_the_ceiling",
+          "subscription_limit_headers_cannot_echo_the_selected_credential",
+          "the_exhausted_failure_reaches_the_client_as_sent",
+          "the_selected_credential_never_reaches_a_websocket_client",
+          "undecodable_events_never_end_or_fail_websocket_turns",
+          "unique_frames_reach_the_client_on_every_native_path",
+          "valid_sse_without_content_type_reaches_websocket_client",
+          "withheld_account_failures_check_their_original_frame_for_the_credential",
+          "withheld_account_failures_use_the_serving_sockets_values",
+          "withheld_frames_keep_the_served_outcome_without_a_replay"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/codex_native_ws-b52879d06a5eb280",
+          "--exact",
+          "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+          "http_fallback_is_a_separate_explicit_conversion",
+          "native_creates_and_events_pass_through_unchanged"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "http_fallback_is_a_separate_explicit_conversion",
+          "outcome": "ok"
+        },
+        {
+          "name": "native_creates_and_events_pass_through_unchanged",
+          "outcome": "ok"
+        },
+        {
+          "name": "a_failure_after_the_response_starts_reaches_the_client_as_sent",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 79
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_native_ws",
+        "src_path": "crates/cpa-server/tests/codex_native_ws.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_native_ws-b52879d06a5eb280",
+        "sha256": "ff9100a6adf49bdac38dced0d9581b2a1ac434a04738b842d996511d673c8f13"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:codex_translated",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_translated",
+        "src_path": "crates/cpa-server/tests/codex_translated.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_translated-12f0d0eb2cd242dc",
+        "sha256": "258f0d23c7907dc0414d272dcf3b25ed53a65181968a78260bc82f20ca62c397"
+      },
+      "fresh_before": true,
+      "requested": [
+        "an_upstream_error_keeps_its_message",
+        "chat_round_trips_keep_meaning",
+        "claude_round_trips_keep_meaning"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/codex_translated-12f0d0eb2cd242dc",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "a_home_pick_takes_the_translated_route",
+          "an_upstream_error_keeps_its_message",
+          "chat_round_trips_keep_meaning",
+          "claude_round_trips_keep_meaning",
+          "claude_without_thinking_gets_no_reasoning_default",
+          "converted_controls_are_checked_by_value",
+          "direct_images_are_not_rewritten",
+          "failed_tool_results_are_refused",
+          "generation_controls_map_or_are_refused",
+          "long_call_ids_stay_unchanged",
+          "nested_content_is_kept_or_refused",
+          "operator_rules_cannot_rewrite_translated_bodies",
+          "tool_schemas_keep_their_constraints",
+          "translated_duplicate_tier_keeps_valid_cache_identity",
+          "unexpressible_content_is_refused_before_the_send"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/codex_translated-12f0d0eb2cd242dc",
+          "--exact",
+          "an_upstream_error_keeps_its_message",
+          "chat_round_trips_keep_meaning",
+          "claude_round_trips_keep_meaning"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "an_upstream_error_keeps_its_message",
+          "outcome": "ok"
+        },
+        {
+          "name": "claude_round_trips_keep_meaning",
+          "outcome": "ok"
+        },
+        {
+          "name": "chat_round_trips_keep_meaning",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 12
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "codex_translated",
+        "src_path": "crates/cpa-server/tests/codex_translated.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/codex_translated-12f0d0eb2cd242dc",
+        "sha256": "258f0d23c7907dc0414d272dcf3b25ed53a65181968a78260bc82f20ca62c397"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:management",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "management",
+        "src_path": "crates/cpa-server/tests/management.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/management-7a1f430637d95a27",
+        "sha256": "4fb226b62e1e9948cb0321371bbeb13d91a072bb0172cd88c433fa6945e52d1d"
+      },
+      "fresh_before": true,
+      "requested": [
+        "management_writes_refuse_a_plugins_section",
+        "retired_plugin_routes_answer_gone_behind_the_guard"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/management-7a1f430637d95a27",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "a_codex_save_refuses_a_disk_subtree_its_loader_cannot_read",
+          "a_finished_login_never_waits_for_the_disk_lock_on_a_runtime_worker",
+          "a_panicking_login_worker_fails_the_session",
+          "a_v0_write_over_a_file_with_an_invalid_catalog_source_is_refused",
+          "api_call_head_does_not_negotiate_gzip",
+          "claude_login_completes_from_a_posted_redirect_url",
+          "claude_login_removes_the_legacy_file_only_after_the_store_has_the_new_one",
+          "codex_login_completes_through_the_main_listener_callback",
+          "codex_passive_quota_snapshots_appear_in_credential_entries",
+          "config_api_keys_become_scheduled_credentials_on_write_and_reload",
+          "config_key_field_patch_is_not_found",
+          "config_key_toggle_edits_only_the_target_key_in_the_current_file",
+          "config_reloads_never_publish_a_value_older_than_a_save",
+          "config_shared_upstream_round_trip",
+          "config_v8_field_updates_keep_comments",
+          "config_v8_historical_configuration_bodies",
+          "config_v8_historical_field_paths",
+          "config_v8_historical_provider_subtrees",
+          "config_writes_honour_if_match_against_the_file_etag",
+          "config_writes_render_json_values_as_block_yaml",
+          "credential_excluded_models_take_priority_over_the_global_list",
+          "credential_models_come_from_registrations",
+          "excluded_models_writes_are_validated",
+          "fallback_with_relative_auth_dir_is_retired_once_synthesized",
+          "fields_refuses_values_its_auth_loader_cannot_read",
+          "file_credential_prefix_patch_refreshes_the_registry",
+          "github_token_stays_out_of_the_v0_config_json",
+          "json_numbers_in_string_settings_keep_their_text",
+          "latest_version_is_anonymous_cached_and_explicit",
+          "latest_version_keeps_tls_verification_through_proxy",
+          "latest_version_uses_configured_and_environment_proxies",
+          "legacy_migration_with_shared_upstream_moves_keeps_other_comments",
+          "management_bodies_are_unbounded_but_the_open_callback_is_not",
+          "management_writes_refuse_a_codex_is_compat_model",
+          "management_writes_refuse_a_plugins_section",
+          "model_catalog_sources_survive_a_legacy_save",
+          "model_definitions_match_go_by_channel",
+          "nonlocal_socket_requires_allow_remote_even_with_a_valid_key",
+          "plaintext_secret_loads_from_a_read_only_config_and_inherited_keys",
+          "polling_publishes_owner_legacy_layout_and_ignores_non_auth_directories",
+          "real_http_config_rejections_comments_publication_and_panel_assets",
+          "remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserves_source",
+          "removed_oauth_maps_refuse_writes_and_keep_the_running_config_on_reload",
+          "removed_provider_operations_fail_and_codex_exchange_errors_read_like_go",
+          "retired_plugin_routes_answer_gone_behind_the_guard",
+          "retired_quota_probe_refuses_load_upload_and_field_edits",
+          "runtime_credential_delete_spares_same_named_file",
+          "runtime_credential_disable_clears_its_cooldowns",
+          "served_app_keeps_api_and_management_no_route_rules",
+          "siwc_binding_flows_follow_go",
+          "siwc_only_codex_credentials_refresh_by_name_and_in_bulk",
+          "typed_secret_keys_are_hashed_as_the_string_they_decode_to",
+          "unreadable_auth_dir_never_blocks_secret_rotation_or_removal",
+          "usage_live_observes_without_taking_records_from_the_queue",
+          "usage_queue_pops_records_in_order",
+          "v0_config_yaml_saves_by_submitted_version",
+          "v0_legacy_saves_expand_merges_and_hash_the_key",
+          "v0_oauth_status_and_session_routes_answer_without_plugins",
+          "v0_setters_keep_a_legacy_layout",
+          "v0_setters_save_v8_files_in_the_latest_layout",
+          "v0_writes_keep_binary_values",
+          "v8_api_keys_carry_auth_indexes_and_writes_drop_them",
+          "v8_views_write_floats_as_go",
+          "v8_yaml_upload_keeps_string_settings_written_as_numbers",
+          "watcher_keeps_last_good_config_and_reconciles_disabled_deleted_and_self_writes",
+          "watcher_reconciles_auth_while_the_config_file_is_missing",
+          "writes_normalize_only_what_they_touch",
+          "xai_login_polls_the_device_flow_and_saves_the_credential"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/management-7a1f430637d95a27",
+          "--exact",
+          "management_writes_refuse_a_plugins_section",
+          "retired_plugin_routes_answer_gone_behind_the_guard"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "management_writes_refuse_a_plugins_section",
+          "outcome": "ok"
+        },
+        {
+          "name": "retired_plugin_routes_answer_gone_behind_the_guard",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 66
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "management",
+        "src_path": "crates/cpa-server/tests/management.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/management-7a1f430637d95a27",
+        "sha256": "4fb226b62e1e9948cb0321371bbeb13d91a072bb0172cd88c433fa6945e52d1d"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:retained_providers",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "retained_providers",
+        "src_path": "crates/cpa-server/tests/retained_providers.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/retained_providers-972ae07d16e7ee6f",
+        "sha256": "bdff756986fe9827488a3758a254e4c04aec686efe722d1db4f53bad4e0ffffc"
+      },
+      "fresh_before": true,
+      "requested": [
+        "meta_chat_completions_http_and_stream",
+        "meta_messages_http_and_stream",
+        "meta_responses_http_and_stream",
+        "plugin_settings_stay_refused",
+        "removed_provider_routes_settings_and_models_stay_refused",
+        "the_semantic_checks_reject_a_mutated_capture",
+        "upstream_rate_limits_keep_their_status",
+        "xai_chat_completions_http_and_stream",
+        "xai_messages_http_and_stream",
+        "xai_responses_http_and_stream"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/retained_providers-972ae07d16e7ee6f",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "meta_chat_completions_http_and_stream",
+          "meta_messages_http_and_stream",
+          "meta_responses_http_and_stream",
+          "plugin_settings_stay_refused",
+          "removed_provider_routes_settings_and_models_stay_refused",
+          "the_semantic_checks_reject_a_mutated_capture",
+          "upstream_rate_limits_keep_their_status",
+          "xai_chat_completions_http_and_stream",
+          "xai_messages_http_and_stream",
+          "xai_responses_http_and_stream"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/retained_providers-972ae07d16e7ee6f",
+          "--exact",
+          "meta_chat_completions_http_and_stream",
+          "meta_messages_http_and_stream",
+          "meta_responses_http_and_stream",
+          "plugin_settings_stay_refused",
+          "removed_provider_routes_settings_and_models_stay_refused",
+          "the_semantic_checks_reject_a_mutated_capture",
+          "upstream_rate_limits_keep_their_status",
+          "xai_chat_completions_http_and_stream",
+          "xai_messages_http_and_stream",
+          "xai_responses_http_and_stream"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "plugin_settings_stay_refused",
+          "outcome": "ok"
+        },
+        {
+          "name": "removed_provider_routes_settings_and_models_stay_refused",
+          "outcome": "ok"
+        },
+        {
+          "name": "the_semantic_checks_reject_a_mutated_capture",
+          "outcome": "ok"
+        },
+        {
+          "name": "meta_chat_completions_http_and_stream",
+          "outcome": "ok"
+        },
+        {
+          "name": "xai_chat_completions_http_and_stream",
+          "outcome": "ok"
+        },
+        {
+          "name": "meta_responses_http_and_stream",
+          "outcome": "ok"
+        },
+        {
+          "name": "xai_responses_http_and_stream",
+          "outcome": "ok"
+        },
+        {
+          "name": "upstream_rate_limits_keep_their_status",
+          "outcome": "ok"
+        },
+        {
+          "name": "xai_messages_http_and_stream",
+          "outcome": "ok"
+        },
+        {
+          "name": "meta_messages_http_and_stream",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 0
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "retained_providers",
+        "src_path": "crates/cpa-server/tests/retained_providers.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/retained_providers-972ae07d16e7ee6f",
+        "sha256": "bdff756986fe9827488a3758a254e4c04aec686efe722d1db4f53bad4e0ffffc"
+      },
+      "fresh_after": true
+    },
+    {
+      "package": "cpa-server",
+      "target": "test:routes",
+      "artifact": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "routes",
+        "src_path": "crates/cpa-server/tests/routes.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/routes-6b0fa4cf200ee891",
+        "sha256": "c9acf06b12d2d50ec85ebfb58f5407b9d4c98c88f044882aa214d00942d83f7b"
+      },
+      "fresh_before": true,
+      "requested": [
+        "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+        "mid_stream_failure_ends_with_route_error_frame"
+      ],
+      "listing": {
+        "command": [
+          "target/debug/deps/routes-6b0fa4cf200ee891",
+          "--list"
+        ],
+        "cwd": "crates/cpa-server",
+        "exit": 0,
+        "timeout": false,
+        "names": [
+          "a_siwc_map_never_refreshes_a_claude_credential_after_401",
+          "anthropic_model_list_cloaking_reads_the_shared_setting",
+          "bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload",
+          "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+          "config_models_alias_and_force_mapping_reach_upstream_and_client",
+          "cooling_selection_waits_for_the_next_retry_round",
+          "count_tokens_home_401s_record_the_home_client_key",
+          "empty_stream_fails_over_and_reports_empty_stream",
+          "expired_token_is_used_then_refreshed_once_after_401",
+          "failover_stop_rules_and_cooldown_contracts",
+          "legacy_completions_convert_both_ways",
+          "mid_stream_failure_ends_with_route_error_frame",
+          "misc_routes_match_go",
+          "nonstream_keepalive_commits_like_go",
+          "passthrough_headers_follow_go",
+          "response_framing_follows_go_net_http",
+          "responses_route_prepares_codex_orphan_delegation",
+          "route_path_uses_gin_templates",
+          "session_turns_honour_pin_callback_and_session",
+          "usage_queue_records_every_attempt",
+          "wrong_methods_are_gin_no_route"
+        ]
+      },
+      "execution": {
+        "command": [
+          "target/debug/deps/routes-6b0fa4cf200ee891",
+          "--exact",
+          "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+          "mid_stream_failure_ends_with_route_error_frame"
+        ],
+        "cwd": "crates/cpa-server",
+        "isolation": "ui/scripts/isolated.sh",
+        "exit": 0,
+        "timeout": false
+      },
+      "results": [
+        {
+          "name": "chat_completions_translate_and_stream_upstream_for_non_stream_clients",
+          "outcome": "ok"
+        },
+        {
+          "name": "mid_stream_failure_ends_with_route_error_frame",
+          "outcome": "ok"
+        }
+      ],
+      "summary": {
+        "result": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 19
+      },
+      "summary_lines": 1,
+      "status": "pass",
+      "problems": [],
+      "missing": [],
+      "failed": [],
+      "ignored": [],
+      "not_run": [],
+      "output_tail": "",
+      "artifact_after": {
+        "package": "cpa-server",
+        "package_dir": "crates/cpa-server",
+        "kind": "test",
+        "kinds": [
+          "test"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "routes",
+        "src_path": "crates/cpa-server/tests/routes.rs",
+        "profile_test": true,
+        "executable": "target/debug/deps/routes-6b0fa4cf200ee891",
+        "sha256": "c9acf06b12d2d50ec85ebfb58f5407b9d4c98c88f044882aa214d00942d83f7b"
+      },
+      "fresh_after": true
+    }
+  ]
+}
