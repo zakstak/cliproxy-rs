@@ -494,6 +494,7 @@
           "fields": {
             "model-level-cooling": "bool",
             "tool-search": "bool",
+            "server-side-fallback": "bool",
             "session-date-pin-days": {
               "optional": "int"
             },

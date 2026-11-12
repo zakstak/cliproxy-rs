@@ -65,6 +65,8 @@ const PATHS: &[(&str, &str)] = &[
     // Go walks the declared fields of ClaudeConfig and ClaudeCode.
     ("claude.model-level-cooling", "upstream.claude.model-level-cooling"),
     ("claude.tool-search", "upstream.claude.tool-search"),
+    // Go v8.0.67 fa11a573 declares this ClaudeConfig field too.
+    ("claude.server-side-fallback", "upstream.claude.server-side-fallback"),
     ("claude.session-date-pin-days", "upstream.claude.session-date-pin-days"),
     (
         "claude-code.disable-cloaking-model-list",

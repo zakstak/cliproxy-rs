@@ -382,6 +382,16 @@ pub(crate) fn details(old_cfg: &Config, new_cfg: &Config) -> Vec<String> {
             "panel-github-repository": if crate::gojson::trim(&m.panel_github_repository).is_empty() { "https://github.com/router-for-me/Cli-Proxy-API-Management-Center" } else { crate::gojson::trim(&m.panel_github_repository) },
             "base-url": cfg.document.get("management").and_then(|m| m.get("base-url")).and_then(serde_yaml_ng::Value::as_str).unwrap_or_default(),
         });
+        // Go v8.0.67 (fa11a573) adds this ClaudeConfig field; the legacy view keeps
+        // its v8.0.35 shape, so the reload summary reads it from the document.
+        let fallback = cfg
+            .document
+            .get("upstream")
+            .and_then(|u| u.get("claude"))
+            .and_then(|c| c.get("server-side-fallback"))
+            .and_then(serde_yaml_ng::Value::as_bool)
+            .unwrap_or(false);
+        view["claude"]["server-side-fallback"] = fallback.into();
         view
     };
     let (old, new) = (view(old_cfg, true), view(new_cfg, false));
@@ -438,6 +448,7 @@ pub(crate) fn details(old_cfg: &Config, new_cfg: &Config) -> Vec<String> {
         ("client.codex.optimize-multi-agent-v2", 'b'),
         ("codex.orphan-delegation-compatibility", 'b'),
         ("claude.tool-search", 'b'),
+        ("claude.server-side-fallback", 'b'),
         ("xai.inject-x-search", 'b'),
         ("codex.live-media-relay.enabled", 'b'),
         ("codex.live-media-relay.max-sessions", 'i'),

@@ -4,6 +4,7 @@
 
 use crate::{
     Error, ResponseCtx,
+    claude_fallback::FallbackChain,
     common::{self, now_unix},
     stream::GoStream,
 };
@@ -90,6 +91,9 @@ pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
 #[derive(Default)]
 struct State {
     model: Vec<u8>,
+    /// The model a server-side fallback switched to (#71), reported from then on.
+    served: Option<Vec<u8>>,
+    fallbacks: FallbackChain,
     id: Vec<u8>,
     created: i64,
     usage: Usage,
@@ -105,14 +109,19 @@ impl GoStream for State {
 }
 
 impl State {
+    /// The requested model, or the model a fallback switched to.
+    fn chunk_model(&self) -> &[u8] {
+        self.served.as_deref().unwrap_or(&self.model)
+    }
+
     fn convert(&mut self, line: &[u8]) -> Option<Vec<u8>> {
         let payload = data_payload(line)?;
         let root = gj::parse(payload);
         let mut out =
             br#"{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":null}]}"#
                 .to_vec();
-        if !self.model.is_empty() {
-            gj::set_str(&mut out, "model", &self.model);
+        if !self.chunk_model().is_empty() {
+            gj::set_str(&mut out, "model", self.chunk_model());
         }
         if !self.id.is_empty() {
             gj::set_str(&mut out, "id", &self.id);
@@ -127,6 +136,8 @@ impl State {
                 if message.exists() {
                     self.id = message.get("id").bytes().into_owned();
                     self.created = now_unix();
+                    self.served = None;
+                    self.fallbacks = FallbackChain::default();
                     gj::set_str(&mut out, "id", &self.id);
                     gj::set_str(&mut out, "model", &self.model);
                     gj::set_int(&mut out, "created", self.created);
@@ -138,6 +149,18 @@ impl State {
             }
             "content_block_start" => {
                 let block = root.get("content_block");
+                if block.get("type").str() == "fallback" {
+                    let from = self.chunk_model().to_vec();
+                    let (served, recorded) = self.fallbacks.block(&block, &from, None);
+                    if let Some(served) = served {
+                        gj::set_str(&mut out, "model", &served);
+                        self.served = Some(served);
+                    } else if !recorded {
+                        return None;
+                    }
+                    self.fallbacks.write(&mut out, "choices.0.delta.");
+                    return Some(out);
+                }
                 if block.get("type").str() == "tool_use" {
                     let tool = Tool {
                         id: block.get("id").bytes().into_owned(),
@@ -196,6 +219,14 @@ impl State {
                 }
                 let usage = root.get("usage");
                 if usage.exists() {
+                    let (served, added) = self.fallbacks.iterations(&usage.get("iterations"), &self.model, None);
+                    if let Some(served) = served {
+                        gj::set_str(&mut out, "model", &served);
+                        self.served = Some(served);
+                    }
+                    if added {
+                        self.fallbacks.write(&mut out, "choices.0.delta.");
+                    }
                     self.usage.merge(&usage);
                     self.usage.write(&mut out);
                 }
@@ -211,8 +242,8 @@ impl State {
                 if !self.id.is_empty() {
                     gj::set_str(&mut out, "id", &self.id);
                 }
-                if !self.model.is_empty() {
-                    gj::set_str(&mut out, "model", &self.model);
+                if !self.chunk_model().is_empty() {
+                    gj::set_str(&mut out, "model", self.chunk_model());
                 }
                 if self.created > 0 {
                     gj::set_int(&mut out, "created", self.created);
@@ -237,7 +268,7 @@ impl State {
 
 /// Buffered Claude SSE (the executor streams upstream for non-Claude clients) to one
 /// chat.completion.
-pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     let (body, _) = common::claude_messages_json_to_sse(body);
     let body = &*body;
     let mut out = br#"{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#.to_vec();
@@ -249,6 +280,7 @@ pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     let mut reasoning: Option<Vec<u8>> = None;
     let mut usage = Usage::default();
     let mut tools: BTreeMap<i64, Tool> = BTreeMap::new();
+    let mut fallbacks = FallbackChain::default();
     for line in body.split(|&c| c == b'\n') {
         let Some(payload) = data_payload(line) else {
             continue;
@@ -267,6 +299,14 @@ pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
             }
             "content_block_start" => {
                 let block = root.get("content_block");
+                if block.get("type").str() == "fallback" {
+                    // Go's boundary: the UTF-8 byte length of the content before the hop.
+                    let from = if model.is_empty() { ctx.model.as_bytes() } else { &model }.to_vec();
+                    let offset = Some(("content_offset", content.len() as i64));
+                    if let (Some(served), _) = fallbacks.block(&block, &from, offset) {
+                        model = served;
+                    }
+                }
                 if block.get("type").str() == "tool_use" {
                     tools.insert(
                         index,
@@ -317,6 +357,12 @@ pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
                 if root.get("delta").exists() && stop.exists() {
                     reason = stop.bytes().into_owned();
                 }
+                let iterations = root.get("usage.iterations");
+                if let (Some(served), _) =
+                    fallbacks.iterations(&iterations, ctx.model.as_bytes(), Some(("content_offset", 0)))
+                {
+                    model = served;
+                }
                 usage.merge(&root.get("usage"));
             }
             _ => {}
@@ -329,6 +375,7 @@ pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     gj::set_int(&mut out, "created", created);
     gj::set_str(&mut out, "model", &model);
     gj::set_str(&mut out, "choices.0.message.content", &content);
+    fallbacks.write(&mut out, "choices.0.message.");
     if let Some(reasoning) = reasoning {
         gj::set_str(&mut out, "choices.0.message.reasoning_content", &reasoning);
     }
