@@ -50,7 +50,7 @@ use cpa_core::format::Format;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
-use super::{Read, Reading, Turn, Upstream, transport};
+use super::{Authority, Read, Reading, Turn, Upstream, transport};
 use crate::codex_request::View;
 use crate::rawjson;
 
@@ -336,10 +336,16 @@ struct Outgoing {
 }
 
 /// The network half of Go's writer goroutine: frames in order, each after the live
-/// account check (`WebsocketAuthEnabled`) right before `writeCodexWebsocketMessage`.
+/// account check (`WebsocketAuthEnabled`) right before `writeCodexWebsocketMessage`. The
+/// client authority admits each write once the socket is ready to take it
+/// ([`super::write_phases`], N1 #111 W2): a frame admitted while the client's key was
+/// accepted is not written once it no longer is, however long it waited in this queue or
+/// for the socket. The stream then ends with the refusal, as it does for a disabled
+/// account.
 async fn write_loop(
     conn: Arc<Upstream>,
     input: Arc<SteeringInput>,
+    authority: Option<Arc<Authority>>,
     credential: String,
     wire: crate::codex_capture::Wire,
     mut queue: mpsc::Receiver<Outgoing>,
@@ -348,8 +354,11 @@ async fn write_loop(
         if !(input.enabled)(&credential) {
             return Err(local("websocket credential is no longer enabled"));
         }
+        // The capture records the frame the writer attempts, as before the write.
         wire.ws_frame(&conn.target.url, frame.as_bytes());
-        conn.send(frame).await?;
+        conn.send_authorized(frame, authority.as_deref())
+            .await
+            .map_err(|failure| failure.error)?;
     }
     Ok(())
 }
@@ -395,6 +404,7 @@ impl Duplex {
         let writer = tokio::spawn(write_loop(
             turn.conn.clone(),
             input.clone(),
+            turn.session.authority(),
             view.credential.id.clone(),
             turn.wire.clone(),
             queue,
@@ -835,6 +845,13 @@ impl Duplex {
             // A fresh connection can select an enabled credential; this frame is neither
             // sent on a disabled account nor replayed elsewhere.
             self.fail(local("websocket credential is no longer enabled"));
+            return;
+        }
+        if let Some(refusal) = self.turn.session.refusal() {
+            // The client's key no longer has authority (N1 #111 W2): this frame is not
+            // sent, the client gets the refusal, and the connection stays open, as Go
+            // rejects a duplex turn (`AuthorizeWebsocketTurn`).
+            self.outbox.push_back(Ok(refusal.event));
             return;
         }
         // The native route reads client frames through the request boundary: strict

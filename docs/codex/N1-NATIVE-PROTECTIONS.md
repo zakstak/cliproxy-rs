@@ -78,6 +78,54 @@ cites a first-party Codex source as a requirement. The orchestrator decides rout
 | W2 | `n1_witness_a_revoked_client_key_admits_no_later_turn` | Go v8.0.67 `b9bb031d`, `3e7a21e2` | A revoked client key keeps its open connection. | Reauthorize each turn against the bound principal, and decide the refusal frame and close behavior. Client keys are not a Codex payload concern. A difference entry is needed either way. |
 | W3 | `n1_witness_moderation_metadata_keeps_bootstrap_failover` | Go v8.0.67 `9e79552f`, upstream capture from 2026-10-21 (Go issue #6856) | Under `stream-bootstrap-buffering`, an overload after `response.metadata` leaks to the client. | Holding a frame changes no bytes. The pinned client reads `response.metadata` headers (`sse/responses.rs:193-222`), so held metadata must still be delivered in order. |
 
+### Disposition in the safety-fix branch
+
+The table and the witnesses above are the audit as reviewed at `0e8463bd` (PR #130). The
+dependent branch `opus/n1-safety-fixes` implements the three missing protections. The
+audit evidence above keeps its original limits: author runs, local mocks, no live
+provider proof.
+
+| ID | Fix | Regression tests (local mocks, author runs) |
+| --- | --- | --- |
+| W1 | Writes report whether the frame provably never left (`codex_ws::WriteFailure`). A read loss after a successful write, and a write that may be partial, are request-scoped (`codex_ws::uncertain`): no failover, no cooldown. The client closes as on any lost socket. Only a provably unsent frame is retried once on a fresh socket. | `codex_native_ws::an_uncertain_loss_is_never_replayed_on_another_account`; `codex_ws::tests::only_refusals_before_queueing_prove_a_write_unsent`, `a_socket_whose_loss_was_recorded_is_not_written`, `an_uncertain_loss_is_request_scoped_and_otherwise_unchanged`; reworked `a_write_the_upstream_never_reads_times_out`, `a_send_retried_on_a_fresh_socket_returns_that_sockets_handshake`, `a_replacement_socket_never_inherits_the_old_sockets_model` |
+| W2 | `websocket::ClientAuthority` re-runs the upgrade's client-key check for every turn, interrupt and duplex frame. The executor session holds it (`codex_ws::Authority`), so it is checked again right before each write. The bound principal is never replaced. | `codex_native_ws::a_revoked_client_key_admits_no_later_send_on_a_reused_socket`, `a_create_queued_before_revocation_is_refused_when_it_would_be_sent`, `a_revoked_client_key_cannot_interrupt`, `another_accepted_key_never_replaces_the_bound_principal`; `codex_duplex::tests::a_revoked_client_cannot_send_a_later_create_and_stays_connected`, `a_create_admitted_before_revocation_is_not_written_after_it` |
+| W3 | `codex_response::bufferable` holds `response.metadata`. | `codex_native_ws::bootstrap_buffering_holds_response_metadata_and_releases_it_in_order`, `codex_native_request::bootstrap_buffering_holds_response_metadata_on_http`, `codex_response::bufferable_tests::response_metadata_is_held_and_output_is_not` |
+
+An independent review of the first fix head (`d6426b32`) found four more defects, fixed in
+the same branch:
+
+- Authority was checked before the write waited for the socket. It is now decided at
+  write admission (`codex_ws::write_phases`), after the sink lock, readiness and earlier
+  flushes, for creates, duplex frames and interrupts.
+- The WebSocket HTTP fallback never checked the authority. It now checks before each
+  attempt dials and again when the HTTP client takes the body (`proxy::GatedBody`).
+  A review of `5055503b` showed that the body check comes after HTTP/2 HEADERS are
+  submitted. At that head, a key revoked during a fresh HTTP/2 dial let one HEADERS frame
+  reach the upstream, and a gated request on a busy pooled HTTP/2 connection queued its
+  HEADERS there; the earlier zero-byte evidence covered HTTP/1.1 only. Gated attempts now
+  dial a connection of their own and are admitted when that dial completes, before any
+  HTTP byte (`proxy::admit_dials`, `codex_tls::Transport::admitting_for_url`). Over TLS
+  with HTTP/2 or HTTP/1.1, a refusal sends no HEADERS, DATA or HTTP/1.1 byte
+  (`codex::tests::a_key_revoked_during_the_dial_sends_no_request_headers`,
+  `a_gated_request_never_queues_headers_on_a_busy_pooled_http2_connection`).
+- The native HTTP route and the fallback replayed requests the upstream may have read.
+  They now track send certainty (`proxy::send_routed_certain`): only a failed connection
+  or an unsent deadline fails over.
+- The bootstrap deadline was checked only when the next frame arrived. It is now a timer
+  (`Turn::frame_until`).
+
+Regression tests: `codex_ws::tests::each_write_phase_reports_whether_the_frame_left`,
+`a_create_waiting_for_the_socket_is_refused_after_revocation`,
+`an_interrupt_waiting_for_the_socket_is_refused_after_revocation`,
+`a_key_revoked_while_an_http_turn_dials_sends_no_request`;
+`codex_duplex::tests::a_create_waiting_for_the_socket_is_refused_after_revocation`;
+`codex_native_ws::an_uncertain_http_loss_is_never_replayed_on_another_account`,
+`provably_unsent_and_rejected_http_requests_still_fail_over`,
+`a_revocation_during_an_http_attempt_stops_the_failover_attempt`,
+`held_metadata_is_released_at_the_bootstrap_deadline`,
+`metadata_beyond_the_bootstrap_bound_passes_in_order`. The translated route keeps its
+transport retry policy.
+
 ## Execution evidence
 
 | Item | Value |

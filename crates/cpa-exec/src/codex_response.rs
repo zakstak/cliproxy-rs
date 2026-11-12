@@ -440,6 +440,14 @@ pub(crate) fn empty_incomplete(payload: &str, items: usize, saw_delta: bool) -> 
 }
 
 /// `isCodexBootstrapBufferableEvent`: frames that show the client nothing yet.
+///
+/// `response.metadata` is notification metadata, not output: the pinned first-party
+/// reader takes headers, turn state, moderation, guardian and safety-buffering notices
+/// from it and reports no response content (`sse/responses.rs:213-290` and 545 at
+/// 44ccf394573c). It is held like `codex.response.metadata`, so an explicit overload after
+/// it still fails over and a failed attempt's metadata never reaches the client; a
+/// serving attempt releases the held frames unchanged and in order (N1 #111 W3; Go
+/// v8.0.67 `9e79552f` holds it too).
 pub(crate) fn bufferable(payload: &str) -> bool {
     if payload.trim().is_empty() {
         return true;
@@ -460,9 +468,12 @@ pub(crate) fn bufferable(payload: &str) -> bool {
         }
     };
     match rawjson::get(payload, "type").str() {
-        "response.created" | "response.in_progress" | "codex.rate_limits" | "codex.response.metadata" | "keepalive" => {
-            true
-        }
+        "response.created"
+        | "response.in_progress"
+        | "codex.rate_limits"
+        | "codex.response.metadata"
+        | "response.metadata"
+        | "keepalive" => true,
         "response.output_item.added" => {
             let item = rawjson::get(payload, "item");
             match item.get("type").str() {
@@ -1031,6 +1042,32 @@ mod empty_incomplete_tests {
             r#""incomplete_details":{"reason":"unknown"},"#,
         ] {
             assert!(empty_incomplete(&incomplete(details), 0, false), "{details}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bufferable_tests {
+    use super::bufferable;
+
+    /// N1 (#111) W3: notification metadata is held for bootstrap like the other
+    /// non-output events; output still releases the window.
+    #[test]
+    fn response_metadata_is_held_and_output_is_not() {
+        for held in [
+            r#"{"type":"response.metadata","response_id":"r1","sequence_number":2,"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{}}}}"#,
+            r#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ts"}}"#,
+            r#"{"type":"codex.response.metadata"}"#,
+            r#"{"type":"response.created","response":{"id":"r1"}}"#,
+        ] {
+            assert!(bufferable(held), "{held}");
+        }
+        for released in [
+            r#"{"type":"response.output_text.delta","delta":"x"}"#,
+            r#"{"type":"response.completed","response":{"id":"r1"}}"#,
+            r#"{"type":"response.metadata.unknown"}"#,
+        ] {
+            assert!(!bufferable(released), "{released}");
         }
     }
 }

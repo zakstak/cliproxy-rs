@@ -7493,3 +7493,762 @@ async fn tool_output_media_reaches_the_upstream_socket_byte_for_byte() {
         "the frame without its tag"
     );
 }
+
+// N1 (#111) safety fixes. W1: a request the upstream may already have read is never sent
+// again on another account. W3: `response.metadata` is held during bootstrap buffering.
+// W2: every send is authorized under the client key the connection was opened with.
+
+const N1_IN_PROGRESS: &str = r#"{"type":"response.in_progress","response":{"id":"resp_n1"}}"#;
+/// Prompt-moderation metadata in the shape of Go's upstream capture (Go issue #6856,
+/// `9e79552f`): Go evidence, not verified provider behaviour. The pinned client reads
+/// such a frame as `TurnModerationMetadata` (`sse/responses.rs:262-271` at 44ccf394573c).
+const N1_MODERATION: &str = r#"{"type":"response.metadata","response_id":"resp_n1","sequence_number":2,"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{"omnimod":{"protection_type":"omnimod"}}}}}"#;
+const N1_OVERLOADED: &str =
+    r#"{"type":"response.failed","response":{"id":"resp_n1","error":{"code":"server_is_overloaded","message":null}}}"#;
+
+/// How the N1 losing upstream ends its first socket after reading the create.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    Close(u16),
+    Drop,
+}
+
+/// A loopback upstream whose first socket reads the create, sends `held`, then ends as
+/// `end`; every later socket answers [`N1_CREATED`] and [`N1_DONE`]. Records every
+/// socket's bearer and frames.
+async fn losing_upstream(held: Vec<&'static str>, end: End) -> (String, Arc<std::sync::Mutex<Vec<Dialed>>>) {
+    use axum::extract::ws::{CloseFrame, Message as Upstream, WebSocketUpgrade};
+    let log = Arc::new(std::sync::Mutex::new(Vec::<Dialed>::new()));
+    let app = {
+        let log = log.clone();
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::get(move |headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade| {
+                let (log, held) = (log.clone(), held.clone());
+                async move {
+                    let dial = {
+                        let mut log = log.lock().unwrap();
+                        log.push(Dialed {
+                            bearer: headers["authorization"].to_str().unwrap().to_owned(),
+                            ..Dialed::default()
+                        });
+                        log.len() - 1
+                    };
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let Upstream::Text(text) = message else { continue };
+                            log.lock().unwrap()[dial].frames.push(text.as_str().to_owned());
+                            if dial == 0 {
+                                for frame in &held {
+                                    let _ = socket.send(Upstream::Text((*frame).into())).await;
+                                }
+                                if let End::Close(code) = end {
+                                    let _ = socket
+                                        .send(Upstream::Close(Some(CloseFrame {
+                                            code,
+                                            reason: "lost".into(),
+                                        })))
+                                        .await;
+                                }
+                                return;
+                            }
+                            for frame in [N1_CREATED, N1_DONE] {
+                                let _ = socket.send(Upstream::Text(frame.into())).await;
+                            }
+                        }
+                    })
+                }
+            }),
+        )
+    };
+    (format!("http://{}", serve(app).await), log)
+}
+
+/// N1 W1: once a create was written and the upstream read it, the upstream may run it.
+/// A loss before anything reached the client (close 1000, close 1011 or a dropped
+/// connection) ends the client connection, as any lost socket does
+/// (`docs/codex/CONTRACT.md` "Socket and account ownership"), and the create is never
+/// sent to another account: with bootstrap buffering, not even after the upstream sent
+/// `response.created` and `response.metadata`, which stay undelivered. The account is not
+/// cooled: the client's next connection is served by it.
+#[tokio::test]
+async fn an_uncertain_loss_is_never_replayed_on_another_account() {
+    for buffering in [false, true] {
+        let helds: &[&[&'static str]] = if buffering {
+            &[&[], &[N1_CREATED], &[N1_CREATED, N1_IN_PROGRESS, N1_MODERATION]]
+        } else {
+            // Without buffering an event is delivered at once: the after-delivery control.
+            &[&[]]
+        };
+        for held in helds {
+            for end in [End::Close(1000), End::Close(1011), End::Drop] {
+                let case = format!("buffering={buffering} held={} end={end:?}", held.len());
+                let (url, log) = losing_upstream(held.to_vec(), end).await;
+                let config = if buffering {
+                    "codex:\n  stream-bootstrap-buffering: true\n"
+                } else {
+                    ""
+                };
+                let proxy = proxy_with(Script::default(), config, |_| two_accounts(&url)).await;
+                let mut socket = connect(&proxy).await;
+                let first = client_frame("ws-create-first", "gpt-5.5");
+                socket.send(Message::text(first.clone())).await.unwrap();
+                let got = read(&mut socket, &TERMINAL).await;
+                assert_eq!(got.frames, Vec::<String>::new(), "{case}: nothing was delivered");
+                assert!(got.closed.is_some(), "{case}: the loss reaches the client");
+                let dialed = log.lock().unwrap().clone();
+                assert_eq!(dialed.len(), 1, "{case}: no other account was dialed: {dialed:?}");
+                assert_eq!(
+                    dialed[0].frames,
+                    std::slice::from_ref(&first),
+                    "{case}: the create was sent once"
+                );
+
+                let mut socket = connect(&proxy).await;
+                socket.send(Message::text(first.clone())).await.unwrap();
+                assert_eq!(
+                    read(&mut socket, &TERMINAL).await.frames,
+                    [N1_CREATED, N1_DONE],
+                    "{case}"
+                );
+                let dialed = log.lock().unwrap().clone();
+                assert_eq!(dialed.len(), 2, "{case}");
+                assert_eq!(dialed[1].bearer, "Bearer at-FAKE", "{case}: the account was not cooled");
+            }
+        }
+    }
+}
+
+/// N1 W3, WebSocket: under `stream-bootstrap-buffering`, an upstream `response.metadata`
+/// before an explicit `server_is_overloaded` rejection is held, so the turn still fails
+/// over, and the failed attempt's events, its metadata included, never reach the client.
+/// The serving attempt's events, its own `response.metadata` included, reach the client
+/// as sent and in order.
+#[tokio::test]
+async fn bootstrap_buffering_holds_response_metadata_and_releases_it_in_order() {
+    const SERVED_METADATA: &str = r#"{"type":"response.metadata","response_id":"resp_n1","headers":{"x-codex-turn-state":"ts-served"},"metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{}}},"future":1.50}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_n1","delta":"served"}"#;
+    let (url, log) = recording_upstream(|dial, _| {
+        if dial == 0 {
+            (vec![N1_CREATED, N1_IN_PROGRESS, N1_MODERATION, N1_OVERLOADED], false)
+        } else {
+            (vec![N1_CREATED, SERVED_METADATA, N1_IN_PROGRESS, DELTA, N1_DONE], false)
+        }
+    })
+    .await;
+    let proxy = proxy_with(
+        Script::default(),
+        "codex:\n  stream-bootstrap-buffering: true\n",
+        |_| two_accounts(&url),
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let got = read(&mut socket, &TERMINAL).await;
+    assert_eq!(
+        got.frames,
+        [N1_CREATED, SERVED_METADATA, N1_IN_PROGRESS, DELTA, N1_DONE],
+        "the serving attempt's events, exactly"
+    );
+    assert!(
+        !got.frames.iter().any(|f| f == N1_MODERATION),
+        "no failed-attempt metadata"
+    );
+    assert_eq!(got.closed, None);
+    assert_eq!(log.lock().unwrap().len(), 2, "the overload failed over");
+}
+
+/// The 401 `error` event a refused frame gets: no key in it.
+fn assert_refused(frame: &str, message: &str) {
+    let event: serde_json::Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(event["type"], "error", "{frame}");
+    assert_eq!(event["status"], 401, "{frame}");
+    assert_eq!(event["error"]["message"], message, "{frame}");
+    for key in ["client-key", "other-key"] {
+        assert!(!frame.contains(key), "{frame}");
+    }
+}
+
+/// The proxy's config with `keys` as the client keys.
+fn keyed(proxy: &Proxy, keys: &str, extra: &str) -> Config {
+    Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [{keys}]\n{extra}",
+        proxy._auth_dir.0.display()
+    ))
+    .unwrap()
+}
+
+/// N1 W2: a client key removed from `api-keys` stops the next create on a connection it
+/// opened, on the reused upstream socket of an ordinary connection and on a steering
+/// connection's duplex stream alike. The refused create reaches no upstream, the client
+/// gets a 401 `error` event that names no key, and the connection stays open: once the
+/// key is accepted again, the next create goes to the same socket as sent. An unrelated
+/// config change (another key added, the keys reordered) changes nothing.
+#[tokio::test]
+async fn a_revoked_client_key_admits_no_later_send_on_a_reused_socket() {
+    for steering in [false, true] {
+        let case = format!("steering={steering}");
+        let extra = if steering { STEERING } else { "" };
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: replies(&["sse-completed", "sse-completed", "sse-completed"]),
+                ..Script::default()
+            },
+            extra,
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let create = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(create.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "extra-key, client-key", extra)));
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}: an unrelated change keeps the connection's authority"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", extra)));
+        let refused = client_frame("ws-create-first", "gpt-5.5").replacen("List the files.", "refused", 1);
+        socket.send(Message::text(refused)).await.unwrap();
+        let got = read(&mut socket, &["error"]).await;
+        assert_eq!(got.frames.len(), 1, "{case}: {got:?}");
+        assert_refused(&got.frames[0], "Invalid API key");
+        assert_eq!(got.closed, None, "{case}: the connection stays open");
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            [create.clone(), continuation.clone()],
+            "{case}"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "client-key", extra)));
+        let again = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(again.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}"
+        );
+        assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: the same socket");
+        assert_eq!(upstream_frames(&proxy, 0), [create, continuation, again], "{case}");
+    }
+}
+
+/// A loopback upstream for the W2 barrier tests: its socket answers the first frame with
+/// [`N1_CREATED`], waits for `release`, then sends [`N1_DONE`]; it answers later frames
+/// with both at once. Records every frame.
+async fn barrier_upstream(release: Arc<tokio::sync::Notify>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    let frames = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = {
+        let frames = frames.clone();
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (frames, release) = (frames.clone(), release.clone());
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let mut first = true;
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let Upstream::Text(text) = message else { continue };
+                            frames.lock().unwrap().push(text.as_str().to_owned());
+                            let _ = socket.send(Upstream::Text(N1_CREATED.into())).await;
+                            if std::mem::take(&mut first) {
+                                // Frames the proxy forwards meanwhile are still recorded.
+                                let wait = release.notified();
+                                tokio::pin!(wait);
+                                loop {
+                                    tokio::select! {
+                                        () = &mut wait => break,
+                                        next = socket.recv() => match next {
+                                            Some(Ok(Upstream::Text(text))) => {
+                                                frames.lock().unwrap().push(text.as_str().to_owned());
+                                            }
+                                            Some(Ok(_)) => {}
+                                            _ => return,
+                                        },
+                                    }
+                                }
+                            }
+                            let _ = socket.send(Upstream::Text(N1_DONE.into())).await;
+                        }
+                    })
+                }
+            }),
+        )
+    };
+    (format!("http://{}", serve(app).await), frames)
+}
+
+/// N1 W2, queued work: a create the client sent while its previous turn ran waits in the
+/// connection's queue. The key is revoked before that turn ends; the queued create is
+/// then refused when its turn would send it, and never reaches the upstream.
+/// Deterministic: the upstream holds the first turn open until the revocation is
+/// published.
+#[tokio::test]
+async fn a_create_queued_before_revocation_is_refused_when_it_would_be_sent() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (url, frames) = barrier_upstream(release.clone()).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &url, true)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [N1_CREATED]);
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    release.notify_one();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames[0], N1_DONE, "the running turn ends as upstream sent it");
+    assert_eq!(got.frames.len(), 2, "{got:?}");
+    assert_refused(&got.frames[1], "Invalid API key");
+    assert_eq!(
+        *frames.lock().unwrap(),
+        [first],
+        "only the first create reached upstream"
+    );
+}
+
+/// N1 W2, control frames: a `response.interrupt` sent after the key was revoked reaches
+/// no upstream (and would end no local turn); the client gets the 401 event, and the
+/// running response goes on to its end.
+#[tokio::test]
+async fn a_revoked_client_key_cannot_interrupt() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (url, frames) = barrier_upstream(release.clone()).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &url, true)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [N1_CREATED]);
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    let interrupt = r#"{"type":"response.interrupt","response_id":"resp_n1","mode":"discard_partial_items"}"#;
+    socket.send(Message::text(interrupt)).await.unwrap();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames.len(), 1, "{got:?}");
+    assert_refused(&got.frames[0], "Invalid API key");
+    release.notify_one();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, [N1_DONE]);
+    assert_eq!(*frames.lock().unwrap(), [first], "the interrupt never reached upstream");
+}
+
+/// N1 W2, bound principal: a connection opened with one client key never acts as another
+/// key it also presents. When the bound key is revoked while the other stays accepted,
+/// the next create is refused as a changed credential instead of moving silently to the
+/// other key, as Go refuses a duplex turn (`3e7a21e2`).
+#[tokio::test]
+async fn another_accepted_key_never_replaces_the_bound_principal() {
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: replies(&["sse-completed", "sse-completed"]),
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    assert!(proxy.rt.publish_config(keyed(&proxy, "client-key, other-key", "")));
+    let mut socket = wreq::Client::new()
+        .websocket(format!("ws://{}/v1/responses", proxy.addr))
+        .header("authorization", "Bearer client-key")
+        .header("x-api-key", "other-key")
+        .header("user-agent", CODEX_UA)
+        .header("originator", "codex_cli_rs")
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(create.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    socket.send(Message::text(create.clone())).await.unwrap();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames.len(), 1, "{got:?}");
+    assert_refused(
+        &got.frames[0],
+        "client credential changed during the websocket stream; reconnect",
+    );
+    assert_eq!(upstream_frames(&proxy, 0), [create]);
+}
+
+// N1 (#111) review: HTTP send certainty, client authority on every HTTP attempt, and a
+// real bootstrap deadline. Codex credentials without `websockets` serve WebSocket turns
+// over HTTP (CONTRACT "WebSocket HTTP fallback"); HTTP clients take the native HTTP route.
+
+/// Two accounts on `url` without `websockets`: WebSocket turns run over HTTP.
+fn two_http_accounts(url: &str) -> Vec<Credential> {
+    two_accounts(url)
+        .into_iter()
+        .map(|mut c| {
+            c.attributes.remove("websockets");
+            c
+        })
+        .collect()
+}
+
+/// A raw HTTP/1.1 upstream: the first request is read whole, then answered with nothing
+/// (`held` false) or with headers and a `response.created` event but a body cut short
+/// (`held` true), and the connection is closed. Later requests get [`N1_DONE`]. Records
+/// each request's `Authorization` line.
+async fn losing_http_upstream(held: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let (start, length) = loop {
+                    let mut buf = [0; 4096];
+                    let n = conn.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..at]).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (at + 4, length);
+                    }
+                };
+                while bytes.len() < start + length {
+                    let mut buf = [0; 4096];
+                    let n = conn.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let head = String::from_utf8_lossy(&bytes[..start]).into_owned();
+                let bearer = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or_default()
+                    .to_owned();
+                let first = {
+                    let mut log = log.lock().unwrap();
+                    log.push(bearer);
+                    log.len() == 1
+                };
+                let (event, cut) = if first {
+                    (format!("data: {N1_CREATED}\n\n"), 999)
+                } else {
+                    (format!("data: {N1_DONE}\n\n"), 0)
+                };
+                if !first || held {
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+                        event.len() + cut
+                    );
+                    let _ = conn.write_all(answer.as_bytes()).await;
+                    let _ = conn.flush().await;
+                }
+                let _ = conn.shutdown().await;
+            });
+        }
+    });
+    (url, seen)
+}
+
+/// N1 (#111) review, HTTP: once a request was sent, a lost connection is uncertain: the
+/// upstream may have read it. Whether nothing came back or the answer broke off after a
+/// held `response.created`, the request is never sent to another account, on the
+/// WebSocket HTTP fallback and on the native HTTP route alike, with bootstrap buffering
+/// on. The WebSocket client's connection closes, as for a lost upstream socket; the HTTP
+/// client gets an error and no events. The account is not cooled.
+#[tokio::test]
+async fn an_uncertain_http_loss_is_never_replayed_on_another_account() {
+    for websocket in [true, false] {
+        for held in [false, true] {
+            let case = format!("websocket={websocket} held={held}");
+            let (url, seen) = losing_http_upstream(held).await;
+            let proxy = proxy_with(
+                Script::default(),
+                "codex:\n  stream-bootstrap-buffering: true\n",
+                |_| two_http_accounts(&url),
+            )
+            .await;
+            if websocket {
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                let got = read(&mut socket, &TERMINAL).await;
+                assert!(
+                    !got.frames.iter().any(|f| f.contains("response.completed")),
+                    "{case}: {got:?}"
+                );
+                assert!(got.closed.is_some(), "{case}: the client connection closes: {got:?}");
+            } else {
+                let answer = wreq::Client::new()
+                    .post(format!("http://{}/v1/responses", proxy.addr))
+                    .bearer_auth("client-key")
+                    .header("content-type", "application/json")
+                    .body(client_frame("http-request-full", "gpt-5.5"))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = answer.status().as_u16();
+                let body = answer.text().await.unwrap_or_default();
+                assert!(!body.contains("response.completed"), "{case}: {status} {body}");
+            }
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{case}: sent once, to one account: {seen:?}");
+            assert!(seen[0].ends_with("at-FAKE"), "{case}: {seen:?}");
+
+            // Not cooled: the next request goes to the same account.
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let _ = read(&mut socket, &TERMINAL).await;
+        }
+    }
+}
+
+/// N1 (#111) review, HTTP controls: a request that provably never left (the first
+/// account's connection is refused) and an explicit upstream rejection (a 503) still fail
+/// over to the next account, which serves the turn.
+#[tokio::test]
+async fn provably_unsent_and_rejected_http_requests_still_fail_over() {
+    let served = format!("data: {N1_CREATED}\n\ndata: {N1_DONE}\n\n");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = {
+        let (seen, served) = (seen.clone(), served.clone());
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::post(move |headers: axum::http::HeaderMap, _: Bytes| {
+                let (seen, served) = (seen.clone(), served.clone());
+                async move {
+                    let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                    seen.lock().unwrap().push(bearer.clone());
+                    if bearer.ends_with("at-FAKE") {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("content-type", "application/json")],
+                            r#"{"error":{"message":"overloaded","type":"server_error"}}"#.to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            served,
+                        )
+                    }
+                }
+            }),
+        )
+    };
+    let live = format!("http://{}", serve(app).await);
+    let refused = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    for (case, first_url) in [("refused", refused.as_str()), ("rejected", live.as_str())] {
+        seen.lock().unwrap().clear();
+        let proxy = proxy_with(Script::default(), "", |_| {
+            let mut accounts = two_http_accounts(&live);
+            accounts[0].attributes.insert("base_url".into(), first_url.into());
+            accounts
+        })
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let got = read(&mut socket, &TERMINAL).await;
+        assert_eq!(
+            got.frames,
+            [N1_CREATED, N1_DONE],
+            "{case}: the next account serves: {got:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("Bearer at-SECOND"),
+            "{case}: {seen:?}"
+        );
+    }
+}
+
+/// N1 (#111) review, W2 on HTTP: every HTTP attempt of a WebSocket turn is sent under the
+/// key the connection was opened with. Revoked while the first account's attempt is
+/// held open (a deterministic barrier), the turn's failover attempt on the next account
+/// is refused: nothing reaches that account, and the client gets the 401 refusal.
+#[tokio::test]
+async fn a_revocation_during_an_http_attempt_stops_the_failover_attempt() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let app = {
+        let (seen, arrived, release) = (seen.clone(), arrived.clone(), release.clone());
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::post(move |headers: axum::http::HeaderMap, _: Bytes| {
+                let (seen, arrived, release) = (seen.clone(), arrived.clone(), release.clone());
+                async move {
+                    let first = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(headers["authorization"].to_str().unwrap().to_owned());
+                        seen.len() == 1
+                    };
+                    if first {
+                        arrived.notify_one();
+                        release.notified().await;
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("content-type", "application/json")],
+                            r#"{"error":{"message":"overloaded"}}"#.to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            format!("data: {N1_DONE}\n\n"),
+                        )
+                    }
+                }
+            }),
+        )
+    };
+    let url = format!("http://{}", serve(app).await);
+    let proxy = proxy_with(Script::default(), "", |_| two_http_accounts(&url)).await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .unwrap();
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    release.notify_one();
+    let got = read(&mut socket, &["error", "response.completed"]).await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "no attempt after the revocation: {got:?}"
+    );
+    assert_eq!(got.frames.len(), 1, "{got:?}");
+    assert_refused(&got.frames[0], "Invalid API key");
+}
+
+/// N1 (#111) review, W3: the bootstrap window closes at its deadline, not when the next
+/// message arrives. Held `response.metadata` reaches the client unchanged once the
+/// configured 100 ms pass, while the upstream still holds the rest of the response; the
+/// rest follows as sent. Deterministic: the upstream sends the rest only after the client
+/// has the metadata.
+#[tokio::test]
+async fn held_metadata_is_released_at_the_bootstrap_deadline() {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    let release = Arc::new(tokio::sync::Notify::new());
+    let url = {
+        let release = release.clone();
+        format!(
+            "http://{}",
+            serve(axum::Router::new().route(
+                "/responses",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let release = release.clone();
+                    async move {
+                        upgrade.on_upgrade(move |mut socket| async move {
+                            let _ = socket.recv().await;
+                            let _ = socket.send(Upstream::Text(N1_CREATED.into())).await;
+                            let _ = socket.send(Upstream::Text(N1_MODERATION.into())).await;
+                            release.notified().await;
+                            let _ = socket.send(Upstream::Text(N1_DONE.into())).await;
+                            while let Some(Ok(_)) = socket.recv().await {}
+                        })
+                    }
+                }),
+            ))
+            .await
+        )
+    };
+    let proxy = proxy_with(
+        Script::default(),
+        "codex:\n  stream-bootstrap-buffering: true\n  stream-bootstrap-timeout: 100ms\n",
+        |_| vec![credential(Profile::Chatgpt, &url, true)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_secs(3), read(&mut socket, &["response.metadata"]))
+        .await
+        .expect("the held events are released at the deadline, before the upstream sends more");
+    assert_eq!(early.frames, [N1_CREATED, N1_MODERATION], "unchanged and in order");
+    release.notify_one();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, [N1_DONE]);
+}
+
+/// N1 (#111) review, W3 bounds: metadata never holds a response past the bootstrap
+/// window's frame bound (48 messages). 60 metadata events and the completion all reach
+/// the client, unchanged and in order, and nothing is lost when the window closes on the
+/// count.
+#[tokio::test]
+async fn metadata_beyond_the_bootstrap_bound_passes_in_order() {
+    let metadata: Vec<String> = (0..60)
+        .map(|i| {
+            format!(r#"{{"type":"response.metadata","response_id":"resp_n1","sequence_number":{i},"metadata":{{}}}}"#)
+        })
+        .collect();
+    let mut frames = vec![N1_CREATED.to_owned()];
+    frames.extend(metadata.iter().cloned());
+    frames.push(N1_DONE.to_owned());
+    let script: Vec<Bytes> = frames.iter().cloned().map(Bytes::from).collect();
+    let proxy = proxy_with(
+        Script {
+            ws: vec![script],
+            ..Script::default()
+        },
+        "codex:\n  stream-bootstrap-buffering: true\n",
+        |url| vec![credential(Profile::Chatgpt, url, true)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, frames);
+}

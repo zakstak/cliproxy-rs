@@ -132,6 +132,8 @@ impl CodexExecutor {
                 ErrorBody::Strict,
                 &model,
                 false,
+                false,
+                None,
             )
             .await?;
         let (status, headers) = (upstream.status, upstream.headers);

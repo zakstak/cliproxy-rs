@@ -260,6 +260,9 @@ pub struct GoClients {
     pool: Option<(usize, Option<std::time::Duration>)>,
     /// The clients tell timed requests whether they dialled ([`watch_connections`]).
     timed: bool,
+    /// The clients ask a gated request's [`Gate`] once each dial completes
+    /// ([`admit_dials`]).
+    admit: bool,
 }
 
 impl GoClients {
@@ -271,7 +274,17 @@ impl GoClients {
             http1: false,
             pool: None,
             timed: false,
+            admit: false,
         }
+    }
+
+    /// Clients for gated requests ([`send_routed_certain`]): every request dials its own
+    /// connection, and its [`Gate`] decides once that connection is up, before any HTTP
+    /// byte is written ([`admit_dials`]). Additive (N1 #111).
+    pub fn admitting(mut self) -> Self {
+        self.pool = Some((0, None));
+        self.admit = true;
+        self
     }
 
     /// Clients keeping at most `max_idle_per_host` idle connections per host (0 closes
@@ -297,6 +310,7 @@ impl GoClients {
             http1: false,
             pool: None,
             timed: false,
+            admit: false,
         }
     }
 
@@ -333,6 +347,9 @@ impl GoClients {
         let mut builder = wreq::Client::builder().redirect(wreq::redirect::Policy::none());
         if self.timed {
             builder = watch_connections(builder);
+        }
+        if self.admit {
+            builder = admit_dials(builder);
         }
         let mut builder = self.hooks.apply(builder);
         if self.http1 {
@@ -626,6 +643,37 @@ pub async fn send_routed(
     upstream(raw)
 }
 
+/// [`send_routed`], with whether a failure provably sent nothing of this request (N1
+/// #111): the connection could not be made (`wreq::Error::is_connect` and
+/// `is_proxy_connect`: DNS, TCP, TLS or proxy setup), the deadline passed before the hop was sent ([`SendError::Timeout`]), or
+/// a local error before the hop. Every other transport failure, wreq's own timeout
+/// included, may come after the upstream read the request.
+///
+/// With `gate`, each hop's body asks it when the HTTP client first takes the body:
+/// after the connection was dialled or taken from the pool, right before the request is
+/// written (see [`GatedBody`]). A closed gate sends no body; the caller learns why from
+/// its own gate.
+pub(crate) async fn send_routed_certain(
+    route: &(dyn Fn(&url::Url) -> Result<Route, ExecError> + Sync),
+    url: &str,
+    headers: GoHeaders,
+    body: Bytes,
+    gate: Option<Gate>,
+) -> Result<Upstream, (ExecError, bool)> {
+    let exchanged = exchange(route, wreq::Method::POST, url, headers, Some(body), None, true, None);
+    let raw = match gate {
+        Some(gate) => GATE.scope(gate, exchanged).await,
+        None => exchanged.await,
+    };
+    raw.map(RawUpstream::sanitized).map_err(|error| {
+        let unsent = match &error {
+            SendError::Transport { error, .. } => error.is_connect() || error.is_proxy_connect(),
+            SendError::Local { .. } | SendError::Timeout { .. } => true,
+        };
+        (sanitize(error), unsent)
+    })
+}
+
 /// [`send_routed`] for any method. `None` is Go's nil body: no body and no
 /// Content-Length (management `api-call`).
 pub async fn send_request(
@@ -884,7 +932,10 @@ async fn exchange(
         // one, so those hops report no `Connected` or `BodySent`. Watching them needs a
         // resendable watched body in wreq.
         let watched = timing.filter(|_| !go_transport || current.scheme() == "http");
-        let builder = if let (true, Some(timing)) = (sends_body, watched) {
+        let gate = GATE.try_with(Gate::clone).ok();
+        let builder = if let (true, Some(gate)) = (sends_body, gate) {
+            builder.body(wreq::Body::wrap(GatedBody::new(body.clone(), gate)))
+        } else if let (true, Some(timing)) = (sends_body, watched) {
             builder.body(wreq::Body::wrap(TimedBody::new(body.clone(), timing.clone(), sent)))
         } else if sends_body {
             builder.body(body.clone())
@@ -1145,6 +1196,129 @@ impl<S: tower::Service<R>, R> tower::Service<R> for Dialling<S> {
 fn dialled<T, E>(result: &Result<T, E>) {
     if result.is_ok() {
         let _ = DIALLED.try_with(|dialled| dialled.set(true));
+    }
+}
+
+tokio::task_local! {
+    /// The gate of the request being sent ([`send_routed_certain`]).
+    static GATE: Gate;
+}
+
+/// Whether a request may still be written: asked once, when the HTTP client first takes
+/// the body. `false` closes the request without its body.
+pub(crate) type Gate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The connection hook of the clients gated requests use ([`GoClients::admitting`] and
+/// the chatgpt.com equivalent): when a dial completes (TCP, TLS with its ALPN choice and
+/// any proxy tunnel), the request's [`Gate`] decides before the client writes any HTTP
+/// byte on it: no HTTP/2 preface, SETTINGS or HEADERS, no HTTP/1.1 request line. A closed
+/// gate fails the dial, and the connection is dropped. The connector runs in the task
+/// that sends the request, where the gate is set ([`GATE`]); requests without a gate pass
+/// unchanged. These clients keep no idle connection, so a gated request always dials its
+/// own and never waits on, or queues its headers into, a shared HTTP/2 connection. After
+/// the gate only local protocol setup precedes the request headers: the HTTP/2 preface
+/// and SETTINGS write, or the HTTP/1.1 dispatch, with no wait on the network.
+pub(crate) fn admit_dials(builder: wreq::ClientBuilder) -> wreq::ClientBuilder {
+    builder.connector_layer(AdmitDials)
+}
+
+#[derive(Clone, Copy)]
+struct AdmitDials;
+
+impl<S> tower::Layer<S> for AdmitDials {
+    type Service = Admitting<S>;
+    fn layer(&self, inner: S) -> Admitting<S> {
+        Admitting(inner)
+    }
+}
+
+#[derive(Clone)]
+struct Admitting<S>(S);
+
+impl<S, R> tower::Service<R> for Admitting<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: From<GateClosed> + Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures_util::future::BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: R) -> Self::Future {
+        let gate = GATE.try_with(Gate::clone).ok();
+        let dial = self.0.call(target);
+        Box::pin(async move {
+            let connection = dial.await?;
+            match gate {
+                Some(gate) if !gate() => Err(GateClosed.into()),
+                _ => Ok(connection),
+            }
+        })
+    }
+}
+
+/// The gate closed: the request was not sent.
+#[derive(Debug)]
+pub(crate) struct GateClosed;
+
+impl std::fmt::Display for GateClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request refused before it was written")
+    }
+}
+
+impl std::error::Error for GateClosed {}
+
+/// A request body that asks its [`Gate`] when the HTTP client first polls it. The client
+/// polls a body only once it holds a connection for the request, dialled or pooled, so
+/// the gate decides after every wait for a connection, right before the body is written.
+/// A closed gate fails the body before any of it is handed over, and the client
+/// abandons the request on that connection: the upstream gets no request body, so no
+/// request it could run. The same bytes and exact length as a plain body otherwise.
+struct GatedBody {
+    rest: Option<Bytes>,
+    gate: Option<Gate>,
+}
+
+impl GatedBody {
+    fn new(body: Bytes, gate: Gate) -> Self {
+        Self {
+            rest: Some(body),
+            gate: Some(gate),
+        }
+    }
+}
+
+impl http_body::Body for GatedBody {
+    type Data = Bytes;
+    type Error = GateClosed;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = &mut *self;
+        if let Some(gate) = this.gate.take()
+            && !gate()
+        {
+            this.rest = None;
+            return std::task::Poll::Ready(Some(Err(GateClosed)));
+        }
+        std::task::Poll::Ready(this.rest.take().map(|body| Ok(http_body::Frame::data(body))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.rest.as_ref().map_or(0, |body| body.len() as u64))
     }
 }
 
