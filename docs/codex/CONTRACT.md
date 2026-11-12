@@ -1382,6 +1382,11 @@ Follow these rules when you add a fixture:
 - Never generate a fixture by running this proxy or from a Go golden.
 - Store the bytes as they appear on the wire. Do not pretty-print a payload whose
   spelling is part of the test.
+- A fixture whose line ranges point at a researched first-party revision instead of the
+  pin sets `revision` to one of the manifest's `research` commits, and its notes say it
+  is source-refresh evidence that does not move the contract pin. Such a fixture shows
+  what a newer client can send. It changes no rule in this document
+  ([FP1-SOURCE-REFRESH.md](FP1-SOURCE-REFRESH.md)).
 
 The test helpers are:
 
