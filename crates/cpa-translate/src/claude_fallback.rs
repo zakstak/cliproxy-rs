@@ -16,6 +16,7 @@
 //! same), so that inference is not ported.
 
 use cpa_common::json::{self as gj, Res};
+use cpa_core::gostr::GoStr;
 
 /// The ordered hops of one message, as Go's `{from, to, trigger}` metadata objects.
 #[derive(Default)]
@@ -71,6 +72,10 @@ impl FallbackChain {
         if from.is_empty() {
             from = default_from.to_vec();
         }
+        if !self.explicit {
+            // Blocks are authoritative: hops derived from iterations give way.
+            self.entries.clear();
+        }
         self.explicit = true;
         let recorded = match metadata(Some(block), &from, &to, boundary) {
             Some(entry) => {
@@ -82,8 +87,18 @@ impl FallbackChain {
         ((!to.is_empty()).then_some(to), recorded)
     }
 
-    /// Go `RecordIterations`: the serving model a `fallback_message` iteration names,
-    /// and, when no block marked the hops, whether the hops it implies added entries.
+    /// The serving model a `fallback_message` iteration names and, when no block marked
+    /// the hops, whether the hops the iterations imply added entries.
+    ///
+    /// Anthropic documents a `message` entry for each declined hop and for the serving
+    /// model's earlier tool-loop iterations, and one `fallback_message` entry for the
+    /// iteration that completed the response (`beta_fallback_message_iteration_usage.py`).
+    /// So the hops run from the requested model through each other model that ran, in
+    /// order, to the serving model. The serving model's own `message` entries and
+    /// repeats of the model before are not hops, and the first model that ran is the
+    /// requested one under whatever name Anthropic reports, so an alias resolving to
+    /// another name never makes a hop. A snapshot with no more hops than the chain has
+    /// already changes nothing, so repeated usage events neither duplicate nor shorten it.
     pub(crate) fn iterations(
         &mut self,
         iterations: &Res<'_>,
@@ -93,34 +108,48 @@ impl FallbackChain {
         if !iterations.is_array() {
             return (None, false);
         }
-        let mut from = crate::common::trim_space(default_from).to_vec();
-        let mut served = None;
-        let mut hops = vec![];
+        // (type is fallback_message, model) of each entry that names a model.
+        let mut ran: Vec<(bool, Vec<u8>)> = vec![];
         iterations.each(|_, it| {
             let model = model_at(&it, "model");
-            if model.is_empty() {
-                return true;
-            }
-            match &*it.get("type").bytes() {
-                b"message" => from = model,
-                b"fallback_message" => {
-                    if !self.explicit
-                        && let Some(hop) = metadata(None, &from, &model, boundary)
-                    {
-                        hops.push(hop);
-                    }
-                    from = model.clone();
-                    served = Some(model);
-                }
-                _ => {}
+            let kind = it.get("type").bytes();
+            if !model.is_empty() && matches!(&*kind, b"message" | b"fallback_message") {
+                ran.push((&*kind == b"fallback_message", model));
             }
             true
         });
-        if served.is_none() || self.explicit || hops.len() <= self.entries.len() {
-            return (served, false);
+        let Some(served) = ran.iter().rev().find(|(fallback, _)| *fallback).map(|(_, m)| m.clone()) else {
+            return (None, false);
+        };
+        if self.explicit {
+            return (Some(served), false);
+        }
+        let mut chain = vec![crate::common::trim_space(default_from).to_vec()];
+        let mut previous: Option<&[u8]> = None;
+        for (_, model) in &ran {
+            if same_model(model, &served) {
+                continue;
+            }
+            match previous {
+                // The first model that ran is the requested one.
+                None => {}
+                Some(prev) if same_model(model, prev) => {}
+                Some(_) => chain.push(model.clone()),
+            }
+            previous = Some(model);
+        }
+        if !chain.last().is_some_and(|last| same_model(last, &served)) {
+            chain.push(served.clone());
+        }
+        let hops: Vec<Vec<u8>> = chain
+            .windows(2)
+            .filter_map(|pair| metadata(None, &pair[0], &pair[1], boundary))
+            .collect();
+        if hops.len() <= self.entries.len() {
+            return (Some(served), false);
         }
         self.entries = hops;
-        (served, true)
+        (Some(served), true)
     }
 
     pub(crate) fn latest(&self) -> Option<&[u8]> {
@@ -138,4 +167,18 @@ impl FallbackChain {
             gj::set_raw(out, &format!("{prefix}fallbacks"), all);
         }
     }
+}
+
+/// Go `ClaudeModelSameOrSnapshot`: the same model, or one is the other's eight-digit
+/// dated snapshot.
+fn same_model(a: &[u8], b: &[u8]) -> bool {
+    let lower = |m: &[u8]| String::from_utf8_lossy(crate::common::trim_space(m)).go_lower();
+    let (a, b) = (lower(a), lower(b));
+    let snapshot = |base: &str, candidate: &str| {
+        candidate
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|c| c.is_ascii_digit()))
+    };
+    !a.is_empty() && (a == b || snapshot(&a, &b) || snapshot(&b, &a))
 }

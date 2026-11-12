@@ -2566,6 +2566,11 @@ async fn server_side_fallback_is_opt_in_and_keeps_callers_fallbacks() {
     let explicit_off = Config::parse("upstream:\n  claude:\n    server-side-fallback: false\n").unwrap();
     let on = Config::parse("upstream:\n  claude:\n    server-side-fallback: true\n").unwrap();
     let legacy_on = Config::parse("claude:\n  server-side-fallback: true\n").unwrap();
+    let oauth_on = Config::parse("oauth:\n  providers:\n    claude:\n      server-side-fallback: true\n").unwrap();
+    let oauth_off_over_flat = Config::parse(
+        "claude:\n  server-side-fallback: true\noauth:\n  providers:\n    claude:\n      server-side-fallback: false\n",
+    )
+    .unwrap();
     let callers = [
         None,
         Some("[]"),
@@ -2582,6 +2587,8 @@ async fn server_side_fallback_is_opt_in_and_keeps_callers_fallbacks() {
                 ("false", &explicit_off, false),
                 ("true", &on, true),
                 ("legacy true", &legacy_on, true),
+                ("oauth true", &oauth_on, true),
+                ("oauth false over flat true", &oauth_off_over_flat, false),
             ] {
                 let fallbacks = caller.map(|f| format!(r#","fallbacks":{f}"#)).unwrap_or_default();
                 let body = format!(

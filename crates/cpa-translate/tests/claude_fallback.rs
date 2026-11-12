@@ -347,3 +347,183 @@ fn native_message_body_agrees_with_the_stream() {
     assert_eq!(body["fallback"]["trigger"], trigger);
     assert_eq!(body["fallback"]["output_index"], 0);
 }
+
+fn it(kind: &str, model: &str) -> Value {
+    json!({"type":kind,"model":model,"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0})
+}
+
+/// A message without fallback blocks whose usage arrives in one `message_delta` per
+/// `snapshots` entry, each carrying those iterations.
+fn iteration_events(snapshots: &[Value]) -> Vec<Value> {
+    let mut e = vec![start(REQUESTED)];
+    e.extend(text(0, "ok"));
+    for (i, iterations) in snapshots.iter().enumerate() {
+        let mut delta = json!({"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2,"iterations":iterations}});
+        if i + 1 == snapshots.len() {
+            delta["delta"]["stop_reason"] = json!("end_turn");
+        }
+        e.push(delta);
+    }
+    e.push(json!({"type":"message_stop"}));
+    e
+}
+
+/// Hops as (from, to).
+type Hops = Vec<(String, String)>;
+
+/// (path, serving model, hops) on each of the four translated paths.
+fn reported(events: &[Value]) -> Vec<(String, String, Hops)> {
+    let pairs = |hops: &Value| -> Hops {
+        hops.as_array()
+            .map(|a| a.iter().map(hop_models).collect())
+            .unwrap_or_default()
+    };
+    let mut out = vec![];
+    let body = buffered_sse(Format::OpenAI, events);
+    out.push((
+        "chat buffered".to_owned(),
+        body["model"].as_str().unwrap().to_owned(),
+        pairs(&body["choices"][0]["message"]["fallbacks"]),
+    ));
+    let chunks = stream(Format::OpenAI, events);
+    let last_hops = chunks
+        .iter()
+        .rev()
+        .find_map(|(_, c)| c["choices"][0]["delta"].get("fallbacks").cloned())
+        .unwrap_or(Value::Null);
+    out.push((
+        "chat stream".to_owned(),
+        chunks.last().unwrap().1["model"].as_str().unwrap().to_owned(),
+        pairs(&last_hops),
+    ));
+    let body = buffered_sse(Format::OpenAIResponse, events);
+    out.push((
+        "responses buffered".to_owned(),
+        body["model"].as_str().unwrap().to_owned(),
+        pairs(&body["fallbacks"]),
+    ));
+    let terminal = stream(Format::OpenAIResponse, events).last().unwrap().1["response"].clone();
+    out.push((
+        "responses stream".to_owned(),
+        terminal["model"].as_str().unwrap().to_owned(),
+        pairs(&terminal["fallbacks"]),
+    ));
+    out
+}
+
+fn hop_models(hop: &Value) -> (String, String) {
+    (
+        hop["from"]["model"].as_str().unwrap().to_owned(),
+        hop["to"]["model"].as_str().unwrap().to_owned(),
+    )
+}
+
+fn hops(list: &[(&str, &str)]) -> Hops {
+    list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+/// Without blocks, the hops run from the requested model through each other model that
+/// ran to the serving one. The serving model's earlier tool-loop iterations, repeated
+/// iterations of one model and the name the requested model ran under are not hops.
+#[test]
+fn iterations_without_blocks_keep_the_requested_origin() {
+    let served = "claude-opus-4-8";
+    for (label, iterations, want) in [
+        (
+            "sticky with tool loop",
+            json!([
+                it("message", served),
+                it("message", served),
+                it("fallback_message", served)
+            ]),
+            hops(&[(REQUESTED, served)]),
+        ),
+        (
+            "requested ran as a snapshot, then the serving tool loop",
+            json!([
+                it("message", "claude-opus-4-7-20260101"),
+                it("message", served),
+                it("fallback_message", served)
+            ]),
+            hops(&[(REQUESTED, served)]),
+        ),
+        (
+            "requested ran under another name",
+            json!([it("message", "claude-opus-4-7-latest"), it("fallback_message", served)]),
+            hops(&[(REQUESTED, served)]),
+        ),
+        (
+            "two transitions with repeats",
+            json!([
+                it("message", REQUESTED),
+                it("message", REQUESTED),
+                it("message", "claude-opus-5"),
+                it("message", "claude-opus-5-20260301"),
+                it("message", "claude-sonnet-4-6"),
+                it("fallback_message", "claude-sonnet-4-6")
+            ]),
+            hops(&[(REQUESTED, "claude-opus-5"), ("claude-opus-5", "claude-sonnet-4-6")]),
+        ),
+    ] {
+        let want_model = want.last().unwrap().1.clone();
+        for (path, model, got) in reported(&iteration_events(std::slice::from_ref(&iterations))) {
+            assert_eq!(model, want_model, "{label}: {path}");
+            assert_eq!(got, want, "{label}: {path}");
+        }
+    }
+}
+
+/// Repeated usage snapshots neither duplicate nor reverse the hops: a longer one
+/// extends them, the same or a shorter one changes nothing.
+#[test]
+fn repeated_iteration_snapshots_do_not_duplicate_or_reverse_hops() {
+    let one = json!([it("message", REQUESTED), it("fallback_message", "claude-opus-5")]);
+    let two = json!([
+        it("message", REQUESTED),
+        it("message", "claude-opus-5"),
+        it("fallback_message", "claude-sonnet-4-6")
+    ]);
+    let both = hops(&[(REQUESTED, "claude-opus-5"), ("claude-opus-5", "claude-sonnet-4-6")]);
+    for (label, snapshots, want) in [
+        (
+            "same twice",
+            vec![one.clone(), one.clone()],
+            hops(&[(REQUESTED, "claude-opus-5")]),
+        ),
+        ("growing", vec![one.clone(), two.clone()], both.clone()),
+        ("shrinking", vec![two.clone(), one.clone()], both.clone()),
+    ] {
+        let events = iteration_events(&snapshots);
+        for (path, _, got) in reported(&events) {
+            assert_eq!(got, want, "{label}: {path}");
+        }
+        // The stream announces each new hop set once.
+        let announced = stream(Format::OpenAI, &events)
+            .iter()
+            .filter(|(_, c)| c["choices"][0]["delta"].get("fallback").is_some())
+            .count();
+        assert_eq!(
+            announced,
+            if label == "same twice" {
+                1
+            } else {
+                1 + usize::from(label == "growing")
+            }
+        );
+    }
+}
+
+/// A block stays authoritative over iterations that would imply other hops.
+#[test]
+fn blocks_override_iteration_hops() {
+    let mut events = vec![start(REQUESTED)];
+    events.extend(hop(0, REQUESTED, "claude-opus-4-8"));
+    events.extend(text(1, "ok"));
+    events.extend(end(json!({"output_tokens":2,"iterations":[
+        it("message", REQUESTED), it("message", "claude-opus-5"), it("message", "claude-opus-4-8"), it("fallback_message", "claude-opus-4-8")
+    ]})));
+    for (path, model, got) in reported(&events) {
+        assert_eq!(model, "claude-opus-4-8", "{path}");
+        assert_eq!(got, hops(&[(REQUESTED, "claude-opus-4-8")]), "{path}");
+    }
+}
