@@ -843,7 +843,7 @@ impl Scheduler {
         })
     }
 
-    /// The retained quota evidence of the live quota cooldown that sets `model`'s wait
+    /// The retained quota evidence of the live cooldown that sets `model`'s wait
     /// ([`Self::wait`]: the later of the model's and the credential-wide deadline; on a
     /// tie, the entry that has evidence). Empty when that cooldown has none.
     pub fn cooldown_signals(
@@ -859,10 +859,10 @@ impl Scheduler {
         let governing = [model, ""]
             .into_iter()
             .filter_map(|m| self.cooldowns.get(&(c.id.clone(), m.to_owned())))
-            .filter(|s| s.quota && s.until(now).is_some())
-            .max_by_key(|s| (s.deadline, !s.signals.is_empty() && s.signals_account == account));
+            .filter_map(|s| Some((s, s.until(now)?)))
+            .max_by_key(|(s, until)| (*until, s.quota && !s.signals.is_empty() && s.signals_account == account));
         match governing {
-            Some(s) if !account.is_empty() && s.signals_account == account => &s.signals,
+            Some((s, _)) if s.quota && !account.is_empty() && s.signals_account == account => &s.signals,
             _ => &NONE,
         }
     }
@@ -3395,6 +3395,42 @@ mod tests {
             ["Anthropic-Ratelimit-Unified-5h-Status"]
         );
         assert!(s.cooldown_signals(&d, "m", now + secs(4 * H)).is_empty(), "expired");
+    }
+
+    /// A credential quota and an independent model failure can both be live after
+    /// concurrent requests finish. Evidence must follow the same effective deadline
+    /// as wait, including a probe reservation, rather than the longest quota alone.
+    #[test]
+    fn quota_evidence_follows_the_governing_effective_wait() {
+        let p = Policy::default();
+        let now = Instant::now();
+        let c = cred("a", serde_json::json!({"api_key": "fake-a"}));
+        for (quota_retry, transient_retry, quota_wins) in [(30, 600, false), (600, 10, true)] {
+            let mut s = Scheduler::default();
+            let mut quota = ExecError::local(429, FailureScope::Credential, "quota");
+            quota.retry_after = Some(secs(quota_retry));
+            quota
+                .headers
+                .insert("anthropic-ratelimit-unified-status", "rejected".parse().unwrap());
+            s.record(&c, "m", &Outcome::Failure(quota), &p, now);
+            let mut transient = ExecError::local(503, FailureScope::Model, "temporary failure");
+            transient.retry_after = Some(secs(transient_retry));
+            s.record(&c, "m", &Outcome::Failure(transient), &p, now);
+            assert_eq!(s.wait(&c, "m", now), Some(secs(quota_retry.max(transient_retry))));
+            assert_eq!(!s.cooldown_signals(&c, "m", now).is_empty(), quota_wins);
+
+            // An unanswered probe on the non-quota model can extend the effective
+            // wait beyond both raw deadlines.
+            let model = s.cooldowns.get_mut(&(c.id.clone(), "m".into())).unwrap();
+            model.trust.probe = Some(now + secs(900));
+            assert_eq!(s.wait(&c, "m", now), Some(secs(900)));
+            assert!(s.cooldown_signals(&c, "m", now).is_empty());
+
+            // At equal effective deadlines, the live quota can supply its evidence.
+            s.cooldowns.get_mut(&(c.id.clone(), String::new())).unwrap().trust.probe = Some(now + secs(900));
+            assert!(!s.cooldown_signals(&c, "m", now).is_empty());
+            assert!(s.cooldown_signals(&c, "m", now + secs(901)).is_empty());
+        }
     }
 
     /// Sol review of #128: evidence belongs to the account that received it. A token
