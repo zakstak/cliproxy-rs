@@ -57,6 +57,7 @@ mod login;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
+mod meta_identity;
 mod meta_wire;
 pub mod multipart;
 pub mod oauth;
