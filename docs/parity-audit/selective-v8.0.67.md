@@ -29,7 +29,7 @@ Credential ownership and the native-byte golden are checked on every case regard
 | Manifest ID | Kind | Owner | Evidence | What v8.0.67 does differently |
 | --- | --- | --- | --- | --- |
 | `C1-claude-client-profile` | pending | [#69](https://github.com/zakstak/cliproxy-rs/issues/69) | Go `b4e7dbd2` | Claude Code 2.1.321 User-Agent, Stainless 0.128.0 and v26.12.1, `thinking-token-count` beta position, billing-header version |
-| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) | Observed only | Cloaks a request carrying the four strong native signals of a 2.1.280 caller. Its wire correctness is unknown, and the entry grants no adoption: cliproxy-rs must still send the v8.0.10-recorded native bytes |
+| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) | Observed only | Cloaks a request carrying the four strong native signals of a 2.1.280 caller. Its wire correctness is unknown, and the entry grants no adoption. Go must match its recorded v8.0.67 request exactly, and cliproxy-rs must still send the v8.0.10-recorded native bytes |
 | `K1-claude-catalog` | pending | [#68](https://github.com/zakstak/cliproxy-rs/issues/68) | Catalog diff | Lists `claude-fable-5-2` |
 | `T2-messages-max-output-tokens` | pending | [#80](https://github.com/zakstak/cliproxy-rs/issues/80) | Go `01b24f1f` | Adds `max_output_tokens` from Claude `max_tokens` for Grok and Muse |
 | `I4-cors-allow-headers` | pending | [#104](https://github.com/zakstak/cliproxy-rs/issues/104) | Observed | Explicit `Access-Control-Allow-Headers` list instead of `*` |
@@ -48,7 +48,9 @@ harness boundary. Global rules: downstream header-name case and order
 ([ledger](../DIFFERENCES-FROM-GO.md#deliberate-differences)), chunk boundaries, Content-Length,
 generated values. On the historical target, `cors-expose-etag`, `claude-responses-compact`
 and `claude-catalog-v8.0.35` record behaviour cliproxy-rs follows from v8.0.35 rather than
-v8.0.10.
+v8.0.10. For historical compaction, cliproxy-rs is held to a golden recorded from Go v8.0.35
+itself (`harness/run --target policy --golden`). Its request matched v8.0.35 byte for byte,
+except for the minted request id.
 
 An unowned or unattributed entry is visible, not accepted as correct. It stays in every
 receipt until an issue decides it from provider evidence.

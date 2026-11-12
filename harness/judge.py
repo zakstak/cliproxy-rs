@@ -25,6 +25,7 @@ from pathlib import Path
 import re
 
 from fixtures import CREDENTIAL, PROVIDER_KEYS, TOKEN_REPLY
+import golden
 
 CLIENT_KEYS = ("fixture-client-key", "wrong-fixture-key")
 CLAUDE_TOKENS = (CREDENTIAL["access_token"], json.loads(TOKEN_REPLY)["access_token"])
@@ -191,7 +192,7 @@ def generated_formats(observation, generated):
     return problems
 
 
-def native_bytes(case, observation, invariants, root):
+def native_bytes(case, observation, invariants, root, pins):
     """Rust-side native requests: byte-exact pass-through, or the recorded golden."""
     problems = []
     inference = [r for r in observation["upstream"]["http"] if is_inference(r, case)]
@@ -199,16 +200,12 @@ def native_bytes(case, observation, invariants, root):
         sent = [_bytes(r["request_body_hex"]) for r in observation["downstream"]]
         if [_bytes(r["body_hex"]) for r in inference] != sent:
             problems.append("native pass-through: the upstream body is not the client's bytes")
-    for golden in invariants.get("upstream_goldens", []):
-        if golden["case"] != case["name"]:
+    for entry in invariants.get("upstream_goldens", []):
+        if entry["case"] != case["name"]:
             continue
-        expected = json.loads((root / golden["file"]).read_text())
-        masked = set(golden.get("masked_headers", []))
-        got = [{"request_line": r["request_line"],
-                "headers": [[k, "<generated>" if k.lower() in masked else v] for k, v in r["headers"]],
-                "body_hex": r["body_hex"]} for r in inference]
-        if got != expected["requests"]:
-            problems.append(f"native golden {golden['file']}: upstream request differs from the recorded bytes")
+        data = json.loads((root / entry["file"]).read_text())
+        for problem in golden.check(data, {"upstream"}, observation, None, golden.masks(pins)):
+            problems.append(f"native golden {entry['file']}: {problem}")
     return problems
 
 
@@ -219,7 +216,7 @@ def invariants(case, observation, side, pins, root):
     if case["name"] in NO_TRAFFIC and inference:
         problems.append("a refused client or unusable credential reached the provider")
     if side == "rust":
-        problems += native_bytes(case, observation, pins["invariants"], root)
+        problems += native_bytes(case, observation, pins["invariants"], root, pins)
     return problems
 
 
@@ -391,58 +388,16 @@ def _json_transform(predicates, divergence, index, spec, go_doc, rust_doc):
         predicates.hit(divergence)
 
 
-def _template(template, value):
-    """A side expectation: strings 're:...' are regexes, other values exact."""
-    if isinstance(template, dict):
-        return isinstance(value, dict) and set(template) == set(value) and all(
-            _template(t, value[k]) for k, t in template.items())
-    if isinstance(template, list):
-        return isinstance(value, list) and len(template) == len(value) and all(
-            _template(t, v) for t, v in zip(template, value))
-    if isinstance(template, str) and template.startswith("re:"):
-        return re.fullmatch(template[3:], str(value)) is not None
-    return template == value
-
-
-def _side_expectation(predicates, divergence, index, spec, side, observation, case, run):
-    def fail(message):
-        predicates.fail(divergence, index, f"{side}: {message}")
-    replies = observation["downstream"]
-    if "status" in spec and [r.get("status") for r in replies] != [spec["status"]] * len(replies):
-        fail(f"status {[r.get('status') for r in replies]} is not {spec['status']}")
-    if "body_equals" in spec and [_bytes(r.get("body_hex")).decode("utf-8", "replace") for r in replies] \
-            != [spec["body_equals"]] * len(replies):
-        fail("body differs from the expected bytes")
-    if "body_json" in spec:
-        for reply in replies:
-            try:
-                ok = _template(spec["body_json"], json.loads(_bytes(reply.get("body_hex"))))
-            except ValueError:
-                ok = False
-            if not ok:
-                fail("body does not have the expected JSON shape")
-    inference = [r for r in observation["upstream"]["http"] if is_inference(r, case)]
-    if "inference_requests" in spec and len(inference) != spec["inference_requests"]:
-        fail(f"{len(inference)} inference requests, expected {spec['inference_requests']}")
-    for check in spec.get("upstream_json", []):
-        for request in inference:
-            try:
-                value = _json_at(json.loads(_bytes(request["body_hex"])), check["pointer"])
-            except (ValueError, KeyError, IndexError, TypeError):
-                value = None
-            text = value if value is None or isinstance(value, str) else json.dumps(value)
-            if not _match({k: check[k] for k in ("equals", "regex") if k in check}, text):
-                fail(f"upstream {check['pointer']} {value!r} does not match")
-    for check in spec.get("upstream_headers", []):
-        for request in inference:
-            if not _match(check["value"], _header_values(request["headers"], check["name"])):
-                fail(f"upstream header {check['name']} does not match")
-    if "tls_like" in spec:
-        reference = run.observation(spec["tls_like"]["case"], spec["tls_like"]["side"])
-        if _tls(observation) != _tls(reference):
-            fail(f"TLS handshakes differ from {spec['tls_like']['side']} {spec['tls_like']['case']}")
-    if "tls_count" in spec and len(observation["upstream"]["tls"]) != spec["tls_count"]:
-        fail(f"{len(observation['upstream']['tls'])} TLS handshakes, expected {spec['tls_count']}")
+def _golden_side(predicates, divergence, index, spec, covers, side, observation, case, pins, root):
+    """A replaced comparison: this side must match its complete golden in every covered
+    dimension. Only the golden's named masks may vary."""
+    data = json.loads((root / spec["golden"]).read_text())
+    missing = set(covers) - set(data["covers"])
+    if missing:
+        predicates.fail(divergence, index, f"{side}: golden {spec['golden']} does not cover {sorted(missing)}")
+        return
+    for problem in golden.check(data, set(covers), observation, None, golden.masks(pins)):
+        predicates.fail(divergence, index, f"{side} ({spec['golden']}): {problem}")
     predicates.hit(divergence)
 
 
@@ -459,7 +414,7 @@ def compare(case, go, rust, predicates, pins, run):
     replaced = {}
     for divergence, index, spec in predicates.of("replace"):
         for side, observation in (("go", go), ("rust", rust)):
-            _side_expectation(predicates, divergence, index, spec[side], side, observation, case, run)
+            _golden_side(predicates, divergence, index, spec[side], spec["covers"], side, observation, case, pins, run.root)
         for dimension in spec["covers"]:
             replaced[dimension] = divergence["id"]
     generated_up = set(pins["generated_headers"]["upstream"])
@@ -654,8 +609,9 @@ def judge(case, go, rust, diffs, divergences, target, pins, run, root):
 class Run:
     """Lazy access to a run directory's observations, for cross-case references."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, root=None):
         self.directory = Path(directory)
+        self.root = Path(root) if root else Path(__file__).resolve().parent.parent
         self.cache = {}
 
     def observation(self, case, side):

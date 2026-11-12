@@ -1,13 +1,18 @@
 {
-  "about": "Native Claude Code request (harness/fixtures.py case native-signals) as the historical Go reference sent it upstream. cliproxy-rs must send these bytes on every target: the four verified native signals keep the caller's body, session and identity headers, with only the billing block and stream flag Go v8.0.10 adds. x-client-request-id is minted per request and masked. A v8.0.67 difference on this case does not change this expectation (C2, #70).",
+  "about": "The native Claude Code request (case native-signals) as Go v8.0.10 sends it: the caller's body, session and identity headers with only the billing block and stream flag added. cliproxy-rs must send exactly this on every target, as an unconditional invariant.",
   "provenance": {
     "go_tag": "v8.0.10",
     "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
-    "captured_by": "harness/run --target historical",
-    "run": "run-historical-20261112-024205",
+    "target": "historical",
+    "run": "run-historical-20261112-051357",
+    "case": "native-signals",
     "side": "go",
-    "evidence": "harness/evidence/2026-11-12-historical.json.gz"
+    "go_binary_sha256": "87b4bf4e619876039245aad672bb71056058a7b7e13d4a80da51ff00967fa6cc"
   },
+  "covers": [
+    "upstream"
+  ],
+  "body_masks": [],
   "requests": [
     {
       "request_line": "POST /v1/messages?beta=true HTTP/1.1",
@@ -82,7 +87,7 @@
         ],
         [
           "x-client-request-id",
-          "<generated>"
+          "{{mask:request-id}}"
         ],
         [
           "Connection",
@@ -101,7 +106,7 @@
           "504"
         ]
       ],
-      "body_hex": "7b226d6f64656c223a22636c617564652d736f6e6e65742d342d36222c226d61785f746f6b656e73223a31372c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a224c6f63616c207175657374696f6e227d5d2c2273797374656d223a5b7b2274797065223a2274657874222c2274657874223a22782d616e7468726f7069632d62696c6c696e672d6865616465723a2063635f76657273696f6e3d322e312e3238302e6234333b2063635f656e747279706f696e743d636c693b206363683d65626632313b227d2c7b2274797065223a2274657874222c2274657874223a224e61746976652063616c6c65722073797374656d227d5d2c226d65746164617461223a7b22757365725f6964223a227b5c226465766963655f69645c223a5c22303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465665c222c5c226163636f756e745f757569645c223a5c2261616161616161612d626262622d346363632d386464642d6565656565656565656565655c222c5c2273657373696f6e5f69645c223a5c2231313131313131312d323232322d343333332d383434342d3535353535353535353535355c227d227d2c2273747265616d223a66616c73657d"
+      "body": "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":17,\"messages\":[{\"role\":\"user\",\"content\":\"Local question\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.b43; cc_entrypoint=cli; cch=ebf21;\"},{\"type\":\"text\",\"text\":\"Native caller system\"}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\\",\\\"account_uuid\\\":\\\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\\\",\\\"session_id\\\":\\\"11111111-2222-4333-8444-555555555555\\\"}\"},\"stream\":false}"
     }
   ]
 }

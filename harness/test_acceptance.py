@@ -6,6 +6,7 @@ namespace."""
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,8 @@ def pins_with(ids=(), skips=()):
 
 
 class FakeRun:
+    root = ROOT
+
     def __init__(self, observations):
         self.observations = observations
 
@@ -69,17 +72,33 @@ def verdict(case, go, rust, pins, target="historical", run=None):
 
 # --- P1: narrow predicates and unconditional invariants -----------------------------------
 
+FILL = {"request-id": UUID, "date": "2026-11-12", "cch": "abcde", "compact-response-id": "resp_ag_compact_" + "1" * 19,
+        "compact-item-id": "cmp_ag_compact_" + "2" * 19, "compact-capsule": "cpa-ag-compact-v1:" + "A" * 60,
+        "unix-seconds": "1794461308"}
+
+
+def from_golden(path):
+    """An observation that sends exactly a golden's requests, masks filled with sample values."""
+    def fill(template):
+        return re.sub(r"\{\{mask:([a-z0-9-]+)\}\}", lambda m: FILL[m.group(1)], template)
+    golden = json.loads((ROOT / path).read_text())
+    replies = []
+    for r in golden.get("replies", []):
+        body = fill(r["body"]).encode()
+        headers = [["Content-Type", "application/json"], ["Content-Length", str(len(body))]]
+        head = f"HTTP/1.1 {r['status']} {r['reason']}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers) + "\r\n"
+        replies.append({"status": r["status"], "reason": r["reason"], "headers": headers, "body_hex": body.hex(),
+                        "body_text": body.decode(), "raw_response_hex": (head.encode() + body).hex(),
+                        "request_body_hex": ""})
+    tls = [dict(h, client_hello_hex="16") for h in golden.get("tls", [])]
+    return observation([request(fill(r["body"]).encode(), [[k, fill(v)] for k, v in r["headers"]], r["request_line"])
+                        for r in golden.get("requests", [])], replies or None, tls)
+
+
 def native_pair():
-    """native-signals on the selective target: Rust sends the recorded golden, Go cloaks."""
-    golden = json.loads((ROOT / "harness/expectations/native-signals.upstream.json").read_text())["requests"][0]
-    headers = [[k, UUID if v == "<generated>" else v] for k, v in golden["headers"]]
-    rust = observation([request(bytes.fromhex(golden["body_hex"]), headers, golden["request_line"])])
-    cloaked = (b'{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"x-anthropic-billing-header: '
-               b'cc_version=2.1.321.4f1; cc_entrypoint=cli; cch=abcde;"}],"messages":[]}')
-    go_headers = [["Authorization", CLAUDE_AUTH], ["User-Agent", "claude-cli/2.1.321 (external, cli)"],
-                  ["X-Claude-Code-Session-Id", UUID], ["Host", "api.anthropic.com"]]
-    go = observation([request(cloaked, go_headers)])
-    return go, rust
+    """native-signals on the selective target: Rust sends the v8.0.10 golden, Go its v8.0.67 one."""
+    return (from_golden("harness/expectations/native-signals.v8.0.67.json"),
+            from_golden("harness/expectations/native-signals.v8.0.10.json"))
 
 
 class PredicateTests(unittest.TestCase):
@@ -105,6 +124,43 @@ class PredicateTests(unittest.TestCase):
         result = verdict("native-signals", go, mutated, pins, "selective")
         self.assertEqual(result["verdict"], "fail")
         self.assertTrue(any("credential" in p for p in result["failed"]["invariant:rust"]))
+
+    def test_replaced_comparisons_compare_every_unmasked_byte(self):
+        """The 2581e74f review probes: a replacement used to check a few fields and then
+        skip whole dimensions."""
+        def edit_body(observation, old, new):
+            first = observation["upstream"]["http"][0]
+            body = bytes.fromhex(first["body_hex"])
+            self.assertIn(old.encode(), body)
+            out = copy.deepcopy(observation)
+            out["upstream"]["http"][0] = request(body.replace(old.encode(), new.encode(), 1), first["headers"], first["request_line"])
+            return out
+        pins = pins_with(["claude-responses-compact"])
+        go = from_golden("harness/expectations/compact-claude.v8.0.10.json")
+        rust = from_golden("harness/expectations/compact-claude.v8.0.35.json")
+        self.assertEqual(verdict("compact-claude", go, rust, pins)["verdict"], "pass")
+        for old, new in [("Local question", "Other question"), ('"max_tokens":64000', '"max_tokens":1')]:
+            self.assertEqual(verdict("compact-claude", go, edit_body(rust, old, new), pins)["verdict"], "fail", old)
+        changed_reply = copy.deepcopy(rust)
+        body = bytes.fromhex(changed_reply["downstream"][0]["body_hex"]).replace(b'"input_tokens":13', b'"input_tokens":14')
+        changed_reply["downstream"] = [dict(changed_reply["downstream"][0], body_hex=body.hex(), body_text=body.decode())]
+        changed_reply["downstream"][0]["raw_response_hex"] = (bytes.fromhex(rust["downstream"][0]["raw_response_hex"])
+                                                             .replace(b'"input_tokens":13', b'"input_tokens":14')).hex()
+        self.assertEqual(verdict("compact-claude", go, changed_reply, pins)["verdict"], "fail")
+        pins = pins_with(["C2-claude-native-detection"])
+        go, rust = native_pair()
+        self.assertEqual(verdict("native-signals", go, rust, pins, "selective")["verdict"], "pass")
+        self.assertEqual(verdict("native-signals", edit_body(go, "Local question", "Other question"), rust, pins,
+                                 "selective")["verdict"], "fail")
+
+    def test_replacement_sides_must_name_complete_goldens(self):
+        base = next(d for d in PINS["divergences"] if d["id"] == "claude-responses-compact")
+        for side in ({"golden": "harness/expectations/compact-claude.v8.0.35.json", "status": 200},
+                     {"inference_requests": 1}, {"golden": "harness/expectations/native-signals.v8.0.10.json"}):
+            bad = copy.deepcopy(base)
+            bad["expect"][0]["replace"]["rust"] = side
+            with self.assertRaises(revisions.ManifestError, msg=side):
+                revisions.validate(pins_with() | {"divergences": [bad]})
 
     def test_tool_alias_restore_rejects_corrupted_tool_arguments(self):
         pins = pins_with(["claude-cloak-tool-alias-restore"])
@@ -292,22 +348,57 @@ SOURCE = {"head": "a" * 40, "tree": "b" * 40, "clean": True, "status": [],
           "manifest_sha256": provenance.sha256(ROOT / "harness/manifest.json")}
 
 
-def receipts(tmp, edit=None):
-    go = lambda t: {"vcs.revision": PINS["go"]["targets"][t]["commit"], "vcs.modified": "false"}
-    total = sum(len(g["tests"]) for g in PINS["groups"])
+def complete_receipts():
+    """A complete, consistent receipt set, as harness/accept writes one."""
+    def go(target):
+        pin = PINS["go"]["targets"][target]["commit"]
+        return {"path": f"harness/.cache/go-{pin[:8]}", "sha256": "2" * 64, "vcs.revision": pin, "vcs.modified": "false",
+                "checkout_head": pin, "checkout_clean": True}
+    driver = {"executable": "harness/rust/target/debug/cpa-differential-driver", "sha256": "1" * 64, "fresh": True}
     items = []
     for target in ("historical", "selective"):
+        spec = PINS["go"]["targets"][target]
         expected, _ = acceptance.expected_cases(PINS, target)
+        ids = [d["id"] for d in PINS["divergences"] if target in d["targets"]]
+        run = f"run-{target}-20261112-000000"
+        cases = [{"name": n, "verdict": "pass", "failed": {}, "unexplained": [], "unexplained_count": 0,
+                  "differences": 0, "hits": ids if i == 0 else []} for i, n in enumerate(expected)]
         common = {"verdict": "pass", "partial": False, "source": dict(SOURCE), "provenance_verified": True,
-                  "target": target, "go_commit": PINS["go"]["targets"][target]["commit"], "run": f"run-{target}",
-                  "rust_revision": SOURCE["head"]}
-        items.append(common | {"kind": "differential", "provenance": {"go": go(target)},
-                               "counts": {"run": len(expected), "named_skips": 0}})
-        want = len([m for m in acceptance.MUTATIONS if m[0] in ("*", target)])
-        items.append(common | {"kind": "mutation-control", "counts": {"mutations": want, "caught": want}})
+                  "target": target, "go_commit": spec["commit"], "run": run, "rust_revision": SOURCE["head"]}
+        items.append(common | {
+            "kind": "differential", "tag": spec["tag"], "role": spec["role"], "suite": spec["suite"], "cases": cases,
+            "named_skips": [], "unknown_skips": [], "stale_divergences": [], "problems": [], "unavailable": [],
+            "divergences": {i: {} for i in ids},
+            "counts": {"suite": len(expected), "run": len(expected), "passed": len(expected), "failed": 0, "infrastructure": 0,
+                       "named_skips": 0, "unknown_skips": 0, "named_divergences": len(ids), "stale_divergences": 0},
+            "provenance": {"driver": dict(driver), "go": go(target), "manifest_sha256": SOURCE["manifest_sha256"],
+                           "after": {"driver": dict(driver), "go": go(target), "source": dict(SOURCE)},
+                           "verified": True, "problems": []}})
+        controls = [{"case": c, "mutation": label, "side": side, "baseline": "pass", "verdict": "fail", "caught": True}
+                    for c, label, side, _ in acceptance.mutations_for(target)]
+        items.append(common | {"kind": "mutation-control", "baseline_verdict": "pass", "controls": controls,
+                               "counts": {"mutations": len(controls), "caught": len(controls)}})
+    groups, targets = [], {}
+    for group in PINS["groups"]:
+        tests = [{"package": t["package"], "target": t["target"], "name": t["name"], "paths": t["paths"],
+                  "outcome": "passed"} for t in group["tests"]]
+        groups.append({"id": group["id"], "provider": group["provider"], "tests": tests, "passed": len(tests), "failed": 0})
+        for t in group["tests"]:
+            targets[(t["package"], t["target"])] = True
+    executions = [{"package": p, "target": t, "status": "pass", "exit": 0, "listed": 0, "problems": [], "missing": [],
+                   "failed": [], "ignored": [], "not_run": [], "executable": f"target/debug/deps/{p}-{i}",
+                   "sha256": "3" * 64, "sha256_after": "3" * 64, "fresh_before": True, "fresh_after": True}
+                  for i, (p, t) in enumerate(targets)]
+    total = sum(len(g["tests"]) for g in PINS["groups"])
     items.append({"kind": "cargo-groups", "verdict": "pass", "partial": False, "source": dict(SOURCE),
-                  "provenance_verified": True, "groups": [{"id": g["id"]} for g in PINS["groups"]],
-                  "counts": {"tests": total, "passed": total}})
+                  "source_after": dict(SOURCE), "provenance_verified": True, "rust_revision": SOURCE["head"],
+                  "groups": groups, "executions": executions, "unavailable": [], "unknown_tests": [],
+                  "counts": {"groups": len(groups), "tests": total, "passed": total, "failed": 0, "unknown_tests": 0}})
+    return items
+
+
+def receipts(tmp, edit=None):
+    items = complete_receipts()
     if edit:
         edit(items)
     paths = []
@@ -318,13 +409,17 @@ def receipts(tmp, edit=None):
     return paths
 
 
+def _swap_case(r):
+    r[0]["cases"][0] = copy.deepcopy(r[0]["cases"][1])
+
+
 class CombineTests(unittest.TestCase):
     def verdict(self, edit=None):
         with tempfile.TemporaryDirectory() as tmp:
             return acceptance.combine(receipts(tmp, edit), PINS, current_source=SOURCE)
 
     def test_complete_consistent_receipts_pass(self):
-        self.assertEqual(self.verdict()["verdict"], "pass")
+        self.assertEqual(self.verdict()["verdict"], "pass", self.verdict()["problems"])
 
     def test_each_hole_fails(self):
         holes = {
@@ -334,18 +429,53 @@ class CombineTests(unittest.TestCase):
             "wrong Go pin": lambda r: r[0].update(go_commit="0" * 40),
             "modified Go binary": lambda r: r[0]["provenance"]["go"].update({"vcs.modified": "true"}),
             "stale binaries": lambda r: r[4].update(provenance_verified=False),
-            "only the controls group": lambda r: r[4].update(groups=[{"id": "controls"}],
-                                                             counts={"tests": 1, "passed": 1}),
+            "only the controls group": lambda r: r[4].update(groups=[g for g in r[4]["groups"] if g["id"] == "controls"]),
             "missing receipt": lambda r: r.pop(3),
             "duplicate receipt": lambda r: r.append(copy.deepcopy(r[0])),
             "partial run": lambda r: r[2].update(partial=True),
-            "incomplete case coverage": lambda r: r[2]["counts"].update(run=61),
-            "mutation on another capture": lambda r: r[1].update(run="run-other"),
-            "too few mutations": lambda r: r[3]["counts"].update(mutations=1, caught=1),
+            "mutation on another capture": lambda r: r[1].update(run="run-historical-20261112-000001"),
             "receipt without counts": lambda r: r[0].pop("counts"),
         }
         for label, edit in holes.items():
             self.assertEqual(self.verdict(edit)["verdict"], "fail", label)
+
+    def test_records_are_checked_individually_not_by_totals(self):
+        # The 2581e74f review probes: each keeps every aggregate total unchanged.
+        holes = {
+            "missing case, same count": lambda r: r[0]["cases"].pop(0),
+            "duplicate case, same count": _swap_case,
+            "extra case, same count": lambda r: r[0]["cases"].append({"name": "unrecognised", "verdict": "pass"}),
+            "failed case, same count": lambda r: r[2]["cases"][3].update(verdict="fail", failed={"tls": ["x"]}),
+            "all groups empty, same count": lambda r: [g.update(tests=[], passed=0, failed=0) for g in r[4]["groups"]],
+            "duplicate test, same count": lambda r: r[4]["groups"][0]["tests"].__setitem__(
+                0, copy.deepcopy(r[4]["groups"][0]["tests"][1])),
+            "failed test, same count": lambda r: r[4]["groups"][0]["tests"][0].update(outcome="failed"),
+            "missing controls, same count": lambda r: r[1].update(controls=[]),
+            "duplicate control, same count": lambda r: r[1]["controls"].__setitem__(0, copy.deepcopy(r[1]["controls"][1])),
+            "unknown control, same count": lambda r: r[1]["controls"][0].update(mutation="unrecognised"),
+            "uncaught control, same count": lambda r: r[3]["controls"][2].update(caught=False),
+            "no cargo binary provenance": lambda r: r[4].update(executions=[]),
+            "failed execution, same count": lambda r: r[4]["executions"][0].update(exit=42, status="fail", problems=["exit 42"]),
+            "binary changed after the run": lambda r: r[4]["executions"][1].update(sha256_after="4" * 64),
+            "missing driver provenance": lambda r: [x["provenance"].pop("driver") for x in r[0:3:2]],
+            "driver hash differs after the run": lambda r: r[2]["provenance"]["after"]["driver"].update(sha256="0" * 64),
+            "Go binary missing after the run": lambda r: r[0]["provenance"]["after"].update(go=None),
+            "different rust_revision field": lambda r: r[2].update(rust_revision="0" * 40),
+            "fake counts": lambda r: r[0]["counts"].update(passed=49),
+            "stale divergence hidden": lambda r: [c.update(hits=[]) for c in r[2]["cases"]],
+            "unknown divergence hit": lambda r: r[0]["cases"][1].update(hits=["invented"]),
+            "wrong tag": lambda r: r[0].update(tag="v8.0.11"),
+            "malformed group": lambda r: r[4]["groups"].__setitem__(0, "claude-router"),
+        }
+        for label, edit in holes.items():
+            self.assertEqual(self.verdict(edit)["verdict"], "fail", label)
+
+    def test_combine_cli_fails_on_empty_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp, lambda r: [g.update(tests=[], passed=0, failed=0) for g in r[4]["groups"]])
+            done = subprocess.run([sys.executable, str(ROOT / "harness/acceptance.py"), "combine", *paths,
+                                   "--receipt", str(Path(tmp) / "out.json")], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 1, done.stdout[-500:])
 
     def test_the_tested_source_must_be_current(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,7 +17,7 @@ manifest and `FIRST_PARTY_COMMIT`, or the fixture counts.
 | Target | Go revision | Role | Suite |
 | --- | --- | --- | --- |
 | `historical` | v8.0.10, `6fecc6e5567912661654a4eaf9b8f5436facd1c2` | The revision the 50 Claude cases were recorded against | 50 Claude cases (`cases()`) |
-| `policy` | v8.0.35, `ae3ee3be303fb07fb8173279923413005bf32177` | AGENTS.md's frozen default reference; not run by the harness | none |
+| `policy` | v8.0.35, `ae3ee3be303fb07fb8173279923413005bf32177` | AGENTS.md's frozen default reference. Not a comparison target; it only records goldens for `golden_cases` | none |
 | `selective` | v8.0.67, `8bba7a77c6bcbfd993516d26606bfecaa4ff49d0` | Separate selective comparison ([ledger](../docs/parity-audit/selective-v8.0.67.md)) | the 50 cases plus 12 Grok and Muse cases (`selective_cases()`) |
 
 No target is a relabelled copy of another, and no golden fixture changes provenance. Codex
@@ -91,7 +91,7 @@ relax them:
   chunked or plain wire bodies decode to the compared body; Content-Length matches;
 - generated values (`generated_headers`) match their documented pattern;
 - native bytes: `native-signals` sends exactly the request recorded from Go v8.0.10
-  ([golden](expectations/native-signals.upstream.json)), and `count-tokens` forwards the
+  ([golden](expectations/native-signals.v8.0.10.json)), and `count-tokens` forwards the
   client's body byte for byte;
 - a refused client or unusable credential reaches no provider.
 
@@ -110,7 +110,8 @@ of these:
 - a generated JSON value and its pattern;
 - an extra Go TLS handshake that must equal a reference handshake;
 - a credential field value;
-- for a case the older reference cannot answer, an exact expectation per side.
+- for a case where one reference cannot answer, a replaced comparison. Each side must
+  match a complete golden in every dimension the replacement covers.
 
 A predicate whose delta is missing or different fails, and everything a predicate does
 not name is still compared. There are no path or assertion exemptions, and the manifest
@@ -142,15 +143,59 @@ summary line, and it counts every requested test as passed with none failed or i
 A timeout, a signal or a failed listing is unavailable. A nonzero exit is never a pass,
 whatever lines were printed.
 
-**Mutation control** edits the Rust side of real captured cases and requires each edit to
-fail: request and reply bytes, status, credential swaps, tool arguments, the TLS
-ClientHello, persisted `disabled`, drift of a named delta and deltas outside it
+**Goldens** ([`golden.py`](golden.py), [`expectations/`](expectations/)) are complete per-side
+expectations recorded from the Go side of a pinned, provenance-verified capture, never from
+cliproxy-rs. A golden holds:
+
+- every upstream request: line, ordered headers and body;
+- every client reply: status, reason and body;
+- every TLS handshake.
+
+Values are literal except `{{mask:NAME}}` tokens. Each mask is named in the manifest's
+`masks` with a narrow pattern: the minted request id, the date, `cch`, and the compaction
+ids, time and capsule. A golden declares which body masks it uses, and the validator
+refuses any other mask. Recorded goldens:
+
+| Golden | Source | Use |
+| --- | --- | --- |
+| `native-signals.v8.0.10.json` | historical capture | cliproxy-rs native bytes, always (invariant) and as the Rust side of C2 |
+| `native-signals.v8.0.67.json` | selective capture | Go side of C2: observed v8.0.67 behaviour, no adoption |
+| `compact-claude.v8.0.10.json` | historical capture | Go side of historical compaction: the 501, no provider traffic |
+| `compact-claude.v8.0.35.json` | `harness/run --target policy --golden` | Rust side of historical compaction: what the frozen v8.0.35 reference sends and answers |
+
+```sh
+CPA_GO_REFERENCE_POLICY=/path/to/clean/v8.0.35 ./harness/run --target policy --golden
+python3 harness/golden.py record RUN_DIR compact-claude --covers upstream,status,downstream-body,tls \
+  --masks date,cch,compact-response-id,compact-item-id,compact-capsule,unix-seconds --about "..." --out FILE
+```
+
+A policy run captures only the manifest's `golden_cases`, is labelled
+`purpose: golden-recording`, and can never be evaluated as acceptance. Recording checks
+that the golden matches the capture it came from.
+
+**Mutation control** edits real captured cases, on the Rust side unless a control names Go,
+and requires each edit to fail: request and reply bytes, status, credential swaps, tool
+arguments, the TLS ClientHello, persisted `disabled`, drift of a named delta, deltas outside
+it, and caller text or `max_tokens` inside a replaced comparison on either side
 (`MUTATIONS` in `acceptance.py`).
 
-**Combine** requires each of the five receipts exactly once, all passing and none partial.
-They must share one clean source identity equal to the current worktree, with the current
-manifest hash, verified provenance, the pinned Go commits and clean Go stamps, full case
-coverage, every required mutation caught, and every manifest group and test passed.
+**Combine** requires each of the five receipts exactly once and validates every record in
+them. Totals are recomputed from the records, never trusted:
+
+- the differential cases are exactly the fixture suite's cases (minus named skips), once
+  each, in order, each a clean pass with no unexplained difference, and their hits name
+  manifest divergences with none stale;
+- the mutation controls are exactly `MUTATIONS` for that target, once each, each caught,
+  on the same capture the differential receipt evaluated;
+- the cargo groups and their tests are exactly the manifest's, once each, all passed. Every
+  test target has one execution record that exited 0 cleanly, and the executable hash
+  before the run equals the hash and fresh flag after it;
+- the driver and Go binaries were recorded before and after each run, are identical, and
+  the Go stamp names the clean pin;
+- every receipt's source before and after equals the current clean worktree and manifest,
+  and `rust_revision` matches it.
+
+The combined receipt records each input receipt's SHA-256.
 
 Committed evidence is usually one commit after the tested source. `acceptance.py
 verify-evidence harness/evidence/receipts/acceptance.json` checks that the tested commit's

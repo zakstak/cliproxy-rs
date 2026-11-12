@@ -24,7 +24,10 @@
         "role": "frozen-default-reference",
         "executed": false,
         "suite": null,
-        "about": "AGENTS.md's frozen default reference for non-Codex behaviour. Go goldens under crates/*/tests/fixtures carry their own recorded versions; the harness does not run this revision and does not relabel any golden to it."
+        "about": "AGENTS.md's frozen default reference for non-Codex behaviour. Go goldens under crates/*/tests/fixtures carry their own recorded versions; the harness does not run this revision and does not relabel any golden to it. Golden recording only: harness/run --target policy --golden captures golden_cases, whose Go side becomes a committed expectation (harness/expectations/) for behaviour v8.0.10 cannot answer. Such a run is never acceptance evidence by itself.",
+        "golden_cases": [
+          "compact-claude"
+        ]
       },
       "selective": {
         "tag": "v8.0.67",
@@ -395,8 +398,8 @@
       "cases": [
         "compact-claude"
       ],
-      "evidence": "Go v8.0.35 (ae3ee3be) internal/runtime/executor/helps/antigravity_compaction.go serves /v1/responses/compact for Claude with a cpa-ag-compact-v1 capsule; v8.0.10 answered 501. The selective target compares this case against v8.0.67 in full.",
-      "reason": "v8.0.10 has no behaviour to compare against, so each side must show its own exact expectation: Go the 501 error with no provider traffic, cliproxy-rs one Claude request and a compaction answer of the exact v8.0.35 shape.",
+      "evidence": "Go v8.0.35 (ae3ee3be) serves /v1/responses/compact for Claude (internal/runtime/executor/helps/antigravity_compaction.go); v8.0.10 answered 501. Both sides are recorded goldens: harness/expectations/compact-claude.v8.0.10.json (Go v8.0.10) and compact-claude.v8.0.35.json (Go v8.0.35, recorded with harness/run --target policy --golden). The selective target also compares the case against v8.0.67.",
+      "reason": "v8.0.10 has no compaction to compare against. Go must show exactly its recorded 501 and no provider traffic; cliproxy-rs must send and answer exactly what the frozen v8.0.35 reference does, with only the golden's named masks open.",
       "expect": [
         {
           "replace": {
@@ -407,54 +410,10 @@
               "tls"
             ],
             "go": {
-              "status": 501,
-              "body_equals": "{\"error\":{\"message\":\"/responses/compact not supported\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
-              "inference_requests": 0,
-              "tls_count": 0
+              "golden": "harness/expectations/compact-claude.v8.0.10.json"
             },
             "rust": {
-              "status": 200,
-              "inference_requests": 1,
-              "tls_like": {
-                "case": "buffered",
-                "side": "rust"
-              },
-              "upstream_json": [
-                {
-                  "pointer": "/model",
-                  "equals": "claude-sonnet-4-6"
-                },
-                {
-                  "pointer": "/max_tokens",
-                  "regex": "[0-9]+"
-                }
-              ],
-              "body_json": {
-                "object": "response.compaction",
-                "status": "completed",
-                "id": "re:resp_ag_compact_[0-9]+",
-                "created_at": "re:[0-9]+",
-                "model": "claude-sonnet-4-6",
-                "output": [
-                  {
-                    "type": "compaction",
-                    "status": "completed",
-                    "id": "re:cmp_ag_compact_[0-9]+",
-                    "encrypted_content": "re:cpa-ag-compact-v1:[A-Za-z0-9_-]+"
-                  }
-                ],
-                "usage": {
-                  "input_tokens_details": {
-                    "cached_tokens": 0
-                  },
-                  "output_tokens_details": {
-                    "reasoning_tokens": 0
-                  },
-                  "input_tokens": 13,
-                  "output_tokens": 3,
-                  "total_tokens": 16
-                }
-              }
+              "golden": "harness/expectations/compact-claude.v8.0.35.json"
             }
           }
         }
@@ -679,7 +638,7 @@
         "native-signals"
       ],
       "attribution": "Observed v8.0.67 behaviour only. Its wire correctness is unknown until C2 records client provenance; this entry grants no adoption.",
-      "reason": "v8.0.67 cloaks a request with the four strong native signals of a 2.1.280 caller. cliproxy-rs must still send the recorded v8.0.10 native bytes (manifest invariants.upstream_goldens); Go must show the specific cloaked shape.",
+      "reason": "v8.0.67 cloaks a request with the four strong native signals of a 2.1.280 caller. Each side must match its complete recorded request: Go its v8.0.67 cloaked request (harness/expectations/native-signals.v8.0.67.json), cliproxy-rs the v8.0.10 native bytes (native-signals.v8.0.10.json, also an unconditional invariant).",
       "expect": [
         {
           "replace": {
@@ -687,34 +646,10 @@
               "upstream"
             ],
             "go": {
-              "inference_requests": 1,
-              "upstream_json": [
-                {
-                  "pointer": "/model",
-                  "equals": "claude-sonnet-4-6"
-                },
-                {
-                  "pointer": "/system/0/text",
-                  "regex": "x-anthropic-billing-header: cc_version=2\\.1\\.321\\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};.*"
-                }
-              ],
-              "upstream_headers": [
-                {
-                  "name": "user-agent",
-                  "value": {
-                    "equals": "claude-cli/2.1.321 (external, cli)"
-                  }
-                },
-                {
-                  "name": "x-claude-code-session-id",
-                  "value": {
-                    "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-                  }
-                }
-              ]
+              "golden": "harness/expectations/native-signals.v8.0.67.json"
             },
             "rust": {
-              "inference_requests": 1
+              "golden": "harness/expectations/native-signals.v8.0.10.json"
             }
           }
         }
@@ -1119,10 +1054,7 @@
     "upstream_goldens": [
       {
         "case": "native-signals",
-        "file": "harness/expectations/native-signals.upstream.json",
-        "masked_headers": [
-          "x-client-request-id"
-        ]
+        "file": "harness/expectations/native-signals.v8.0.10.json"
       }
     ]
   },
@@ -1144,5 +1076,38 @@
       "id": "generated-values",
       "rule": "generated_headers values are masked only after matching their pattern on both sides."
     }
-  ]
+  ],
+  "masks": {
+    "about": "The only values a golden template may leave open. Each mask is narrow: `pattern` is what the value must match; `record` finds it in a capture when a golden is recorded.",
+    "request-id": {
+      "pattern": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+      "headers": [
+        "x-client-request-id"
+      ]
+    },
+    "date": {
+      "pattern": "[0-9]{4}-[0-9]{2}-[0-9]{2}",
+      "record": "(?<=Today's date is )[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    },
+    "cch": {
+      "pattern": "[0-9a-f]{5}",
+      "record": "(?<=; cch=)[0-9a-f]{5}(?=;)"
+    },
+    "compact-response-id": {
+      "pattern": "resp_ag_compact_[0-9]{19}",
+      "record": "resp_ag_compact_[0-9]{19}"
+    },
+    "compact-item-id": {
+      "pattern": "cmp_ag_compact_[0-9]{19}",
+      "record": "cmp_ag_compact_[0-9]{19}"
+    },
+    "compact-capsule": {
+      "pattern": "cpa-ag-compact-v1:[A-Za-z0-9_-]{40,400}",
+      "record": "cpa-ag-compact-v1:[A-Za-z0-9_-]{40,400}"
+    },
+    "unix-seconds": {
+      "pattern": "[0-9]{10}",
+      "record": "(?<=\"created_at\":)[0-9]{10}"
+    }
+  }
 }

@@ -500,13 +500,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="new run directory")
     parser.add_argument("--case", action="append", help="run only named fixture(s)")
     parser.add_argument("--strict", action="store_true", help="exit 1 if any difference remains")
+    parser.add_argument("--golden", action="store_true", help="record a recorded-only target's golden_cases")
     args = parser.parse_args()
     assert_isolated()
     root = args.root.resolve()
     pins = revisions.load(revisions.suite_sizes())
     target = pins["go"]["targets"][args.target]
-    if not target["executed"]:
+    golden = not target["executed"]
+    if golden and not (args.golden and target.get("golden_cases")):
         raise ValueError(f"{args.target} is not an executed Go target")
+    if args.golden and not golden:
+        raise ValueError("--golden records only a recorded-only target")
     output = args.output.resolve()
     output.mkdir()
     os.umask(0o077)
@@ -517,7 +521,8 @@ def main():
     hosts = output / "hosts"
     hosts.write_text("127.0.0.1 localhost\n127.0.0.2 api.anthropic.com platform.claude.com\n")
     subprocess.run(["mount", "--bind", str(hosts), "/etc/hosts"], check=True)
-    selected = [case for case in suite(target["suite"]) if not args.case or case["name"] in args.case]
+    universe = ([c for c in cases() if c["name"] in target["golden_cases"]] if golden else suite(target["suite"]))
+    selected = [case for case in universe if not args.case or case["name"] in args.case]
     if not selected or (args.case and set(args.case) - {case["name"] for case in selected}):
         raise ValueError("unknown or empty case selection")
     results = []
@@ -535,9 +540,10 @@ def main():
     failed = any(result["capture_errors"] or result["transport_errors"] for result in results)
     summary = {"target": args.target, "tag": target["tag"], "reference": target["commit"],
                "role": target["role"], "suite": target["suite"],
-               "suite_cases": [case["name"] for case in suite(target["suite"])],
+               "suite_cases": [case["name"] for case in universe],
+               "purpose": "golden-recording" if golden else "comparison",
                "selected": [case["name"] for case in selected], "cases": results,
-               "partial": bool(args.case),
+               "partial": bool(args.case) or golden,
                "executed": {"go_binary": os.path.relpath(args.go_binary.resolve(), root),
                             "driver": os.path.relpath(args.driver.resolve(), root)},
                "toolchain": toolchain(),

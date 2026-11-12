@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Usage: harness/run [--target historical|selective] [differential.py options]
+#        harness/run --target policy --golden   # record golden_cases only (never acceptance)
 # The Go revision comes from harness/manifest.json; the default target is the
 # historical v8.0.10 recording the 50 Claude cases were built against.
 set -euo pipefail
@@ -8,9 +9,11 @@ root=$PWD
 cache=$root/harness/.cache
 mkdir -p "$cache"
 target=historical
+golden=()
 args=()
 while (($#)); do
     case $1 in
+        --golden) golden=(--golden); args+=("$1"); shift ;;
         --target) target=${2:?--target needs a value}; shift 2 ;;
         --target=*) target=${1#--target=}; shift ;;
         *) args+=("$1"); shift ;;
@@ -19,7 +22,7 @@ done
 for command in go cargo cmake clang perl python3 openssl unshare ip mount; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 2; }
 done
-pins=$(python3 harness/manifest.py shell "$target") || exit 2
+pins=$(python3 harness/manifest.py shell "$target" "${golden[@]}") || exit 2
 eval "$pins"
 # The historical checkout keeps its original location; every other target has its own.
 # CPA_GO_REFERENCE overrides the historical checkout, CPA_GO_REFERENCE_SELECTIVE the

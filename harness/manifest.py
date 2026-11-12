@@ -5,7 +5,7 @@ runner, the collector and the acceptance command read pins only through `load()`
 which refuses a manifest whose pins disagree with the sources they claim to mirror.
 
     python3 harness/manifest.py check          # validate, exit 1 on a problem
-    python3 harness/manifest.py shell TARGET   # shell assignments for harness/run
+    python3 harness/manifest.py shell TARGET [--golden]   # shell assignments for harness/run
 """
 import fnmatch
 import json
@@ -40,8 +40,7 @@ PREDICATES = {"downstream_header", "upstream_header", "upstream_body_edit", "dow
               "downstream_body_timestamps",
               "downstream_json", "tls_extra_go_handshakes", "credential_field", "credential_timestamps", "replace"}
 REPLACE_COVERS = {"status", "downstream-body", "upstream", "tls"}
-SIDE_KEYS = {"status", "body_equals", "body_json", "inference_requests", "upstream_json", "upstream_headers",
-             "tls_like", "tls_count"}
+SIDE_KEYS = {"golden"}
 DIVERGENCE_FIELDS = {"id", "kind", "targets", "cases", "except_cases", "expect", "reason", "issue", "ledger",
                      "evidence", "attribution", "may_be_absent"}
 # Removed in the predicate schema: they exempted whole paths or assertions.
@@ -53,6 +52,25 @@ def _value_spec(spec, where):
              f"{where}: a value spec is null (absent), {{equals}} or {{regex}}")
     if spec and "regex" in spec:
         re.compile(spec["regex"])
+
+
+def _golden(path, where, data=None):
+    """A golden file: pinned Go provenance, complete content for what it covers, known masks."""
+    golden = json.loads((ROOT / path).read_text())
+    manifest = data or json.loads(PATH.read_text())
+    commits = {t["commit"] for t in manifest["go"]["targets"].values()}
+    masks = {k for k in manifest.get("masks", {}) if k != "about"}
+    _require(golden["provenance"]["go_commit"] in commits and golden["provenance"]["side"] == "go",
+             f"{where}: {path} must come from the Go side of a pinned capture")
+    _require(set(golden["covers"]) <= {"upstream", "status", "downstream-body", "tls"}, f"{where}: {path} covers")
+    needed = {"upstream": "requests", "status": "replies", "downstream-body": "replies", "tls": "tls"}
+    for cover in golden["covers"]:
+        _require(needed[cover] in golden, f"{where}: {path} covers {cover} but has no {needed[cover]}")
+    text = json.dumps(golden.get("requests", [])) + json.dumps(golden.get("replies", []))
+    used = set(re.findall(r"\{\{mask:([a-z0-9-]+)\}\}", text))
+    _require(used <= masks, f"{where}: {path} uses unknown masks {sorted(used - masks)}")
+    _require(used <= set(golden.get("body_masks", [])) | {"request-id"}, f"{where}: {path} masks more than it declares")
+    return golden
 
 
 def _predicate(predicate, where, divergence):
@@ -101,7 +119,9 @@ def _predicate(predicate, where, divergence):
     elif kind == "replace":
         _require(set(spec["covers"]) <= REPLACE_COVERS and spec["covers"], f"{where}: covers {sorted(REPLACE_COVERS)}")
         for side in ("go", "rust"):
-            _require(set(spec[side]) <= SIDE_KEYS and spec[side], f"{where}: {side} expectation keys")
+            _require(set(spec[side]) == SIDE_KEYS, f"{where}: {side} names exactly one complete golden")
+            data = _golden(spec[side]["golden"], where)
+            _require(set(spec["covers"]) <= set(data["covers"]), f"{where}: {side} golden does not cover {spec['covers']}")
         _require(not divergence.get("may_be_absent"), f"{where}: a replaced comparison cannot be optional")
 
 
@@ -148,6 +168,20 @@ def validate(data, suite_sizes=None):
     _require(targets["policy"]["commit"] == "ae3ee3be303fb07fb8173279923413005bf32177",
              "policy target must stay AGENTS.md's frozen v8.0.35 reference")
     _require(targets["policy"]["executed"] is False, "the policy reference is not a harness target")
+    for name, target in targets.items():
+        golden = target.get("golden_cases", [])
+        _require(not golden or not target["executed"], f"{name}: only a recorded-only target records goldens")
+        if golden and suite_sizes is not None:
+            sys.path.insert(0, str(ROOT / "harness"))
+            from fixtures import cases
+            _require(set(golden) <= {c["name"] for c in cases()}, f"{name}: golden_cases must be suite cases")
+    masks = {k: v for k, v in data.get("masks", {}).items() if k != "about"}
+    for mask, spec in masks.items():
+        _require(re.fullmatch(r"[a-z0-9-]+", mask) and set(spec) <= {"pattern", "record", "headers"},
+                 f"mask {mask}: name and fields")
+        _require(not re.fullmatch(spec["pattern"], "") and ".*" not in spec["pattern"] and ".+" not in spec["pattern"],
+                 f"mask {mask}: pattern must be narrow")
+        re.compile(spec.get("record", spec["pattern"]))
     ci = _ci_rust_toolchain()
     _require(data["toolchain"]["rust"] == ci,
              f"toolchain.rust {data['toolchain']['rust']} differs from CI RUST_TOOLCHAIN {ci}")
@@ -223,10 +257,9 @@ def validate(data, suite_sizes=None):
             re.compile(pattern)
     invariants = data.get("invariants", {})
     _require(set(invariants) >= {"native_passthrough", "upstream_goldens"}, "invariants need native rules")
-    for golden in invariants["upstream_goldens"]:
-        golden_data = json.loads((ROOT / golden["file"]).read_text())
-        _require(golden_data["provenance"]["go_commit"] in commits,
-                 f"{golden['file']}: golden must come from a pinned Go capture")
+    for entry in invariants["upstream_goldens"]:
+        _require(set(entry) == {"case", "file"}, f"{entry}: a native golden names a case and a file")
+        _require("upstream" in _golden(entry["file"], "invariants", data)["covers"], f"{entry['file']}: covers upstream")
     for skip in data.get("skips", []):
         _require(skip.get("reason") and skip.get("issue"), f"skip {skip.get('case')}: needs reason and issue")
     return data
@@ -248,10 +281,11 @@ def main(argv):
         load(suite_sizes())
         print("harness/manifest.json: ok")
         return 0
-    if len(argv) == 2 and argv[0] == "shell":
+    if len(argv) in (2, 3) and argv[0] == "shell" and argv[2:] in ([], ["--golden"]):
         data = load()
         target = data["go"]["targets"].get(argv[1])
-        if target is None or not target["executed"]:
+        golden = argv[2:] == ["--golden"]
+        if target is None or (not target["executed"] and not (golden and target.get("golden_cases"))):
             print(f"not an executed Go target: {argv[1]}", file=sys.stderr)
             return 2
         print(f"go_repository={shlex.quote(data['go']['repository'])}")
