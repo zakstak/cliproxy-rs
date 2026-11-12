@@ -916,4 +916,182 @@ mod migrated_leases {
         lease.complete(Outcome::Success);
         assert!(s.store.cooldowns(&s.c.id).is_empty());
     }
+
+    /// One parsed OAuth alias published as a config reload does; the revision stays.
+    fn publish_alias(s: &Setup, name: &str, alias: &str) {
+        let revision = s.store.get(&s.c.id).unwrap().revision;
+        let config = Config::parse(&format!(
+            "oauth:\n  model-alias:\n    claude:\n      - name: {name}\n        alias: {alias}\n"
+        ))
+        .unwrap();
+        let aliases = global_aliases(&config);
+        assert_eq!(aliases["claude"].len(), 1, "the parser keeps {name} <- {alias}");
+        s.store.set_model_aliases(aliases);
+        assert_eq!(s.store.get(&s.c.id).unwrap().revision, revision, "config only");
+    }
+
+    fn transient() -> Outcome {
+        let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+        e.retry_after = Some(Duration::from_secs(40));
+        Outcome::Failure(e)
+    }
+
+    /// Sol review of #136 at `abcbac05` (finding 1): after the move, the alias is removed,
+    /// remapped to another model, published again or reversed. The lease's acceptance,
+    /// success, cancellation, failure and pooled note answer where its cooldown actually
+    /// is, never a new cooldown under the old spelling.
+    #[test]
+    fn a_lease_follows_its_cooldown_through_later_alias_publishes() {
+        for later in ["removed", "other model", "repeated", "reversed"] {
+            for answer in ["accepted", "success", "cancelled", "failure", "note"] {
+                let case = format!("{later}, {answer}");
+                let s = setup(&format!("history-{later}-{answer}").replace(' ', "-"), "m", None);
+                let lease = s.pick("m").expect("the ended window's probe");
+                s.publish();
+                match later {
+                    "removed" => {
+                        let revision = s.store.get(&s.c.id).unwrap().revision;
+                        s.store.set_model_aliases(HashMap::new());
+                        assert_eq!(s.store.get(&s.c.id).unwrap().revision, revision);
+                    }
+                    "other model" => publish_alias(&s, "other-model(high)", "m"),
+                    "repeated" => s.publish(),
+                    _ => publish_alias(&s, "m(high)", "M"),
+                }
+                let key = if later == "reversed" { "m" } else { "M" };
+                assert!(s.pick(key).is_none(), "{case}: held where the cooldown is");
+                match answer {
+                    "accepted" => {
+                        lease.accepted();
+                        assert!(s.pick(key).is_some(), "{case}: released");
+                        lease.complete(Outcome::Success);
+                    }
+                    "success" => {
+                        lease.complete(Outcome::Success);
+                        assert!(s.pick(key).is_some(), "{case}: released");
+                    }
+                    "cancelled" => {
+                        lease.complete(Outcome::Cancelled);
+                        assert!(s.pick(key).is_some(), "{case}: released");
+                    }
+                    _ => {
+                        if answer == "note" {
+                            lease.note("m", &transient());
+                        } else {
+                            lease.complete(transient());
+                        }
+                        let states = s.store.cooldowns(&s.c.id);
+                        assert!(
+                            states.iter().all(|x| x.model == key)
+                                && states.iter().any(|x| x.remaining > Duration::from_secs(35)),
+                            "{case}: the failure cools {key} only: {states:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A login with no saved cooldowns and a tiny trust bound, so bounded windows end at
+    /// once and the next pick probes.
+    fn seed(name: &str, cap: Duration) -> (Arc<CredentialStore>, Arc<Policy>, Credential) {
+        let dir = auth_dir(name);
+        let meta = json!({"type": "claude", "access_token": "sk-ant-oat01-FAKE", "account_uuid": "synthetic"});
+        let c = Credential::from_file(&dir, &dir.join("a.json"), meta.as_object().unwrap().clone()).unwrap();
+        let policy = Arc::new(Policy {
+            max_trusted_cooldown: cap,
+            ..Policy::default()
+        });
+        (CredentialStore::new(vec![c.clone()]), policy, c)
+    }
+
+    fn take(store: &Arc<CredentialStore>, policy: &Arc<Policy>, key: &str) -> Option<Lease> {
+        let admit = |_: &Credential| Some(key.to_owned());
+        store
+            .select_with(Selection::new("claude", key), policy.clone(), &admit)
+            .ok()
+    }
+
+    fn fail(status: u16, retry: Duration) -> Outcome {
+        let mut e = ExecError::local(status, FailureScope::Model, "slow down".to_owned());
+        e.retry_after = Some(retry);
+        Outcome::Failure(e)
+    }
+
+    /// Sol review of #136 at `abcbac05` (finding 2): an alias publish racing a lease's
+    /// acceptance or completion never orphans the hold, because migration and a result's
+    /// key resolution and application share the scheduler lock. The serial orders are the
+    /// deterministic cases (`scheduler::tests::results_follow_the_migration_history_of_their_pick`
+    /// and `a_lease_follows_its_cooldown_through_later_alias_publishes`); this releases both
+    /// threads together for many rounds.
+    #[test]
+    fn a_publish_racing_an_answer_never_orphans_the_hold() {
+        let aliases = aliases();
+        for accept in [false, true] {
+            for round in 0..300 {
+                let (store, policy, _) = seed("race", Duration::from_nanos(1));
+                take(&store, &policy, "m")
+                    .unwrap()
+                    .complete(fail(429, Duration::from_secs(3600)));
+                std::thread::sleep(Duration::from_micros(10));
+                let mut lease = Some(take(&store, &policy, "m").expect("the probe"));
+                assert!(take(&store, &policy, "m").is_none(), "held");
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        store.set_model_aliases(aliases.clone());
+                    });
+                    barrier.wait();
+                    if accept {
+                        lease.as_ref().unwrap().accepted();
+                    } else {
+                        lease.take().unwrap().complete(Outcome::Success);
+                    }
+                });
+                assert!(
+                    take(&store, &policy, "M").is_some(),
+                    "accept {accept}, round {round}: the hold was orphaned"
+                );
+                if let Some(lease) = lease {
+                    lease.complete(Outcome::Success);
+                }
+            }
+        }
+    }
+
+    /// Sol review of #136 at `abcbac05` (finding 3): once the stream of a probe carried
+    /// onto an unbounded owner is accepted, a lease picked before that probe cannot
+    /// re-cool the recovered key with a late failure. Control: a bounded window that
+    /// never moved keeps the same fence.
+    #[test]
+    fn an_older_lease_cannot_re_cool_a_key_after_its_carried_hold_was_accepted() {
+        for carried in [true, false] {
+            let (store, policy, _) = seed(&format!("fence-{carried}"), Duration::from_millis(1));
+            let old = take(&store, &policy, "m").unwrap();
+            take(&store, &policy, "m")
+                .unwrap()
+                .complete(fail(429, Duration::from_secs(3600)));
+            if carried {
+                take(&store, &policy, "M")
+                    .unwrap()
+                    .complete(fail(503, Duration::from_millis(2)));
+            }
+            std::thread::sleep(Duration::from_millis(4));
+            let probe = take(&store, &policy, "m").expect("the probe");
+            if carried {
+                store.set_model_aliases(aliases());
+            }
+            let key = if carried { "M" } else { "m" };
+            probe.accepted();
+            assert!(take(&store, &policy, key).is_some(), "carried {carried}: accepted");
+            old.complete(fail(503, Duration::from_secs(65)));
+            let recovered = take(&store, &policy, key).is_some();
+            probe.complete(Outcome::Success);
+            assert!(
+                recovered,
+                "carried {carried}: the older lease's failure re-cooled {key}"
+            );
+        }
+    }
 }

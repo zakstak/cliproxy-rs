@@ -752,9 +752,15 @@ pub(crate) struct Scheduler {
     /// The live policy turned session affinity off: results of leases picked while it
     /// was on no longer bind anything (Go's replacement selector has no affinity).
     affinity_off: bool,
-    /// Bounded windows opened plus probes reserved; each lease carries the value at its
-    /// pick ([`Trust::generation`]).
+    /// Bounded windows opened, probes reserved and key migrations; each lease carries
+    /// the value at its pick ([`Trust::generation`]).
     generation: u32,
+    /// Where model-key migrations moved each credential's cooldowns (#95): `(credential,
+    /// from)` to its moves, oldest first. A lease picked before a move answers the key
+    /// its cooldown moved to ([`Self::result_key`]), whatever aliases were published
+    /// since. Kept for the credential revision it moved under; dropped with that revision,
+    /// the credential, or after 2^30 generations.
+    moved: HashMap<(String, String), Vec<Moved>>,
     /// Upstream dispatches so far (Go `Manager.executionSeq`): each dispatch takes the
     /// next value ([`Self::dispatch`]); a recorded failure stamps the current one.
     dispatched: u64,
@@ -764,6 +770,20 @@ pub(crate) struct Scheduler {
     /// selected nor refreshed until their tokens change ([`Self::tokens_rejected`]).
     rejected: HashMap<String, std::sync::Arc<Credential>>,
 }
+
+/// One model-key migration of a credential's cooldown ([`Scheduler::migrate_model_keys`]).
+#[derive(Debug, Clone)]
+struct Moved {
+    /// The scheduler generation the migration took: leases picked before it follow it.
+    generation: u32,
+    /// The credential revision it moved under; results come only from that revision.
+    revision: u64,
+    to: String,
+}
+
+/// History older than this many generations is dropped, so the wrapping generation
+/// counter never compares it the wrong way round.
+const MOVED_HORIZON: u32 = 1 << 30;
 
 /// A selection's affinity keys: the session, and its parent or alias when distinct.
 struct SessionKeys {
@@ -946,7 +966,8 @@ impl Scheduler {
     /// Cost: two lookups, and a scan of the cooldown table only when the credential-wide
     /// window ended.
     pub fn accept_probe_picked(&mut self, c: &Credential, model: &str, picked: u32, now: Instant) {
-        let model = canonical_model(model);
+        let key = self.result_key(c, canonical_model(model), picked);
+        let model = key.as_str();
         let mut credential_window = None;
         for m in [model, ""] {
             let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned())) else {
@@ -960,8 +981,12 @@ impl Scheduler {
                 if m.is_empty() {
                     credential_window = Some(s.deadline);
                 }
-            } else {
+            } else if s.trust.probe.is_some() {
+                // A reservation carried onto another deadline owner: answered, so it keeps
+                // its generation as a fence against older leases, as an accepted bounded
+                // window does. The owner's deadline, quota and evidence stay.
                 s.trust.probe = None;
+                s.trust.accepted = true;
             }
         }
         if let Some(ended) = credential_window {
@@ -1366,7 +1391,8 @@ impl Scheduler {
         seq: u64,
         now: Instant,
     ) {
-        let model = canonical_model(model);
+        let key = self.result_key(c, canonical_model(model), picked);
+        let model = key.as_str();
         self.apply(c, model, outcome, policy, picked, seq, now);
         // Go stamps the failing state with the dispatch watermark; a credential-wide 429
         // also stamps the credential and every sibling state. A credential-level failure
@@ -2108,6 +2134,38 @@ impl Scheduler {
         true
     }
 
+    /// The key a result for `model` from a lease of `c` picked at generation `picked`
+    /// answers: `model`, or where the migrations since that pick moved its cooldown,
+    /// followed in the order they happened ([`Self::migrate_model_keys`]). Only moves
+    /// under `c`'s revision count, so a replaced credential's history never applies; the
+    /// caller has checked that the lease's revision is current. Resolution and the
+    /// result's application happen under the scheduler lock, as migrations do, so a
+    /// result never lands between a migration and its record. Cost: nothing without
+    /// history; one lookup per move followed otherwise.
+    fn result_key(&self, c: &Credential, model: &str, picked: u32) -> String {
+        let mut key = model.to_owned();
+        if self.moved.is_empty() {
+            return key;
+        }
+        let mut since = picked;
+        let current = self.generation;
+        // Each step follows a strictly later move, so this ends.
+        while let Some(next) = self.moved.get(&(c.id.clone(), key.clone())).and_then(|history| {
+            history
+                .iter()
+                .filter(|m| {
+                    m.revision == c.revision
+                        && current.wrapping_sub(m.generation) < MOVED_HORIZON
+                        && (m.generation.wrapping_sub(since) as i32) > 0
+                })
+                .min_by_key(|m| m.generation.wrapping_sub(since))
+        }) {
+            since = next.generation;
+            key = next.to.clone();
+        }
+        key
+    }
+
     /// Moves `c`'s model cooldowns to the keys their spellings resolve to now (#95, Go
     /// v8.0.67 098af7d5): `key_of` is the key a route model's cooldown lives under
     /// ([`crate::registry::cooldown_key`]). A key moves only to a spelling that is the
@@ -2122,7 +2180,24 @@ impl Scheduler {
             .filter(|(id, _)| *id == c.id)
             .filter_map(|(_, m)| migrated_key(m, &key_of).map(|to| (m.clone(), to)))
             .collect();
+        let current = self.generation;
+        self.moved.retain(|(id, _), history| {
+            if *id == c.id {
+                history.retain(|m| m.revision == c.revision && current.wrapping_sub(m.generation) < MOVED_HORIZON);
+            }
+            !history.is_empty()
+        });
+        if !moves.is_empty() {
+            // Leases picked before this migration follow it; later ones were picked under
+            // the new keys.
+            self.generation = self.generation.wrapping_add(1);
+        }
         for (from, to) in &moves {
+            self.moved.entry((c.id.clone(), from.clone())).or_default().push(Moved {
+                generation: self.generation,
+                revision: c.revision,
+                to: to.clone(),
+            });
             let Some(moved) = self.cooldowns.remove(&(c.id.clone(), from.clone())) else {
                 continue;
             };
@@ -2165,6 +2240,7 @@ impl Scheduler {
     pub fn reconcile(&mut self, credentials: &[std::sync::Arc<Credential>]) {
         self.cooldowns
             .retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
+        self.moved.retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
         self.affinity.retain(|id| credentials.iter().any(|c| c.id == id));
         self.lcp.retain(|id| credentials.iter().any(|c| c.id == id));
         self.probes.retain(|id, _| credentials.iter().any(|c| c.id == *id));
@@ -2174,9 +2250,7 @@ impl Scheduler {
 
 /// The key a cooldown kept under model key `key` moves to now
 /// ([`Scheduler::migrate_model_keys`]), or `None` when it stays: only to a spelling that
-/// is the same name under Go's `strings.ToLower` and that `key_of` maps to itself. A
-/// result for a lease picked before the move is recorded there too
-/// (`CredentialStore::result_key`), so it answers the state its pick reserved.
+/// is the same name under Go's `strings.ToLower` and that `key_of` maps to itself.
 pub(crate) fn migrated_key(key: &str, key_of: impl Fn(&str) -> String) -> Option<String> {
     use cpa_core::gostr::GoStr;
     let key = canonical_model(key);
@@ -4640,6 +4714,177 @@ mod tests {
             None,
             "not a fixpoint"
         );
+    }
+
+    /// Sol review of #136 at `abcbac05` (findings 1 and 2): a lease's results follow the
+    /// migrations since its pick, in order, whatever aliases were published later, and
+    /// only under the revision they moved under. Leases picked after a migration answer
+    /// their own key. Both event orders around a migration answer the reservation.
+    #[test]
+    fn results_follow_the_migration_history_of_their_pick() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let quota = || {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = || {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(40));
+            Outcome::Failure(e)
+        };
+        let to_upper = |m: &str| -> String { if m == "m" { "M".into() } else { m.to_owned() } };
+        let to_lower = |m: &str| -> String { if m == "M" { "m".into() } else { m.to_owned() } };
+        let unchanged = |m: &str| -> String { m.to_owned() };
+        let t1 = t0 + secs(61);
+        let later = t1 + secs(1);
+        // A probe reserved under `m`, then moved to `M`.
+        let reserved = |start: u32| {
+            let mut s = Scheduler {
+                generation: start,
+                ..Scheduler::default()
+            };
+            s.record(&c, "m", &quota(), &p, t0);
+            let g = s.reserve_probe(&c, "m", t1);
+            (s, g)
+        };
+        let held = |s: &Scheduler, key: &str| s.wait(&c, key, later).is_some();
+        // Wraps the generation counter on the way, and again for the history below.
+        for start in [0, u32::MAX - 1] {
+            let case = format!("generation {start}");
+            // Alias removed, or the spelling mapped to another model, after the move:
+            // acceptance, success, cancellation and failure all answer `M`.
+            for answer in 0..4 {
+                let (mut s, g) = reserved(start);
+                assert!(s.migrate_model_keys(&c, to_upper, t1), "{case}");
+                assert!(
+                    !s.migrate_model_keys(&c, unchanged, t1),
+                    "{case}: a removal moves nothing"
+                );
+                assert!(held(&s, "M"), "{case}");
+                match answer {
+                    0 => s.accept_probe_picked(&c, "m", g, later),
+                    1 => s.record_picked(&c, "m", &Outcome::Success, &p, g, later),
+                    2 => s.record_picked(&c, "m", &Outcome::Cancelled, &p, g, later),
+                    _ => s.record_picked(&c, "m", &transient(), &p, g, later),
+                }
+                let keys: Vec<&str> = s.cooldowns.keys().map(|(_, m)| m.as_str()).collect();
+                assert!(
+                    !keys.contains(&"m"),
+                    "{case}, answer {answer}: nothing under the old key: {keys:?}"
+                );
+                if answer == 3 {
+                    assert_eq!(s.wait(&c, "M", later), Some(secs(40)), "{case}: the failure cools M");
+                } else {
+                    assert!(!held(&s, "M"), "{case}, answer {answer}: released");
+                }
+            }
+            // Reversed: the state moved back, and so does the answer.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            assert!(s.migrate_model_keys(&c, to_lower, t1), "{case}: moved back");
+            s.record_picked(&c, "m", &Outcome::Success, &p, g, later);
+            assert!(!held(&s, "m") && s.cooldowns.is_empty(), "{case}: reversed");
+            // A lease picked after the move answers the key it was picked under.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            let fresh = s.generation;
+            assert!((fresh.wrapping_sub(g) as i32) > 0, "{case}: the move took a generation");
+            s.record_picked(&c, "m", &transient(), &p, fresh, later);
+            assert_eq!(s.wait(&c, "m", later), Some(secs(40)), "{case}: its own key");
+            assert!(held(&s, "M"), "{case}: the moved reservation is not its own");
+            // History of a replaced revision never applies.
+            let (mut s, g) = reserved(start);
+            s.migrate_model_keys(&c, to_upper, t1);
+            let mut replaced = c.clone();
+            replaced.revision += 1;
+            s.migrate_model_keys(&replaced, unchanged, t1);
+            assert!(s.moved.is_empty(), "{case}: pruned with its revision");
+            s.record_picked(&replaced, "m", &Outcome::Success, &p, g, later);
+            assert!(held(&s, "M"), "{case}: no history for the new revision");
+        }
+        // Both orders of one answer and one migration: the answer reaches the state.
+        for accept in [false, true] {
+            for answer_first in [false, true] {
+                let case = format!("accept {accept}, answer first {answer_first}");
+                let (mut s, g) = reserved(0);
+                let answer = |s: &mut Scheduler| {
+                    if accept {
+                        s.accept_probe_picked(&c, "m", g, later);
+                    } else {
+                        s.record_picked(&c, "m", &Outcome::Success, &p, g, later);
+                    }
+                };
+                if answer_first {
+                    answer(&mut s);
+                    s.migrate_model_keys(&c, to_upper, later);
+                } else {
+                    s.migrate_model_keys(&c, to_upper, later);
+                    answer(&mut s);
+                }
+                assert!(!held(&s, "M") && !held(&s, "m"), "{case}");
+            }
+        }
+    }
+
+    /// Sol review of #136 at `abcbac05` (finding 3): accepting a carried reservation keeps
+    /// its generation as a fence, so an older lease's late failure cannot re-cool the
+    /// recovered key, as with an accepted bounded window. A newer lease's failure still
+    /// cools it.
+    #[test]
+    fn an_accepted_carried_hold_keeps_its_fence_against_older_leases() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let fail = |status: u16, retry: u64| {
+            let mut e = ExecError::local(status, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(retry));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String { if m == "m" { "M".into() } else { m.to_owned() } };
+        let t1 = t0 + secs(61);
+        let late = t0 + secs(80);
+        for carried in [true, false] {
+            let mut s = Scheduler::default();
+            let old = s.generation;
+            s.record(&c, "m", &fail(429, 3600), &p, t0);
+            if carried {
+                s.record(&c, "M", &fail(503, 60), &p, t0 + secs(1));
+            }
+            let g = s.reserve_probe(&c, "m", t1);
+            if carried {
+                assert!(s.migrate_model_keys(&c, key_of, t1));
+                assert!(
+                    !s.cooldowns[&(c.id.clone(), "M".to_owned())].trust.bounded,
+                    "an unbounded owner"
+                );
+            }
+            let key = if carried { "M" } else { "m" };
+            s.accept_probe_picked(&c, "m", g, t1 + secs(1));
+            assert_eq!(s.wait(&c, key, late), None, "carried {carried}: accepted");
+            s.record_picked(&c, "m", &fail(503, 65), &p, old, late);
+            assert_eq!(
+                s.wait(&c, key, late),
+                None,
+                "carried {carried}: an older lease's failure"
+            );
+            // A lease picked now is picked under the current key.
+            let newer = s.generation;
+            s.record_picked(&c, key, &fail(503, 65), &p, newer, late);
+            assert_eq!(
+                s.wait(&c, key, late),
+                Some(secs(65)),
+                "carried {carried}: a newer lease's"
+            );
+        }
     }
 
     #[test]
