@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use cpa_common::gostr::GoStr;
 use cpa_core::config::Config;
+use cpa_core::config::credentials::{AuthFile, Unsettled};
 use cpa_core::credential::{Credential, MetadataPatch, Source};
 use cpa_core::exec::{ExecError, ExecStream, FailureScope};
 use cpa_exec::{Executors, Readiness};
@@ -2733,7 +2734,7 @@ impl CredentialStore {
     /// Replaces the credential set (watcher reload, management import/delete). Unchanged
     /// credentials keep their revision; new and changed ones get fresh revisions.
     pub fn reconcile(&self, credentials: Vec<Credential>) {
-        self.reconcile_scanned(credentials, &std::collections::BTreeMap::new());
+        self.reconcile_scanned(credentials, &std::collections::BTreeMap::new(), &Unsettled::default());
     }
 
     /// [`Self::reconcile`] for an auth-folder scan; `read` has the SHA-256 of the bytes
@@ -2746,16 +2747,23 @@ impl CredentialStore {
     /// under the exclusive reload gate, so no write lands between it and the swap, but
     /// before `inner` is taken, so its file reads never stall readers. Returns the files
     /// whose scanned credential was rejected.
+    ///
+    /// A file credential whose file the scan left `unsettled` (incomplete, unreadable,
+    /// or in a folder it could not list) and that the scan did not rebuild stays as it
+    /// is now, under the same gate: the revision, cooldowns, 401 block and saved-document
+    /// binding all survive, a refresh committed after the scan is not undone, and a
+    /// credential already removed is not brought back.
     pub fn reconcile_scanned(
         &self,
         credentials: Vec<Credential>,
         read: &std::collections::BTreeMap<std::path::PathBuf, [u8; 32]>,
+        unsettled: &Unsettled,
     ) -> Vec<std::path::PathBuf> {
         use sha2::{Digest, Sha256};
         let reload = self.reload.write().unwrap_or_else(PoisonError::into_inner);
         let mut credentials = credentials;
         // A credential this scan synthesized has no revision yet; one kept for an
-        // incomplete file is the store's own record, not built from `read`.
+        // unsettled file is the store's own record, not built from `read`.
         let built: std::collections::HashSet<std::path::PathBuf> = credentials
             .iter()
             .filter(|c| c.revision == 0)
@@ -2779,13 +2787,26 @@ impl CredentialStore {
                 }
                 // The scan's own rule: a FIFO or device in the file's place is never read
                 // (it could block or never end) and counts as a changed file.
-                let on_disk: Option<[u8; 32]> = cpa_core::config::credentials::read_regular(path)
-                    .filter(|data| !data.is_empty())
-                    .map(|data| Sha256::digest(&data).into());
+                let file = cpa_core::config::credentials::read_auth_file(path);
+                #[cfg(test)]
+                let file = crate::watching::faults::read(crate::watching::faults::Stage::Freshness, path, file);
+                let on_disk: Option<[u8; 32]> = match file {
+                    AuthFile::Bytes(data) if !data.is_empty() => Some(Sha256::digest(&data).into()),
+                    _ => None,
+                };
                 if on_disk.as_ref() != Some(seen) {
                     rejected.push(path.clone());
                     *cred = Credential::clone(existing);
                 }
+            }
+        }
+        let scanned: std::collections::HashSet<String> = credentials.iter().map(|c| c.id.clone()).collect();
+        for existing in self.snapshot().iter() {
+            if let Source::File(path) = &existing.source
+                && !scanned.contains(&existing.id)
+                && unsettled.contains(path)
+            {
+                credentials.push(Credential::clone(existing));
             }
         }
         let mut guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
@@ -4349,7 +4370,7 @@ pub(crate) mod tests {
         store.apply_patch("synthetic.json", revision, &patch).unwrap();
         let current = || store.get("synthetic.json").unwrap();
         let before = current();
-        store.reconcile_scanned(stale.credentials, &stale.read);
+        store.reconcile_scanned(stale.credentials, &stale.read, &Unsettled::default());
         assert_eq!(
             current().metadata["prefix"],
             "pfx-9",
@@ -4358,20 +4379,20 @@ pub(crate) mod tests {
         assert_eq!(current().revision, before.revision);
         write("manual-edit");
         let manual = scan();
-        store.reconcile_scanned(manual.credentials, &manual.read);
+        store.reconcile_scanned(manual.credentials, &manual.read, &Unsettled::default());
         assert_eq!(current().metadata["prefix"], "manual-edit", "a real edit was lost");
         let before = current();
         write("deleted-edit");
         let deleted = scan();
         std::fs::remove_file(&path).unwrap();
-        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read);
+        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read, &Unsettled::default());
         assert_eq!(
             current().revision,
             before.revision,
             "a deleted file's snapshot was applied"
         );
         std::fs::create_dir(&path).unwrap();
-        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read);
+        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read, &Unsettled::default());
         assert_eq!(
             current().revision,
             before.revision,
@@ -4385,7 +4406,7 @@ pub(crate) mod tests {
             assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
             let done = spawn_bounded({
                 let store = store.clone();
-                move || store.reconcile_scanned(deleted.credentials, &deleted.read)
+                move || store.reconcile_scanned(deleted.credentials, &deleted.read, &Unsettled::default())
             });
             done.recv_timeout(BOUND).expect("the freshness check opened the FIFO");
             assert_eq!(current().revision, before.revision, "a FIFO's snapshot was applied");
