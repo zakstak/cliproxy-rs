@@ -313,6 +313,20 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaises(revisions.ManifestError, msg=bad):
                 revisions.validate(pins_with() | {"divergences": [bad]})
 
+    def test_a_missing_audit_requires_ownership_and_frozen_reference_evidence(self):
+        audit = {"id": "audit", "kind": "missing-audit", "targets": ["selective"], "cases": ["*"],
+                 "reason": "Unresolved frozen-reference discrepancy", "issue": "issue67",
+                 "evidence": "Go commit", "attribution": "Frozen v8.0.35 differs from Rust",
+                 "ledger": "docs/parity-audit/checklist.md#unresolved-frozen-reference-discrepancies",
+                 "expect": [{"credential_field": {"field": "disabled", "go": "<absent>", "rust": False,
+                                                   "equal_values": ["<absent>", False]}}]}
+        revisions.validate(pins_with() | {"divergences": [audit]})
+        for field in ("issue", "evidence", "attribution", "ledger"):
+            with self.subTest(field=field), self.assertRaises(revisions.ManifestError):
+                revisions.validate(pins_with() | {"divergences": [{k: v for k, v in audit.items() if k != field}]})
+        with self.assertRaises(revisions.ManifestError):
+            revisions.validate(pins_with() | {"divergences": [audit | {"targets": ["historical", "selective"]}]})
+
     def test_targets_keep_distinct_validated_pins(self):
         for path, value in [(("go", "targets", "historical", "commit"), PINS["go"]["targets"]["selective"]["commit"]),
                             (("go", "targets", "selective", "commit"), "8bba7a77"),

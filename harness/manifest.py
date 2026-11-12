@@ -37,6 +37,9 @@ DIVERGENCE_KINDS = {
     "unowned",
     # Neither a commit nor an owner is established; the attribution says what is known.
     "unattributed",
+    # An owned, unresolved discrepancy with the frozen reference. The audit ledger
+    # records what is missing; this neither adopts behaviour nor declares a policy.
+    "missing-audit",
     # Selective only: the tracker decided not to adopt this v8.0.67 behaviour in this batch.
     # cliproxy-rs keeps the frozen v8.0.35 behaviour. Names the Go commit (evidence), the
     # deciding issue, and the executed v8.0.35 comparison that shows Rust matches it
@@ -254,8 +257,13 @@ def validate(data, suite_sizes=None):
         for index, predicate in enumerate(divergence["expect"]):
             _predicate(predicate, f"{name}[{index}]", divergence, data)
         kind = divergence["kind"]
-        if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed", "not-adopted"):
+        if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed", "not-adopted", "missing-audit"):
             _require(divergence.get("issue"), f"{name}: needs the issue that tracks it")
+        if kind == "missing-audit":
+            _require(divergence["targets"] == ["selective"] and divergence.get("evidence")
+                     and divergence.get("attribution") and divergence.get("ledger"),
+                     f"{name}: a missing audit is selective-only and names its Go evidence, "
+                     "frozen-reference attribution and unresolved audit ledger entry")
         if kind == "unowned":
             _require(divergence.get("evidence"), f"{name}: an unowned divergence names its Go commit")
         if kind == "unattributed":
