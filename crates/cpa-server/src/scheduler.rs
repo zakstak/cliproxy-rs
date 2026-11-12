@@ -1214,12 +1214,14 @@ impl Scheduler {
         self.rejected.insert(c.id.clone(), c);
     }
 
-    /// Whether `c` still holds the tokens [`Self::reject_tokens`] recorded (Go
-    /// `updateInternalLocked` lifts the block once `CredentialsChanged`).
+    /// Whether `c` still holds the tokens [`Self::reject_tokens`] recorded: the block lifts
+    /// once the token set requests use changes ([`crate::runtime::active_tokens_changed`];
+    /// Go v8.0.35 `updateInternalLocked` lifts it on any `CredentialsChanged`, Go v8.0.67
+    /// a96e640d keeps it across a refresh that leaves the refused token in place).
     pub(crate) fn tokens_rejected(&self, c: &Credential) -> bool {
         self.rejected
             .get(&c.id)
-            .is_some_and(|r| !crate::runtime::credentials_changed(r, c))
+            .is_some_and(|r| !crate::runtime::active_tokens_changed(r, c))
     }
 
     /// [`Self::record_picked`] for an attempt picked just now.

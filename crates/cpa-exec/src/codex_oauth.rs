@@ -184,7 +184,64 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-type RefreshResult<T> = Shared<BoxFuture<'static, Result<T, ExecError>>>;
+/// A refresh grant's failure. `terminal` when the token endpoint refused the refresh
+/// token for good, so sending it again cannot succeed (see [`outer_terminal`] and
+/// [`siwc_terminal`]); a transient failure keeps the token for a later attempt.
+#[derive(Debug, Clone)]
+pub struct GrantError {
+    pub error: ExecError,
+    pub terminal: bool,
+}
+
+impl GrantError {
+    fn transient(error: ExecError) -> Self {
+        Self { error, terminal: false }
+    }
+}
+
+impl From<ExecError> for GrantError {
+    fn from(error: ExecError) -> Self {
+        Self::transient(error)
+    }
+}
+
+/// Whether the ChatGPT OAuth (outer) token endpoint refused a refresh token for good.
+/// First-party `openai/codex` at the contract pin `44ccf394573c`
+/// (`codex-rs/login/src/auth/manager.rs`, `request_chatgpt_token_refresh` and
+/// `classify_refresh_token_failure`): HTTP 401, the codes `refresh_token_expired`,
+/// `refresh_token_reused` and `refresh_token_invalidated` (any case), or HTTP 400 with
+/// `invalid_grant`. Everything else is transient.
+pub fn outer_terminal(status: u16, code: &str) -> bool {
+    status == 401
+        || [
+            "refresh_token_expired",
+            "refresh_token_reused",
+            "refresh_token_invalidated",
+        ]
+        .iter()
+        .any(|c| code.eq_ignore_ascii_case(c))
+        || (status == 400 && code.eq_ignore_ascii_case("invalid_grant"))
+}
+
+/// Whether the Sign in with ChatGPT token endpoint refused a refresh token for good.
+/// OpenAI "SIWC errors and recovery", unusable refresh token: `invalid_grant` on
+/// refresh, `invalid_refresh_token`, `token_expired`, `refresh_token_expired`,
+/// `refresh_token_invalidated`, `refresh_token_reused` ("clear unusable tokens and
+/// repeat OAuth with the saved issued client ID"). The page states no status, so the
+/// documented code decides; `invalid_client` is a configuration fault, not a dead token.
+pub fn siwc_terminal(code: &str) -> bool {
+    [
+        "invalid_grant",
+        "invalid_refresh_token",
+        "token_expired",
+        "refresh_token_expired",
+        "refresh_token_invalidated",
+        "refresh_token_reused",
+    ]
+    .contains(&code)
+}
+
+type RefreshResult<T> = Shared<BoxFuture<'static, Result<T, GrantError>>>;
 /// Completed refresh results kept for deduplication and failure backoff.
 const MAX_RETAINED_REFRESHES: usize = 64;
 type Table<T> = Arc<Mutex<HashMap<[u8; 32], (Instant, RefreshResult<T>)>>>;
@@ -203,7 +260,7 @@ struct Refreshes {
 fn single_flight<T: Clone + Send + Sync + 'static>(
     table: &Table<T>,
     key: [u8; 32],
-    run: BoxFuture<'static, Result<T, ExecError>>,
+    run: BoxFuture<'static, Result<T, GrantError>>,
     retain_failures: bool,
 ) -> RefreshResult<T> {
     let mut locked = table.lock().expect("refresh table");
@@ -228,7 +285,10 @@ fn single_flight<T: Clone + Send + Sync + 'static>(
     let task = tokio::spawn(async move {
         let result = run.await;
         let mut table = retained.lock().expect("refresh table");
-        if result.is_err() && !retain_failures {
+        // A refresh token refused for good is retained like a success: the same token
+        // fails fast for five minutes (first-party codex-rs caches a permanent refresh
+        // failure per auth snapshot).
+        if result.as_ref().is_err_and(|e| !e.terminal) && !retain_failures {
             table.remove(&key);
         } else if let Some((until, _)) = table.get_mut(&key) {
             *until = Instant::now() + Duration::from_secs(300);
@@ -236,9 +296,12 @@ fn single_flight<T: Clone + Send + Sync + 'static>(
         drop(table);
         result
     });
-    let shared = async move { task.await.map_err(|_| oauth_error(500, "codex refresh task failed"))? }
-        .boxed()
-        .shared();
+    let shared = async move {
+        task.await
+            .map_err(|_| GrantError::transient(oauth_error(500, "codex refresh task failed")))?
+    }
+    .boxed()
+    .shared();
     locked.insert(key, (Instant::now() + Duration::from_secs(300), shared.clone()));
     shared
 }
@@ -305,6 +368,22 @@ impl CodexOAuth {
         body: Vec<u8>,
     ) -> Result<(u16, bytes::Bytes), ExecError> {
         let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
+        match self.post_status(url, content_type, body).await? {
+            (status, Some(body)) => Ok((status, body)),
+            (_, None) => Err(failed()),
+        }
+    }
+
+    /// [`Self::post`], keeping the answer's HTTP status when its body cannot be read
+    /// (`None`), as first-party codex-rs's `TokenRejection` does ("HTTP status survives
+    /// even when its body cannot be read").
+    async fn post_status(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
+        let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
         headers.set("Accept", "application/json");
@@ -316,29 +395,47 @@ impl CodexOAuth {
             .map_err(|_| failed())?;
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
-            .map_err(|_| failed())?;
+            .ok();
         Ok((upstream.status, body))
     }
 
     /// `exchange` keeps Go's `ExchangeCodeForTokens` error texts (status and body);
     /// refreshes keep the sanitized refresh error.
     async fn token_request(&self, form: &[(&str, &str)], exchange: bool) -> Result<Tokens, ExecError> {
+        self.token_grant(form, exchange).await.map_err(|e| e.error)
+    }
+
+    /// [`Self::token_request`], with a refusal's classification ([`outer_terminal`]).
+    async fn token_grant(&self, form: &[(&str, &str)], exchange: bool) -> Result<Tokens, GrantError> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
-        let (status, body) = self
-            .post(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
-            .await?;
+        let (status, body) = match self
+            .post_status(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
+            .await?
+        {
+            (status, Some(body)) => (status, body),
+            // A refusal whose body cannot be read keeps its status (first-party codex-rs
+            // classifies an outer HTTP 401 as refused for good without reading the body).
+            // The code exchange and a 200 keep the transport failure.
+            (status, None) if !exchange && status != 200 => (status, bytes::Bytes::new()),
+            (_, None) => {
+                return Err(ExecError::local(502, FailureScope::Transport, "codex oauth request failed").into());
+            }
+        };
         if status != 200 && exchange {
             let message = format!(
                 "token exchange failed with status {status}: {}",
                 String::from_utf8_lossy(&body)
             );
-            return Err(oauth_error(status, &message));
+            return Err(oauth_error(status, &message).into());
         }
         if status != 200 {
-            return Err(token_error(status, &body));
+            return Err(GrantError {
+                error: token_error(status, &body),
+                terminal: outer_terminal(status, &grant_code(&body)),
+            });
         }
         // Go appends the decoder error (`failed to parse token response: %w`); serde's
         // diagnostics can quote response values such as tokens, so only the prefix is kept.
@@ -384,8 +481,13 @@ impl CodexOAuth {
     /// `RefreshTokensWithRetry(ctx, token, 3)`, single-flighted per refresh token and
     /// detached from the caller so a cancelled request cannot strand a rotated token.
     pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, ExecError> {
+        self.refresh_grant(refresh_token).await.map_err(|e| e.error)
+    }
+
+    /// [`Self::refresh`], with a refusal's classification.
+    pub async fn refresh_grant(&self, refresh_token: &str) -> Result<Tokens, GrantError> {
         if refresh_token.is_empty() {
-            return Err(oauth_error(400, "refresh token is required"));
+            return Err(oauth_error(400, "refresh token is required").into());
         }
         let key: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
         let oauth = self.clone();
@@ -401,16 +503,17 @@ impl CodexOAuth {
         refresh_token: &str,
         client_id: &str,
         device_id: &str,
-    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+    ) -> Result<crate::codex_siwc::Tokens, GrantError> {
         let (refresh_token, client_id) = (refresh_token.trim(), client_id.trim());
         if refresh_token.is_empty() {
-            return Err(oauth_error(400, "SIWC refresh token is required"));
+            return Err(oauth_error(400, "SIWC refresh token is required").into());
         }
         if client_id.is_empty() {
             return Err(oauth_error(
                 400,
                 "Stored OpenAI OAuth credential does not contain an issued client ID; reconnect ChatGPT",
-            ));
+            )
+            .into());
         }
         let key: [u8; 32] = Sha256::digest(format!("{client_id}:{refresh_token}").as_bytes()).into();
         let oauth = self.clone();
@@ -424,7 +527,7 @@ impl CodexOAuth {
         refresh_token: &str,
         client_id: &str,
         device_id: &str,
-    ) -> Result<crate::codex_siwc::Tokens, ExecError> {
+    ) -> Result<crate::codex_siwc::Tokens, GrantError> {
         let mut last = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
@@ -445,25 +548,24 @@ impl CodexOAuth {
                 ),
             )
             .await
-            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out")));
+            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out").into()));
             match once {
                 Ok(tokens) => return Ok(tokens),
-                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
-                    return Err(error);
-                }
+                // A refresh token refused for good is not sent again.
+                Err(error) if error.terminal => return Err(error),
                 Err(error) => last = Some(error),
             }
         }
-        let mut error = last.expect("three attempts ran");
-        error.body = format!(
+        let mut last = last.expect("three attempts ran");
+        last.error.body = format!(
             "SIWC token refresh failed after 3 attempts: {}",
-            String::from_utf8_lossy(&error.body)
+            String::from_utf8_lossy(&last.error.body)
         )
         .into();
-        Err(error)
+        Err(last)
     }
 
-    async fn refresh_with_retry(&self, refresh_token: &str) -> Result<Tokens, ExecError> {
+    async fn refresh_with_retry(&self, refresh_token: &str) -> Result<Tokens, GrantError> {
         let mut last = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
@@ -471,7 +573,7 @@ impl CodexOAuth {
             }
             let once = tokio::time::timeout(
                 Duration::from_secs(30),
-                self.token_request(
+                self.token_grant(
                     &[
                         ("client_id", CLIENT_ID),
                         ("grant_type", "refresh_token"),
@@ -482,22 +584,21 @@ impl CodexOAuth {
                 ),
             )
             .await
-            .unwrap_or_else(|_| Err(oauth_error(504, "codex token refresh timed out")));
+            .unwrap_or_else(|_| Err(oauth_error(504, "codex token refresh timed out").into()));
             match once {
                 Ok(tokens) => return Ok(tokens),
-                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
-                    return Err(error);
-                }
+                // A refresh token refused for good is not sent again.
+                Err(error) if error.terminal => return Err(error),
                 Err(error) => last = Some(error),
             }
         }
-        let mut error = last.expect("three attempts ran");
-        error.body = format!(
+        let mut last = last.expect("three attempts ran");
+        last.error.body = format!(
             "token refresh failed after 3 attempts: {}",
-            String::from_utf8_lossy(&error.body)
+            String::from_utf8_lossy(&last.error.body)
         )
         .into();
-        Err(error)
+        Err(last)
     }
 
     /// Requests a device code (`requestCodexDeviceUserCode`).
@@ -598,8 +699,8 @@ impl CodexOAuth {
     }
 
     /// The patch Go's `CodexExecutor.Refresh` applies to credential metadata.
-    pub async fn refresh_patch(&self, refresh_token: &str) -> Result<MetadataPatch, ExecError> {
-        let tokens = self.refresh(refresh_token).await?;
+    pub async fn refresh_patch(&self, refresh_token: &str) -> Result<MetadataPatch, GrantError> {
+        let tokens = self.refresh_grant(refresh_token).await?;
         Ok(refresh_patch(&tokens, Local::now()))
     }
 }
@@ -669,6 +770,26 @@ pub(crate) fn oauth_code(body: &[u8]) -> String {
             _ => None,
         })
         .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
+        .unwrap_or_default()
+}
+
+/// The OAuth error code a refusal is classified by, as first-party codex-rs reads it at
+/// the contract pin (`codex-rs/login/src/oauth/error.rs`, `TokenErrorDetail::parse`): a
+/// non-blank string `error`, else `error.code`, else a top-level `code` ("top-level codes
+/// inform refresh recovery without replacing the legacy full-body display"). Unmodified,
+/// for classification only: messages keep [`oauth_code`]. `""` when there is none.
+pub(crate) fn grant_code(body: &[u8]) -> String {
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return String::new();
+    };
+    text(json.get("error"))
+        .or_else(|| text(json.get("error").and_then(|e| e.get("code"))))
+        .or_else(|| text(json.get("code")))
         .unwrap_or_default()
 }
 

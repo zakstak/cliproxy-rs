@@ -640,7 +640,7 @@ impl CodexOAuth {
         client_id: &str,
         device_id: &str,
         require_id_token: bool,
-    ) -> Result<Tokens, ExecError> {
+    ) -> Result<Tokens, crate::codex_oauth::GrantError> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
@@ -653,49 +653,42 @@ impl CodexOAuth {
             )
             .await?;
         if status != 200 && !require_id_token {
-            // A refresh keeps the OAuth error code (Go echoes the body), so
-            // `refresh_token_reused` stops the retries; bodies may echo request material.
-            return Err(crate::codex_oauth::refresh_error(
-                status,
-                &format!(
-                    "OpenAI OAuth token request failed ({status}): {}",
-                    crate::codex_oauth::oauth_code(&body)
+            // A refresh keeps the OAuth error code (Go echoes the body), and a documented
+            // unusable-token code stops the retries; bodies may echo request material.
+            let code = crate::codex_oauth::oauth_code(&body);
+            return Err(crate::codex_oauth::GrantError {
+                error: crate::codex_oauth::refresh_error(
+                    status,
+                    &format!("OpenAI OAuth token request failed ({status}): {code}"),
                 ),
-            ));
+                // Read as the first-party client reads the same issuer's codes.
+                terminal: crate::codex_oauth::siwc_terminal(&crate::codex_oauth::grant_code(&body)),
+            });
         }
         if status != 200 {
-            return Err(siwc_error(
-                status,
-                &format!("OpenAI OAuth token request failed ({status})"),
-            ));
+            return Err(siwc_error(status, &format!("OpenAI OAuth token request failed ({status})")).into());
         }
         let parsed: TokenResponse =
             serde_json::from_slice(&body).map_err(|_| siwc_error(502, "failed to parse SIWC token response"))?;
         let invalid = |field: &str| siwc_error(502, &format!("OpenAI OAuth token response has invalid {field}"));
         if parsed.access_token.trim().is_empty() {
-            return Err(invalid("access_token"));
+            return Err(invalid("access_token").into());
         }
         if parsed.refresh_token.trim().is_empty() {
-            return Err(invalid("refresh_token"));
+            return Err(invalid("refresh_token").into());
         }
         if require_id_token && parsed.id_token.trim().is_empty() {
-            return Err(siwc_error(
-                502,
-                "OpenAI OAuth token response did not contain an ID token",
-            ));
+            return Err(siwc_error(502, "OpenAI OAuth token response did not contain an ID token").into());
         }
         if parsed.scope.trim().is_empty() {
-            return Err(invalid("scope"));
+            return Err(invalid("scope").into());
         }
         if parsed.expires_in <= 0 {
-            return Err(invalid("expires_in"));
+            return Err(invalid("expires_in").into());
         }
         let scopes: Vec<String> = parsed.scope.split_whitespace().map(str::to_owned).collect();
         if !scopes.iter().any(|s| s == DIRECT_TOKEN_SCOPE) {
-            return Err(siwc_error(
-                502,
-                &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}"),
-            ));
+            return Err(siwc_error(502, &format!("OpenAI OAuth grant did not include {DIRECT_TOKEN_SCOPE}")).into());
         }
         let now = Local::now();
         let lifetime = TimeDelta::try_seconds(parsed.expires_in).unwrap_or(TimeDelta::MAX);
@@ -757,6 +750,7 @@ impl CodexOAuth {
             true,
         )
         .await
+        .map_err(|e| e.error)
     }
 }
 
