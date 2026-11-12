@@ -336,3 +336,272 @@ async fn failed_attempt_reaches_errors_subscribers() {
     assert_eq!(event["status_code"], 500, "{event}");
     assert!(event["auth_status"].is_object(), "{event}");
 }
+
+// Command bounds (#102 I2; Go v8.0.67 888f2382 added its own): checked counts and
+// lengths, bounded lines and a per-command byte budget, refused with one `ERR` reply
+// and a graceful close (`cpa_server::resp`, docs/DIFFERENCES-FROM-GO.md "RESP command
+// bounds").
+
+/// Allocation bytes counted on one thread while [`measure`] runs. A `#[tokio::test]`
+/// runtime is single-threaded, so the listener's connection tasks run on the test's
+/// thread and nothing from tests running in parallel is counted.
+struct ThreadCounting;
+
+thread_local! {
+    static COUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    static PEAK: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn counted(delta: isize) {
+    if COUNTING.with(std::cell::Cell::get) {
+        let live = LIVE.with(|l| {
+            l.set(l.get() + delta);
+            l.get()
+        });
+        PEAK.with(|p| p.set(p.get().max(live)));
+    }
+}
+
+// SAFETY: every call is forwarded to `System`; the counters are const thread-locals,
+// which neither allocate nor reenter the allocator.
+unsafe impl std::alloc::GlobalAlloc for ThreadCounting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        counted(layout.size() as isize);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        counted(layout.size() as isize);
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        counted(-(layout.size() as isize));
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        counted(new_size as isize - layout.size() as isize);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: ThreadCounting = ThreadCounting;
+
+/// The peak heap growth on this thread while `work` runs.
+async fn measure<F: std::future::Future<Output = ()>>(work: F) -> isize {
+    LIVE.with(|l| l.set(0));
+    PEAK.with(|p| p.set(0));
+    COUNTING.with(|c| c.set(true));
+    work.await;
+    COUNTING.with(|c| c.set(false));
+    PEAK.with(std::cell::Cell::get)
+}
+
+const MIB: usize = 1024 * 1024;
+/// `cpa_server::resp::MAX_BULK_BYTES`, the shared 64 MiB request limit.
+const MAX_BULK: usize = 64 * MIB;
+
+fn bulk_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = format!("${}\r\n", payload.len()).into_bytes();
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The server refuses with `want`, then closes with a FIN: the reply arrives whole and
+/// the next read is a clean end, not a reset.
+async fn refused(conn: &mut BufReader<TcpStream>, want: &str) {
+    assert_eq!(line(conn).await, want);
+    let mut rest = Vec::new();
+    let end = tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut rest))
+        .await
+        .expect("closed in time");
+    assert!(
+        matches!(end, Ok(0)),
+        "graceful close, got {end:?} after {} bytes",
+        rest.len()
+    );
+}
+
+/// A new connection after a refusal still authenticates and pops, and HTTP answers.
+async fn still_healthy(s: &Server) {
+    let mut conn = connect(s.addr).await;
+    auth(&mut conn).await;
+    command(&mut conn, &["LPOP", "usage"]).await;
+    assert_eq!(bulk(&mut conn).await, None);
+    let health = wreq::Client::new()
+        .get(format!("http://{}/healthz", s.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn oversized_bulk_is_refused_before_its_payload() {
+    let s = server(Some(PASSWORD)).await;
+    let mut conn = connect(s.addr).await;
+    let mut out = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n", MAX_BULK + 1).into_bytes();
+    // The start of the payload is already in flight; the refusal must survive it.
+    out.extend(std::iter::repeat_n(b'a', 256 * 1024));
+    conn.get_mut().write_all(&out).await.unwrap();
+    refused(&mut conn, "-ERR bulk string too large").await;
+    still_healthy(&s).await;
+}
+
+#[tokio::test]
+async fn counts_and_lengths_are_checked_up_front() {
+    let s = server(Some(PASSWORD)).await;
+    for input in [
+        "*1025\r\n",
+        "*9223372036854775807\r\n",
+        "*-1\r\n",
+        "*1\r\n$-2\r\n",
+        "*1\r\n$99999999999999999999\r\n",
+    ] {
+        let mut conn = connect(s.addr).await;
+        conn.get_mut().write_all(input.as_bytes()).await.unwrap();
+        refused(&mut conn, "-ERR protocol error").await;
+    }
+    still_healthy(&s).await;
+}
+
+#[tokio::test]
+async fn long_lines_are_refused_at_the_line_limit() {
+    let s = server(Some(PASSWORD)).await;
+    for head in ["*", "*1\r\n+", "*1\r\n$"] {
+        let mut conn = connect(s.addr).await;
+        let mut out = head.as_bytes().to_vec();
+        out.extend(std::iter::repeat_n(b'1', 70 * 1024));
+        conn.get_mut().write_all(&out).await.unwrap();
+        refused(&mut conn, "-ERR protocol error").await;
+    }
+    still_healthy(&s).await;
+}
+
+#[tokio::test]
+async fn many_valid_bulks_stop_at_the_command_budget() {
+    let s = server(Some(PASSWORD)).await;
+    let mut conn = connect(s.addr).await;
+    // Each fits the bulk ceiling; the second no longer fits what is left of the budget,
+    // so it is refused at its length line, before its payload.
+    let mut out = b"*3\r\n".to_vec();
+    out.extend_from_slice(&bulk_frame(&vec![b'a'; 33 * MIB]));
+    out.extend_from_slice(format!("${}\r\n", 33 * MIB).as_bytes());
+    conn.get_mut().write_all(&out).await.unwrap();
+    refused(&mut conn, "-ERR bulk string too large").await;
+    still_healthy(&s).await;
+}
+
+/// Regression control: the 64 MiB ceiling still admits a maximal argument, and two
+/// such commands pipelined together each get their own budget.
+#[tokio::test]
+async fn maximum_bulk_is_admitted_and_each_command_has_its_own_budget() {
+    let s = server(Some(PASSWORD)).await;
+    let conn = connect(s.addr).await;
+    let mut one = b"*2\r\n$4\r\nPING\r\n".to_vec();
+    one.extend_from_slice(&bulk_frame(&vec![b'p'; MAX_BULK]));
+    let mut out = one.clone();
+    out.extend_from_slice(&one);
+    let (mut read, mut write) = conn.into_inner().into_split();
+    let writer = tokio::spawn(async move {
+        write.write_all(&out).await.unwrap();
+        write
+    });
+    let mut replies = BufReader::new(&mut read);
+    for _ in 0..2 {
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(30), replies.read_line(&mut reply))
+            .await
+            .expect("reply in time")
+            .unwrap();
+        assert_eq!(reply, "-NOAUTH Authentication required.\r\n");
+    }
+    let mut conn = BufReader::new(read.reunite(writer.await.unwrap()).unwrap());
+    auth(&mut conn).await;
+    command(&mut conn, &["LPOP", "usage"]).await;
+    assert_eq!(bulk(&mut conn).await, None);
+}
+
+/// Regression control: a command cut off by the client's FIN is still Go's
+/// `unexpected EOF`, then a clean close.
+#[tokio::test]
+async fn truncated_command_ends_with_unexpected_eof() {
+    let s = server(Some(PASSWORD)).await;
+    let mut conn = connect(s.addr).await;
+    conn.get_mut()
+        .write_all(b"*2\r\n$4\r\nAUTH\r\n$10\r\nabc")
+        .await
+        .unwrap();
+    conn.get_mut().shutdown().await.unwrap();
+    refused(&mut conn, "-ERR unexpected EOF").await;
+}
+
+#[tokio::test]
+async fn subscription_commands_are_bounded_too() {
+    let s = server(Some(PASSWORD)).await;
+    let mut conn = connect(s.addr).await;
+    auth(&mut conn).await;
+    // `errors` pushes nothing until an error is queued, unlike `usage`.
+    command(&mut conn, &["SUBSCRIBE", "errors"]).await;
+    assert_eq!(pubsub(&mut conn).await.0, "subscribe");
+    command(&mut conn, &["PING", "x"]).await;
+    assert_eq!(array_len(&mut conn).await, 2);
+    assert_eq!(bulk(&mut conn).await.as_deref(), Some("pong"));
+    assert_eq!(bulk(&mut conn).await.as_deref(), Some("x"));
+    conn.get_mut().write_all(b"*1025\r\n$0\r\n\r\n").await.unwrap();
+    refused(&mut conn, "-ERR protocol error").await;
+    still_healthy(&s).await;
+}
+
+/// The server holds what arrived, not what a client declares or keeps sending: a
+/// 64 MiB length with three bytes behind it, and a line that never ends.
+#[tokio::test]
+async fn declared_lengths_and_endless_lines_allocate_only_what_arrived() {
+    // Positive control: the probe sees an allocation made on this thread.
+    let control = measure(async {
+        drop(std::hint::black_box(vec![0u8; 2 * MIB]));
+    })
+    .await;
+    assert!(control >= 2 * MIB as isize, "probe saw {control} bytes");
+    let s = server(Some(PASSWORD)).await;
+    let mut conn = connect(s.addr).await;
+    auth(&mut conn).await;
+    let declared = format!("*2\r\n$4\r\nPING\r\n${MAX_BULK}\r\nabc").into_bytes();
+    let grown = measure(async {
+        conn.get_mut().write_all(&declared).await.unwrap();
+        conn.get_mut().shutdown().await.unwrap();
+        // The reply proves the server read the length and the three bytes.
+        assert_eq!(line(&mut conn).await, "-ERR unexpected EOF");
+    })
+    .await;
+    eprintln!("declared 64 MiB bulk, 3 bytes sent: peak heap growth {grown} bytes");
+    assert!(
+        grown < MIB as isize,
+        "a declared 64 MiB bulk grew the heap by {grown} bytes"
+    );
+
+    // `*` routes the connection to RESP; the count line never ends.
+    let mut endless = vec![b'1'; 4 * MIB];
+    endless[0] = b'*';
+    let mut conn = connect(s.addr).await;
+    let mut reply = String::new();
+    let grown = measure(async {
+        let (mut read, mut write) = conn.get_mut().split();
+        let send = async {
+            // The server stops reading after the line limit and a bounded drain.
+            let _ = write.write_all(&endless).await;
+        };
+        let receive = async {
+            let _ = BufReader::new(&mut read).read_line(&mut reply).await;
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(send, receive) }).await;
+    })
+    .await;
+    eprintln!("4 MiB unterminated count line: peak heap growth {grown} bytes");
+    assert!(
+        grown < MIB as isize,
+        "a 4 MiB unterminated line grew the heap by {grown} bytes"
+    );
+    assert_eq!(reply, "-ERR protocol error\r\n");
+}
