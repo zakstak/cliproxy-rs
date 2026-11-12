@@ -124,8 +124,10 @@ not name is still compared. There are no path or assertion exemptions, and the m
 validator refuses them. Kinds: `pending-feature` and `deferred-feature` (owning issue),
 `unowned` (Go commit found, no owner), `unattributed` (states what is not known),
 `documented-difference` (ledger entry), `later-reference` (historical only, Go evidence),
-`nondeterministic` and `harness-boundary`. A pending or unattributed entry grants no
-adoption.
+`nondeterministic`, `harness-boundary` and `not-adopted`. A `not-adopted` entry is
+selective-only and names the deciding issue, the Go commit and the executed v8.0.35
+comparison that shows cliproxy-rs keeps the frozen behaviour; its predicate stays exact. A
+pending or unattributed entry grants no adoption.
 
 **Raw differences** must fall in a dimension whose check passed. Any other path fails,
 including a TLS change, an extra request or a read error.

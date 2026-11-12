@@ -19,6 +19,16 @@ rejects a behaviour, update the manifest entry and this table in the same change
 
 None yet.
 
+## Not adopted in this batch
+
+`claude-cloak-tool-alias` and `claude-cloak-tool-alias-restore`: the Claude OAuth MCP alias seed
+change of Go `e48d780f` is not an authorized feature under C1, C2 or plugin work. Tracker #66
+records it as not adopted. cliproxy-rs keeps the frozen v8.0.35 behaviour, which the executed
+v8.0.35 comparison below confirms. The comparison stays exact: on `cloak-tools-beta`,
+`tool-roundtrip` and `tool-stream-roundtrip` only the alias spelling may differ, the same
+number of times, and v8.0.67 does not restore the scripted alias. This is not a general
+exemption for alias or cloaking differences.
+
 ## Named divergences on the selective target
 
 Observed with the 62-case selective suite: the 50 historical Claude cases plus 12 Grok and Muse
@@ -29,7 +39,7 @@ Credential ownership and the native-byte golden are checked on every case regard
 | Manifest ID | Kind | Owner | Evidence | What v8.0.67 does differently |
 | --- | --- | --- | --- | --- |
 | `C1-claude-client-profile` | pending | [#69](https://github.com/zakstak/cliproxy-rs/issues/69) | Go `b4e7dbd2` | Claude Code 2.1.321 User-Agent, Stainless 0.128.0 and v26.12.1, `thinking-token-count` beta position, billing-header version |
-| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) | Observed only | Cloaks a request carrying the four strong native signals of a 2.1.280 caller. Its wire correctness is unknown, and the entry grants no adoption. Go must match its recorded v8.0.67 request exactly, and cliproxy-rs must still send the v8.0.10-recorded native bytes |
+| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) (moving it to #69 is a tracker decision) | Executed: Go `b4e7dbd2`'s version gate, not C2's detection commits | Cloaks a request carrying the four strong native signals of a 2.1.280 caller. Its wire correctness is unknown, and the entry grants no adoption. Go must match its recorded v8.0.67 request exactly, and cliproxy-rs must still send the v8.0.10-recorded native bytes |
 | `K1-claude-catalog` | pending | [#68](https://github.com/zakstak/cliproxy-rs/issues/68) | Catalog diff | Lists `claude-fable-5-2` |
 | `T2-messages-max-output-tokens` | pending | [#80](https://github.com/zakstak/cliproxy-rs/issues/80) | Go `01b24f1f` | Adds `max_output_tokens` from Claude `max_tokens` for Grok and Muse |
 | `I4-cors-allow-headers` | pending | [#104](https://github.com/zakstak/cliproxy-rs/issues/104) | Observed | Explicit `Access-Control-Allow-Headers` list instead of `*` |
@@ -38,9 +48,9 @@ Credential ownership and the native-byte golden are checked on every case regard
 | `P2-claude-connection-reuse` | deferred | [#107](https://github.com/zakstak/cliproxy-rs/issues/107) | Go `2c5b01f4` | One more TLS handshake (a session resumption) for a later request on the same credential |
 | `X5-grok-user-agent` | deferred | [#88](https://github.com/zakstak/cliproxy-rs/issues/88) | Observed | `xai-grok-workspace/1.0.46` User-Agent on the API-key path |
 | `P1-response-compression-vary` | deferred | [#106](https://github.com/zakstak/cliproxy-rs/issues/106) | `response_compression.go` | `Vary: Accept-Encoding` on every response |
-| `claude-cloak-tool-alias`, `-restore` | unowned | none (tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66)) | Go `e48d780f` | Alias secret is `CallerScope(api key)`, so the alias spelling differs and the v8.0.10 alias is no longer restored |
-| `error-retry-after` | unattributed | none (tracker #66) | Code path `sdk/api/handlers/handlers_errors.go:127-138`; commit not bisected (candidates referenced by #94 and #111) | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
-| `credential-disabled-persist` | unattributed | none (tracker #66) | No commit located | Leaves `disabled` absent after an abandoned stream where cliproxy-rs and v8.0.10 persist `false` |
+| `claude-cloak-tool-alias`, `-restore` | not adopted | tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) (decision above) | Executed: Go `e48d780f` against its parent; v8.0.35 matches cliproxy-rs | Alias secret is `CallerScope(api key)`, so the alias spelling differs and the v8.0.10 alias is no longer restored |
+| `error-retry-after` | unowned | none (tracker #66) | Executed: Go `9a35fa12` against its parent; v8.0.35 sends none | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
+| `credential-disabled-persist` | unowned | none (tracker #66) | Executed bisect: Go `091ff27f`, which is already in v8.0.35 | Leaves `disabled` absent after an abandoned stream where cliproxy-rs and v8.0.10 persist `false`. **v8.0.35 does the same, so cliproxy-rs differs from the frozen default reference here; no ledger entry records that yet** |
 
 Shared entries: `go-openai-model-order` (Go builds the OpenAI model list by ranging over a map), `openai-created-timestamps` (wall-clock `created` within 5 seconds),
 `credential-refresh-timestamps`, `compaction-capsule-generated` and the `plain-upstream-host-label`
@@ -54,6 +64,30 @@ except for the minted request id.
 
 An unowned or unattributed entry is visible, not accepted as correct. It stays in every
 receipt until an issue decides it from provider evidence.
+
+## Executed attribution evidence (v8.0.35 and bisect pairs)
+
+[`harness/evidence/attribution-20261112.json.gz`](../../harness/evidence/attribution-20261112.json.gz)
+records what the attributions above rest on. It is separate from the acceptance receipts:
+the historical v8.0.10 and selective v8.0.67 pins, their goldens and receipts do not change.
+The real collector ran selected cases against Go builds of single commits, each built
+offline from a private scratch clone with a clean VCS stamp. It ran in the same
+loopback-only, network-denied sandbox, with fake credentials and the cached Rust driver.
+Rust results are the same cached binary throughout.
+
+| Question | Control (parent) | Commit | v8.0.35 (`ae3ee3be`) |
+| --- | --- | --- | --- |
+| MCP alias spelling and restore | `b2fda98e`: as cliproxy-rs | `e48d780f`: v8.0.67 spelling, no restore | as cliproxy-rs |
+| `Retry-After` on six failed attempts | `c3767123`: none | `9a35fa12`: all six | none |
+| `disabled` after an abandoned stream | `a2718314`: `false` (3/3) | `091ff27f`: absent (3/3) | absent |
+| 2.1.280 caller with native signals | `19a0a854` (with three C2 detection commits): native | `b4e7dbd2`: cloaked; 2.1.321 and later native | native |
+
+The disabled-persistence commit was found by a first-parent bisect of `8a01bc02..4f2e5270`
+(`8a01bc02` itself still persists `false`). The native-signals variants change only the
+caller's User-Agent version (2.1.279, 2.1.280, 2.1.290, 2.1.320, 2.1.321, 2.1.322) and send
+no Stainless headers, so the cached cliproxy-rs driver cloaks the newer versions as
+documented in [DIFFERENCES-FROM-GO.md](../DIFFERENCES-FROM-GO.md). This classifies Go
+behaviour. It does not show that cloaking any genuine client is correct.
 
 ## Not compared here
 

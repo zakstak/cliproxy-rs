@@ -37,6 +37,11 @@ DIVERGENCE_KINDS = {
     "unowned",
     # Neither a commit nor an owner is established; the attribution says what is known.
     "unattributed",
+    # Selective only: the tracker decided not to adopt this v8.0.67 behaviour in this batch.
+    # cliproxy-rs keeps the frozen v8.0.35 behaviour. Names the Go commit (evidence), the
+    # deciding issue, and the executed v8.0.35 comparison that shows Rust matches it
+    # (attribution). The predicate stays exact; this is a decision record, not an exemption.
+    "not-adopted",
 }
 PREDICATES = {"downstream_header", "upstream_header", "upstream_body_edit", "downstream_body_edit",
               "downstream_body_timestamps",
@@ -249,12 +254,16 @@ def validate(data, suite_sizes=None):
         for index, predicate in enumerate(divergence["expect"]):
             _predicate(predicate, f"{name}[{index}]", divergence, data)
         kind = divergence["kind"]
-        if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed"):
+        if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed", "not-adopted"):
             _require(divergence.get("issue"), f"{name}: needs the issue that tracks it")
         if kind == "unowned":
             _require(divergence.get("evidence"), f"{name}: an unowned divergence names its Go commit")
         if kind == "unattributed":
             _require(divergence.get("attribution"), f"{name}: says what is and is not attributed")
+        if kind == "not-adopted":
+            _require(divergence["targets"] == ["selective"] and divergence.get("evidence") and divergence.get("attribution"),
+                     f"{name}: a not-adopted divergence is selective-only, names its Go commit (evidence) and the "
+                     "executed v8.0.35 comparison (attribution)")
         if kind == "documented-difference":
             _require(divergence.get("ledger"), f"{name}: needs its ledger entry")
         if kind == "nondeterministic":

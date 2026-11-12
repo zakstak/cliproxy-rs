@@ -301,8 +301,14 @@ class ManifestTests(unittest.TestCase):
     def test_owner_status_is_required(self):
         base = {"id": "x", "targets": ["selective"], "cases": ["*"], "reason": "r",
                 "expect": [{"downstream_header": {"name": "vary", "go": {"equals": "a"}, "rust": None}}]}
+        decided = base | {"kind": "not-adopted", "issue": "i", "evidence": "Go c", "attribution": "v8.0.35 run"}
+        revisions.validate(pins_with() | {"divergences": [decided]})
         for bad in (base | {"kind": "unowned", "issue": "i"}, base | {"kind": "unattributed", "issue": "i"},
-                    base | {"kind": "unclassified", "issue": "i"}, base | {"kind": "pending-feature"}):
+                    base | {"kind": "unclassified", "issue": "i"}, base | {"kind": "pending-feature"},
+                    {k: v for k, v in decided.items() if k != "evidence"},
+                    {k: v for k, v in decided.items() if k != "attribution"},
+                    {k: v for k, v in decided.items() if k != "issue"},
+                    decided | {"targets": ["historical", "selective"]}):
             with self.assertRaises(revisions.ManifestError, msg=bad):
                 revisions.validate(pins_with() | {"divergences": [bad]})
 
