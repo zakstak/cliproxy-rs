@@ -7,6 +7,7 @@ which refuses a manifest whose pins disagree with the sources they claim to mirr
     python3 harness/manifest.py check          # validate, exit 1 on a problem
     python3 harness/manifest.py shell TARGET   # shell assignments for harness/run
 """
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -18,35 +19,84 @@ PATH = ROOT / "harness" / "manifest.json"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 ROLES = {"historical-recording", "frozen-default-reference", "selective-comparison"}
 DIVERGENCE_KINDS = {
-    # A v8.0.67 behaviour an issue in the selective batch will adopt; not yet in Rust.
+    # A v8.0.67 behaviour an issue in the approved core batch owns; not yet in Rust.
     "pending-feature",
+    # A v8.0.67 behaviour an issue outside the core batch owns (deferred or follow-up).
+    "deferred-feature",
     # Rust deliberately differs, recorded in docs/DIFFERENCES-FROM-GO.md or a contract.
     "documented-difference",
-    # Generated IDs, timing, framing: the collector sees them, meaning is unaffected.
+    # Values minted per request or nondeterministic upstream ordering, with evidence.
     "nondeterministic",
-    # On the historical target: Rust follows a later Go reference (v8.0.35 policy or a
-    # selective adoption) than the v8.0.10 recording. Names the Go evidence.
+    # Historical target only: Rust follows the v8.0.35 policy reference, not v8.0.10.
     "later-reference",
-    # The harness itself makes the sides differ (for example each proxy's upstream
-    # address label). Named so the cause is visible, never a provider behaviour.
+    # The harness itself makes the sides differ (each proxy's upstream address label).
     "harness-boundary",
-    # A v8.0.67 behaviour outside the approved core batch (deferred or follow-up); names
-    # the issue that would adopt it.
-    "deferred-feature",
-    # A difference the harness has not yet classified as either; it stays visible in
-    # every receipt and names the follow-up that resolves it.
-    "unclassified",
+    # The Go commit is identified but no tracker issue owns the behaviour.
+    "unowned",
+    # Neither a commit nor an owner is established; the attribution says what is known.
+    "unattributed",
 }
+PREDICATES = {"downstream_header", "upstream_header", "upstream_body_edit", "downstream_body_edit",
+              "downstream_json", "tls_extra_go_handshakes", "credential_field", "credential_timestamps", "replace"}
+REPLACE_COVERS = {"status", "downstream-body", "upstream", "tls"}
+SIDE_KEYS = {"status", "body_equals", "body_json", "inference_requests", "upstream_json", "upstream_headers",
+             "tls_like", "tls_count"}
+DIVERGENCE_FIELDS = {"id", "kind", "targets", "cases", "except_cases", "expect", "reason", "issue", "ledger",
+                     "evidence", "attribution", "may_be_absent"}
+# Removed in the predicate schema: they exempted whole paths or assertions.
+FORBIDDEN_FIELDS = {"paths", "assertions", "header_names", "upstream_header_names", "upstream_body_patterns"}
 
 
-# Semantic assertions harness/acceptance.py applies; a divergence may excuse these.
-ASSERTIONS = {"status", "content-type", "upstream-traffic", "request-lines", "upstream-headers",
-              "upstream-body-bytes", "upstream-body-meaning", "downstream-headers", "downstream-body-bytes",
-              "downstream-meaning"}
-# credential-isolation is deliberately absent: no divergence can excuse a leak.
-DIVERGENCE_FIELDS = {"id", "kind", "targets", "cases", "except_cases", "paths", "assertions", "header_names",
-                     "upstream_header_names", "upstream_body_patterns", "reason", "issue", "ledger", "evidence",
-                     "may_be_absent"}
+def _value_spec(spec, where):
+    _require(spec is None or (isinstance(spec, dict) and len(spec) == 1 and set(spec) <= {"equals", "regex"}),
+             f"{where}: a value spec is null (absent), {{equals}} or {{regex}}")
+    if spec and "regex" in spec:
+        re.compile(spec["regex"])
+
+
+def _predicate(predicate, where, divergence):
+    _require(isinstance(predicate, dict) and len(predicate) == 1 and set(predicate) <= PREDICATES,
+             f"{where}: one predicate of {sorted(PREDICATES)}")
+    (kind, spec), = predicate.items()
+    if kind in ("downstream_header", "upstream_header"):
+        _require(spec["name"] == spec["name"].lower(), f"{where}: header names are lowercase")
+        _require(spec["name"] not in ("authorization", "x-api-key", "api-key", "cookie", "set-cookie"),
+                 f"{where}: credential headers cannot be a divergence")
+        if "relation" in spec:
+            _require(set(spec) == {"name", "relation"} and kind == "upstream_header", f"{where}: relation form")
+        else:
+            _require(set(spec) == {"name", "go", "rust"} and spec["go"] != spec["rust"],
+                     f"{where}: needs distinct go and rust value specs")
+            _value_spec(spec["go"], where)
+            _value_spec(spec["rust"], where)
+    elif kind in ("upstream_body_edit", "downstream_body_edit"):
+        _require(set(spec) == {"go", "rust", "count"}, f"{where}: needs go, rust and count")
+        _require(spec["go"] is not None or spec["rust"] is not None, f"{where}: an edit names a pattern")
+        _require(spec["count"] == "same" and spec["go"] and spec["rust"] or isinstance(spec["count"], int)
+                 and spec["count"] > 0, f"{where}: count is a positive integer, or 'same' with both patterns")
+        for pattern in (spec["go"], spec["rust"]):
+            if pattern:
+                re.compile(pattern)
+                _require(not re.fullmatch(pattern, "") and ".*" != pattern, f"{where}: pattern must be specific")
+    elif kind == "downstream_json":
+        _require(set(spec) <= {"go_only", "rust_only", "unordered", "generated"} and spec, f"{where}: json form")
+        for item in spec.get("generated", []):
+            re.compile(item["regex"])
+    elif kind == "tls_extra_go_handshakes":
+        _require(isinstance(spec["count"], int) and spec["count"] > 0 and set(spec["reference"]) == {"case", "side", "index"},
+                 f"{where}: needs a count and a reference handshake")
+    elif kind == "credential_field":
+        _require(spec["field"] not in ("access_token", "refresh_token", "id_token", "type", "email"),
+                 f"{where}: credential identity fields cannot diverge")
+        _require(spec["go"] != spec["rust"], f"{where}: go and rust values must differ")
+    elif kind == "credential_timestamps":
+        _require(set(spec["fields"]) <= {"expired", "last_refresh"} and 0 < spec["max_skew_seconds"] <= 60,
+                 f"{where}: timestamps are expired or last_refresh within 60s")
+    elif kind == "replace":
+        _require(set(spec["covers"]) <= REPLACE_COVERS and spec["covers"], f"{where}: covers {sorted(REPLACE_COVERS)}")
+        for side in ("go", "rust"):
+            _require(set(spec[side]) <= SIDE_KEYS and spec[side], f"{where}: {side} expectation keys")
+        _require(not divergence.get("may_be_absent"), f"{where}: a replaced comparison cannot be optional")
 
 
 class ManifestError(ValueError):
@@ -115,35 +165,62 @@ def validate(data, suite_sizes=None):
     providers = {group["provider"] for group in data["groups"]}
     _require({"claude", "codex", "xai", "meta", "removed"} <= providers,
              "groups must cover claude, codex, xai, meta and the removed-provider refusals")
+    case_names = {}
+    if suite_sizes is not None:
+        sys.path.insert(0, str(ROOT / "harness"))
+        from fixtures import cases, selective_cases
+        case_names = {"historical": [c["name"] for c in cases()],
+                      "selective": [c["name"] for c in cases() + selective_cases()]}
     ids = set()
     for divergence in data["divergences"]:
-        _require(divergence["id"] not in ids, f"divergence {divergence['id']} listed twice")
-        ids.add(divergence["id"])
-        _require(divergence["kind"] in DIVERGENCE_KINDS, f"{divergence['id']}: unknown kind")
+        name = divergence["id"]
+        _require(name not in ids, f"divergence {name} listed twice")
+        ids.add(name)
+        _require(not set(divergence) & FORBIDDEN_FIELDS,
+                 f"{name}: path or assertion exemptions are not allowed ({sorted(set(divergence) & FORBIDDEN_FIELDS)})")
+        _require(set(divergence) <= DIVERGENCE_FIELDS, f"{name}: unknown fields {sorted(set(divergence) - DIVERGENCE_FIELDS)}")
+        _require(divergence["kind"] in DIVERGENCE_KINDS, f"{name}: unknown kind")
         _require(set(divergence["targets"]) <= {"historical", "selective"} and divergence["targets"],
-                 f"{divergence['id']}: targets must name executed Go targets")
-        _require(divergence["cases"], f"{divergence['id']}: needs cases")
-        for pattern in divergence.get("upstream_body_patterns", []):
-            re.compile(pattern)
-        _require(any(divergence.get(k) for k in ("paths", "assertions", "header_names", "upstream_header_names",
-                                                 "upstream_body_patterns")),
-                 f"{divergence['id']}: needs raw paths, header names or assertions to cover")
-        for pattern in divergence.get("paths", []):
-            re.compile(pattern)
-        _require(divergence.get("reason"), f"{divergence['id']}: needs a reason")
-        if divergence["kind"] in ("pending-feature", "deferred-feature", "unclassified"):
-            _require(divergence.get("issue"), f"{divergence['id']}: needs the issue that resolves it")
-        if divergence["kind"] == "documented-difference":
-            _require(divergence.get("ledger"), f"{divergence['id']}: needs its ledger entry")
-        if divergence["kind"] == "later-reference":
+                 f"{name}: targets must name executed Go targets")
+        _require(divergence["cases"], f"{name}: needs cases")
+        _require(divergence.get("reason"), f"{name}: needs a reason")
+        _require(divergence.get("expect"), f"{name}: needs at least one predicate")
+        for index, predicate in enumerate(divergence["expect"]):
+            _predicate(predicate, f"{name}[{index}]", divergence)
+        kind = divergence["kind"]
+        if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed"):
+            _require(divergence.get("issue"), f"{name}: needs the issue that tracks it")
+        if kind == "unowned":
+            _require(divergence.get("evidence"), f"{name}: an unowned divergence names its Go commit")
+        if kind == "unattributed":
+            _require(divergence.get("attribution"), f"{name}: says what is and is not attributed")
+        if kind == "documented-difference":
+            _require(divergence.get("ledger"), f"{name}: needs its ledger entry")
+        if kind == "nondeterministic":
+            _require(divergence.get("evidence") or all(
+                set(p) <= {"downstream_json", "credential_timestamps"} for p in divergence["expect"]),
+                f"{name}: nondeterminism outside generated values needs evidence")
+        if kind == "later-reference":
             _require(divergence["targets"] == ["historical"] and divergence.get("evidence"),
-                     f"{divergence['id']}: a later-reference divergence is historical-only and names its Go evidence")
-        unknown = set(divergence.get("assertions", [])) - ASSERTIONS
-        _require(not unknown, f"{divergence['id']}: unknown assertions {sorted(unknown)}")
-        _require(set(divergence) <= DIVERGENCE_FIELDS, f"{divergence['id']}: unknown fields "
-                 f"{sorted(set(divergence) - DIVERGENCE_FIELDS)}")
+                     f"{name}: a later-reference divergence is historical-only and names its Go evidence")
+        for target in divergence["targets"]:
+            if case_names:
+                for pattern in divergence["cases"]:
+                    _require(any(fnmatch.fnmatchcase(c, pattern) for c in case_names[target]),
+                             f"{name}: case pattern {pattern} matches no {target} case")
     generated = data.get("generated_headers", {})
-    _require(set(generated) == {"upstream", "downstream"}, "generated_headers needs upstream and downstream")
+    _require(set(generated) == {"upstream", "downstream"} and all(isinstance(v, dict) for v in generated.values()),
+             "generated_headers maps upstream and downstream header names to patterns")
+    for patterns in generated.values():
+        for header, pattern in patterns.items():
+            _require(header not in ("authorization", "content-type", "host"), f"{header} cannot be generated")
+            re.compile(pattern)
+    invariants = data.get("invariants", {})
+    _require(set(invariants) >= {"native_passthrough", "upstream_goldens"}, "invariants need native rules")
+    for golden in invariants["upstream_goldens"]:
+        golden_data = json.loads((ROOT / golden["file"]).read_text())
+        _require(golden_data["provenance"]["go_commit"] in commits,
+                 f"{golden['file']}: golden must come from a pinned Go capture")
     for skip in data.get("skips", []):
         _require(skip.get("reason") and skip.get("issue"), f"skip {skip.get('case')}: needs reason and issue")
     return data

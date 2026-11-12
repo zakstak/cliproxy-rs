@@ -22,33 +22,36 @@ None yet.
 ## Named divergences on the selective target
 
 Observed with the 62-case selective suite: the 50 historical Claude cases plus 12 Grok and Muse
-cases over a plain-HTTP loopback upstream. Request bodies for Grok and Muse match byte for byte,
-except where an entry below says otherwise.
+cases over a plain-HTTP loopback upstream. Every entry is an exact predicate in the manifest:
+the specific values each side must show, with everything else compared byte for byte.
+Credential ownership and the native-byte golden are checked on every case regardless.
 
-| Manifest ID | Kind | Owner | What v8.0.67 does differently |
-| --- | --- | --- | --- |
-| `C1-claude-client-profile` | pending | [#69](https://github.com/zakstak/cliproxy-rs/issues/69) | Claude Code 2.1.321 tuple: User-Agent, Stainless package and runtime versions, beta order, billing-header version |
-| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) | Cloaks a request carrying the four strong native signals of a 2.1.280 caller |
-| `K1-claude-catalog` | pending | [#68](https://github.com/zakstak/cliproxy-rs/issues/68) | Lists `claude-fable-5-2` |
-| `I4-cors-allow-headers` | pending | [#104](https://github.com/zakstak/cliproxy-rs/issues/104) | Explicit `Access-Control-Allow-Headers` list instead of `*` |
-| `I3-unauthenticated-connection-close` | pending | [#103](https://github.com/zakstak/cliproxy-rs/issues/103) | `Connection: close` on an unauthenticated rejection |
-| `M1-muse-identity-headers` | pending | [#81](https://github.com/zakstak/cliproxy-rs/issues/81) | muse-build 1.4.14 non-interactive identity and session headers |
-| `X5-grok-user-agent` | deferred | [#88](https://github.com/zakstak/cliproxy-rs/issues/88) | `xai-grok-workspace/1.0.46` User-Agent on the API-key path |
-| `P1-response-compression-vary` | deferred | [#106](https://github.com/zakstak/cliproxy-rs/issues/106) | `Vary: Accept-Encoding` on every response |
-| `claude-cloak-tool-alias` | unclassified | [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Different cloak alias for the same client key and tool |
-| `claude-tls-connection-reuse` | unclassified | [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | New TLS connection for a later request on the same credential (candidate P2, #107) |
-| `credential-disabled-persist` | unclassified | [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Does not persist `disabled: false` after an abandoned stream |
-| `error-retry-after` | unclassified | [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Adds its own `Retry-After: 31` to failed upstream attempts (candidates R1 #94, R2 #95) |
-| `messages-max-tokens-to-responses` | unclassified | [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Maps Claude `max_tokens` to `max_output_tokens` for Grok and Muse (candidate T2 #80) |
+| Manifest ID | Kind | Owner | Evidence | What v8.0.67 does differently |
+| --- | --- | --- | --- | --- |
+| `C1-claude-client-profile` | pending | [#69](https://github.com/zakstak/cliproxy-rs/issues/69) | Go `b4e7dbd2` | Claude Code 2.1.321 User-Agent, Stainless 0.128.0 and v26.12.1, `thinking-token-count` beta position, billing-header version |
+| `C2-claude-native-detection` | pending | [#70](https://github.com/zakstak/cliproxy-rs/issues/70) | Observed only | Cloaks a request carrying the four strong native signals of a 2.1.280 caller. Its wire correctness is unknown, and the entry grants no adoption: cliproxy-rs must still send the v8.0.10-recorded native bytes |
+| `K1-claude-catalog` | pending | [#68](https://github.com/zakstak/cliproxy-rs/issues/68) | Catalog diff | Lists `claude-fable-5-2` |
+| `T2-messages-max-output-tokens` | pending | [#80](https://github.com/zakstak/cliproxy-rs/issues/80) | Go `01b24f1f` | Adds `max_output_tokens` from Claude `max_tokens` for Grok and Muse |
+| `I4-cors-allow-headers` | pending | [#104](https://github.com/zakstak/cliproxy-rs/issues/104) | Observed | Explicit `Access-Control-Allow-Headers` list instead of `*` |
+| `I3-unauthenticated-connection-close` | pending | [#103](https://github.com/zakstak/cliproxy-rs/issues/103) | Observed | `Connection: close` on an unauthenticated rejection |
+| `M1-muse-identity-headers` | pending | [#81](https://github.com/zakstak/cliproxy-rs/issues/81) | Observed | muse-build 1.4.14 non-interactive identity and session headers |
+| `P2-claude-connection-reuse` | deferred | [#107](https://github.com/zakstak/cliproxy-rs/issues/107) | Go `2c5b01f4` | One more TLS handshake (a session resumption) for a later request on the same credential |
+| `X5-grok-user-agent` | deferred | [#88](https://github.com/zakstak/cliproxy-rs/issues/88) | Observed | `xai-grok-workspace/1.0.46` User-Agent on the API-key path |
+| `P1-response-compression-vary` | deferred | [#106](https://github.com/zakstak/cliproxy-rs/issues/106) | `response_compression.go` | `Vary: Accept-Encoding` on every response |
+| `claude-cloak-tool-alias`, `-restore` | unowned | none (tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66)) | Go `e48d780f` | Alias secret is `CallerScope(api key)`, so the alias spelling differs and the v8.0.10 alias is no longer restored |
+| `error-retry-after` | unattributed | none (tracker #66) | Code path `sdk/api/handlers/handlers_errors.go:127-138`; commit not bisected (candidates referenced by #94 and #111) | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
+| `credential-disabled-persist` | unattributed | none (tracker #66) | No commit located | Leaves `disabled` absent after an abandoned stream where cliproxy-rs and v8.0.10 persist `false` |
 
-Provider-neutral entries are shared with the historical target: `downstream-header-framing`
-([ledger](../DIFFERENCES-FROM-GO.md#deliberate-differences)), `upstream-generated-request-ids`,
-`credential-refresh-timestamps`, plus `compaction-capsule-generated` and the `plain-upstream-host-label`
-harness boundary. On the historical target, `cors-expose-etag`, `claude-responses-compact` and
-`claude-catalog-v8.0.35` record behaviour cliproxy-rs follows from v8.0.35 rather than v8.0.10.
+Shared entries: `go-openai-model-order` (Go builds the OpenAI model list by ranging over a map),
+`credential-refresh-timestamps`, `compaction-capsule-generated` and the `plain-upstream-host-label`
+harness boundary. Global rules: downstream header-name case and order
+([ledger](../DIFFERENCES-FROM-GO.md#deliberate-differences)), chunk boundaries, Content-Length,
+generated values. On the historical target, `cors-expose-etag`, `claude-responses-compact`
+and `claude-catalog-v8.0.35` record behaviour cliproxy-rs follows from v8.0.35 rather than
+v8.0.10.
 
-An unclassified entry is visible, not accepted. It stays in every receipt until an issue
-attributes it to a Go commit and decides it from provider evidence.
+An unowned or unattributed entry is visible, not accepted as correct. It stays in every
+receipt until an issue decides it from provider evidence.
 
 ## Not compared here
 

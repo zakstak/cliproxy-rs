@@ -1,24 +1,23 @@
 """Acceptance over harness evidence (issue #67, H1).
 
-The collector (differential.py) records everything and exits 0 when capture worked.
-This command decides acceptance. It applies semantic assertions to each Go/Rust case
-and requires every raw collector difference to match a named divergence in
-harness/manifest.json. It also requires every suite case to have run or to be a named
-skip, and it runs the retained-provider cargo groups. Each command writes a receipt.
+The collector (differential.py) records; this command decides. Every command writes a
+receipt under harness/.cache/receipts/.
 
-    acceptance.py evaluate RUN_DIR           # one differential run
-    acceptance.py cargo [--group ID ...]     # cargo test groups, network-isolated
-    acceptance.py mutation-control RUN_DIR   # proves evaluate fails on real deviations
-    acceptance.py combine RECEIPT ...        # one verdict over several receipts
+    acceptance.py evaluate RUN_DIR           # one differential run (harness/judge.py)
+    acceptance.py cargo                      # every manifest cargo group, isolated
+    acceptance.py mutation-control RUN_DIR   # evaluate must fail on each real deviation
+    acceptance.py combine RECEIPT ...        # one verdict; requires full, consistent coverage
+    acceptance.py verify-evidence RECEIPT    # HEAD differs from the tested source only in evidence
 
-Exit 0: accepted. Exit 1: a semantic assertion failed, a difference was not named, a
-case was skipped without a named reason, a named divergence went stale, or a cargo test
-failed, was ignored or was missing. Exit 2: execution was unavailable (prerequisite,
-capture or transport failure). An unavailable run is never reported as a pass.
+Verdicts and exit codes:
+- pass (0): accepted.
+- fail (1): an invariant, comparison, named delta or test failed; a case or test is missing,
+  extra or duplicated; metadata disagrees.
+- unavailable (2): execution or provenance could not be established.
+- partial-pass (3): an explicitly partial run whose cases passed. It is never acceptance.
 """
 import argparse
 import copy
-import fnmatch
 import json
 import os
 from pathlib import Path
@@ -29,367 +28,146 @@ import sys
 import tempfile
 import time
 
+import judge
 import manifest as revisions
-from differential import comparable, differences
-from fixtures import CREDENTIAL, PROVIDER_KEYS, TOKEN_REPLY
+import provenance
+from differential import comparable, differences, suite
 
 ROOT = revisions.ROOT
 CACHE = ROOT / "harness/.cache"
-CLIENT_KEYS = ("fixture-client-key", "wrong-fixture-key")
-UPSTREAM_SECRETS = (CREDENTIAL["access_token"], CREDENTIAL["refresh_token"],
-                    *(json.loads(TOKEN_REPLY)[k] for k in ("access_token", "refresh_token")),
-                    *PROVIDER_KEYS.values())
-# Fields a provider or proxy generates per response; the meaning comparison ignores
-# their values. Their raw differences still need a named divergence.
-GENERATED = {"id", "created", "created_at", "system_fingerprint", "item_id", "call_id", "tool_use_id"}
-# Cases where neither proxy may reach the inference upstream (differential.py).
-NO_TRAFFIC = {"auth-missing", "auth-wrong", "auth-query-first", "models-openai", "models-anthropic",
-              "disabled-credential"}
+EXIT = {"pass": 0, "fail": 1, "unavailable": 2, "partial-pass": 3}
+TEST_TIMEOUT = 1800
+LIST_TIMEOUT = 300
 
 
-# --- semantic assertions -------------------------------------------------------------
+# --- differential runs -----------------------------------------------------------------
 
-def _hex_text(value):
-    return bytes.fromhex(value).decode("utf-8", errors="replace") if value else ""
-
-
-def _content_type(reply):
-    for name, value in reply.get("headers", []):
-        if name.lower() == "content-type":
-            return value.split(";")[0].strip().lower()
-    return None
+def expected_cases(pins, target):
+    """The case names the current fixtures define for a target's suite, checked unique."""
+    names = [case["name"] for case in suite(pins["go"]["targets"][target]["suite"])]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    return names, duplicates
 
 
-def _inference(observation, case):
-    prefix = "POST /v1/responses " if case.get("provider") else "POST /v1/messages"
-    return [r for r in observation["upstream"]["http"] if r["request_line"].startswith(prefix)]
+def universe(summary, pins, run_dir):
+    """Problems with the run's case set and metadata, plus whether it was partial."""
+    problems = []
+    target = summary.get("target")
+    if target not in pins["go"]["targets"] or not pins["go"]["targets"][target]["executed"]:
+        return [f"unknown or unexecuted target {target!r}"], False, [], []
+    spec = pins["go"]["targets"][target]
+    for key, want in (("reference", spec["commit"]), ("tag", spec["tag"]), ("role", spec["role"]),
+                      ("suite", spec["suite"])):
+        if summary.get(key) != want:
+            problems.append(f"summary {key} {summary.get(key)!r} is not the manifest's {want!r}")
+    expected, duplicates = expected_cases(pins, target)
+    if duplicates:
+        problems.append(f"fixtures define duplicate cases {duplicates}")
+    if len(expected) != pins["suites"][spec["suite"]]["count"]:
+        problems.append(f"fixtures define {len(expected)} cases, manifest expects {pins['suites'][spec['suite']]['count']}")
+    if summary.get("suite_cases") != expected:
+        problems.append("summary suite_cases is not the current fixture suite")
+    selected = summary.get("selected", [])
+    ran = [c["name"] for c in summary.get("cases", [])]
+    for label, names in (("selected", selected), ("ran", ran)):
+        if len(names) != len(set(names)):
+            problems.append(f"{label} cases repeat")
+        extra = sorted(set(names) - set(expected))
+        if extra:
+            problems.append(f"{label} cases outside the suite: {extra}")
+    if ran != [n for n in expected if n in set(selected)]:
+        problems.append("cases that ran differ from the selection")
+    for name in ran:
+        if not all((run_dir / name / f"{part}.json").is_file() for part in ("fixture", "go", "rust", "diff")):
+            problems.append(f"{name}: capture files missing")
+    skips = {s["case"] for s in pins.get("skips", []) if target in s["targets"]}
+    complete = [n for n in expected if n not in skips]
+    partial = summary.get("partial") is True
+    if not partial and selected != complete:
+        problems.append("a run not marked partial did not select the complete suite")
+    if partial and selected == complete:
+        problems.append("a run marked partial selected the complete suite")
+    named = sorted(set(expected) - set(ran) & skips)
+    unknown = [] if partial else sorted(set(expected) - set(ran) - skips)
+    return problems, partial, named, unknown
 
 
-def _strip_generated(value):
-    if isinstance(value, dict):
-        return {k: _strip_generated(v) for k, v in value.items() if k not in GENERATED}
-    if isinstance(value, list):
-        return [_strip_generated(v) for v in value]
-    return value
-
-
-def _events(text):
-    """(event types, concatenated text deltas, terminal marker) of an SSE body."""
-    kinds, chunks, done = [], [], False
-    for line in text.replace("\r\n", "\n").split("\n"):
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            done = True
-            continue
-        try:
-            event = json.loads(data)
-        except ValueError:
-            kinds.append("<undecodable>")
-            continue
-        if not isinstance(event, dict):
-            kinds.append("<non-object>")
-            continue
-        kinds.append(event.get("type") or event.get("object") or "<untyped>")
-        delta = event.get("delta")
-        if isinstance(delta, dict):
-            chunks.append(delta.get("text") or delta.get("partial_json") or "")
-        elif isinstance(delta, str):
-            chunks.append(delta)
-        for choice in event.get("choices") or []:
-            if isinstance(choice, dict):
-                chunks.append((choice.get("delta") or {}).get("content") or choice.get("text") or "")
-    return kinds, "".join(chunks), done
-
-
-def _meaning(reply):
-    """What a downstream body means, independent of generated values and framing."""
-    text = _hex_text(reply.get("body_hex"))
-    if _content_type(reply) == "text/event-stream":
-        kinds, joined, done = _events(text)
-        return {"sse": kinds, "text": joined, "done": done, "read_error": reply.get("read_error")}
-    try:
-        return {"json": _strip_generated(json.loads(text))}
-    except ValueError:
-        return {"bytes": text}
-
-
-def _request_meaning(request):
-    try:
-        body = json.loads(_hex_text(request["body_hex"]))
-    except ValueError:
-        return {"bytes": request["body_hex"]}
-    keep = ("model", "messages", "input", "stream", "max_tokens", "tools", "tool_choice")
-    return {k: body.get(k) for k in keep if isinstance(body, dict) and k in body}
-
-
-def _masked(headers, generated, dropped=frozenset()):
-    """Ordered headers with generated values masked and divergence-named fields left out."""
-    return [[name, "<generated>" if name.lower() in generated else value]
-            for name, value in headers if name.lower() not in dropped]
-
-
-def _header_map(headers, generated):
-    """Field name (case-insensitive) -> values in order; RFC 9110 field semantics."""
-    out = {}
-    for name, value in headers:
-        key = name.lower()
-        out.setdefault(key, []).append("<generated>" if key in generated else value)
-    return out
-
-
-def header_differences(go_reply, rust_reply, generated):
-    go_map = _header_map(go_reply.get("headers", []), generated)
-    rust_map = _header_map(rust_reply.get("headers", []), generated)
-    return sorted(name for name in go_map.keys() | rust_map.keys() if go_map.get(name) != rust_map.get(name))
-
-
-def assertions(case, go, rust, generated=None, excused_headers=(), upstream_excuses=None):
-    """[{name, ok, detail}] for one case. Byte checks cover request and response bodies
-    and the ordered upstream request headers; meaning checks cover what a client reads.
-    `generated` names headers whose values are minted per request (manifest
-    "generated_headers"); `excused_headers` are downstream field names a named
-    divergence covers. `upstream_excuses` holds upstream header names and body regexes
-    named divergences cover; each is masked on both sides before the byte comparison."""
-    generated = generated or {"upstream": [], "downstream": []}
-    upstream_excuses = upstream_excuses or {"headers": set(), "patterns": []}
-    up_generated = {h.lower() for h in generated["upstream"]}
-    down_generated = {h.lower() for h in generated["downstream"]}
-    out = []
-
-    def check(name, ok, detail=""):
-        out.append({"name": name, "ok": bool(ok), "detail": "" if ok else detail})
-
-    go_down, rust_down = go["downstream"], rust["downstream"]
-    check("status", [r.get("status") for r in go_down] == [r.get("status") for r in rust_down],
-          f"Go {[r.get('status') for r in go_down]} Rust {[r.get('status') for r in rust_down]}")
-    check("content-type", [_content_type(r) for r in go_down] == [_content_type(r) for r in rust_down],
-          f"Go {[_content_type(r) for r in go_down]} Rust {[_content_type(r) for r in rust_down]}")
-    go_up, rust_up = _inference(go, case), _inference(rust, case)
-    if case["name"] in NO_TRAFFIC:
-        # A refused client or an unusable credential must never reach the provider.
-        check("upstream-traffic", not go_up and not rust_up,
-              f"inference requests: Go {len(go_up)} Rust {len(rust_up)}; none allowed")
-    elif case.get("no_upstream"):
-        check("upstream-traffic", len(go_up) == len(rust_up),
-              f"inference requests: Go {len(go_up)} Rust {len(rust_up)}")
-    else:
-        check("upstream-traffic", go_up and rust_up and len(go_up) == len(rust_up),
-              f"inference requests: Go {len(go_up)} Rust {len(rust_up)}; both required")
-    check("request-lines", [r["request_line"] for r in go_up] == [r["request_line"] for r in rust_up],
-          f"Go {[r['request_line'] for r in go_up]} Rust {[r['request_line'] for r in rust_up]}")
-    go_heads = [_masked(r["headers"], up_generated, upstream_excuses["headers"]) for r in go_up]
-    rust_heads = [_masked(r["headers"], up_generated, upstream_excuses["headers"]) for r in rust_up]
-    # Upstream header order and case are part of a client fingerprint: compared exactly.
-    check("upstream-headers", go_heads == rust_heads,
-          next((f"request {i}: Go {g} Rust {r}" for i, (g, r) in enumerate(zip(go_heads, rust_heads)) if g != r),
-               "request count differs"))
-    def body(request):
-        raw = bytes.fromhex(request["body_hex"])
-        for pattern in upstream_excuses["patterns"]:
-            raw = re.sub(pattern.encode(), b"", raw)
-        return raw
-    check("upstream-body-bytes", [body(r) for r in go_up] == [body(r) for r in rust_up],
-          "an inference request body differs byte for byte outside named divergence patterns")
-    check("upstream-body-meaning",
-          [_request_meaning(r) for r in go_up] == [_request_meaning(r) for r in rust_up],
-          "model, messages/input, stream, max_tokens, tools or tool_choice differ upstream")
-    differing = sorted({name for g, r in zip(go_down, rust_down)
-                        for name in header_differences(g, r, down_generated)} - set(excused_headers))
-    check("downstream-headers", not differing, f"field values differ: {differing}")
-    if case.get("disconnect"):
-        # The client closes after the first event; how much it read is timing.
-        check("downstream-body-bytes", True)
-        check("downstream-meaning", True)
-    else:
-        check("downstream-body-bytes", [r.get("body_hex") for r in go_down] == [r.get("body_hex") for r in rust_down],
-              "a downstream body differs byte for byte")
-        go_meaning, rust_meaning = [_meaning(r) for r in go_down], [_meaning(r) for r in rust_down]
-        check("downstream-meaning", go_meaning == rust_meaning,
-              f"Go {json.dumps(go_meaning)[:400]} Rust {json.dumps(rust_meaning)[:400]}")
-    # Credential isolation is absolute: Go's behaviour does not excuse a leak.
-    leaks = []
-    for request in rust["upstream"]["http"]:
-        raw = _hex_text(request["raw_head_hex"]) + _hex_text(request["body_hex"])
-        leaks += [f"client key {k[:8]}... reached the upstream" for k in CLIENT_KEYS if k in raw]
-    for reply in rust_down:
-        raw = _hex_text(reply.get("raw_response_hex"))
-        leaks += [f"upstream secret {s[:12]}... reached the client" for s in UPSTREAM_SECRETS if s in raw]
-    check("credential-isolation", not leaks, "; ".join(sorted(set(leaks))))
-    return out
-
-
-# --- divergences ---------------------------------------------------------------------
-
-def _applies(divergence, target, case_name):
-    def matches(patterns):
-        return any(fnmatch.fnmatchcase(case_name, pattern) for pattern in patterns)
-    return (target in divergence["targets"] and matches(divergence["cases"])
-            and not matches(divergence.get("except_cases", [])))
-
-
-def classify(diffs, divergences, target, case_name):
-    """Split raw differences into named (by divergence id) and unexpected."""
-    named, unexpected = {}, []
-    candidates = [d for d in divergences if _applies(d, target, case_name)]
-    for diff in diffs:
-        for divergence in candidates:
-            if any(re.fullmatch(pattern, diff["path"]) for pattern in divergence.get("paths", [])):
-                named[divergence["id"]] = named.get(divergence["id"], 0) + 1
-                break
-        else:
-            unexpected.append(diff)
-    return named, unexpected
-
-
-def excused(divergences, target, case_name, assertion):
-    return [d["id"] for d in divergences
-            if _applies(d, target, case_name) and assertion in d.get("assertions", [])]
-
-
-def upstream_excuses(divergences, target, case_name):
-    """Upstream header names and body regexes named divergences cover for this case."""
-    out = {"headers": set(), "patterns": [], "sources": {}}
-    for divergence in divergences:
-        if _applies(divergence, target, case_name):
-            for name in divergence.get("upstream_header_names", []):
-                out["headers"].add(name.lower())
-                out["sources"].setdefault(("header", name.lower()), divergence["id"])
-            for pattern in divergence.get("upstream_body_patterns", []):
-                out["patterns"].append(pattern)
-                out["sources"].setdefault(("pattern", pattern), divergence["id"])
-    return out
-
-
-def upstream_excuse_hits(excuses, go_up, rust_up):
-    """Divergence ids whose upstream header or body excuse covers a real difference."""
-    hit = set()
-    for go_request, rust_request in zip(go_up, rust_up):
-        go_map = _header_map(go_request["headers"], set())
-        rust_map = _header_map(rust_request["headers"], set())
-        go_body, rust_body = bytes.fromhex(go_request["body_hex"]), bytes.fromhex(rust_request["body_hex"])
-        for (kind, key), divergence in excuses["sources"].items():
-            if kind == "header" and go_map.get(key) != rust_map.get(key):
-                hit.add(divergence)
-            if kind == "pattern" and go_body != rust_body and \
-                    (re.search(key.encode(), go_body) or re.search(key.encode(), rust_body)):
-                hit.add(divergence)
-    return hit
-
-
-def excused_headers(divergences, target, case_name):
-    """{lowercase downstream field name: divergence id} for this case."""
-    out = {}
-    for divergence in divergences:
-        if _applies(divergence, target, case_name):
-            for name in divergence.get("header_names", []):
-                out.setdefault(name.lower(), divergence["id"])
-    return out
-
-
-# --- evaluate ------------------------------------------------------------------------
-
-def evaluate(run_dir, pins=None):
-    """A receipt for one differential run directory."""
+def evaluate(run_dir, pins=None, check_provenance=True):
     pins = pins or revisions.load(revisions.suite_sizes())
     summary = json.loads((run_dir / "summary.json").read_text())
-    target = summary["target"]
-    expected = pins["go"]["targets"][target]
-    divergences = pins["divergences"]
-    problems = []
-    if summary["reference"] != expected["commit"]:
-        problems.append(f"run used {summary['reference']}, manifest pins {expected['commit']}")
-    skips = {s["case"]: s for s in pins.get("skips", []) if target in s["targets"]}
-    ran = {result["name"] for result in summary["cases"]}
-    named_skips = sorted(set(summary["suite_cases"]) - ran & set(skips))
-    unknown_skips = sorted(set(summary["suite_cases"]) - ran - set(skips))
-    cases, hits = [], {}
-    infrastructure = []
-    for result in summary["cases"]:
-        name = result["name"]
-        directory = run_dir / name
-        fixture = json.loads((directory / "fixture.json").read_text())
-        go = json.loads((directory / "go.json").read_text())
-        rust = json.loads((directory / "rust.json").read_text())
-        diffs = json.loads((directory / "diff.json").read_text())
-        errors = result["capture_errors"] + result["transport_errors"]
-        if errors:
-            infrastructure.append({"case": name, "errors": errors})
-        named, unexpected = classify(diffs, divergences, target, name)
-        for key, count in named.items():
-            hits[key] = hits.get(key, 0) + count
-        failed = []
-        header_excuses = excused_headers(divergences, target, name)
-        generated = pins.get("generated_headers")
-        for key in {header_excuses[h] for g, r in zip(go["downstream"], rust["downstream"])
-                    for h in header_differences(g, r, {x.lower() for x in (generated or {}).get("downstream", [])})
-                    if h in header_excuses}:
-            named[key] = named.get(key, 0) + 1
-            hits[key] = hits.get(key, 0) + 1
-        upstream_named = upstream_excuses(divergences, target, name)
-        for key in upstream_excuse_hits(upstream_named, _inference(go, fixture), _inference(rust, fixture)):
-            named[key] = named.get(key, 0) + 1
-            hits[key] = hits.get(key, 0) + 1
-        for item in assertions(fixture, go, rust, generated, header_excuses, upstream_named):
-            if item["ok"]:
+    problems, partial, named_skips, unknown_skips = universe(summary, pins, run_dir)
+    target = summary.get("target")
+    record = summary.get("provenance") or {}
+    unavailable = []
+    if check_provenance:
+        if record.get("verified") is not True:
+            unavailable.append("provenance missing or unverified: " + "; ".join(record.get("problems", [])))
+        elif record["before"]["source"]["head"] != summary.get("rust_revision"):
+            problems.append("summary rust_revision is not the source provenance recorded")
+    cases, hits = [], set()
+    run = judge.Run(run_dir)
+    if not problems:
+        for result in summary["cases"]:
+            name = result["name"]
+            directory = run_dir / name
+            fixture = json.loads((directory / "fixture.json").read_text())
+            if fixture.get("name") != name:
+                problems.append(f"{name}: fixture.json names {fixture.get('name')!r}")
                 continue
-            excuse = excused(divergences, target, name, item["name"])
-            if excuse:
-                for key in excuse:
-                    named[key] = named.get(key, 0) + 1
-                    hits[key] = hits.get(key, 0) + 1
-                item["excused_by"] = excuse
-            else:
-                failed.append(item)
-        verdict = "infrastructure" if errors else ("fail" if failed or unexpected else "pass")
-        cases.append({"name": name, "verdict": verdict, "differences": len(diffs), "named": named,
-                      "failed_assertions": failed,
-                      "unexpected": unexpected[:20], "unexpected_count": len(unexpected)})
-    complete = not unknown_skips and set(summary["selected"]) == set(summary["suite_cases"]) - set(named_skips)
+            errors = result.get("capture_errors", []) + result.get("transport_errors", [])
+            verdict = judge.judge(fixture, run.observation(name, "go"), run.observation(name, "rust"),
+                                  json.loads((directory / "diff.json").read_text()), pins["divergences"],
+                                  target, pins, run, ROOT)
+            if errors:
+                verdict["verdict"] = "infrastructure"
+                verdict["infrastructure"] = errors
+            hits |= set(verdict["hits"])
+            cases.append(verdict)
     stale = []
-    if complete:
-        for divergence in divergences:
+    if not partial and not problems:
+        for divergence in pins["divergences"]:
             if target in divergence["targets"] and divergence["id"] not in hits \
                     and not divergence.get("may_be_absent"):
                 stale.append(divergence["id"])
-    counts = {
-        "suite": len(summary["suite_cases"]), "run": len(summary["cases"]),
-        "passed": sum(c["verdict"] == "pass" for c in cases),
-        "failed": sum(c["verdict"] == "fail" for c in cases),
-        "infrastructure": sum(c["verdict"] == "infrastructure" for c in cases),
-        "named_skips": len(named_skips), "unknown_skips": len(unknown_skips),
-        "named_divergences": len(hits), "stale_divergences": len(stale),
-    }
-    if infrastructure or summary.get("infrastructure_failed"):
-        verdict = "unavailable"
-    elif problems or unknown_skips or stale or counts["failed"]:
+    counts = {"suite": len(summary.get("suite_cases", [])), "run": len(cases),
+              "passed": sum(c["verdict"] == "pass" for c in cases),
+              "failed": sum(c["verdict"] == "fail" for c in cases),
+              "infrastructure": sum(c["verdict"] == "infrastructure" for c in cases),
+              "named_skips": len(named_skips), "unknown_skips": len(unknown_skips),
+              "named_divergences": len(hits), "stale_divergences": len(stale)}
+    if problems or unknown_skips or stale or counts["failed"]:
         verdict = "fail"
+    elif unavailable or counts["infrastructure"] or summary.get("infrastructure_failed"):
+        verdict = "unavailable"
+    elif partial:
+        verdict = "partial-pass"
     else:
         verdict = "pass"
-    return {
-        "kind": "differential", "verdict": verdict, "target": target, "tag": summary["tag"],
-        "go_commit": summary["reference"], "role": summary["role"], "suite": summary["suite"],
-        "rust_revision": summary["rust_revision"], "rust_worktree_clean": summary.get("rust_worktree_clean"),
-        "toolchain": summary.get("toolchain"), "isolation": summary.get("isolation"),
-        "normalizations": summary.get("normalizations"), "run": run_dir.name,
-        "counts": counts, "problems": problems, "named_skips": named_skips, "unknown_skips": unknown_skips,
-        "divergences": {key: {"differences": hits[key], **_brief(divergences, key)} for key in sorted(hits)},
-        "stale_divergences": stale, "infrastructure": infrastructure, "cases": cases,
-    }
+    divergences = {d["id"]: d for d in pins["divergences"]}
+    return {"kind": "differential", "verdict": verdict, "partial": partial, "target": target,
+            "tag": summary.get("tag"), "go_commit": summary.get("reference"), "role": summary.get("role"),
+            "suite": summary.get("suite"), "run": run_dir.name, "rust_revision": summary.get("rust_revision"),
+            "source": (record.get("before") or {}).get("source"), "provenance_verified": record.get("verified"),
+            "provenance": _brief_provenance(record), "toolchain": summary.get("toolchain"),
+            "isolation": summary.get("isolation"), "counts": counts, "problems": problems,
+            "unavailable": unavailable, "named_skips": named_skips, "unknown_skips": unknown_skips,
+            "divergences": {k: {f: divergences[k].get(f) for f in ("kind", "issue", "evidence", "attribution", "ledger")
+                                if divergences[k].get(f)} for k in sorted(hits)},
+            "stale_divergences": stale, "cases": cases}
 
 
-def _brief(divergences, key):
-    divergence = next(d for d in divergences if d["id"] == key)
-    return {k: divergence[k] for k in ("kind", "issue", "ledger") if divergence.get(k)}
+def _brief_provenance(record):
+    if not record.get("before"):
+        return None
+    before = record["before"]
+    return {"driver": before.get("driver"), "go": before.get("go"), "manifest_sha256": before["source"]["manifest_sha256"],
+            "problems": record.get("problems")}
 
 
-# --- cargo groups ----------------------------------------------------------------------
+# --- cargo groups ------------------------------------------------------------------------
 
-def _cargo_args(package, target):
-    if target == "lib":
-        return ["-p", package, "--lib"]
-    return ["-p", package, "--test", target.split(":", 1)[1]]
+SUMMARY = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+                     r"(\d+) measured; (\d+) filtered out", re.M)
 
 
 def parse_libtest(output):
@@ -406,91 +184,167 @@ def parse_list(output):
     return {line[:-len(": test")] for line in output.splitlines() if line.endswith(": test")}
 
 
-def judge_group(group, results, listed):
-    """Each manifest test must exist and pass. Missing, ignored or failed is a failure."""
-    out = []
-    for test in group["tests"]:
-        key = (test["package"], test["target"])
-        if test["name"] not in listed.get(key, set()):
-            outcome = "missing"
-        else:
-            outcome = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}.get(
-                results.get(key, {}).get(test["name"]), "not-run")
-        out.append({"name": test["name"], "package": test["package"], "target": test["target"],
-                    "paths": test["paths"], "outcome": outcome})
+def judge_execution(names, listing, execution):
+    """Outcome of one test binary run. Never pass unless the process exited 0, printed
+    exactly one summary line counting every requested test, and reported each one ok."""
+    out = {"listed": listing.get("exit"), "exit": execution.get("exit"), "problems": []}
+    if listing.get("timeout") or listing.get("exit") != 0:
+        out["problems"].append(f"listing exited {listing.get('exit')}{' (timeout)' if listing.get('timeout') else ''}")
+        out["status"] = "unavailable"
+        return out
+    missing = sorted(set(names) - listing["names"])
+    results = parse_libtest(execution.get("stdout", ""))
+    summaries = SUMMARY.findall(execution.get("stdout", ""))
+    failed = sorted(n for n in names if results.get(n) == "FAILED")
+    ignored = sorted(n for n in names if results.get(n) == "ignored")
+    not_run = sorted(n for n in names if n not in results and n not in missing)
+    out.update(missing=missing, failed=failed, ignored=ignored, not_run=not_run)
+    if missing:
+        out["problems"].append(f"not in the binary: {missing}")
+    if failed or ignored:
+        out["problems"].append(f"failed {failed} ignored {ignored}")
+    if execution.get("timeout") or execution.get("exit") is None or execution["exit"] < 0:
+        out["problems"].append("execution timed out or was killed")
+    elif execution["exit"] != 0:
+        out["problems"].append(f"execution exited {execution['exit']}")
+    if len(summaries) != 1:
+        out["problems"].append(f"{len(summaries)} libtest summary lines (truncated or extra output)")
+    else:
+        result, passed, n_failed, n_ignored = summaries[0][0], int(summaries[0][1]), int(summaries[0][2]), int(summaries[0][3])
+        if (result, passed, n_failed, n_ignored) != ("ok", len(set(names)), 0, 0):
+            out["problems"].append(f"summary says {result}: {passed} passed, {n_failed} failed, {n_ignored} ignored "
+                                   f"for {len(set(names))} requested")
+    if not_run:
+        out["problems"].append(f"no result line for {not_run}")
+    if failed or missing or ignored:
+        out["status"] = "fail"
+    elif out["problems"]:
+        out["status"] = "unavailable" if (execution.get("timeout") or execution.get("exit", 0) < 0
+                                          or execution.get("exit") is None) else "fail"
+    else:
+        out["status"] = "pass"
     return out
 
 
-def run_cargo(pins, group_ids):
-    groups = [g for g in pins["groups"] if not group_ids or g["id"] in group_ids]
-    if group_ids and len(groups) != len(set(group_ids)):
-        raise SystemExit(f"unknown group in {group_ids}")
+def _cargo_selection(package, targets):
+    args = ["test", "--locked", "--no-run", "-p", package]
+    for target in sorted(targets):
+        args += ["--lib"] if target == "lib" else ["--test", target.split(":", 1)[1]]
+    return args
+
+
+def _artifact_for(build, package, target):
+    kind, name = ("lib", None) if target == "lib" else ("test", target.split(":", 1)[1])
+    found = [a for a in build["artifacts"] if a["package"] == package and a["kind"] == kind
+             and (name is None or a["name"] == name)]
+    return found[0] if len(found) == 1 else None
+
+
+def _run(command, cwd, env, timeout):
+    try:
+        done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        return {"exit": done.returncode, "stdout": done.stdout, "stderr": done.stderr, "timeout": False}
+    except subprocess.TimeoutExpired as exc:
+        return {"exit": None, "stdout": exc.stdout or "", "stderr": exc.stderr or "", "timeout": True}
+
+
+def run_cargo(pins):
+    """Every manifest group. Build, hash, list and run each test binary directly in a
+    loopback-only namespace, then confirm cargo still calls the same binaries fresh."""
     targets = {}
-    for group in groups:
+    for group in pins["groups"]:
         for test in group["tests"]:
             targets.setdefault((test["package"], test["target"]), []).append(test["name"])
     env = dict(os.environ, CPA_TEST_NO_SKIP="1", CARGO_TERM_COLOR="never")
-    log = []
-    # Build before isolation (dependencies may need fetching); run offline inside it.
-    for package in sorted({package for package, _ in targets}):
-        build = ["cargo", "test", "--locked", "--no-run", "-p", package]
-        for (other, target) in sorted(targets):
-            if other == package:
-                build += _cargo_args(package, target)[2:]
-        built = subprocess.run(build, cwd=ROOT, env=env, capture_output=True, text=True)
-        log.append({"command": build, "exit": built.returncode, "tail": built.stderr[-4000:]})
-        if built.returncode != 0:
-            return {"kind": "cargo-groups", "verdict": "unavailable", "log": log}
-    results, listed = {}, {}
-    isolated = ROOT / "ui/scripts/isolated.sh"
-    for (package, target), names in sorted(targets.items()):
-        base = ["cargo", "test", "--locked", "--offline", *_cargo_args(package, target), "--"]
-        listing = subprocess.run(base + ["--list"], cwd=ROOT, env=env, capture_output=True, text=True)
-        listed[(package, target)] = parse_list(listing.stdout)
-        command = base + ["--exact", *sorted(set(names))]
-        shell = " ".join(_quote(part) for part in command)
-        # Loopback-only namespace with the caller's uid: tests cannot reach a provider.
-        ran = subprocess.run([str(isolated), shell], cwd=ROOT, env=env, capture_output=True, text=True)
-        results[(package, target)] = parse_libtest(ran.stdout)
-        log.append({"command": command, "isolated": True, "exit": ran.returncode,
-                    "tail": (ran.stdout + ran.stderr)[-4000:] if ran.returncode else ""})
+    source_before = provenance.source_identity()
+    packages = sorted({p for p, _ in targets})
+    before = {p: provenance.cargo_artifacts(_cargo_selection(p, [t for q, t in targets if q == p]), env=env)
+              for p in packages}
+    unavailable = [f"build of {p} exited {b['exit']}" for p, b in before.items() if b["exit"] != 0]
+    executions = {}
+    if not unavailable:
+        isolated = ROOT / "ui/scripts/isolated.sh"
+        for (package, target), names in sorted(targets.items()):
+            artifact = _artifact_for(before[package], package, target)
+            if artifact is None:
+                unavailable.append(f"{package} {target}: no single test executable")
+                continue
+            executable = ROOT / artifact["executable"]
+            package_dir = ROOT / "crates" / package
+            listing = _run([str(executable), "--list"], package_dir, env, LIST_TIMEOUT)
+            listing["names"] = parse_list(listing["stdout"])
+            shell = "cd " + _quote(str(package_dir)) + " && exec " + " ".join(
+                _quote(p) for p in [str(executable), "--exact", *sorted(set(names))])
+            execution = _run([str(isolated), shell], ROOT, env, TEST_TIMEOUT)
+            outcome = judge_execution(names, listing, execution)
+            outcome.update(executable=artifact["executable"], sha256=artifact["sha256"], fresh_before=artifact["fresh"],
+                           listed_names=sorted(listing["names"]), output_tail=(execution["stdout"] + execution["stderr"])[-3000:]
+                           if outcome["status"] != "pass" else "")
+            executions[(package, target)] = outcome
+    after = {p: provenance.cargo_artifacts(_cargo_selection(p, [t for q, t in targets if q == p]), env=env)
+             for p in packages}
+    source_after = provenance.source_identity()
+    if source_before != source_after:
+        unavailable.append("Rust source or manifest changed during the run")
+    for (package, target), outcome in executions.items():
+        artifact = _artifact_for(after[package], package, target)
+        if artifact is None or artifact["fresh"] is not True or artifact["sha256"] != outcome["sha256"]:
+            unavailable.append(f"{package} {target}: tested binary is not cargo's fresh binary after the run")
     unknown = []
     for owned in pins.get("owned_test_targets", []):
         key = (owned["package"], owned["target"])
-        if key not in listed:
-            continue
-        known = {t["name"] for g in pins["groups"] for t in g["tests"]
-                 if (t["package"], t["target"]) == key}
-        unknown += [f"{key[0]} {key[1]} {name}" for name in sorted(listed[key] - known)]
-    report = []
-    for group in groups:
-        tests = judge_group(group, results, listed)
-        report.append({"id": group["id"], "provider": group["provider"], "tests": tests,
+        if key in executions:
+            known = {t["name"] for g in pins["groups"] for t in g["tests"] if (t["package"], t["target"]) == key}
+            unknown += [f"{key[0]} {key[1]} {n}" for n in sorted(set(executions[key]["listed_names"]) - known)]
+    groups = []
+    for group in pins["groups"]:
+        tests = []
+        for test in group["tests"]:
+            outcome = executions.get((test["package"], test["target"]))
+            if outcome is None:
+                state = "unavailable"
+            elif test["name"] in outcome.get("missing", []):
+                state = "missing"
+            elif test["name"] in outcome.get("failed", []):
+                state = "failed"
+            elif test["name"] in outcome.get("ignored", []):
+                state = "ignored"
+            elif outcome["status"] == "pass":
+                state = "passed"
+            else:
+                state = outcome["status"]
+            tests.append({"name": test["name"], "package": test["package"], "target": test["target"],
+                          "paths": test["paths"], "outcome": state})
+        groups.append({"id": group["id"], "provider": group["provider"], "tests": tests,
                        "passed": sum(t["outcome"] == "passed" for t in tests),
                        "failed": sum(t["outcome"] != "passed" for t in tests)})
-    failed = sum(g["failed"] for g in report)
-    return {"kind": "cargo-groups", "verdict": "fail" if failed or unknown else "pass",
-            "rust_revision": _git("rev-parse", "HEAD"), "rust_worktree_clean": not _git("status", "--porcelain",
-                                                                                      "--untracked-files=no"),
-            "toolchain": _toolchain(), "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, "
-                                                     "caller uid/gid; CPA_TEST_NO_SKIP=1",
-            "counts": {"groups": len(report), "tests": sum(len(g["tests"]) for g in report),
-                       "passed": sum(g["passed"] for g in report), "failed": failed,
+    statuses = [o["status"] for o in executions.values()]
+    if unknown or "fail" in statuses:
+        verdict = "fail"
+    elif unavailable or "unavailable" in statuses or len(executions) != len(targets):
+        verdict = "unavailable"
+    else:
+        verdict = "pass"
+    return {"kind": "cargo-groups", "verdict": verdict, "partial": False,
+            "rust_revision": source_before["head"], "source": source_before,
+            "provenance_verified": not unavailable, "toolchain": _toolchain(),
+            "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, caller uid/gid; "
+                         "test binaries run directly with CPA_TEST_NO_SKIP=1",
+            "counts": {"groups": len(groups), "tests": sum(len(g["tests"]) for g in groups),
+                       "passed": sum(g["passed"] for g in groups), "failed": sum(g["failed"] for g in groups),
                        "unknown_tests": len(unknown)},
-            "unknown_tests": unknown, "groups": report, "log": log}
+            "unavailable": unavailable, "unknown_tests": unknown, "groups": groups,
+            "executions": [{"package": p, "target": t, **{k: v for k, v in o.items() if k != "listed_names"}}
+                           for (p, t), o in sorted(executions.items())]}
 
 
 def _quote(part):
-    return part if re.fullmatch(r"[A-Za-z0-9_:./=-]+", part) else "'" + part.replace("'", "'\\''") + "'"
-
-
-def _git(*args):
-    return subprocess.check_output(["git", "-C", str(ROOT), *args]).decode().strip()
+    return part if re.fullmatch(r"[A-Za-z0-9_:./=+-]+", part) else "'" + part.replace("'", "'\\''") + "'"
 
 
 def _toolchain():
     out = {}
-    for name, command in [("rustc", ["rustc", "--version"]), ("cargo", ["cargo", "--version"])]:
+    for name, command in (("rustc", ["rustc", "--version"]), ("cargo", ["cargo", "--version"])):
         try:
             out[name] = subprocess.check_output(command).decode().strip()
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -498,127 +352,287 @@ def _toolchain():
     return out
 
 
-# --- mutation control ----------------------------------------------------------------
+# --- mutation control --------------------------------------------------------------------
 
-def _first_inference_case(run_dir, summary):
-    for result in summary["cases"]:
-        fixture = json.loads((run_dir / result["name"] / "fixture.json").read_text())
-        rust = json.loads((run_dir / result["name"] / "rust.json").read_text())
-        if _inference(rust, fixture) and not fixture.get("disconnect") and result["name"] == "buffered":
-            return result["name"]
-    raise SystemExit("mutation control needs the buffered case in the run")
+def _inference(observation, provider=None):
+    prefix = "POST /v1/responses " if provider else "POST /v1/messages"
+    return [r for r in observation["upstream"]["http"] if r["request_line"].startswith(prefix)]
 
 
-def _edit_body(field, old, new):
+def _set_header(request, name, value):
+    headers = [[k, value if k.lower() == name.lower() else v] for k, v in request["headers"]]
+    if not any(k.lower() == name.lower() for k, _ in request["headers"]):
+        headers.insert(len(headers) - 1, [name, value])
+    _rewrite_head(request, headers)
+
+
+def _rewrite_head(request, headers):
+    request["headers"] = headers
+    head = request["request_line"] + "\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers) + "\r\n"
+    request["raw_head_hex"] = head.encode("latin1").hex()
+
+
+def _set_body(request, body):
+    request["body_hex"] = body.hex()
+    request["body_text"] = body.decode("utf-8", errors="replace")
+    headers = [[k, str(len(body)) if k.lower() == "content-length" else v] for k, v in request["headers"]]
+    _rewrite_head(request, headers)
+
+
+def _replace_body(old, new, provider=None):
     def edit(observation):
-        request = next(r for r in observation["upstream"]["http"] if r["request_line"].startswith("POST /v1/messages"))
+        request = _inference(observation, provider)[0]
         body = bytes.fromhex(request["body_hex"])
-        assert old.encode() in body, f"{field}: {old} not in the request"
-        body = body.replace(old.encode(), new.encode(), 1)
-        request["body_hex"] = body.hex()
-        request["body_text"] = body.decode("utf-8", errors="replace")
+        if old.encode() not in body:
+            raise AssertionError(f"mutation target {old!r} not in the request")
+        _set_body(request, body.replace(old.encode(), new.encode(), 1))
     return edit
 
 
-def _edit_status(observation):
-    observation["downstream"][0]["status"] = 500
+def _replace_reply(old, new):
+    def edit(observation):
+        reply = observation["downstream"][0]
+        body = bytes.fromhex(reply["body_hex"])
+        if old.encode() not in body:
+            raise AssertionError(f"mutation target {old!r} not in the reply")
+        changed = body.replace(old.encode(), new.encode(), 1)
+        reply["body_hex"] = changed.hex()
+        reply["body_text"] = changed.decode("utf-8", errors="replace")
+        raw = bytes.fromhex(reply["raw_response_hex"])
+        reply["raw_response_hex"] = raw.replace(old.encode(), new.encode(), 1).hex()
+    return edit
 
 
-def _leak_client_key(observation):
-    request = observation["upstream"]["http"][0]
-    head = bytes.fromhex(request["raw_head_hex"])
-    head = head.replace(b"\r\n\r\n", b"\r\nX-Leak: fixture-client-key\r\n\r\n", 1)
-    request["raw_head_hex"] = head.hex()
+def _header(name, value, provider=None):
+    def edit(observation):
+        _set_header(_inference(observation, provider)[0], name, value)
+    return edit
 
 
-def _edit_answer(observation):
+def _status(observation):
     reply = observation["downstream"][0]
-    reply["body_hex"] = bytes.fromhex(reply["body_hex"]).replace(b"local answer", b"other answer").hex()
+    reply["status"] = 500
 
 
+def _reply_header(name, value):
+    def edit(observation):
+        reply = observation["downstream"][0]
+        reply["headers"] = reply["headers"] + [[name, value]]
+        raw = bytes.fromhex(reply["raw_response_hex"])
+        head, sep, tail = raw.partition(b"\r\n\r\n")
+        reply["raw_response_hex"] = (head + f"\r\n{name}: {value}".encode() + sep + tail).hex()
+    return edit
+
+
+def _tls_cipher(observation):
+    observation["upstream"]["tls"][0]["profile"]["ciphers"] = observation["upstream"]["tls"][0]["profile"]["ciphers"][1:]
+
+
+def _credential(field, value):
+    def edit(observation):
+        observation["credential_after"][field] = value
+    return edit
+
+
+# (target, case, label, Rust-side edit). Each must turn a passing case into a failure.
 MUTATIONS = [
-    ("upstream max_tokens 17 -> 18", _edit_body("max_tokens", '"max_tokens":17', '"max_tokens":18')),
-    ("downstream status 200 -> 500", _edit_status),
-    ("client key forwarded upstream", _leak_client_key),
-    ("downstream text changed", _edit_answer),
+    ("*", "buffered", "upstream max_tokens 17 -> 18", _replace_body('"max_tokens":17', '"max_tokens":18')),
+    ("*", "buffered", "downstream status 200 -> 500", _status),
+    ("*", "buffered", "client key forwarded upstream", _header("X-Leak", "fixture-client-key")),
+    ("*", "buffered", "downstream text changed", _replace_reply("local answer", "other answer")),
+    ("*", "native-signals", "native body model changed", _replace_body('"claude-sonnet-4-6"', '"claude-opus-4-6"')),
+    ("*", "native-signals", "Grok credential in the Claude Authorization",
+     _header("Authorization", "Bearer sk-xai-FAKE-LOCAL-ONLY")),
+    ("*", "tool-roundtrip", "tool arguments corrupted", _replace_reply('{"city":"Local"}', '{"city":"Other"}')),
+    ("*", "continuity-two-turns", "TLS ClientHello ciphers changed", _tls_cipher),
+    ("*", "client-disconnect", "credential persisted disabled: true", _credential("disabled", True)),
+    ("*", "upstream-429", "unexpected downstream header", _reply_header("X-Unexpected", "1")),
+    ("historical", "compact-claude", "compaction answer shape changed", _replace_reply('"status":"completed"', '"status":"failed"')),
+    ("historical", "models-openai", "catalog entry dropped", _replace_reply('"id":"claude-sonnet-4-6"', '"id":"claude-sonnet-4-7"')),
+    ("selective", "buffered", "C1 Rust User-Agent drifts", _header("User-Agent", "claude-cli/2.1.281 (external, cli)")),
+    ("selective", "cloak-tools-beta", "tool schema changed outside the alias",
+     _replace_body('"description":"Local tool"', '"description":"Other tool"')),
+    ("selective", "meta-chat-stream", "M1 Rust client id drifts", _header("X-Client-Id", "tbh:other", "meta")),
+    ("selective", "xai-chat-stream", "Muse credential sent to Grok", _header("Authorization", "Bearer sk-meta-FAKE-LOCAL-ONLY", "xai")),
+    ("selective", "xai-messages-stream", "Rust also sends max_output_tokens",
+     _replace_body('"stream":true', '"max_output_tokens":17,"stream":true', "xai")),
+    ("selective", "upstream-401", "credential expiry skewed by an hour", _credential("expired", "2099-01-01T00:00:00Z")),
+    ("selective", "compact-claude", "compaction capsule prefix changed", _replace_reply("cpa-ag-compact-v1:", "cpa-ag-compact-v2:")),
 ]
 
 
-def mutation_control(run_dir, pins):
-    """Mutate the Rust side of a recorded case in a copy and re-evaluate. Each mutation
-    must turn an accepted case into a failure; one that still passes means the
-    acceptance command cannot see that deviation."""
+def mutation_control(run_dir, pins, check_provenance=True):
     summary = json.loads((run_dir / "summary.json").read_text())
-    name = _first_inference_case(run_dir, summary)
-    baseline = evaluate(run_dir, pins)
-    base_case = next(c for c in baseline["cases"] if c["name"] == name)
+    target = summary["target"]
+    baseline = evaluate(run_dir, pins, check_provenance)
+    by_name = {c["name"]: c for c in baseline["cases"]}
     controls = []
-    for label, edit in MUTATIONS:
+    for mutation_target, name, label, edit in MUTATIONS:
+        if mutation_target not in ("*", target):
+            continue
+        control = {"mutation": label, "case": name, "baseline": by_name.get(name, {}).get("verdict")}
         with tempfile.TemporaryDirectory() as scratch:
             copy_dir = Path(scratch) / run_dir.name
-            shutil.copytree(run_dir, copy_dir, symlinks=True)
+            shutil.copytree(run_dir, copy_dir, symlinks=True,
+                            ignore=shutil.ignore_patterns("auth", "process.log", "config.yaml", "certs"))
             directory = copy_dir / name
             go = json.loads((directory / "go.json").read_text())
             rust = json.loads((directory / "rust.json").read_text())
-            edit(rust)
+            try:
+                edit(rust)
+            except (AssertionError, IndexError, KeyError) as exc:
+                control.update(caught=False, error=f"mutation not applicable: {exc}")
+                controls.append(control)
+                continue
             (directory / "rust.json").write_text(json.dumps(rust))
             (directory / "diff.json").write_text(json.dumps(differences(comparable(go), comparable(rust))))
-            receipt = evaluate(copy_dir, pins)
-            case = next(c for c in receipt["cases"] if c["name"] == name)
-            controls.append({"mutation": label, "case": name, "case_verdict": case["verdict"],
-                             "failed_assertions": [a["name"] for a in case["failed_assertions"]],
-                             "unexpected_count": case["unexpected_count"], "caught": case["verdict"] == "fail"})
-    verdict = "pass" if base_case["verdict"] == "pass" and all(c["caught"] for c in controls) else "fail"
-    return {"kind": "mutation-control", "verdict": verdict, "run": run_dir.name, "target": summary["target"],
-            "go_commit": summary["reference"], "rust_revision": summary["rust_revision"],
-            "baseline_case_verdict": base_case["verdict"], "controls": controls}
+            receipt = evaluate(copy_dir, pins, check_provenance)
+            case = next((c for c in receipt["cases"] if c["name"] == name), None)
+            control.update(verdict=case and case["verdict"], failed=sorted((case or {}).get("failed", {})),
+                           unexplained=(case or {}).get("unexplained_count"),
+                           caught=bool(case) and case["verdict"] == "fail")
+        controls.append(control)
+    caught = all(c["caught"] and c["baseline"] == "pass" for c in controls)
+    return {"kind": "mutation-control", "verdict": "pass" if caught and baseline["verdict"] == "pass" else "fail",
+            "partial": False, "run": run_dir.name, "target": target, "go_commit": summary.get("reference"),
+            "rust_revision": summary.get("rust_revision"), "source": baseline.get("source"),
+            "provenance_verified": baseline.get("provenance_verified"), "baseline_verdict": baseline["verdict"],
+            "counts": {"mutations": len(controls), "caught": sum(c["caught"] for c in controls)},
+            "controls": controls}
 
 
-# --- receipts ------------------------------------------------------------------------
+# --- combined acceptance ---------------------------------------------------------------
 
-def write_receipt(receipt, name):
+REQUIRED = [("differential", "historical"), ("differential", "selective"), ("mutation-control", "historical"),
+            ("mutation-control", "selective"), ("cargo-groups", None)]
+
+
+def combine(paths, pins, current_source=None):
+    receipts, problems = [], []
+    for p in paths:
+        try:
+            receipt = json.loads(Path(p).read_text())
+            if not isinstance(receipt, dict) or "kind" not in receipt:
+                raise ValueError("not a receipt")
+            receipts.append((Path(p).name, receipt))
+        except (OSError, ValueError) as exc:
+            problems.append(f"{p}: unreadable receipt ({exc})")
+    keys = [(r["kind"], r.get("target")) for _, r in receipts]
+    for key in REQUIRED:
+        if keys.count(key) != 1:
+            problems.append(f"{key[0]}:{key[1]} appears {keys.count(key)} times, exactly one required")
+    extra = sorted({f"{k}:{t}" for k, t in keys if (k, t) not in REQUIRED})
+    if extra:
+        problems.append(f"unexpected receipts {extra}")
+    current_source = current_source or provenance.source_identity()
+    for name, receipt in receipts:
+        source = receipt.get("source")
+        counts = receipt.get("counts") if isinstance(receipt.get("counts"), dict) else {}
+        if receipt.get("verdict") != "pass" or receipt.get("partial") is not False:
+            problems.append(f"{name}: verdict {receipt.get('verdict')} partial {receipt.get('partial')}")
+        if receipt.get("provenance_verified") is not True:
+            problems.append(f"{name}: provenance not verified")
+        if not source or source.get("clean") is not True:
+            problems.append(f"{name}: tested source was not a clean worktree")
+        elif source != current_source:
+            problems.append(f"{name}: tested source {source.get('head')} is not the current source "
+                            f"{current_source.get('head')} (tree, cleanliness or manifest differ)")
+        if source and source.get("manifest_sha256") != current_source.get("manifest_sha256"):
+            problems.append(f"{name}: manifest hash differs from the current manifest")
+        if receipt["kind"] in ("differential", "mutation-control"):
+            target = receipt.get("target")
+            pin = pins["go"]["targets"].get(target, {}).get("commit")
+            if receipt.get("go_commit") != pin:
+                problems.append(f"{name}: Go commit {receipt.get('go_commit')} is not the {target} pin {pin}")
+        if receipt["kind"] == "differential":
+            go = (receipt.get("provenance") or {}).get("go") or {}
+            if go.get("vcs.revision") != receipt.get("go_commit") or go.get("vcs.modified") != "false":
+                problems.append(f"{name}: Go binary stamp does not match the pinned clean revision")
+            expected, _ = expected_cases(pins, receipt.get("target"))
+            if counts.get("run", 0) + counts.get("named_skips", 0) != len(expected):
+                problems.append(f"{name}: covers {counts.get('run')} of {len(expected)} cases")
+        if receipt["kind"] == "mutation-control":
+            want = [m for m in MUTATIONS if m[0] in ("*", receipt.get("target"))]
+            if counts.get("mutations") != len(want) or counts.get("caught") != len(want):
+                problems.append(f"{name}: {counts.get('caught')} of {len(want)} required mutations caught")
+        if receipt["kind"] == "cargo-groups":
+            ids = sorted(str(g.get("id")) for g in receipt.get("groups", []) if isinstance(g, dict))
+            if ids != sorted(g["id"] for g in pins["groups"]):
+                problems.append(f"{name}: groups {ids} are not every manifest group")
+            total = sum(len(g["tests"]) for g in pins["groups"])
+            if counts.get("tests") != total or counts.get("passed") != total:
+                problems.append(f"{name}: {counts.get('passed')} of {total} manifest tests passed")
+    heads = {(r.get("source") or {}).get("head") for _, r in receipts}
+    if len(heads) != 1:
+        problems.append(f"receipts come from different revisions {sorted(map(str, heads))}")
+    differential_runs = {r.get("target"): r.get("run") for _, r in receipts if r["kind"] == "differential"}
+    for name, receipt in receipts:
+        if receipt["kind"] == "mutation-control" and differential_runs.get(receipt.get("target")) != receipt.get("run"):
+            problems.append(f"{name}: mutation control ran on a different capture than the evaluated one")
+    return {"kind": "acceptance", "verdict": "fail" if problems else "pass", "partial": False, "problems": problems,
+            "tested_source": current_source,
+            "pins": {"go": {n: {k: t[k] for k in ("tag", "commit", "role", "executed")}
+                            for n, t in pins["go"]["targets"].items()},
+                     "codex": pins["contracts"]["codex"]["commit"], "rust_toolchain": pins["toolchain"]["rust"]},
+            "receipts": [{"file": n, "kind": r["kind"], "target": r.get("target"), "verdict": r["verdict"],
+                          "counts": r.get("counts"), "rust_revision": r.get("rust_revision")} for n, r in receipts]}
+
+
+def verify_evidence(receipt_path, root=ROOT, allowed=("harness/evidence/",)):
+    """A committed acceptance receipt names the source it tested. Later commits may add
+    evidence only: HEAD's tree must equal the tested tree outside the evidence paths."""
+    receipt = json.loads(Path(receipt_path).read_text())
+    tested = receipt["tested_source"]
+    problems = []
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
+    if receipt.get("verdict") != "pass":
+        problems.append(f"receipt verdict is {receipt.get('verdict')}")
+    try:
+        if git("rev-parse", f"{tested['head']}^{{tree}}") != tested["tree"]:
+            problems.append("tested commit's tree is not the recorded tree")
+        changed = [p for p in git("diff", "--name-only", tested["head"], "HEAD").splitlines() if p]
+    except subprocess.CalledProcessError as exc:
+        return {"verdict": "fail", "problems": [f"git: {exc}"]}
+    outside = [p for p in changed if not p.startswith(allowed)]
+    if outside:
+        problems.append(f"HEAD changes files beyond evidence since the tested source: {outside}")
+    if git("status", "--porcelain"):
+        problems.append("worktree is not clean")
+    return {"verdict": "fail" if problems else "pass", "tested_head": tested["head"], "head": git("rev-parse", "HEAD"),
+            "evidence_only_changes": changed, "problems": problems}
+
+
+# --- receipts and CLI ------------------------------------------------------------------
+
+def write_receipt(receipt, name, path=None):
     directory = CACHE / "receipts"
     directory.mkdir(parents=True, exist_ok=True)
     receipt = {"written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **receipt}
-    path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{name}.json"
+    path = Path(path) if path else directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{name}.json"
     path.write_text(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n")
     return path
-
-
-def combine(paths, pins):
-    receipts = [json.loads(Path(p).read_text()) for p in paths]
-    kinds = {(r["kind"], r.get("target")) for r in receipts}
-    required = {("differential", "historical"), ("differential", "selective"), ("cargo-groups", None),
-                ("mutation-control", "historical")}
-    missing = sorted(f"{k}:{t}" if t else k for k, t in required - kinds)
-    verdicts = [r["verdict"] for r in receipts]
-    if missing or "fail" in verdicts:
-        verdict = "fail"
-    elif "unavailable" in verdicts:
-        verdict = "unavailable"
-    else:
-        verdict = "pass"
-    return {"kind": "acceptance", "verdict": verdict, "missing_receipts": missing,
-            "pins": {"go": {name: {"tag": t["tag"], "commit": t["commit"], "role": t["role"],
-                                   "executed": t["executed"]} for name, t in pins["go"]["targets"].items()},
-                     "codex": pins["contracts"]["codex"]["commit"], "rust_toolchain": pins["toolchain"]["rust"]},
-            "receipts": [{"file": Path(p).name, "kind": r["kind"], "target": r.get("target"),
-                          "verdict": r["verdict"], "counts": r.get("counts"),
-                          "rust_revision": r.get("rust_revision")} for p, r in zip(paths, receipts)]}
-
-
-EXIT = {"pass": 0, "fail": 1, "unavailable": 2}
 
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+    parsers = {}
     for name in ("evaluate", "mutation-control"):
-        sub.add_parser(name).add_argument("run", type=Path)
-    cargo = sub.add_parser("cargo")
-    cargo.add_argument("--group", action="append", default=[])
-    sub.add_parser("combine").add_argument("receipts", nargs="+")
+        parsers[name] = sub.add_parser(name)
+        parsers[name].add_argument("run", type=Path)
+    parsers["cargo"] = sub.add_parser("cargo")
+    parsers["combine"] = sub.add_parser("combine")
+    parsers["combine"].add_argument("receipts", nargs="*")
+    for parser_ in parsers.values():
+        parser_.add_argument("--receipt", type=Path, help="write the receipt to this path")
+    sub.add_parser("verify-evidence").add_argument("receipt", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "verify-evidence":
+        result = verify_evidence(args.receipt)
+        print(json.dumps(result, indent=2))
+        return EXIT[result["verdict"]]
     pins = revisions.load(revisions.suite_sizes())
     if args.command == "evaluate":
         receipt = evaluate(args.run.resolve(), pins)
@@ -627,22 +641,24 @@ def main(argv):
         receipt = mutation_control(args.run.resolve(), pins)
         label = f"mutation-{receipt['target']}"
     elif args.command == "cargo":
-        receipt = run_cargo(pins, args.group)
+        receipt = run_cargo(pins)
         label = "cargo-groups"
     else:
         receipt = combine(args.receipts, pins)
         label = "acceptance"
-    path = write_receipt(receipt, label)
-    print(json.dumps({k: receipt.get(k) for k in ("kind", "target", "verdict", "counts", "missing_receipts")
-                      if k in receipt}, indent=2))
-    if receipt.get("kind") == "differential":
-        for case in receipt["cases"]:
-            if case["verdict"] != "pass":
-                print(f"  {case['name']}: {case['verdict']}; assertions "
-                      f"{[a['name'] for a in case['failed_assertions']]}; unexpected {case['unexpected_count']}")
-        for key in ("unknown_skips", "stale_divergences", "problems"):
-            if receipt.get(key):
-                print(f"  {key}: {receipt[key]}")
+    path = write_receipt(receipt, label, args.receipt)
+    print(json.dumps({k: receipt.get(k) for k in ("kind", "target", "verdict", "partial", "counts") if k in receipt},
+                     indent=2))
+    for case in receipt.get("cases", []):
+        if case["verdict"] != "pass":
+            print(f"  {case['name']}: {case['verdict']} {json.dumps(case['failed'])[:600]} "
+                  f"unexplained {case['unexplained_count']}")
+    for control in receipt.get("controls", []):
+        if not control.get("caught"):
+            print(f"  NOT CAUGHT: {control}")
+    for key in ("problems", "unavailable", "unknown_skips", "stale_divergences", "unknown_tests"):
+        if receipt.get(key):
+            print(f"  {key}: {receipt[key]}")
     print(f"receipt: {path}")
     return EXIT[receipt["verdict"]]
 

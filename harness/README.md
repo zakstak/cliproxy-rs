@@ -76,48 +76,91 @@ and lockfile keep Go/network requirements out of `cargo test --workspace`.
 
 ## Acceptance
 
-`./harness/accept` runs both differential targets, evaluates each, applies the mutation
-control, runs the cargo groups and combines their receipts. `acceptance.py` decides; the
-collector only records. A capture without semantic assertions is never a pass.
+`./harness/accept` runs both differential targets, evaluates each one, runs the mutation
+control on each capture, runs every cargo group and combines exactly those receipts. The
+collector only records; `acceptance.py` and [`judge.py`](judge.py) decide. Nothing is
+accepted on a capture without these checks.
 
-- **Semantic assertions** per case, Go against Rust: status, content type, inference
-  traffic (a refused client or unusable credential must reach no provider), request lines,
-  ordered upstream headers with generated values masked, upstream body bytes and meaning,
-  downstream field values (case-insensitive), downstream body bytes and meaning (SSE event
-  types, text and terminal marker; JSON without generated IDs).
-- **Credential isolation** is absolute: no client key upstream and no upstream secret
-  downstream. No divergence can excuse it.
-- **Named divergences**: every raw collector difference must match a manifest entry for its
-  target and case, by path. An entry can also excuse a named assertion, downstream field,
-  upstream header or upstream body pattern. Kinds: `pending-feature` and `deferred-feature`
-  (with the owning issue), `documented-difference` (with its ledger entry), `later-reference`
-  (historical only, with Go evidence), `nondeterministic`, `harness-boundary` and
-  `unclassified` (still names an issue; stays visible in every receipt). An entry that matches
-  nothing in a complete run is stale and fails, unless it is marked `may_be_absent`.
-- **Skips**: a suite case that did not run fails unless the manifest's `skips` names it with
-  a reason and issue.
-- **Cargo groups**: `claude-router`, `codex-contract`, `xai`, `meta`, `refusals` and `controls`
-  list exact test names. They are built first and then run offline in a loopback-only namespace
-  (`ui/scripts/isolated.sh`, caller uid) with `CPA_TEST_NO_SKIP=1`. A missing, ignored or
-  failing test fails the group, and so does an unlisted test in a target the harness owns
-  (`tests/retained_providers.rs`).
-- **Mutation control**: the evaluator re-runs on copies of the historical `buffered` capture
-  with one Rust-side change each: upstream `max_tokens`, downstream status, a forwarded client
-  key, downstream text. Each must fail, otherwise the control fails.
-  `the_semantic_checks_reject_a_mutated_capture` does the same for the Rust contract checks.
+**Per-side invariants** apply to every case on both targets, and no divergence can
+relax them:
 
-Receipts go to `harness/.cache/receipts/`. Each records the Go and Rust revisions, whether the
-Rust worktree was clean, the toolchain, case counts, passes, failures, named and unknown skips,
-divergence hits and stale entries. The `combine` receipt requires all four kinds. Exit codes:
-0 accepted, 1 failed, 2 execution unavailable.
+- credential ownership: each upstream request carries only its provider's credential
+  (Claude OAuth token, Grok key or Muse key), never a client key or another provider's
+  secret, and no upstream secret reaches the client;
+- capture consistency: raw heads match the parsed request line, status and headers;
+  chunked or plain wire bodies decode to the compared body; Content-Length matches;
+- generated values (`generated_headers`) match their documented pattern;
+- native bytes: `native-signals` sends exactly the request recorded from Go v8.0.10
+  ([golden](expectations/native-signals.upstream.json)), and `count-tokens` forwards the
+  client's body byte for byte;
+- a refused client or unusable credential reaches no provider.
+
+**Dimensions** are compared Go against Rust: status and reason, upstream request lines,
+ordered upstream headers, upstream bodies byte for byte, downstream field values
+(case-insensitive names), downstream bodies byte for byte, TLS handshakes, and the
+persisted credential.
+
+**Named divergences** state the exact delta each side must show. Each predicate names one
+of these:
+
+- a header value per side (`null` for absent);
+- a body edit with an exact match count;
+- a JSON element only one side lists, or a set compared without order, with evidence of
+  nondeterminism;
+- a generated JSON value and its pattern;
+- an extra Go TLS handshake that must equal a reference handshake;
+- a credential field value;
+- for a case the older reference cannot answer, an exact expectation per side.
+
+A predicate whose delta is missing or different fails, and everything a predicate does
+not name is still compared. There are no path or assertion exemptions, and the manifest
+validator refuses them. Kinds: `pending-feature` and `deferred-feature` (owning issue),
+`unowned` (Go commit found, no owner), `unattributed` (states what is not known),
+`documented-difference` (ledger entry), `later-reference` (historical only, Go evidence),
+`nondeterministic` and `harness-boundary`. A pending or unattributed entry grants no
+adoption.
+
+**Raw differences** must fall in a dimension whose check passed. Any other path fails,
+including a TLS change, an extra request or a read error.
+
+**Case universe**: the expected cases come from the current fixtures and the manifest,
+not from the run's summary. Missing, extra or duplicate cases, or a summary whose target,
+tag, commit, role or suite disagrees, fail. A `--case` run is labelled partial (`partial-pass`,
+exit 3) and can never satisfy combined acceptance.
+
+**Provenance**: before each run, `provenance.py` records HEAD, its tree, worktree
+cleanliness, the manifest hash, the driver executable's hash, the Go binary's hash and its
+embedded VCS stamp. After the run it checks that all of them are unchanged, that cargo
+still reports the same driver as fresh, and that the Go stamp names the clean pin. The
+cargo groups do the same for every test executable they run.
+
+**Cargo groups**: `claude-router`, `codex-contract`, `xai`, `meta`, `refusals` and `controls`
+list exact test names. Each test executable is built and hashed, then listed, then run
+directly with `--exact` inside `ui/scripts/isolated.sh` (loopback only, caller uid,
+`CPA_TEST_NO_SKIP=1`). A run passes only if every exit is 0, there is exactly one libtest
+summary line, and it counts every requested test as passed with none failed or ignored.
+A timeout, a signal or a failed listing is unavailable. A nonzero exit is never a pass,
+whatever lines were printed.
+
+**Mutation control** edits the Rust side of real captured cases and requires each edit to
+fail: request and reply bytes, status, credential swaps, tool arguments, the TLS
+ClientHello, persisted `disabled`, drift of a named delta and deltas outside it
+(`MUTATIONS` in `acceptance.py`).
+
+**Combine** requires each of the five receipts exactly once, all passing and none partial.
+They must share one clean source identity equal to the current worktree, with the current
+manifest hash, verified provenance, the pinned Go commits and clean Go stamps, full case
+coverage, every required mutation caught, and every manifest group and test passed.
+
+Committed evidence is usually one commit after the tested source. `acceptance.py
+verify-evidence harness/evidence/receipts/acceptance.json` checks that the tested commit's
+tree matches the receipt and that later commits change only `harness/evidence/`.
 
 ```sh
 python3 harness/acceptance.py evaluate harness/.cache/latest-selective
-python3 harness/acceptance.py cargo --group xai --group meta
+python3 harness/acceptance.py cargo
 python3 harness/manifest.py check
 ```
-
-Committed receipts live in [`evidence/receipts/`](evidence/receipts/).
 
 ## Results and exit codes
 

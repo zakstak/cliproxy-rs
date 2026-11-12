@@ -362,37 +362,156 @@
   ],
   "divergences": [
     {
-      "id": "downstream-header-framing",
-      "kind": "documented-difference",
+      "id": "cors-expose-etag",
+      "kind": "later-reference",
       "targets": [
-        "historical",
-        "selective"
+        "historical"
       ],
       "cases": [
         "*"
       ],
-      "paths": [
-        "/downstream/\\d+/headers(/.*)?",
-        "/downstream/\\d+/raw_response_hex"
-      ],
-      "reason": "Go net/http writes canonical-case field names sorted by name; cliproxy-rs (hyper) writes lowercase names in handler order. RFC 9110 field names are case-insensitive and the order of different field names carries no meaning. The downstream-headers assertion still compares every field value case-insensitively, and downstream-body-bytes compares the body byte for byte, so this names only the raw head and its framing.",
-      "ledger": "docs/DIFFERENCES-FROM-GO.md \"Response header field-name case and order\""
+      "evidence": "Go v8.0.35 (ae3ee3be) internal/api/server_middleware.go:33 adds ETag to Access-Control-Expose-Headers; v8.0.10 (6fecc6e) lacks it, v8.0.67 keeps it.",
+      "reason": "cliproxy-rs follows the v8.0.35 policy reference.",
+      "expect": [
+        {
+          "downstream_header": {
+            "name": "access-control-expose-headers",
+            "go": {
+              "equals": "X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id"
+            },
+            "rust": {
+              "equals": "X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, ETag, X-Request-Id, OpenAI-Request-Id"
+            }
+          }
+        }
+      ]
     },
     {
-      "id": "upstream-generated-request-ids",
+      "id": "claude-responses-compact",
+      "kind": "later-reference",
+      "targets": [
+        "historical"
+      ],
+      "cases": [
+        "compact-claude"
+      ],
+      "evidence": "Go v8.0.35 (ae3ee3be) internal/runtime/executor/helps/antigravity_compaction.go serves /v1/responses/compact for Claude with a cpa-ag-compact-v1 capsule; v8.0.10 answered 501. The selective target compares this case against v8.0.67 in full.",
+      "reason": "v8.0.10 has no behaviour to compare against, so each side must show its own exact expectation: Go the 501 error with no provider traffic, cliproxy-rs one Claude request and a compaction answer of the exact v8.0.35 shape.",
+      "expect": [
+        {
+          "replace": {
+            "covers": [
+              "status",
+              "downstream-body",
+              "upstream",
+              "tls"
+            ],
+            "go": {
+              "status": 501,
+              "body_equals": "{\"error\":{\"message\":\"/responses/compact not supported\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}",
+              "inference_requests": 0,
+              "tls_count": 0
+            },
+            "rust": {
+              "status": 200,
+              "inference_requests": 1,
+              "tls_like": {
+                "case": "buffered",
+                "side": "rust"
+              },
+              "upstream_json": [
+                {
+                  "pointer": "/model",
+                  "equals": "claude-sonnet-4-6"
+                },
+                {
+                  "pointer": "/max_tokens",
+                  "regex": "[0-9]+"
+                }
+              ],
+              "body_json": {
+                "object": "response.compaction",
+                "status": "completed",
+                "id": "re:resp_ag_compact_[0-9]+",
+                "created_at": "re:[0-9]+",
+                "model": "claude-sonnet-4-6",
+                "output": [
+                  {
+                    "type": "compaction",
+                    "status": "completed",
+                    "id": "re:cmp_ag_compact_[0-9]+",
+                    "encrypted_content": "re:cpa-ag-compact-v1:[A-Za-z0-9_-]+"
+                  }
+                ],
+                "usage": {
+                  "input_tokens_details": {
+                    "cached_tokens": 0
+                  },
+                  "output_tokens_details": {
+                    "reasoning_tokens": 0
+                  },
+                  "input_tokens": 13,
+                  "output_tokens": 3,
+                  "total_tokens": 16
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "claude-catalog-v8.0.35",
+      "kind": "later-reference",
+      "targets": [
+        "historical"
+      ],
+      "cases": [
+        "models-openai",
+        "models-anthropic",
+        "models-anthropic-ua"
+      ],
+      "evidence": "claude-haiku-5-5 is in Go v8.0.35 (ae3ee3be) internal/registry/models/models.json and absent at v8.0.10; cliproxy-rs added it with the v8.0.35 port (827445c1).",
+      "reason": "Exactly one extra model on the cliproxy-rs side; every other entry and field is compared.",
+      "expect": [
+        {
+          "downstream_json": {
+            "rust_only": [
+              {
+                "array": "/data",
+                "key": "id",
+                "value": "claude-haiku-5-5"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "go-openai-model-order",
       "kind": "nondeterministic",
       "targets": [
         "historical",
         "selective"
       ],
       "cases": [
-        "*"
+        "models-openai"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers/\\d+/1",
-        "/upstream/http/\\d+/raw_head_hex"
-      ],
-      "reason": "x-client-request-id is minted per request (manifest generated_headers.upstream). Raw header value paths are named here; the upstream-headers assertion compares every other header name, value, case and position exactly unless a narrower divergence names that field."
+      "evidence": "Go internal/registry/model_registry.go buildAvailableModelsLocked ranges over the r.models map, so /v1/models (OpenAI format) has no stable order.",
+      "reason": "Entries are compared as a set keyed by id; each entry's fields are still compared exactly.",
+      "may_be_absent": true,
+      "expect": [
+        {
+          "downstream_json": {
+            "unordered": [
+              {
+                "array": "/data",
+                "key": "id"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "credential-refresh-timestamps",
@@ -405,57 +524,19 @@
         "upstream-401",
         "refresh-expired"
       ],
-      "paths": [
-        "/credential_after/(expired|last_refresh)"
-      ],
       "may_be_absent": true,
-      "reason": "Both proxies persist the scripted token rotation; expiry and last_refresh are wall-clock times of that refresh and can fall in different seconds."
-    },
-    {
-      "id": "cors-expose-etag",
-      "kind": "later-reference",
-      "targets": [
-        "historical"
-      ],
-      "cases": [
-        "*"
-      ],
-      "header_names": [
-        "access-control-expose-headers"
-      ],
-      "evidence": "Go v8.0.35 (ae3ee3be) internal/api/server_middleware.go:33 adds ETag to Access-Control-Expose-Headers; v8.0.10 (6fecc6e) lacks it. v8.0.67 keeps it (no difference on the selective target).",
-      "reason": "cliproxy-rs follows the v8.0.35 policy reference, not the v8.0.10 recording."
-    },
-    {
-      "id": "claude-responses-compact",
-      "kind": "later-reference",
-      "targets": [
-        "historical"
-      ],
-      "cases": [
-        "compact-claude"
-      ],
-      "paths": [
-        "/downstream/\\d+/(status|reason|body_hex|body_text)",
-        "/upstream/(http|tls)(/.*)?"
-      ],
-      "assertions": [
-        "status",
-        "content-type",
-        "upstream-traffic",
-        "request-lines",
-        "upstream-headers",
-        "upstream-body-bytes",
-        "upstream-body-meaning",
-        "downstream-body-bytes",
-        "downstream-meaning"
-      ],
-      "header_names": [
-        "content-length",
-        "content-type"
-      ],
-      "evidence": "Go v8.0.35 (ae3ee3be) internal/runtime/executor/helps/antigravity_compaction.go answers /v1/responses/compact for Claude with a cpa-ag-compact-v1 capsule; v8.0.10 answered 501. v8.0.67 answers 200 the same way (selective target).",
-      "reason": "cliproxy-rs serves Claude Responses compaction as v8.0.35 does; the v8.0.10 recording predates it."
+      "reason": "Both proxies persist the scripted rotation; expired and last_refresh are wall-clock times of that refresh.",
+      "expect": [
+        {
+          "credential_timestamps": {
+            "fields": [
+              "expired",
+              "last_refresh"
+            ],
+            "max_skew_seconds": 5
+          }
+        }
+      ]
     },
     {
       "id": "compaction-capsule-generated",
@@ -466,19 +547,37 @@
       "cases": [
         "compact-claude"
       ],
-      "paths": [
-        "/downstream/\\d+/body_(hex|text)"
-      ],
-      "assertions": [
-        "downstream-body-bytes",
-        "downstream-meaning"
-      ],
-      "reason": "The compaction answer's response and item IDs, created_at and encrypted capsule are minted per request (random nonce)."
+      "reason": "Response and item IDs, created_at and the encrypted capsule are minted per request; each must keep its exact shape.",
+      "expect": [
+        {
+          "downstream_json": {
+            "generated": [
+              {
+                "pointer": "/id",
+                "regex": "resp_ag_compact_[0-9]+"
+              },
+              {
+                "pointer": "/created_at",
+                "regex": "[0-9]+"
+              },
+              {
+                "pointer": "/output/0/id",
+                "regex": "cmp_ag_compact_[0-9]+"
+              },
+              {
+                "pointer": "/output/0/encrypted_content",
+                "regex": "cpa-ag-compact-v1:[A-Za-z0-9_-]+"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "C1-claude-client-profile",
       "kind": "pending-feature",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/69",
+      "evidence": "Go b4e7dbd2 (Claude Code 2.1.321 fingerprint baseline).",
       "targets": [
         "selective"
       ],
@@ -487,23 +586,114 @@
       ],
       "except_cases": [
         "xai-*",
-        "meta-*"
+        "meta-*",
+        "native-signals"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers/\\d+/1",
-        "/upstream/http/\\d+/raw_head_hex",
-        "/upstream/http/\\d+/body_(hex|text)"
+      "reason": "v8.0.67 sends the 2.1.321 tuple; cliproxy-rs keeps 2.1.280 until C1 has wire evidence. Exactly these fields differ; every other header, position and body byte is compared.",
+      "expect": [
+        {
+          "upstream_header": {
+            "name": "user-agent",
+            "go": {
+              "equals": "claude-cli/2.1.321 (external, cli)"
+            },
+            "rust": {
+              "equals": "claude-cli/2.1.280 (external, cli)"
+            }
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-stainless-package-version",
+            "go": {
+              "equals": "0.128.0"
+            },
+            "rust": {
+              "equals": "0.112.1"
+            }
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-stainless-runtime-version",
+            "go": {
+              "equals": "v26.12.1"
+            },
+            "rust": {
+              "equals": "v26.3.0"
+            }
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "anthropic-beta",
+            "relation": {
+              "move_token": "thinking-token-count-2026-05-13",
+              "after": "prompt-caching-scope-2026-01-05",
+              "separator": ","
+            }
+          }
+        },
+        {
+          "upstream_body_edit": {
+            "go": "cc_version=2\\.1\\.321\\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};",
+            "rust": "cc_version=2\\.1\\.280\\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};",
+            "count": "same"
+          }
+        }
+      ]
+    },
+    {
+      "id": "C2-claude-native-detection",
+      "kind": "pending-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/70",
+      "targets": [
+        "selective"
       ],
-      "upstream_header_names": [
-        "user-agent",
-        "x-stainless-package-version",
-        "x-stainless-runtime-version",
-        "anthropic-beta"
+      "cases": [
+        "native-signals"
       ],
-      "upstream_body_patterns": [
-        "cc_version=[0-9.]+\\.[0-9a-f]+; cc_entrypoint=cli; cch=[0-9a-f]+;"
-      ],
-      "reason": "v8.0.67 (b4e7dbd2) sends the Claude Code 2.1.321 tuple: User-Agent, Stainless package 0.128.0 and runtime v26.12.1, a reordered anthropic-beta list and the matching billing-header cc_version/cch. cliproxy-rs keeps 2.1.280 until C1 obtains wire evidence. Only those header fields and the billing-header version fragment are masked; every other upstream byte is compared."
+      "attribution": "Observed v8.0.67 behaviour only. Its wire correctness is unknown until C2 records client provenance; this entry grants no adoption.",
+      "reason": "v8.0.67 cloaks a request with the four strong native signals of a 2.1.280 caller. cliproxy-rs must still send the recorded v8.0.10 native bytes (manifest invariants.upstream_goldens); Go must show the specific cloaked shape.",
+      "expect": [
+        {
+          "replace": {
+            "covers": [
+              "upstream"
+            ],
+            "go": {
+              "inference_requests": 1,
+              "upstream_json": [
+                {
+                  "pointer": "/model",
+                  "equals": "claude-sonnet-4-6"
+                },
+                {
+                  "pointer": "/system/0/text",
+                  "regex": "x-anthropic-billing-header: cc_version=2\\.1\\.321\\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};.*"
+                }
+              ],
+              "upstream_headers": [
+                {
+                  "name": "user-agent",
+                  "value": {
+                    "equals": "claude-cli/2.1.321 (external, cli)"
+                  }
+                },
+                {
+                  "name": "x-claude-code-session-id",
+                  "value": {
+                    "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                  }
+                }
+              ]
+            },
+            "rust": {
+              "inference_requests": 1
+            }
+          }
+        }
+      ]
     },
     {
       "id": "K1-claude-catalog",
@@ -517,22 +707,26 @@
         "models-anthropic",
         "models-anthropic-ua"
       ],
-      "paths": [
-        "/downstream/\\d+/body_(hex|text)"
-      ],
-      "assertions": [
-        "downstream-body-bytes",
-        "downstream-meaning"
-      ],
-      "header_names": [
-        "content-length"
-      ],
-      "reason": "v8.0.67 lists claude-fable-5-2; cliproxy-rs's embedded catalog does not yet."
+      "reason": "v8.0.67 lists claude-fable-5-2; every other entry and field is compared.",
+      "expect": [
+        {
+          "downstream_json": {
+            "go_only": [
+              {
+                "array": "/data",
+                "key": "id",
+                "value": "claude-fable-5-2"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "claude-cloak-tool-alias",
-      "kind": "unclassified",
+      "kind": "unowned",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "evidence": "Go e48d780f derives the Claude OAuth MCP alias secret from session.CallerScope(api key) instead of the raw key (claude_executor_request.go resolveClaudeMCPAliasOptions). No tracker issue owns it.",
       "targets": [
         "selective"
       ],
@@ -541,26 +735,45 @@
         "tool-roundtrip",
         "tool-stream-roundtrip"
       ],
-      "paths": [
-        "/downstream/\\d+/body_(hex|text)"
-      ],
-      "upstream_body_patterns": [
-        "mcp__[a-z]+_[a-z]+__[a-z]+_fixture_lookup"
-      ],
-      "assertions": [
-        "upstream-body-meaning",
-        "downstream-body-bytes",
-        "downstream-meaning"
-      ],
-      "header_names": [
-        "content-length"
-      ],
-      "reason": "v8.0.67 derives a different cloak alias for the same client key and tool (mcp__drive_trade__cycle_fixture_lookup instead of v8.0.10's mcp__poem_real__leisure_fixture_lookup), in the upstream tools, tool_choice and history. The scripted reply carries the v8.0.10 alias, so only cliproxy-rs restores the caller's name. The Go commit and the owning issue are not yet identified."
+      "reason": "Only the alias spelling differs upstream: Go sends mcp__drive_trade__cycle_fixture_lookup where cliproxy-rs sends v8.0.10's mcp__poem_real__leisure_fixture_lookup, the same number of times.",
+      "expect": [
+        {
+          "upstream_body_edit": {
+            "go": "mcp__drive_trade__cycle_fixture_lookup",
+            "rust": "mcp__poem_real__leisure_fixture_lookup",
+            "count": "same"
+          }
+        }
+      ]
     },
     {
-      "id": "claude-tls-connection-reuse",
-      "kind": "unclassified",
+      "id": "claude-cloak-tool-alias-restore",
+      "kind": "unowned",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "evidence": "Same Go e48d780f change: the scripted reply carries the v8.0.10 alias, which v8.0.67 no longer maps back.",
+      "targets": [
+        "selective"
+      ],
+      "cases": [
+        "tool-roundtrip",
+        "tool-stream-roundtrip"
+      ],
+      "reason": "Go returns the scripted alias name unchanged; cliproxy-rs restores the caller's fixture_lookup. Tool arguments and every other byte are compared.",
+      "expect": [
+        {
+          "downstream_body_edit": {
+            "go": "\"name\":\"mcp__poem_real__leisure_fixture_lookup\"",
+            "rust": "\"name\":\"fixture_lookup\"",
+            "count": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "P2-claude-connection-reuse",
+      "kind": "deferred-feature",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/107",
+      "evidence": "Go 2c5b01f4 disables default Claude upstream connection reuse (referenced by #107).",
       "targets": [
         "selective"
       ],
@@ -568,27 +781,42 @@
         "continuity-two-turns",
         "upstream-401"
       ],
-      "paths": [
-        "/upstream/tls/length",
-        "/upstream/tls/\\d+(/.*)?"
-      ],
-      "reason": "v8.0.67 opens a new TLS connection for a later request on the same credential where v8.0.10 and cliproxy-rs reuse the kept-alive one. The ClientHello profile of every handshake both sides make is identical. Candidate owner: P2 per-account connection pools (#107, deferred)."
+      "reason": "Go makes exactly one more TLS handshake, a session resumption identical to the one cliproxy-rs makes when the upstream closes the connection; every handshake both sides make is compared.",
+      "expect": [
+        {
+          "tls_extra_go_handshakes": {
+            "count": 1,
+            "reference": {
+              "case": "tls-reconnect-two-turns",
+              "side": "rust",
+              "index": 1
+            }
+          }
+        }
+      ]
     },
     {
       "id": "credential-disabled-persist",
-      "kind": "unclassified",
+      "kind": "unattributed",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "attribution": "No Go commit located between v8.0.35 and v8.0.67; owner unassigned.",
       "targets": [
         "selective"
       ],
       "cases": [
         "client-disconnect"
       ],
-      "paths": [
-        "/credential_after/disabled"
-      ],
       "may_be_absent": true,
-      "reason": "After the client abandons the stream, v8.0.10 and cliproxy-rs persist the credential with disabled: false; v8.0.67 leaves the file as written. Unknown fields survive on both."
+      "reason": "After an abandoned stream, cliproxy-rs and v8.0.10 persist disabled: false; v8.0.67 leaves the field absent. disabled: true or any other field change fails.",
+      "expect": [
+        {
+          "credential_field": {
+            "field": "disabled",
+            "go": "<absent>",
+            "rust": false
+          }
+        }
+      ]
     },
     {
       "id": "plain-upstream-host-label",
@@ -600,14 +828,20 @@
         "xai-*",
         "meta-*"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers/\\d+/1",
-        "/upstream/http/\\d+/raw_head_hex"
-      ],
-      "upstream_header_names": [
-        "host"
-      ],
-      "reason": "Each proxy's configured base URL names its own loopback address (127.0.0.2 for Go, 127.0.0.3 for Rust) so captures stay labelled; Host differs by construction."
+      "reason": "Each proxy's base URL names its own loopback address so captures stay labelled.",
+      "expect": [
+        {
+          "upstream_header": {
+            "name": "host",
+            "go": {
+              "equals": "127.0.0.2:8080"
+            },
+            "rust": {
+              "equals": "127.0.0.3:8080"
+            }
+          }
+        }
+      ]
     },
     {
       "id": "X5-grok-user-agent",
@@ -619,14 +853,20 @@
       "cases": [
         "xai-*"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers/\\d+/1",
-        "/upstream/http/\\d+/raw_head_hex"
-      ],
-      "upstream_header_names": [
-        "user-agent"
-      ],
-      "reason": "v8.0.67 sends User-Agent xai-grok-workspace/1.0.46 on the API-key path; cliproxy-rs sends Go-http-client/1.1 as v8.0.35 did. X5 is a follow-up outside the approved core batch."
+      "reason": "v8.0.67 sends xai-grok-workspace/1.0.46 on the API-key path; cliproxy-rs sends Go-http-client/1.1 as v8.0.35 did. X5 is a follow-up outside the core batch.",
+      "expect": [
+        {
+          "upstream_header": {
+            "name": "user-agent",
+            "go": {
+              "equals": "xai-grok-workspace/1.0.46"
+            },
+            "rust": {
+              "equals": "Go-http-client/1.1"
+            }
+          }
+        }
+      ]
     },
     {
       "id": "M1-muse-identity-headers",
@@ -638,66 +878,99 @@
       "cases": [
         "meta-*"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers(/.*)?",
-        "/upstream/http/\\d+/raw_head_hex"
-      ],
-      "upstream_header_names": [
-        "user-agent",
-        "x-client-id",
-        "x-meta-ai-gateway-session-id",
-        "x-tbh-agent-role",
-        "x-tbh-root-session-id",
-        "x-tbh-session-id",
-        "x-tbh-thread-id"
-      ],
-      "reason": "v8.0.67 sends the muse-build/1.4.14 non-interactive identity, X-Client-Id tbh:exec and gateway, root, session, thread and agent-role headers; cliproxy-rs sends muse-build/1.3.0 interactive and tbh:tui. Request bodies are byte-identical."
+      "reason": "v8.0.67 sends the muse-build 1.4.14 non-interactive identity and session headers; request bodies stay byte-identical.",
+      "expect": [
+        {
+          "upstream_header": {
+            "name": "user-agent",
+            "go": {
+              "equals": "muse-build/1.4.14 (non-interactive; linux-x86_64; build dec7d7497fecdad135ec5835a8161dbc92e55b58)"
+            },
+            "rust": {
+              "equals": "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)"
+            }
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-client-id",
+            "go": {
+              "equals": "tbh:exec"
+            },
+            "rust": {
+              "equals": "tbh:tui"
+            }
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-meta-ai-gateway-session-id",
+            "go": {
+              "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            },
+            "rust": null
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-tbh-agent-role",
+            "go": {
+              "equals": "main"
+            },
+            "rust": null
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-tbh-root-session-id",
+            "go": {
+              "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            },
+            "rust": null
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-tbh-session-id",
+            "go": {
+              "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            },
+            "rust": null
+          }
+        },
+        {
+          "upstream_header": {
+            "name": "x-tbh-thread-id",
+            "go": {
+              "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            },
+            "rust": null
+          }
+        }
+      ]
     },
     {
-      "id": "claude-catalog-v8.0.35",
-      "kind": "later-reference",
-      "targets": [
-        "historical"
-      ],
-      "cases": [
-        "models-openai",
-        "models-anthropic",
-        "models-anthropic-ua"
-      ],
-      "paths": [
-        "/downstream/\\d+/body_(hex|text)"
-      ],
-      "assertions": [
-        "downstream-body-bytes",
-        "downstream-meaning"
-      ],
-      "header_names": [
-        "content-length"
-      ],
-      "evidence": "claude-haiku-5-5 is in Go v8.0.35 (ae3ee3be) internal/registry/models/models.json and absent at v8.0.10 (6fecc6e); cliproxy-rs added it with the v8.0.35 port (827445c1).",
-      "reason": "cliproxy-rs's embedded catalog follows the v8.0.35 policy reference."
-    },
-    {
-      "id": "C2-claude-native-detection",
+      "id": "T2-messages-max-output-tokens",
       "kind": "pending-feature",
-      "issue": "https://github.com/zakstak/cliproxy-rs/issues/70",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/80",
+      "evidence": "Go 01b24f1f forwards max_output_tokens across request translators (referenced by #80).",
       "targets": [
         "selective"
       ],
       "cases": [
-        "native-signals"
+        "xai-messages-stream",
+        "meta-messages-stream"
       ],
-      "paths": [
-        "/upstream/http/\\d+/headers(/.*)?",
-        "/upstream/http/\\d+/raw_head_hex",
-        "/upstream/http/\\d+/body_(hex|text)"
-      ],
-      "assertions": [
-        "upstream-headers",
-        "upstream-body-bytes",
-        "upstream-body-meaning"
-      ],
-      "reason": "With the four strong native signals of a claude-cli/2.1.280 caller, v8.0.67 cloaks the request (its own session ID, Stainless platform and a 1203-byte cloaked body) where v8.0.10 and cliproxy-rs pass the native body through (504 bytes, the caller's session ID). C2 decides native detection from recorded client provenance, not this Go result."
+      "reason": "For a Claude Messages client on a Responses upstream, v8.0.67 adds max_output_tokens from max_tokens once; nothing else in the body differs.",
+      "expect": [
+        {
+          "upstream_body_edit": {
+            "go": ",\"max_output_tokens\":17",
+            "rust": null,
+            "count": 1
+          }
+        }
+      ]
     },
     {
       "id": "I4-cors-allow-headers",
@@ -709,66 +982,73 @@
       "cases": [
         "*"
       ],
-      "header_names": [
-        "access-control-allow-headers"
-      ],
-      "reason": "v8.0.67 lists Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version and Anthropic-Beta instead of * on every response; cliproxy-rs sends *."
+      "reason": "v8.0.67 lists the allowed request headers instead of *.",
+      "expect": [
+        {
+          "downstream_header": {
+            "name": "access-control-allow-headers",
+            "go": {
+              "equals": "Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version, Anthropic-Beta"
+            },
+            "rust": {
+              "equals": "*"
+            }
+          }
+        }
+      ]
     },
     {
       "id": "P1-response-compression-vary",
       "kind": "deferred-feature",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/106",
+      "evidence": "Go internal/api/response_compression.go merges Vary: Accept-Encoding into every response.",
       "targets": [
         "selective"
       ],
       "cases": [
         "*"
       ],
-      "header_names": [
-        "vary"
-      ],
-      "reason": "v8.0.67's response compression middleware (internal/api/response_compression.go) adds Vary: Accept-Encoding to every response; P1 is deferred."
-    },
-    {
-      "id": "messages-max-tokens-to-responses",
-      "kind": "unclassified",
-      "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
-      "targets": [
-        "selective"
-      ],
-      "cases": [
-        "xai-messages-stream",
-        "meta-messages-stream"
-      ],
-      "paths": [
-        "/upstream/http/\\d+/body_(hex|text)",
-        "/upstream/http/\\d+/headers/\\d+/1",
-        "/upstream/http/\\d+/raw_head_hex"
-      ],
-      "upstream_body_patterns": [
-        ",\\\"max_output_tokens\\\":17"
-      ],
-      "upstream_header_names": [
-        "content-length"
-      ],
-      "reason": "For a Claude Messages client on a Responses upstream (Grok, Muse), v8.0.67 maps max_tokens to max_output_tokens; cliproxy-rs drops it as v8.0.35 does. Provider documentation decides the target; no owning issue yet (candidate T2 #80)."
+      "reason": "P1 is deferred.",
+      "expect": [
+        {
+          "downstream_header": {
+            "name": "vary",
+            "go": {
+              "equals": "Accept-Encoding"
+            },
+            "rust": null
+          }
+        }
+      ]
     },
     {
       "id": "error-retry-after",
-      "kind": "unclassified",
+      "kind": "unattributed",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
+      "attribution": "Code path located: Go sdk/api/handlers/handlers_errors.go:127-138 writes a trusted retry deadline as Retry-After. Commit not bisected; candidates cb70eacf and e458999b (referenced by R1 #94) and 9a35fa12 and b5e6027c (referenced by N1 #111). Owner unassigned.",
       "targets": [
         "selective"
       ],
       "cases": [
         "stream-bootstrap-error",
-        "upstream-4*",
-        "upstream-5*"
+        "upstream-400",
+        "upstream-401",
+        "upstream-429",
+        "upstream-500",
+        "upstream-503"
       ],
-      "header_names": [
-        "retry-after"
-      ],
-      "reason": "On a failed upstream attempt (400, 401, 429, 500, 503 and a rejected stream start) v8.0.67 adds its own Retry-After: 31 to the client response; the scripted upstream sent Retry-After: 7, and v8.0.10 and cliproxy-rs send none. Candidate owners: R1 (#94) and R2 (#95)."
+      "reason": "v8.0.67 adds its own whole-second Retry-After (a local retry deadline) to a failed attempt; cliproxy-rs sends none, as v8.0.10 did.",
+      "expect": [
+        {
+          "downstream_header": {
+            "name": "retry-after",
+            "go": {
+              "regex": "[0-9]{1,2}"
+            },
+            "rust": null
+          }
+        }
+      ]
     },
     {
       "id": "I3-unauthenticated-connection-close",
@@ -782,20 +1062,62 @@
         "auth-wrong",
         "auth-query-first"
       ],
-      "header_names": [
-        "connection"
-      ],
-      "reason": "v8.0.67 answers an unauthenticated request with Connection: close; v8.0.10 and cliproxy-rs keep the connection open."
+      "reason": "v8.0.67 closes the connection after an unauthenticated rejection.",
+      "expect": [
+        {
+          "downstream_header": {
+            "name": "connection",
+            "go": {
+              "equals": "close"
+            },
+            "rust": null
+          }
+        }
+      ]
     }
   ],
   "generated_headers": {
-    "upstream": [
-      "x-client-request-id"
+    "upstream": {
+      "x-client-request-id": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    },
+    "downstream": {
+      "date": "(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT",
+      "x-cpa-trace-id": "[0-9]{14}-[0-9a-f]{16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    }
+  },
+  "skips": [],
+  "invariants": {
+    "about": "Checked on every case and target, whatever divergence applies. Credential ownership and isolation and capture consistency apply to both sides; these native-byte rules apply to cliproxy-rs.",
+    "native_passthrough": [
+      "count-tokens"
     ],
-    "downstream": [
-      "date",
-      "x-cpa-trace-id"
+    "upstream_goldens": [
+      {
+        "case": "native-signals",
+        "file": "harness/expectations/native-signals.upstream.json",
+        "masked_headers": [
+          "x-client-request-id"
+        ]
+      }
     ]
   },
-  "skips": []
+  "rules": [
+    {
+      "id": "downstream-header-framing",
+      "ledger": "docs/DIFFERENCES-FROM-GO.md \"Response header field-name case and order\"",
+      "rule": "Downstream header fields are compared as case-insensitive names with ordered values; raw head bytes only need to agree with those parsed fields on each side."
+    },
+    {
+      "id": "chunk-boundaries",
+      "rule": "Chunked downstream framing may split differently; each side's wire must decode to its own body, and bodies are compared byte for byte."
+    },
+    {
+      "id": "content-length",
+      "rule": "A Content-Length may differ only when each side's value equals its own body length and the bodies' difference is itself explained."
+    },
+    {
+      "id": "generated-values",
+      "rule": "generated_headers values are masked only after matching their pattern on both sides."
+    }
+  ]
 }

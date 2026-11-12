@@ -46,10 +46,22 @@ binary=$cache/go-${go_commit:0:8}
 [[ -z $(git -C "$reference" status --porcelain) ]] || {
     echo "Building the Go reference modified $reference" >&2; exit 2;
 }
-CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6} cargo build --locked --manifest-path harness/rust/Cargo.toml
 python3 -m unittest discover -s harness -p 'test_*.py'
+stamp=$(date +%Y%m%d-%H%M%S)
+output=$cache/run-$target-$stamp
+pre=$cache/provenance-$target-$stamp.json
+# Builds the driver and records source, manifest and binary identity before the run.
+driver=$(CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6} python3 harness/provenance.py pre --target "$target" \
+    --go-binary "$binary" --go-reference "$reference" --out "$pre") || exit 2
 # No fallback: if namespaces/mounts fail, no proxy is started. Never touch host
 # /etc/hosts or its trust store. --kill-child reaps everything if interrupted.
-exec unshare --user --map-root-user --net --mount --pid --fork --kill-child \
+set +e
+unshare --user --map-root-user --net --mount --pid --fork --kill-child \
     bash -c 'set -euo pipefail; mount --make-rprivate /; ip link set lo up; exec python3 "$1/harness/differential.py" "$1" "${@:2}"' \
-    harness "$root" --target "$target" --go-binary "$binary" "${args[@]}"
+    harness "$root" --target "$target" --go-binary "$binary" --driver "$driver" --output "$output" "${args[@]}"
+code=$?
+set -e
+[[ -f $output/summary.json ]] || { echo "collector wrote no summary (exit $code)" >&2; exit 2; }
+# Confirms the same source, manifest and binaries are still current and fresh.
+python3 harness/provenance.py post --pre "$pre" --run "$output" || exit 2
+exit "$code"

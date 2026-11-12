@@ -363,7 +363,7 @@ def wait_ready(process, port, registration_log=None):
     raise TimeoutError("proxy did not become ready")
 
 
-def run_case(root, output, recorder, case, go_binary):
+def run_case(root, output, recorder, case, go_binary, driver):
     directory = output / case["name"]
     directory.mkdir()
     write_json(directory / "fixture.json", case)
@@ -400,8 +400,7 @@ def run_case(root, output, recorder, case, go_binary):
             if side == "go":
                 command = [str(go_binary), "-config", str(config), "-local-model"]
             else:
-                command = [str(root / "harness/rust/target/debug/cpa-differential-driver"),
-                           str(config), str(output / "certs/ca.pem")]
+                command = [str(driver), str(config), str(output / "certs/ca.pem")]
             log = (working / "process.log").open("wb")
             handles.append(log)
             process = subprocess.Popen(command, cwd=working, env=env, stdout=log, stderr=log)
@@ -497,6 +496,8 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("--target", required=True, help="executed Go target in harness/manifest.json")
     parser.add_argument("--go-binary", type=Path, required=True)
+    parser.add_argument("--driver", type=Path, required=True, help="the driver executable provenance hashed")
+    parser.add_argument("--output", type=Path, required=True, help="new run directory")
     parser.add_argument("--case", action="append", help="run only named fixture(s)")
     parser.add_argument("--strict", action="store_true", help="exit 1 if any difference remains")
     args = parser.parse_args()
@@ -506,7 +507,7 @@ def main():
     target = pins["go"]["targets"][args.target]
     if not target["executed"]:
         raise ValueError(f"{args.target} is not an executed Go target")
-    output = root / "harness/.cache" / (f"run-{args.target}-" + time.strftime("%Y%m%d-%H%M%S"))
+    output = args.output.resolve()
     output.mkdir()
     os.umask(0o077)
     certs = output / "certs"
@@ -525,7 +526,7 @@ def main():
         for server in (tls, plain):
             threading.Thread(target=server.serve_forever, daemon=True).start()
         for case in selected:
-            result = run_case(root, output, recorder, case, args.go_binary)
+            result = run_case(root, output, recorder, case, args.go_binary.resolve(), args.driver.resolve())
             results.append(result)
             print(f"{result['name']}: Go {result['go_status']} Rust {result['rust_status']}; "
                   f"{result['differences']} differing fields", flush=True)
@@ -536,6 +537,9 @@ def main():
                "role": target["role"], "suite": target["suite"],
                "suite_cases": [case["name"] for case in suite(target["suite"])],
                "selected": [case["name"] for case in selected], "cases": results,
+               "partial": bool(args.case),
+               "executed": {"go_binary": os.path.relpath(args.go_binary.resolve(), root),
+                            "driver": os.path.relpath(args.driver.resolve(), root)},
                "toolchain": toolchain(),
                "rust_worktree_clean": not subprocess.check_output(
                    ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"]).strip(),
