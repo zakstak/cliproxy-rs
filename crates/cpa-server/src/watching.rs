@@ -15,14 +15,13 @@
 //! made by another machine on a network or FUSE file system raise no event and are seen
 //! with the next local change.
 use cpa_core::gostr::GoStr;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use cpa_core::config::{Config, credentials};
-use cpa_core::credential::{Credential, Source};
 use sha2::{Digest, Sha256};
 
 use crate::fs_events::{Events, Targets};
@@ -68,9 +67,11 @@ impl Stat {
     }
 }
 
-/// Hashes by path, reused while a file's metadata is unchanged and not racy.
+/// Hashes by path, reused while a file's metadata is unchanged and not racy. Metadata
+/// that is `None` was forgotten: the file is read again, and its last hash stays known
+/// for when it cannot be.
 #[derive(Default)]
-struct HashCache(BTreeMap<PathBuf, (Stat, Hash)>);
+struct HashCache(BTreeMap<PathBuf, (Option<Stat>, Hash)>);
 
 impl HashCache {
     /// The content hash of `path`, or `None` when it cannot be read.
@@ -79,7 +80,7 @@ impl HashCache {
         let racy = meta
             .modified()
             .map_or(true, |m| now.duration_since(m).map_or(true, |age| age < RACY));
-        if let Some((cached, hash)) = self.0.get(path)
+        if let Some((Some(cached), hash)) = self.0.get(path)
             && *cached == stat
             && !racy
         {
@@ -87,8 +88,20 @@ impl HashCache {
         }
         let data = std::fs::read(path).ok()?;
         let hash: Hash = Sha256::digest(&data).into();
-        self.0.insert(path.to_owned(), (stat, hash));
+        self.0.insert(path.to_owned(), (Some(stat), hash));
         Some(hash)
+    }
+
+    /// The hash last read from `path`, whatever its metadata says now.
+    fn last(&self, path: &Path) -> Option<Hash> {
+        self.0.get(path).map(|(_, hash)| *hash)
+    }
+
+    /// Reads every file again on its next look, keeping the hashes last read.
+    fn forget_metadata(&mut self) {
+        for (stat, _) in self.0.values_mut() {
+            *stat = None;
+        }
     }
 }
 
@@ -107,17 +120,46 @@ fn observe(state: &Management, cache: &mut HashCache) -> Snapshot {
     seen.push(state.path.clone());
     let mut auth = BTreeMap::new();
     let dir = state.rt.config().auth_dir.clone();
-    // An unreadable auth dir is an empty set, as in reload.
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
-        if !meta.is_file() || !is_auth_json(&path) {
-            continue;
+    // The scan's classification (`credentials::read_auth_file`): an entry that is gone
+    // or not a regular file is absent; one that cannot be read for now is present with
+    // the hash last read from it (zeros when never read), so losing access is no change
+    // and nothing reloads, while deleting it is a removal the watcher sees.
+    let mut listed = true;
+    match std::fs::read_dir(&dir) {
+        // A missing folder holds no files.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => listed = false,
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    listed = false;
+                    break;
+                };
+                let path = entry.path();
+                if !is_auth_json(&path) {
+                    continue;
+                }
+                let hash = match std::fs::metadata(&path) {
+                    Ok(meta) if !meta.is_file() => continue,
+                    Ok(meta) => cache.hash(&path, &meta, now).or_else(|| cache.last(&path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => cache.last(&path),
+                };
+                seen.push(path.clone());
+                auth.insert(path, hash.unwrap_or_default());
+            }
         }
-        // An unreadable file is present but unknown; reload skips it.
-        let hash = cache.hash(&path, &meta, now).unwrap_or_default();
-        seen.push(path.clone());
-        auth.insert(path, hash);
+    }
+    // A folder that exists but cannot be listed (in full) still holds the files last
+    // seen in it, as last seen: unknown, not removed.
+    if !listed {
+        for (path, (_, hash)) in &cache.0 {
+            // The config file can live in the auth folder too.
+            if path.parent() == Some(dir.as_path()) && is_auth_json(path) && !auth.contains_key(path) {
+                seen.push(path.clone());
+                auth.insert(path.clone(), *hash);
+            }
+        }
     }
     cache.0.retain(|path, _| seen.contains(path));
     Snapshot { config, auth }
@@ -309,11 +351,12 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
 /// landing in between is reloaded when it is next observed (Go records the parsed
 /// config's `SourceHash` and forgets the hash of an incomplete auth read). When the two
 /// differ, cached hashes may be the stale ones (a same-size write with the same
-/// modification time, or a lasting read denial), so the next observation reads afresh.
+/// modification time), so the next observation reads afresh. The hashes last read stay
+/// known for the files it then cannot read.
 fn record(cache: &mut HashCache, observed: Snapshot, read: Option<Snapshot>) -> Snapshot {
     let read = read.unwrap_or_else(|| observed.clone());
     if read != observed {
-        *cache = HashCache::default();
+        cache.forget_metadata();
     }
     read
 }
@@ -463,13 +506,13 @@ fn reload_config(
         }
     };
     state.lock_auth_dir(&mut config);
-    let mut scan = credentials::scan_auth_dir(&config);
-    keep_incomplete(state, &mut scan.credentials, &scan.incomplete);
+    let scan = credentials::scan_auth_dir(&config);
     read.auth = scan.read.clone();
-    // A file neither could read stays as observed; recording it as missing would
-    // reload it on every tick.
+    // A file the scan could not read, or did not list in a folder it could not list,
+    // stays as observed; recording it as missing would reload it on every tick.
+    let unsettled = scan.unsettled();
     for (path, hash) in &observed.auth {
-        if *hash == Hash::default() {
+        if unsettled.contains(path) {
             read.auth.entry(path.clone()).or_insert(*hash);
         }
     }
@@ -482,25 +525,10 @@ fn reload_config(
     (result, read)
 }
 
-/// An empty or half-written file is not a deletion (Go 7484a521): keep the
-/// last good credentials of the files the scan found incomplete. Deciding from the scan's
-/// own read, never a second one, means a file completed after the scan is picked up by
-/// the reload its write triggers instead of being dropped now. Removal and valid JSON
-/// without a credential are reconciled normally.
-fn keep_incomplete(state: &Management, files: &mut Vec<Credential>, incomplete: &HashSet<PathBuf>) {
-    for existing in state.rt.store().snapshot() {
-        if let Source::File(path) = &existing.source
-            && incomplete.contains(path)
-            && !files.iter().any(|c| c.id == existing.id)
-        {
-            files.push(Credential::clone(&existing));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cpa_core::credential::Source;
 
     fn state() -> (Arc<Management>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("cpa-watch-outcome-{}", uuid::Uuid::new_v4()));
@@ -725,7 +753,7 @@ mod tests {
             .unwrap();
         // Not racy, and cached for an earlier same-size write with the same metadata.
         let meta = std::fs::metadata(&file).unwrap();
-        cache.0.insert(file.clone(), (Stat::of(&meta), [7; 32]));
+        cache.0.insert(file.clone(), (Some(Stat::of(&meta)), [7; 32]));
         let observed = observe(&state, &mut cache);
         assert_eq!(observed.auth[&file], [7; 32]);
         let applied = step(&state, &mut cache, false, &observed);
@@ -743,7 +771,9 @@ mod tests {
 
     /// Go 7484a521: an empty or partial in-place write keeps the credential; valid
     /// JSON without one, or a removed file, deletes it (also the empty, partial and
-    /// valid-but-empty files of Go `TestFileSynthesizerRecordsIncompleteFiles`).
+    /// valid-but-empty files of Go `TestFileSynthesizerRecordsIncompleteFiles`). A file
+    /// that is readable and refused (a removed provider, #49, or retired metadata) is
+    /// not kept either: only a file whose contents are unknown keeps its credential.
     #[tokio::test]
     async fn incomplete_auth_writes_keep_the_credential_until_the_file_is_valid_json() {
         let (state, dir) = state();
@@ -758,6 +788,8 @@ mod tests {
             (" \n", true),
             ("null", false),
             ("{}", false),
+            (r#"{"type":"gemini","email":"a@example.com"}"#, false),
+            (r#"{"type":"codex","email":"a@example.com","quota_probe":null}"#, false),
         ] {
             std::fs::write(&file, r#"{"type":"codex","email":"a@example.com"}"#).unwrap();
             reload(&state).unwrap();
@@ -825,13 +857,15 @@ mod tests {
         let good = r#"{"type":"codex","email":"a@example.com"}"#;
         std::fs::write(&file, good).unwrap();
         reload(&state).unwrap();
+        let before = state.rt.store().get("a.json").unwrap();
         std::fs::write(&file, r#"{"type":"codex""#).unwrap();
-        let scan = credentials::scan_auth_dir(&state.rt.config());
-        let mut files = scan.credentials;
-        assert!(scan.incomplete.contains(&file) && files.is_empty());
+        let config = (*state.rt.config()).clone();
+        let scan = credentials::scan_auth_dir(&config);
+        assert!(scan.incomplete.contains(&file) && scan.credentials.is_empty());
         std::fs::write(&file, good).unwrap();
-        keep_incomplete(&state, &mut files, &scan.incomplete);
-        assert_eq!(files.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["a.json"]);
+        state.publish(config, Some(scan));
+        let kept = state.rt.store().get("a.json").expect("kept");
+        assert_eq!(kept.revision, before.revision);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -939,21 +973,347 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A file that cannot be read (here a symlink loop, for every user) drops its
-    /// credential, as Go's full scan does; only a read that succeeded can mark a file
-    /// incomplete. The watcher does not observe such an entry, so keeping it would
-    /// leave the credential live after the entry is deleted.
+    /// #89 (Go v8.0.67 5fe203d5): an entry that cannot be read (here a symlink loop,
+    /// unreadable for every user, root included) is present but unknown, not deleted:
+    /// its credential stays, with its revision. The watcher observes the entry with the
+    /// hash last read from it, so losing access is no change, and deleting the entry is
+    /// a removal it sees and applies. This replaces the earlier policy that dropped it.
     #[tokio::test]
-    async fn an_unreadable_file_drops_its_credential() {
+    async fn an_unreadable_file_keeps_its_credential_until_it_is_deleted() {
         let (state, dir) = state();
+        let mut cache = HashCache::default();
         let file = dir.join("a.json");
         std::fs::write(&file, r#"{"type":"codex","email":"a@example.com"}"#).unwrap();
+        let observed = observe(&state, &mut cache);
+        let applied = step(&state, &mut cache, false, &observed);
+        let before = state.rt.store().get("a.json").expect("loaded");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&file, &file).unwrap();
+        assert!(matches!(
+            credentials::read_auth_file(&file),
+            credentials::AuthFile::Unreadable(_)
+        ));
+        let observed = observe(&state, &mut cache);
+        assert!(observed == applied, "losing access is no change");
+        // A reload for another reason (a config edit, a management save) rescans.
+        let applied = step(&state, &mut cache, true, &observed);
+        let kept = state.rt.store().get("a.json").expect("kept while unreadable");
+        assert_eq!(kept.revision, before.revision);
+        assert!(observe(&state, &mut cache) == applied, "converges");
+        std::fs::remove_file(&file).unwrap();
+        let observed = observe(&state, &mut cache);
+        assert!(!observed.auth.contains_key(&file), "the deletion is seen");
+        step(&state, &mut cache, false, &observed);
+        assert!(state.rt.store().get("a.json").is_none(), "deleted");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A [`state`] whose auth-dir is a folder of its own, `auth`, so that taking its
+    /// permissions leaves the config readable; relative to the working directory when
+    /// `relative`. Returns the auth folder as configured.
+    fn state_with_auth_folder(relative: bool) -> (Arc<Management>, PathBuf, PathBuf) {
+        let (state, dir) = state();
+        let auth = if relative {
+            PathBuf::from(format!("cpa-watch-relative-{}", uuid::Uuid::new_v4()))
+        } else {
+            dir.join("auth")
+        };
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(&state.path, format!("oauth: {{auth-dir: {}}}\n", auth.display())).unwrap();
+        reload(&state).unwrap();
+        assert_eq!(state.rt.config().auth_dir, auth);
+        (state, dir, auth)
+    }
+
+    /// Sets `path`'s permission bits.
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Whether `path`'s permissions deny this process: root, also uid 0 in a user
+    /// namespace, reads through any mode. Run these tests as the caller's own uid
+    /// (`ui/scripts/isolated.sh` keeps it inside a network namespace, as CI's `setpriv`
+    /// does); where permissions are not enforced the test says so and checks nothing.
+    fn denied(path: &Path) -> bool {
+        let denied = if path.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        };
+        if !denied {
+            eprintln!("permissions are not enforced for this process (root?); skipping");
+        }
+        denied
+    }
+
+    /// #89 (Go v8.0.67 5fe203d5): an auth file that loses read permission keeps its
+    /// credential as it was: revision, a model's 429 cooldown and a 401 block all stay,
+    /// through the watcher and through a full rescan. Access restored with the same
+    /// bytes changes nothing; a re-login written in its place is applied, clearing the
+    /// 401; deleting the unreadable file deletes the credential.
+    #[tokio::test]
+    async fn an_auth_file_without_read_permission_keeps_its_credential_and_state() {
+        use crate::runtime::{Outcome, Selection};
+        use cpa_core::exec::{ExecError, FailureScope};
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let file = auth.join("claude-a.json");
+        let doc = |token: &str| {
+            serde_json::json!({"type": "claude", "access_token": token, "refresh_token": "fake-rt", "email": "a@example.invalid"})
+                .to_string()
+        };
+        std::fs::write(&file, doc("sk-ant-oat-old-fake")).unwrap();
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        step(&state, &mut cache, false, &observed);
+        let store = state.rt.store();
+        let select = |model: &str| store.select(Selection::new("claude", model));
+        let mut quota = ExecError::local(429, FailureScope::Model, "rate limited");
+        quota.retry_after = Some(Duration::from_secs(3600));
+        select("q").unwrap().complete(Outcome::Failure(quota));
+        let unauthorized = ExecError::local(
+            401,
+            FailureScope::Credential,
+            "authentication_error: OAuth access token",
+        );
+        select("m").unwrap().complete(Outcome::Failure(unauthorized));
+        // The 401 saves the credential's status to its file; the watcher reloads that.
+        let observed = observe(&state, &mut cache);
+        let applied = step(&state, &mut cache, false, &observed);
+        let before = store.get("claude-a.json").unwrap();
+        let cooldowns = || {
+            let all = store.cooldowns("claude-a.json");
+            all.iter().map(|c| (c.model.clone(), c.status)).collect::<Vec<_>>()
+        };
+        assert_eq!(cooldowns(), [("m".to_owned(), 401), ("q".to_owned(), 429)]);
+        let kept = |why: &str| {
+            let now = store.get("claude-a.json").unwrap_or_else(|| panic!("{why}: dropped"));
+            assert_eq!(now.revision, before.revision, "{why}");
+            assert!(select("m").is_none(), "{why}: the 401 block stays");
+            assert_eq!(cooldowns(), [("m".to_owned(), 401), ("q".to_owned(), 429)], "{why}");
+        };
+        chmod(&file, 0o000);
+        if !denied(&file) {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let observed = observe(&state, &mut cache);
+        assert!(observed == applied, "losing access is no change");
+        reload(&state).unwrap();
+        kept("full rescan");
+        let applied = step(&state, &mut cache, false, &observed);
+        kept("watcher reload");
+        assert!(observe(&state, &mut cache) == applied, "converges");
+        chmod(&file, 0o600);
+        let observed = observe(&state, &mut cache);
+        assert!(observed == applied, "the same bytes are no change");
+        step(&state, &mut cache, false, &observed);
+        reload(&state).unwrap();
+        kept("access restored");
+        // A re-login replaces the unreadable file.
+        chmod(&file, 0o000);
+        let staged = auth.join("claude-a.json.tmp");
+        std::fs::write(&staged, doc("sk-ant-oat-new-fake")).unwrap();
+        std::fs::rename(&staged, &file).unwrap();
+        let observed = observe(&state, &mut cache);
+        step(&state, &mut cache, false, &observed);
+        let lease = select("m").expect("the re-login is selectable at once");
+        assert_eq!(lease.credential.str("access_token"), Some("sk-ant-oat-new-fake"));
+        drop(lease);
+        assert!(select("q").is_none(), "the 429 cooldown survives the re-login");
+        assert_eq!(cooldowns(), [("q".to_owned(), 429)]);
+        chmod(&file, 0o000);
+        std::fs::remove_file(&file).unwrap();
+        let observed = observe(&state, &mut cache);
+        step(&state, &mut cache, false, &observed);
+        assert!(store.get("claude-a.json").is_none(), "deleted while unreadable");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #89 (Go v8.0.67 57a12996): an auth folder that exists but cannot be listed keeps
+    /// every credential loaded from it, with its revision, and the watcher sees no
+    /// change (no removal is logged or pushed to a remote store). A credential replaced
+    /// or deleted before access was lost is not brought back, and a file deleted while
+    /// the folder was unreadable is dropped once it can be listed again. Both an
+    /// absolute and a relative auth-dir, with an upload fallback recorded under its
+    /// absolute path.
+    #[tokio::test]
+    async fn an_auth_folder_without_read_permission_keeps_its_credentials() {
+        for relative in [false, true] {
+            let (state, dir, auth) = state_with_auth_folder(relative);
+            let store = state.rt.store();
+            let account = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
+            std::fs::write(auth.join("a.json"), account("old@example.invalid")).unwrap();
+            std::fs::write(auth.join("b.json"), account("b@example.invalid")).unwrap();
+            std::fs::write(auth.join("gone.json"), account("gone@example.invalid")).unwrap();
+            let upload = std::path::absolute(auth.join("upload.json")).unwrap();
+            std::fs::write(&upload, r#"{"type":"gemini","email":"u@example.invalid"}"#).unwrap();
+            state.fallbacks.lock().unwrap().insert(upload.clone());
+            let mut cache = HashCache::default();
+            let observed = observe(&state, &mut cache);
+            step(&state, &mut cache, false, &observed);
+            // Replaced and deleted before access is lost.
+            std::fs::write(auth.join("a.json"), account("new@example.invalid")).unwrap();
+            std::fs::remove_file(auth.join("gone.json")).unwrap();
+            let observed = observe(&state, &mut cache);
+            let applied = step(&state, &mut cache, false, &observed);
+            let ids = || {
+                let mut ids: Vec<(String, u64)> = store
+                    .snapshot()
+                    .iter()
+                    .filter(|c| matches!(c.source, Source::File(_)))
+                    .map(|c| (c.id.clone(), c.revision))
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let before = ids();
+            assert_eq!(
+                before.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                ["a.json", "b.json", "upload.json"],
+                "relative: {relative}"
+            );
+            // 0o300 lists nothing but still opens files; 0o000 does neither.
+            for mode in [0o300, 0o000] {
+                chmod(&auth, mode);
+                if !denied(&auth) {
+                    chmod(&auth, 0o755);
+                    std::fs::remove_dir_all(&dir).unwrap();
+                    if relative {
+                        std::fs::remove_dir_all(&auth).unwrap();
+                    }
+                    return;
+                }
+                let observed = observe(&state, &mut cache);
+                assert!(observed == applied, "relative: {relative}, {mode:o}: no change");
+                reload(&state).unwrap();
+                assert_eq!(ids(), before, "relative: {relative}, {mode:o}: full rescan");
+                let applied = step(&state, &mut cache, true, &observed);
+                assert_eq!(ids(), before, "relative: {relative}, {mode:o}: watcher reload");
+                assert!(
+                    observe(&state, &mut cache) == applied,
+                    "relative: {relative}, {mode:o}: converges"
+                );
+                assert!(
+                    state.fallbacks.lock().unwrap().contains(&upload),
+                    "the fallback stays tracked"
+                );
+                let a = store.get("a.json").unwrap();
+                assert_eq!(
+                    a.str("email"),
+                    Some("new@example.invalid"),
+                    "the replaced account stays replaced"
+                );
+                assert!(store.get("gone.json").is_none(), "a deleted credential stays deleted");
+            }
+            chmod(&auth, 0o700);
+            std::fs::remove_file(auth.join("b.json")).unwrap();
+            let observed = observe(&state, &mut cache);
+            assert!(observed != applied, "the deletion is seen once the folder lists again");
+            step(&state, &mut cache, false, &observed);
+            let after = ids();
+            assert_eq!(
+                after,
+                [before[0].clone(), before[2].clone()],
+                "relative: {relative}: only b.json is dropped, the rest keep their revisions"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+            if relative {
+                std::fs::remove_dir_all(&auth).unwrap();
+            }
+        }
+    }
+
+    /// An auth folder that also holds the config file and cannot be listed: the config
+    /// is still observed as the config file only, so nothing changes and nothing reloads.
+    #[tokio::test]
+    async fn an_unlistable_auth_folder_holding_the_config_is_no_change() {
+        let (state, dir) = state();
+        std::fs::write(dir.join("a.json"), r#"{"type":"codex","email":"a@example.invalid"}"#).unwrap();
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        let applied = step(&state, &mut cache, true, &observed);
+        let before = state.rt.store().get("a.json").unwrap();
+        chmod(&dir, 0o300);
+        if !denied(&dir) {
+            chmod(&dir, 0o755);
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let observed = observe(&state, &mut cache);
+        let unchanged = observed == applied;
+        let applied = step(&state, &mut cache, true, &observed);
+        let kept = state.rt.store().get("a.json").map(|c| c.revision);
+        let converged = observe(&state, &mut cache) == applied;
+        chmod(&dir, 0o755);
+        assert!(unchanged, "no change");
+        assert_eq!(kept, Some(before.revision));
+        assert!(converged);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Go c4c1d43e with #89: a scan that read new bytes from a file that is unreadable
+    /// by the time it publishes cannot be checked against the file, so the loaded
+    /// credential stays; the new bytes are applied once the file can be read again.
+    #[tokio::test]
+    async fn a_scan_of_a_file_that_became_unreadable_keeps_the_loaded_credential() {
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let file = auth.join("a.json");
+        let account = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
+        std::fs::write(&file, account("a@example.invalid")).unwrap();
+        reload(&state).unwrap();
+        let store = state.rt.store();
+        let before = store.get("a.json").unwrap();
+        std::fs::write(&file, account("b@example.invalid")).unwrap();
+        let config = (*state.rt.config()).clone();
+        let stale = credentials::scan_auth_dir(&config);
+        chmod(&file, 0o000);
+        if !denied(&file) {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        state.publish(config, Some(stale));
+        assert_eq!(store.get("a.json").unwrap().revision, before.revision);
+        chmod(&file, 0o600);
+        reload(&state).unwrap();
+        assert_eq!(store.get("a.json").unwrap().str("email"), Some("b@example.invalid"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #89: the credential an unreadable file keeps is the store's own when the scan is
+    /// published, not when it was taken: a token refresh committed in between (here at
+    /// the last moment before the swap) is kept, not undone by an older copy.
+    #[tokio::test]
+    async fn a_refresh_committed_after_an_unreadable_scan_is_kept() {
+        let (state, dir) = state();
+        let file = dir.join("a.json");
+        std::fs::write(&file, r#"{"type":"codex","access_token":"old-fake"}"#).unwrap();
         reload(&state).unwrap();
         std::fs::remove_file(&file).unwrap();
         std::os::unix::fs::symlink(&file, &file).unwrap();
-        assert!(std::fs::read(&file).is_err());
-        reload(&state).unwrap();
-        assert!(!state.rt.store().snapshot().iter().any(|c| c.id == "a.json"));
+        let config = (*state.rt.config()).clone();
+        let scan = credentials::scan_auth_dir(&config);
+        assert!(scan.unreadable.contains(&file), "the loop is unreadable");
+        let store = state.rt.store();
+        let refreshed = Arc::new(std::sync::Mutex::new(None));
+        crate::management::BEFORE_RECONCILE
+            .lock()
+            .unwrap()
+            .push((config.auth_dir.clone(), {
+                let (store, refreshed, file) = (store.clone(), refreshed.clone(), file.clone());
+                Box::new(move || {
+                    // The refresh writes a regular file in the loop's place.
+                    std::fs::remove_file(&file).unwrap();
+                    let revision = store.get("a.json").unwrap().revision;
+                    let mut patch = cpa_core::credential::MetadataPatch::default();
+                    patch.set.insert("access_token".into(), "refreshed-fake".into());
+                    *refreshed.lock().unwrap() = Some(store.apply_patch("a.json", revision, &patch).unwrap().revision);
+                })
+            }));
+        state.publish(config, Some(scan));
+        let now = store.get("a.json").unwrap();
+        assert_eq!(now.metadata["access_token"], "refreshed-fake");
+        assert_eq!(Some(now.revision), *refreshed.lock().unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1228,7 +1588,7 @@ mod tests {
         // A recently modified file is re-read even with identical cached metadata.
         std::fs::write(&path, b"thr!").unwrap();
         let meta = std::fs::metadata(&path).unwrap();
-        cache.0.insert(path.clone(), (Stat::of(&meta), [7; 32]));
+        cache.0.insert(path.clone(), (Some(Stat::of(&meta)), [7; 32]));
         assert_eq!(
             cache.hash(&path, &meta, SystemTime::now()),
             Some(Sha256::digest(b"thr!").into())

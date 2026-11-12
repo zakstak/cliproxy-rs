@@ -1101,30 +1101,138 @@ pub struct AuthScan {
     /// The files this read found empty or not valid JSON (Go v8.0.35
     /// `SynthesisContext.IncompleteFiles`); a caller keeps their last good credentials.
     pub incomplete: HashSet<PathBuf>,
+    /// The files listed in the folder whose read failed for a reason other than the file
+    /// being gone: permission denied, an I/O error, a symlink loop (Go v8.0.67 5fe203d5).
+    /// They are present but unknown; a caller keeps their last good credentials.
+    pub unreadable: HashSet<PathBuf>,
+    /// The folder, when it exists but could not be listed in full (Go v8.0.67 57a12996):
+    /// every file in it that this read did not settle is unknown, not removed.
+    pub unlisted: Option<PathBuf>,
     /// The SHA-256 of every file read, so the watcher records what it applied rather than
     /// what it observed before a later write.
     pub read: BTreeMap<PathBuf, [u8; 32]>,
 }
 
-/// [`from_auth_dir`], with the files it found incomplete and the hashes of what it read.
-/// A file that cannot be read is skipped, as in Go's full scan.
+impl AuthScan {
+    /// The files whose current credentials this scan leaves as they are.
+    pub fn unsettled(&self) -> Unsettled {
+        let mut unsettled = Unsettled::default();
+        for path in self.incomplete.iter().chain(&self.unreadable) {
+            unsettled.insert(path);
+        }
+        unsettled.dir = self.unlisted.as_deref().map(absolute);
+        unsettled
+    }
+}
+
+/// Auth files a scan found but could not learn the current state of: incomplete,
+/// unreadable, or in a folder it could not list. Their loaded credentials are neither
+/// replaced nor removed. Paths compare absolute, so a scan of a relative `auth-dir`
+/// matches an upload's absolute path.
+#[derive(Debug, Default, Clone)]
+pub struct Unsettled {
+    files: HashSet<PathBuf>,
+    dir: Option<PathBuf>,
+}
+
+impl Unsettled {
+    pub fn insert(&mut self, path: &Path) {
+        self.files.insert(absolute(path));
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        let path = absolute(path);
+        self.files.contains(&path) || self.dir.as_deref().is_some_and(|dir| path.parent() == Some(dir))
+    }
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// One auth file entry, as the scan and the auth-folder watcher classify it.
+pub enum AuthFile {
+    /// The bytes of a regular file, or of the regular file a symlink leads to.
+    Bytes(Vec<u8>),
+    /// Gone (not found, including a dangling symlink), or not a regular file (a link to
+    /// `/dev/null`, a FIFO, a folder): it holds no credential.
+    Absent,
+    /// Present but unreadable for now: any other error.
+    Unreadable(std::io::Error),
+}
+
+/// Reads `path` when it is, or links to, a regular file: the rule the auth-folder watcher
+/// observes by, so a credential is never kept for an entry the watcher cannot see go away.
+/// The type is checked before opening (a FIFO would block) and again on the opened file,
+/// which is the one read. Only "not found" is an absence: like Go's
+/// `errors.Is(err, fs.ErrNotExist)`, every other failure leaves the file unknown.
+pub fn read_auth_file(path: &Path) -> AuthFile {
+    use std::io::Read;
+    let failed = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => AuthFile::Absent,
+        _ => AuthFile::Unreadable(e),
+    };
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => return AuthFile::Absent,
+        Ok(_) => {}
+        Err(e) => return failed(e),
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => return failed(e),
+    };
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => return AuthFile::Absent,
+        Ok(_) => {}
+        Err(e) => return failed(e),
+    }
+    let mut data = Vec::new();
+    match file.read_to_end(&mut data) {
+        Ok(_) => AuthFile::Bytes(data),
+        Err(e) => failed(e),
+    }
+}
+
+/// [`from_auth_dir`], with the files it found incomplete or unreadable, whether it could
+/// list the folder, and the hashes of what it read. A file that is gone or is not a
+/// regular file is skipped, as in Go's full scan.
 pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
     let mut scan = AuthScan::default();
     let entries = match std::fs::read_dir(&cfg.auth_dir) {
         Ok(entries) => entries,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot read auth dir");
+                tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot read auth dir; keeping its loaded credentials");
+                scan.unlisted = Some(cfg.auth_dir.clone());
             }
             return scan;
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // ponytail: a listing that fails partway keeps every file of the folder this
+            // scan did not rebuild, ones it found gone included, until the next complete
+            // listing; recording the settled paths would drop those at once.
+            Err(e) => {
+                tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot list auth dir; keeping its loaded credentials");
+                scan.unlisted = Some(cfg.auth_dir.clone());
+                break;
+            }
+        };
         let path: PathBuf = entry.path();
         if !entry.file_name().to_string_lossy().go_lower().ends_with(".json") {
             continue;
         }
-        let Some(data) = read_regular(&path) else { continue };
+        let data = match read_auth_file(&path) {
+            AuthFile::Bytes(data) => data,
+            AuthFile::Absent => continue,
+            AuthFile::Unreadable(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read auth file; keeping its loaded credential");
+                scan.unreadable.insert(path);
+                continue;
+            }
+        };
         scan.read.insert(path.clone(), Sha256::digest(&data).into());
         if serde_json::from_slice::<serde::de::IgnoredAny>(&data).is_err() {
             scan.incomplete.insert(path);
@@ -1138,24 +1246,6 @@ pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
     }
     scan.credentials.sort_by(|a, b| a.id.cmp(&b.id));
     scan
-}
-
-/// The bytes of `path` when it is, or links to, a regular file: the rule the auth-folder
-/// watcher observes by, so a credential is never kept for an entry the watcher cannot
-/// see go away (a link to `/dev/null`, a FIFO, a folder). The type is checked before
-/// opening (a FIFO would block) and again on the opened file, which is the one read.
-pub fn read_regular(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    Some(data)
 }
 
 /// All runtime credentials for a config: auth files, then config API keys.
@@ -1521,5 +1611,57 @@ mod tests {
             "model-a,model-b",
         );
         own(r#"{"type":"claude","excluded-models":["Alias-*"]}"#, "alias-*");
+    }
+
+    /// #89: the scan tells a file that is gone or not a regular file (no credential)
+    /// from one it cannot read (unknown), and a missing folder (no files) from one it
+    /// cannot list (unknown). Root reads through permissions, so the unreadable cases
+    /// here are ones no user can read: a symlink loop and a folder that is a file.
+    #[test]
+    fn the_scan_tells_unreadable_from_absent() {
+        let dir = std::env::temp_dir().join(format!("cpa-scan-classes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::parse("").unwrap();
+        cfg.auth_dir = dir.clone();
+        std::fs::write(dir.join("good.json"), r#"{"type":"codex"}"#).unwrap();
+        std::fs::write(dir.join("partial.json"), r#"{"type":"#).unwrap();
+        std::os::unix::fs::symlink(dir.join("loop.json"), dir.join("loop.json")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", dir.join("null.json")).unwrap();
+        std::fs::create_dir(dir.join("folder.json")).unwrap();
+        let scan = scan_auth_dir(&cfg);
+        assert_eq!(
+            scan.credentials.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["good.json"]
+        );
+        assert_eq!(scan.incomplete, HashSet::from([dir.join("partial.json")]));
+        assert_eq!(scan.unreadable, HashSet::from([dir.join("loop.json")]));
+        assert_eq!(scan.unlisted, None);
+        let unsettled = scan.unsettled();
+        for (name, kept) in [
+            ("partial.json", true),
+            ("loop.json", true),
+            ("good.json", false),
+            ("dangling.json", false),
+            ("null.json", false),
+            ("folder.json", false),
+        ] {
+            assert_eq!(unsettled.contains(&dir.join(name)), kept, "{name}");
+        }
+        cfg.auth_dir = dir.join("missing");
+        let scan = scan_auth_dir(&cfg);
+        assert_eq!(scan.unlisted, None, "a missing folder holds no files");
+        assert!(!scan.unsettled().contains(&cfg.auth_dir.join("a.json")));
+        cfg.auth_dir = dir.join("good.json");
+        let scan = scan_auth_dir(&cfg);
+        assert_eq!(scan.unlisted.as_deref(), Some(cfg.auth_dir.as_path()));
+        let unsettled = scan.unsettled();
+        assert!(unsettled.contains(&cfg.auth_dir.join("a.json")));
+        assert!(
+            !unsettled.contains(&dir.join("a.json")),
+            "only the unlisted folder's files"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

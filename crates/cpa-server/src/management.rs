@@ -230,16 +230,31 @@ impl Management {
         self.lock_auth_dir(&mut cfg);
         use sha2::{Digest, Sha256};
         let scan = files.unwrap_or_else(|| credentials::scan_auth_dir(&cfg));
+        // Files whose loaded credentials stay as they are. An empty or half-written file
+        // is not a deletion (Go 7484a521), nor is a file or folder that cannot be read
+        // for now (Go v8.0.67 5fe203d5, 57a12996). Deciding from the scan's own read,
+        // never a second one, means a file completed after the scan is picked up by the
+        // reload its write triggers instead of being dropped now. Removal and valid JSON
+        // without a credential are reconciled normally.
+        let mut unsettled = scan.unsettled();
         let mut all = scan.credentials;
         let mut read = scan.read;
         // Uploads record absolute paths; a relative auth-dir scans relative ones.
         let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
         // Fallbacks follow their file: gone with it, replaced once a synthesizer
-        // claims it, otherwise rebuilt from its current content.
+        // claims it, otherwise rebuilt from its current content. One whose file cannot
+        // be read for now stays tracked, and its loaded credential stays.
         let mut claimed = Vec::new();
         let mut fallbacks = self.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         fallbacks.retain(|path| {
-            let Ok(data) = std::fs::read(path) else { return false };
+            let data = match credentials::read_auth_file(path) {
+                credentials::AuthFile::Bytes(data) => data,
+                credentials::AuthFile::Absent => return false,
+                credentials::AuthFile::Unreadable(_) => {
+                    unsettled.insert(path);
+                    return true;
+                }
+            };
             if all
                 .iter()
                 .any(|c| matches!(&c.source, Source::File(p) if absolute(p) == absolute(path)))
@@ -279,7 +294,7 @@ impl Management {
         self.rt.usage_queue().configure(self.access.available(), &cfg);
         let policy = policy(&cfg);
         self.rt.publish_config_and_policy(cfg, policy);
-        let rejected = self.rt.store().reconcile_scanned(all, &read);
+        let rejected = self.rt.store().reconcile_scanned(all, &read, &unsettled);
         // A synthesizer claimed the file but its credential was rejected as stale, so the
         // fallback stays live: keep tracking it, or the next reload would drop it.
         let kept: Vec<PathBuf> = claimed
