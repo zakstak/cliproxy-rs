@@ -476,8 +476,16 @@ def current_cargo_targets(pins, current_source, artifact_root=ROOT):
         env = dict(os.environ, RUSTC_WRAPPER=str(NO_COMPILE_RUSTC), CPA_NO_COMPILE_LOG=str(log),
                    CARGO_TERM_COLOR="never")
         source_before = provenance.source_identity()
-        builds = {p: provenance.cargo_artifacts([*_cargo_selection(p, [t for q, t in targets if q == p]), "--offline"],
-                                                env=env, detail=True) for p in packages}
+        builds = {}
+        for package in packages:
+            args = [*_cargo_selection(package, [t for q, t in targets if q == package]), "--offline"]
+            try:
+                builds[package] = provenance.cargo_artifacts(args, env=env, detail=True)
+            except OSError as exc:
+                # Tool startup and artifact reads cross the query boundary. Preserve
+                # an unavailable result so the CLI can write its receipt and exit 2.
+                builds[package] = {"command": ["cargo", *args, "--message-format=json"], "exit": None,
+                                   "stderr_tail": f"unavailable: {exc}", "stale": [], "artifacts": []}
         refused = log.read_text().splitlines() if log.exists() else []
     artifacts, profiles = {}, {}
     for package, build in builds.items():
@@ -503,8 +511,11 @@ def current_cargo_targets(pins, current_source, artifact_root=ROOT):
             problems.append(f"cargo query for {package} names test executables outside the manifest targets: {extra}")
     for key, artifact in artifacts.items():
         path = Path(artifact_root) / artifact["executable"]
-        if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
-            problems.append(f"{key}: executable bytes changed during the query")
+        try:
+            if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
+                problems.append(f"{key}: executable bytes changed during the query")
+        except OSError as exc:
+            problems.append(f"{key}: executable unavailable during the query: {exc}")
     source_after = provenance.source_identity()
     if not source_before == source_after == current_source:
         problems.append("the source changed during the cargo query or is not the combined source")

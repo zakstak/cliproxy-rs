@@ -8,13 +8,38 @@
 # rerun-if conditions changed would still execute before its dependants' compilation is
 # refused. Ceiling: a query never builds Rust, but cannot stop such a script. Upgrade path: a
 # stable cargo dry-run/freshness report, when one exists.
+set -u
 rustc=$1
 shift
-for arg in "$@"; do
-    if [[ $arg == -vV || $arg == ___ ]]; then
-        exec "$rustc" "$@"
+# Match complete information-only commands. The probe sentinel is also a valid cfg
+# name, so its presence (or -vV among other arguments) cannot authorize a command.
+if [[ $# == 1 && $1 == -vV ]]; then
+    exec "$rustc" "$@"
+fi
+if [[ ${1:-} == - && ${2:-} == --crate-name && ${3:-} == ___ ]]; then
+    args=("$@")
+    shift 3
+    good=1
+    printed=0
+    while (($#)); do
+        case $1 in
+            --print=file-names|--print=sysroot|--print=split-debuginfo|--print=crate-name|--print=cfg)
+                printed=1; shift ;;
+            --crate-type)
+                case ${2:-} in
+                    bin|rlib|dylib|cdylib|staticlib|proc-macro) shift 2 ;;
+                    *) good=0; break ;;
+                esac ;;
+            -Wwarnings) shift ;;
+            *) good=0; break ;;
+        esac
+    done
+    if ((good && printed)); then
+        exec "$rustc" "${args[@]}"
     fi
-done
+    # Keep the complete refused command in the diagnostic, including its prefix.
+    set -- "${args[@]}"
+fi
 if [[ -n ${CPA_NO_COMPILE_LOG:-} ]]; then
     printf '%s\n' "$*" | cut -c1-500 >> "$CPA_NO_COMPILE_LOG"
 fi

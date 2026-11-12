@@ -5,6 +5,7 @@ They build synthetic captures in the collector's layout and need no Go, Rust bui
 namespace."""
 import copy
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -1143,6 +1144,64 @@ class NoCompileWrapperTests(unittest.TestCase):
         done, _ = self.run_wrapper(*args, log=False)
         self.assertEqual(done.returncode, 101)
         self.assertNotIn("RAN", done.stdout)
+
+    def test_probe_tokens_in_a_compilation_do_not_authorize_it(self):
+        compile_args = ["--crate-name", "cpa_core", "--edition=2024", "crates/cpa-core/src/lib.rs", "--test"]
+        cases = [compile_args + ["--cfg", "___"], compile_args + ["-vV"],
+                 ["--crate-name", "___", "src/lib.rs", "--print=file-names", "--emit=link"],
+                 ["-", "--crate-name", "___", "--print=file-names", "--emit=link"],
+                 ["-", "--crate-name", "___", "--print=cfg", "-o", "output"],
+                 ["-", "--crate-name", "___", "--crate-type", "bin"],
+                 ["-", "--crate-name", "___", "--print=cfg", "--crate-type"],
+                 ["-", "--crate-name", "___", "--print=cfg", "src/lib.rs"]]
+        for args in cases:
+            with self.subTest(args=args):
+                done, refused = self.run_wrapper(*args)
+                self.assertEqual(done.returncode, 101)
+                self.assertNotIn("RAN", done.stdout)
+                self.assertTrue(refused)
+
+
+class CargoQueryUnavailableTests(unittest.TestCase):
+    def test_tool_startup_and_artifact_io_errors_are_unavailable(self):
+        for error in (FileNotFoundError("cargo missing"), PermissionError("artifact unreadable")):
+            with self.subTest(error=error), \
+                    mock.patch.object(provenance, "source_identity", return_value=dict(SOURCE)), \
+                    mock.patch.object(provenance, "cargo_artifacts", side_effect=error), \
+                    mock.patch.object(acceptance, "_toolchain", return_value={}):
+                result = acceptance.current_cargo_targets(PINS, dict(SOURCE))
+                self.assertFalse(result["available"])
+                self.assertTrue(any(str(error) in p for p in result["problems"]))
+                self.assertTrue(all(v is None for v in result["exits"].values()))
+
+    def test_missing_cargo_cli_writes_an_unavailable_receipt(self):
+        # Exercise the CLI in a new process, with a genuinely absent executable.
+        # Only fixture source identity and artifact location are injected; the
+        # query, subprocess startup failure, receipt writer and exit are real.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp)
+            out = Path(tmp) / "out.json"
+            script = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import acceptance, test_acceptance as fixture
+acceptance.provenance.source_identity = lambda: dict(fixture.SOURCE)
+combine = acceptance.combine
+acceptance.combine = lambda paths, pins: combine(paths, pins, current_source=fixture.SOURCE,
+                                                artifact_root=Path(sys.argv[2]) / 'artifacts')
+sys.exit(acceptance.main(sys.argv[3:]))
+"""
+            env = dict(os.environ, PATH=str(Path(tmp) / "no-executables"))
+            done = subprocess.run([sys.executable, "-c", script, str(ROOT / "harness"), tmp,
+                                   "combine", *paths, "--receipt", str(out)], env=env,
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 2, done.stderr)
+            result = json.loads(out.read_text())
+            self.assertEqual(result["verdict"], "unavailable")
+            self.assertFalse(result["problems"], result["problems"])
+            self.assertTrue(result["current_cargo"]["queried"])
+            self.assertTrue(any("No such file or directory" in p and "cargo" in p for p in result["unavailable"]))
+            self.assertNotIn("Traceback", done.stderr)
 
 
 if __name__ == "__main__":
