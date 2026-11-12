@@ -408,6 +408,14 @@ def _tls(observation):
 
 # --- comparison --------------------------------------------------------------------
 
+def _credential_value_matches(credential, field, expected):
+    # The manifest's absence marker is not a JSON string value. Python equality
+    # alone also treats 0 as False, so require the expected JSON type explicitly.
+    if expected == "<absent>":
+        return field not in credential
+    return field in credential and type(credential[field]) is type(expected) and credential[field] == expected
+
+
 def compare(case, go, rust, predicates, pins, run):
     """{dimension: [problems]} after the named predicates are applied."""
     results = {d: [] for d in DIMENSIONS}
@@ -519,9 +527,12 @@ def compare(case, go, rust, predicates, pins, run):
     for divergence, index, spec in predicates.of("credential_field"):
         field = spec["field"]
         values = {side: cred.get(field, "<absent>") for side, cred in (("go", go_cred), ("rust", rust_cred))}
-        if values["go"] == values["rust"] and divergence.get("may_be_absent"):
+        credentials = {"go": go_cred, "rust": rust_cred}
+        if divergence.get("may_be_absent") and any(
+                all(_credential_value_matches(cred, field, allowed) for cred in credentials.values())
+                for allowed in spec["equal_values"]):
             continue
-        if values != {"go": spec["go"], "rust": spec["rust"]}:
+        if not all(_credential_value_matches(cred, field, spec[side]) for side, cred in credentials.items()):
             predicates.fail(divergence, index, f"{field}: Go {values['go']!r} Rust {values['rust']!r}")
         else:
             predicates.hit(divergence)

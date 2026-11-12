@@ -110,9 +110,17 @@ def _predicate(predicate, where, divergence):
         _require(isinstance(spec["count"], int) and spec["count"] > 0 and set(spec["reference"]) == {"case", "side", "index"},
                  f"{where}: needs a count and a reference handshake")
     elif kind == "credential_field":
+        _require({"field", "go", "rust"} <= set(spec) <= {"field", "go", "rust", "equal_values"},
+                 f"{where}: credential field needs go/rust and optional explicit equal values")
         _require(spec["field"] not in ("access_token", "refresh_token", "id_token", "type", "email"),
                  f"{where}: credential identity fields cannot diverge")
         _require(spec["go"] != spec["rust"], f"{where}: go and rust values must differ")
+        _require(not divergence.get("may_be_absent") or isinstance(spec.get("equal_values"), list)
+                 and spec["equal_values"], f"{where}: optional credential delta needs explicit equal states")
+        if spec["field"] == "disabled":
+            _require(all(v is False or isinstance(v, str) and v == "<absent>"
+                         for v in [spec["go"], spec["rust"], *spec.get("equal_values", [])]),
+                     f"{where}: disabled is exactly false or absent")
     elif kind == "credential_timestamps":
         _require(set(spec["fields"]) <= {"expired", "last_refresh"} and 0 < spec["max_skew_seconds"] <= 60,
                  f"{where}: timestamps are expired or last_refresh within 60s")

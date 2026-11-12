@@ -49,7 +49,7 @@ def observation(requests=None, replies=None, tls=None, credential=None):
 
 def pins_with(ids=(), skips=()):
     out = copy.deepcopy(PINS)
-    out["divergences"] = [d for d in PINS["divergences"] if d["id"] in ids]
+    out["divergences"] = [d for d in out["divergences"] if d["id"] in ids]
     out["skips"] = list(skips)
     return out
 
@@ -191,6 +191,37 @@ class PredicateTests(unittest.TestCase):
                                  pins, "selective")["verdict"], "pass")
         self.assertEqual(verdict("client-disconnect", go, observation(credential={"type": "claude", "disabled": True}),
                                  pins, "selective")["verdict"], "fail")
+
+    def test_optional_disabled_requires_exact_safe_states(self):
+        pins = pins_with(["credential-disabled-persist"])
+        absent = object()
+
+        def saved(value):
+            credential = {"type": "claude"}
+            if value is not absent:
+                credential["disabled"] = value
+            return observation(credential=credential)
+
+        for go, rust in ((absent, False), (absent, absent), (False, False)):
+            with self.subTest(safe=(go, rust)):
+                self.assertEqual(verdict("client-disconnect", saved(go), saved(rust), pins,
+                                         "selective")["verdict"], "pass")
+        for value in (0, 0.0, 1, None, "false", "<absent>", True, [], {}):
+            for go, rust in ((value, False), (absent, value), (value, value)):
+                with self.subTest(unsafe=(go, rust)):
+                    self.assertEqual(verdict("client-disconnect", saved(go), saved(rust), pins,
+                                             "selective")["verdict"], "fail")
+
+    def test_optional_disabled_manifest_names_only_safe_equal_states(self):
+        for allowed in (None, [], [0], [True], ["<absent>", 0]):
+            pins = pins_with(["credential-disabled-persist"])
+            spec = pins["divergences"][0]["expect"][0]["credential_field"]
+            if allowed is None:
+                spec.pop("equal_values", None)
+            else:
+                spec["equal_values"] = allowed
+            with self.subTest(allowed=allowed), self.assertRaises(revisions.ManifestError):
+                revisions.validate(pins)
 
     def test_a_header_delta_must_be_exactly_the_named_one(self):
         pins = pins_with(["X5-grok-user-agent", "plain-upstream-host-label"])

@@ -773,7 +773,8 @@
           "credential_field": {
             "field": "disabled",
             "go": "<absent>",
-            "rust": false
+            "rust": false,
+            "equal_values": ["<absent>", false]
           }
         }
       ]
