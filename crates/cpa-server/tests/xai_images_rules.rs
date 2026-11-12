@@ -258,6 +258,90 @@ fn served(seen: &Seen) -> usize {
     seen.lock().unwrap().len()
 }
 
+struct HomePick {
+    credential: cpa_core::credential::Credential,
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+impl cpa_server::remote::RemoteDispatch for HomePick {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn dispatch(
+        &self,
+        request: cpa_server::remote::RemoteRequest,
+    ) -> futures_util::future::BoxFuture<'_, Result<cpa_server::remote::RemoteGrant, cpa_server::remote::RemoteError>>
+    {
+        self.models.lock().unwrap().push(request.model);
+        let credential = self.credential.clone();
+        Box::pin(async move {
+            Ok(cpa_server::remote::RemoteGrant {
+                credential,
+                end: Box::new(|| None),
+                cancel: None,
+                request_retry: Some(0),
+                user_api_key: "fake-home-principal".into(),
+                private: Default::default(),
+            })
+        })
+    }
+
+    fn models(
+        &self,
+        _: Vec<(String, String)>,
+        _: Vec<(String, String)>,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, cpa_server::remote::ModelsError>> {
+        Box::pin(async { Ok(b"{}".to_vec()) })
+    }
+}
+
+/// Home selects the credential; the same executor hook still determines the answer's
+/// format from the finalized upstream request, for both buffered and streamed answers.
+#[tokio::test]
+async fn home_selected_credentials_use_the_rule_settled_format() {
+    let _registry = REGISTRY.lock().await;
+    let (up, seen) = upstream().await;
+    let p = proxy(&[("", &up)], DEFAULTS).await;
+    let auth_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("xai-images-home");
+    let mut credential = cpa_core::credential::Credential::from_file(
+        &auth_dir,
+        &auth_dir.join("fake-xai.json"),
+        json!({"type": "xai"}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    credential
+        .attributes
+        .insert("api_key".into(), "sk-fake-home-xai".into());
+    credential
+        .attributes
+        .insert("base_url".into(), format!("http://{up}/v1"));
+    let models = Arc::new(Mutex::new(Vec::new()));
+    p._rt.set_remote_dispatch(Some(Arc::new(HomePick {
+        credential,
+        models: models.clone(),
+    })));
+
+    for stream in [false, true] {
+        let (status, body) = generate(
+            &p.addr,
+            json!({"model": "xai/grok-imagine-image", "prompt": "draw", "stream": stream}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(seen.lock().unwrap().last().unwrap().1["response_format"], "url");
+        let out = if stream {
+            let event = body.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+            serde_json::from_str::<Value>(event).unwrap()
+        } else {
+            json_body(status, &body)["data"][0].clone()
+        };
+        assert_eq!(out["url"], "https://imgen.x.ai/fake.png", "{out}");
+        assert!(out.get("b64_json").is_none(), "{out}");
+    }
+    assert_eq!(*models.lock().unwrap(), vec!["xai/grok-imagine-image"; 2]);
+}
+
 const FORCED: &str = "routing:\n  force-model-prefix: true\n";
 
 /// A prefix an xAI credential registered routes to that credential: `team/` reaches the
