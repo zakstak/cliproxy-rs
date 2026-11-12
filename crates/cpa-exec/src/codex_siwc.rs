@@ -633,10 +633,6 @@ impl Tokens {
         if !self.expires_at.is_empty() {
             set("expires_at", &self.expires_at);
         }
-        if self.expired.is_empty() {
-            out.insert("expired".into(), Value::Null);
-            out.insert("expires_at".into(), Value::Null);
-        }
         if !self.id_token.is_empty() {
             set("id_token", &self.id_token);
         }
@@ -648,6 +644,10 @@ impl Tokens {
         }
         if !self.scopes.is_empty() {
             out.insert("scopes".into(), self.scopes.clone().into());
+        }
+        if self.expired.is_empty() {
+            out.insert("expired".into(), Value::Null);
+            out.insert("expires_at".into(), Value::Null);
         }
         out
     }
