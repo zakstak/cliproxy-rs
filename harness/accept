@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# The selective acceptance command (issue #67, H1). Runs, in order:
+#   1. the historical 50-case Claude differential against Go v8.0.10 and its evaluation,
+#   2. the selective differential (Claude, Grok, Muse) against Go v8.0.67 and its evaluation,
+#   3. the mutation control on each of those two captures,
+#   4. every retained-provider cargo group (Claude, Codex, Grok, Muse, refusals, controls):
+#      built and hashed first, run offline in a loopback-only namespace, re-verified fresh,
+# and combines exactly those receipts. Source, manifest and binary identity are taken
+# before each step and confirmed after it (harness/provenance.py). Pins come from
+# harness/manifest.json.
+#
+# Exit 0: accepted. 1: something failed. 2: execution or provenance was unavailable.
+# A step that cannot run, or a partial run, never counts as a pass.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+python3 harness/manifest.py check || exit 2
+[[ -z $(git status --porcelain) ]] || echo "warning: the worktree is not clean; combine will refuse these receipts" >&2
+cache=harness/.cache
+out=$cache/accept-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$out"
+receipts=()
+worst=0
+record() {  # keep the most severe outcome: 2 > 1 > 0; any other nonzero is a failure
+    local code=$1
+    ((code == 0)) && return
+    if ((code == 2)); then worst=2; elif ((worst == 0)); then worst=1; fi
+}
+step() {  # step NAME ARGS...: one acceptance command writing its receipt to $out/NAME.json
+    local name=$1; shift
+    python3 harness/acceptance.py "$@" --receipt "$out/$name.json"
+    record $?
+    [[ -f $out/$name.json ]] && receipts+=("$out/$name.json")
+}
+
+for target in historical selective; do
+    ./harness/run --target "$target"
+    code=$?
+    if ((code != 0)); then
+        echo "differential $target: collector exit $code (execution unavailable)" >&2
+        record 2
+        continue
+    fi
+    # The run succeeded in this invocation, so latest-$target is that capture.
+    step "differential-$target" evaluate "$cache/latest-$target"
+    step "mutation-$target" mutation-control "$cache/latest-$target"
+done
+step cargo-groups cargo
+python3 harness/acceptance.py combine "${receipts[@]}" --receipt "$out/acceptance.json"
+record $?
+echo "receipts: $out"
+exit "$worst"

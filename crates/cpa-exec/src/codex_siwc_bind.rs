@@ -119,6 +119,23 @@ pub fn device_id(path: &Path) -> Result<String, String> {
     Ok(uuid::Uuid::new_v4().to_string())
 }
 
+/// The issued client a file's SIWC partition holds (Go v8.0.67 `DoSIWCBind` reads
+/// `siwc.client_id`, 3891ebaa): empty when there is none, an error when the member is
+/// there but not a string.
+pub fn saved_client(path: &Path) -> Result<String, String> {
+    let invalid = || "invalid saved registration".to_owned();
+    let data = std::fs::read(path).map_err(|e| format!("failed to read saved registration: {e}"))?;
+    let meta = decode(&data).map_err(|_| invalid())?;
+    let Some(GoValue::Object(siwc)) = meta.as_ref().and_then(|m| m.get("siwc")) else {
+        return Ok(String::new());
+    };
+    match siwc.get("client_id") {
+        None => Ok(String::new()),
+        Some(GoValue::String(id)) => Ok(id.trim().to_owned()),
+        Some(_) => Err(invalid()),
+    }
+}
+
 /// Go `saveSIWCToCodexCredentialFile` after its log line: under the credential lock, the
 /// current file with `use_siwc` set and `siwc` replaced, encoded as Go's `json.Marshal`
 /// of the decoded map (sorted keys, numbers through float64), written atomically.
@@ -308,9 +325,9 @@ pub(crate) async fn bind_with(
     interaction: Interaction,
 ) -> Result<PathBuf, BindError> {
     let path = resolve(&cfg.auth_dir, target).map_err(BindError::Log)?;
-    let device = {
+    let (device, saved) = {
         let path = path.clone();
-        tokio::task::spawn_blocking(move || device_id(&path))
+        tokio::task::spawn_blocking(move || device_id(&path).and_then(|d| Ok((d, saved_client(&path)?))))
             .await
             .map_err(|e| BindError::Log(format!("siwc-bind: {e}")))?
             .map_err(|e| BindError::Log(format!("siwc-bind: {e}")))?
@@ -329,13 +346,18 @@ pub(crate) async fn bind_with(
         .await
         .map_err(|_| BindError::PortInUse)?;
     let identifier = crate::codex_siwc::identifier(cfg);
-    let url =
-        crate::codex_siwc::authorize_url(&state, &nonce, &device, &redirect, &challenge, &identifier).map_err(|e| {
-            BindError::Log(format!(
-                "siwc-bind: failed to generate authorization URL: {}",
-                String::from_utf8_lossy(&e.body)
-            ))
-        })?;
+    // An account that already holds an issued client reauthorizes with it.
+    let url = if saved.is_empty() {
+        crate::codex_siwc::authorize_url(&state, &nonce, &device, &redirect, &challenge, &identifier)
+    } else {
+        crate::codex_siwc::reauth_url(&saved, &state, &nonce, &device, &redirect, &challenge)
+    }
+    .map_err(|e| {
+        BindError::Log(format!(
+            "siwc-bind: failed to generate authorization URL: {}",
+            String::from_utf8_lossy(&e.body)
+        ))
+    })?;
     // Go's callback server runs until the command returns, so the browser's redirect
     // to /success is answered; the first callback wins.
     let (results, mut callbacks) = tokio::sync::mpsc::channel(1);
@@ -362,7 +384,16 @@ pub(crate) async fn bind_with(
         if got_state != state {
             return Err(failed("state mismatch".into()));
         }
-        if client_id.trim().is_empty() {
+        let mut client_id = client_id.trim().to_owned();
+        if !saved.is_empty() {
+            if !client_id.is_empty() && client_id != saved {
+                return Err(failed(
+                    "callback client ID does not match the saved registration".into(),
+                ));
+            }
+            client_id = saved.clone();
+        }
+        if client_id.is_empty() || client_id == crate::codex_siwc::DYNAMIC_CLIENT_ID {
             return Err(failed("callback did not contain an issued client ID".into()));
         }
         let tokens = oauth

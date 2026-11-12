@@ -10,7 +10,7 @@
 // ported. Pre-result stream keep-alives and the non-streaming keep-alive are not ported
 // either; both are off by default. Routed calls run with WithDisallowFreeAuth.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -63,14 +63,62 @@ fn model_base(model: &str) -> String {
     model_parts(model).1.trim().go_lower()
 }
 
-/// `isXAIImagesModel`.
+/// `isXAIVendorAlias`: the prefixes that name xAI itself rather than a credential.
+fn is_xai_vendor_alias(prefix: &str) -> bool {
+    matches!(prefix.trim().go_lower().as_str(), "xai" | "x-ai" | "grok")
+}
+
+/// `registeredXAIImagesModel`: `model`, or its lowercase, as an xAI credential
+/// registered it (with that credential's `prefix/`).
+fn registered_xai_model(model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    [model.to_owned(), model.go_lower()].into_iter().find(|candidate| {
+        cpa_core::registry::model_providers(candidate)
+            .iter()
+            .any(|provider| provider.trim().go_eq_fold("xai"))
+    })
+}
+
+/// `isXAIImagesModel`: an xAI image model, unprefixed, under a vendor alias, or under
+/// a prefix an xAI credential registered it with.
 fn is_xai_model(model: &str) -> bool {
     let (prefix, base) = model_parts(model);
     let base = base.trim().go_lower();
     if ![XAI_DEFAULT_MODEL, XAI_QUALITY_MODEL, XAI_20_MODEL].contains(&base.as_str()) {
         return false;
     }
-    matches!(prefix.trim().go_lower().as_str(), "" | "xai" | "x-ai" | "grok")
+    if prefix.is_empty() || is_xai_vendor_alias(prefix) {
+        return true;
+    }
+    registered_xai_model(&format!("{prefix}/{}", canonical_xai_model(model))).is_some()
+        || registered_xai_model(model).is_some()
+}
+
+/// `routingXAIImagesModel` (v8.0.67, with 8a3e7622): the model the scheduler routes an
+/// xAI image request by. A prefix an xAI credential registered keeps the request on
+/// it. Under `force-model-prefix` (or Home) another prefix stays, so only a credential
+/// with that prefix serves it, except a vendor alias (`xai/`, `x-ai/`, `grok/`), which
+/// names no credential and falls back to unprefixed ones.
+fn routing_xai_model(rt: &Runtime, model: &str) -> String {
+    let canonical = canonical_xai_model(model);
+    let (prefix, _) = model_parts(model);
+    if prefix.is_empty() {
+        return canonical.to_owned();
+    }
+    let prefixed = format!("{prefix}/{canonical}");
+    if let Some(resolved) = registered_xai_model(&prefixed).or_else(|| registered_xai_model(model)) {
+        return resolved;
+    }
+    if !is_xai_vendor_alias(prefix) && rt.config().routing.force_model_prefix {
+        return prefixed;
+    }
+    if rt.remote_dispatch().is_some() || registered_xai_model(canonical).is_none() {
+        return prefixed;
+    }
+    canonical.to_owned()
 }
 
 /// `isCodexImagesToolModel`.
@@ -205,7 +253,10 @@ fn xai_base_request(model: &str, prompt: &str, format: &str, o: &XaiOptions) -> 
     let mut req = b"{}".to_vec();
     gj::set_str(&mut req, "model", canonical_xai_model(model));
     gj::set_str(&mut req, "prompt", prompt.trim());
-    gj::set_str(&mut req, "response_format", response_format(format));
+    // Absent from the original request when the client sent none (826bb167).
+    if !format.trim().is_empty() {
+        gj::set_str(&mut req, "response_format", response_format(format));
+    }
     if !o.aspect_ratio.is_empty() {
         gj::set_str(&mut req, "aspect_ratio", &o.aspect_ratio);
     }
@@ -521,7 +572,7 @@ impl Prepared {
     /// `stream` is the upstream call's mode; `sse` whether the client gets events.
     /// `routed`: a gpt-image model routed to its provider, which Go runs with
     /// `WithDisallowFreeAuth`.
-    fn call(&self, model: &str, body: Vec<u8>, stream: bool, sse: bool, routed: bool) -> Call {
+    fn call(&self, model: &str, body: Vec<u8>, stream: bool, sse: bool, routed: bool, xai: XaiCall) -> Call {
         Call {
             entry: Format::OpenAI,
             response: Format::OpenAI,
@@ -545,6 +596,8 @@ impl Prepared {
                 on_selected: None,
                 sse,
                 disallow_free: routed,
+                original: xai.original.map(Bytes::from),
+                on_format: xai.on_format,
             })),
         }
     }
@@ -637,11 +690,20 @@ impl Writer for Raw {
 }
 
 /// `collectRoutedImages` / `streamRoutedImages`, and the streaming half of the compat
+/// What an xAI image call adds to the dispatch (Go v8.0.67 826bb167): the request
+/// before the route's defaults, for payload `default` rules, and the hook that hears
+/// the `response_format` the rules settled on. Empty for every other image family.
+#[derive(Default)]
+struct XaiCall {
+    original: Option<Vec<u8>>,
+    on_format: Option<dispatch::OnFormat>,
+}
+
 /// path (`streamOpenAICompatImages`, `routed` false): the upstream body or event stream as
 /// is.
 async fn raw(p: Prepared, model: &str, body: Vec<u8>, stream: bool, routed: bool) -> Response {
     let keepalive = respond::keepalive(&p.rt.config());
-    let call = p.call(model, body, stream, stream, routed);
+    let call = p.call(model, body, stream, stream, routed, XaiCall::default());
     dispatch::serve(&p.rt, call, move |result| async move {
         match result {
             Err(failure) => failed(&failure, stream),
@@ -657,11 +719,40 @@ async fn raw(p: Prepared, model: &str, body: Vec<u8>, stream: bool, routed: bool
 }
 
 /// `collectImagesWithModel` and `streamImagesWithModel`: one buffered execution whose
-/// result is normalized to the Images API, or emitted as completed events.
-async fn normalized(p: Prepared, model: &str, body: Vec<u8>, format: String, prefix: &str, stream: bool) -> Response {
-    let call = p.call(model, body, false, stream, false);
+/// result is normalized to the Images API, or emitted as completed events. An xAI call
+/// (`xai`) answers in the `response_format` the executor's payload rules settled on
+/// (Go `WithFinalizedResponseFormatCallback`), else in `format`.
+#[allow(clippy::too_many_arguments)]
+async fn normalized(
+    p: Prepared,
+    model: &str,
+    body: Vec<u8>,
+    format: String,
+    prefix: &str,
+    stream: bool,
+    xai: Option<Option<Vec<u8>>>,
+) -> Response {
+    let finalized: Arc<Mutex<Option<String>>> = Arc::default();
+    let extras = match xai {
+        Some(original) => {
+            let slot = finalized.clone();
+            XaiCall {
+                original,
+                on_format: Some(Arc::new(move |format: &str| {
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(format.to_owned());
+                })),
+            }
+        }
+        None => XaiCall::default(),
+    };
+    let call = p.call(model, body, false, stream, false, extras);
     let prefix = prefix.to_owned();
     dispatch::serve(&p.rt, call, move |result| async move {
+        let format = finalized
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or(format);
         let payload = match result {
             Err(failure) => return failed(&failure, stream),
             Ok(Done::Buffered { body, .. }) => body,
@@ -748,15 +839,31 @@ pub async fn generations(
     }
     if is_xai_model(&model) {
         let req = xai_base_request(&model, &prompt, &format, &xai_json_options(&body, true));
-        let routing = text(&req, "model");
-        return normalized(p, &routing, req, format, "image_generation", stream).await;
+        // `buildXAIImagesGenerationsOriginalRequest`: without the route's defaults.
+        let original = xai_base_request(
+            &model,
+            &prompt,
+            text(&body, "response_format").trim(),
+            &xai_json_options(&body, false),
+        );
+        let routing = routing_xai_model(&p.rt, &model);
+        return normalized(
+            p,
+            &routing,
+            req,
+            format,
+            "image_generation",
+            stream,
+            Some(Some(original)),
+        )
+        .await;
     }
     // isOpenAICompatImagesModel (the only family left after `unsupported`).
     let req = compat_json_request(&body, &model, stream);
     if stream {
         return raw(p, &model, req, true, false).await;
     }
-    normalized(p, &model, req, format, "image_generation", false).await
+    normalized(p, &model, req, format, "image_generation", false, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -879,7 +986,8 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
         return bad_request("Invalid request: image is required");
     }
     let images: Vec<String> = files.iter().map(data_url).collect();
-    let mut format = form.value("response_format").trim().to_owned();
+    let raw_format = form.value("response_format").trim().to_owned();
+    let mut format = raw_format.clone();
     if format.is_empty() {
         format = "b64_json".into();
     }
@@ -893,8 +1001,9 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
             n: parse_int(&form.value("n"), 0),
         };
         let req = xai_edit_request(&model, &prompt, &images, &format, &options);
-        let routing = text(&req, "model");
-        return normalized(p, &routing, req, format, "image_edit", stream).await;
+        let original = edit_original(&req, &raw_format);
+        let routing = routing_xai_model(&p.rt, &model);
+        return normalized(p, &routing, req, format, "image_edit", stream, Some(original)).await;
     }
     // Codex tool models and OpenAI-compatible image models forward the rebuilt form.
     let (req, content_type) = multipart::rewrite_images_form(&form, &model, stream, true);
@@ -903,7 +1012,19 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
     if routed || stream {
         return raw(p, &model, req, stream, routed).await;
     }
-    normalized(p, &model, req, format, "image_edit", false).await
+    normalized(p, &model, req, format, "image_edit", false, None).await
+}
+
+/// `buildXAIImagesEditOriginalRequest`: an edit request differs from its original only
+/// by a `response_format` the client left out, so `None` (the request itself) unless
+/// the client sent none; the image data is not copied otherwise.
+fn edit_original(req: &[u8], raw_format: &str) -> Option<Vec<u8>> {
+    if !raw_format.trim().is_empty() {
+        return None;
+    }
+    let mut original = req.to_vec();
+    gj::delete(&mut original, "response_format");
+    Some(original)
 }
 
 /// `imagesEditsFromJSON`.
@@ -927,7 +1048,8 @@ async fn edits_json(p: Prepared, body: &[u8]) -> Response {
     if prompt.is_empty() {
         return bad_request("Invalid request: prompt is required");
     }
-    let mut format = text(body, "response_format").trim().to_owned();
+    let raw_format = text(body, "response_format").trim().to_owned();
+    let mut format = raw_format.clone();
     if format.is_empty() {
         format = "b64_json".into();
     }
@@ -942,14 +1064,15 @@ async fn edits_json(p: Prepared, body: &[u8]) -> Response {
             return bad_request("Invalid request: image is required");
         }
         let req = xai_edit_request(&model, &prompt, &images, &format, &xai_json_options(body, false));
-        let routing = text(&req, "model");
-        return normalized(p, &routing, req, format, "image_edit", stream).await;
+        let original = edit_original(&req, &raw_format);
+        let routing = routing_xai_model(&p.rt, &model);
+        return normalized(p, &routing, req, format, "image_edit", stream, Some(original)).await;
     }
     let req = compat_json_request(body, &model, stream);
     if stream {
         return raw(p, &model, req, true, false).await;
     }
-    normalized(p, &model, req, format, "image_edit", false).await
+    normalized(p, &model, req, format, "image_edit", false, None).await
 }
 
 // --- net/http DetectContentType (sniff.go) ------------------------------------------------

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use cpa_common::gostr::GoStr;
 use cpa_core::config::Config;
+use cpa_core::config::credentials::{AuthFile, Unsettled};
 use cpa_core::credential::{Credential, MetadataPatch, Source};
 use cpa_core::exec::{ExecError, ExecStream, FailureScope};
 use cpa_exec::{Executors, Readiness};
@@ -511,9 +512,21 @@ impl Runtime {
             ));
         }
         match failed {
+            // Another task refreshed it meanwhile. That recovers nothing when the token set
+            // requests use still holds a refresh token refused for good: its own refresh
+            // may only have rotated the other set (#92), so this one fails as that one did.
+            Some(revision)
+                if current.revision != revision && self.store.refused_renewal(&current).active_refused(&current) =>
+            {
+                if let Some(refused) = refused {
+                    self.store.reject_refused(refused, registered.registration, true);
+                }
+                return Err(refused_active());
+            }
             Some(revision) if current.revision != revision => return Ok(current),
             Some(_) => {}
-            None if self.readiness(&current, cfg) == Readiness::Ready => return Ok(current),
+            // A refresh token refused for good is no reason to refresh.
+            None if self.readiness(&self.store.renewable(&current), cfg) == Readiness::Ready => return Ok(current),
             None => {}
         }
         let refused = refused.map(|c| Arc::new(c.clone()));
@@ -553,7 +566,8 @@ impl Runtime {
         // Still under the preparation lock, so a refresh queued behind this one sees it.
         let patch = prepared.inspect_err(|e| {
             if let Some(refused) = &refused {
-                self.store.reject_refused(refused, registered.registration, e);
+                let terminal = crate::classify::is_invalid_grant(e.status, &String::from_utf8_lossy(&e.body));
+                self.store.reject_refused(refused, registered.registration, terminal);
             }
         })?;
         let store = self.store.clone();
@@ -590,7 +604,13 @@ impl Runtime {
     // due, and Claude's prepare already refreshed on demand before 50d5fe18. A provider
     // whose prepare refreshes only inside its lead cannot recover a revoked token here.
     pub async fn refresh_after_unauthorized(&self, credential: &Credential, cfg: &Config) -> Option<Arc<Credential>> {
-        if !self.executors.has_refresh_credential(credential) {
+        // A known active renewal refusal still needs the fenced preparation path to
+        // quarantine the access token this 401 rejected. It masks the refused refresh
+        // token before any grant, so handling the rejection does not resend it.
+        let renewable = self.store.renewable(&Arc::new(credential.clone()));
+        if !self.executors.has_refresh_credential(&renewable)
+            && !self.store.refused_renewal(credential).active_refused(credential)
+        {
             return None;
         }
         let refreshed = match self
@@ -605,7 +625,7 @@ impl Runtime {
                 // selected nor refreshed again until its tokens change. Preparation
                 // recorded that, or refused because another 401 had.
                 if self.store.tokens_rejected(credential) {
-                    if !crate::classify::is_invalid_grant(error.status, &String::from_utf8_lossy(&error.body)) {
+                    if error.status == 401 && error.body.starts_with(b"credential tokens were refused") {
                         return None;
                     }
                     tracing::warn!(
@@ -732,11 +752,16 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
             state.reconcile(&snapshot);
             let mut jobs = Vec::new();
             rt.store.forget_stale_unauthorized(&rejected, &snapshot);
+            rt.store.forget_removed_renewals(&snapshot);
             // Far enough ahead that any expiry has passed, near enough for chrono.
             let eventually = wall + chrono::Duration::days(36_500);
             // Go `shouldRefresh`: tokens refused for good wait for new ones.
             let refused = rt.store.rejected_ids(&snapshot);
-            for c in snapshot.iter().filter(|c| !refused.contains(&c.id)) {
+            for original in snapshot.iter().filter(|c| !refused.contains(&c.id)) {
+                // Scheduled on what can still renew: a refresh token refused for good is
+                // never due, so a partition left without one stops here, at any time.
+                let renewable = rt.store.renewable(original);
+                let c = &renewable;
                 if !refresh_candidate(c) {
                     // Go refreshes a disabled credential; here its due refresh waits until
                     // it is enabled, logged once per revision, when it comes due.
@@ -778,7 +803,7 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                     if at > now {
                         soonest(at);
                     } else if state.reserve(c, now) {
-                        jobs.push(spawn(c, true));
+                        jobs.push(spawn(original, true));
                     } else {
                         warn_refresh_held(&mut state, c);
                         if let Some(at) = state.retry_at(c).filter(|at| *at > now) {
@@ -793,7 +818,7 @@ async fn refresh_loop(weak: std::sync::Weak<Runtime>) {
                 let due = rt.executors.prepare_due(c, &cfg, wall, horizon);
                 match due {
                     Some(at) if at > wall => soonest(now + (at - wall).to_std().unwrap_or_default()),
-                    Some(_) if state.reserve(c, now) => jobs.push(spawn(c, false)),
+                    Some(_) if state.reserve(c, now) => jobs.push(spawn(original, false)),
                     // A job still running, or backing off: look again when that ends.
                     Some(_) => {
                         warn_refresh_held(&mut state, c);
@@ -923,7 +948,7 @@ async fn run_refresh_job(
         }
         return;
     };
-    let ineffective = result.is_ok() && rt.readiness(&current, &cfg) != Readiness::Ready;
+    let ineffective = result.is_ok() && rt.readiness(&rt.store.renewable(&current), &cfg) != Readiness::Ready;
     let now = Instant::now();
     let retry = reservation.end(|state| {
         state.finish(&current, result.as_ref().err(), ineffective, now);
@@ -1475,6 +1500,10 @@ pub struct CredentialStore {
     /// `LastRefreshedAt`).
     unauthorized: Mutex<Rejections>,
     unauthorized_noted: tokio::sync::watch::Sender<()>,
+    /// Codex refresh tokens a token endpoint refused for good, by credential and
+    /// partition ([`cpa_exec::codex_refresh::Refused`]): never sent again, and each
+    /// lifted only when its partition's refresh token changes.
+    renewals: Mutex<HashMap<String, cpa_exec::codex_refresh::Refused>>,
     /// Ends the upstream WebSocket sessions a removed credential serves (set by the
     /// runtime to [`cpa_exec::Executors::credential_session_closer`]).
     session_closer: std::sync::OnceLock<SessionCloser>,
@@ -1596,6 +1625,7 @@ impl CredentialStore {
             error_events: std::sync::OnceLock::new(),
             changed: tokio::sync::watch::Sender::new(()),
             unauthorized: Mutex::default(),
+            renewals: Mutex::default(),
             unauthorized_noted: tokio::sync::watch::Sender::new(()),
             session_closer: std::sync::OnceLock::new(),
             registrations,
@@ -1880,10 +1910,9 @@ impl CredentialStore {
         let replaced: Vec<&str> = after
             .iter()
             .filter(|next| {
-                before
-                    .iter()
-                    .find(|c| c.id == next.id)
-                    .is_some_and(|previous| !previous.disabled && !next.disabled && credentials_changed(previous, next))
+                before.iter().find(|c| c.id == next.id).is_some_and(|previous| {
+                    !previous.disabled && !next.disabled && active_tokens_changed(previous, next)
+                })
             })
             .map(|c| c.id.as_str())
             .collect();
@@ -2017,8 +2046,8 @@ impl CredentialStore {
     /// (`registration`, Go `RegistrationEpoch`), so a credential removed and imported
     /// again while the exchange ran is not rejected. Checked and recorded under the
     /// store's read lock, so a replacement or removal lands entirely before or after.
-    pub(crate) fn reject_refused(&self, refused: &Credential, registration: u64, error: &ExecError) -> bool {
-        if !crate::classify::is_invalid_grant(error.status, &String::from_utf8_lossy(&error.body)) {
+    pub(crate) fn reject_refused(&self, refused: &Credential, registration: u64, terminal: bool) -> bool {
+        if !terminal {
             return false;
         }
         let inner = self.read();
@@ -2030,7 +2059,7 @@ impl CredentialStore {
             || self.registered(&current.id).registration != registration
             || token.is_empty()
             || effective_access_token(current) != token
-            || credentials_changed(refused, current)
+            || active_tokens_changed(refused, current)
         {
             return false;
         }
@@ -2039,6 +2068,46 @@ impl CredentialStore {
             .unwrap_or_else(PoisonError::into_inner)
             .reject_tokens(current.clone());
         true
+    }
+
+    /// The refresh tokens of `c` refused for good that it still holds.
+    pub(crate) fn refused_renewal(&self, c: &Credential) -> cpa_exec::codex_refresh::Refused {
+        self.renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&c.id)
+            .map(|r| r.current(c))
+            .unwrap_or_default()
+    }
+
+    /// Drops the refusals of credentials no longer in `snapshot`.
+    pub(crate) fn forget_removed_renewals(&self, snapshot: &[Arc<Credential>]) {
+        self.renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, _| snapshot.iter().any(|c| c.id == *id));
+    }
+
+    /// Records what a refresh of credential `id` left refused ([`Self::refused_renewal`]).
+    pub(crate) fn note_renewal(&self, id: &str, refused: cpa_exec::codex_refresh::Refused) {
+        let mut renewals = self.renewals.lock().unwrap_or_else(PoisonError::into_inner);
+        if refused.is_empty() {
+            renewals.remove(id);
+        } else {
+            renewals.insert(id.to_owned(), refused);
+        }
+    }
+
+    /// `c` as refresh scheduling sees it: a refresh token refused for good is no renewal
+    /// credential, so its partition is never due and never refreshed (it would only be
+    /// refused again). The same `Arc` when nothing of `c` is refused.
+    pub(crate) fn renewable(&self, c: &Arc<Credential>) -> Arc<Credential> {
+        let refused = self.refused_renewal(c);
+        if refused.is_empty() {
+            c.clone()
+        } else {
+            Arc::new(refused.mask(c))
+        }
     }
 
     /// Whether `c`'s tokens were refused for good ([`crate::scheduler::Scheduler::tokens_rejected`]).
@@ -2379,7 +2448,10 @@ impl CredentialStore {
             }
             committed
         };
-        if credentials_changed(original, &committed) {
+        // Go `updateInternal` after a refresh: new tokens end the unauthorized state,
+        // but only new tokens of the set requests use (#92): rotating the other token set
+        // does not recover a refused one.
+        if active_tokens_changed(original, &committed) {
             self.recover_unauthorized(id);
         }
         Ok(CodexAdmission::Committed(committed))
@@ -2804,7 +2876,7 @@ impl CredentialStore {
     /// Replaces the credential set (watcher reload, management import/delete). Unchanged
     /// credentials keep their revision; new and changed ones get fresh revisions.
     pub fn reconcile(&self, credentials: Vec<Credential>) {
-        self.reconcile_scanned(credentials, &std::collections::BTreeMap::new());
+        self.reconcile_scanned(credentials, &std::collections::BTreeMap::new(), &Unsettled::default());
     }
 
     /// [`Self::reconcile`] for an auth-folder scan; `read` has the SHA-256 of the bytes
@@ -2817,16 +2889,23 @@ impl CredentialStore {
     /// under the exclusive reload gate, so no write lands between it and the swap, but
     /// before `inner` is taken, so its file reads never stall readers. Returns the files
     /// whose scanned credential was rejected.
+    ///
+    /// A file credential whose file the scan left `unsettled` (incomplete, unreadable,
+    /// or in a folder it could not list) and that the scan did not rebuild stays as it
+    /// is now, under the same gate: the revision, cooldowns, 401 block and saved-document
+    /// binding all survive, a refresh committed after the scan is not undone, and a
+    /// credential already removed is not brought back.
     pub fn reconcile_scanned(
         &self,
         credentials: Vec<Credential>,
         read: &std::collections::BTreeMap<std::path::PathBuf, [u8; 32]>,
+        unsettled: &Unsettled,
     ) -> Vec<std::path::PathBuf> {
         use sha2::{Digest, Sha256};
         let reload = self.reload.write().unwrap_or_else(PoisonError::into_inner);
         let mut credentials = credentials;
         // A credential this scan synthesized has no revision yet; one kept for an
-        // incomplete file is the store's own record, not built from `read`.
+        // unsettled file is the store's own record, not built from `read`.
         let built: std::collections::HashSet<std::path::PathBuf> = credentials
             .iter()
             .filter(|c| c.revision == 0)
@@ -2850,13 +2929,26 @@ impl CredentialStore {
                 }
                 // The scan's own rule: a FIFO or device in the file's place is never read
                 // (it could block or never end) and counts as a changed file.
-                let on_disk: Option<[u8; 32]> = cpa_core::config::credentials::read_regular(path)
-                    .filter(|data| !data.is_empty())
-                    .map(|data| Sha256::digest(&data).into());
+                let file = cpa_core::config::credentials::read_auth_file(path);
+                #[cfg(test)]
+                let file = crate::watching::faults::read(crate::watching::faults::Stage::Freshness, path, file);
+                let on_disk: Option<[u8; 32]> = match file {
+                    AuthFile::Bytes(data) if !data.is_empty() => Some(Sha256::digest(&data).into()),
+                    _ => None,
+                };
                 if on_disk.as_ref() != Some(seen) {
                     rejected.push(path.clone());
                     *cred = Credential::clone(existing);
                 }
+            }
+        }
+        let scanned: std::collections::HashSet<String> = credentials.iter().map(|c| c.id.clone()).collect();
+        for existing in self.snapshot().iter() {
+            if let Source::File(path) = &existing.source
+                && !scanned.contains(&existing.id)
+                && unsettled.contains(path)
+            {
+                credentials.push(Credential::clone(existing));
             }
         }
         let mut guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
@@ -3312,13 +3404,14 @@ fn rebase_patch(
             out.set.extend(changed);
         }
         // Go `codexSIWCCredentialKeys`.
-        const CODEX_SIWC: [&str; 9] = [
+        const CODEX_SIWC: [&str; 10] = [
             "access_token",
             "refresh_token",
             "id_token",
             "client_id",
             "device_id",
             "expired",
+            "expires_at",
             "last_refresh",
             "scope",
             "scopes",
@@ -3368,12 +3461,31 @@ async fn refresh_codex_file(
         let _guard = guard;
         let (lock, disk) = read_locked_codex_file(&path, &shutdown).await.map_err(local)?;
         // Recorded while the preparation lock is held ([`Runtime::prepare_credential_with`]).
-        let patch = refresher.refresh_locked(&view, &disk, mode).await.inspect_err(|e| {
-            if let Some(refused) = &refused {
-                store.reject_refused(refused, registered.registration, e);
+        let known = store.refused_renewal(&current);
+        let (refreshed, renewal) = refresher.refresh_locked(&view, &disk, mode, &known).await;
+        store.note_renewal(&current.id, renewal);
+        // The token an upstream refused (`refused`) belongs to the partition requests use:
+        // when that partition's refresh token is refused for good, nothing but a new
+        // sign-in or another token set recovers it (Go `accessTokenRejected`).
+        let terminal = refused.as_ref().is_some_and(|r| renewal.active_refused(r));
+        if let Some(refused) = &refused {
+            store.reject_refused(refused, registered.registration, terminal);
+        }
+        // A management refresh of a credential whose partition requests use holds a
+        // refused refresh token fails, after saving whatever the other partition got
+        // (Go v8.0.67 a96e640d; first-party codex-rs fails a refused token fast).
+        let quarantined = (mode == cpa_exec::codex_refresh::RefreshMode::Management)
+            .then_some(renewal)
+            .filter(|r| !r.is_empty());
+        let fail_quarantined = |c: &Credential| -> Result<(), ExecError> {
+            match quarantined {
+                Some(r) if r.active_refused(c) => Err(refused_active()),
+                _ => Ok(()),
             }
-        })?;
+        };
+        let patch = refreshed?;
         if patch.is_empty() {
+            fail_quarantined(&current)?;
             return Ok(current);
         }
         let admitted = tokio::task::spawn_blocking(move || {
@@ -3404,11 +3516,24 @@ async fn refresh_codex_file(
                 format!("committing prepared credential: {e:?}"),
             )
         })?;
-        Ok(match admitted {
+        let committed = match admitted {
             CodexAdmission::Committed(c) | CodexAdmission::Discarded(c) => c,
-        })
+        };
+        fail_quarantined(&committed)?;
+        Ok(committed)
     });
     transaction.await.map_err(|e| local(e.to_string()))?
+}
+
+/// A refresh of a credential whose active token set (SIWC while `use_siwc` is on, else
+/// the outer tokens) holds a refresh token refused for good: only a new sign-in of that
+/// set recovers it (#92).
+fn refused_active() -> ExecError {
+    ExecError::local(
+        401,
+        FailureScope::Credential,
+        "the refresh token of the credential's active token set was refused; sign in again",
+    )
 }
 
 /// The Codex credential document `bytes` with `patch` applied (each partition over a
@@ -3626,6 +3751,42 @@ pub(crate) fn credentials_changed(a: &Credential, b: &Credential) -> bool {
             .iter()
             .any(|k| siwc(a, k) != siwc(b, k))
         || use_siwc(a) != use_siwc(b)
+}
+
+/// Whether the token set requests use changed between `a` and `b`: the Sign in with
+/// ChatGPT partition while `use_siwc` is on (its access, refresh and ID tokens and issued
+/// client), else the outer tokens and API key; a `use_siwc` toggle always counts. A
+/// block or 401 recovery tied to the tokens an upstream or a token endpoint refused
+/// lifts on this, so refreshing or replacing the other partition does not end it.
+/// Each partition is its own token set (OpenAI "Accounts and sessions": never combine
+/// one registration's client ID with another's tokens).
+pub(crate) fn active_tokens_changed(a: &Credential, b: &Credential) -> bool {
+    let (siwc_a, siwc_b) = (
+        cpa_core::registry::dynamic::uses_siwc(a),
+        cpa_core::registry::dynamic::uses_siwc(b),
+    );
+    if siwc_a != siwc_b {
+        return true;
+    }
+    if siwc_a {
+        let siwc = |c: &Credential, key: &str| {
+            c.metadata
+                .get("siwc")
+                .and_then(|s| s.get(key))
+                .and_then(Value::as_str)
+                .map_or("", str::trim)
+                .to_owned()
+        };
+        return ["access_token", "refresh_token", "id_token", "client_id"]
+            .iter()
+            .any(|k| siwc(a, k) != siwc(b, k));
+    }
+    let mut outer_a = a.clone();
+    let mut outer_b = b.clone();
+    for c in [&mut outer_a, &mut outer_b] {
+        c.metadata.remove("siwc");
+    }
+    credentials_changed(&outer_a, &outer_b)
 }
 
 /// Replaces `path` with `bytes` through an exclusively created, uniquely named 0600
@@ -4422,7 +4583,7 @@ pub(crate) mod tests {
         store.apply_patch("synthetic.json", revision, &patch).unwrap();
         let current = || store.get("synthetic.json").unwrap();
         let before = current();
-        store.reconcile_scanned(stale.credentials, &stale.read);
+        store.reconcile_scanned(stale.credentials, &stale.read, &Unsettled::default());
         assert_eq!(
             current().metadata["prefix"],
             "pfx-9",
@@ -4431,20 +4592,20 @@ pub(crate) mod tests {
         assert_eq!(current().revision, before.revision);
         write("manual-edit");
         let manual = scan();
-        store.reconcile_scanned(manual.credentials, &manual.read);
+        store.reconcile_scanned(manual.credentials, &manual.read, &Unsettled::default());
         assert_eq!(current().metadata["prefix"], "manual-edit", "a real edit was lost");
         let before = current();
         write("deleted-edit");
         let deleted = scan();
         std::fs::remove_file(&path).unwrap();
-        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read);
+        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read, &Unsettled::default());
         assert_eq!(
             current().revision,
             before.revision,
             "a deleted file's snapshot was applied"
         );
         std::fs::create_dir(&path).unwrap();
-        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read);
+        store.reconcile_scanned(deleted.credentials.clone(), &deleted.read, &Unsettled::default());
         assert_eq!(
             current().revision,
             before.revision,
@@ -4458,7 +4619,7 @@ pub(crate) mod tests {
             assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
             let done = spawn_bounded({
                 let store = store.clone();
-                move || store.reconcile_scanned(deleted.credentials, &deleted.read)
+                move || store.reconcile_scanned(deleted.credentials, &deleted.read, &Unsettled::default())
             });
             done.recv_timeout(BOUND).expect("the freshness check opened the FIFO");
             assert_eq!(current().revision, before.revision, "a FIFO's snapshot was applied");
@@ -5290,9 +5451,31 @@ pub(crate) mod tests {
         }
 
         async fn gated(files: &[(&str, &Value)], permits: usize) -> Self {
+            Self::answering(
+                files,
+                permits,
+                (
+                    200,
+                    r#"{"access_token":"outer-access-refreshed","refresh_token":"outer-ref-refreshed","expires_in":864000}"#,
+                ),
+                (
+                    200,
+                    r#"{"access_token":"siwc-access-refreshed","refresh_token":"siwc-ref-refreshed","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#,
+                ),
+            )
+            .await
+        }
+
+        /// [`Self::gated`] with the outer and SIWC token endpoints' answers.
+        async fn answering(
+            files: &[(&str, &Value)],
+            permits: usize,
+            outer: (u16, &'static str),
+            siwc: (u16, &'static str),
+        ) -> Self {
             let grants = Arc::new(Mutex::new(Vec::new()));
             let gate = Arc::new(tokio::sync::Semaphore::new(permits));
-            let route = |partition: &'static str, answer: &'static str| {
+            let route = |partition: &'static str, (status, answer): (u16, &'static str)| {
                 let (grants, gate) = (grants.clone(), gate.clone());
                 axum::routing::post(move |body: String| async move {
                     let field = |key: &str| {
@@ -5306,24 +5489,12 @@ pub(crate) mod tests {
                         .unwrap()
                         .push((partition, field("refresh_token"), field("client_id")));
                     gate.acquire().await.unwrap().forget();
-                    answer
+                    (axum::http::StatusCode::from_u16(status).unwrap(), answer)
                 })
             };
             let app = axum::Router::new()
-                .route(
-                    "/oauth/token",
-                    route(
-                        "outer",
-                        r#"{"access_token":"outer-access-refreshed","refresh_token":"outer-ref-refreshed","expires_in":864000}"#,
-                    ),
-                )
-                .route(
-                    "/siwc/token",
-                    route(
-                        "siwc",
-                        r#"{"access_token":"siwc-access-refreshed","refresh_token":"siwc-ref-refreshed","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#,
-                    ),
-                );
+                .route("/oauth/token", route("outer", outer))
+                .route("/siwc/token", route("siwc", siwc));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -5436,6 +5607,354 @@ pub(crate) mod tests {
                 "expired": (now + siwc.2).to_rfc3339(),
             },
         })
+    }
+
+    const OUTER_OK: (u16, &str) = (
+        200,
+        r#"{"access_token":"outer-access-refreshed","refresh_token":"outer-ref-refreshed","expires_in":864000}"#,
+    );
+    const SIWC_REFUSED: (u16, &str) = (400, r#"{"error":"invalid_grant"}"#);
+
+    fn partition_grants(grants: &Grants, partition: &str) -> usize {
+        grants.iter().filter(|(p, ..)| *p == partition).count()
+    }
+
+    /// #92 (Go v8.0.67 a96e640d; OpenAI SIWC errors and recovery; first-party codex-rs
+    /// keeps a permanent refresh failure per auth snapshot): after an upstream 401 on the
+    /// SIWC token requests use, its refresh token is refused (`invalid_grant`) and sent
+    /// once. The credential is quarantined. A manual refresh then refreshes and saves the
+    /// outer partition, never resends the refused SIWC token, fails with "sign in again",
+    /// and the quarantine stays: refreshing the other token set does not recover this
+    /// one. A new SIWC sign-in in the file lifts it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_manual_refresh_keeps_a_refused_siwc_credential_quarantined() {
+        let file = codex_file(
+            ("a", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::hours(1)),
+        );
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(rt.refresh_after_unauthorized(&c, &rt.config()).await.is_none());
+        let first = f.grants();
+        assert_eq!(
+            partition_grants(&first, "siwc"),
+            1,
+            "the refused token is sent once: {first:?}"
+        );
+        assert!(rt.store.tokens_rejected(&rt.store.get("codex.json").unwrap()));
+        let manual = rt.refresh_credential("codex.json").await;
+        let second = f.grants();
+        assert_eq!(
+            partition_grants(&second, "siwc"),
+            0,
+            "the refused token was sent again: {second:?}"
+        );
+        assert_eq!(partition_grants(&second, "outer"), 1, "{second:?}");
+        assert_eq!(
+            manual.map(|c| c.revision).map_err(|e| e.status),
+            Err(401),
+            "a manual refresh of a refused active token set fails"
+        );
+        assert_eq!(
+            f.tokens("codex.json", &["/refresh_token", "/siwc/refresh_token"]),
+            [
+                serde_json::json!("outer-ref-refreshed"),
+                serde_json::json!("siwc-ref-dead")
+            ],
+            "the outer refresh is saved"
+        );
+        assert!(
+            rt.store.tokens_rejected(&rt.store.get("codex.json").unwrap()),
+            "an outer refresh lifted the SIWC quarantine"
+        );
+        // A new sign-in of the SIWC partition.
+        let relogin = codex_file(
+            ("a", chrono::Duration::days(10)),
+            ("new", "oaiapp_fake", chrono::Duration::hours(1)),
+        );
+        std::fs::write(f.dir.join("codex.json"), relogin.to_string()).unwrap();
+        let cfg = rt.config();
+        rt.store.reconcile(
+            cpa_core::config::credentials::from_auth_dir(&cfg)
+                .into_iter()
+                .map(crate::testing::local)
+                .collect(),
+        );
+        assert!(!rt.store.tokens_rejected(&rt.store.get("codex.json").unwrap()));
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// Sol review of 8596a77d: two management refreshes of a quarantined SIWC credential
+    /// queue on its preparation lock. The first rotates the outer tokens and fails with
+    /// "sign in again"; the second, which read the credential before that commit, finds
+    /// a newer revision. That revision recovered nothing (the active SIWC refresh token is
+    /// still refused), so it fails the same way instead of answering OK. Barriers: the
+    /// first holds the lock inside its outer grant (the mock's gate) until the second has
+    /// reached preparation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_manual_refresh_of_a_refused_credential_fails_too() {
+        let name = "codex-queued.json";
+        let file = codex_file(
+            ("q", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::hours(1)),
+        );
+        let f = CodexDisk::answering(&[(name, &file)], 0, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        // The upstream 401 and its refused SIWC refresh: the gate admits every send it makes.
+        f.gate.add_permits(3);
+        let c = rt.store.get(name).unwrap();
+        assert!(rt.refresh_after_unauthorized(&c, &rt.config()).await.is_none());
+        while let Ok(permit) = f.gate.try_acquire() {
+            permit.forget();
+        }
+        f.grants();
+        assert!(rt.store.tokens_rejected(&rt.store.get(name).unwrap()));
+        let before = reached("prepare", name);
+        let first = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.refresh_credential(name).await.map(|c| c.revision) }
+        });
+        f.granted().await; // The first holds the preparation lock inside its outer grant.
+        let second = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.refresh_credential(name).await.map(|c| c.revision) }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reached("prepare", name) < before + 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second refresh reached preparation");
+        f.gate.add_permits(100);
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.map_err(|e| e.status), Err(401), "the first manual refresh");
+        assert_eq!(second.map_err(|e| e.status), Err(401), "the queued manual refresh");
+        let grants = f.grants();
+        assert_eq!(partition_grants(&grants, "siwc"), 0, "{grants:?}");
+        assert!(rt.store.tokens_rejected(&rt.store.get(name).unwrap()));
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// #92 (Go v8.0.67 95f125ff, e5827065): a due SIWC refresh whose token is refused for
+    /// good is sent once; when its backoff has run out, the next background job has
+    /// nothing to renew and sends nothing, instead of retrying the dead token forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_due_siwc_refresh_is_never_retried() {
+        let file = codex_file(
+            ("b", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        for round in 0..3 {
+            let c = rt.store.get("codex.json").unwrap();
+            run_refresh_job(rt.clone(), rt.config(), workers.clone(), c.clone(), false).await;
+            rt.refresh_state.lock().unwrap().expire(&c);
+            let grants = f.grants();
+            let want = usize::from(round == 0);
+            assert_eq!(partition_grants(&grants, "siwc"), want, "round {round}: {grants:?}");
+            assert_eq!(partition_grants(&grants, "outer"), 0, "round {round}: {grants:?}");
+        }
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// A due or management refresh can refuse the only renewable token before an
+    /// upstream rejects its access token. The later 401 must still quarantine it,
+    /// without sending the refused refresh token again. A new sign-in recovers it.
+    async fn known_refusal_after_unauthorized(siwc: bool, management: bool) {
+        let mut file = codex_file(
+            ("dead", chrono::Duration::minutes(2)),
+            ("dead", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        file["use_siwc"] = siwc.into();
+        if siwc {
+            file.as_object_mut().unwrap().remove("refresh_token");
+        } else {
+            file.as_object_mut().unwrap().remove("siwc");
+        }
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, SIWC_REFUSED, SIWC_REFUSED).await;
+        let rt = &f.rt;
+        let c = rt.store.get("codex.json").unwrap();
+        if management {
+            assert_eq!(rt.refresh_credential(&c.id).await.unwrap_err().status, 401);
+        } else {
+            run_refresh_job(
+                rt.clone(),
+                rt.config(),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                c,
+                false,
+            )
+            .await;
+        }
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(rt.store.refused_renewal(&c).active_refused(&c));
+        assert!(!rt.executors.has_refresh_credential(&rt.store.renewable(&c)));
+        assert!(
+            !rt.store.tokens_rejected(&c),
+            "a renewal refusal alone does not reject usable access tokens"
+        );
+        assert_eq!(f.grants().len(), 1);
+        assert!(rt.refresh_after_unauthorized(&c, &rt.config()).await.is_none());
+        assert!(f.grants().is_empty(), "the refused refresh token was sent again");
+        assert!(
+            rt.store.tokens_rejected(&rt.store.get(&c.id).unwrap()),
+            "known refusal then upstream 401 must quarantine: siwc={siwc}, management={management}"
+        );
+        assert!(rt.store.select(Selection::new("codex", "gpt-5")).is_none());
+
+        let mut relogin = file;
+        if siwc {
+            relogin["siwc"]["access_token"] = "siwc-new-signin".into();
+            relogin["siwc"]["refresh_token"] = "siwc-refresh-new-signin".into();
+        } else {
+            relogin["access_token"] = "outer-new-signin".into();
+            relogin["refresh_token"] = "outer-refresh-new-signin".into();
+        }
+        std::fs::write(f.dir.join(&c.id), relogin.to_string()).unwrap();
+        rt.store.reconcile(
+            cpa_core::config::credentials::from_auth_dir(&rt.config())
+                .into_iter()
+                .map(crate::testing::local)
+                .collect(),
+        );
+        let current = rt.store.get(&c.id).unwrap();
+        assert!(!rt.store.tokens_rejected(&current));
+        assert!(!rt.store.refused_renewal(&current).active_refused(&current));
+        assert!(rt.store.select(Selection::new("codex", "gpt-5")).is_some());
+        // A late 401 for the old tokens cannot quarantine the new sign-in.
+        rt.refresh_after_unauthorized(&c, &rt.config()).await;
+        assert!(!rt.store.tokens_rejected(&current));
+        assert!(f.grants().is_empty());
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_due_outer_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_management_outer_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(false, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_due_siwc_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_refusal_after_management_siwc_renewal_is_quarantined() {
+        known_refusal_after_unauthorized(true, true).await;
+    }
+
+    /// #92 (Go v8.0.67 5f38d557, baec297f): with `use_siwc` off, a refused SIWC refresh
+    /// token does not touch the outer token set requests use: the credential is neither
+    /// quarantined nor blocked, a manual refresh succeeds on the outer partition alone,
+    /// and the SIWC failure stays recorded beside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_codex_stays_usable_while_its_siwc_partition_is_refused() {
+        let mut file = codex_file(
+            ("c", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        file["use_siwc"] = false.into();
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        let c = rt.store.get("codex.json").unwrap();
+        run_refresh_job(
+            rt.clone(),
+            rt.config(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            c,
+            false,
+        )
+        .await;
+        assert_eq!(partition_grants(&f.grants(), "siwc"), 1);
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(!rt.store.tokens_rejected(&c));
+        let lease = rt
+            .store
+            .select(Selection::new("codex", "gpt-5"))
+            .expect("still selectable");
+        assert_eq!(lease.credential.str("access_token"), Some("outer-c"));
+        drop(lease);
+        let manual = rt
+            .refresh_credential("codex.json")
+            .await
+            .expect("the outer refresh succeeds");
+        let grants = f.grants();
+        assert_eq!(
+            (partition_grants(&grants, "outer"), partition_grants(&grants, "siwc")),
+            (1, 0),
+            "{grants:?}"
+        );
+        assert_eq!(manual.str("refresh_token"), Some("outer-ref-refreshed"));
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// #92: the refusal does not wear off with time. At any later instant the refused
+    /// SIWC partition is never due, while the outer one still comes due on its own
+    /// schedule; a changed SIWC refresh token makes it renewable again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_renewal_outlives_time_until_its_token_changes() {
+        let file = codex_file(
+            ("d", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        let f = CodexDisk::answering(&[("codex.json", &file)], 1000, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        let c = rt.store.get("codex.json").unwrap();
+        run_refresh_job(
+            rt.clone(),
+            rt.config(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            c,
+            false,
+        )
+        .await;
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(rt.store.refused_renewal(&c).siwc_refused(&c));
+        let renewable = rt.store.renewable(&c);
+        let now = chrono::Utc::now();
+        for later in [0, 1, 24 * 7, 24 * 60, 24 * 365] {
+            let at = now + chrono::Duration::hours(later);
+            assert_eq!(cpa_exec::codex_siwc::refresh_due(&renewable, at), None, "+{later}h");
+            assert_eq!(
+                cpa_exec::codex_siwc::refresh_due(&c, at),
+                Some(true),
+                "+{later}h unmasked"
+            );
+        }
+        let cfg = rt.config();
+        assert!(
+            rt.executors
+                .needs_prepare_at(&renewable, &cfg, now + chrono::Duration::days(9)),
+            "the outer partition comes due on its own schedule"
+        );
+        let relogin = codex_file(
+            ("d", chrono::Duration::days(10)),
+            ("new", "oaiapp_fake", chrono::Duration::minutes(2)),
+        );
+        std::fs::write(f.dir.join("codex.json"), relogin.to_string()).unwrap();
+        rt.store.reconcile(
+            cpa_core::config::credentials::from_auth_dir(&cfg)
+                .into_iter()
+                .map(crate::testing::local)
+                .collect(),
+        );
+        let c = rt.store.get("codex.json").unwrap();
+        assert!(rt.store.refused_renewal(&c).is_empty());
+        assert_eq!(
+            cpa_exec::codex_siwc::refresh_due(&rt.store.renewable(&c), now),
+            Some(true)
+        );
+        std::fs::remove_dir_all(&f.dir).unwrap();
     }
 
     /// A shutdown that lands while a credential lock wait sleeps stops it, even when
@@ -6494,8 +7013,8 @@ pub(crate) mod tests {
         };
         let kimi = json!({"type": "kimi", "note": "a", "expired": "t0", "gone": "a"});
         let siwc = json!({"type": "codex", "access_token": "a", "refresh_token": "r", "account_id": "acct",
-            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c", "expired": "t0", "note": "n"}});
-        let siwc_refresh = json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "n"}});
+            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c", "expired": "t0", "expires_at": "real-t0", "note": "n"}});
+        let siwc_refresh = json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "expires_at": "real-t1", "note": "n"}});
         let siwc_edit = |k: &str, v: Value| {
             let mut m = map(siwc.clone());
             m["siwc"][k] = v;
@@ -6579,7 +7098,7 @@ pub(crate) mod tests {
                 siwc_edit("note", json!("edited")),
                 siwc_refresh.clone(),
                 vec![],
-                json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "edited"}}),
+                json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "expires_at": "real-t1", "note": "edited"}}),
                 vec![],
             ),
             (
@@ -7127,11 +7646,10 @@ pub(crate) mod tests {
         let file = claude_file("sk-ant-oat-a-fake", chrono::Duration::hours(1), false);
         let (rt, dir, _) = claude_refusing(name, file, (500, "{}")).await;
         let cfg = rt.config();
-        let invalid = ExecError::local(400, FailureScope::Request, r#"{"error":"invalid_grant"}"#);
+        let invalid = true;
         let a = rt.store.get(&id).unwrap();
         let registration = rt.store.get_registered(&id).unwrap().1.registration;
-        let other = ExecError::local(400, FailureScope::Request, r#"{"error":"server_error"}"#);
-        assert!(!rt.store.reject_refused(&a, registration, &other), "not invalid_grant");
+        assert!(!rt.store.reject_refused(&a, registration, false), "not terminal");
         std::fs::write(
             dir.join(&id),
             claude_file("sk-ant-oat-b-fake", chrono::Duration::hours(1), false).to_string(),
@@ -7144,10 +7662,10 @@ pub(crate) mod tests {
                 .collect(),
         );
         let b = rt.store.get(&id).unwrap();
-        assert!(!rt.store.reject_refused(&a, registration, &invalid));
+        assert!(!rt.store.reject_refused(&a, registration, invalid));
         assert!(!rt.store.tokens_rejected(&b), "a stale failure blocked the new tokens");
-        assert!(rt.store.reject_refused(&b, registration, &invalid));
-        assert!(!rt.store.reject_refused(&a, registration, &invalid));
+        assert!(rt.store.reject_refused(&b, registration, invalid));
+        assert!(!rt.store.reject_refused(&a, registration, invalid));
         assert!(
             rt.store.tokens_rejected(&b),
             "a stale failure lifted the new tokens' rejection"
@@ -7167,7 +7685,7 @@ pub(crate) mod tests {
         let empty = rt.store.get(&id).unwrap();
         assert_eq!(empty.str("access_token"), Some(" "));
         assert!(
-            !rt.store.reject_refused(&empty, registration, &invalid),
+            !rt.store.reject_refused(&empty, registration, invalid),
             "empty access token"
         );
         assert!(!rt.store.tokens_rejected(&empty));

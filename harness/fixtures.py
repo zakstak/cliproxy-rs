@@ -176,3 +176,61 @@ TOKEN_REPLY = encoded({"access_token": "sk-ant-oat01-FAKE-ROTATED-LOCAL-ONLY",
                        "scope": "user:profile user:inference"})
 PROFILE_REPLY = encoded({"account": {"uuid": CREDENTIAL["account_uuid"], "email": CREDENTIAL["email"]},
                          "organization": {"uuid": CREDENTIAL["organization_uuid"], "name": "Local fixture"}})
+
+
+# Selective comparison only (harness/manifest.json "selective-differential"): Grok and
+# Muse through a configured API key whose base URL is a plain-HTTP loopback upstream.
+# These are not part of the historical 50-case Claude suite and were never recorded
+# against v8.0.10. All keys are fake.
+PROVIDER_KEYS = {"xai": "sk-xai-FAKE-LOCAL-ONLY", "meta": "sk-meta-FAKE-LOCAL-ONLY"}
+PROVIDER_MODELS = {"xai": "grok-4.7", "meta": "muse-spark-1.3"}
+
+
+def responses_stream(model):
+    """A Responses event stream with one text output and a completed terminal event."""
+    message = {"type": "message", "id": "msg_fixture", "role": "assistant", "status": "completed",
+               "content": [{"type": "output_text", "text": "local answer", "annotations": []}]}
+
+    def response(status, output):
+        return {"id": "resp_fixture", "object": "response", "created_at": 1790000000, "status": status,
+                "model": model, "output": output,
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}}
+    part = {"item_id": "msg_fixture", "output_index": 0, "content_index": 0}
+    return "".join(event(kind, {"type": kind, "sequence_number": n, **data}) for n, (kind, data) in enumerate([
+        ("response.created", {"response": response("in_progress", [])}),
+        ("response.output_item.added", {"output_index": 0, "item": {
+            "type": "message", "id": "msg_fixture", "role": "assistant", "status": "in_progress", "content": []}}),
+        ("response.content_part.added", {**part, "part": {"type": "output_text", "text": "", "annotations": []}}),
+        ("response.output_text.delta", {**part, "delta": "local answer"}),
+        ("response.output_text.done", {**part, "text": "local answer"}),
+        ("response.content_part.done", {**part, "part": {"type": "output_text", "text": "local answer",
+                                                         "annotations": []}}),
+        ("response.output_item.done", {"output_index": 0, "item": message}),
+        ("response.completed", {"response": response("completed", [message])}),
+    ]))
+
+
+def selective_cases():
+    out = []
+    openai_headers = [["Authorization", "Bearer fixture-client-key"], ["Content-Type", "application/json"]]
+    anthropic_headers = [["X-Api-Key", "fixture-client-key"], ["Content-Type", "application/json"],
+                         ["Anthropic-Version", "2023-06-01"]]
+    for provider, model in PROVIDER_MODELS.items():
+        sse = {"status": 200, "body": responses_stream(model), "sse": True, "fragment": 17}
+        chat = {"model": model, "messages": [{"role": "user", "content": "Local question"}]}
+        bodies = {
+            "responses": ("/v1/responses", openai_headers, {"model": model, "input": "Local question"}),
+            "chat": ("/v1/chat/completions", openai_headers, chat),
+            "messages": ("/v1/messages", anthropic_headers, {**chat, "max_tokens": 17}),
+        }
+        for client, stream in [("responses", False), ("responses", True), ("chat", False), ("chat", True),
+                               ("messages", True)]:
+            path, headers, body = bodies[client]
+            out.append({"name": f"{provider}-{client}-{'stream' if stream else 'buffered'}", "provider": provider,
+                        "method": "POST", "path": path, "headers": headers,
+                        "body": encoded({**body, "stream": stream}), "script": sse})
+        out.append({"name": f"{provider}-chat-upstream-429", "provider": provider, "method": "POST",
+                    "path": "/v1/chat/completions", "headers": openai_headers, "body": encoded(chat),
+                    "script": {"status": 429, "body": encoded({"error": {
+                        "message": "scripted 429", "type": "rate_limit_error", "code": "rate_limited"}})}})
+    return out

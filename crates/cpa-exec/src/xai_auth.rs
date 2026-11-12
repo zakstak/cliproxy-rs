@@ -666,17 +666,269 @@ fn sanitize_segment(value: &str) -> String {
         .to_owned()
 }
 
-/// `CredentialFileName`.
+/// The longest sanitized identity a file name keeps (Go: room for the prefix, hash and
+/// extension within common file name limits). Sanitized text is ASCII.
+const MAX_NAME_SEGMENT: usize = 120;
+
+/// One identity's name segment and hash: `xai-<sanitized>-<16 hex>.json`.
+fn hashed_name(kind: &str, identity: &str, sanitized: String) -> String {
+    use sha2::{Digest, Sha256};
+    let mut segment = if sanitized.is_empty() {
+        "account".to_owned()
+    } else {
+        sanitized
+    };
+    segment.truncate(MAX_NAME_SEGMENT);
+    let digest = Sha256::new()
+        .chain_update(kind.as_bytes())
+        .chain_update([0])
+        .chain_update(identity.as_bytes())
+        .finalize();
+    let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("xai-{segment}-{hash}.json")
+}
+
+/// `CredentialFileName` (v8.0.67, d65840fb): a readable account name and a hash of
+/// the original identity, so distinct accounts that sanitize alike get distinct files.
+/// The email (case-folded, as emails are case-insensitive) names the file whenever it
+/// is known, so the name does not change when a later login lacks the subject.
 pub fn credential_file_name(email: &str, subject: &str, now_ms: i64) -> String {
-    let email = sanitize_segment(email);
+    let email = email.trim();
     if !email.is_empty() {
-        return format!("xai-{email}.json");
+        let email = email.go_lower();
+        return hashed_name("email", &email, sanitize_segment(&email));
     }
-    let subject = sanitize_segment(subject);
+    let subject = subject.trim();
     if !subject.is_empty() {
-        return format!("xai-{subject}.json");
+        return hashed_name("subject", subject, sanitize_segment(subject));
     }
     format!("xai-{now_ms}.json")
+}
+
+/// `legacyCredentialFileName`: the v8.0.35 name, without the identity hash.
+pub(crate) fn legacy_credential_file_name(email: &str, subject: &str) -> String {
+    [email, subject]
+        .iter()
+        .map(|identity| sanitize_segment(identity))
+        .find(|s| !s.is_empty())
+        .map_or_else(String::new, |s| format!("xai-{s}.json"))
+}
+
+/// `isRecognizedPredecessor`: a name the login itself would have given some subset of
+/// the stored identity: the v8.0.35 name, or a hashed name from either field.
+fn recognized_predecessor(base: &str, email: &str, subject: &str) -> bool {
+    if email.is_empty() && subject.is_empty() {
+        return false;
+    }
+    let mut names = vec![credential_file_name(email, subject, 0)];
+    if !email.is_empty() {
+        names.push(credential_file_name(email, "", 0));
+    }
+    if !subject.is_empty() {
+        names.push(credential_file_name("", subject, 0));
+        names.push(legacy_credential_file_name("", subject));
+    }
+    names.push(legacy_credential_file_name(email, subject));
+    names.iter().any(|name| !name.is_empty() && base.go_eq_fold(name))
+}
+
+/// `identityMatches`: provably the same account. One stored field matches and none
+/// conflicts; emails compare case-insensitively, subjects exactly.
+fn identity_matches(email: &str, subject: &str, candidate_email: &str, candidate_subject: &str) -> bool {
+    let both = |a: &str, b: &str| !a.is_empty() && !b.is_empty();
+    let email_matches = both(email, candidate_email) && email.go_eq_fold(candidate_email);
+    let email_conflicts = both(email, candidate_email) && !email.go_eq_fold(candidate_email);
+    let subject_matches = both(subject, candidate_subject) && subject == candidate_subject;
+    let subject_conflicts = both(subject, candidate_subject) && subject != candidate_subject;
+    (email_matches || subject_matches) && !email_conflicts && !subject_conflicts
+}
+
+/// A credential file's trimmed string member (Go `metadataString`: strings only).
+fn member(document: &serde_json::Map<String, Value>, key: &str) -> String {
+    document
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// A file found by [`legacy_credential`]: where it is, its bytes and its stored email.
+struct Predecessor {
+    path: PathBuf,
+    raw: Vec<u8>,
+    email: String,
+}
+
+/// `FindMatchingLegacyCredential` over the auth directory: an earlier file of the same
+/// account under a name the login would have given it before (v8.0.35's unhashed name,
+/// or the hashed name of only its email or only its subject). A name alone is
+/// ambiguous, so the file's stored identity must match `email`/`subject` and conflict
+/// with neither; the target file itself never qualifies. Only top-level files take
+/// part, as login only writes there.
+///
+/// A folder that does not exist yet holds no earlier file; one that cannot be listed
+/// fails the save, so an earlier file is never left behind unseen. An entry that
+/// cannot be read is skipped and left in place: nothing proves whose it is.
+fn legacy_credential(
+    directory: &Path,
+    target_name: &str,
+    email: &str,
+    subject: &str,
+) -> Result<Option<Predecessor>, SaveError> {
+    if (email.is_empty() && subject.is_empty()) || !target_name.go_eq_fold(&credential_file_name(email, subject, 0)) {
+        return Ok(None);
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SaveError::Unreadable(format!(
+                "xai: cannot list the auth directory to find earlier credential files: {e}"
+            )));
+        }
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")))
+        .collect();
+    files.sort();
+    Ok(files.into_iter().find_map(|path| {
+        let base = path.file_name()?.to_str()?.to_owned();
+        if base.go_eq_fold(target_name) {
+            return None;
+        }
+        let raw = std::fs::read(&path).ok()?;
+        let document: serde_json::Map<String, Value> = serde_json::from_slice(&raw).ok()?;
+        if !member(&document, "type").go_eq_fold("xai") {
+            return None;
+        }
+        let (candidate_email, candidate_subject) = (member(&document, "email"), member(&document, "sub"));
+        (identity_matches(email, subject, &candidate_email, &candidate_subject)
+            && recognized_predecessor(&base, &candidate_email, &candidate_subject))
+        .then_some(Predecessor {
+            path,
+            raw,
+            email: candidate_email,
+        })
+    }))
+}
+
+/// The file already at a path this login would write, when it is safe to refresh: a
+/// regular file holding an xAI credential whose stored identity matches the login and
+/// conflicts with neither field (as [`legacy_credential`] requires of an earlier file).
+/// `None` when nothing is there.
+///
+/// Anything else is refused before a byte is merged or written. A hashed name can equal
+/// another account's v8.0.35 name without any hash collision (a subject that reads
+/// `dev@x.ai-<16 hex>` was saved as `xai-dev@x.ai-<16 hex>.json`), and a file without a
+/// stored identity, of another provider, or not a regular file (a symlink is not
+/// followed) cannot be proven to be this account's.
+fn owned_destination(path: &Path, email: &str, subject: &str) -> Result<Option<Vec<u8>>, SaveError> {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let conflict = |why: &str| {
+        SaveError::Conflict(format!(
+            "xai: refusing to overwrite {name} in the auth directory: {why}; move it aside and sign in again"
+        ))
+    };
+    let unreadable =
+        |e: std::io::Error| SaveError::Unreadable(format!("xai: cannot read {name} in the auth directory: {e}"));
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+        Ok(meta) if !meta.file_type().is_file() => return Err(conflict("it is not a regular file")),
+        Ok(_) => {}
+    }
+    let raw = std::fs::read(path).map_err(unreadable)?;
+    let Ok(document) = serde_json::from_slice::<serde_json::Map<String, Value>>(&raw) else {
+        return Err(conflict("it is not a credential file"));
+    };
+    if !member(&document, "type").go_eq_fold("xai") {
+        return Err(conflict("it is not an xAI credential"));
+    }
+    if !identity_matches(email, subject, &member(&document, "email"), &member(&document, "sub")) {
+        return Err(conflict("it does not store this account's identity"));
+    }
+    Ok(Some(raw))
+}
+
+/// Why [`save_login`] wrote nothing.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The merged document is invalid (Go's file store refuses it).
+    Refused(String),
+    /// A file at the path this login would write is not provably this account's
+    /// ([`owned_destination`]); it was left untouched.
+    Conflict(String),
+    /// The auth directory or a file the save must check could not be read.
+    Unreadable(String),
+    /// Publishing the file failed.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Refused(reason) | SaveError::Conflict(reason) | SaveError::Unreadable(reason) => {
+                f.write_str(reason)
+            }
+            SaveError::Write(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Writes a finished login into `directory` as Go's `Manager.Login` and
+/// `saveTokenRecord` do (v8.0.67, d65840fb): under its hashed name, merged with an
+/// existing file of that name and with an earlier file of the same account
+/// ([`legacy_credential`]), whose operator settings (`disabled`, `proxy_url`,
+/// priority, prefixes and the rest) are kept. `write` publishes the bytes atomically.
+///
+/// Returns the saved path and the file the caller deletes once the save is stored; it
+/// stays in place if the save fails. A login that names only the subject keeps
+/// refreshing the earlier email-named file instead, so the account keeps its richest
+/// name, unless the subject-named file disables the credential; the subject-named file
+/// it then supersedes (left by a migration interrupted before its cleanup) is the one
+/// returned for deletion, so one credential remains.
+///
+/// Nothing is written, and nothing is returned for deletion, when a file at the path
+/// it would write is not provably this account's ([`owned_destination`]).
+pub fn save_login(
+    directory: &Path,
+    record: LoginRecord,
+    write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<(PathBuf, Option<PathBuf>), SaveError> {
+    let field = |key: &str| match record.metadata.get(key) {
+        Some(GoValue::String(s)) => s.trim().to_owned(),
+        _ => String::new(),
+    };
+    let (email, subject) = (field("email"), field("sub"));
+    let target = directory.join(&record.file_name);
+    let existing = owned_destination(&target, &email, &subject)?;
+    let legacy = legacy_credential(directory, &record.file_name, &email, &subject)?;
+    let target_disabled = existing
+        .as_deref()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Map<String, Value>>(raw).ok())
+        .is_some_and(|doc| doc.get("disabled") == Some(&Value::Bool(true)));
+    let adopt = legacy
+        .as_ref()
+        .is_some_and(|l| email.is_empty() && !subject.is_empty() && !l.email.is_empty() && !target_disabled);
+    let document = saved_document(
+        record.metadata,
+        existing.as_deref(),
+        legacy.as_ref().map(|l| l.raw.as_slice()),
+    )
+    .map_err(SaveError::Refused)?;
+    let had_target = existing.is_some();
+    let (path, superseded) = match legacy {
+        Some(legacy) if adopt => (legacy.path, had_target.then_some(target)),
+        legacy => (target, legacy.map(|l| l.path)),
+    };
+    write(&path, &GoValue::Object(document).encode_indented()).map_err(SaveError::Write)?;
+    Ok((path, superseded))
 }
 
 /// A finished login: file name, the saved document and label.
@@ -780,37 +1032,57 @@ fn canonical_key(key: &str) -> &str {
     }
 }
 
-/// The file `Manager.Login` + `FileTokenStore.Save` write: non-token fields of an
-/// existing file are kept (`MergeExistingAuthMetadata`), legacy keys are renamed
-/// (`NormalizeCredentialMetadata`), `disabled` is the existing boolean or false, and a
-/// merged `weight` must be valid (`ValidateAuthWeight`) or nothing is written.
-pub fn saved_document(
-    mut record: BTreeMap<String, GoValue>,
-    existing: Option<&[u8]>,
-) -> Result<BTreeMap<String, GoValue>, String> {
-    let existing = existing
-        .and_then(GoValue::parse_f64)
-        .and_then(|v| v.into_object().ok())
-        .filter(|map| !map.is_empty());
-    let mut disabled = false;
-    if let Some(existing) = existing {
-        if let Some(GoValue::Bool(b)) = existing.get("disabled") {
-            disabled = *b;
-        }
-        for (k, v) in existing {
-            if !is_token_key(&k) {
-                record.entry(k).or_insert(v);
-            }
-        }
-    }
-    let legacy: Vec<String> = record
+/// `NormalizeCredentialMetadata` on one document: each legacy key takes its canonical
+/// name unless the document already has that name, which then wins.
+fn normalize_keys(document: &mut BTreeMap<String, GoValue>) {
+    let aliases: Vec<String> = document
         .keys()
         .filter(|k| canonical_key(k) != k.as_str())
         .cloned()
         .collect();
-    for key in legacy {
-        let value = record.remove(&key).expect("present");
-        record.entry(canonical_key(&key).to_owned()).or_insert(value);
+    for key in aliases {
+        let value = document.remove(&key).expect("present");
+        document.entry(canonical_key(&key).to_owned()).or_insert(value);
+    }
+}
+
+/// The file `Manager.Login` + `FileTokenStore.Save` write: non-token fields of an
+/// existing file, then of an earlier file of the same account (`legacy`), are kept
+/// (`MergeExistingAuthMetadata`, in that order), `disabled` is the first of those
+/// files' booleans (an existing file with any `disabled` value decides) or false, and a
+/// merged `weight` must be valid (`ValidateAuthWeight`) or nothing is written.
+///
+/// Legacy keys are renamed (`NormalizeCredentialMetadata`) in each document before the
+/// merge, so the order holds for a setting whatever spelling each file uses: an
+/// existing file's `proxy-url` beats an earlier file's `proxy_url`. Go renames after
+/// merging, which lets an earlier file's canonical spelling beat the existing file's
+/// legacy one (docs/DIFFERENCES-FROM-GO.md, "xAI credential file names").
+pub fn saved_document(
+    mut record: BTreeMap<String, GoValue>,
+    existing: Option<&[u8]>,
+    legacy: Option<&[u8]>,
+) -> Result<BTreeMap<String, GoValue>, String> {
+    normalize_keys(&mut record);
+    let mut disabled = false;
+    for file in [existing, legacy] {
+        let Some(mut file) = file
+            .and_then(GoValue::parse_f64)
+            .and_then(|v| v.into_object().ok())
+            .filter(|map| !map.is_empty())
+        else {
+            continue;
+        };
+        normalize_keys(&mut file);
+        if !record.contains_key("disabled")
+            && let Some(GoValue::Bool(b)) = file.get("disabled")
+        {
+            disabled = *b;
+        }
+        for (k, v) in file {
+            if !is_token_key(&k) {
+                record.entry(k).or_insert(v);
+            }
+        }
     }
     if let Some(weight) = record.get("weight") {
         let json = match weight {
@@ -984,19 +1256,30 @@ pub(crate) async fn login_with(auth: XaiAuth, auth_dir: &Path, no_browser: bool)
         &code.token_endpoint,
         Utc::now().timestamp_millis(),
     );
-    let path = auth_dir.join(&record.file_name);
-    let target = path.clone();
-    let metadata = record.metadata;
-    tokio::task::spawn_blocking(move || {
-        let existing = std::fs::read(&target).ok().filter(|raw| !raw.is_empty());
-        let document = GoValue::Object(saved_document(metadata, existing.as_deref()).map_err(|e| auth_error(500, e))?);
-        crate::login::write_private(&target, &document.encode_indented())
-            .map_err(|_| auth_error(500, "xai: cannot write credential file"))
+    let label = record.label.clone();
+    let directory = auth_dir.to_owned();
+    let path = tokio::task::spawn_blocking(move || {
+        let (path, legacy) = save_login(&directory, record, crate::login::write_private).map_err(|e| match e {
+            SaveError::Refused(reason) | SaveError::Conflict(reason) | SaveError::Unreadable(reason) => {
+                auth_error(500, reason)
+            }
+            SaveError::Write(_) => auth_error(500, "xai: cannot write credential file"),
+        })?;
+        // Go removes the earlier file only after the canonical one is saved.
+        if let Some(legacy) = legacy {
+            std::fs::remove_file(&legacy).map_err(|_| {
+                auth_error(
+                    500,
+                    "cliproxy auth: canonical xAI credential saved but legacy credential cleanup failed",
+                )
+            })?;
+        }
+        Ok::<_, ExecError>(path)
     })
     .await
     .map_err(|_| auth_error(500, "xai: credential publication failed"))??;
     println!("Authentication saved to {}", path.display());
-    println!("Authenticated as {}", record.label);
+    println!("Authenticated as {label}");
     println!("xAI authentication successful!");
     Ok(path)
 }

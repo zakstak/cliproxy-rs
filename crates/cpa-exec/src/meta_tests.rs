@@ -107,8 +107,187 @@ struct Run {
     error: Option<ExecError>,
 }
 
+/// The `User-Agent` the official Muse Code 1.4.15-R8339.1 linux-x86_64 build sent to a
+/// loopback mock (SHA-256 `abe0a728…3d5`, as Meta's release manifest lists it).
+const MUSE_CODE_USER_AGENT: &str =
+    "muse-build/1.4.15 (non-interactive; linux-x86_64; build c7a95b745e7eb209c8446981803d89c497d7cae0)";
+
+/// The headers whose values differ per request: the Host port and the Muse session id
+/// (a fresh UUIDv7 when the client names no session). Their names and positions are
+/// still compared, and [`assert_session_headers`] checks their values.
+const IDENTITY_MASKED: [&str; 5] = [
+    "Host",
+    "X-Tbh-Session-Id",
+    "X-Meta-Ai-Gateway-Session-Id",
+    "X-Tbh-Thread-Id",
+    "X-Tbh-Root-Session-Id",
+];
+
+/// The fixtures record Go v8.0.35's Meta identity (`muse-build/1.3.0`, `tbh:tui`, no
+/// session headers). The deliberate difference (docs/DIFFERENCES-FROM-GO.md, "Muse Code
+/// client identity", #81) is applied to each recorded `/responses` request and its
+/// captured log: Go's default `User-Agent` and `X-Client-Id` become the captured Muse
+/// Code 1.4.15 values, and the session, role and (for an account login) contributor
+/// headers join the others in Go's sorted order. The contributor value comes from the
+/// model in Go's recorded body. Operator headers, the body and the fixtures are unchanged.
+fn with_identity_difference(mut fx: Value) -> Value {
+    const GO_USER_AGENT: &str =
+        "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)";
+    let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_owned();
+    let account = [&fx["credential"], &fx["attributes"]].iter().any(|v| {
+        field(v, "auth_kind") == "oauth"
+            || !field(v, "dca_token").is_empty()
+            || field(v, "access_token").starts_with("dca:")
+    });
+    let mut added_by_body = Vec::new();
+    for upstream in fx["upstream"].as_array_mut().into_iter().flatten() {
+        if !upstream["target"].as_str().unwrap_or_default().ends_with("/responses") {
+            continue;
+        }
+        let model = gj::get(upstream["body"].as_str().unwrap_or_default().as_bytes(), "model")
+            .str()
+            .into_owned();
+        let mut added: Vec<(&str, &str)> = vec![
+            ("X-Meta-Ai-Gateway-Session-Id", "<session>"),
+            ("X-Tbh-Agent-Role", "main"),
+            ("X-Tbh-Root-Session-Id", "<session>"),
+            ("X-Tbh-Session-Id", "<session>"),
+            ("X-Tbh-Thread-Id", "<session>"),
+        ];
+        if account {
+            let mode = if model.ends_with("-contributor") { "1" } else { "0" };
+            added.push(("X-Tbh-Contributor-Mode", mode));
+        }
+        let headers = upstream["headers"].as_array_mut().unwrap();
+        let mut list: Vec<(String, String)> = headers
+            .iter()
+            .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
+            .collect();
+        for (name, value) in &mut list {
+            match (name.as_str(), value.as_str()) {
+                ("User-Agent", GO_USER_AGENT) => *value = MUSE_CODE_USER_AGENT.to_owned(),
+                ("X-Client-Id", "tbh:tui") => *value = "tbh:exec".to_owned(),
+                _ => {}
+            }
+        }
+        // Go's wire order: Host, User-Agent, Content-Length, the rest sorted, then the
+        // transport's Accept-Encoding.
+        assert_eq!(list[0].0, "Host");
+        assert_eq!(list[2].0, "Content-Length");
+        assert_eq!(list.last().unwrap().0, "Accept-Encoding");
+        let end = list.len() - 1;
+        let mut middle = list[3..end].to_vec();
+        assert!(middle.windows(2).all(|w| w[0].0 <= w[1].0), "Go's headers are sorted");
+        middle.extend(added.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())));
+        middle.sort_by(|a, b| a.0.cmp(&b.0));
+        let rebuilt: Vec<(String, String)> = list[..3]
+            .iter()
+            .cloned()
+            .chain(middle)
+            .chain(std::iter::once(list[end].clone()))
+            .collect();
+        *headers = rebuilt.into_iter().map(|(n, v)| serde_json::json!([n, v])).collect();
+        added_by_body.push(added);
+    }
+    if let Some(text) = fx["extra"]["capture"]["request"].as_str() {
+        let mut text = text.to_owned();
+        for added in added_by_body.iter().take(1) {
+            let start = text.find("\nHeaders:\n").expect("captured headers") + "\nHeaders:\n".len();
+            let end = start + text[start..].find("\n\n").expect("end of captured headers");
+            let mut lines: Vec<String> = text[start..end]
+                .lines()
+                .map(|line| match line.split_once(": ") {
+                    Some(("User-Agent", GO_USER_AGENT)) => format!("User-Agent: {}", MUSE_CODE_USER_AGENT),
+                    Some(("X-Client-Id", "tbh:tui")) => "X-Client-Id: tbh:exec".to_owned(),
+                    _ => line.to_owned(),
+                })
+                .collect();
+            assert!(
+                lines.windows(2).all(|w| w[0] <= w[1]),
+                "Go's captured headers are sorted"
+            );
+            lines.extend(added.iter().map(|(n, v)| format!("{n}: {v}")));
+            lines.sort();
+            text.replace_range(start..end, &lines.join("\n"));
+        }
+        fx["extra"]["capture"]["request"] = Value::String(text);
+    }
+    fx
+}
+
+/// The four session headers of a sent Meta request carry one UUIDv7; the role is `main`.
+fn assert_session_headers(name: &str, sent: &Captured) -> String {
+    let get = |n: &str| {
+        sent.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{name}: {n} missing"))
+    };
+    let session = get("X-Tbh-Session-Id");
+    let parsed = uuid::Uuid::parse_str(&session).unwrap_or_else(|_| panic!("{name}: {session:?}"));
+    assert_eq!(parsed.get_version_num(), 7, "{name}: {session}");
+    assert_eq!(parsed.get_variant(), uuid::Variant::RFC4122, "{name}: {session}");
+    assert_eq!(parsed.hyphenated().to_string(), session, "{name}: lowercase hyphenated");
+    for n in [
+        "X-Meta-Ai-Gateway-Session-Id",
+        "X-Tbh-Thread-Id",
+        "X-Tbh-Root-Session-Id",
+    ] {
+        assert_eq!(get(n), session, "{name}: {n}");
+    }
+    assert_eq!(get("X-Tbh-Agent-Role"), "main", "{name}");
+    session
+}
+
+/// The fixtures record Go v8.0.35, which deleted `prompt_cache_retention`. The deliberate
+/// difference (docs/DIFFERENCES-FROM-GO.md, "Meta explicit prompt-cache retention"; Go
+/// v8.0.67 f77a3c10) is applied to the expected Meta request and its captured log text:
+/// the client's explicit string, trimmed, appended to Go's body. The recorded fixtures stay
+/// unchanged; the request sent is still the recorded one.
+fn with_retention_difference(mut fx: Value) -> Value {
+    let client = fx["request"]["body"].as_str().unwrap_or_default().to_owned();
+    let value = gj::get(client.as_bytes(), "prompt_cache_retention");
+    if value.kind != Kind::String {
+        return fx;
+    }
+    let retention = go_trim_space(&value.bytes()).to_vec();
+    if retention.is_empty() {
+        return fx;
+    }
+    let mut bodies = Vec::new();
+    for upstream in fx["upstream"].as_array_mut().into_iter().flatten() {
+        if !upstream["target"].as_str().unwrap_or_default().ends_with("/responses") {
+            continue;
+        }
+        assert!(upstream["body_b64"].as_str().unwrap_or_default().is_empty());
+        let go = upstream["body"].as_str().unwrap().to_owned();
+        assert!(!gj::get(go.as_bytes(), "prompt_cache_retention").exists());
+        let mut ours = go.clone().into_bytes();
+        gj::set_str(&mut ours, "prompt_cache_retention", &retention);
+        let ours = String::from_utf8(ours).unwrap();
+        for header in upstream["headers"].as_array_mut().unwrap() {
+            if header[0] == "Content-Length" {
+                header[1] = Value::String(ours.len().to_string());
+            }
+        }
+        upstream["body"] = Value::String(ours.clone());
+        bodies.push((go, ours));
+    }
+    assert!(!bodies.is_empty(), "explicit retention with no Meta request recorded");
+    if let Some(text) = fx["extra"]["capture"]["request"].as_str() {
+        let mut text = text.to_owned();
+        for (go, ours) in &bodies {
+            assert_eq!(text.matches(go.as_str()).count(), 1, "captured body");
+            text = text.replace(go.as_str(), ours);
+        }
+        fx["extra"]["capture"]["request"] = Value::String(text);
+    }
+    fx
+}
+
 async fn run(name: &str) -> Run {
-    let fx = fixture("meta", name);
+    let fx = with_identity_difference(with_retention_difference(fixture("meta", name)));
     let origin = go_origin(&fx).expect("fixture names its capture server");
     let mock = Mock::start_replacing(&fx["responses"], Some(&origin)).await;
     let credential = meta_credential(&fx, &origin, &mock.url);
@@ -157,7 +336,10 @@ fn assert_upstream(r: &Run, name: &str) {
         .collect();
     assert_eq!(r.captured.len(), go.len(), "{name}: upstream request count");
     for (go, rust) in go.iter().zip(&r.captured) {
-        assert_same_request(name, go, rust, &["Host"]);
+        assert_same_request(name, go, rust, &IDENTITY_MASKED);
+        if rust.target.ends_with("/responses") {
+            assert_session_headers(name, rust);
+        }
     }
 }
 
@@ -1058,7 +1240,7 @@ async fn request_capture_matches_go() {
     assert!(names.len() >= 30, "{names:?}");
     for name in names.iter().filter(|n| n.as_str() != "refresh-direct") {
         let r = run(name).await;
-        crate::device_fixture::assert_capture_like_go(name, &r.fx, &r.capture, &r.url, &["Host"]);
+        crate::device_fixture::assert_capture_like_go(name, &r.fx, &r.capture, &r.url, &IDENTITY_MASKED);
     }
 }
 
@@ -1089,6 +1271,699 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
         assert_eq!(captured.len(), usize::from(baseline_only));
         if let Some(sent) = captured.first() {
             assert!(String::from_utf8_lossy(&sent.body).contains(r#""text":"hi""#));
+        }
+    }
+}
+
+/// The upstream request one Meta execution sends with a fixture's synthetic credential,
+/// captured by a private loopback mock. `edit` adjusts the request and credential.
+async fn sent_request(name: &str, edit: impl FnOnce(&mut ExecRequest, &mut Credential), cfg: &Config) -> Captured {
+    let fx = fixture("meta", name);
+    let origin = go_origin(&fx).unwrap();
+    let mock = Mock::start(&fx["responses"]).await;
+    let mut credential = meta_credential(&fx, &origin, &mock.url);
+    let mut req = request(&fx, "");
+    edit(&mut req, &mut credential);
+    let response = MetaExecutor::with_client(default_client())
+        .execute(&credential, req, cfg)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    if let ResponseBody::Stream(mut s) = response.body {
+        while s.next().await.is_some() {}
+    }
+    let mut captured = mock.captured();
+    assert_eq!(captured.len(), 1, "{name}");
+    captured.remove(0)
+}
+
+fn sent_header(sent: &Captured, name: &str) -> Option<String> {
+    sent.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+/// An account login (`responses-nonstream-collected`: OAuth record with a DCA token) and
+/// a config API key (`config-apikey-headers`).
+const ACCOUNT: &str = "responses-nonstream-collected";
+const API_KEY: &str = "config-apikey-headers";
+
+/// #81: the identity the official Muse Code 1.4.15 `muse exec` sent to a loopback mock
+/// (docs/DIFFERENCES-FROM-GO.md, "Muse Code client identity"). With an account login,
+/// `X-Tbh-Contributor-Mode` is `1` exactly for a `-contributor` model and `0` otherwise;
+/// with an API key it is absent. Headers the client sends only for side agents, tracing
+/// or opt-in routing are not sent.
+#[tokio::test]
+async fn identity_follows_the_captured_muse_code_profile() {
+    let cfg = cfg();
+    let cases: [(&str, &str, Option<&str>); 6] = [
+        (ACCOUNT, "muse-spark-1.3", Some("0")),
+        (ACCOUNT, "muse-spark-1.3-contributor", Some("1")),
+        (ACCOUNT, "muse-spark-1.3-contributor(high)", Some("1")),
+        (ACCOUNT, "Muse-Spark-1.3-Contributor", Some("1")),
+        (API_KEY, "muse-spark-1.3", None),
+        (API_KEY, "muse-spark-1.3-contributor", None),
+    ];
+    for (fixture_name, model, contributor) in cases {
+        let sent = sent_request(fixture_name, |req, _| req.model = model.into(), &cfg).await;
+        let what = format!("{fixture_name} {model}");
+        assert_eq!(
+            sent_header(&sent, "User-Agent").as_deref(),
+            Some(MUSE_CODE_USER_AGENT),
+            "{what}"
+        );
+        assert_eq!(sent_header(&sent, "X-Client-Id").as_deref(), Some("tbh:exec"), "{what}");
+        assert_eq!(
+            sent_header(&sent, "X-Tbh-Contributor-Mode").as_deref(),
+            contributor,
+            "{what}"
+        );
+        assert_session_headers(&what, &sent);
+        for absent in [
+            "traceparent",
+            "X-Tbh-Parent-Thread-Id",
+            "X-FB-Routing-Control",
+            "X-Tbh-Invocation-Kind",
+        ] {
+            assert_eq!(sent_header(&sent, absent), None, "{what}: {absent}");
+        }
+    }
+}
+
+/// #81: the Muse session id lives as long as the client's explicit session. Requests
+/// without one, including those with only a guessed session (first messages, conversation
+/// prefix), each get a fresh UUIDv7; requests naming the same session on the same
+/// credential share one; another session or another credential gets another.
+#[tokio::test]
+async fn session_ids_follow_explicit_client_sessions() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    let named = |session: String| {
+        move |req: &mut ExecRequest, _: &mut Credential| {
+            req.headers.insert("Session-Id", session.parse().unwrap());
+        }
+    };
+    let session = |sent: &Captured, what: &str| assert_session_headers(what, sent);
+
+    let a1 = session(&sent_request(ACCOUNT, |_, _| {}, &cfg).await, "none 1");
+    let a2 = session(&sent_request(ACCOUNT, |_, _| {}, &cfg).await, "none 2");
+    assert_ne!(a1, a2, "no explicit session: one Muse session per request");
+    for guessed in ["msg:0123456789abcdef", "lcp:v1:abc", "derived:abc"] {
+        let g1 = session(
+            &sent_request(ACCOUNT, |req, _| req.session = Some(guessed.into()), &cfg).await,
+            guessed,
+        );
+        let g2 = session(
+            &sent_request(ACCOUNT, |req, _| req.session = Some(guessed.into()), &cfg).await,
+            guessed,
+        );
+        assert_ne!(g1, g2, "{guessed} is not an explicit session");
+    }
+
+    let s1 = session(
+        &sent_request(ACCOUNT, named(format!("s1-{unique}")), &cfg).await,
+        "s1 first",
+    );
+    let s1_again = session(
+        &sent_request(ACCOUNT, named(format!("s1-{unique}")), &cfg).await,
+        "s1 again",
+    );
+    assert_eq!(s1, s1_again, "the same explicit session keeps its Muse session id");
+    let contributor_turn = sent_request(
+        ACCOUNT,
+        |req, c| {
+            named(format!("s1-{unique}"))(req, c);
+            req.model = "muse-spark-1.3-contributor".into();
+        },
+        &cfg,
+    )
+    .await;
+    assert_eq!(
+        session(&contributor_turn, "s1 contributor"),
+        s1,
+        "the model does not end a session"
+    );
+    let s2 = session(&sent_request(ACCOUNT, named(format!("s2-{unique}")), &cfg).await, "s2");
+    assert_ne!(s1, s2, "another session, another id");
+    let other_account = sent_request(
+        ACCOUNT,
+        |req, c| {
+            named(format!("s1-{unique}"))(req, c);
+            c.id = "meta-other-account.json".into();
+        },
+        &cfg,
+    )
+    .await;
+    assert_ne!(
+        session(&other_account, "s1 other credential"),
+        s1,
+        "never shared across credentials"
+    );
+}
+
+/// A user can open unrelated conversations. Only an actual session signal, including
+/// a transport-owned session when a plain user ID masks it, retains the Muse UUID.
+#[tokio::test]
+async fn user_identity_does_not_become_a_muse_conversation() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    let edit = |req: &mut ExecRequest, user: &str| {
+        let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+        body["metadata"] = json!({"user_id": user});
+        req.body = serde_json::to_vec(&body).unwrap().into();
+        req.original_body = req.body.clone();
+    };
+    for user in [format!("plain-{unique}"), json!({"account_uuid": unique}).to_string()] {
+        let first = sent_request(ACCOUNT, |req, _| edit(req, &user), &cfg).await;
+        let next = sent_request(ACCOUNT, |req, _| edit(req, &user), &cfg).await;
+        assert_ne!(
+            assert_session_headers("user first", &first),
+            assert_session_headers("user next", &next)
+        );
+    }
+    let user = format!("user-{unique}");
+    let transport = format!("transport-{unique}");
+    let turn = || {
+        sent_request(
+            ACCOUNT,
+            |req, _| {
+                edit(req, &user);
+                req.execution_session = Some(transport.clone());
+            },
+            &cfg,
+        )
+    };
+    let first = turn().await;
+    let next = turn().await;
+    let id = assert_session_headers("transport first", &first);
+    assert_eq!(id, assert_session_headers("transport next", &next));
+    let other = sent_request(
+        ACCOUNT,
+        |req, _| {
+            edit(req, &user);
+            req.execution_session = Some(format!("other-{transport}"));
+        },
+        &cfg,
+    )
+    .await;
+    assert_ne!(id, assert_session_headers("another transport", &other));
+
+    let named = || {
+        sent_request(
+            ACCOUNT,
+            |req, _| {
+                edit(req, &user);
+                req.headers.insert("Session-Id", transport.parse().unwrap());
+            },
+            &cfg,
+        )
+    };
+    assert_eq!(
+        assert_session_headers("named first", &named().await),
+        assert_session_headers("named next", &named().await),
+    );
+}
+
+/// Plain user identities must not hide a named conversation, including the legacy
+/// root/envelope spellings. Body conversations also outrank transport fallback.
+#[tokio::test]
+async fn plain_user_ids_do_not_shadow_explicit_conversation_fields() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for nested in [false, true] {
+        for path in [
+            "conversation_id",
+            "conversationId",
+            "chat_id",
+            "chatId",
+            "metadata.conversation_id",
+            "extra_body.conversation_id",
+        ] {
+            let turn = |conversation: String, transport: String, user: &str| {
+                let mut fields = json!({"metadata": {"user_id": user}});
+                if let Some((root, key)) = path.split_once('.') {
+                    if fields.get(root).is_none() {
+                        fields[root] = json!({});
+                    }
+                    fields[root][key] = conversation.into();
+                } else {
+                    fields[path] = conversation.into();
+                }
+                let fields = if nested { json!({"request": fields}) } else { fields };
+                sent_request(
+                    ACCOUNT,
+                    move |req, _| {
+                        let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+                        body.as_object_mut()
+                            .unwrap()
+                            .extend(fields.as_object().unwrap().clone());
+                        req.body = serde_json::to_vec(&body).unwrap().into();
+                        req.original_body = req.body.clone();
+                        req.execution_session = (!transport.is_empty()).then_some(transport);
+                    },
+                    &cfg,
+                )
+            };
+            let conversation = format!("{unique}-{nested}-{path}");
+            let first = turn(conversation.clone(), String::new(), "user-a").await;
+            let next = turn(conversation.clone(), "transport-b".into(), "user-b").await;
+            let id = assert_session_headers(path, &first);
+            assert_eq!(id, assert_session_headers(path, &next), "{nested}: {path}");
+            let other = turn(format!("other-{conversation}"), "transport-b".into(), "user-b").await;
+            assert_ne!(id, assert_session_headers(path, &other), "{nested}: {path}");
+        }
+    }
+
+    // A session encoded in Claude metadata retains its higher priority.
+    for user in [
+        json!({"session_id": unique}).to_string(),
+        format!("user_account_session_{unique}"),
+    ] {
+        let turn = |conversation: String| {
+            let user = user.clone();
+            sent_request(
+                ACCOUNT,
+                move |req, _| {
+                    let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+                    body["metadata"] = json!({"user_id": user});
+                    body["conversation_id"] = conversation.into();
+                    req.body = serde_json::to_vec(&body).unwrap().into();
+                    req.original_body = req.body.clone();
+                },
+                &cfg,
+            )
+        };
+        assert_eq!(
+            assert_session_headers("encoded first", &turn("first".into()).await),
+            assert_session_headers("encoded next", &turn("next".into()).await),
+        );
+    }
+}
+
+/// Session retention follows the authorization root, not the reusable filename or a
+/// short-lived minted key. Caller namespaces also keep equal session names apart.
+#[tokio::test]
+async fn muse_sessions_are_fenced_by_authorization_and_caller() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    async fn turn(fixture: &str, unique: &str, root: &str, key: &str, caller: &str, cfg: &Config) -> Captured {
+        sent_request(
+            fixture,
+            |req, c| {
+                req.headers.insert("Session-Id", unique.parse().unwrap());
+                req.caller.principal = caller.into();
+                c.id = format!("same-file-{unique}.json");
+                if !root.is_empty() {
+                    c.metadata.insert("dca_token".into(), root.into());
+                }
+                c.metadata.insert("api_key".into(), key.into());
+                c.metadata.insert("access_token".into(), key.into());
+                c.attributes.remove("api_key");
+                c.attributes.remove("access_token");
+            },
+            cfg,
+        )
+        .await
+    }
+    let first = turn(
+        ACCOUNT,
+        &unique,
+        "dca:account-a",
+        "fake-minted-a",
+        "fake-caller-a",
+        &cfg,
+    )
+    .await;
+    let refreshed = turn(
+        ACCOUNT,
+        &unique,
+        "dca:account-a",
+        "fake-minted-a-new",
+        "fake-caller-a",
+        &cfg,
+    )
+    .await;
+    let id = assert_session_headers("account a", &first);
+    assert_eq!(id, assert_session_headers("account a refreshed", &refreshed));
+    for (root, key, caller) in [
+        ("dca:account-b", "fake-minted-b", "fake-caller-a"),
+        ("dca:recreated-account-c", "fake-minted-c", "fake-caller-a"),
+        ("dca:account-a", "fake-minted-a", "fake-caller-b"),
+    ] {
+        let replaced = turn(ACCOUNT, &unique, root, key, caller, &cfg).await;
+        assert_ne!(id, assert_session_headers("replaced account or caller", &replaced));
+    }
+    let first_key = turn(API_KEY, &unique, "", "fake-api-a", "fake-caller-a", &cfg).await;
+    let same_key = turn(API_KEY, &unique, "", "fake-api-a", "fake-caller-a", &cfg).await;
+    let other_key = turn(API_KEY, &unique, "", "fake-api-b", "fake-caller-a", &cfg).await;
+    let id = assert_session_headers("api a", &first_key);
+    assert_eq!(id, assert_session_headers("api a again", &same_key));
+    assert_ne!(id, assert_session_headers("api b", &other_key));
+}
+
+async fn assert_authorization_override_session_fence(dynamic: bool) {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for fixture in [ACCOUNT, API_KEY] {
+        let turn = |bearer: &'static str, shadow: &'static str| {
+            let session = unique.clone();
+            sent_request(
+                fixture,
+                move |req, credential| {
+                    req.headers.insert("Session-Id", session.parse().unwrap());
+                    // Case variants are applied in attribute order, last wins.
+                    credential
+                        .attributes
+                        .insert("header:Authorization".into(), shadow.into());
+                    credential.attributes.insert(
+                        "header:authorization".into(),
+                        if dynamic { "$X-Upstream-Auth" } else { bearer }.into(),
+                    );
+                    req.headers.insert("X-Upstream-Auth", bearer.parse().unwrap());
+                },
+                &cfg,
+            )
+        };
+        let first = turn("Bearer fake-override-a", "Bearer ignored-a").await;
+        let next = turn("Bearer fake-override-a", "Bearer ignored-b").await;
+        let other = turn("Bearer fake-override-b", "Bearer ignored-b").await;
+        assert_eq!(
+            sent_header(&first, "Authorization").as_deref(),
+            Some("Bearer fake-override-a")
+        );
+        assert_eq!(
+            sent_header(&next, "Authorization").as_deref(),
+            Some("Bearer fake-override-a")
+        );
+        assert_eq!(
+            sent_header(&other, "Authorization").as_deref(),
+            Some("Bearer fake-override-b")
+        );
+        let id = assert_session_headers("override first", &first);
+        assert_eq!(
+            id,
+            assert_session_headers("override next", &next),
+            "the winning bearer is unchanged"
+        );
+        assert_ne!(
+            id,
+            assert_session_headers("override replaced", &other),
+            "{fixture}: effective bearer changed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn muse_sessions_follow_literal_authorization_overrides() {
+    assert_authorization_override_session_fence(false).await;
+}
+
+#[tokio::test]
+async fn muse_sessions_follow_referenced_authorization_overrides() {
+    assert_authorization_override_session_fence(true).await;
+}
+
+/// An unresolved custom header does not replace the credential's default bearer.
+#[tokio::test]
+async fn missing_authorization_reference_keeps_default_session_scope() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    for custom in [false, true] {
+        let turn = || {
+            sent_request(
+                ACCOUNT,
+                |req, credential| {
+                    req.headers.insert("Session-Id", unique.parse().unwrap());
+                    if custom {
+                        credential
+                            .attributes
+                            .insert("header:Authorization".into(), "$X-Not-Sent".into());
+                    }
+                },
+                &cfg,
+            )
+        };
+        let first = turn().await;
+        let next = sent_request(
+            ACCOUNT,
+            |req, _| {
+                req.headers.insert("Session-Id", unique.parse().unwrap());
+            },
+            &cfg,
+        )
+        .await;
+        assert_eq!(
+            sent_header(&first, "Authorization"),
+            sent_header(&next, "Authorization")
+        );
+        assert_eq!(
+            assert_session_headers("default first", &first),
+            assert_session_headers("default next", &next)
+        );
+    }
+}
+
+/// #81, Go v8.0.67 c2f402b4: contributor mode follows the model the prepared body sends,
+/// after alias resolution and payload rules, not the client's requested name.
+#[tokio::test]
+async fn contributor_mode_follows_the_final_model() {
+    let rule = |from: &str, to: &str| {
+        Config::parse(&format!(
+            "payload:\n  override:\n    - models: [{{name: \"{from}\", protocol: meta}}]\n      params: {{model: \"{to}\"}}\n"
+        ))
+        .unwrap()
+    };
+    let plain = cfg();
+    let to_contributor = rule("muse-spark-1.3", "muse-spark-1.3-contributor");
+    let to_plain = rule("muse-spark-1.3-contributor", "muse-spark-1.3");
+    let cases: [(&str, &str, &Config, &str, &str); 4] = [
+        ("my-contributor-alias", "muse-spark-1.3", &plain, "muse-spark-1.3", "0"),
+        (
+            "fast",
+            "muse-spark-1.3-contributor",
+            &plain,
+            "muse-spark-1.3-contributor",
+            "1",
+        ),
+        (
+            "muse-spark-1.3",
+            "muse-spark-1.3",
+            &to_contributor,
+            "muse-spark-1.3-contributor",
+            "1",
+        ),
+        (
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.3-contributor",
+            &to_plain,
+            "muse-spark-1.3",
+            "0",
+        ),
+    ];
+    for (requested, upstream, cfg, sent_model, mode) in cases {
+        let sent = sent_request(
+            ACCOUNT,
+            |req, _| {
+                req.requested_model = requested.into();
+                req.model = upstream.into();
+            },
+            cfg,
+        )
+        .await;
+        let what = format!("{requested} -> {upstream}");
+        assert_eq!(&*gj::get(&sent.body, "model").str(), sent_model, "{what}");
+        assert_eq!(
+            sent_header(&sent, "X-Tbh-Contributor-Mode").as_deref(),
+            Some(mode),
+            "{what}"
+        );
+    }
+}
+
+/// #81: a caller cannot set the identity headers (they are not forwarded), while the
+/// operator's credential headers still replace them, as every Meta header policy did.
+#[tokio::test]
+async fn caller_headers_cannot_set_the_identity_and_operator_headers_still_win() {
+    let cfg = cfg();
+    let caller = sent_request(
+        ACCOUNT,
+        |req, _| {
+            for (name, value) in [
+                ("User-Agent", "caller-agent"),
+                ("X-Client-Id", "tbh:tui"),
+                ("X-Tbh-Session-Id", "caller-session"),
+                ("X-Meta-Ai-Gateway-Session-Id", "caller-session"),
+                ("X-Tbh-Contributor-Mode", "1"),
+                ("X-Tbh-Agent-Role", "reminder:goal-reminder"),
+                ("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            ] {
+                req.headers.insert(name, value.parse().unwrap());
+            }
+        },
+        &cfg,
+    )
+    .await;
+    assert_eq!(
+        sent_header(&caller, "User-Agent").as_deref(),
+        Some(MUSE_CODE_USER_AGENT)
+    );
+    assert_eq!(sent_header(&caller, "X-Client-Id").as_deref(), Some("tbh:exec"));
+    assert_eq!(sent_header(&caller, "X-Tbh-Contributor-Mode").as_deref(), Some("0"));
+    assert_eq!(sent_header(&caller, "traceparent"), None);
+    assert_ne!(assert_session_headers("caller", &caller), "caller-session");
+
+    let operator = sent_request(
+        ACCOUNT,
+        |_, c| {
+            c.attributes.insert("header:User-Agent".into(), "operator-agent".into());
+            c.attributes
+                .insert("header:X-Tbh-Agent-Role".into(), "operator-role".into());
+        },
+        &cfg,
+    )
+    .await;
+    assert_eq!(sent_header(&operator, "User-Agent").as_deref(), Some("operator-agent"));
+    assert_eq!(
+        sent_header(&operator, "X-Tbh-Agent-Role").as_deref(),
+        Some("operator-role")
+    );
+    assert_eq!(sent_header(&operator, "X-Client-Id").as_deref(), Some("tbh:exec"));
+}
+
+/// The body the executor sends upstream for `body` from a `source` client, captured by a
+/// private loopback mock with the fixture's synthetic credential.
+async fn sent_body(source: Format, body: &str, stream: bool, cfg: &Config) -> Vec<u8> {
+    let fx = fixture("meta", "responses-nonstream-collected");
+    let origin = go_origin(&fx).unwrap();
+    let mock = Mock::start(&fx["responses"]).await;
+    let credential = meta_credential(&fx, &origin, &mock.url);
+    let mut req = request(&fx, "");
+    req.source_format = source;
+    req.response_format = source;
+    req.stream = stream;
+    req.body = Bytes::from(body.to_owned());
+    req.original_body = req.body.clone();
+    let response = MetaExecutor::with_client(default_client())
+        .execute(&credential, req, cfg)
+        .await
+        .unwrap_or_else(|e| panic!("{source:?} {body}: {e:?}"));
+    if let ResponseBody::Stream(mut s) = response.body {
+        while s.next().await.is_some() {}
+    }
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1, "{source:?} {body}");
+    captured[0].body.clone()
+}
+
+/// One client body per format Meta serves (a Codex-format client is refused with 501
+/// before anything is sent), with `{}` standing for the `prompt_cache_retention` member
+/// (or nothing) between the model and the rest.
+const RETENTION_BODIES: [(Format, &str); 3] = [
+    (
+        Format::OpenAIResponse,
+        r#"{"model":"muse-spark-1.3"{},"input":"hello","temperature":0.2,"metadata":{"k":"v"}}"#,
+    ),
+    (
+        Format::OpenAI,
+        r#"{"model":"muse-spark-1.3"{},"messages":[{"role":"user","content":"hello"}],"temperature":0.2}"#,
+    ),
+    (
+        Format::Claude,
+        r#"{"model":"muse-spark-1.3"{},"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+    ),
+];
+
+/// M2 (#82), Go v8.0.67 f77a3c10: an explicit string `prompt_cache_retention` that is not
+/// blank reaches Meta trimmed; absent, empty, blank, null and non-string values are not
+/// sent, and nothing invents a default. Every other byte of the prepared body is the one
+/// the same request without the member produces.
+#[tokio::test]
+async fn prompt_cache_retention_passes_through_only_as_an_explicit_string() {
+    let cfg = cfg();
+    let cases: [(&str, Option<&str>); 11] = [
+        (r#","prompt_cache_retention":"24h""#, Some("24h")),
+        (r#","prompt_cache_retention":"in_memory""#, Some("in_memory")),
+        // Unknown values are the upstream's to judge.
+        (r#","prompt_cache_retention":"7d""#, Some("7d")),
+        // Go's strings.TrimSpace, then set as a string.
+        (r#","prompt_cache_retention":" 24h\t""#, Some("24h")),
+        (r#","prompt_cache_retention":"""#, None),
+        (r#","prompt_cache_retention":"   ""#, None),
+        (r#","prompt_cache_retention":null"#, None),
+        (r#","prompt_cache_retention":24"#, None),
+        (r#","prompt_cache_retention":true"#, None),
+        (r#","prompt_cache_retention":{"ttl":"24h"}"#, None),
+        (r#","prompt_cache_retention":["24h"]"#, None),
+    ];
+    for (source, template) in RETENTION_BODIES {
+        for stream in [false, true] {
+            let absent = sent_body(source, &template.replace("{}", ""), stream, &cfg).await;
+            assert!(
+                !gj::get(&absent, "prompt_cache_retention").exists(),
+                "{source:?} stream={stream}: no default when absent: {}",
+                String::from_utf8_lossy(&absent)
+            );
+            for (member, want) in cases {
+                let body = template.replace("{}", member);
+                let mut sent = sent_body(source, &body, stream, &cfg).await;
+                let got = gj::get(&sent, "prompt_cache_retention");
+                let shown = String::from_utf8_lossy(&sent).into_owned();
+                match want {
+                    Some(want) => {
+                        assert_eq!(got.kind, Kind::String, "{source:?} stream={stream} {member}: {shown}");
+                        assert_eq!(
+                            &*got.bytes(),
+                            want.as_bytes(),
+                            "{source:?} stream={stream} {member}: {shown}"
+                        );
+                    }
+                    None => assert!(!got.exists(), "{source:?} stream={stream} {member}: {shown}"),
+                }
+                gj::delete(&mut sent, "prompt_cache_retention");
+                assert_eq!(
+                    String::from_utf8_lossy(&sent),
+                    String::from_utf8_lossy(&absent),
+                    "{source:?} stream={stream} {member}: other bytes unchanged"
+                );
+            }
+        }
+    }
+}
+
+/// The payload rules stay the last change: a `default` rule fills only an omitted
+/// retention (its baseline carries the client's value), `override` replaces it and
+/// `filter` removes it.
+#[tokio::test]
+async fn payload_rules_decide_prompt_cache_retention_after_the_client() {
+    let rule = |kind: &str, params: &str| {
+        Config::parse(&format!(
+            "payload:\n  {kind}:\n    - models: [{{name: \"muse-*\", protocol: meta}}]\n      params: {params}\n"
+        ))
+        .unwrap()
+    };
+    let default = rule("default", r#"{prompt_cache_retention: "24h"}"#);
+    let override_ = rule("override", r#"{prompt_cache_retention: "24h"}"#);
+    let filter = rule("filter", "[prompt_cache_retention]");
+    let explicit = r#"{"model":"muse-spark-1.3","prompt_cache_retention":"in_memory","input":"hello"}"#;
+    let omitted = r#"{"model":"muse-spark-1.3","input":"hello"}"#;
+    let blank = r#"{"model":"muse-spark-1.3","prompt_cache_retention":" ","input":"hello"}"#;
+    let cases: [(&Config, &str, Option<&str>); 6] = [
+        (&default, omitted, Some("24h")),
+        (&default, blank, Some("24h")),
+        (&default, explicit, Some("in_memory")),
+        (&override_, explicit, Some("24h")),
+        (&override_, omitted, Some("24h")),
+        (&filter, explicit, None),
+    ];
+    for (i, (cfg, body, want)) in cases.into_iter().enumerate() {
+        for stream in [false, true] {
+            let sent = sent_body(Format::OpenAIResponse, body, stream, cfg).await;
+            let got = gj::get(&sent, "prompt_cache_retention");
+            let shown = String::from_utf8_lossy(&sent).into_owned();
+            match want {
+                Some(want) => assert_eq!(&*got.bytes(), want.as_bytes(), "case {i} stream={stream}: {shown}"),
+                None => assert!(!got.exists(), "case {i} stream={stream}: {shown}"),
+            }
         }
     }
 }

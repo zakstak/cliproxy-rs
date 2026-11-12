@@ -1,0 +1,203 @@
+harness/manifest.json: ok
+..................................................................
+----------------------------------------------------------------------
+Ran 66 tests in 2.547s
+
+OK
+buffered: Go [200] Rust [200]; 18 differing fields
+cloak-tools-beta: Go [200] Rust [200]; 18 differing fields
+tool-roundtrip: Go [200] Rust [200]; 18 differing fields
+tool-stream-roundtrip: Go [200] Rust [200]; 23 differing fields
+native-signals: Go [200] Rust [200]; 18 differing fields
+stream-fragmented: Go [200] Rust [200]; 23 differing fields
+stream-crlf: Go [200] Rust [200]; 23 differing fields
+stream-bootstrap-error: Go [429] Rust [429]; 18 differing fields
+stream-mid-error: Go [200] Rust [200]; 23 differing fields
+stream-truncated: Go [200] Rust [200]; 23 differing fields
+stream-after-stop: Go [200] Rust [200]; 23 differing fields
+client-disconnect: Go [200] Rust [200]; 23 differing fields
+count-tokens: Go [200] Rust [200]; 18 differing fields
+upstream-400: Go [400] Rust [400]; 18 differing fields
+upstream-401: Go [401] Rust [401]; 20 differing fields
+upstream-429: Go [429] Rust [429]; 18 differing fields
+upstream-500: Go [500] Rust [500]; 18 differing fields
+upstream-503: Go [503] Rust [503]; 18 differing fields
+empty-500: Go [500] Rust [500]; 18 differing fields
+gzip-json: Go [200] Rust [200]; 18 differing fields
+gzip-unlabelled: Go [200] Rust [200]; 18 differing fields
+gzip-sse: Go [200] Rust [200]; 23 differing fields
+deflate-json: Go [200] Rust [200]; 18 differing fields
+auth-missing: Go [401] Rust [401]; 15 differing fields
+auth-wrong: Go [401] Rust [401]; 15 differing fields
+auth-query-first: Go [401] Rust [401]; 15 differing fields
+auth-query-encoded: Go [200] Rust [200]; 18 differing fields
+models-openai: Go [200] Rust [200]; 17 differing fields
+models-anthropic: Go [200] Rust [200]; 17 differing fields
+refresh-expired: Go [200] Rust [200]; 18 differing fields
+continuity-two-turns: Go [200, 200] Rust [200, 200]; 36 differing fields
+tls-reconnect-two-turns: Go [200, 200] Rust [200, 200]; 36 differing fields
+disabled-credential: Go [400] Rust [400]; 15 differing fields
+chat-completions: Go [200] Rust [200]; 18 differing fields
+chat-completions-stream: Go [200] Rust [200]; 23 differing fields
+chat-upstream-429: Go [429] Rust [429]; 18 differing fields
+completions: Go [200] Rust [200]; 18 differing fields
+completions-stream: Go [200] Rust [200]; 23 differing fields
+unknown-model: Go [400] Rust [400]; 15 differing fields
+chat-unknown-model: Go [400] Rust [400]; 15 differing fields
+compact-claude: Go [501] Rust [200]; 24 differing fields
+compact-stream-rejected: Go [400] Rust [400]; 15 differing fields
+models-anthropic-ua: Go [200] Rust [200]; 17 differing fields
+healthz-head: Go [200] Rust [200]; 7 differing fields
+wrong-method-chat: Go [404] Rust [404]; 10 differing fields
+models-head: Go [404] Rust [404]; 7 differing fields
+healthz-post: Go [404] Rust [404]; 10 differing fields
+unknown-path: Go [404] Rust [404]; 10 differing fields
+root: Go [200] Rust [200]; 15 differing fields
+dd-model-messages: Go [200] Rust [200]; 18 differing fields
+Results: /home/agent/git/cliproxy-rs/harness/.cache/run-historical-20261112-102514
+{
+  "kind": "differential",
+  "target": "historical",
+  "verdict": "pass",
+  "partial": false,
+  "counts": {
+    "suite": 50,
+    "run": 50,
+    "passed": 50,
+    "failed": 0,
+    "infrastructure": 0,
+    "named_skips": 0,
+    "unknown_skips": 0,
+    "named_divergences": 4,
+    "stale_divergences": 0
+  }
+}
+receipt: harness/.cache/accept-20261112-102510/differential-historical.json
+{
+  "kind": "mutation-control",
+  "target": "historical",
+  "verdict": "pass",
+  "partial": false,
+  "counts": {
+    "mutations": 19,
+    "caught": 19
+  }
+}
+receipt: harness/.cache/accept-20261112-102510/mutation-historical.json
+..................................................................
+----------------------------------------------------------------------
+Ran 66 tests in 2.284s
+
+OK
+buffered: Go [200] Rust [200]; 25 differing fields
+cloak-tools-beta: Go [200] Rust [200]; 25 differing fields
+tool-roundtrip: Go [200] Rust [200]; 27 differing fields
+tool-stream-roundtrip: Go [200] Rust [200]; 32 differing fields
+native-signals: Go [200] Rust [200]; 29 differing fields
+stream-fragmented: Go [200] Rust [200]; 30 differing fields
+stream-crlf: Go [200] Rust [200]; 30 differing fields
+stream-bootstrap-error: Go [429] Rust [429]; 27 differing fields
+stream-mid-error: Go [200] Rust [200]; 30 differing fields
+stream-truncated: Go [200] Rust [200]; 30 differing fields
+stream-after-stop: Go [200] Rust [200]; 30 differing fields
+client-disconnect: Go [200] Rust [200]; 31 differing fields
+count-tokens: Go [200] Rust [200]; 22 differing fields
+upstream-400: Go [400] Rust [400]; 27 differing fields
+upstream-401: Go [401] Rust [401]; 37 differing fields
+upstream-429: Go [429] Rust [429]; 27 differing fields
+upstream-500: Go [500] Rust [500]; 27 differing fields
+upstream-503: Go [503] Rust [503]; 27 differing fields
+empty-500: Go [500] Rust [500]; 25 differing fields
+gzip-json: Go [200] Rust [200]; 25 differing fields
+gzip-unlabelled: Go [200] Rust [200]; 25 differing fields
+gzip-sse: Go [200] Rust [200]; 30 differing fields
+deflate-json: Go [200] Rust [200]; 25 differing fields
+auth-missing: Go [401] Rust [401]; 18 differing fields
+auth-wrong: Go [401] Rust [401]; 18 differing fields
+auth-query-first: Go [401] Rust [401]; 18 differing fields
+auth-query-encoded: Go [200] Rust [200]; 25 differing fields
+models-openai: Go [200] Rust [200]; 18 differing fields
+models-anthropic: Go [200] Rust [200]; 18 differing fields
+refresh-expired: Go [200] Rust [200]; 25 differing fields
+continuity-two-turns: Go [200, 200] Rust [200, 200]; 52 differing fields
+tls-reconnect-two-turns: Go [200, 200] Rust [200, 200]; 50 differing fields
+disabled-credential: Go [400] Rust [400]; 16 differing fields
+chat-completions: Go [200] Rust [200]; 25 differing fields
+chat-completions-stream: Go [200] Rust [200]; 30 differing fields
+chat-upstream-429: Go [429] Rust [429]; 25 differing fields
+completions: Go [200] Rust [200]; 25 differing fields
+completions-stream: Go [200] Rust [200]; 30 differing fields
+unknown-model: Go [400] Rust [400]; 16 differing fields
+chat-unknown-model: Go [400] Rust [400]; 16 differing fields
+compact-claude: Go [200] Rust [200]; 27 differing fields
+compact-stream-rejected: Go [400] Rust [400]; 16 differing fields
+models-anthropic-ua: Go [200] Rust [200]; 18 differing fields
+healthz-head: Go [200] Rust [200]; 10 differing fields
+wrong-method-chat: Go [404] Rust [404]; 11 differing fields
+models-head: Go [404] Rust [404]; 10 differing fields
+healthz-post: Go [404] Rust [404]; 11 differing fields
+unknown-path: Go [404] Rust [404]; 11 differing fields
+root: Go [200] Rust [200]; 16 differing fields
+dd-model-messages: Go [200] Rust [200]; 25 differing fields
+xai-responses-buffered: Go [200] Rust [200]; 20 differing fields
+xai-responses-stream: Go [200] Rust [200]; 25 differing fields
+xai-chat-buffered: Go [200] Rust [200]; 20 differing fields
+xai-chat-stream: Go [200] Rust [200]; 25 differing fields
+xai-messages-stream: Go [200] Rust [200]; 28 differing fields
+xai-chat-upstream-429: Go [429] Rust [429]; 20 differing fields
+meta-responses-buffered: Go [200] Rust [200]; 29 differing fields
+meta-responses-stream: Go [200] Rust [200]; 34 differing fields
+meta-chat-buffered: Go [200] Rust [200]; 29 differing fields
+meta-chat-stream: Go [200] Rust [200]; 34 differing fields
+meta-messages-stream: Go [200] Rust [200]; 37 differing fields
+meta-chat-upstream-429: Go [429] Rust [429]; 29 differing fields
+Results: /home/agent/git/cliproxy-rs/harness/.cache/run-selective-20261112-102544
+{
+  "kind": "differential",
+  "target": "selective",
+  "verdict": "pass",
+  "partial": false,
+  "counts": {
+    "suite": 62,
+    "run": 62,
+    "passed": 62,
+    "failed": 0,
+    "infrastructure": 0,
+    "named_skips": 0,
+    "unknown_skips": 0,
+    "named_divergences": 17,
+    "stale_divergences": 0
+  }
+}
+receipt: harness/.cache/accept-20261112-102510/differential-selective.json
+{
+  "kind": "mutation-control",
+  "target": "selective",
+  "verdict": "pass",
+  "partial": false,
+  "counts": {
+    "mutations": 30,
+    "caught": 30
+  }
+}
+receipt: harness/.cache/accept-20261112-102510/mutation-selective.json
+{
+  "kind": "cargo-groups",
+  "verdict": "pass",
+  "partial": false,
+  "counts": {
+    "groups": 6,
+    "tests": 32,
+    "passed": 32,
+    "failed": 0,
+    "unknown_tests": 0
+  }
+}
+receipt: harness/.cache/accept-20261112-102510/cargo-groups.json
+{
+  "kind": "acceptance",
+  "verdict": "pass",
+  "partial": false
+}
+receipt: harness/.cache/accept-20261112-102510/acceptance.json
+receipts: harness/.cache/accept-20261112-102510

@@ -279,6 +279,35 @@
       ]
     },
     {
+      "id": "claude-fable-5-2",
+      "object": "model",
+      "created": 1794250800,
+      "owned_by": "anthropic",
+      "type": "claude",
+      "display_name": "Claude Fable 5.2",
+      "description": "For demanding reasoning and long-horizon agentic work",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "zero_allowed": false,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "claude-opus-5-5",
       "native_capabilities": {
         "web_search": true
@@ -505,6 +534,40 @@
       "description": "GPT-6 Luna Codex model.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "object": "model",
+      "created": 1792972800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Terra",
+      "version": "gpt-6.0",
+      "description": "GPT-6.1 Terra Codex model.",
+      "context_length": 500000,
       "supported_parameters": [
         "tools"
       ],
@@ -785,6 +848,40 @@
       "description": "Latest workhorse model for coding and everyday work.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "object": "model",
+      "created": 1792972800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Terra",
+      "version": "gpt-6.0",
+      "description": "GPT-6.1 Terra Codex model.",
+      "context_length": 500000,
       "supported_parameters": [
         "tools"
       ],
@@ -1126,6 +1223,40 @@
       "support_configuration_update": true
     },
     {
+      "id": "gpt-6.1-terra",
+      "object": "model",
+      "created": 1792972800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Terra",
+      "version": "gpt-6.0",
+      "description": "GPT-6.1 Terra Codex model.",
+      "context_length": 500000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
       "id": "gpt-6-luna",
       "object": "model",
       "created": 1790035200,
@@ -1417,6 +1548,40 @@
       "description": "Latest workhorse model for coding and everyday work.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "object": "model",
+      "created": 1792972800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Terra",
+      "version": "gpt-6.0",
+      "description": "GPT-6.1 Terra Codex model.",
+      "context_length": 500000,
       "supported_parameters": [
         "tools"
       ],
@@ -1914,6 +2079,37 @@
     }
   ],
   "meta": [
+    {
+      "id": "muse-ember-1.0",
+      "object": "model",
+      "created": 1794182400,
+      "owned_by": "meta",
+      "type": "meta",
+      "display_name": "Muse Ember 1.0",
+      "name": "muse-ember-1.0",
+      "description": "Meta's smallest, most efficient model, for high-volume agent work.",
+      "context_length": 1048576,
+      "max_completion_tokens": 524288,
+      "thinking": {
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video",
+        "audio"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
     {
       "id": "muse-wonder-1.0",
       "object": "model",

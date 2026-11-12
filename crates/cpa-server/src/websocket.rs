@@ -56,7 +56,7 @@ use cpa_core::config::Config;
 use cpa_core::credential::Credential;
 use cpa_core::exec::{Caller, ExecError, ExecSession, ExecStream, Operation};
 use cpa_core::format::Format;
-use cpa_exec::codex::{CodexExecutor, InterruptError, SteeringInput};
+use cpa_exec::codex::{CodexExecutor, InterruptError, Refusal, SteeringInput};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc, watch};
@@ -206,11 +206,13 @@ async fn upgrade(
     peer: dispatch::Peer,
     matched: axum::extract::MatchedPath,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let Ok(ws) = ws else {
         return upgrade_rejected();
     };
+    let authority = Arc::new(ClientAuthority::new(&rt, &caller, &headers, query.unwrap_or_default()));
     // `websocketUpgradeHeaders`: keep sticky turn state across reconnects.
     let turn_state = headers
         .get(TURN_STATE)
@@ -219,6 +221,7 @@ async fn upgrade(
         .filter(|v| !v.is_empty())
         .and_then(|v| HeaderValue::from_str(v).ok());
     let mut connection = Connection::new(rt, caller, headers);
+    connection.authority = authority;
     // Go `request_path` metadata: gin FullPath of the upgrade route.
     connection.request_path = matched.as_str().to_owned();
     connection.peer = dispatch::peer(peer);
@@ -396,9 +399,56 @@ fn unix_now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// Go's refusal when a duplex turn authenticates as another principal.
+const CREDENTIAL_CHANGED: &str = "client credential changed during the websocket stream; reconnect";
+
+/// The client authority a connection was opened with (N1 #111 W2). The upgrade
+/// authenticates the client once; each later frame that would reach an upstream
+/// re-runs the same client-key check on the upgrade's headers and query against the
+/// current config, as Go reauthorizes Responses WebSocket turns (`b9bb031d`,
+/// `3e7a21e2`). A key removed from `api-keys` stops the connection's next send, and the
+/// connection never moves to another accepted key it also presents: the principal bound
+/// at the upgrade is the only one it may act as. With no client keys configured, access
+/// is open, for this connection as for a new one.
+pub(crate) struct ClientAuthority {
+    /// No cycle: the executor session that holds this authority belongs to the runtime.
+    rt: std::sync::Weak<Runtime>,
+    principal: String,
+    headers: HeaderMap,
+    query: String,
+}
+
+impl ClientAuthority {
+    fn new(rt: &Arc<Runtime>, caller: &Caller, headers: &HeaderMap, query: String) -> Self {
+        Self {
+            rt: Arc::downgrade(rt),
+            principal: caller.principal.clone(),
+            headers: headers.clone(),
+            query,
+        }
+    }
+
+    /// Why the client may no longer send, if it may not. The message names no key.
+    pub(crate) fn refusal(&self) -> Option<Refusal> {
+        let rt = self.rt.upgrade()?;
+        let message = match crate::access::check(&rt, &self.headers, &self.query) {
+            Ok(None) => return None,
+            Ok(Some(caller)) if caller.principal == self.principal => return None,
+            Ok(Some(_)) => CREDENTIAL_CHANGED,
+            Err(message) => message,
+        };
+        Some(Refusal {
+            message: message.to_owned(),
+            event: Bytes::from(error_payload(401, message, None)),
+        })
+    }
+}
+
 struct Connection {
     rt: Arc<Runtime>,
     caller: Caller,
+    /// The client authority bound at the upgrade, checked before every upstream send.
+    authority: Arc<ClientAuthority>,
     headers: HeaderMap,
     /// An official Codex client (`User-Agent` or `originator`): it gets subscription-limit
     /// failures as the structured event Codex classifies, where Go closes silently.
@@ -663,6 +713,7 @@ struct Control {
     local: Arc<LocalInterrupt>,
     writer: Writer,
     timeline: Timeline,
+    authority: Arc<ClientAuthority>,
 }
 
 impl Control {
@@ -679,6 +730,14 @@ impl Control {
             return None;
         }
         self.diagnostic(frame, "");
+        // A control frame acts for the client too: under a revoked key it reaches no
+        // upstream and ends no local turn (N1 #111 W2).
+        if let Some(refusal) = self.authority.refusal() {
+            self.diagnostic(frame, "rejected");
+            let event = String::from_utf8_lossy(&refusal.event).into_owned();
+            let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
+            return Some(sent.map_err(|e| e.to_string()));
+        }
         let outcome = match self.forward(frame).await {
             Ok(None) => "handled",
             // Upstream acknowledged an interrupt for a response that had already ended.
@@ -703,6 +762,14 @@ impl Control {
                 }
                 Local::Refused => return Some(self.reject(frame, InterruptError::NoActive).await),
             },
+            // The key was revoked while the interrupt waited for the socket: nothing was
+            // written (N1 #111 W2).
+            Err(InterruptError::Refused(refusal)) => {
+                self.diagnostic(frame, "rejected");
+                let event = String::from_utf8_lossy(&refusal.event).into_owned();
+                let sent = self.writer.lock().await.send(Message::Text(event.into())).await;
+                return Some(sent.map_err(|e| e.to_string()));
+            }
             Err(error) => return Some(self.reject(frame, error).await),
         };
         self.diagnostic(frame, outcome);
@@ -827,6 +894,7 @@ impl Connection {
         Self {
             tool_key: tools::session_key(&headers),
             codex_client: cpa_common::codex_client::is_codex_responses_client(&headers),
+            authority: Arc::new(ClientAuthority::new(&rt, &caller, &headers, String::new())),
             rt,
             caller,
             headers,
@@ -873,8 +941,16 @@ impl Connection {
                 local: self.local.clone(),
                 writer: sink.inner.clone(),
                 timeline: sink.timeline.clone(),
+                authority: self.authority.clone(),
             },
         );
+        {
+            let authority = self.authority.clone();
+            self.rt
+                .executors
+                .codex
+                .attach_authority(&self.session, Arc::new(move || authority.refusal()));
+        }
         if CodexExecutor::response_steering_configured(&self.rt.config()) {
             let store = self.rt.store().clone();
             // `WithWebsocketAuthCheck`. ponytail: Go falls back to the execution session's
@@ -973,6 +1049,15 @@ impl Connection {
     /// which reads them through the request boundary; the fallback path reads a lossy
     /// UTF-8 copy, as before.
     async fn turn(&mut self, socket: &mut Sink, frame: Bytes) -> Flow {
+        // Every turn is admitted under the client authority bound at the upgrade, a frame
+        // queued before a key was revoked included (N1 #111 W2). The refused frame
+        // reaches no upstream; the connection stays open, as in Go.
+        if let Some(refusal) = self.authority.refusal() {
+            return match send_text(socket, String::from_utf8_lossy(&refusal.event).into_owned()).await {
+                true => Flow::Next,
+                false => Flow::End,
+            };
+        }
         let payload = String::from_utf8_lossy(&frame).into_owned();
         let cfg = self.rt.config();
         let explicit_model = field(&payload, "model");

@@ -571,6 +571,26 @@ pub fn extract_session_info(
     payload: &[u8],
     execution_session: Option<&str>,
 ) -> Option<SessionInfo> {
+    session_info(headers, payload, execution_session, true)
+}
+
+/// Explicit conversation identity, excluding a plain `metadata.user_id` that names
+/// a user. Encoded Claude sessions retain their priority, and other explicit body
+/// fields are considered before the execution-session fallback.
+pub fn extract_conversation_info(
+    headers: &HeaderMap,
+    payload: &[u8],
+    execution_session: Option<&str>,
+) -> Option<SessionInfo> {
+    session_info(headers, payload, execution_session, false)
+}
+
+fn session_info(
+    headers: &HeaderMap,
+    payload: &[u8],
+    execution_session: Option<&str>,
+    include_user_identity: bool,
+) -> Option<SessionInfo> {
     let body = Body::new(payload);
     let mut info = SessionInfo::default();
     let mut parent_candidate = String::new();
@@ -702,7 +722,7 @@ pub fn extract_session_info(
     // 6. Payload inspection.
     if !payload.is_empty()
         && body.exists
-        && let Some(info) = payload_session(headers, &body, parent)
+        && let Some(info) = payload_session(headers, &body, parent, include_user_identity)
     {
         let source = if info.source.is_empty() { "body" } else { info.source };
         return finalize(SessionInfo { source, ..info });
@@ -884,7 +904,12 @@ fn body_child(info: &mut SessionInfo, body: &Body<'_>) {
     }
 }
 
-fn payload_session(headers: &HeaderMap, body: &Body<'_>, parent: &str) -> Option<SessionInfo> {
+fn payload_session(
+    headers: &HeaderMap,
+    body: &Body<'_>,
+    parent: &str,
+    include_user_identity: bool,
+) -> Option<SessionInfo> {
     let mut info = SessionInfo::default();
 
     // Gemini context caching.
@@ -1039,7 +1064,7 @@ fn payload_session(headers: &HeaderMap, body: &Body<'_>, parent: &str) -> Option
     if user.is_empty() {
         user = body.req("metadata.user_id");
     }
-    if !user.is_empty() {
+    if include_user_identity && !user.is_empty() {
         info.client_type = "generic";
         info.source = "user_id";
         info.session_id = format!("user:{user}");

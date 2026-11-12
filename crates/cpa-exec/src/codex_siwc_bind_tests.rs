@@ -99,6 +99,8 @@ fn siwc_bind_matches_go() {
         scope: "openid chatgpt.tokens.use.direct".into(),
         scopes: vec!["openid".into(), "chatgpt.tokens.use.direct".into()],
         expired: "2026-10-22T18:00:00Z".into(),
+        // The v8.0.35 golden predates `expires_at` (Go v8.0.67 06fd5b8b).
+        expires_at: String::new(),
         last_refresh: "2026-10-22T17:00:00Z".into(),
         device_id: "e61bbe28-07ef-466d-8e5d-a344f94ab305".into(),
     };
@@ -228,5 +230,150 @@ async fn bind_saves_the_issued_client_tokens() {
     assert_eq!(saved["siwc"]["access_token"], "siwc-at");
     assert_eq!(saved["siwc"]["client_id"], "oaiapp_issued");
     assert_eq!(saved["siwc"]["device_id"], "e61bbe28-07ef-466d-8e5d-a344f94ab305");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// #91 (Go v8.0.67 3891ebaa; OpenAI "Accounts and sessions": reauthorize with the
+/// selected account's issued `client_id`, omit `agent_name_hint`, keep the host's
+/// `ext_agent_host_id`): a file that already holds an issued SIWC client reauthorizes
+/// with it. A callback naming another client, or a denied authorization, is a canceled
+/// reauthorization: nothing is exchanged and the file keeps its bytes. A callback
+/// without a client ID exchanges with the saved one, which the file keeps.
+#[tokio::test]
+async fn reauthorization_reuses_the_saved_issued_client() {
+    let mock = Mock::start().await;
+    let token_path = "/api/accounts/oauth/token";
+    let grant = r#"{"access_token":"siwc-at2","refresh_token":"siwc-rt2","id_token":"it","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#;
+    mock.script(token_path, vec![json(200, grant)]);
+    let root = temp_root();
+    let dir = root.join("auth");
+    let original = r#"{"type":"codex","access_token":"at","refresh_token":"rt","siwc":{"access_token":"old-siwc-fake","refresh_token":"old-siwc-rt-fake","client_id":"oaiapp_saved","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305"},"use_siwc":true}"#;
+    std::fs::write(dir.join("c.json"), original).unwrap();
+    let mut cfg = Config::parse("").unwrap();
+    cfg.auth_dir = dir.clone();
+    let run = |callback: &'static str| {
+        let (cfg, url) = (cfg.clone(), format!("{}{token_path}", mock.url));
+        async move {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            let interaction = Interaction {
+                manual_delay: Duration::from_secs(3600),
+                prompt: None,
+                show_url: Box::new(move |url| {
+                    let _ = tx.send(url.to_owned());
+                }),
+            };
+            let oauth = CodexOAuth::new(wreq::Client::new()).with_siwc_token_url(&url);
+            let task = tokio::spawn(async move { bind_with(&cfg, "c.json", port, oauth, interaction).await });
+            let auth_url = url::Url::parse(&rx.await.unwrap()).unwrap();
+            let query: BTreeMap<String, String> = auth_url.query_pairs().into_owned().collect();
+            let callback = callback.replace("{state}", &query["state"]);
+            let _ = wreq::Client::new()
+                .get(format!("http://127.0.0.1:{port}/auth/callback?{callback}"))
+                .send()
+                .await
+                .unwrap();
+            (query, task.await.unwrap())
+        }
+    };
+    let file = || std::fs::read_to_string(dir.join("c.json")).unwrap();
+
+    let (query, other) = run("code=c&state={state}&client_id=oaiapp_other").await;
+    assert_eq!(query.get("client_id").map(String::as_str), Some("oaiapp_saved"));
+    assert!(!query.contains_key("agent_name_hint"), "{query:?}");
+    assert_eq!(
+        query["ext_agent_host_id"],
+        "urn:uuid:e61bbe28-07ef-466d-8e5d-a344f94ab305"
+    );
+    assert_eq!(
+        other,
+        Err(BindError::Print(
+            "Sign in with ChatGPT authentication failed: callback client ID does not match the saved registration"
+                .into()
+        ))
+    );
+    let (_, denied) = run("error=access_denied&state={state}").await;
+    assert!(matches!(denied, Err(BindError::Print(_))), "{denied:?}");
+    assert!(mock.take().is_empty(), "a canceled reauthorization exchanges nothing");
+    assert_eq!(file(), original, "a canceled reauthorization keeps the file");
+
+    let (_, bound) = run("code=c&state={state}").await;
+    assert!(bound.is_ok(), "{bound:?}");
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(&sent[0].body).into_owned().collect();
+    assert_eq!(form["client_id"], "oaiapp_saved");
+    let saved: Value = serde_json::from_str(&file()).unwrap();
+    assert_eq!(saved["siwc"]["client_id"], "oaiapp_saved");
+    assert_eq!(saved["siwc"]["access_token"], "siwc-at2");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// #91 (Go 3891ebaa): a saved registration that is not a string, or that names the
+/// dynamic registration client, is refused before any authorization starts.
+#[tokio::test]
+async fn reauthorization_refuses_an_unusable_saved_registration() {
+    let root = temp_root();
+    let dir = root.join("auth");
+    let mut cfg = Config::parse("").unwrap();
+    cfg.auth_dir = dir.clone();
+    for (siwc, want) in [
+        (r#"{"client_id":7}"#, "siwc-bind: invalid saved registration"),
+        (
+            r#"{"client_id":"dynamic_agent_client"}"#,
+            "siwc-bind: failed to generate authorization URL: SIWC reauthorization requires the saved issued client ID",
+        ),
+    ] {
+        let original = format!(r#"{{"type":"codex","access_token":"at","refresh_token":"rt","siwc":{siwc}}}"#);
+        std::fs::write(dir.join("c.json"), &original).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let shown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interaction = Interaction {
+            manual_delay: Duration::from_secs(3600),
+            prompt: None,
+            show_url: Box::new({
+                let shown = shown.clone();
+                move |_| shown.store(true, std::sync::atomic::Ordering::SeqCst)
+            }),
+        };
+        let oauth = CodexOAuth::new(wreq::Client::new()).with_siwc_token_url("http://127.0.0.1:9/token");
+        let got = bind_with(&cfg, "c.json", port, oauth, interaction).await;
+        assert_eq!(got, Err(BindError::Log(want.into())), "{siwc}");
+        assert!(
+            !shown.load(std::sync::atomic::Ordering::SeqCst),
+            "{siwc}: no authorization URL"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("c.json")).unwrap(), original);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// #91 (Go 88041f0c `canonicalLockPath`): the credential lock of a file reached through
+/// a symlinked auth folder is the lock of its real path, so the server (which names the
+/// file through the configured folder) and the CLI binding (which names its real path)
+/// exclude each other.
+#[test]
+fn the_credential_lock_follows_symlinked_folders() {
+    let root = temp_root();
+    std::fs::write(root.join("auth/c.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(root.join("auth"), root.join("linked")).unwrap();
+    let held = lock_file(&root.join("auth/c.json")).unwrap();
+    let other = open_lock_file(&root.join("linked/c.json")).unwrap();
+    assert!(!try_lock(&other).unwrap(), "the link's lock is the real file's lock");
+    drop(held);
+    assert!(try_lock(&other).unwrap());
+    drop(other);
+    // A file that does not exist yet locks through its folder's real path.
+    let held = lock_file(&root.join("auth/new.json")).unwrap();
+    assert!(!try_lock(&open_lock_file(&root.join("linked/new.json")).unwrap()).unwrap());
+    drop(held);
     let _ = std::fs::remove_dir_all(root);
 }

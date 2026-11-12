@@ -221,25 +221,44 @@ impl Management {
     /// has one; its file hashes keep a stale scan from undoing a later write (Go
     /// c4c1d43e). Callers hold `disk`. Infallible on purpose: access settings of a
     /// valid config (a rotated or removed secret) always take effect.
-    pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) {
+    ///
+    /// Returns the files whose scanned credential was not applied because the freshness
+    /// check rejected it (the file changed, went or could not be read since the scan),
+    /// or `None` when the config was refused and nothing was published.
+    pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) -> Option<Vec<PathBuf>> {
         // Nothing below is applied for a config the runtime would refuse to publish.
         if !Runtime::accepts_config(&cfg) {
-            return;
+            return None;
         }
         let mut cfg = cfg;
         self.lock_auth_dir(&mut cfg);
         use sha2::{Digest, Sha256};
         let scan = files.unwrap_or_else(|| credentials::scan_auth_dir(&cfg));
+        // Files whose loaded credentials stay as they are. An empty or half-written file
+        // is not a deletion (Go 7484a521), nor is a file or folder that cannot be read
+        // for now (Go v8.0.67 5fe203d5, 57a12996). Deciding from the scan's own read,
+        // never a second one, means a file completed after the scan is picked up by the
+        // reload its write triggers instead of being dropped now. Removal and valid JSON
+        // without a credential are reconciled normally.
+        let mut unsettled = scan.unsettled();
         let mut all = scan.credentials;
         let mut read = scan.read;
         // Uploads record absolute paths; a relative auth-dir scans relative ones.
         let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
         // Fallbacks follow their file: gone with it, replaced once a synthesizer
-        // claims it, otherwise rebuilt from its current content.
+        // claims it, otherwise rebuilt from its current content. One whose file cannot
+        // be read for now stays tracked, and its loaded credential stays.
         let mut claimed = Vec::new();
         let mut fallbacks = self.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         fallbacks.retain(|path| {
-            let Ok(data) = std::fs::read(path) else { return false };
+            let data = match credentials::read_auth_file(path) {
+                credentials::AuthFile::Bytes(data) => data,
+                credentials::AuthFile::Absent => return false,
+                credentials::AuthFile::Unreadable(_) => {
+                    unsettled.insert(path);
+                    return true;
+                }
+            };
             if all
                 .iter()
                 .any(|c| matches!(&c.source, Source::File(p) if absolute(p) == absolute(path)))
@@ -279,7 +298,7 @@ impl Management {
         self.rt.usage_queue().configure(self.access.available(), &cfg);
         let policy = policy(&cfg);
         self.rt.publish_config_and_policy(cfg, policy);
-        let rejected = self.rt.store().reconcile_scanned(all, &read);
+        let rejected = self.rt.store().reconcile_scanned(all, &read, &unsettled);
         // A synthesizer claimed the file but its credential was rejected as stale, so the
         // fallback stays live: keep tracking it, or the next reload would drop it.
         let kept: Vec<PathBuf> = claimed
@@ -294,6 +313,7 @@ impl Management {
         }
         // Go's watcher calls redisqueue.NotifyUsageRefresh after every client reload.
         self.rt.usage_queue().notify_usage_refresh();
+        Some(rejected)
     }
 }
 
@@ -564,6 +584,9 @@ pub fn router(state: Arc<Management>) -> Router {
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),
         ("oauth/import", methods().post(guarded!(s, oauth::import))),
         ("oauth/siwc/bind", methods().post(guarded!(s, siwc::bind))),
+        // Go v8.0.67 06fd5b8b: read-only, under the same management key.
+        ("oauth/siwc/status", methods().get(guarded!(s, siwc::status))),
+        ("credentials/siwc/status", methods().get(guarded!(s, siwc::status))),
         (
             "observability/logs",
             methods()

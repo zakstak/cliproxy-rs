@@ -3,6 +3,14 @@
     "repository": "https://github.com/openai/codex",
     "commit": "44ccf394573cabb95e1f751a59f9d76f6f79faf1"
   },
+  "research": [
+    {
+      "repository": "https://github.com/openai/codex",
+      "commit": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "label": "main 2026-11-12",
+      "status": "Source-refresh evidence for FP1 (#115). Not the contract authority: the contract pin above is unchanged. Not the rust-v0.167.2 release, which is a divergent maintenance branch at ce21072c90d3."
+    }
+  ],
   "fixtures": [
     {
       "name": "http-request-full",
@@ -345,6 +353,40 @@
       ],
       "contract": "One response.incomplete per event: reason absent, incomplete_details null, reason null, reason empty, an unknown reason, interrupted, content_filter and max_output_tokens, each with zero output and output_tokens 0; usage missing; opaque members with raw number spellings, a unicode escape and a duplicate key; and partial output with partial usage. Each reaches the client as sent at every stage of the response, and a buffered answer is its response object byte for byte.",
       "notes": "Not first-party output and not recorded traffic: no source shows which of these shapes a backend sends. Hand-authored to probe the preservation rule. In every event response is the last member, so a test can slice the buffered answer from the fixture's own bytes."
+    },
+    {
+      "name": "http-request-tool-output-media",
+      "file": "http/request_tool_output_media.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-source",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/protocol/src/models.rs:2394-2419 FunctionCallOutputContentItem (input_text, input_image, input_audio with flattened references)",
+        "codex-rs/protocol/src/models.rs:998-1013 ImageReference and AudioReference (inline URL or file_id, untagged)",
+        "codex-rs/protocol/src/models.rs:2577-2587 FunctionCallOutputPayload serializes content items as an array",
+        "codex-rs/protocol/src/models.rs:1260-1285 ResponseItem::FunctionCallOutput"
+      ],
+      "contract": "A native body whose function_call_output carries multimodal content items: text, file-backed and inline audio, and a file-backed image with detail. Native routes pass it byte for byte.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin: file-backed input_audio in a tool output is new since 44ccf394573c (openai/codex 9018f3a3b021), where InputAudio carried only audio_url. Whether an endpoint accepts it is unknown. IDs, file IDs and the audio data are placeholders."
+    },
+    {
+      "name": "ws-error-context-length-status",
+      "file": "ws/error_context_length_status.jsonl",
+      "format": "jsonl",
+      "transport": "websocket",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "revision": "5c3ff1dabf644169f4bd74b215719f381e4fdb3f",
+      "sources": [
+        "codex-rs/codex-api/src/endpoint/responses_websocket.rs:1416-1439 wrapped_context_length_error_respects_http_status",
+        "codex-rs/codex-api/src/error.rs:110-112 context_length_exceeded is a context-window error only without a status or with 400"
+      ],
+      "contract": "Wrapped WebSocket context_length_exceeded errors with status 400 and 503. At the research pin the 400 is a context-window failure and the 503 keeps its transient, retryable meaning.",
+      "notes": "Source-refresh evidence at the research pin, not the contract pin (openai/codex 1885417cd45a). Classification belongs to FP2 (#116); FP1 asserts no behaviour for it. The member order follows the test's json! literal; serialized order is not part of the contract."
     }
   ]
 }

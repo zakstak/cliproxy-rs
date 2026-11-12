@@ -19,7 +19,7 @@ use cpa_exec::codex_siwc::{self, REDIRECT_URI, Tokens};
 use serde_json::{Map, Value};
 
 use super::Management;
-use super::auth_files::{CodexLock, Query, auth_kind, fail, file_name, path_of, reply, runtime_only};
+use super::auth_files::{CodexLock, Query, auth_kind, fail, file_name, lookup, path_of, reply, runtime_only};
 use super::oauth::CallbackRequest;
 use crate::runtime::PatchError;
 
@@ -32,8 +32,13 @@ pub(crate) struct Flow {
     /// The credential file, symlinks resolved, as checked at start.
     pub(super) path: PathBuf,
     device_id: String,
-    /// The file's `account_id` at start: a binding never lands on another account.
-    account: Option<String>,
+    /// The account of the credential the binding started on, `""` for none (Go v8.0.67
+    /// `siwcBindSession.accountID`, 6bbd2cb7). Its file held the same account then; the
+    /// commit requires both the loaded credential and the file to still hold it.
+    account: String,
+    /// The issued client the credential already held, `""` for none: a rebinding
+    /// reauthorizes with it (OpenAI "Accounts and sessions"; Go 3891ebaa for the CLI).
+    client: String,
     verifier: String,
     deadline: Instant,
     exchange: Mutex<Option<tokio::task::AbortHandle>>,
@@ -47,7 +52,8 @@ impl Flow {
             target_id: target_id.into(),
             path: PathBuf::new(),
             device_id: String::new(),
-            account: None,
+            account: String::new(),
+            client: String::new(),
             verifier: String::new(),
             deadline: Instant::now() + TTL,
             exchange: Mutex::default(),
@@ -73,6 +79,35 @@ fn non_empty(meta: &Map<String, Value>, key: &str) -> bool {
 
 fn has_outer(meta: &Map<String, Value>) -> bool {
     non_empty(meta, "access_token") && non_empty(meta, "refresh_token")
+}
+
+/// A credential's account: its `account_id` string, `""` for none.
+fn account_of(c: &Credential) -> &str {
+    c.str("account_id").unwrap_or_default()
+}
+
+/// Whether a file's `account_id` member is `expected` (Go v8.0.67 6bbd2cb7): the same
+/// string, or for `""` none, `null` or `""`. Any other value is another account.
+fn holds_account(meta: &Map<String, Value>, expected: &str) -> bool {
+    match meta.get("account_id") {
+        None | Some(Value::Null) => expected.is_empty(),
+        Some(Value::String(account)) => account == expected,
+        Some(_) => false,
+    }
+}
+
+/// The issued client a SIWC partition holds: `Ok("")` for none, `Err` for a member
+/// that is not a usable issued client (not a string, or the registration client).
+fn saved_client(meta: &Map<String, Value>) -> Result<String, ()> {
+    let Some(Value::Object(siwc)) = meta.get("siwc") else {
+        return Ok(String::new());
+    };
+    match siwc.get("client_id") {
+        None => Ok(String::new()),
+        Some(Value::String(id)) if id.trim() == codex_siwc::DYNAMIC_CLIENT_ID => Err(()),
+        Some(Value::String(id)) => Ok(id.trim().to_owned()),
+        Some(_) => Err(()),
+    }
 }
 
 /// Go `siwcBindEligible`.
@@ -216,6 +251,14 @@ fn start(state: &Management, name: &str) -> Response {
     let Some((path, meta)) = resolved else {
         return fail(StatusCode::BAD_REQUEST, "SIWC binding target is unavailable or invalid");
     };
+    // The file must still hold the loaded credential's account (a replacement the
+    // watcher has not applied yet is not this target), and a saved issued client must
+    // be usable for reauthorization.
+    let account = account_of(target).to_owned();
+    let client = saved_client(&meta);
+    let (true, Ok(client)) = (holds_account(&meta, &account), client) else {
+        return fail(StatusCode::BAD_REQUEST, "SIWC binding target is unavailable or invalid");
+    };
     // Rebinding keeps a valid device ID.
     let device_id = meta
         .get("siwc")
@@ -234,7 +277,12 @@ fn start(state: &Management, name: &str) -> Response {
         );
     };
     let identifier = codex_siwc::identifier(&cfg);
-    let Ok(url) = codex_siwc::authorize_url(&sid, &nonce, &device_id, REDIRECT_URI, &challenge, &identifier) else {
+    let url = if client.is_empty() {
+        codex_siwc::authorize_url(&sid, &nonce, &device_id, REDIRECT_URI, &challenge, &identifier)
+    } else {
+        codex_siwc::reauth_url(&client, &sid, &nonce, &device_id, REDIRECT_URI, &challenge)
+    };
+    let Ok(url) = url else {
         return fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to generate SIWC authorization URL",
@@ -244,11 +292,8 @@ fn start(state: &Management, name: &str) -> Response {
         target_id: target.id.clone(),
         path,
         device_id,
-        account: meta
-            .get("account_id")
-            .and_then(Value::as_str)
-            .filter(|a| !a.is_empty())
-            .map(str::to_owned),
+        account,
+        client,
         verifier,
         deadline: Instant::now() + TTL,
         exchange: Mutex::default(),
@@ -269,6 +314,62 @@ fn start(state: &Management, name: &str) -> Response {
             ("expires_in", TTL.as_secs().into()),
         ],
     )
+}
+
+/// Whether an upstream refused `c`'s SIWC token: SIWC is in use, so the request token
+/// was the SIWC one, and the store holds a 401 cooldown for the credential or its
+/// tokens were refused for good. Both clear when the tokens change or a binding lands.
+// ponytail: Go records the rejected SIWC token itself (`RejectedSIWCAccessToken`), so
+// its `invalid` outlives the 30-minute 401 cooldown, an outer token refresh and a
+// `use_siwc` toggle; port that with A4's renewal state if the status needs it.
+fn rejected(store: &crate::runtime::CredentialStore, c: &Credential) -> bool {
+    codex_siwc::enabled(c)
+        && (store.tokens_rejected(c) || store.cooldowns(&c.id).iter().any(|cooldown| cooldown.status == 401))
+}
+
+/// Go v8.0.67 `CodexSIWCStatus` for a stored credential, now.
+fn local_status(store: &crate::runtime::CredentialStore, c: &Credential) -> &'static str {
+    codex_siwc::status(c, rejected(store, c), chrono::Utc::now())
+}
+
+/// Go v8.0.67 `GetSIWCStatus` (06fd5b8b): `GET /v8/management/oauth/siwc/status` and
+/// `/v8/management/credentials/siwc/status`, `?name=` (or `id`) and/or `?auth_index=`
+/// (or `authIndex`). Reads the loaded credential and the store's rejection state only:
+/// no lock, no file read, no refresh, no upstream request, and never a token.
+pub(crate) async fn status(
+    State(state): State<Arc<Management>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    let q = Query::parse(raw);
+    let pick = |keys: [&str; 2]| {
+        keys.iter()
+            .map(|k| q.first(k).trim().to_owned())
+            .find(|v| !v.is_empty())
+            .unwrap_or_default()
+    };
+    let (name, index) = (pick(["name", "id"]), pick(["auth_index", "authIndex"]));
+    if name.is_empty() && index.is_empty() {
+        return fail(StatusCode::BAD_REQUEST, "name or auth_index is required");
+    }
+    let store = state.rt.store();
+    let target = if name.is_empty() {
+        store
+            .snapshot()
+            .into_iter()
+            .find(|c| cpa_core::config::credentials::auth_index(c) == index)
+    } else {
+        lookup(&state, &name, &index)
+    };
+    let Some(target) = target else {
+        return fail(StatusCode::NOT_FOUND, "auth file not found");
+    };
+    // Go `IsCodexAuthRecord`.
+    let codex =
+        target.provider.trim().go_eq_fold("codex") || target.str("type").is_some_and(|t| t.trim().go_eq_fold("codex"));
+    if !codex {
+        return fail(StatusCode::BAD_REQUEST, "SIWC status requires a Codex credential");
+    }
+    reply(StatusCode::OK, [("status", local_status(store, &target).into())])
 }
 
 fn status_error(status: StatusCode, message: &str) -> Response {
@@ -358,6 +459,17 @@ pub(super) fn callback(state: &Arc<Management>, req: &CallbackRequest, query: Op
                 *target = value.to_owned();
             }
         }
+    }
+    // A rebinding reauthorizes with the saved issued client: a callback may omit it,
+    // and one naming another client is refused without consuming the session.
+    if !flow.client.is_empty() && error.is_empty() {
+        if !client_id.is_empty() && client_id != flow.client {
+            return Some(status_error(
+                StatusCode::BAD_REQUEST,
+                "callback client ID does not match the saved registration",
+            ));
+        }
+        client_id = flow.client.clone();
     }
     if error.is_empty() && (code.is_empty() || client_id.is_empty()) {
         return Some(status_error(
@@ -522,9 +634,9 @@ fn commit(
 /// publishes nothing.
 ///
 /// ponytail: Go also rejects a target re-registered since the start (its registration
-/// epoch, not reproduced here, M5-0247); this checks the same file and provider and
-/// the account the binding started with, and v8 uploads and deletes fail the binding
-/// explicitly.
+/// epoch, not reproduced here, M5-0247); this checks the same file and provider, the
+/// account the binding started with in both the loaded credential and the file, and
+/// the file's bytes up to the write. v8 uploads and deletes fail the binding explicitly.
 fn write_binding(state: &Management, flow: &Flow, tokens: &Tokens, lock: &mut CodexLock) -> Result<(), String> {
     for _ in 0..8 {
         let current = state
@@ -555,15 +667,33 @@ fn write_binding(state: &Management, flow: &Flow, tokens: &Tokens, lock: &mut Co
         if !codex || !has_outer(&meta) {
             return Err("invalid Codex OAuth file".into());
         }
-        let disk_account = meta.get("account_id").and_then(Value::as_str);
-        let changed = |account: Option<&str>| account.is_some_and(|a| disk_account != Some(a));
-        if changed(current.str("account_id").filter(|a| !a.is_empty())) || changed(flow.account.as_deref()) {
+        // The account the binding started on, in the loaded credential and the file.
+        if account_of(&current) != flow.account || !holds_account(&meta, &flow.account) {
             return Err("backing account changed".into());
         }
         let bytes = codex_siwc::bind_file(&disk, tokens).ok_or("invalid Codex OAuth file")?;
-        match super::auth_files::save_bytes(state, &current, bytes) {
+        #[cfg(test)]
+        {
+            let mut hooks = tests::BEFORE_SAVE.lock().unwrap();
+            let hook = hooks
+                .iter()
+                .position(|(p, _)| p == &flow.path)
+                .map(|i| hooks.remove(i).1);
+            drop(hooks);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Saved only while the file still holds the bytes read above (Go 88041f0c): a
+        // writer that does not take the credential lock is never overwritten.
+        let read: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&disk).into();
+        match super::auth_files::save_bytes_if(state, &current, bytes, read) {
             Ok(()) => return Ok(()),
-            Err(crate::runtime::PatchError::Stale { .. }) => continue,
+            // The store's record moved on (a refresh committed): bind onto it.
+            Err(crate::runtime::PatchError::Stale { current: now }) if now != current.revision => continue,
+            Err(crate::runtime::PatchError::Stale { .. }) => {
+                return Err("backing file changed during binding".into());
+            }
             Err(e) => return Err(format!("{e:?}")),
         }
     }
@@ -572,10 +702,16 @@ fn write_binding(state: &Management, flow: &Flow, tokens: &Tokens, lock: &mut Co
 
 /// Go's v8 credential-list summary for Codex: support, the toggle, whether a SIWC
 /// token set is stored (not whether it works) and its expiry. Never a token.
-pub(super) fn summary(c: &Credential, entry: &mut std::collections::BTreeMap<&'static str, Value>) {
+pub(super) fn summary(
+    c: &Credential,
+    store: &crate::runtime::CredentialStore,
+    entry: &mut std::collections::BTreeMap<&'static str, Value>,
+) {
     if !c.provider.trim().eq_ignore_ascii_case("codex") {
         return;
     }
+    // Go v8.0.67 `siwc_status` (06fd5b8b).
+    entry.insert("siwc_status", local_status(store, c).into());
     entry.insert("siwc_bind_supported", eligible(c).into());
     // Go `IsCodexUseSIWC`: a true attribute wins, else the file's flag.
     let flag = |v: &Value| match v {
@@ -613,6 +749,467 @@ mod tests {
     use super::*;
     use crate::body_limit::FirstJson;
 
+    /// Runs once in the next commit of a binding of the file it names (its real path),
+    /// after the commit read the file and before it saves.
+    #[allow(clippy::type_complexity)]
+    pub(super) static BEFORE_SAVE: Mutex<Vec<(PathBuf, Box<dyn FnOnce() + Send>)>> = Mutex::new(Vec::new());
+
+    const GRANT: &str = r#"{"access_token":"siwc-at","refresh_token":"siwc-rt","id_token":"siwc-id","scope":"openid chatgpt.tokens.use.direct","expires_in":3600}"#;
+
+    /// A loopback SIWC token endpoint answering [`GRANT`]; returns its base URL and the
+    /// client IDs it was asked with.
+    async fn token_endpoint() -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/api/accounts/oauth/token",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |body: axum::body::Bytes| async move {
+                    let form: std::collections::HashMap<String, String> =
+                        url::form_urlencoded::parse(&body).into_owned().collect();
+                    seen.lock()
+                        .unwrap()
+                        .push(form.get("client_id").cloned().unwrap_or_default());
+                    GRANT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    async fn start_binding(state: &Arc<Management>, name: &str) -> Response {
+        bind(
+            State(state.clone()),
+            FirstJson(axum::body::Bytes::from(format!(r#"{{"name":"{name}"}}"#))),
+        )
+        .await
+    }
+
+    /// Sends the binding's callback with `client_id` and waits for its outcome: the
+    /// session's status text (empty once completed) and whether it completed.
+    async fn finish(state: &Arc<Management>, sid: &str, client_id: &str) -> (String, bool) {
+        let req = CallbackRequest {
+            state: sid.to_owned(),
+            code: "c".into(),
+            client_id: client_id.into(),
+            ..Default::default()
+        };
+        let response = callback(state, &req, None).unwrap();
+        if response.status() != StatusCode::OK {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            return (String::from_utf8_lossy(&body).into_owned(), false);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, status, completed) = state.oauth.details(sid).unwrap();
+                if completed || !status.is_empty() {
+                    return (status, completed);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the binding settles")
+    }
+
+    const SAVE_FAILED: &str = "Failed to save SIWC binding; the target may have changed";
+
+    /// #91 (Go v8.0.67 6bbd2cb7): a binding started on a credential without an account
+    /// never lands on one that has an account, whether the replacement reached the store
+    /// (a watcher reload) or only the file. Before, only an account present at start was
+    /// compared, so an account-less start bound onto any account.
+    #[tokio::test]
+    async fn a_binding_started_without_an_account_never_lands_on_one() {
+        let (base, _) = token_endpoint().await;
+        for published in [true, false] {
+            let (dir, file, state) = fixture(Some(base.clone()));
+            let accountless = r#"{"type":"codex","access_token":"a","refresh_token":"r"}"#;
+            std::fs::write(&file, accountless).unwrap();
+            state.publish((*state.rt.config()).clone(), None);
+            let sid = started_state(start_binding(&state, "codex.json").await).await;
+            assert_eq!(state.oauth.siwc(&sid).unwrap().account, "");
+            let replaced = codex_file("acct-b");
+            std::fs::write(&file, &replaced).unwrap();
+            if published {
+                state.publish((*state.rt.config()).clone(), None);
+            }
+            let outcome = finish(&state, &sid, "oaiapp_issued").await;
+            assert_eq!(outcome, (SAVE_FAILED.to_owned(), false), "published: {published}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                replaced,
+                "published: {published}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// #91 (Go 6bbd2cb7 `StartSIWCBind`): a start refuses a target whose file holds
+    /// another account than the credential the store has loaded (a replacement the
+    /// watcher has not applied yet), instead of binding the file's account.
+    #[tokio::test]
+    async fn a_start_refuses_a_file_that_holds_another_account() {
+        for (loaded, disk) in [
+            (codex_file("old"), codex_file("new")),
+            (
+                codex_file("old"),
+                r#"{"type":"codex","access_token":"a","refresh_token":"r"}"#.to_owned(),
+            ),
+            (
+                r#"{"type":"codex","access_token":"a","refresh_token":"r"}"#.to_owned(),
+                codex_file("new"),
+            ),
+        ] {
+            let (dir, file, state) = fixture(None);
+            std::fs::write(&file, &loaded).unwrap();
+            state.publish((*state.rt.config()).clone(), None);
+            std::fs::write(&file, &disk).unwrap();
+            let response = start_binding(&state, "codex.json").await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{loaded} -> {disk}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                &body[..],
+                br#"{"error":"SIWC binding target is unavailable or invalid"}"#
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// #91 (Go 88041f0c): a writer that does not take the credential lock rewrites the
+    /// file in place after the commit read it: the binding fails and the file keeps that
+    /// writer's bytes. Before, the commit overwrote them.
+    #[tokio::test]
+    async fn an_in_place_rewrite_during_the_commit_fails_the_binding() {
+        let (base, _) = token_endpoint().await;
+        let (dir, file, state) = fixture(Some(base));
+        let sid = started_state(start_binding(&state, "codex.json").await).await;
+        let external = codex_file("old").replace(r#""refresh_token":"r""#, r#""refresh_token":"r-external""#);
+        BEFORE_SAVE.lock().unwrap().push((
+            std::fs::canonicalize(&file).unwrap(),
+            Box::new({
+                let (file, external) = (file.clone(), external.clone());
+                move || std::fs::write(&file, external).unwrap()
+            }),
+        ));
+        let outcome = finish(&state, &sid, "oaiapp_issued").await;
+        assert_eq!(outcome, (SAVE_FAILED.to_owned(), false));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #91 (Go 88041f0c): a legacy (v0) upload of the target between the start and the
+    /// commit does not fail the session by itself, unlike a v8 one. One that brings
+    /// another account fails the binding; one that keeps the account (a rotated outer
+    /// token) is what the binding lands on, its tokens kept.
+    #[tokio::test]
+    async fn a_legacy_upload_during_a_binding() {
+        let (base, _) = token_endpoint().await;
+        for (account, lands) in [("acct-b", false), ("old", true)] {
+            let (dir, file, state) = fixture(Some(base.clone()));
+            let sid = started_state(start_binding(&state, "codex.json").await).await;
+            let upload = codex_file(account).replace(r#""refresh_token":"r""#, r#""refresh_token":"r-uploaded""#);
+            let stored = super::super::auth_files::with_codex_lock(&state, {
+                let upload = upload.clone();
+                move |state, lock| {
+                    super::super::auth_files::store_file(state, "codex.json", upload.as_bytes(), false, lock)
+                }
+            })
+            .await
+            .unwrap();
+            assert!(stored.is_ok(), "{account}: {stored:?}");
+            let outcome = finish(&state, &sid, "oaiapp_issued").await;
+            let disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(
+                disk["refresh_token"], "r-uploaded",
+                "{account}: the upload's tokens stay"
+            );
+            if lands {
+                assert_eq!(outcome, (String::new(), true), "{account}");
+                assert_eq!(disk["siwc"]["client_id"], "oaiapp_issued", "{account}");
+            } else {
+                assert_eq!(outcome, (SAVE_FAILED.to_owned(), false), "{account}");
+                assert!(disk.get("siwc").is_none(), "{account}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A token refresh committed through the store after the commit read the file
+    /// changes the record and the file: the commit binds again onto the refreshed file,
+    /// so the rotated outer token is kept (the byte fence does not fail it).
+    #[tokio::test]
+    async fn a_refresh_committed_during_the_commit_is_kept() {
+        let (base, _) = token_endpoint().await;
+        let (dir, file, state) = fixture(Some(base));
+        let sid = started_state(start_binding(&state, "codex.json").await).await;
+        BEFORE_SAVE.lock().unwrap().push((
+            std::fs::canonicalize(&file).unwrap(),
+            Box::new({
+                let state = state.clone();
+                move || {
+                    let store = state.rt.store();
+                    let revision = store.get("codex.json").unwrap().revision;
+                    let mut patch = cpa_core::credential::MetadataPatch::default();
+                    patch.set.insert("refresh_token".into(), "r-refreshed".into());
+                    store.apply_patch("codex.json", revision, &patch).unwrap();
+                }
+            }),
+        ));
+        assert_eq!(finish(&state, &sid, "oaiapp_issued").await, (String::new(), true));
+        let disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            (&disk["refresh_token"], &disk["siwc"]["client_id"]),
+            (&Value::from("r-refreshed"), &Value::from("oaiapp_issued"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #91 (Go bb2d8f82): with a relative `auth-dir`, the start and the commit resolve
+    /// the credential against the working directory, once, and the binding lands.
+    #[tokio::test]
+    async fn a_relative_auth_dir_binds() {
+        let (base, _) = token_endpoint().await;
+        let (dir, _, state) = fixture(Some(base));
+        let local = PathBuf::from(format!("cpa-siwc-relative-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("codex.json"), codex_file("old")).unwrap();
+        std::fs::write(&state.path, format!("oauth: {{auth-dir: {}}}\n", local.display())).unwrap();
+        crate::watching::reload(&state).unwrap();
+        assert!(state.rt.config().auth_dir.is_relative());
+        let sid = started_state(start_binding(&state, "codex.json").await).await;
+        assert_eq!(finish(&state, &sid, "oaiapp_issued").await, (String::new(), true));
+        let bound: Value = serde_json::from_slice(&std::fs::read(local.join("codex.json")).unwrap()).unwrap();
+        assert_eq!(bound["siwc"]["client_id"], "oaiapp_issued");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(local).unwrap();
+    }
+
+    /// #91 (OpenAI "Accounts and sessions"; Go 3891ebaa for the CLI): rebinding a
+    /// credential that holds an issued client reauthorizes with it, without
+    /// `agent_name_hint`. A callback naming another client is refused and leaves the
+    /// session open; one without a client ID exchanges with the saved client.
+    #[tokio::test]
+    async fn a_rebinding_reuses_the_saved_issued_client() {
+        let (base, seen) = token_endpoint().await;
+        let (dir, file, state) = fixture(Some(base));
+        let saved = r#"{"type":"codex","account_id":"old","access_token":"a","refresh_token":"r","siwc":{"access_token":"s","refresh_token":"sr","client_id":"oaiapp_saved","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305"},"use_siwc":true}"#;
+        std::fs::write(&file, saved).unwrap();
+        state.publish((*state.rt.config()).clone(), None);
+        let response = start_binding(&state, "codex.json").await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let started: Value = serde_json::from_slice(&body).unwrap();
+        let url = url::Url::parse(started["url"].as_str().unwrap()).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], "oaiapp_saved");
+        assert!(!query.contains_key("agent_name_hint"), "{query:?}");
+        assert_eq!(
+            query["ext_agent_host_id"],
+            "urn:uuid:e61bbe28-07ef-466d-8e5d-a344f94ab305"
+        );
+        let sid = started["state"].as_str().unwrap().to_owned();
+        let (refused, _) = finish(&state, &sid, "oaiapp_other").await;
+        assert!(
+            refused.contains("callback client ID does not match the saved registration"),
+            "{refused}"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing exchanged");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+        assert_eq!(finish(&state, &sid, "").await, (String::new(), true));
+        assert_eq!(*seen.lock().unwrap(), ["oaiapp_saved"]);
+        let bound: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(bound["siwc"]["client_id"], "oaiapp_saved");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #91 (Go v8.0.67 06fd5b8b): `GET /v8/management/oauth/siwc/status` and its alias
+    /// `/v8/management/credentials/siwc/status` report a Codex credential's local SIWC
+    /// status, by name or auth index, behind the management key: `off` until SIWC is in
+    /// use, `valid` with an unexpired token, `invalid` once an upstream 401 refused it or
+    /// its real expiry passed. The answer carries no token, and asking changes nothing:
+    /// the file, the record and the token endpoint stay untouched.
+    #[tokio::test]
+    async fn the_siwc_status_route_is_read_only_and_reveals_no_token() {
+        use tower::ServiceExt as _;
+        let (base, seen) = token_endpoint().await;
+        let (dir, file, state) = fixture_with(crate::management::Options {
+            login_base: Some(base),
+            management_password: Some("fake-management-only".into()),
+            ..Default::default()
+        });
+        std::fs::write(
+            dir.join("claude.json"),
+            r#"{"type":"claude","access_token":"a","refresh_token":"b"}"#,
+        )
+        .unwrap();
+        state.publish((*state.rt.config()).clone(), None);
+        let get = |path: String, key: Option<&'static str>| {
+            let state = state.clone();
+            async move {
+                let mut request = axum::http::Request::get(path).extension(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 1234)),
+                ));
+                if let Some(key) = key {
+                    request = request.header("authorization", format!("Bearer {key}"));
+                }
+                let response = crate::management::router(state)
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+        let key = Some("fake-management-only");
+        let both = |query: &str| {
+            [
+                format!("/v8/management/oauth/siwc/status?{query}"),
+                format!("/v8/management/credentials/siwc/status?{query}"),
+            ]
+        };
+        for path in both("name=codex.json") {
+            assert_eq!(get(path, key).await, (200, r#"{"status":"off"}"#.to_owned()));
+        }
+        let sid = started_state(start_binding(&state, "codex.json").await).await;
+        assert_eq!(finish(&state, &sid, "oaiapp_issued").await, (String::new(), true));
+        let bound = state.rt.store().get("codex.json").unwrap();
+        // Asking changes nothing: the file, the record and the token endpoint.
+        let untouched = |why: &str| {
+            let snapshot = (
+                std::fs::read(&file).unwrap(),
+                state.rt.store().get("codex.json").unwrap().revision,
+                seen.lock().unwrap().len(),
+            );
+            let why = why.to_owned();
+            let (file, state, seen) = (file.clone(), state.clone(), seen.clone());
+            move || {
+                let now = (
+                    std::fs::read(&file).unwrap(),
+                    state.rt.store().get("codex.json").unwrap().revision,
+                    seen.lock().unwrap().len(),
+                );
+                assert!(now == snapshot, "{why}: the status changed something");
+            }
+        };
+        let check = untouched("valid");
+        let index = cpa_core::config::credentials::auth_index(&bound);
+        for path in both("name=codex.json")
+            .into_iter()
+            .chain(both("id=codex.json"))
+            .chain(both(&format!("auth_index={index}")))
+            .chain(both(&format!("authIndex={index}")))
+        {
+            let (status, body) = get(path.clone(), key).await;
+            assert_eq!((status, body.as_str()), (200, r#"{"status":"valid"}"#), "{path}");
+        }
+        check();
+        // An upstream 401 on the SIWC token (its completion saves the credential's status).
+        let lease = state
+            .rt
+            .store()
+            .select(crate::runtime::Selection::new("codex", "gpt-5"))
+            .expect("selectable");
+        lease.complete(crate::runtime::Outcome::Failure(cpa_core::exec::ExecError::local(
+            401,
+            cpa_core::exec::FailureScope::Credential,
+            "401 unauthorized",
+        )));
+        let check = untouched("invalid");
+        for path in both("name=codex.json") {
+            assert_eq!(get(path, key).await, (200, r#"{"status":"invalid"}"#.to_owned()));
+        }
+        for (path, want) in [
+            ("/v8/management/oauth/siwc/status".to_owned(), 400),
+            ("/v8/management/oauth/siwc/status?name=missing.json".to_owned(), 404),
+            ("/v8/management/oauth/siwc/status?name=claude.json".to_owned(), 400),
+            ("/v0/management/oauth/siwc/status?name=codex.json".to_owned(), 404),
+        ] {
+            assert_eq!(get(path.clone(), key).await.0, want, "{path}");
+        }
+        for path in both("name=codex.json") {
+            assert_eq!(
+                get(path.clone(), None).await.0,
+                401,
+                "{path}: the management key is required"
+            );
+            assert_eq!(get(path.clone(), Some("wrong")).await.0, 401, "{path}");
+        }
+        check();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #91 (Go 06fd5b8b `SIWCRealExpirationTime`): the status reads the token's real
+    /// expiry (`expires_at`, then `expires_in` after the last refresh, then the JWT
+    /// `exp`), never the margin-deducted `expired`.
+    #[test]
+    fn the_siwc_status_reads_the_real_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .into();
+        let cred = |siwc: Value, use_siwc: bool| Credential {
+            id: "c.json".into(),
+            provider: "codex".into(),
+            source: cpa_core::credential::Source::File("c.json".into()),
+            disabled: false,
+            label: String::new(),
+            attributes: Default::default(),
+            metadata: serde_json::json!({"type": "codex", "use_siwc": use_siwc, "siwc": siwc})
+                .as_object()
+                .unwrap()
+                .clone(),
+            revision: 0,
+        };
+        let jwt = |exp: i64| {
+            use base64::Engine as _;
+            let b = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+            format!("{}.{}.sig", b(r#"{"alg":"none"}"#), b(&format!(r#"{{"exp":{exp}}}"#)))
+        };
+        let soon = "2030-01-01T00:02:00Z";
+        for (siwc, use_siwc, want) in [
+            (
+                serde_json::json!({"access_token": "t", "expires_at": soon}),
+                false,
+                "off",
+            ),
+            (serde_json::json!({"expires_at": soon}), true, "invalid"),
+            (
+                serde_json::json!({"access_token": "t", "expires_at": soon, "expired": "2029-12-31T23:59:00Z"}),
+                true,
+                "valid",
+            ),
+            (
+                serde_json::json!({"access_token": "t", "expires_at": "2029-12-31T23:59:59Z"}),
+                true,
+                "invalid",
+            ),
+            (
+                serde_json::json!({"access_token": "t", "expired": soon}),
+                true,
+                "invalid",
+            ),
+            (
+                serde_json::json!({"access_token": "t", "expires_in": 3600, "last_refresh": "2029-12-31T23:30:00Z"}),
+                true,
+                "valid",
+            ),
+            (
+                serde_json::json!({"access_token": "t", "expires_in": 600, "last_refresh": "2029-12-31T23:30:00Z"}),
+                true,
+                "invalid",
+            ),
+            (serde_json::json!({"access_token": jwt(1_893_456_120)}), true, "valid"),
+            (serde_json::json!({"access_token": jwt(1_893_455_000)}), true, "invalid"),
+        ] {
+            let c = cred(siwc.clone(), use_siwc);
+            assert_eq!(codex_siwc::status(&c, false, now), want, "{siwc}");
+        }
+        let c = cred(serde_json::json!({"access_token": "t", "expires_at": soon}), true);
+        assert_eq!(codex_siwc::status(&c, true, now), "invalid", "rejected");
+    }
+
     /// Go `StartSIWCBind` holds its commit gate from the lookup through registration: a
     /// bind waiting on `disk` has read nothing yet, so a replacement made under the lock
     /// (what a v8 upload does) is the target it registers, never the file it replaced.
@@ -646,15 +1243,7 @@ mod tests {
         writer.await.unwrap();
         let response = started.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            state
-                .oauth
-                .siwc(&started_state(response).await)
-                .unwrap()
-                .account
-                .as_deref(),
-            Some("new")
-        );
+        assert_eq!(state.oauth.siwc(&started_state(response).await).unwrap().account, "new");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -928,6 +1517,14 @@ mod tests {
 
     /// A private auth dir holding `codex.json` for account "old".
     fn fixture(login_base: Option<String>) -> (PathBuf, PathBuf, Arc<Management>) {
+        fixture_with(crate::management::Options {
+            login_base,
+            ..Default::default()
+        })
+    }
+
+    /// [`fixture`] with management `options`.
+    fn fixture_with(options: crate::management::Options) -> (PathBuf, PathBuf, Arc<Management>) {
         let dir = std::env::temp_dir().join(format!("cpa-siwc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("codex.json");
@@ -945,10 +1542,6 @@ mod tests {
                 xai: Default::default(),
             },
         ));
-        let options = crate::management::Options {
-            login_base,
-            ..Default::default()
-        };
         (dir, file, Management::with_options(rt, path, options))
     }
 }

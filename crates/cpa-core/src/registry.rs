@@ -750,6 +750,8 @@ mod tests {
             ("claude-sonnet-5-5-20261001", "claude-sonnet-5-5"),
             ("claude-fable-5[1m]", "claude-fable-5"),
             ("claude-fable-5-1[1m]", "claude-fable-5-1"),
+            ("claude-fable-5-2[1m]", "claude-fable-5-2"),
+            ("claude-fable-5-2-20261109", "claude-fable-5-2"),
             ("claude-haiku-4-5-20251001[1m]", "claude-haiku-4-5-20251001"),
         ] {
             assert_eq!(c.lookup(id).map(|m| m.id.as_str()), Some(family), "{id}");
@@ -853,20 +855,23 @@ mod tests {
         check_catalog_members(MODELS_JSON).unwrap();
     }
 
+    /// Go v8.0.35's retained section sizes plus the K1 additions (#68): Claude Fable 5.2,
+    /// GPT-6.1 Terra in each Codex tier and Muse Ember 1.0 (docs/DIFFERENCES-FROM-GO.md).
+    /// This is the catalog served when no remote catalog was read.
     #[test]
-    fn embedded_catalog_matches_go_channel_sizes() {
-        let catalog = pinned();
+    fn embedded_catalog_channel_sizes() {
+        let catalog = catalog(MODELS_JSON);
         let sizes: Vec<(&str, usize)> = catalog.channels.iter().map(|(n, m)| (n.as_str(), m.len())).collect();
         assert_eq!(
             sizes,
             [
-                ("claude", 19),
-                ("codex-free", 5),
-                ("codex-team", 9),
-                ("codex-plus", 9),
-                ("codex-pro", 9),
+                ("claude", 19 + 1),
+                ("codex-free", 5 + 1),
+                ("codex-team", 9 + 1),
+                ("codex-plus", 9 + 1),
+                ("codex-pro", 9 + 1),
                 ("xai", 12),
-                ("meta", 9),
+                ("meta", 9 + 1),
             ]
         );
     }

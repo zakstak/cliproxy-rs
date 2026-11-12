@@ -57,6 +57,7 @@ mod login;
 pub mod meta;
 pub mod meta_auth;
 mod meta_codex;
+mod meta_identity;
 mod meta_wire;
 pub mod multipart;
 pub mod oauth;
@@ -86,6 +87,7 @@ pub mod xai_auth;
 mod xai_replay;
 mod xai_request;
 mod xai_response;
+mod xai_sse;
 pub mod xai_url;
 mod xai_ws;
 
@@ -163,16 +165,20 @@ impl Executors {
     /// The Images API (`/v1/images/generations`, `/v1/images/edits`) for providers that
     /// serve it directly. `request_path` is the inbound route; `req.stream` asks for the
     /// upstream event stream passed through raw.
+    ///
+    /// `on_format` hears the `response_format` an xAI credential's payload rules settled
+    /// on; the Codex adapter keeps its own contract and never calls it.
     pub async fn images(
         &self,
         credential: &Credential,
         req: ExecRequest,
         request_path: &str,
         cfg: &Config,
+        on_format: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<ExecResponse, ExecError> {
         match credential.provider.as_str() {
             "codex" => self.codex.images(credential, req, request_path, cfg).await,
-            xai::PROVIDER => self.xai.images(credential, req, request_path, cfg).await,
+            xai::PROVIDER => self.xai.images(credential, req, request_path, cfg, on_format).await,
             other => Err(no_executor(other)),
         }
     }
