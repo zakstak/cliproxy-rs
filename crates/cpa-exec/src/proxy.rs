@@ -260,6 +260,9 @@ pub struct GoClients {
     pool: Option<(usize, Option<std::time::Duration>)>,
     /// The clients tell timed requests whether they dialled ([`watch_connections`]).
     timed: bool,
+    /// The clients ask a gated request's [`Gate`] once each dial completes
+    /// ([`admit_dials`]).
+    admit: bool,
 }
 
 impl GoClients {
@@ -271,7 +274,17 @@ impl GoClients {
             http1: false,
             pool: None,
             timed: false,
+            admit: false,
         }
+    }
+
+    /// Clients for gated requests ([`send_routed_certain`]): every request dials its own
+    /// connection, and its [`Gate`] decides once that connection is up, before any HTTP
+    /// byte is written ([`admit_dials`]). Additive (N1 #111).
+    pub fn admitting(mut self) -> Self {
+        self.pool = Some((0, None));
+        self.admit = true;
+        self
     }
 
     /// Clients keeping at most `max_idle_per_host` idle connections per host (0 closes
@@ -297,6 +310,7 @@ impl GoClients {
             http1: false,
             pool: None,
             timed: false,
+            admit: false,
         }
     }
 
@@ -333,6 +347,9 @@ impl GoClients {
         let mut builder = wreq::Client::builder().redirect(wreq::redirect::Policy::none());
         if self.timed {
             builder = watch_connections(builder);
+        }
+        if self.admit {
+            builder = admit_dials(builder);
         }
         let mut builder = self.hooks.apply(builder);
         if self.http1 {
@@ -1191,7 +1208,62 @@ tokio::task_local! {
 /// the body. `false` closes the request without its body.
 pub(crate) type Gate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// The gate closed: the request body was not sent.
+/// The connection hook of the clients gated requests use ([`GoClients::admitting`] and
+/// the chatgpt.com equivalent): when a dial completes (TCP, TLS with its ALPN choice and
+/// any proxy tunnel), the request's [`Gate`] decides before the client writes any HTTP
+/// byte on it: no HTTP/2 preface, SETTINGS or HEADERS, no HTTP/1.1 request line. A closed
+/// gate fails the dial, and the connection is dropped. The connector runs in the task
+/// that sends the request, where the gate is set ([`GATE`]); requests without a gate pass
+/// unchanged. These clients keep no idle connection, so a gated request always dials its
+/// own and never waits on, or queues its headers into, a shared HTTP/2 connection. After
+/// the gate only local protocol setup precedes the request headers: the HTTP/2 preface
+/// and SETTINGS write, or the HTTP/1.1 dispatch, with no wait on the network.
+pub(crate) fn admit_dials(builder: wreq::ClientBuilder) -> wreq::ClientBuilder {
+    builder.connector_layer(AdmitDials)
+}
+
+#[derive(Clone, Copy)]
+struct AdmitDials;
+
+impl<S> tower::Layer<S> for AdmitDials {
+    type Service = Admitting<S>;
+    fn layer(&self, inner: S) -> Admitting<S> {
+        Admitting(inner)
+    }
+}
+
+#[derive(Clone)]
+struct Admitting<S>(S);
+
+impl<S, R> tower::Service<R> for Admitting<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: From<GateClosed> + Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures_util::future::BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: R) -> Self::Future {
+        let gate = GATE.try_with(Gate::clone).ok();
+        let dial = self.0.call(target);
+        Box::pin(async move {
+            let connection = dial.await?;
+            match gate {
+                Some(gate) if !gate() => Err(GateClosed.into()),
+                _ => Ok(connection),
+            }
+        })
+    }
+}
+
+/// The gate closed: the request was not sent.
 #[derive(Debug)]
 pub(crate) struct GateClosed;
 

@@ -328,11 +328,16 @@ impl CodexExecutor {
     ) -> Result<crate::proxy::Upstream, (ExecError, bool)> {
         let transport = &self.transport;
         let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
+        // A gated request dials its own connection and is admitted after the dial,
+        // before any HTTP byte (`crate::proxy::admit_dials`); the same TLS, ALPN and proxy.
+        let gated = gate.is_some();
         let route = |hop: &url::Url| {
-            Ok(crate::proxy::Route {
-                client: transport.for_url(hop.as_str(), proxy, keep_alive, handshake),
-                order: None,
-            })
+            let client = if gated {
+                transport.admitting_for_url(hop.as_str(), proxy, handshake)
+            } else {
+                transport.for_url(hop.as_str(), proxy, keep_alive, handshake)
+            };
+            Ok(crate::proxy::Route { client, order: None })
         };
         crate::proxy::send_routed_certain(&route, url, go_headers(headers), body, gate).await
     }
