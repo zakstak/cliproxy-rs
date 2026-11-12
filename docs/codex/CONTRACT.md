@@ -386,6 +386,12 @@ The response reaches the client as the upstream sent it:
   with no event renamed, no output repaired and no usage added. Usage, capture and
   failure classification read a copy. The observer splits lines as the shared SSE
   framer does (`\r\n`, `\r` or `\n`) and joins a multiline `data` field in one pass.
+- A request that was sent is never sent to another credential once the upstream may
+  have read it (N1 #111): a lost connection after the request left, and a broken body
+  after a success status, are request-scoped failures, whether or not
+  `stream-bootstrap-buffering` still holds `response.created`. Only a connection that
+  could not be made (DNS, TCP, TLS or proxy setup) or a request whose deadline passed
+  before it was sent fails over; an explicit upstream rejection keeps its failover.
 - Leading handshake events are held under `stream-bootstrap-buffering`, using their
   decoded classification view; positional and object envelopes are held alike. The held
   events are `response.created`, `response.in_progress`, `codex.rate_limits`,
@@ -523,10 +529,15 @@ connection closes. The client continues with a `response.create` and
 `previous_response_id`, as the pinned client does.
 
 Every client frame that would reach an upstream is sent under the client key the
-connection was opened with (N1 #111): each turn as it is admitted and again right before
-its `response.create` is written, each later frame of a `codex.response-steering`
-connection as it is admitted and again right before it is written, and each
-`response.interrupt`. The check re-runs the upgrade's client-key authentication against
+connection was opened with (N1 #111). The key is checked when a frame is admitted: each
+turn, each later frame of a `codex.response-steering` connection and each
+`response.interrupt`. It is checked again at the write itself, after every wait for the
+upstream. On an upstream socket that is once the socket is ready to take the frame
+(after its lock, its readiness and any earlier frame's flush) and before the frame is
+handed over; a revocation after the hand-over cannot recall it. On a turn served over
+HTTP it is before each attempt dials, and again when the HTTP client first takes the
+request body, which it does only once it holds a connection. A refusal there sends no
+byte of the request. The check re-runs the upgrade's client-key authentication against
 the current config. A key removed from `api-keys` stops the next send, and the
 connection never acts as another accepted key it also presents. A refused frame reaches
 no upstream, and the client gets a 401 `error` event that names no key; at admission the
@@ -607,7 +618,14 @@ the client connection closes as for any lost socket. That holds under
 held. Only a request that provably never left (the socket's loss was recorded before the
 write, or the WebSocket library refused the frame before queueing it) is retried, once,
 on a fresh socket, and an explicit upstream rejection (a wrapped status error, a
-failure event) keeps its failover. The first-party client reads such a loss as a
+failure event) keeps its failover. A write is provably unsent when it failed or timed
+out before the frame was handed to the WebSocket library; one that failed or timed out
+after the hand-over may have sent part of it. The same rule holds for a turn served over
+HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) and for the
+[native HTTP route](#native-http-route): only a request whose connection could not be
+made, or that never left because its deadline had passed, may fail over. After a
+success status, or after a request was sent and the answer was lost, the failure is
+request-scoped: no other account gets it, and a WebSocket client's connection closes. The first-party client reads such a loss as a
 stream error (`responses_websocket.rs:1002-1005`) and retries the sampling request
 itself (`core/src/responses_retry_tests.rs:17-50`); the proxy makes no copy (N1 #111). A loss
 reported while the turn's request has not been served yet is the loss of a socket its own

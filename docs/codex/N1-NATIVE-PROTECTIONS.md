@@ -91,10 +91,32 @@ provider proof.
 | W2 | `websocket::ClientAuthority` re-runs the upgrade's client-key check for every turn, interrupt and duplex frame. The executor session holds it (`codex_ws::Authority`), so it is checked again right before each write. The bound principal is never replaced. | `codex_native_ws::a_revoked_client_key_admits_no_later_send_on_a_reused_socket`, `a_create_queued_before_revocation_is_refused_when_it_would_be_sent`, `a_revoked_client_key_cannot_interrupt`, `another_accepted_key_never_replaces_the_bound_principal`; `codex_duplex::tests::a_revoked_client_cannot_send_a_later_create_and_stays_connected`, `a_create_admitted_before_revocation_is_not_written_after_it` |
 | W3 | `codex_response::bufferable` holds `response.metadata`. | `codex_native_ws::bootstrap_buffering_holds_response_metadata_and_releases_it_in_order`, `codex_native_request::bootstrap_buffering_holds_response_metadata_on_http`, `codex_response::bufferable_tests::response_metadata_is_held_and_output_is_not` |
 
-The WebSocket HTTP fallback (a Codex credential without `websockets`) and the native HTTP
-route keep their transport retry policy. This branch does not establish whether an HTTP
-stream lost after its request was sent is replayed on another credential; that remains a
-gate.
+An independent review of the first fix head (`d6426b32`) found four more defects, fixed in
+the same branch:
+
+- Authority was checked before the write waited for the socket. It is now decided at
+  write admission (`codex_ws::write_phases`), after the sink lock, readiness and earlier
+  flushes, for creates, duplex frames and interrupts.
+- The WebSocket HTTP fallback never checked the authority. It now checks before each
+  attempt dials and again when the HTTP client takes the body (`proxy::GatedBody`).
+  Revoked during the dial, no request byte left.
+- The native HTTP route and the fallback replayed requests the upstream may have read.
+  They now track send certainty (`proxy::send_routed_certain`): only a failed connection
+  or an unsent deadline fails over.
+- The bootstrap deadline was checked only when the next frame arrived. It is now a timer
+  (`Turn::frame_until`).
+
+Regression tests: `codex_ws::tests::each_write_phase_reports_whether_the_frame_left`,
+`a_create_waiting_for_the_socket_is_refused_after_revocation`,
+`an_interrupt_waiting_for_the_socket_is_refused_after_revocation`,
+`a_key_revoked_while_an_http_turn_dials_sends_no_request`;
+`codex_duplex::tests::a_create_waiting_for_the_socket_is_refused_after_revocation`;
+`codex_native_ws::an_uncertain_http_loss_is_never_replayed_on_another_account`,
+`provably_unsent_and_rejected_http_requests_still_fail_over`,
+`a_revocation_during_an_http_attempt_stops_the_failover_attempt`,
+`held_metadata_is_released_at_the_bootstrap_deadline`,
+`metadata_beyond_the_bootstrap_bound_passes_in_order`. The translated route keeps its
+transport retry policy.
 
 ## Execution evidence
 
