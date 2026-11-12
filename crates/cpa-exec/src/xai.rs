@@ -69,6 +69,11 @@ pub struct XaiExecutor {
 /// The payload rules on an image or video body (Go's media finalizer: the body's
 /// model, else the routed one; protocol `openai`; the client body as the baseline).
 fn media_rules(req: &ExecRequest, cfg: &Config, payload: Vec<u8>) -> Vec<u8> {
+    media_rules_with(req, cfg, payload, &req.body)
+}
+
+/// [`media_rules`] with `original` as the body `default` rules check for fields.
+fn media_rules_with(req: &ExecRequest, cfg: &Config, payload: Vec<u8>, original: &[u8]) -> Vec<u8> {
     let mut model = text(&gj::get(&req.body, "model")).trim().to_owned();
     if model.is_empty() {
         model = req.model.trim().to_owned();
@@ -78,7 +83,7 @@ fn media_rules(req: &ExecRequest, cfg: &Config, payload: Vec<u8>) -> Vec<u8> {
         model: &model,
         protocol: "openai",
         root: "",
-        original: &req.body,
+        original,
     }
     .apply(cfg, req, payload)
 }
@@ -636,12 +641,18 @@ impl XaiExecutor {
 
     /// `executeImages`: the JSON body, image references in xAI's shape, to
     /// `/images/edits` or `/images/generations` by the inbound route.
+    ///
+    /// Payload rules see the request before the route's defaults (`original_body`, Go
+    /// v8.0.67 826bb167), so a `default` rule fills a field the client left out even
+    /// where the route would have defaulted it; `on_format` hears the `response_format`
+    /// the rules settled on, which the route answers in.
     pub async fn images(
         &self,
         credential: &Credential,
         req: ExecRequest,
         request_path: &str,
         cfg: &Config,
+        on_format: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<ExecResponse, ExecError> {
         let cfg = scoped(credential, cfg);
         let path = if request_path.ends_with(IMAGES_EDITS) {
@@ -649,7 +660,21 @@ impl XaiExecutor {
         } else {
             IMAGES_GENERATIONS
         };
-        let payload = media_rules(&req, cfg.as_ref(), request::normalize_image_refs(req.body.to_vec()));
+        let source = if req.original_body.is_empty() {
+            &req.body
+        } else {
+            &req.original_body
+        };
+        let original = request::normalize_image_refs(source.to_vec());
+        let payload = media_rules_with(
+            &req,
+            cfg.as_ref(),
+            request::normalize_image_refs(req.body.to_vec()),
+            &original,
+        );
+        if let Some(on_format) = on_format {
+            on_format(gj::get(&payload, "response_format").str().trim());
+        }
         self.media(credential, &req, cfg.as_ref(), wreq::Method::POST, path, payload, false)
             .await
     }

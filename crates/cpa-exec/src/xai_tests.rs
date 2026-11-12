@@ -250,7 +250,7 @@ async fn go_reference_scenarios() {
         let op = s["op"].as_str().unwrap();
         let path = s["request_path"].as_str().unwrap_or_default().to_owned();
         let result = match op {
-            "images" => executor.images(&cred, req, &path, &cfg).await,
+            "images" => executor.images(&cred, req, &path, &cfg, None).await,
             "videos" => executor.videos(&cred, req, &path, &cfg).await,
             _ => {
                 executor
