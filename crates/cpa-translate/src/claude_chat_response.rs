@@ -60,10 +60,16 @@ struct Tool {
     arguments: Vec<u8>,
 }
 
+/// Go `mapAnthropicStopReasonToOpenAI` (v8.0.67 c2dfec28). Anthropic documents
+/// `model_context_window_exceeded` as output truncated by the context window
+/// (anthropic-sdk-python `types/message.py`), so it ends like `max_tokens`: a
+/// successful `length` finish that keeps the content, tool calls and usage.
+/// `refusal` stays a successful `content_filter` finish; `pause_turn` has no Chat
+/// equivalent and finishes as `stop`.
 fn finish_reason(reason: &[u8]) -> &'static str {
     match reason {
         b"tool_use" => "tool_calls",
-        b"max_tokens" => "length",
+        b"max_tokens" | b"model_context_window_exceeded" => "length",
         b"refusal" | b"sensitive" => "content_filter",
         _ => "stop",
     }
@@ -336,7 +342,9 @@ pub fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
         gj::set_str(&mut out, &format!("{path}.function.arguments"), &tool.arguments);
         count += 1;
     }
-    if count > 0 {
+    // A tool call cut off by a truncation keeps `length`, as the stream does: its
+    // arguments may be incomplete (v8.0.67 c2dfec28).
+    if count > 0 && finish_reason(&reason) != "length" {
         gj::set_str(&mut out, "choices.0.finish_reason", "tool_calls");
     } else if finish_reason(&reason) != "stop" {
         gj::set_str(&mut out, "choices.0.finish_reason", finish_reason(&reason));

@@ -499,6 +499,18 @@ async fn finish_reply(scenario: &Value, ctx: &Ctx<'_>, prepared: &Prepared) -> R
     .await
 }
 
+/// Scenarios recorded at an older Go whose error scope and retry hint this fork takes
+/// from the selective Go v8.0.67 target instead (docs/DIFFERENCES-FROM-GO.md). The
+/// recording keeps its provenance; each entry must differ from it, so an entry cannot
+/// outlive the difference.
+const SELECTIVE_ERRORS: &[(&str, FailureScope, bool, &str)] = &[(
+    "oauth-overage-retry-after-429",
+    FailureScope::Model,
+    false,
+    "#72: a rejected overage claim with an allowed 7d window and no 5h headers is a \
+     model-scoped rejection without a quota reset (0130d6f3)",
+)];
+
 /// The error Rust builds from the scenario's upstream reply matches what Go's conductor
 /// and handlers read from its error: scope, retry hint, and the direct response.
 fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, Value>, error: ExecError) {
@@ -519,8 +531,19 @@ fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, 
     } else {
         crate::upstream::scope_for(error.status)
     };
+    let (scope, retry_hint) = match SELECTIVE_ERRORS.iter().find(|(n, ..)| *n == name) {
+        Some((_, selective, hint, why)) => {
+            assert!(
+                (scope, flag("retry_after")) != (*selective, *hint),
+                "{name}: SELECTIVE_ERRORS entry matches the recording"
+            );
+            eprintln!("{name}: follows v8.0.67 ({why})");
+            (*selective, *hint)
+        }
+        None => (scope, flag("retry_after")),
+    };
     assert_eq!(error.scope, scope, "{name}: scope");
-    assert_eq!(error.retry_after.is_some(), flag("retry_after"), "{name}: retry hint");
+    assert_eq!(error.retry_after.is_some(), retry_hint, "{name}: retry hint");
     assert_eq!(error.direct, flag("direct"), "{name}: direct response");
     if let Some(status) = status {
         assert_eq!(error.status, status, "{name}: status");

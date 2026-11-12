@@ -17,6 +17,7 @@ use crate::{
     stream::GoStream,
 };
 use cpa_common::json::{self as gj, Kind, Res};
+use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub static PAIR: Registered = registered!(
@@ -210,17 +211,40 @@ impl Usage {
     }
 }
 
-/// Go `claudeResponsesIncompleteDetails`: `pause_turn` (a server-tool
-/// iteration pause) is unfinished too, but Responses has no matching reason,
-/// so its details stay null.
+/// Go `claudeResponsesIncompleteDetails` (v8.0.67 aadb34f9, d495e24c). Anthropic
+/// documents `max_tokens` and `model_context_window_exceeded` as truncated output and
+/// `refusal` as a safety stop (anthropic-sdk-python `types/message.py`); the
+/// Responses `incomplete_details.reason` values for those are `max_output_tokens` and
+/// `content_filter`. The response stays a successful `response.incomplete` that keeps
+/// its output and usage, never an error.
 fn incomplete_details(stop: &[u8]) -> Option<&'static str> {
-    let stop = trim_space(stop);
-    if stop.eq_ignore_ascii_case(b"max_tokens") {
-        Some(r#"{"reason":"max_output_tokens"}"#)
-    } else if stop.eq_ignore_ascii_case(b"pause_turn") {
-        Some("null")
+    match String::from_utf8_lossy(trim_space(stop)).go_lower().as_str() {
+        "max_tokens" | "model_context_window_exceeded" => Some(r#"{"reason":"max_output_tokens"}"#),
+        "refusal" => Some(r#"{"reason":"content_filter"}"#),
+        _ => None,
+    }
+}
+
+fn stop_is(stop: &[u8], reason: &str) -> bool {
+    String::from_utf8_lossy(trim_space(stop)).go_eq_fold(reason)
+}
+
+/// Go `claudeStopReasonPauseTurn`. Anthropic's server-tool iteration pause is a
+/// finished response that the client continues by sending the paused content back,
+/// so it completes with `end_turn: false`, the field the first-party Codex client
+/// reads on `response.completed` (docs/codex/CONTRACT.md).
+fn is_pause_turn(stop: &[u8]) -> bool {
+    stop_is(stop, "pause_turn")
+}
+
+/// Go `claudeResponsesWebSearchStatus` (v8.0.67 df860eb9): a search that a
+/// `pause_turn` or `tool_use` stop left without its result stays `in_progress`, so the
+/// next request sends it back without inventing a result.
+fn web_search_status(stop: &[u8], status: &'static str, has_results: bool) -> &'static str {
+    if !has_results && (is_pause_turn(stop) || stop_is(stop, "tool_use")) {
+        "in_progress"
     } else {
-        None
+        status
     }
 }
 
@@ -542,6 +566,15 @@ impl State {
 
     fn name(&self, idx: i64) -> Vec<u8> {
         self.func_names.get(&idx).cloned().unwrap_or_default()
+    }
+
+    fn web_search_added(&mut self, output_index: i64, tool_use_id: &[u8]) -> Vec<u8> {
+        let mut added = br#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"in_progress","action":{"type":"search","query":""}}}"#.to_vec();
+        let seq = self.next_seq();
+        gj::set_int(&mut added, "sequence_number", seq);
+        gj::set_int(&mut added, "output_index", output_index);
+        gj::set_str(&mut added, "item.id", web_search_call_id(tool_use_id));
+        event("response.output_item.added", &added)
     }
 
     fn finalize_web_search(&mut self, i: usize, status: &'static str) -> Vec<Vec<u8>> {
@@ -1187,17 +1220,30 @@ impl State {
                     let i = self.web.len() - 1;
                     self.web_by_block.insert(idx, i);
                     self.web_by_tool.insert(tool_use_id.clone(), i);
-                    let mut added = br#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"in_progress","action":{"type":"search","query":""}}}"#.to_vec();
-                    let seq = self.next_seq();
-                    gj::set_int(&mut added, "sequence_number", seq);
-                    gj::set_int(&mut added, "output_index", output_index);
-                    gj::set_str(&mut added, "item.id", web_search_call_id(&tool_use_id));
-                    out.push(event("response.output_item.added", &added));
+                    out.push(self.web_search_added(output_index, &tool_use_id));
                 }
             }
             b"web_search_tool_result" => {
-                if let Some(&i) = self.web_by_tool.get(&*cb.get("tool_use_id").bytes()) {
+                let tool_use_id = cb.get("tool_use_id").bytes().into_owned();
+                if let Some(&i) = self.web_by_tool.get(&tool_use_id) {
                     self.web[i].results = web_search_results(&cb.get("content"));
+                } else if !tool_use_id.is_empty() {
+                    // A continuation after pause_turn delivers the result of a search
+                    // whose server_tool_use came in the previous response; it keeps
+                    // that search's ID (v8.0.67 aadb34f9).
+                    let output_index = self.allocate();
+                    self.web.push(WebSearch {
+                        tool_use_id: tool_use_id.clone(),
+                        output_index,
+                        input: vec![],
+                        results: web_search_results(&cb.get("content")),
+                        emitted: false,
+                        status: "",
+                    });
+                    let i = self.web.len() - 1;
+                    self.web_by_block.insert(idx, i);
+                    self.web_by_tool.insert(tool_use_id.clone(), i);
+                    out.push(self.web_search_added(output_index, &tool_use_id));
                 }
             }
             b"thinking" | b"redacted_thinking" => {
@@ -1244,6 +1290,7 @@ impl State {
         }
         for i in 0..self.web.len() {
             if !self.web[i].emitted {
+                let status = web_search_status(&self.stop_reason, status, self.web[i].results.is_some());
                 out.extend(self.finalize_web_search(i, status));
             }
         }
@@ -1262,6 +1309,9 @@ impl State {
         gj::set_str(&mut completed, "response.status", status);
         if let Some(details) = details {
             gj::set_raw(&mut completed, "response.incomplete_details", details);
+        }
+        if is_pause_turn(&self.stop_reason) {
+            gj::set_bool(&mut completed, "response.end_turn", false);
         }
         copy_request_fields(&mut completed, &self.request, "response.", Echo::default());
         let mut outputs = br#"{"arr":[]}"#.to_vec();
@@ -1648,8 +1698,17 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
                         }
                     }
                     b"web_search_tool_result" => {
-                        if let Some(&i) = web_by_tool.get(&*cb.get("tool_use_id").bytes()) {
+                        let tool_use_id = cb.get("tool_use_id").bytes().into_owned();
+                        if let Some(&i) = web_by_tool.get(&tool_use_id) {
                             items[i].results = web_search_results(&cb.get("content"));
+                        } else if !tool_use_id.is_empty() {
+                            // Continuation after pause_turn: the search started in the
+                            // previous response and keeps its ID.
+                            let i = new_item(&mut items, &mut by_block, "web_search_call", idx);
+                            items[i].id = web_search_call_id(&tool_use_id);
+                            items[i].call_id = tool_use_id.clone();
+                            items[i].results = web_search_results(&cb.get("content"));
+                            web_by_tool.insert(tool_use_id, i);
                         }
                     }
                     b"thinking" | b"redacted_thinking" => {
@@ -1729,6 +1788,9 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
     if let Some(details) = incomplete_details(&stop) {
         gj::set_raw(&mut out, "incomplete_details", details);
     }
+    if is_pause_turn(&stop) {
+        gj::set_bool(&mut out, "end_turn", false);
+    }
     copy_request_fields(&mut out, request, "", Echo::default());
     // A native response's model is authoritative.
     if !native_model.is_empty() {
@@ -1757,7 +1819,11 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
             }
             "web_search_call" => {
                 let mut item = web_search_item(&it.call_id, &web_search_query(&it.args), it.results.as_ref());
-                gj::set_str(&mut item, "status", item_status);
+                gj::set_str(
+                    &mut item,
+                    "status",
+                    web_search_status(&stop, item_status, it.results.is_some()),
+                );
                 item
             }
             "message" => {
