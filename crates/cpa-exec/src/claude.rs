@@ -60,6 +60,8 @@ use futures_util::StreamExt;
 
 use crate::oauth::{self, OAuth};
 use crate::proxy::{GoClients, GoHeaders, Proxy, Route};
+/// Retained Claude quota evidence for local cooldowns (cb70eacf).
+pub use crate::quota::{rejected_cooldown_signals, sanitize_cooldown_signals};
 use crate::rawjson;
 use crate::tls::Transport;
 use crate::upstream::{Decoded, decode_upstream};

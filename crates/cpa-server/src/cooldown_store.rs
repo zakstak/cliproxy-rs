@@ -26,6 +26,25 @@ pub struct Record {
     pub reason: String,
     #[serde(default)]
     pub quota: Quota,
+    /// Go v8.0.67 `CooldownStateRecord.CooldownSignals` (cb70eacf): the rejected
+    /// Anthropic unified quota headers the cooldown was recorded with. Restored only
+    /// after the same sanitizing a live 429 gets.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cooldown_signals: std::collections::BTreeMap<String, String>,
+    /// cliproxy-rs only: the one-way account fingerprint those signals belong to
+    /// (`scheduler::evidence_account`); a restore drops them for another account. Go's
+    /// decoder ignores it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cooldown_signals_account: String,
+    /// Go v8.0.67 `ForceCooldownUntil` (9d7d012b): the exact deadline a
+    /// `*-and-cooldown` rule forced, which outlives `disable-cooling`.
+    #[serde(default, with = "go_time", skip_serializing_if = "Option::is_none")]
+    pub force_cooldown_until: Option<SystemTime>,
+    /// Go v8.0.67 `ForceCooldownEvaluated`: the record was written with force
+    /// provenance, so a missing `force_cooldown_until` means an ordinary cooldown. Older
+    /// records lack it and are never treated as forced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_cooldown_evaluated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LastError>,
     #[serde(default, with = "go_time")]
@@ -424,6 +443,19 @@ mod tests {
             // The one deliberate difference (docs/DIFFERENCES-FROM-GO.md): every quota
             // record cliproxy-rs writes carries `trust_windows`, which Go's decoder skips.
             for record in actual["records"].as_array_mut().unwrap() {
+                // #95: Go v8.0.67's force provenance (9d7d012b), which this v8.0.35
+                // recording predates: every record carries the evaluated mark, and none
+                // of this sequence was forced.
+                let fields = record.as_object_mut().unwrap();
+                assert_eq!(
+                    fields.remove("force_cooldown_evaluated"),
+                    Some(serde_json::Value::Bool(true)),
+                    "{name}: force provenance on every record"
+                );
+                assert!(
+                    fields.remove("force_cooldown_until").is_none(),
+                    "{name}: nothing forced"
+                );
                 if record["quota"]["exceeded"] == true {
                     let removed = record["quota"].as_object_mut().unwrap().remove("trust_windows");
                     assert!(

@@ -198,13 +198,14 @@ async fn alpha_search(
             };
             return with_retry_after(error(503, &text), failure.retry_after());
         }
-        Err(AcquireError::Cooldown { wait, cause }) => {
+        Err(AcquireError::Cooldown { wait, cause, .. }) => {
             // `modelCooldownError`: the same JSON the inference routes return, as a string.
             let failure = crate::dispatch::Failure::Cooldown {
                 model: model.clone(),
                 provider: "codex".into(),
                 wait,
                 cause,
+                signals: Default::default(),
             };
             return with_retry_after(error(429, &failure.text()), failure.retry_after());
         }
