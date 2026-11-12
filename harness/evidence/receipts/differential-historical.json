@@ -1,5 +1,5 @@
 {
-  "written": "2026-11-12T06:39:28Z",
+  "written": "2026-11-12T09:08:19Z",
   "kind": "differential",
   "verdict": "pass",
   "partial": false,
@@ -8,14 +8,14 @@
   "go_commit": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
   "role": "historical-recording",
   "suite": "claude-differential",
-  "run": "run-historical-20261112-063902",
-  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
+  "run": "run-historical-20261112-090753",
+  "rust_revision": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
   "source": {
-    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+    "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+    "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
     "clean": true,
     "status": [],
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
   },
   "provenance_verified": true,
   "provenance": {
@@ -45,7 +45,7 @@
       "checkout_head": "6fecc6e5567912661654a4eaf9b8f5436facd1c2",
       "checkout_clean": true
     },
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184",
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9",
     "after": {
       "driver": {
         "package": "cpa-differential-driver",
@@ -74,11 +74,11 @@
         "checkout_clean": true
       },
       "source": {
-        "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-        "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+        "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+        "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
         "clean": true,
         "status": [],
-        "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+        "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
       }
     },
     "verified": true,
@@ -100,7 +100,7 @@
     "infrastructure": 0,
     "named_skips": 0,
     "unknown_skips": 0,
-    "named_divergences": 5,
+    "named_divergences": 4,
     "stale_divergences": 0
   },
   "problems": [],
@@ -119,9 +119,6 @@
     "cors-expose-etag": {
       "kind": "later-reference",
       "evidence": "Go v8.0.35 (ae3ee3be) internal/api/server_middleware.go:33 adds ETag to Access-Control-Expose-Headers; v8.0.10 (6fecc6e) lacks it, v8.0.67 keeps it."
-    },
-    "credential-refresh-timestamps": {
-      "kind": "nondeterministic"
     },
     "go-openai-model-order": {
       "kind": "nondeterministic",
@@ -458,10 +455,9 @@
       "failed": {},
       "unexplained": [],
       "unexplained_count": 0,
-      "differences": 20,
+      "differences": 18,
       "hits": [
-        "cors-expose-etag",
-        "credential-refresh-timestamps"
+        "cors-expose-etag"
       ]
     },
     {

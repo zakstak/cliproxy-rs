@@ -1,27 +1,92 @@
 {
-  "written": "2026-11-12T06:40:41Z",
+  "written": "2026-11-12T09:09:21Z",
   "kind": "cargo-groups",
   "verdict": "pass",
   "partial": false,
-  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
+  "rust_revision": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
   "source": {
-    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+    "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+    "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
     "clean": true,
     "status": [],
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
   },
   "source_after": {
-    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+    "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+    "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
     "clean": true,
     "status": [],
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
   },
   "provenance_verified": true,
   "toolchain": {
     "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
     "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)"
+  },
+  "build": {
+    "commands": {
+      "cpa-core": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-core",
+        "--lib",
+        "--message-format=json"
+      ],
+      "cpa-exec": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-exec",
+        "--lib",
+        "--message-format=json"
+      ],
+      "cpa-server": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-run",
+        "-p",
+        "cpa-server",
+        "--test",
+        "claude_passthrough",
+        "--test",
+        "codex_native_request",
+        "--test",
+        "codex_native_ws",
+        "--test",
+        "codex_translated",
+        "--test",
+        "management",
+        "--test",
+        "retained_providers",
+        "--test",
+        "routes",
+        "--message-format=json"
+      ]
+    },
+    "cwd": ".",
+    "environment": {
+      "CARGO_INCREMENTAL": null,
+      "CARGO_BUILD_JOBS": "2",
+      "CARGO_TARGET_DIR": null,
+      "CARGO_BUILD_TARGET_DIR": null,
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "CARGO_BUILD_RUSTFLAGS": null,
+      "RUSTDOCFLAGS": null,
+      "RUSTC": null,
+      "RUSTC_WRAPPER": "/review/opus-test-1e0aa543/rustc-guard.sh",
+      "RUSTC_WORKSPACE_WRAPPER": null,
+      "RUSTUP_TOOLCHAIN": null,
+      "RUSTUP_HOME": "/usr/local/rustup",
+      "CARGO_HOME": "/home/agent/.cargo",
+      "CARGO_NET_OFFLINE": "true"
+    }
   },
   "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, caller uid/gid; test binaries run directly with CPA_TEST_NO_SKIP=1",
   "counts": {
@@ -1147,7 +1212,7 @@
       },
       "results": [
         {
-          "name": "codex_contract::tests::every_fixture_records_its_provenance",
+          "name": "codex_contract::tests::fixtures_hold_no_credentials",
           "outcome": "ok"
         },
         {
@@ -1155,11 +1220,11 @@
           "outcome": "ok"
         },
         {
-          "name": "codex_contract::tests::fixtures_hold_no_credentials",
+          "name": "codex_contract::tests::frames_are_exact_slices",
           "outcome": "ok"
         },
         {
-          "name": "codex_contract::tests::frames_are_exact_slices",
+          "name": "codex_contract::tests::every_fixture_records_its_provenance",
           "outcome": "ok"
         }
       ],

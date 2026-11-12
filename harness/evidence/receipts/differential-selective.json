@@ -1,5 +1,5 @@
 {
-  "written": "2026-11-12T06:40:13Z",
+  "written": "2026-11-12T09:08:53Z",
   "kind": "differential",
   "verdict": "pass",
   "partial": false,
@@ -8,14 +8,14 @@
   "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
   "role": "selective-comparison",
   "suite": "selective-differential",
-  "run": "run-selective-20261112-063933",
-  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
+  "run": "run-selective-20261112-090824",
+  "rust_revision": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
   "source": {
-    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+    "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+    "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
     "clean": true,
     "status": [],
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
   },
   "provenance_verified": true,
   "provenance": {
@@ -45,7 +45,7 @@
       "checkout_head": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
       "checkout_clean": true
     },
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184",
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9",
     "after": {
       "driver": {
         "package": "cpa-differential-driver",
@@ -74,11 +74,11 @@
         "checkout_clean": true
       },
       "source": {
-        "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-        "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+        "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+        "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
         "clean": true,
         "status": [],
-        "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+        "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
       }
     },
     "verified": true,
@@ -116,7 +116,7 @@
     "C2-claude-native-detection": {
       "kind": "pending-feature",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/70",
-      "attribution": "Observed v8.0.67 behaviour only. Its wire correctness is unknown until C2 records client provenance; this entry grants no adoption."
+      "attribution": "Executed classification: the cloaking comes from the version gate of Go b4e7dbd2 (fix(claude): bump Claude Code CLI fingerprint baseline to 2.1.321, C1 #69 scope), not from C2's detection commits. Its parent 19a0a854 already contains 20c9095c, 6d4102f3 and 542a525f and forwards callers 2.1.280, 2.1.290, 2.1.320, 2.1.321 and 2.1.322 natively and cloaks 2.1.279. b4e7dbd2 and 8bba7a77 cloak 2.1.279 through 2.1.320 and forward 2.1.321 and 2.1.322. v8.0.35 (ae3ee3be) forwards 2.1.280 and later. The variants differ from native-signals only in the caller's User-Agent version. This classifies observed Go behaviour only: whether cloaking a genuine 2.1.280 client is correct on the wire stays unknown until C2 records client provenance, the entry grants no adoption, and moving it to #69 is a tracker decision (harness/evidence/attribution-20261112.json.gz)."
     },
     "I3-unauthenticated-connection-close": {
       "kind": "pending-feature",
@@ -154,27 +154,29 @@
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/88"
     },
     "claude-cloak-tool-alias": {
-      "kind": "unowned",
+      "kind": "not-adopted",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
-      "evidence": "Go e48d780f derives the Claude OAuth MCP alias secret from session.CallerScope(api key) instead of the raw key (claude_executor_request.go resolveClaudeMCPAliasOptions). No tracker issue owns it."
+      "evidence": "Go e48d780f (fix(plugin): preserve caller scope for replayed Claude OAuth MCP tool aliases) derives the Claude OAuth MCP alias secret from caller_scope metadata or session.CallerScope(api key) instead of the raw key (claude_executor_request.go resolveClaudeMCPAliasOptions). Executed pair: its parent b2fda98e sends mcp__poem_real__leisure_fixture_lookup (once in cloak-tools-beta, three times in each round trip); e48d780f sends mcp__drive_trade__cycle_fixture_lookup the same number of times.",
+      "attribution": "Not adopted in this batch: tracker #66 decision, not a C1/C2 or plugin feature; cliproxy-rs keeps the frozen v8.0.35 behaviour. Executed v8.0.35 (ae3ee3be) on cloak-tools-beta, tool-roundtrip and tool-stream-roundtrip sends the same alias spelling the same number of times as cliproxy-rs and v8.0.10 (harness/evidence/attribution-20261112.json.gz)."
     },
     "claude-cloak-tool-alias-restore": {
-      "kind": "unowned",
+      "kind": "not-adopted",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
-      "evidence": "Same Go e48d780f change: the scripted reply carries the v8.0.10 alias, which v8.0.67 no longer maps back."
+      "evidence": "Same Go e48d780f change: the scripted reply carries the v8.0.10 alias, which v8.0.67 no longer maps back. Executed pair: parent b2fda98e restores the caller's fixture_lookup once per round trip; e48d780f returns the scripted alias unchanged.",
+      "attribution": "Not adopted in this batch (tracker #66 decision). Executed v8.0.35 (ae3ee3be) restores fixture_lookup once in tool-roundtrip and tool-stream-roundtrip, as cliproxy-rs does (harness/evidence/attribution-20261112.json.gz)."
     },
     "compaction-capsule-generated": {
       "kind": "nondeterministic"
     },
     "credential-disabled-persist": {
-      "kind": "unattributed",
+      "kind": "unowned",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
-      "attribution": "No Go commit located between v8.0.35 and v8.0.67; owner unassigned."
+      "evidence": "Executed first-parent bisect between 8a01bc02 (persists disabled: false) and 4f2e5270 (field absent): the first change is Go 091ff27f (feat(antigravity): persist model capability hints in auth metadata, which reworks shared auth persistence in sdk/cliproxy/auth/conductor_persistence.go and persist_policy.go). Its parent a2718314 persists disabled: false and 091ff27f leaves the field absent, in 3 of 3 runs each. 091ff27f is in v8.0.35: executed v8.0.35 (ae3ee3be) already leaves disabled absent, so cliproxy-rs differs from the frozen default reference here too, which no ledger entry records yet. No tracker issue owns it (harness/evidence/attribution-20261112.json.gz)."
     },
     "error-retry-after": {
-      "kind": "unattributed",
+      "kind": "unowned",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/66",
-      "attribution": "Code path located: Go sdk/api/handlers/handlers_errors.go:127-138 writes a trusted retry deadline as Retry-After. Commit not bisected; candidates cb70eacf and e458999b (referenced by R1 #94) and 9a35fa12 and b5e6027c (referenced by N1 #111). Owner unassigned."
+      "evidence": "Executed pair: Go 9a35fa12 (fix(codex): treat turn_rate_limit_exceeded as transient capacity with retry hint, which adds trustedRetryAfterError and HasTrustedRetryDeadline) answers all six cases with its own whole-second Retry-After; its parent c3767123 and v8.0.35 (ae3ee3be) send none, as cliproxy-rs and v8.0.10 do. The writer at sdk/api/handlers/handlers_errors.go:127-128 predates v8.0.10; the trusted local deadline it now writes is new. N1 #111 references the commit for Codex; no tracker issue owns the Claude-visible effect (harness/evidence/attribution-20261112.json.gz)."
     },
     "go-openai-model-order": {
       "kind": "nondeterministic",

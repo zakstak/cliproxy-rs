@@ -1,18 +1,18 @@
 {
-  "written": "2026-11-12T06:40:17Z",
+  "written": "2026-11-12T09:08:57Z",
   "kind": "mutation-control",
   "verdict": "pass",
   "partial": false,
-  "run": "run-selective-20261112-063933",
+  "run": "run-selective-20261112-090824",
   "target": "selective",
   "go_commit": "8bba7a77c6bcbfd993516d26606bfecaa4ff49d0",
-  "rust_revision": "2f2b12092a10b244be56964157f43aaa30db29d2",
+  "rust_revision": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
   "source": {
-    "head": "2f2b12092a10b244be56964157f43aaa30db29d2",
-    "tree": "798e4dc2ba03db88aed0ef1a950504deeee3145c",
+    "head": "84a40b27a0dfef9afd6aab5328c740c46ea0cd7d",
+    "tree": "a0f47e2d115bb0ab9cde5ca111f0a558c289a47d",
     "clean": true,
     "status": [],
-    "manifest_sha256": "e32da1abbc6ca1c8c1e6999831ea003a345450b387cb1a261089fa86229d9184"
+    "manifest_sha256": "669830bb6da506ea159e2b639cf06b6f2611174cd39e21a001887e358872c4c9"
   },
   "provenance_verified": true,
   "baseline_verdict": "pass",
