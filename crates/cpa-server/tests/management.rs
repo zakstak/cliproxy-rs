@@ -5184,7 +5184,8 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
             let siwc = |rt: &str, active: bool| {
                 // A loopback base URL lets the test runtime's guard reach the token mock.
                 json!({"type": "codex", "use_siwc": active, "access_token": "outer-at", "base_url": "http://127.0.0.1:1",
-                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1"}})
+                       "siwc": {"access_token": "siwc-old", "refresh_token": rt, "client_id": "client-1",
+                                "expires_at": "2000-01-01T00:00:00Z"}})
                 .to_string()
             };
             std::fs::write(auth.join("active.json"), siwc("siwc-rt-1", true)).unwrap();
@@ -5265,6 +5266,41 @@ async fn siwc_only_codex_credentials_refresh_by_name_and_in_bulk() {
         refreshed_with(&forms.lock().unwrap().drain(..).collect::<Vec<_>>()),
         ["siwc-rt-2", "siwc-rt-new"]
     );
+    // #91: both refresh filters must retain the real grant expiry with the rotated
+    // tokens. Reload the persisted credential so status cannot rely on memory alone.
+    for name in ["active.json", "bound.json"] {
+        let path = f.dir.join("auth").join(name);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let credential =
+            cpa_core::credential::Credential::from_file(&f.dir.join("auth"), &path, saved.as_object().unwrap().clone())
+                .unwrap();
+        let expected_status = if name == "active.json" { "valid" } else { "off" };
+        assert_eq!(
+            cpa_exec::codex_siwc::status(&credential, false, chrono::Utc::now()),
+            expected_status,
+            "{name}: persisted refresh must replace the original grant expiry"
+        );
+        let expiry = chrono::DateTime::parse_from_rfc3339(saved["siwc"]["expires_at"].as_str().unwrap()).unwrap();
+        assert!((expiry.to_utc() - chrono::Utc::now()).num_seconds() > 3500);
+        let loaded =
+            f.rt.store()
+                .snapshot()
+                .into_iter()
+                .find(|c| c.id.ends_with(name))
+                .unwrap();
+        assert_eq!(loaded.metadata["siwc"]["expires_at"], saved["siwc"]["expires_at"]);
+        let response = wreq::Client::new()
+            .get(format!("{base}/v8/management/credentials/siwc/status?name={name}"))
+            .bearer_auth("fake-management-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"status": expected_status})
+        );
+    }
     server.abort();
     upstream.abort();
 }

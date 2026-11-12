@@ -3260,13 +3260,14 @@ fn rebase_patch(
             out.set.extend(changed);
         }
         // Go `codexSIWCCredentialKeys`.
-        const CODEX_SIWC: [&str; 9] = [
+        const CODEX_SIWC: [&str; 10] = [
             "access_token",
             "refresh_token",
             "id_token",
             "client_id",
             "device_id",
             "expired",
+            "expires_at",
             "last_refresh",
             "scope",
             "scopes",
@@ -6437,8 +6438,8 @@ pub(crate) mod tests {
         };
         let kimi = json!({"type": "kimi", "note": "a", "expired": "t0", "gone": "a"});
         let siwc = json!({"type": "codex", "access_token": "a", "refresh_token": "r", "account_id": "acct",
-            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c", "expired": "t0", "note": "n"}});
-        let siwc_refresh = json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "n"}});
+            "siwc": {"access_token": "s", "refresh_token": "sr", "client_id": "c", "expired": "t0", "expires_at": "real-t0", "note": "n"}});
+        let siwc_refresh = json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "expires_at": "real-t1", "note": "n"}});
         let siwc_edit = |k: &str, v: Value| {
             let mut m = map(siwc.clone());
             m["siwc"][k] = v;
@@ -6522,7 +6523,7 @@ pub(crate) mod tests {
                 siwc_edit("note", json!("edited")),
                 siwc_refresh.clone(),
                 vec![],
-                json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "note": "edited"}}),
+                json!({"siwc": {"access_token": "s2", "refresh_token": "sr2", "client_id": "c", "expired": "t1", "expires_at": "real-t1", "note": "edited"}}),
                 vec![],
             ),
             (
