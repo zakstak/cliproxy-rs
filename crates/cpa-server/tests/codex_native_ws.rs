@@ -7437,3 +7437,59 @@ async fn a_terminal_end_releases_the_upstream_socket() {
         .await;
     }
 }
+
+/// FP1 (#115) qualification at the research pin: a `response.create` whose
+/// `function_call_output` carries multimodal content items, file-backed audio included
+/// (`http-request-tool-output-media`, openai/codex main `5c3ff1dabf64`), reaches the
+/// upstream socket byte for byte on both native profiles a loopback can stand for. Over
+/// the WebSocket HTTP fallback it is the same body without the frame's `type`. This is
+/// source-refresh evidence. The contract pin is unchanged, and endpoint acceptance stays
+/// unknown.
+#[tokio::test]
+async fn tool_output_media_reaches_the_upstream_socket_byte_for_byte() {
+    let frame = as_create("http-request-tool-output-media", "gpt-5.5");
+    for profile in [Profile::Chatgpt, Profile::Compatible] {
+        let proxy = proxy(
+            profile,
+            Script {
+                ws: replies(&["sse-completed"]),
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{profile:?}"
+        );
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            std::slice::from_ref(&frame),
+            "{profile:?}: the frame as sent"
+        );
+    }
+
+    let proxy = proxy_with(
+        Script {
+            http: vec![cpa_server::testing::codex_capture::Reply::sse(
+                fixture("sse-completed").bytes(),
+            )],
+            ..Script::default()
+        },
+        "",
+        |url| vec![credential(Profile::Chatgpt, url, false)],
+    )
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket.send(Message::text(frame.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    let sent = proxy.upstream.http().pop().expect("an HTTP request");
+    assert_eq!(
+        text(sent.body),
+        client_frame("http-request-tool-output-media", "gpt-5.5"),
+        "the frame without its tag"
+    );
+}

@@ -2523,3 +2523,46 @@ async fn a_confidential_bootstrap_failure_hands_the_client_no_upstream_headers()
         }
     }
 }
+
+/// FP1 (#115) qualification at the research pin: a native body whose
+/// `function_call_output` carries multimodal content items, file-backed audio included
+/// (`http-request-tool-output-media`, openai/codex main `5c3ff1dabf64`), reaches the
+/// upstream byte for byte. That holds for HTTP streaming, and for a buffered request on
+/// the `chatgpt` profile (where only `stream` changes) and on an API key (no change).
+/// This is source-refresh evidence. The contract pin is unchanged, and endpoint acceptance
+/// of the new shape stays unknown.
+#[tokio::test]
+async fn tool_output_media_reaches_the_upstream_byte_for_byte() {
+    let full = routed("http-request-tool-output-media");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    assert_ne!(buffered, full);
+    let json = r#"{"id":"resp_1","object":"response","status":"completed","output":[],"usage":null}"#;
+    for api_key in [false, true] {
+        let second = if api_key {
+            Reply::json(200, json)
+        } else {
+            Reply::sse(fixture("sse-completed").bytes())
+        };
+        let proxy = native(
+            api_key,
+            Script {
+                http: vec![Reply::sse(fixture("sse-completed").bytes()), second],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let (status, _, _) = post(&proxy.url, "/v1/responses", &[("user-agent", CODEX_UA)], full.clone()).await;
+        assert_eq!(status, 200, "api_key={api_key}: streaming");
+        let (status, _, _) = post(&proxy.url, "/v1/responses", &[], buffered.clone()).await;
+        assert_eq!(status, 200, "api_key={api_key}: buffered");
+        let sent: Vec<String> = proxy
+            .upstream
+            .http()
+            .into_iter()
+            .map(|e| String::from_utf8(e.body.to_vec()).unwrap())
+            .collect();
+        let want_buffered = if api_key { &buffered } else { &full };
+        assert_eq!(sent, [full.clone(), want_buffered.clone()], "api_key={api_key}");
+    }
+}
