@@ -32,6 +32,10 @@ const TICK: Duration = Duration::from_millis(50);
 const CONFIG_SETTLE: Duration = Duration::from_millis(150);
 /// Go `replaceCheckDelay`: one tick.
 const AUTH_SETTLE: Duration = Duration::from_millis(50);
+/// How often the watcher, while idle, checks whether what the last reload could not read
+/// ([`Pending`]) can be read now. A permission change also raises a file event, which
+/// checks at once; this covers a transient I/O error that clears without one.
+const PENDING_RETRY: Duration = Duration::from_secs(2);
 /// Files modified this recently are re-hashed even when their metadata is unchanged:
 /// coarse file timestamps cannot tell two quick same-size writes apart.
 const RACY: Duration = Duration::from_secs(2);
@@ -112,51 +116,44 @@ fn is_auth_json(path: &Path) -> bool {
 }
 
 fn observe(state: &Management, cache: &mut HashCache) -> Snapshot {
+    let listing = credentials::list_auth_dir(&state.rt.config().auth_dir);
+    observe_listing(state, cache, listing)
+}
+
+/// [`observe`] over a listing already taken of the auth folder.
+fn observe_listing(state: &Management, cache: &mut HashCache, listing: credentials::Listing) -> Snapshot {
     let now = SystemTime::now();
-    let mut seen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let config = std::fs::metadata(&state.path)
         .ok()
         .and_then(|meta| cache.hash(&state.path, &meta, now));
-    seen.push(state.path.clone());
+    seen.insert(state.path.clone());
     let mut auth = BTreeMap::new();
-    let dir = state.rt.config().auth_dir.clone();
+    let complete = listing.complete();
     // The scan's classification (`credentials::read_auth_file`): an entry that is gone
     // or not a regular file is absent; one that cannot be read for now is present with
     // the hash last read from it (zeros when never read), so losing access is no change
     // and nothing reloads, while deleting it is a removal the watcher sees.
-    let mut listed = true;
-    match std::fs::read_dir(&dir) {
-        // A missing folder holds no files.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => listed = false,
-        Ok(entries) => {
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    listed = false;
-                    break;
-                };
-                let path = entry.path();
-                if !is_auth_json(&path) {
-                    continue;
-                }
-                let hash = match std::fs::metadata(&path) {
-                    Ok(meta) if !meta.is_file() => continue,
-                    Ok(meta) => cache.hash(&path, &meta, now).or_else(|| cache.last(&path)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => cache.last(&path),
-                };
-                seen.push(path.clone());
-                auth.insert(path, hash.unwrap_or_default());
-            }
-        }
+    let mut listed = std::collections::HashSet::new();
+    for path in listing.paths {
+        listed.insert(path.clone());
+        let hash = match std::fs::metadata(&path) {
+            Ok(meta) if !meta.is_file() => continue,
+            Ok(meta) => cache.hash(&path, &meta, now).or_else(|| cache.last(&path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => cache.last(&path),
+        };
+        seen.insert(path.clone());
+        auth.insert(path, hash.unwrap_or_default());
     }
-    // A folder that exists but cannot be listed (in full) still holds the files last
-    // seen in it, as last seen: unknown, not removed.
-    if !listed {
+    // A folder that exists but cannot be listed in full still holds the files last seen
+    // in it that the listing did not reach, as last seen: unknown, not removed. An entry
+    // the listing reached is settled by what it found, absent included.
+    if !complete {
         for (path, (_, hash)) in &cache.0 {
             // The config file can live in the auth folder too.
-            if path.parent() == Some(dir.as_path()) && is_auth_json(path) && !auth.contains_key(path) {
-                seen.push(path.clone());
+            if path.parent() == Some(listing.dir.as_path()) && is_auth_json(path) && !listed.contains(path) {
+                seen.insert(path.clone());
                 auth.insert(path.clone(), *hash);
             }
         }
@@ -213,10 +210,21 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
         let mut applied: Option<Snapshot> = None;
         let mut observed: Option<Snapshot> = None;
         let mut since = Instant::now();
+        // What the last reload could not read, and whether it can be read now: then the
+        // same observation reloads again, though nothing it records has changed.
+        let mut pending = Pending::default();
+        let mut retry = false;
         loop {
-            let woke = applied.is_some() && applied == observed;
+            let woke = applied.is_some() && applied == observed && !retry;
             if woke {
-                events.changed().await;
+                if pending.is_empty() {
+                    events.changed().await;
+                } else {
+                    tokio::select! {
+                        () = events.changed() => {}
+                        () = tokio::time::sleep(PENDING_RETRY) => {}
+                    }
+                }
             } else {
                 tokio::time::sleep(TICK).await;
             }
@@ -231,13 +239,15 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
             // back and notifications stay on.
             let looked = tokio::task::spawn_blocking({
                 let state = state.clone();
+                let pending = (!retry && !pending.is_empty()).then(|| pending.clone());
                 move || {
                     let snapshot = catch_unwind(AssertUnwindSafe(|| {
                         if let Some(t) = wake_targets {
                             events.retarget(&t);
                         }
                         let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
-                        observe(&state, &mut cache)
+                        let ready = pending.is_some_and(|p| p.ready());
+                        (observe(&state, &mut cache), ready)
                     }));
                     (snapshot.ok(), cache, events)
                 }
@@ -247,7 +257,10 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 Ok((snapshot, returned_cache, returned_events)) => {
                     cache = returned_cache;
                     events = returned_events;
-                    snapshot
+                    snapshot.map(|(snapshot, ready)| {
+                        retry |= ready;
+                        snapshot
+                    })
                 }
                 // Cancelled at shutdown.
                 Err(_) => {
@@ -268,7 +281,7 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 continue;
             }
             let Some(current) = observed.clone() else { continue };
-            if applied.as_ref() == Some(&current) {
+            if applied.as_ref() == Some(&current) && !retry {
                 continue;
             }
             let config_changed = applied.as_ref().map_or(initial_hash, |a| a.config) != current.config;
@@ -300,11 +313,15 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 }
             })
             .await;
+            retry = false;
             let (loaded, read) = match reloaded {
                 Ok((loaded, returned)) => {
                     events = returned;
                     match loaded {
-                        Ok((loaded, read)) => (Ok(loaded), Some(read)),
+                        Ok((loaded, read, unread)) => {
+                            pending = unread;
+                            (Ok(loaded), Some(read))
+                        }
                         Err(()) => (Err(()), None),
                     }
                 }
@@ -464,14 +481,45 @@ pub fn reload(state: &Management) -> Result<(), ReloadError> {
     reload_config(state, true, &Snapshot::default()).0.map(|_| ())
 }
 
+/// What a reload could not read, so did not apply: the auth files whose read failed
+/// and, when it could not list the auth folder in full, that folder. The applied
+/// snapshot records these entries as observed, so a lasting denial is no change and
+/// nothing reloads every tick; the watcher keeps them here instead and reloads once one
+/// can be read, with no new write needed (#89: bytes observed just before the reload's
+/// read failed, a re-login or a revocation, are applied then).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Pending {
+    files: std::collections::BTreeSet<PathBuf>,
+    dir: Option<PathBuf>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dir.is_none()
+    }
+
+    /// Whether a reload could now read something the last one could not: the folder
+    /// lists in full, or a file reads (or is gone).
+    fn ready(&self) -> bool {
+        self.dir
+            .as_deref()
+            .is_some_and(|dir| credentials::list_auth_dir(dir).complete())
+            || self
+                .files
+                .iter()
+                .any(|path| !matches!(credentials::read_auth_file(path), credentials::AuthFile::Unreadable(_)))
+    }
+}
+
 /// Return the config actually accepted under the disk lock, not a later runtime
-/// snapshot possibly replaced by management (None is an auth-only or empty reload), and
-/// the hashes of what this reload read. Entries it did not read are as `observed`.
+/// snapshot possibly replaced by management (None is an auth-only or empty reload), the
+/// hashes of what this reload read, and what it could not read. Entries it did not
+/// read are as `observed`.
 fn reload_config(
     state: &Management,
     read_config: bool,
     observed: &Snapshot,
-) -> (Result<Option<Config>, ReloadError>, Snapshot) {
+) -> (Result<Option<Config>, ReloadError>, Snapshot, Pending) {
     let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
     let mut read = Snapshot {
         config: observed.config,
@@ -506,24 +554,47 @@ fn reload_config(
         }
     };
     state.lock_auth_dir(&mut config);
+    #[cfg(test)]
+    {
+        let hook = BEFORE_SCAN
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(dir, _)| *dir == config.auth_dir)
+            .map(|(_, hook)| hook.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     let scan = credentials::scan_auth_dir(&config);
     read.auth = scan.read.clone();
-    // A file the scan could not read, or did not list in a folder it could not list,
-    // stays as observed; recording it as missing would reload it on every tick.
+    // A file the scan could not read, or did not reach in a folder it could not list,
+    // stays as observed; recording it as missing would reload it on every tick. What the
+    // scan could not read is pending, so that it is retried once it can be.
     let unsettled = scan.unsettled();
     for (path, hash) in &observed.auth {
         if unsettled.contains(path) {
             read.auth.entry(path.clone()).or_insert(*hash);
         }
     }
+    let pending = Pending {
+        files: scan.unreadable.iter().cloned().collect(),
+        dir: scan.unlisted.clone(),
+    };
     let result = accepted.then(|| config.clone());
     state.publish(config, Some(scan));
     let result = match config_error {
         Some(error) => Err(error),
         None => Ok(result),
     };
-    (result, read)
+    (result, read, pending)
 }
+
+/// Test hook: runs in a reload of the auth folder it names, after the watcher observed
+/// the folder and before the reload's scan reads it.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static BEFORE_SCAN: std::sync::Mutex<Vec<(PathBuf, Arc<dyn Fn() + Send + Sync>)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests {
@@ -652,8 +723,18 @@ mod tests {
     /// One watcher reload as `start` makes it: reload what was observed, then record
     /// what was applied.
     fn step(state: &Management, cache: &mut HashCache, read_config: bool, observed: &Snapshot) -> Snapshot {
-        let (_, read) = reload_config(state, read_config, observed);
-        record(cache, observed.clone(), Some(read))
+        step_pending(state, cache, read_config, observed).0
+    }
+
+    /// [`step`], with what the reload could not read.
+    fn step_pending(
+        state: &Management,
+        cache: &mut HashCache,
+        read_config: bool,
+        observed: &Snapshot,
+    ) -> (Snapshot, Pending) {
+        let (_, read, pending) = reload_config(state, read_config, observed);
+        (record(cache, observed.clone(), Some(read)), pending)
     }
 
     /// The watcher records what its reload read, not what it observed before: a write
@@ -1314,6 +1395,245 @@ mod tests {
         let now = store.get("a.json").unwrap();
         assert_eq!(now.metadata["access_token"], "refreshed-fake");
         assert_eq!(Some(now.revision), *refreshed.lock().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Waits up to 5 seconds for `done`.
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Sol review of 6785ebb8, finding 1: the watcher observed new bytes B and the
+    /// reload's read then failed, so the loaded credential A was kept, correctly, but B was
+    /// recorded as applied: once the file could be read again, nothing reloaded it. Now
+    /// what the reload could not read is pending, apart from the applied snapshot, and the
+    /// watcher reloads it once it can be read, with no new write. Here through the
+    /// running watcher, for a re-login, a revocation (`{}`) and a removed provider's file;
+    /// for the first, a lasting denial also does not reload again and again.
+    #[tokio::test]
+    async fn a_write_seen_before_its_read_failed_is_applied_once_readable() {
+        let account = |token: &str, email: &str| {
+            serde_json::json!({"type": "codex", "access_token": token, "email": email}).to_string()
+        };
+        let cases = [
+            (
+                "re-login",
+                account("new-fake", "new@example.invalid"),
+                Some("new@example.invalid"),
+            ),
+            ("revocation", "{}".to_owned(), None),
+            (
+                "removed provider",
+                r#"{"type":"gemini","email":"g@example.invalid"}"#.to_owned(),
+                None,
+            ),
+        ];
+        for (i, (case, replacement, want)) in cases.into_iter().enumerate() {
+            let (state, dir, auth) = state_with_auth_folder(false);
+            let file = auth.join("a.json");
+            let probe = auth.join("probe");
+            std::fs::write(&probe, "").unwrap();
+            chmod(&probe, 0o000);
+            if !denied(&probe) {
+                std::fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::write(&file, account("old-fake", "old@example.invalid")).unwrap();
+            let store = state.rt.store();
+            let email = || {
+                store
+                    .get("a.json")
+                    .map(|c| c.str("email").unwrap_or_default().to_owned())
+            };
+            let watcher = start(&state);
+            wait_until(&format!("{case}: A loaded"), || {
+                email().as_deref() == Some("old@example.invalid")
+            })
+            .await;
+            let before = store.get("a.json").unwrap().revision;
+            // Denies the reload's read once, after the watcher observed the new bytes.
+            let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            BEFORE_SCAN.lock().unwrap().push((auth.clone(), {
+                let (scans, file) = (scans.clone(), file.clone());
+                Arc::new(move || {
+                    if scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        chmod(&file, 0o000);
+                    }
+                })
+            }));
+            let staged = auth.join("a.json.tmp");
+            std::fs::write(&staged, &replacement).unwrap();
+            std::fs::rename(&staged, &file).unwrap();
+            let scanned = || scans.load(std::sync::atomic::Ordering::SeqCst);
+            wait_until(&format!("{case}: the reload ran"), || scanned() >= 1).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                store.get("a.json").map(|c| c.revision),
+                Some(before),
+                "{case}: A is kept while the file cannot be read"
+            );
+            if i == 0 {
+                // A lasting denial: retries look, but do not reload, every PENDING_RETRY.
+                tokio::time::sleep(PENDING_RETRY + Duration::from_millis(700)).await;
+                assert_eq!(scanned(), 1, "{case}: no reload while the file stays unreadable");
+                assert_eq!(store.get("a.json").map(|c| c.revision), Some(before), "{case}");
+            }
+            chmod(&file, 0o600);
+            match want {
+                Some(want) => wait_until(&format!("{case}: B applied"), || email().as_deref() == Some(want)).await,
+                None => {
+                    wait_until(&format!("{case}: the credential removed"), || {
+                        store.get("a.json").is_none()
+                    })
+                    .await
+                }
+            }
+            watcher.abort();
+            let _ = watcher.await;
+            BEFORE_SCAN.lock().unwrap().retain(|(d, _)| *d != auth);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Finding 1 step by step, as the watcher loop drives it: the failed read leaves A
+    /// loaded (revision, no removal), the file pending and the applied snapshot equal to
+    /// the observation, so a lasting denial is no change; once readable, `ready` says so
+    /// and the same observation applies B.
+    #[tokio::test]
+    async fn a_failed_read_is_pending_until_the_file_can_be_read() {
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let file = auth.join("a.json");
+        let account = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
+        std::fs::write(&file, account("old@example.invalid")).unwrap();
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        let (_, pending) = step_pending(&state, &mut cache, false, &observed);
+        assert!(pending.is_empty());
+        let store = state.rt.store();
+        let before = store.get("a.json").unwrap().revision;
+        std::fs::write(&file, account("new@example.invalid")).unwrap();
+        let observed = observe(&state, &mut cache); // Reads B.
+        chmod(&file, 0o000); // Before the reload's read.
+        if !denied(&file) {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let (applied, pending) = step_pending(&state, &mut cache, false, &observed);
+        assert_eq!(store.get("a.json").map(|c| c.revision), Some(before), "A kept");
+        assert_eq!(pending.files.iter().collect::<Vec<_>>(), [&file]);
+        assert!(observe(&state, &mut cache) == applied, "a lasting denial is no change");
+        assert!(!pending.ready(), "nothing to retry while unreadable");
+        chmod(&file, 0o600);
+        let observed = observe(&state, &mut cache);
+        assert!(observed == applied, "B was recorded as observed");
+        assert!(pending.ready(), "readable again: retry");
+        let (_, pending) = step_pending(&state, &mut cache, false, &observed);
+        assert_eq!(store.get("a.json").unwrap().str("email"), Some("new@example.invalid"));
+        assert!(pending.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Finding 1 with a refresh: a token refresh committed while the file is pending
+    /// (it writes a readable file in place) is what the retry finds and keeps; it is not
+    /// undone by an older copy, and nothing stays pending.
+    #[tokio::test]
+    async fn a_refresh_committed_while_a_read_is_pending_is_kept() {
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let file = auth.join("a.json");
+        std::fs::write(&file, r#"{"type":"codex","access_token":"old-fake"}"#).unwrap();
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        step(&state, &mut cache, false, &observed);
+        std::fs::write(&file, r#"{"type":"codex","access_token":"edited-fake"}"#).unwrap();
+        let observed = observe(&state, &mut cache);
+        chmod(&file, 0o000);
+        if !denied(&file) {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let (_, pending) = step_pending(&state, &mut cache, false, &observed);
+        assert!(!pending.is_empty());
+        let store = state.rt.store();
+        let revision = store.get("a.json").unwrap().revision;
+        let mut patch = cpa_core::credential::MetadataPatch::default();
+        patch.set.insert("access_token".into(), "refreshed-fake".into());
+        let refreshed = store.apply_patch("a.json", revision, &patch).unwrap().revision;
+        assert!(pending.ready(), "the refresh wrote a readable file");
+        let observed = observe(&state, &mut cache);
+        let (_, pending) = step_pending(&state, &mut cache, false, &observed);
+        let now = store.get("a.json").unwrap();
+        assert_eq!(
+            (now.metadata["access_token"].as_str(), now.revision),
+            (Some("refreshed-fake"), refreshed)
+        );
+        assert!(pending.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sol review of 6785ebb8, finding 2: a listing that fails after reaching some files
+    /// settles those files by what was found; only the files it never reached are
+    /// unknown. A file read and refused (a removed provider) drops its credential, as do
+    /// a file found gone and a link to `/dev/null`, though the folder-wide rule would
+    /// have kept them; a file not reached keeps its credential and revision. The watcher
+    /// restores from its cache only the files the listing did not reach. A complete
+    /// listing afterwards, with no byte changed, changes nothing more.
+    #[tokio::test]
+    async fn a_partial_listing_settles_the_files_it_reached() {
+        let (state, dir, auth) = state_with_auth_folder(false);
+        let account = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
+        for name in ["a", "gone", "null", "kept"] {
+            std::fs::write(
+                auth.join(format!("{name}.json")),
+                account(&format!("{name}@example.invalid")),
+            )
+            .unwrap();
+        }
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        step(&state, &mut cache, false, &observed);
+        let store = state.rt.store();
+        let kept = store.get("kept.json").unwrap().revision;
+        std::fs::write(auth.join("a.json"), r#"{"type":"gemini","email":"a@example.invalid"}"#).unwrap();
+        std::fs::remove_file(auth.join("gone.json")).unwrap();
+        std::fs::remove_file(auth.join("null.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", auth.join("null.json")).unwrap();
+        let partial = || credentials::Listing {
+            dir: auth.clone(),
+            paths: ["a", "gone", "null"].map(|n| auth.join(format!("{n}.json"))).to_vec(),
+            failure: Some(std::io::Error::from_raw_os_error(libc::EIO)),
+        };
+        let observed = observe_listing(&state, &mut cache, partial());
+        assert_eq!(
+            observed
+                .auth
+                .keys()
+                .map(|p| p.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a.json", "kept.json"],
+            "only the file not reached is restored from the cache"
+        );
+        let config = (*state.rt.config()).clone();
+        let scan = credentials::scan_listing(&config, partial());
+        assert_eq!(scan.unlisted.as_deref(), Some(auth.as_path()));
+        state.publish(config, Some(scan));
+        let ids = || {
+            let mut ids: Vec<(String, u64)> = store
+                .snapshot()
+                .iter()
+                .filter(|c| matches!(c.source, Source::File(_)))
+                .map(|c| (c.id.clone(), c.revision))
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(), [("kept.json".to_owned(), kept)]);
+        reload(&state).unwrap(); // Complete listing, nothing written.
+        assert_eq!(ids(), [("kept.json".to_owned(), kept)]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

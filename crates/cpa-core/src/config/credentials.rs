@@ -1106,8 +1106,12 @@ pub struct AuthScan {
     /// They are present but unknown; a caller keeps their last good credentials.
     pub unreadable: HashSet<PathBuf>,
     /// The folder, when it exists but could not be listed in full (Go v8.0.67 57a12996):
-    /// every file in it that this read did not settle is unknown, not removed.
+    /// every file in it that this read did not list is unknown, not removed.
     pub unlisted: Option<PathBuf>,
+    /// Every auth file this read listed. With `unlisted`, a listed file is settled by
+    /// what this read found (a credential, nothing, or incomplete or unreadable), never
+    /// by the folder-wide rule: only the files the listing never reached are unknown.
+    pub listed: HashSet<PathBuf>,
     /// The SHA-256 of every file read, so the watcher records what it applied rather than
     /// what it observed before a later write.
     pub read: BTreeMap<PathBuf, [u8; 32]>,
@@ -1120,19 +1124,24 @@ impl AuthScan {
         for path in self.incomplete.iter().chain(&self.unreadable) {
             unsettled.insert(path);
         }
-        unsettled.dir = self.unlisted.as_deref().map(absolute);
+        if let Some(dir) = &self.unlisted {
+            unsettled.dir = Some(absolute(dir));
+            unsettled.listed = self.listed.iter().map(|p| absolute(p)).collect();
+        }
         unsettled
     }
 }
 
 /// Auth files a scan found but could not learn the current state of: incomplete,
-/// unreadable, or in a folder it could not list. Their loaded credentials are neither
-/// replaced nor removed. Paths compare absolute, so a scan of a relative `auth-dir`
-/// matches an upload's absolute path.
+/// unreadable, or in a folder it could not list and not reached by its listing. Their
+/// loaded credentials are neither replaced nor removed. Paths compare absolute, so a
+/// scan of a relative `auth-dir` matches an upload's absolute path.
 #[derive(Debug, Default, Clone)]
 pub struct Unsettled {
     files: HashSet<PathBuf>,
     dir: Option<PathBuf>,
+    /// The files of `dir` the listing reached: settled by their own read.
+    listed: HashSet<PathBuf>,
 }
 
 impl Unsettled {
@@ -1142,8 +1151,56 @@ impl Unsettled {
 
     pub fn contains(&self, path: &Path) -> bool {
         let path = absolute(path);
-        self.files.contains(&path) || self.dir.as_deref().is_some_and(|dir| path.parent() == Some(dir))
+        self.files.contains(&path)
+            || (self.dir.as_deref().is_some_and(|dir| path.parent() == Some(dir)) && !self.listed.contains(&path))
     }
+}
+
+/// One listing of the auth folder: its top-level `*.json` entries (case-insensitive
+/// extension, as Go scans), in listing order.
+pub struct Listing {
+    pub dir: PathBuf,
+    pub paths: Vec<PathBuf>,
+    /// Why the folder could not be listed in full, when it exists: `paths` then holds
+    /// only the entries reached before the failure. A missing folder is a complete,
+    /// empty listing.
+    pub failure: Option<std::io::Error>,
+}
+
+impl Listing {
+    pub fn complete(&self) -> bool {
+        self.failure.is_none()
+    }
+}
+
+/// Lists `dir` once, the way the scan and the auth-folder watcher both read it.
+pub fn list_auth_dir(dir: &Path) -> Listing {
+    let mut listing = Listing {
+        dir: dir.to_owned(),
+        paths: Vec::new(),
+        failure: None,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return listing,
+        Err(e) => {
+            listing.failure = Some(e);
+            return listing;
+        }
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name().to_string_lossy().go_lower().ends_with(".json") => {
+                listing.paths.push(entry.path());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                listing.failure = Some(e);
+                break;
+            }
+        }
+    }
+    listing
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -1197,33 +1254,18 @@ pub fn read_auth_file(path: &Path) -> AuthFile {
 /// list the folder, and the hashes of what it read. A file that is gone or is not a
 /// regular file is skipped, as in Go's full scan.
 pub fn scan_auth_dir(cfg: &Config) -> AuthScan {
+    scan_listing(cfg, list_auth_dir(&cfg.auth_dir))
+}
+
+/// [`scan_auth_dir`] over a listing already taken of `cfg.auth_dir`.
+pub fn scan_listing(cfg: &Config, listing: Listing) -> AuthScan {
     let mut scan = AuthScan::default();
-    let entries = match std::fs::read_dir(&cfg.auth_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot read auth dir; keeping its loaded credentials");
-                scan.unlisted = Some(cfg.auth_dir.clone());
-            }
-            return scan;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            // ponytail: a listing that fails partway keeps every file of the folder this
-            // scan did not rebuild, ones it found gone included, until the next complete
-            // listing; recording the settled paths would drop those at once.
-            Err(e) => {
-                tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot list auth dir; keeping its loaded credentials");
-                scan.unlisted = Some(cfg.auth_dir.clone());
-                break;
-            }
-        };
-        let path: PathBuf = entry.path();
-        if !entry.file_name().to_string_lossy().go_lower().ends_with(".json") {
-            continue;
-        }
+    if let Some(e) = &listing.failure {
+        tracing::warn!(dir = %cfg.auth_dir.display(), error = %e, "cannot list auth dir; keeping the credentials of the files not listed");
+        scan.unlisted = Some(cfg.auth_dir.clone());
+    }
+    for path in listing.paths {
+        scan.listed.insert(path.clone());
         let data = match read_auth_file(&path) {
             AuthFile::Bytes(data) => data,
             AuthFile::Absent => continue,
@@ -1662,6 +1704,56 @@ mod tests {
             !unsettled.contains(&dir.join("a.json")),
             "only the unlisted folder's files"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Sol review of 6785ebb8, finding 2: when the listing fails partway, the files it
+    /// reached are settled by their own read (a credential, refused, gone, not a regular
+    /// file, incomplete or unreadable); only the files it never reached are unknown.
+    #[test]
+    fn a_partial_listing_settles_the_files_it_reached() {
+        let dir = std::env::temp_dir().join(format!("cpa-scan-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::parse("").unwrap();
+        cfg.auth_dir = dir.clone();
+        std::fs::write(dir.join("good.json"), r#"{"type":"codex"}"#).unwrap();
+        std::fs::write(dir.join("removed.json"), r#"{"type":"gemini"}"#).unwrap();
+        std::fs::write(dir.join("empty.json"), r#"{}"#).unwrap();
+        std::fs::write(dir.join("partial.json"), r#"{"type":"#).unwrap();
+        std::os::unix::fs::symlink(dir.join("loop.json"), dir.join("loop.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", dir.join("null.json")).unwrap();
+        std::fs::write(dir.join("unreached.json"), r#"{"type":"codex"}"#).unwrap();
+        let reached = ["good", "removed", "empty", "partial", "loop", "null", "gone"];
+        let listing = Listing {
+            dir: dir.clone(),
+            paths: reached.map(|n| dir.join(format!("{n}.json"))).to_vec(),
+            failure: Some(std::io::Error::other("injected listing failure")),
+        };
+        assert!(!listing.complete());
+        let scan = scan_listing(&cfg, listing);
+        assert_eq!(scan.unlisted.as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            scan.credentials.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["good.json"]
+        );
+        let unsettled = scan.unsettled();
+        for (name, kept) in [
+            ("good", false),
+            ("removed", false),
+            ("empty", false),
+            ("null", false),
+            ("gone", false),
+            ("partial", true),
+            ("loop", true),
+            ("unreached", true),
+        ] {
+            assert_eq!(unsettled.contains(&dir.join(format!("{name}.json"))), kept, "{name}");
+        }
+        // The same files, listed in full: only the per-file rules remain.
+        let complete = scan_auth_dir(&cfg).unsettled();
+        assert!(!complete.contains(&dir.join("unreached.json")));
+        assert!(complete.contains(&dir.join("loop.json")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
