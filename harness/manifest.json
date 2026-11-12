@@ -538,19 +538,19 @@
             "generated": [
               {
                 "pointer": "/id",
-                "regex": "resp_ag_compact_[0-9]+"
+                "mask": "compact-response-id"
               },
               {
                 "pointer": "/created_at",
-                "regex": "[0-9]+"
+                "mask": "unix-seconds"
               },
               {
                 "pointer": "/output/0/id",
-                "regex": "cmp_ag_compact_[0-9]+"
+                "mask": "compact-item-id"
               },
               {
                 "pointer": "/output/0/encrypted_content",
-                "regex": "cpa-ag-compact-v1:[A-Za-z0-9_-]+"
+                "mask": "compact-capsule"
               }
             ]
           }
@@ -1048,7 +1048,10 @@
   },
   "skips": [],
   "invariants": {
-    "about": "Checked on every case and target, whatever divergence applies. Credential ownership and isolation and capture consistency apply to both sides; these native-byte rules apply to cliproxy-rs.",
+    "about": "Checked on every case and target, whatever divergence applies. Credential ownership and isolation, capture consistency and upstream write completion apply to both sides; the native-byte rules apply to cliproxy-rs. Every captured upstream request must finish writing its scripted reply (`write_result` complete) except in `upstream_write_failures`, whose client abandons the stream; there each side's write must still be a recorded collector outcome, and Go and Rust must agree.",
+    "upstream_write_failures": [
+      "client-disconnect"
+    ],
     "native_passthrough": [
       "count-tokens"
     ],
@@ -1079,7 +1082,7 @@
     }
   ],
   "masks": {
-    "about": "The only values a golden template may leave open. Each mask is narrow: `pattern` is what the value must match; `record` finds it in a capture when a golden is recorded.",
+    "about": "The only values a golden template or a generated JSON value may leave open. Each mask is narrow: `pattern` is what the value's text must match; `json_type` is the exact JSON type a generated value must have before it is masked; `decode` names a structural check (harness/golden.py); `record` finds it in a capture when a golden is recorded.",
     "request-id": {
       "pattern": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
       "headers": [
@@ -1096,19 +1099,24 @@
     },
     "compact-response-id": {
       "pattern": "resp_ag_compact_[0-9]{19}",
-      "record": "resp_ag_compact_[0-9]{19}"
+      "record": "resp_ag_compact_[0-9]{19}",
+      "json_type": "string"
     },
     "compact-item-id": {
       "pattern": "cmp_ag_compact_[0-9]{19}",
-      "record": "cmp_ag_compact_[0-9]{19}"
+      "record": "cmp_ag_compact_[0-9]{19}",
+      "json_type": "string"
     },
     "compact-capsule": {
       "pattern": "cpa-ag-compact-v1:[A-Za-z0-9_-]{40,400}",
-      "record": "cpa-ag-compact-v1:[A-Za-z0-9_-]{40,400}"
+      "record": "cpa-ag-compact-v1:[A-Za-z0-9_-]{40,400}",
+      "json_type": "string",
+      "decode": "compaction-capsule"
     },
     "unix-seconds": {
       "pattern": "[0-9]{10}",
-      "record": "(?<=\"created_at\":)[0-9]{10}"
+      "record": "(?<=\"created_at\":)[0-9]{10}",
+      "json_type": "integer"
     }
   }
 }

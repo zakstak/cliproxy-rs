@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 import acceptance
+import golden
 import judge
 import manifest as revisions
 import provenance
@@ -379,6 +380,36 @@ SOURCE = {"head": "a" * 40, "tree": "b" * 40, "clean": True, "status": [],
           "manifest_sha256": provenance.sha256(ROOT / "harness/manifest.json")}
 
 
+EXTRA_LISTED = "other_module::unlisted_test"
+
+
+def execution_record(package, target, index):
+    """A clean execution record for one manifest test target, as run_cargo writes it. Its
+    executable's bytes are `binary(index)`; receipts() writes them under the artifact root."""
+    requested = sorted({t["name"] for g in PINS["groups"] for t in g["tests"]
+                        if (t["package"], t["target"]) == (package, target)})
+    owned = {(o["package"], o["target"]) for o in PINS["owned_test_targets"]}
+    listed = sorted(requested + ([] if (package, target) in owned else [EXTRA_LISTED]))
+    artifact = acceptance.expected_artifact(package, target)
+    executable = f"target/debug/deps/{artifact['name'].replace('-', '_')}-{index:016x}"
+    artifact = dict(artifact, executable=executable, sha256=provenance.hashlib.sha256(binary(index)).hexdigest())
+    return {"package": package, "target": target, "artifact": artifact, "fresh_before": False,
+            "artifact_after": dict(artifact), "fresh_after": True, "requested": requested,
+            "listing": {"command": [executable, "--list"], "cwd": f"crates/{package}", "exit": 0, "timeout": False,
+                        "names": listed},
+            "execution": {"command": [executable, "--exact", *requested], "cwd": f"crates/{package}",
+                          "isolation": "ui/scripts/isolated.sh", "exit": 0, "timeout": False},
+            "results": [{"name": n, "outcome": "ok"} for n in reversed(requested)],
+            "summary": {"result": "ok", "passed": len(requested), "failed": 0, "ignored": 0, "measured": 0,
+                        "filtered_out": len(listed) - len(requested)},
+            "summary_lines": 1, "status": "pass", "problems": [], "missing": [], "failed": [], "ignored": [],
+            "not_run": [], "output_tail": ""}
+
+
+def binary(index):
+    return f"test executable {index}\n".encode()
+
+
 def complete_receipts():
     """A complete, consistent receipt set, as harness/accept writes one."""
     def go(target):
@@ -416,10 +447,7 @@ def complete_receipts():
         groups.append({"id": group["id"], "provider": group["provider"], "tests": tests, "passed": len(tests), "failed": 0})
         for t in group["tests"]:
             targets[(t["package"], t["target"])] = True
-    executions = [{"package": p, "target": t, "status": "pass", "exit": 0, "listed": 0, "problems": [], "missing": [],
-                   "failed": [], "ignored": [], "not_run": [], "executable": f"target/debug/deps/{p}-{i}",
-                   "sha256": "3" * 64, "sha256_after": "3" * 64, "fresh_before": True, "fresh_after": True}
-                  for i, (p, t) in enumerate(targets)]
+    executions = [execution_record(p, t, i) for i, (p, t) in enumerate(targets)]
     total = sum(len(g["tests"]) for g in PINS["groups"])
     items.append({"kind": "cargo-groups", "verdict": "pass", "partial": False, "source": dict(SOURCE),
                   "source_after": dict(SOURCE), "provenance_verified": True, "rust_revision": SOURCE["head"],
@@ -429,7 +457,12 @@ def complete_receipts():
 
 
 def receipts(tmp, edit=None):
+    """Receipt files under tmp, and each cargo executable (before any edit) under tmp/artifacts."""
     items = complete_receipts()
+    for i, execution in enumerate(items[4]["executions"]):
+        path = Path(tmp) / "artifacts" / execution["artifact"]["executable"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(binary(i))
     if edit:
         edit(items)
     paths = []
@@ -447,7 +480,7 @@ def _swap_case(r):
 class CombineTests(unittest.TestCase):
     def verdict(self, edit=None):
         with tempfile.TemporaryDirectory() as tmp:
-            return acceptance.combine(receipts(tmp, edit), PINS, current_source=SOURCE)
+            return acceptance.combine(receipts(tmp, edit), PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts")
 
     def test_complete_consistent_receipts_pass(self):
         self.assertEqual(self.verdict()["verdict"], "pass", self.verdict()["problems"])
@@ -486,8 +519,8 @@ class CombineTests(unittest.TestCase):
             "unknown control, same count": lambda r: r[1]["controls"][0].update(mutation="unrecognised"),
             "uncaught control, same count": lambda r: r[3]["controls"][2].update(caught=False),
             "no cargo binary provenance": lambda r: r[4].update(executions=[]),
-            "failed execution, same count": lambda r: r[4]["executions"][0].update(exit=42, status="fail", problems=["exit 42"]),
-            "binary changed after the run": lambda r: r[4]["executions"][1].update(sha256_after="4" * 64),
+            "failed execution, same count": lambda r: r[4]["executions"][0]["execution"].update(exit=42),
+            "binary changed after the run": lambda r: r[4]["executions"][1]["artifact_after"].update(sha256="4" * 64),
             "missing driver provenance": lambda r: [x["provenance"].pop("driver") for x in r[0:3:2]],
             "driver hash differs after the run": lambda r: r[2]["provenance"]["after"]["driver"].update(sha256="0" * 64),
             "Go binary missing after the run": lambda r: r[0]["provenance"]["after"].update(go=None),
@@ -510,7 +543,8 @@ class CombineTests(unittest.TestCase):
 
     def test_the_tested_source_must_be_current(self):
         with tempfile.TemporaryDirectory() as tmp:
-            receipt = acceptance.combine(receipts(tmp), PINS, current_source=SOURCE | {"head": "d" * 40})
+            receipt = acceptance.combine(receipts(tmp), PINS, current_source=SOURCE | {"head": "d" * 40},
+                                         artifact_root=Path(tmp) / "artifacts")
         self.assertEqual(receipt["verdict"], "fail")
 
 
@@ -605,6 +639,279 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.status({"exit": 0, "stdout": OK.replace("a ... ok", "a ... ignored"), "timeout": False}), "fail")
         self.assertEqual(self.status({"exit": 0, "stdout": OK, "timeout": False},
                                      {"exit": 0, "names": set(), "timeout": False}), "fail")
+
+
+# --- review of 60928bbf -------------------------------------------------------------------
+
+class CargoBindingTests(unittest.TestCase):
+    """Finding 1: an execution record must be bound to its target's cargo artifact and carry
+    the complete listing, every result line and the summary combine re-derives it from."""
+
+    def verdict(self, edit):
+        return CombineTests.verdict(self, edit)
+
+    def test_target_binding_and_result_records_are_required(self):
+        def other_target(r):
+            first, second = r[4]["executions"][0], r[4]["executions"][1]
+            r[4]["executions"][0] = dict(copy.deepcopy(second), package=first["package"], target=first["target"])
+
+        def each(*keys):
+            return lambda r: [e.pop(k) for e in r[4]["executions"] for k in keys]
+
+        def first(edit):
+            return lambda r: edit(r[4]["executions"][0])
+
+        def owned(edit):
+            def apply(r):
+                keys = {(o["package"], o["target"]) for o in PINS["owned_test_targets"]}
+                edit(next(e for e in r[4]["executions"] if (e["package"], e["target"]) in keys))
+            return apply
+        holes = {
+            "another target's executable, same hash": lambda r: r[4]["executions"][0]["artifact"].update(
+                executable=r[4]["executions"][1]["artifact"]["executable"]),
+            "another target's whole execution under these labels": other_target,
+            "result detail fields removed everywhere": each("missing", "failed", "ignored", "not_run"),
+            "nonexistent executable path": first(lambda e: [a.update(executable="target/does-not-exist")
+                                                            for a in (e["artifact"], e["artifact_after"])]),
+            "well-named executable not on disk": first(lambda e: [
+                a.update(executable=a["executable"][:-16] + "f" * 16) for a in (e["artifact"], e["artifact_after"])]),
+            "executable bytes differ from the recorded hash": first(lambda e: [
+                a.update(sha256="5" * 64) for a in (e["artifact"], e["artifact_after"])]),
+            "artifact package differs": first(lambda e: e["artifact"].update(package="cpa-exec")),
+            "artifact source file differs": first(lambda e: e["artifact"].update(src_path="crates/x/src/lib.rs")),
+            "not a test-profile build": first(lambda e: e["artifact"].update(profile_test=False)),
+            "artifact identity missing": first(lambda e: e.pop("artifact")),
+            "artifact after the run missing": first(lambda e: e.update(artifact_after=None)),
+            "not fresh after the run": first(lambda e: e.update(fresh_after=False)),
+            "requested names missing": first(lambda e: e.update(requested=[])),
+            "requested names changed": first(lambda e: e.update(requested=e["requested"][:-1])),
+            "listing removed": first(lambda e: e.pop("listing")),
+            "listing names removed": first(lambda e: e["listing"].update(names=[])),
+            "listing of another executable": first(lambda e: e["listing"].update(command=["target/x", "--list"])),
+            "listing exit is a boolean": first(lambda e: e["listing"].update(exit=False)),
+            "run of other names": first(lambda e: e["execution"].update(command=e["execution"]["command"][:2])),
+            "run without --exact": first(lambda e: e["execution"]["command"].__setitem__(1, "--include-ignored")),
+            "run exit missing": first(lambda e: e["execution"].pop("exit")),
+            "run timed out": first(lambda e: e["execution"].update(timeout=True)),
+            "result lines removed": first(lambda e: e.update(results=[])),
+            "one result line missing": first(lambda e: e["results"].pop()),
+            "a result line duplicated": first(lambda e: e["results"].append(dict(e["results"][0]))),
+            "a result line ignored": first(lambda e: e["results"][0].update(outcome="ignored")),
+            "an extra result line": first(lambda e: e["results"].append({"name": "extra", "outcome": "ok"})),
+            "summary removed": first(lambda e: e.update(summary=None)),
+            "summary count is a string": first(lambda e: e["summary"].update(passed=str(e["summary"]["passed"]))),
+            "summary filtered count disagrees with the listing": first(lambda e: e["summary"].update(filtered_out=99)),
+            "two summary lines": first(lambda e: e.update(summary_lines=2)),
+            "unlisted test claimed missing": first(lambda e: e.update(missing=["x"])),
+            "output tail on a pass": first(lambda e: e.update(output_tail="x")),
+            "unknown test on an owned target": owned(lambda e: [e["listing"].update(names=sorted(e["listing"]["names"] + ["zz_new"])),
+                                                                e["summary"].update(filtered_out=1)]),
+            "two targets share one executable": lambda r: [r[4]["executions"][1][k].update(
+                executable=r[4]["executions"][0]["artifact"]["executable"], sha256=r[4]["executions"][0]["artifact"]["sha256"])
+                for k in ("artifact", "artifact_after")],
+            "missing rust_revision": lambda r: r[1].pop("rust_revision"),
+        }
+        self.assertEqual(self.verdict(None)["verdict"], "pass")
+        for label, edit in holes.items():
+            with self.subTest(label):
+                self.assertEqual(self.verdict(edit)["verdict"], "fail", label)
+
+    def test_a_test_label_cannot_pass_without_its_execution(self):
+        def edit(r):
+            first = r[4]["executions"][0]
+            first["results"][0]["outcome"] = "FAILED"
+            first["failed"] = [first["results"][0]["name"]]
+        result = self.verdict(edit)
+        self.assertEqual(result["verdict"], "fail")
+        self.assertTrue(any("not every test passed in a verified execution" in p for p in result["problems"]))
+
+    def test_libtest_records_are_parsed_individually(self):
+        output = OK.replace("test a ... ok\n", "test a ... ok\ntest b ... FAILED\ntest a ... ok\n")
+        self.assertEqual(acceptance.parse_results(output), [{"name": "a", "outcome": "ok"}, {"name": "b", "outcome": "FAILED"},
+                                                             {"name": "a", "outcome": "ok"}])
+        self.assertEqual(acceptance.parse_summary(OK), ({"result": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0,
+                                                         "filtered_out": 0}, 1))
+        self.assertEqual(acceptance.parse_summary(OK + OK.splitlines()[-1] + "\n"), (None, 2))
+        self.assertEqual(acceptance.parse_summary("running 1 test\n"), (None, 0))
+
+
+CAPSULE = "cpa-ag-compact-v1:" + "A" * 60
+
+
+def compaction(created_at=1794463196, capsule=CAPSULE, response_id="resp_ag_compact_" + "1" * 19,
+               item_id="cmp_ag_compact_" + "2" * 19, tokens="13"):
+    body = ('{"object":"response.compaction","status":"completed","id":%s,"created_at":%s,"output":[{"type":"compaction",'
+            '"id":%s,"encrypted_content":%s}],"usage":{"input_tokens":%s}}' % (
+                json.dumps(response_id), json.dumps(created_at), json.dumps(item_id), json.dumps(capsule), tokens))
+    return observation(requests=[request()], replies=[reply(body.encode())])
+
+
+class GeneratedValueTests(unittest.TestCase):
+    """Finding 2: generated values have an exact JSON type and the shared narrow mask format,
+    checked on each side before masking; capsules must decode to a nonce and a tag."""
+
+    def run_case(self, go, rust):
+        return verdict("compact-claude", go, rust, pins_with(["compaction-capsule-generated"]), "selective")["verdict"]
+
+    def test_typed_formats_on_either_side(self):
+        self.assertEqual(self.run_case(compaction(), compaction(1794463197, "cpa-ag-compact-v1:" + "B" * 60)), "pass")
+        bad = {
+            "created_at digit string": {"created_at": "1794463196"},
+            "created_at boolean": {"created_at": True},
+            "created_at float": {"created_at": 1794463196.0},
+            "created_at null": {"created_at": None},
+            "created_at list": {"created_at": [1794463196]},
+            "created_at dict": {"created_at": {"s": 1794463196}},
+            "created_at nine digits": {"created_at": 179446319},
+            "created_at negative": {"created_at": -1794463196},
+            "response id integer": {"response_id": 1},
+            "response id short": {"response_id": "resp_ag_compact_1"},
+            "item id wrong prefix": {"item_id": "cmp_ag_other_" + "2" * 19},
+            "capsule A": {"capsule": "cpa-ag-compact-v1:A"},
+            "capsule 41 characters": {"capsule": "cpa-ag-compact-v1:" + "A" * 41},
+            "capsule non-canonical trailing bits": {"capsule": "cpa-ag-compact-v1:" + "A" * 41 + "B"},
+            "capsule padded": {"capsule": "cpa-ag-compact-v1:" + "A" * 58 + "=="},
+            "capsule standard alphabet": {"capsule": "cpa-ag-compact-v1:" + "A" * 58 + "+/"},
+            "capsule wrong prefix": {"capsule": "cpa-ag-compact-v2:" + "A" * 60},
+            "capsule empty": {"capsule": ""},
+            "capsule integer": {"capsule": 1},
+        }
+        for label, change in bad.items():
+            for side in ("go", "rust"):
+                with self.subTest(label, side=side):
+                    go, rust = compaction(), compaction()
+                    if side == "go":
+                        go = compaction(**change)
+                    else:
+                        rust = compaction(**change)
+                    self.assertEqual(self.run_case(go, rust), "fail")
+
+    def test_capsule_structure_minimum(self):
+        spec = golden.masks(PINS)["compact-capsule"]
+        enough = "cpa-ag-compact-v1:" + golden.base64.urlsafe_b64encode(bytes(30)).decode().rstrip("=")
+        short = "cpa-ag-compact-v1:" + golden.base64.urlsafe_b64encode(bytes(27)).decode().rstrip("=")
+        self.assertIsNone(golden.json_problem(spec, enough))
+        self.assertIsNotNone(golden.text_problem(dict(spec, pattern="cpa-ag-compact-v1:[A-Za-z0-9_-]+"), short))
+        self.assertIsNotNone(golden.json_problem(golden.masks(PINS)["unix-seconds"], True))
+
+    def test_golden_masks_share_the_capsule_check(self):
+        pins = pins_with(["claude-responses-compact"])
+        go = from_golden("harness/expectations/compact-claude.v8.0.10.json")
+        self.assertEqual(verdict("compact-claude", go, from_golden("harness/expectations/compact-claude.v8.0.35.json"),
+                                 pins)["verdict"], "pass")
+        saved = FILL["compact-capsule"]
+        try:
+            FILL["compact-capsule"] = "cpa-ag-compact-v1:" + "A" * 41
+            rust = from_golden("harness/expectations/compact-claude.v8.0.35.json")
+        finally:
+            FILL["compact-capsule"] = saved
+        self.assertEqual(verdict("compact-claude", go, rust, pins)["verdict"], "fail")
+
+    def test_manifest_refuses_untyped_or_parallel_formats(self):
+        def generated(items):
+            pins = pins_with(["compaction-capsule-generated"])
+            pins["divergences"][0]["expect"][0]["downstream_json"]["generated"] = items
+            return pins
+        for items in ([{"pointer": "/id", "regex": "resp_ag_compact_[0-9]+"}],
+                      [{"pointer": "/id", "mask": "compact-response-id", "regex": "x"}],
+                      [{"pointer": "/id", "mask": "unknown"}], [{"pointer": "/id", "mask": "date"}],
+                      [{"pointer": "/id", "mask": "about"}]):
+            with self.subTest(items=items), self.assertRaises(revisions.ManifestError):
+                revisions.validate(generated(items))
+        for name, change in (("unix-seconds", {"json_type": "number"}), ("compact-capsule", {"decode": "other"}),
+                             ("cch", {"pattern": "([0-9a-f]{5})"})):
+            pins = pins_with()
+            pins["masks"][name] = dict(pins["masks"][name], **change)
+            with self.subTest(mask=name), self.assertRaises(revisions.ManifestError):
+                revisions.validate(pins)
+
+
+class StrictTypeTests(unittest.TestCase):
+    """Python equality treats 0 as false and 13 as 13.0; the type-exact raw difference then
+    looked explained. Every structured comparison is type-exact."""
+
+    def test_unreplaced_dimensions_compare_exact_json_types(self):
+        go = observation(credential={"type": "claude", "disabled": False})
+        for value in (0, 0.0, None, "false", [], {}):
+            with self.subTest(credential=value):
+                rust = observation(credential={"type": "claude", "disabled": value})
+                self.assertEqual(verdict("client-disconnect", go, rust, pins_with())["verdict"], "fail")
+        hello = {"client_hello_hex": "16", "record_layout": [[22, 769, 512]], "profile": {"ciphers": [1, 2]},
+                 "negotiated_alpn": "http/1.1", "negotiated_version": "TLSv1.3", "session_reused": False}
+        rust = observation(tls=[dict(hello, session_reused=0)])
+        self.assertEqual(verdict("buffered", observation(tls=[hello]), rust, pins_with())["verdict"], "fail")
+        self.assertEqual(GeneratedValueTests.run_case(self, compaction(), compaction(tokens="13.0")), "fail")
+
+
+class WriteResultTests(unittest.TestCase):
+    """Finding 4: upstream write results are part of every golden and a per-side invariant."""
+
+    def compaction_pair(self):
+        return (from_golden("harness/expectations/compact-claude.v8.0.10.json"),
+                from_golden("harness/expectations/compact-claude.v8.0.35.json"))
+
+    def test_replaced_comparisons_keep_write_results(self):
+        pins = pins_with(["claude-responses-compact"])
+        go, rust = self.compaction_pair()
+        self.assertEqual(verdict("compact-claude", go, rust, pins)["verdict"], "pass")
+        for value in ("BrokenPipeError", "ConnectionResetError", "pending", None):
+            with self.subTest(historical=value):
+                changed = copy.deepcopy(rust)
+                changed["upstream"]["http"][0]["write_result"] = value
+                self.assertEqual(verdict("compact-claude", go, changed, pins)["verdict"], "fail")
+        pins = pins_with(["C2-claude-native-detection"])
+        go, rust = native_pair()
+        for side in ("go", "rust"):
+            with self.subTest(c2=side):
+                pair = {"go": copy.deepcopy(go), "rust": copy.deepcopy(rust)}
+                pair[side]["upstream"]["http"][0]["write_result"] = "BrokenPipeError"
+                self.assertEqual(verdict("native-signals", pair["go"], pair["rust"], pins, "selective")["verdict"], "fail")
+
+    def test_golden_check_alone_covers_missing_extra_and_failed_writes(self):
+        data = json.loads((ROOT / "harness/expectations/compact-claude.v8.0.35.json").read_text())
+        _, rust = self.compaction_pair()
+        masks = golden.masks(PINS)
+        self.assertEqual(golden.check(data, {"upstream"}, rust, None, masks), [])
+        failed = copy.deepcopy(rust)
+        failed["upstream"]["http"][0]["write_result"] = "BrokenPipeError"
+        missing = copy.deepcopy(rust)
+        del missing["upstream"]["http"][0]["write_result"]
+        extra = copy.deepcopy(rust)
+        extra["upstream"]["http"].append(copy.deepcopy(extra["upstream"]["http"][0]))
+        unrecorded = copy.deepcopy(data)
+        del unrecorded["requests"][0]["write_result"]
+        for label, (want, have) in {"failed": (data, failed), "missing": (data, missing), "extra": (data, extra),
+                                    "golden without write result": (unrecorded, rust)}.items():
+            with self.subTest(label):
+                self.assertTrue(golden.check(want, {"upstream"}, have, None, masks))
+
+    def test_completion_is_a_per_side_invariant(self):
+        pins = pins_with()
+        for value in ("pending", "BrokenPipeError", None, 0):
+            with self.subTest(buffered=value):
+                go, rust = observation(), observation()
+                for side in (go, rust):
+                    if value is None:
+                        del side["upstream"]["http"][0]["write_result"]
+                    else:
+                        side["upstream"]["http"][0]["write_result"] = value
+                result = verdict("buffered", go, rust, pins)
+                self.assertEqual(result["verdict"], "fail")
+                self.assertIn("invariant:rust", result["failed"])
+        # The abandoned stream may fail its upstream write, identically on both sides.
+        broken = observation()
+        broken["upstream"]["http"][0]["write_result"] = "BrokenPipeError"
+        self.assertEqual(verdict("client-disconnect", broken, copy.deepcopy(broken), pins)["verdict"], "pass")
+        self.assertEqual(verdict("client-disconnect", broken, observation(), pins)["verdict"], "fail")
+        pending = observation()
+        pending["upstream"]["http"][0]["write_result"] = "pending"
+        self.assertEqual(verdict("client-disconnect", pending, copy.deepcopy(pending), pins)["verdict"], "fail")
+
+    def test_manifest_requires_recorded_write_results(self):
+        pins = pins_with()
+        del pins["invariants"]["upstream_write_failures"]
+        with self.assertRaises(revisions.ManifestError):
+            revisions.validate(pins)
 
 
 # --- evidence-only commits ---------------------------------------------------------------

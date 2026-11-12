@@ -106,7 +106,8 @@
           "504"
         ]
       ],
-      "body": "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":17,\"messages\":[{\"role\":\"user\",\"content\":\"Local question\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.b43; cc_entrypoint=cli; cch=ebf21;\"},{\"type\":\"text\",\"text\":\"Native caller system\"}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\\",\\\"account_uuid\\\":\\\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\\\",\\\"session_id\\\":\\\"11111111-2222-4333-8444-555555555555\\\"}\"},\"stream\":false}"
+      "body": "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":17,\"messages\":[{\"role\":\"user\",\"content\":\"Local question\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.280.b43; cc_entrypoint=cli; cch=ebf21;\"},{\"type\":\"text\",\"text\":\"Native caller system\"}],\"metadata\":{\"user_id\":\"{\\\"device_id\\\":\\\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\\",\\\"account_uuid\\\":\\\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\\\",\\\"session_id\\\":\\\"11111111-2222-4333-8444-555555555555\\\"}\"},\"stream\":false}",
+      "write_result": "complete"
     }
   ]
 }

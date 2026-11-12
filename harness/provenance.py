@@ -55,8 +55,17 @@ def package_name(package_id):
     return url.rstrip("/").rsplit("/", 1)[-1]
 
 
+def package_dir(package_id, root=ROOT):
+    """`path+file:///x/crates/cpa-server#0.4.1` -> `crates/cpa-server` (relative to root)."""
+    url = package_id.partition("#")[0]
+    if not url.startswith("path+file://"):
+        return None
+    return os.path.relpath(url[len("path+file://"):], root)
+
+
 def cargo_artifacts(args, root=ROOT, env=None):
-    """(exit code, [{package, kind, name, executable, fresh, sha256}]) for executables."""
+    """(exit code, [{package, package_dir, kind, kinds, crate_types, name, src_path, profile_test,
+    executable, fresh, sha256}]) for executables, as cargo's compiler-artifact messages name them."""
     command = ["cargo", *args, "--message-format=json"]
     done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
     artifacts = []
@@ -70,7 +79,11 @@ def cargo_artifacts(args, root=ROOT, env=None):
         target = message["target"]
         name = package_name(message["package_id"])
         executable = message["executable"]
-        artifacts.append({"package": name, "kind": target["kind"][0], "name": target["name"],
+        artifacts.append({"package": name, "package_dir": package_dir(message["package_id"], root),
+                          "kind": target["kind"][0], "kinds": list(target["kind"]),
+                          "crate_types": list(target.get("crate_types", [])), "name": target["name"],
+                          "src_path": os.path.relpath(target["src_path"], root),
+                          "profile_test": (message.get("profile") or {}).get("test"),
                           "executable": os.path.relpath(executable, root), "fresh": message.get("fresh"),
                           "sha256": sha256(executable)})
     return {"command": command, "exit": done.returncode, "stderr_tail": done.stderr[-2000:] if done.returncode else "",

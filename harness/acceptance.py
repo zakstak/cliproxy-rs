@@ -186,6 +186,23 @@ def parse_list(output):
     return {line[:-len(": test")] for line in output.splitlines() if line.endswith(": test")}
 
 
+def parse_results(output):
+    """Every individual libtest result line, in printed order: [{name, outcome}]."""
+    return [{"name": m.group(1), "outcome": m.group(2)} for line in output.splitlines()
+            if (m := re.match(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b", line))]
+
+
+def parse_summary(output):
+    """(the one complete libtest summary as a record or None, the number of summary lines)."""
+    lines = [line for line in output.splitlines() if line.startswith("test result:")]
+    found = [m.groups() for line in lines if (m := SUMMARY.fullmatch(line))]
+    if len(lines) != 1 or len(found) != 1:
+        return None, len(lines)
+    result, *numbers = found[0]
+    return dict(zip(("result", "passed", "failed", "ignored", "measured", "filtered_out"),
+                    [result, *map(int, numbers)])), 1
+
+
 def judge_execution(names, listing, execution):
     """Outcome of one test binary run. Never pass unless the process exited 0, printed
     exactly one summary line counting every requested test, and reported each one ok."""
@@ -244,6 +261,43 @@ def _artifact_for(build, package, target):
     return found[0] if len(found) == 1 else None
 
 
+IDENTITY = ("package", "package_dir", "kind", "kinds", "crate_types", "name", "src_path", "profile_test",
+            "executable", "sha256")
+
+
+def identity(artifact):
+    """The fields that identify a cargo test artifact; `fresh` is recorded separately."""
+    return None if artifact is None else {k: artifact.get(k) for k in IDENTITY}
+
+
+def expected_artifact(package, target):
+    """What cargo must report for a manifest test target in this workspace's layout: the
+    package and its directory, the target kind and name, its source file and a test-profile
+    build. The executable is that crate name plus cargo's 16-hex metadata hash."""
+    if target == "lib":
+        name, kind, crate_types, src = package.replace("-", "_"), "lib", ["lib"], f"crates/{package}/src/lib.rs"
+    else:
+        name = target.split(":", 1)[1]
+        kind, crate_types, src = "test", ["bin"], f"crates/{package}/tests/{name}.rs"
+    return {"package": package, "package_dir": f"crates/{package}", "kind": kind, "kinds": [kind],
+            "crate_types": crate_types, "name": name, "src_path": src, "profile_test": True}
+
+
+def artifact_problems(package, target, artifact):
+    """Why a recorded artifact identity is not the one cargo builds for this target."""
+    if not isinstance(artifact, dict) or set(artifact) != set(IDENTITY):
+        return [f"artifact identity needs exactly {list(IDENTITY)}"]
+    problems = [f"artifact {k} {artifact[k]!r} is not {v!r}" for k, v in expected_artifact(package, target).items()
+                if not judge.same(artifact[k], v)]
+    crate = re.escape(expected_artifact(package, target)["name"].replace("-", "_"))
+    if not isinstance(artifact["executable"], str) or not re.fullmatch(rf"target/debug/deps/{crate}-[0-9a-f]{{16}}",
+                                                                        artifact["executable"]):
+        problems.append(f"executable {artifact['executable']!r} is not this target's test binary")
+    if not _hash(artifact["sha256"]):
+        problems.append("artifact sha256 is not a SHA-256")
+    return problems
+
+
 def _run(command, cwd, env, timeout):
     try:
         done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -279,18 +333,34 @@ def run_cargo(pins):
             if artifact is None:
                 unavailable.append(f"{package} {target}: no single test executable")
                 continue
+            mismatch = artifact_problems(package, target, identity(artifact))
+            if mismatch:
+                unavailable.append(f"{package} {target}: {mismatch}")
+                continue
             executable = ROOT / artifact["executable"]
             package_dir = ROOT / "crates" / package
+            requested = sorted(set(names))
             listing = _run([str(executable), "--list"], package_dir, env, LIST_TIMEOUT)
             listing["names"] = parse_list(listing["stdout"])
             shell = "cd " + _quote(str(package_dir)) + " && exec " + " ".join(
-                _quote(p) for p in [str(executable), "--exact", *sorted(set(names))])
+                _quote(p) for p in [str(executable), "--exact", *requested])
             execution = _run([str(isolated), shell], ROOT, env, TEST_TIMEOUT)
             outcome = judge_execution(names, listing, execution)
-            outcome.update(executable=artifact["executable"], sha256=artifact["sha256"], fresh_before=artifact["fresh"],
-                           listed_names=sorted(listing["names"]), output_tail=(execution["stdout"] + execution["stderr"])[-3000:]
-                           if outcome["status"] != "pass" else "")
-            executions[(package, target)] = outcome
+            summary, summary_lines = parse_summary(execution.get("stdout", ""))
+            # The record keeps what combine re-derives the outcome from: the artifact cargo
+            # named, the exact commands, the complete listing, every result line and the summary.
+            executions[(package, target)] = {
+                "package": package, "target": target, "artifact": identity(artifact), "fresh_before": artifact["fresh"],
+                "requested": requested,
+                "listing": {"command": [artifact["executable"], "--list"], "cwd": f"crates/{package}",
+                            "exit": listing["exit"], "timeout": listing["timeout"], "names": sorted(listing["names"])},
+                "execution": {"command": [artifact["executable"], "--exact", *requested], "cwd": f"crates/{package}",
+                              "isolation": "ui/scripts/isolated.sh", "exit": execution["exit"],
+                              "timeout": execution["timeout"]},
+                "results": parse_results(execution.get("stdout", "")), "summary": summary,
+                "summary_lines": summary_lines,
+                **{k: outcome[k] for k in ("status", "problems", "missing", "failed", "ignored", "not_run") if k in outcome},
+                "output_tail": (execution["stdout"] + execution["stderr"])[-3000:] if outcome["status"] != "pass" else ""}
     after = {p: provenance.cargo_artifacts(_cargo_selection(p, [t for q, t in targets if q == p]), env=env)
              for p in packages}
     source_after = provenance.source_identity()
@@ -298,15 +368,15 @@ def run_cargo(pins):
         unavailable.append("Rust source or manifest changed during the run")
     for (package, target), outcome in executions.items():
         artifact = _artifact_for(after[package], package, target)
-        outcome.update(sha256_after=artifact and artifact["sha256"], fresh_after=artifact and artifact["fresh"])
-        if artifact is None or artifact["fresh"] is not True or artifact["sha256"] != outcome["sha256"]:
+        outcome.update(artifact_after=identity(artifact), fresh_after=artifact and artifact["fresh"])
+        if artifact is None or artifact["fresh"] is not True or identity(artifact) != outcome["artifact"]:
             unavailable.append(f"{package} {target}: tested binary is not cargo's fresh binary after the run")
     unknown = []
     for owned in pins.get("owned_test_targets", []):
         key = (owned["package"], owned["target"])
         if key in executions:
             known = {t["name"] for g in pins["groups"] for t in g["tests"] if (t["package"], t["target"]) == key}
-            unknown += [f"{key[0]} {key[1]} {n}" for n in sorted(set(executions[key]["listed_names"]) - known)]
+            unknown += [f"{key[0]} {key[1]} {n}" for n in sorted(set(executions[key]["listing"]["names"]) - known)]
     groups = []
     for group in pins["groups"]:
         tests = []
@@ -345,8 +415,7 @@ def run_cargo(pins):
                        "passed": sum(g["passed"] for g in groups), "failed": sum(g["failed"] for g in groups),
                        "unknown_tests": len(unknown)},
             "unavailable": unavailable, "unknown_tests": unknown, "groups": groups,
-            "executions": [{"package": p, "target": t, **{k: v for k, v in o.items() if k != "listed_names"}}
-                           for (p, t), o in sorted(executions.items())]}
+            "executions": [o for _, o in sorted(executions.items())]}
 
 
 def _quote(part):
@@ -411,6 +480,28 @@ def _replace_reply(old, new):
         reply["body_text"] = changed.decode("utf-8", errors="replace")
         raw = bytes.fromhex(reply["raw_response_hex"])
         reply["raw_response_hex"] = raw.replace(old.encode(), new.encode(), 1).hex()
+    return edit
+
+
+def _reply_regex(pattern, replacement):
+    """Edit the first reply body by regex and keep the capture consistent: body, body text,
+    raw response and its Content-Length all carry the edited bytes."""
+    def edit(observation):
+        reply = observation["downstream"][0]
+        body, count = re.subn(pattern.encode(), replacement.encode(), bytes.fromhex(reply["body_hex"]), count=1)
+        if count != 1:
+            raise AssertionError(f"mutation target {pattern!r} not in the reply")
+        reply["body_hex"], reply["body_text"] = body.hex(), body.decode("utf-8", errors="replace")
+        reply["headers"] = [[k, str(len(body)) if k.lower() == "content-length" else v] for k, v in reply["headers"]]
+        head = bytes.fromhex(reply["raw_response_hex"]).partition(b"\r\n\r\n")[0]
+        head = re.sub(rb"(?im)^(content-length:[ \t]*)[0-9]+", lambda m: m.group(1) + str(len(body)).encode(), head)
+        reply["raw_response_hex"] = (head + b"\r\n\r\n" + body).hex()
+    return edit
+
+
+def _write_result(value, provider=None):
+    def edit(observation):
+        _inference(observation, provider)[0]["write_result"] = value
     return edit
 
 
@@ -485,6 +576,22 @@ MUTATIONS = [
     ("historical", "compact-claude", "Go 501 body changed", _replace_reply("not supported", "unsupported"), "go"),
     ("selective", "native-signals", "C2 Go caller text changed", _replace_body("Local question", "Other question"), "go"),
     ("selective", "native-signals", "C2 Go header changed", _header("X-Stainless-Timeout", "601"), "go"),
+    # Review of 60928bbf: upstream write results, typed generated values and typed states.
+    ("*", "buffered", "upstream write never finished", _write_result("pending")),
+    ("historical", "compact-claude", "compaction upstream write failed", _write_result("BrokenPipeError")),
+    ("selective", "native-signals", "C2 Go upstream write failed", _write_result("BrokenPipeError"), "go"),
+    ("selective", "native-signals", "C2 Rust upstream write failed", _write_result("BrokenPipeError")),
+    ("selective", "compact-claude", "created_at integer -> digit string", _reply_regex(r'"created_at":([0-9]+)', r'"created_at":"\1"')),
+    ("selective", "compact-claude", "Go created_at integer -> digit string",
+     _reply_regex(r'"created_at":([0-9]+)', r'"created_at":"\1"'), "go"),
+    ("selective", "compact-claude", "capsule is not decodable base64",
+     _reply_regex(r"cpa-ag-compact-v1:[A-Za-z0-9_-]+", "cpa-ag-compact-v1:" + "A" * 41)),
+    ("selective", "compact-claude", "Go capsule shorter than a nonce and tag",
+     _reply_regex(r"cpa-ag-compact-v1:[A-Za-z0-9_-]+", "cpa-ag-compact-v1:A"), "go"),
+    ("selective", "compact-claude", "usage integer -> float", _reply_regex(r'"input_tokens":13\b', '"input_tokens":13.0')),
+    ("historical", "client-disconnect", "credential persisted disabled: 0", _credential("disabled", 0)),
+    ("selective", "client-disconnect", "credential persisted disabled: 0", _credential("disabled", 0)),
+    ("selective", "client-disconnect", "Go credential persisted disabled: 0", _credential("disabled", 0), "go"),
 ]
 
 
@@ -554,8 +661,8 @@ def _check_common(receipt, current, problems):
     elif source != current:
         problems.append(f"tested source {source.get('head')} is not the current source {current.get('head')} "
                         "(revision, tree, cleanliness or manifest differ)")
-    if receipt.get("rust_revision") is not None and receipt.get("rust_revision") != (source or {}).get("head"):
-        problems.append("rust_revision is not the recorded source revision")
+    if not isinstance(source, dict) or receipt.get("rust_revision") != source.get("head"):
+        problems.append("rust_revision is missing or not the recorded source revision")
 
 
 def _check_go(record, pin, label, problems):
@@ -660,53 +767,133 @@ def _check_mutation(receipt, pins, differential, problems):
         problems.append(f"counts {receipt.get('counts')} are not the recomputed {recomputed}")
 
 
-def _check_cargo(receipt, pins, current, problems):
-    groups = receipt.get("groups") if isinstance(receipt.get("groups"), list) else []
-    if [g.get("id") if isinstance(g, dict) else None for g in groups] != [g["id"] for g in pins["groups"]]:
-        problems.append("groups are not every manifest group once each in order")
-    total = 0
+EXECUTION_KEYS = {"package", "target", "artifact", "fresh_before", "artifact_after", "fresh_after", "requested",
+                  "listing", "execution", "results", "summary", "summary_lines", "status", "problems", "missing",
+                  "failed", "ignored", "not_run", "output_tail"}
+
+
+def _check_execution(execution, requested, owned, artifact_root):
+    """Problems with one test target's execution record, and the listed names outside the
+    manifest on an owned target. Everything is re-derived from the record's parts: the
+    artifact cargo named, the exact commands, the complete listing, each result line and
+    the summary. Labels and totals are only compared against what is derived."""
+    problems, unknown = [], []
+    if not isinstance(execution, dict) or set(execution) != EXECUTION_KEYS:
+        return [f"execution record needs exactly {sorted(EXECUTION_KEYS)}"], unknown
+    package, target = execution["package"], execution["target"]
+    artifact = execution["artifact"]
+    problems += artifact_problems(package, target, artifact)
+    if problems:
+        return problems, unknown
+    executable = artifact["executable"]
+    if not judge.same(execution["artifact_after"], artifact) or execution["fresh_after"] is not True \
+            or not isinstance(execution["fresh_before"], bool):
+        problems.append("the artifact after the run is not the same fresh test binary")
+    path = Path(artifact_root) / executable
+    if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
+        problems.append(f"{executable} is not on disk with the recorded SHA-256")
+    if execution["requested"] != requested:
+        problems.append(f"requested tests {execution['requested']} are not the manifest's {requested}")
+    listing, run = execution["listing"], execution["execution"]
+    cwd = f"crates/{package}"
+    names = listing.get("names") if isinstance(listing, dict) else None
+    if not isinstance(listing, dict) or set(listing) != {"command", "cwd", "exit", "timeout", "names"} \
+            or listing["command"] != [executable, "--list"] or listing["cwd"] != cwd \
+            or type(listing["exit"]) is not int or listing["exit"] != 0 or listing["timeout"] is not False \
+            or not isinstance(names, list) or not all(isinstance(n, str) for n in names) or names != sorted(set(names)):
+        return problems + ["listing is not a complete, clean --list of this executable"], unknown
+    if owned:
+        unknown = sorted(set(names) - set(requested))
+    if not isinstance(run, dict) or set(run) != {"command", "cwd", "isolation", "exit", "timeout"} \
+            or run["command"] != [executable, "--exact", *requested] or run["cwd"] != cwd \
+            or run["isolation"] != "ui/scripts/isolated.sh" or type(run["exit"]) is not int or run["exit"] != 0 \
+            or run["timeout"] is not False:
+        problems.append("execution is not a clean exit-0 --exact run of the requested tests in this executable")
+    results = execution["results"]
+    if not isinstance(results, list) or not all(isinstance(r, dict) and set(r) == {"name", "outcome"} for r in results):
+        return problems + ["individual result records are missing or malformed"], unknown
+    outcomes = {}
+    for result in results:
+        outcomes.setdefault(result["name"], []).append(result["outcome"])
+    derived = {"missing": sorted(set(requested) - set(names)),
+               "failed": sorted(n for n in requested if "FAILED" in outcomes.get(n, [])),
+               "ignored": sorted(n for n in requested if "ignored" in outcomes.get(n, [])),
+               "not_run": sorted(n for n in requested if n not in outcomes and n in names)}
+    if sorted(outcomes) != requested or any(v != ["ok"] for v in outcomes.values()):
+        problems.append(f"result lines are not one ok per requested test: {sorted(outcomes)}")
+    summary = {"result": "ok", "passed": len(requested), "failed": 0, "ignored": 0, "measured": 0,
+               "filtered_out": len(names) - len(requested)}
+    if not judge.same(execution["summary"], summary) or execution["summary_lines"] != 1:
+        problems.append(f"summary {execution['summary']} is not the one complete summary {summary} for this listing")
+    for key, value in derived.items():
+        if execution[key] != value:
+            problems.append(f"{key} {execution[key]!r} is not the derived {value}")
+    if any(derived.values()) or execution["status"] != "pass" or execution["problems"] != [] \
+            or execution["output_tail"] != "":
+        problems.append("execution is not a clean pass of every requested test")
+    return problems, unknown
+
+
+def _check_cargo(receipt, pins, current, problems, artifact_root):
     targets = {}
-    for want_group, group in zip(pins["groups"], groups):
-        tests = group.get("tests") if isinstance(group, dict) and isinstance(group.get("tests"), list) else []
-        want = [(t["package"], t["target"], t["name"]) for t in want_group["tests"]]
-        got = [(t.get("package"), t.get("target"), t.get("name")) if isinstance(t, dict) else None for t in tests]
-        if got != want:
-            problems.append(f"group {want_group['id']}: tests are not the manifest's {len(want)} once each in order")
-        passed = sum(isinstance(t, dict) and t.get("outcome") == "passed" for t in tests)
-        stated = (group.get("passed"), group.get("failed")) if isinstance(group, dict) else None
-        if passed != len(tests) or stated != (passed, len(tests) - passed):
-            problems.append(f"group {want_group['id']}: not every test passed")
-        total += passed
-        for package, target, _ in want:
-            targets[(package, target)] = True
+    for group in pins["groups"]:
+        for test in group["tests"]:
+            targets.setdefault((test["package"], test["target"]), set()).add(test["name"])
+    requested = {key: sorted(names) for key, names in targets.items()}
+    owned = {(o["package"], o["target"]) for o in pins.get("owned_test_targets", [])}
     executions = receipt.get("executions") if isinstance(receipt.get("executions"), list) else []
     got = [(e.get("package"), e.get("target")) if isinstance(e, dict) else None for e in executions]
     if sorted(map(str, got)) != sorted(map(str, targets)) or len(got) != len(set(map(str, got))):
         problems.append("test executions are not every manifest test target once each")
-    for execution in executions:
-        if not isinstance(execution, dict):
+    clean, unknown, seen = set(), [], {"executable": set(), "sha256": set()}
+    for execution, key in zip(executions, got):
+        if key not in requested:
             continue
-        label = f"{execution.get('package')} {execution.get('target')}"
-        if execution.get("status") != "pass" or execution.get("exit") != 0 or execution.get("listed") != 0 \
-                or execution.get("problems") != [] or any(execution.get(k) for k in ("missing", "failed", "ignored", "not_run")):
-            problems.append(f"{label}: execution is not a clean exit-0 run of every requested test")
-        if not _hash(execution.get("sha256")) or execution.get("sha256_after") != execution.get("sha256") \
-                or execution.get("fresh_after") is not True or not str(execution.get("executable", "")).startswith("target/"):
-            problems.append(f"{label}: binary record missing, or not the same fresh executable after the run")
+        found, extra = _check_execution(execution, requested[key], key in owned, artifact_root)
+        unknown += [f"{key[0]} {key[1]} {n}" for n in extra]
+        if not found:
+            for field in ("executable", "sha256"):
+                value = execution["artifact"][field]
+                if value in seen[field]:
+                    found.append(f"{field} is shared with another test target")
+                seen[field].add(value)
+        problems += [f"{key[0]} {key[1]}: {f}" for f in found]
+        if not found:
+            clean.add(key)
+    if unknown or receipt.get("unknown_tests") != unknown:
+        problems.append(f"owned targets list tests outside the manifest: {unknown or receipt.get('unknown_tests')}")
+    groups = receipt.get("groups") if isinstance(receipt.get("groups"), list) else []
+    if [g.get("id") if isinstance(g, dict) else None for g in groups] != [g["id"] for g in pins["groups"]]:
+        problems.append("groups are not every manifest group once each in order")
+    total = 0
+    for want_group, group in zip(pins["groups"], groups):
+        tests = group.get("tests") if isinstance(group, dict) and isinstance(group.get("tests"), list) else []
+        want = [(t["package"], t["target"], t["name"]) for t in want_group["tests"]]
+        got_tests = [(t.get("package"), t.get("target"), t.get("name")) if isinstance(t, dict) else None for t in tests]
+        if got_tests != want:
+            problems.append(f"group {want_group['id']}: tests are not the manifest's {len(want)} once each in order")
+        # A test passed only if its target's execution record proves it; the label must agree.
+        passed = sum(isinstance(t, dict) and t.get("outcome") == "passed" and (t.get("package"), t.get("target")) in clean
+                     for t in tests)
+        stated = (group.get("passed"), group.get("failed")) if isinstance(group, dict) else None
+        if passed != len(want) or got_tests != want or stated != (passed, len(want) - passed):
+            problems.append(f"group {want_group['id']}: not every test passed in a verified execution")
+        total += passed if got_tests == want else 0
     expected_total = sum(len(g["tests"]) for g in pins["groups"])
     recomputed = {"groups": len(pins["groups"]), "tests": expected_total, "passed": total, "failed": expected_total - total,
-                  "unknown_tests": 0}
+                  "unknown_tests": len(unknown)}
     if receipt.get("counts") != recomputed or total != expected_total:
         problems.append(f"counts {receipt.get('counts')} are not the recomputed {recomputed}")
-    if receipt.get("unavailable") != [] or receipt.get("unknown_tests") != []:
-        problems.append("receipt lists unavailable steps or unknown tests")
+    if receipt.get("unavailable") != []:
+        problems.append("receipt lists unavailable steps")
     if receipt.get("source_after") != current:
         problems.append("source after the cargo run is not the current identity")
 
 
-def combine(paths, pins, current_source=None):
+def combine(paths, pins, current_source=None, artifact_root=ROOT):
     """One verdict over exactly the five required receipts. Every record is validated
-    individually; totals are recomputed from them, never trusted."""
+    individually; totals are recomputed from them, never trusted. Each test executable a
+    cargo receipt names must still be on disk under `artifact_root` with its recorded hash."""
     receipts, problems = [], []
     for p in paths:
         try:
@@ -734,7 +921,7 @@ def combine(paths, pins, current_source=None):
         elif receipt["kind"] == "mutation-control":
             _check_mutation(receipt, pins, differentials.get(receipt.get("target")), found)
         elif receipt["kind"] == "cargo-groups":
-            _check_cargo(receipt, pins, current, found)
+            _check_cargo(receipt, pins, current, found, artifact_root)
         problems += [f"{name}: {f}" for f in found]
     return {"kind": "acceptance", "verdict": "fail" if problems else "pass", "partial": False, "problems": problems,
             "tested_source": current,

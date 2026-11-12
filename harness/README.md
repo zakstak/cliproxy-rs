@@ -90,6 +90,10 @@ relax them:
 - capture consistency: raw heads match the parsed request line, status and headers;
   chunked or plain wire bodies decode to the compared body; Content-Length matches;
 - generated values (`generated_headers`) match their documented pattern;
+- upstream writes: every captured upstream request finished writing its scripted reply
+  (`write_result` is `complete`). The exception is `invariants.upstream_write_failures`
+  (`client-disconnect`, whose client abandons the stream). There a write may fail, but only
+  with an outcome the collector records, and Go and Rust must agree;
 - native bytes: `native-signals` sends exactly the request recorded from Go v8.0.10
   ([golden](expectations/native-signals.v8.0.10.json)), and `count-tokens` forwards the
   client's body byte for byte;
@@ -98,7 +102,8 @@ relax them:
 **Dimensions** are compared Go against Rust: status and reason, upstream request lines,
 ordered upstream headers, upstream bodies byte for byte, downstream field values
 (case-insensitive names), downstream bodies byte for byte, TLS handshakes, and the
-persisted credential.
+persisted credential. Structured values (status, write results, TLS, the credential and
+decoded JSON) are compared with exact JSON types: `0` is not `false` and `13` is not `13.0`.
 
 **Named divergences** state the exact delta each side must show. Each predicate names one
 of these:
@@ -107,7 +112,8 @@ of these:
 - a body edit with an exact match count;
 - a JSON element only one side lists, or a set compared without order, with evidence of
   nondeterminism;
-- a generated JSON value and its pattern;
+- a generated JSON value, named by a shared mask: its exact JSON type and narrow format are
+  checked on each side before it is masked;
 - an extra Go TLS handshake that must equal a reference handshake;
 - a credential field value;
 - for a case where one reference cannot answer, a replaced comparison. Each side must
@@ -143,18 +149,37 @@ summary line, and it counts every requested test as passed with none failed or i
 A timeout, a signal or a failed listing is unavailable. A nonzero exit is never a pass,
 whatever lines were printed.
 
+Each execution record keeps what `combine` re-derives its outcome from:
+
+- the artifact identity cargo reported before and after the run: package and its
+  directory, target kind and name, crate types, source file, test profile, executable
+  and SHA-256;
+- the requested test names;
+- the listing command, its exit and the complete list of test names;
+- the run command, its working directory and isolation, exit and timeout;
+- every individual result line and the parsed summary.
+
+This checks structural consistency only. It is not a cryptographic proof of a build and
+does not detect a coherently fabricated receipt.
+
 **Goldens** ([`golden.py`](golden.py), [`expectations/`](expectations/)) are complete per-side
 expectations recorded from the Go side of a pinned, provenance-verified capture, never from
 cliproxy-rs. A golden holds:
 
-- every upstream request: line, ordered headers and body;
+- every upstream request: line, ordered headers, body and the collector's write result;
 - every client reply: status, reason and body;
 - every TLS handshake.
 
 Values are literal except `{{mask:NAME}}` tokens. Each mask is named in the manifest's
 `masks` with a narrow pattern: the minted request id, the date, `cch`, and the compaction
 ids, time and capsule. A golden declares which body masks it uses, and the validator
-refuses any other mask. Recorded goldens:
+refuses any other mask. Generated JSON values (`downstream_json.generated`) name the same
+masks, so there is one format definition, not a looser parallel one. A mask may also
+declare its exact JSON type (`json_type`) and a structural check (`decode`). The compaction
+capsule must be `cpa-ag-compact-v1:` and canonical unpadded URL-safe base64 of at least a
+12-byte nonce and a 16-byte tag, as in `crates/cpa-exec/src/compaction_capsule.rs`. The
+random ciphertext is never compared, and a valid structure says nothing about provider
+correctness. Recorded goldens:
 
 | Golden | Source | Use |
 | --- | --- | --- |
@@ -175,9 +200,10 @@ that the golden matches the capture it came from.
 
 **Mutation control** edits real captured cases, on the Rust side unless a control names Go,
 and requires each edit to fail: request and reply bytes, status, credential swaps, tool
-arguments, the TLS ClientHello, persisted `disabled`, drift of a named delta, deltas outside
-it, and caller text or `max_tokens` inside a replaced comparison on either side
-(`MUTATIONS` in `acceptance.py`).
+arguments, the TLS ClientHello, persisted `disabled` (`true`, and `0` on either side), drift of
+a named delta, deltas outside it, caller text, `max_tokens` and failed or unfinished upstream
+writes inside a replaced comparison on either side, generated values of the wrong JSON type,
+malformed capsules, and an integer turned into a float (`MUTATIONS` in `acceptance.py`).
 
 **Combine** requires each of the five receipts exactly once and validates every record in
 them. Totals are recomputed from the records, never trusted:
@@ -188,8 +214,16 @@ them. Totals are recomputed from the records, never trusted:
 - the mutation controls are exactly `MUTATIONS` for that target, once each, each caught,
   on the same capture the differential receipt evaluated;
 - the cargo groups and their tests are exactly the manifest's, once each, all passed. Every
-  test target has one execution record that exited 0 cleanly, and the executable hash
-  before the run equals the hash and fresh flag after it;
+  test target has one execution record. Its artifact is the cargo test artifact of that
+  target (package, kind, name, source file, test profile, and an executable named for the
+  crate), identical and fresh after the run, and the executable is still on disk with the
+  recorded hash. No two targets share an executable or a hash. The record's commands run
+  that executable, with `--exact` and exactly the manifest's names. The listing is complete
+  and contains every requested name; on an owned target it contains nothing else. There is
+  one `ok` result line per requested name, and the summary is `ok` with every requested
+  test passed and `filtered_out` equal to the listed names minus the requested ones.
+  Missing, failed, ignored and not-run lists are derived and must match. A test's
+  `passed` label counts only when its target's record verifies;
 - the driver and Go binaries were recorded before and after each run, are identical, and
   the Go stamp names the clean pin;
 - every receipt's source before and after equals the current clean worktree and manifest,

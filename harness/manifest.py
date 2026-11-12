@@ -14,6 +14,8 @@ import re
 import shlex
 import sys
 
+import golden as goldens
+
 ROOT = Path(__file__).resolve().parent.parent
 PATH = ROOT / "harness" / "manifest.json"
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -66,6 +68,9 @@ def _golden(path, where, data=None):
     needed = {"upstream": "requests", "status": "replies", "downstream-body": "replies", "tls": "tls"}
     for cover in golden["covers"]:
         _require(needed[cover] in golden, f"{where}: {path} covers {cover} but has no {needed[cover]}")
+    for request in golden.get("requests", []):
+        _require(set(request) == goldens.REQUEST_FIELDS and isinstance(request["write_result"], str),
+                 f"{where}: {path} requests need exactly {sorted(goldens.REQUEST_FIELDS)}, with the upstream write result")
     text = json.dumps(golden.get("requests", [])) + json.dumps(golden.get("replies", []))
     used = set(re.findall(r"\{\{mask:([a-z0-9-]+)\}\}", text))
     _require(used <= masks, f"{where}: {path} uses unknown masks {sorted(used - masks)}")
@@ -73,7 +78,7 @@ def _golden(path, where, data=None):
     return golden
 
 
-def _predicate(predicate, where, divergence):
+def _predicate(predicate, where, divergence, data):
     _require(isinstance(predicate, dict) and len(predicate) == 1 and set(predicate) <= PREDICATES,
              f"{where}: one predicate of {sorted(PREDICATES)}")
     (kind, spec), = predicate.items()
@@ -104,8 +109,13 @@ def _predicate(predicate, where, divergence):
                  f"{where}: the pattern captures exactly one 10-digit Unix time")
     elif kind == "downstream_json":
         _require(set(spec) <= {"go_only", "rust_only", "unordered", "generated"} and spec, f"{where}: json form")
+        masks = data.get("masks", {})
         for item in spec.get("generated", []):
-            re.compile(item["regex"])
+            # A generated value names a shared mask: one narrow, typed format definition for
+            # goldens and generated values alike, never a parallel looser regex.
+            _require(isinstance(item, dict) and set(item) == {"pointer", "mask"} and item["mask"] != "about"
+                     and item["mask"] in masks and masks[item["mask"]].get("json_type"),
+                     f"{where}: a generated value names a pointer and a typed mask")
     elif kind == "tls_extra_go_handshakes":
         _require(isinstance(spec["count"], int) and spec["count"] > 0 and set(spec["reference"]) == {"case", "side", "index"},
                  f"{where}: needs a count and a reference handshake")
@@ -128,8 +138,8 @@ def _predicate(predicate, where, divergence):
         _require(set(spec["covers"]) <= REPLACE_COVERS and spec["covers"], f"{where}: covers {sorted(REPLACE_COVERS)}")
         for side in ("go", "rust"):
             _require(set(spec[side]) == SIDE_KEYS, f"{where}: {side} names exactly one complete golden")
-            data = _golden(spec[side]["golden"], where)
-            _require(set(spec["covers"]) <= set(data["covers"]), f"{where}: {side} golden does not cover {spec['covers']}")
+            recorded = _golden(spec[side]["golden"], where, data)
+            _require(set(spec["covers"]) <= set(recorded["covers"]), f"{where}: {side} golden does not cover {spec['covers']}")
         _require(not divergence.get("may_be_absent"), f"{where}: a replaced comparison cannot be optional")
 
 
@@ -185,8 +195,11 @@ def validate(data, suite_sizes=None):
             _require(set(golden) <= {c["name"] for c in cases()}, f"{name}: golden_cases must be suite cases")
     masks = {k: v for k, v in data.get("masks", {}).items() if k != "about"}
     for mask, spec in masks.items():
-        _require(re.fullmatch(r"[a-z0-9-]+", mask) and set(spec) <= {"pattern", "record", "headers"},
+        _require(re.fullmatch(r"[a-z0-9-]+", mask) and set(spec) <= {"pattern", "record", "headers", "json_type", "decode"},
                  f"mask {mask}: name and fields")
+        _require(spec.get("json_type", "string") in goldens.JSON_TYPES and spec.get("decode", "compaction-capsule")
+                 in goldens.DECODERS, f"mask {mask}: json_type {sorted(goldens.JSON_TYPES)}, decode {sorted(goldens.DECODERS)}")
+        _require(re.compile(spec["pattern"]).groups == 0, f"mask {mask}: pattern has no capture groups")
         _require(not re.fullmatch(spec["pattern"], "") and ".*" not in spec["pattern"] and ".+" not in spec["pattern"],
                  f"mask {mask}: pattern must be narrow")
         re.compile(spec.get("record", spec["pattern"]))
@@ -234,7 +247,7 @@ def validate(data, suite_sizes=None):
         _require(divergence.get("reason"), f"{name}: needs a reason")
         _require(divergence.get("expect"), f"{name}: needs at least one predicate")
         for index, predicate in enumerate(divergence["expect"]):
-            _predicate(predicate, f"{name}[{index}]", divergence)
+            _predicate(predicate, f"{name}[{index}]", divergence, data)
         kind = divergence["kind"]
         if kind in ("pending-feature", "deferred-feature", "unowned", "unattributed"):
             _require(divergence.get("issue"), f"{name}: needs the issue that tracks it")
@@ -265,6 +278,11 @@ def validate(data, suite_sizes=None):
             re.compile(pattern)
     invariants = data.get("invariants", {})
     _require(set(invariants) >= {"native_passthrough", "upstream_goldens"}, "invariants need native rules")
+    failures = invariants.get("upstream_write_failures")
+    _require(isinstance(failures, list) and all(isinstance(c, str) for c in failures),
+             "invariants.upstream_write_failures lists the cases whose upstream write may fail")
+    if case_names:
+        _require(set(failures) <= set(case_names["selective"]), "upstream_write_failures must be suite cases")
     for entry in invariants["upstream_goldens"]:
         _require(set(entry) == {"case", "file"}, f"{entry}: a native golden names a case and a file")
         _require("upstream" in _golden(entry["file"], "invariants", data)["covers"], f"{entry['file']}: covers upstream")

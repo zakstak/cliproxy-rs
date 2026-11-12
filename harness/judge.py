@@ -4,8 +4,9 @@ A case passes when three things hold:
 
 1. Per-side invariants hold. They are unconditional: no divergence can relax them.
    They cover credential ownership and isolation, consistency of the raw capture with
-   its parsed fields, the formats of generated values, Content-Length against the body,
-   and the native-byte goldens and pass-through cases the manifest lists.
+   its parsed fields, completed upstream writes, the formats of generated values,
+   Content-Length against the body, and the native-byte goldens and pass-through cases
+   the manifest lists.
 2. Every compared dimension (status, upstream requests, upstream headers and bodies,
    downstream headers and bodies, TLS, persisted credential) is equal between Go and
    Rust. The exception is a named divergence predicate that states the exact delta
@@ -15,7 +16,8 @@ A case passes when three things hold:
    read error) fails.
 
 There are no path or assertion exemptions. A divergence describes values, and
-everything it does not describe is compared byte for byte.
+everything it does not describe is compared byte for byte, or for structured values with
+exact JSON types (golden.same).
 """
 import copy
 import datetime
@@ -26,6 +28,7 @@ import re
 
 from fixtures import CREDENTIAL, PROVIDER_KEYS, TOKEN_REPLY
 import golden
+from golden import same
 
 CLIENT_KEYS = ("fixture-client-key", "wrong-fixture-key")
 CLAUDE_TOKENS = (CREDENTIAL["access_token"], json.loads(TOKEN_REPLY)["access_token"])
@@ -35,6 +38,9 @@ UPSTREAM_SECRETS = (*CLAUDE_SECRETS, *PROVIDER_KEYS.values())
 # Cases whose client is refused or whose credential is unusable: no provider traffic.
 NO_TRAFFIC = {"auth-missing", "auth-wrong", "auth-query-first", "models-openai", "models-anthropic",
               "disabled-credential"}
+# The collector's upstream write outcomes (differential.py): complete, or the exception that
+# stopped the scripted reply. "pending" means the write never finished and is never valid.
+WRITE_FAILURES = ("BrokenPipeError", "ConnectionResetError", "SSLError")
 DIMENSIONS = ("status", "upstream-requests", "upstream-headers", "upstream-body", "downstream-headers",
               "downstream-body", "tls", "credential")
 
@@ -209,8 +215,21 @@ def native_bytes(case, observation, invariants, root, pins):
     return problems
 
 
+def upstream_writes(case, observation, allowed_failures):
+    """Each captured upstream request finished writing its scripted reply, unless the case's
+    client abandons the stream; then a write may fail, but only with a recorded outcome."""
+    problems = []
+    failures = WRITE_FAILURES if case["name"] in allowed_failures else ()
+    for i, request in enumerate(observation["upstream"]["http"]):
+        result = request.get("write_result", "<absent>")
+        if not (isinstance(result, str) and (result == "complete" or result in failures)):
+            problems.append(f"upstream request {i}: write result {result!r} is not a completed upstream write")
+    return problems
+
+
 def invariants(case, observation, side, pins, root):
     problems = consistency(observation) + ownership(case, observation)
+    problems += upstream_writes(case, observation, pins["invariants"]["upstream_write_failures"])
     problems += generated_formats(observation, pins["generated_headers"])
     inference = [r for r in observation["upstream"]["http"] if is_inference(r, case)]
     if case["name"] in NO_TRAFFIC and inference:
@@ -354,7 +373,7 @@ def _set_json(document, pointer, value):
         node[parts[-1]] = value
 
 
-def _json_transform(predicates, divergence, index, spec, go_doc, rust_doc):
+def _json_transform(predicates, divergence, index, spec, go_doc, rust_doc, mask_specs):
     for side, doc in (("go", go_doc), ("rust", rust_doc)):
         for item in spec.get(f"{side}_only", []):
             array = _json_at(doc, item["array"])
@@ -376,13 +395,18 @@ def _json_transform(predicates, divergence, index, spec, go_doc, rust_doc):
         for array in arrays:
             array.sort(key=lambda e: e[item["key"]])
     for item in spec.get("generated", []):
-        for doc in (go_doc, rust_doc):
+        # The shared mask gives the exact JSON type and format (golden.py); both are checked
+        # on each side before the value is masked.
+        mask = mask_specs[item["mask"]]
+        for side, doc in (("go", go_doc), ("rust", rust_doc)):
             try:
                 value = _json_at(doc, item["pointer"])
-            except (KeyError, IndexError, TypeError):
-                value = None
-            if not isinstance(value, (str, int)) or not re.fullmatch(item["regex"], str(value)):
-                predicates.fail(divergence, index, f"{item['pointer']} {value!r} is not {item['regex']}")
+            except (KeyError, IndexError, TypeError, ValueError):
+                predicates.fail(divergence, index, f"{side} {item['pointer']} is absent")
+                continue
+            problem = golden.json_problem(mask, value)
+            if problem:
+                predicates.fail(divergence, index, f"{side} {item['pointer']} ({item['mask']}): {problem}")
                 continue
             _set_json(doc, item["pointer"], "<generated>")
         predicates.hit(divergence)
@@ -431,7 +455,7 @@ def compare(case, go, rust, predicates, pins, run):
     if "status" not in replaced:
         go_status = [(r.get("status"), r.get("reason")) for r in go["downstream"]]
         rust_status = [(r.get("status"), r.get("reason")) for r in rust["downstream"]]
-        if go_status != rust_status:
+        if not same(go_status, rust_status):
             results["status"].append(f"Go {go_status} Rust {rust_status}")
     if len(go["downstream"]) != len(rust["downstream"]):
         results["status"].append("different number of client exchanges")
@@ -444,7 +468,7 @@ def compare(case, go, rust, predicates, pins, run):
         if [r["request_line"] for r in go_up] != [r["request_line"] for r in rust_up]:
             results["upstream-requests"].append(
                 f"Go {[r['request_line'] for r in go_up]} Rust {[r['request_line'] for r in rust_up]}")
-        if [r.get("write_result") for r in go_up] != [r.get("write_result") for r in rust_up]:
+        if not same([r.get("write_result") for r in go_up], [r.get("write_result") for r in rust_up]):
             results["upstream-requests"].append("upstream write results differ")
         header_specs = predicates.of("upstream_header")
         named = {spec["name"] for _, _, spec in header_specs}
@@ -502,8 +526,8 @@ def compare(case, go, rust, predicates, pins, run):
                     results["downstream-body"].append(f"reply {i}: differs and is not JSON")
                     continue
                 for divergence, index, spec in json_specs:
-                    _json_transform(predicates, divergence, index, spec, go_doc, rust_doc)
-                if go_doc == rust_doc:
+                    _json_transform(predicates, divergence, index, spec, go_doc, rust_doc, golden.masks(pins))
+                if same(go_doc, rust_doc):
                     continue
             results["downstream-body"].append(f"reply {i} differs byte for byte")
 
@@ -514,13 +538,13 @@ def compare(case, go, rust, predicates, pins, run):
             extra = len(go_tls) - len(rust_tls)
             reference = _tls(run.observation(spec["reference"]["case"], spec["reference"]["side"]))
             reference = reference[spec["reference"]["index"]] if len(reference) > spec["reference"]["index"] else None
-            if extra != spec["count"] or any(h != reference for h in go_tls[len(rust_tls):]):
+            if extra != spec["count"] or any(not same(h, reference) for h in go_tls[len(rust_tls):]):
                 predicates.fail(divergence, index, f"Go has {extra} extra handshakes, expected {spec['count']} "
                                                    "matching the reference handshake")
             else:
                 predicates.hit(divergence)
                 go_tls = go_tls[:len(rust_tls)]
-        if go_tls != rust_tls:
+        if not same(go_tls, rust_tls):
             results["tls"].append("TLS handshakes differ")
 
     go_cred, rust_cred = dict(go.get("credential_after", {})), dict(rust.get("credential_after", {}))
@@ -541,7 +565,7 @@ def compare(case, go, rust, predicates, pins, run):
     for divergence, index, spec in predicates.of("credential_timestamps"):
         for field in spec["fields"]:
             g, r = go_cred.get(field), rust_cred.get(field)
-            if g == r:
+            if same(g, r):
                 continue
             try:
                 skew = abs((_time(g) - _time(r)).total_seconds())
@@ -553,8 +577,10 @@ def compare(case, go, rust, predicates, pins, run):
             predicates.hit(divergence)
             go_cred.pop(field)
             rust_cred.pop(field)
-    if go_cred != rust_cred:
-        differing = sorted(k for k in go_cred.keys() | rust_cred.keys() if go_cred.get(k) != rust_cred.get(k))
+    # Exact JSON types: a persisted 0 is not false (raw differences are type-exact too).
+    if not same(go_cred, rust_cred):
+        differing = sorted(k for k in go_cred.keys() | rust_cred.keys()
+                           if k not in go_cred or k not in rust_cred or not same(go_cred[k], rust_cred[k]))
         results["credential"].append(f"persisted credential differs: {differing}")
     return results
 
