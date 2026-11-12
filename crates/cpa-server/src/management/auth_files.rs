@@ -220,7 +220,7 @@ pub(super) fn path_of(c: &Credential) -> Option<&Path> {
 }
 
 /// Go `lookupAuthFile`: by ID, then file name; with an index, the first match of both.
-fn lookup(state: &Management, name: &str, auth_index: &str) -> Option<Arc<Credential>> {
+pub(super) fn lookup(state: &Management, name: &str, auth_index: &str) -> Option<Arc<Credential>> {
     let (name, auth_index) = (name.trim(), auth_index.trim());
     if name.is_empty() {
         return None;
@@ -676,7 +676,7 @@ fn entry(state: &Management, c: &Credential, v8: bool) -> Option<BTreeMap<&'stat
         Value::Array(store.cooldowns(&c.id).iter().map(cooldown_view).collect()),
     );
     if v8 {
-        super::siwc::summary(c, &mut e);
+        super::siwc::summary(c, store, &mut e);
     }
     Some(e)
 }
@@ -905,7 +905,7 @@ async fn store(
 /// Go `writeAuthFile`: validate ([`prepare_upload`]), then persist. A Codex record is
 /// written under its file's credential lock, as Go's store saves it; the outer `Err`
 /// names a file whose lock another holder has ([`with_codex_lock`]).
-fn store_file(
+pub(super) fn store_file(
     state: &Management,
     name: &str,
     data: &[u8],
@@ -2209,12 +2209,19 @@ fn merge_codex_from_disk(disk: &BTreeMap<String, GoValue>, doc: &mut BTreeMap<St
 }
 
 /// Writes `bytes` as `target`'s file and registers their re-synthesis in its place,
-/// while `target` is still the current record (see [`save_file_backed`]).
-pub(super) fn save_bytes(state: &Management, target: &Credential, bytes: Vec<u8>) -> Result<(), PatchError> {
+/// while `target` is still the current record (see [`save_file_backed`]) and the file
+/// still holds the bytes hashed `disk` (checked under the credential's write lock);
+/// `Stale` otherwise.
+pub(super) fn save_bytes_if(
+    state: &Management,
+    target: &Credential,
+    bytes: Vec<u8>,
+    disk: [u8; 32],
+) -> Result<(), PatchError> {
     let commit = Commit {
         bytes,
         write: true,
-        disk: None,
+        disk: Some(Some(disk)),
         doc: None,
     };
     commit_bytes(state, target, commit)

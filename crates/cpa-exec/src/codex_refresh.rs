@@ -207,13 +207,14 @@ const OUTER: [&str; 8] = [
 ];
 
 /// Go `codexSIWCCredentialKeys`.
-const SIWC: [&str; 9] = [
+const SIWC: [&str; 10] = [
     "access_token",
     "refresh_token",
     "id_token",
     "client_id",
     "device_id",
     "expired",
+    "expires_at",
     "last_refresh",
     "scope",
     "scopes",
