@@ -509,6 +509,17 @@ impl Runtime {
             ));
         }
         match failed {
+            // Another task refreshed it meanwhile. That recovers nothing when the token set
+            // requests use still holds a refresh token refused for good: its own refresh
+            // may only have rotated the other set (#92), so this one fails as that one did.
+            Some(revision)
+                if current.revision != revision && self.store.refused_renewal(&current).active_refused(&current) =>
+            {
+                if let Some(refused) = refused {
+                    self.store.reject_refused(refused, registered.registration, true);
+                }
+                return Err(refused_active());
+            }
             Some(revision) if current.revision != revision => return Ok(current),
             Some(_) => {}
             // A refresh token refused for good is no reason to refresh.
@@ -3392,11 +3403,7 @@ async fn refresh_codex_file(
             .filter(|r| !r.is_empty());
         let fail_quarantined = |c: &Credential| -> Result<(), ExecError> {
             match quarantined {
-                Some(r) if r.active_refused(c) => Err(ExecError::local(
-                    401,
-                    FailureScope::Credential,
-                    "the refresh token of the credential's active token set was refused; sign in again",
-                )),
+                Some(r) if r.active_refused(c) => Err(refused_active()),
                 _ => Ok(()),
             }
         };
@@ -3440,6 +3447,17 @@ async fn refresh_codex_file(
         Ok(committed)
     });
     transaction.await.map_err(|e| local(e.to_string()))?
+}
+
+/// A refresh of a credential whose active token set (SIWC while `use_siwc` is on, else
+/// the outer tokens) holds a refresh token refused for good: only a new sign-in of that
+/// set recovers it (#92).
+fn refused_active() -> ExecError {
+    ExecError::local(
+        401,
+        FailureScope::Credential,
+        "the refresh token of the credential's active token set was refused; sign in again",
+    )
 }
 
 /// The Codex credential document `bytes` with `patch` applied (each partition over a
@@ -5588,6 +5606,59 @@ pub(crate) mod tests {
                 .collect(),
         );
         assert!(!rt.store.tokens_rejected(&rt.store.get("codex.json").unwrap()));
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// Sol review of 8596a77d: two management refreshes of a quarantined SIWC credential
+    /// queue on its preparation lock. The first rotates the outer tokens and fails with
+    /// "sign in again"; the second, which read the credential before that commit, finds
+    /// a newer revision. That revision recovered nothing (the active SIWC refresh token is
+    /// still refused), so it fails the same way instead of answering OK. Barriers: the
+    /// first holds the lock inside its outer grant (the mock's gate) until the second has
+    /// reached preparation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_manual_refresh_of_a_refused_credential_fails_too() {
+        let name = "codex-queued.json";
+        let file = codex_file(
+            ("q", chrono::Duration::days(10)),
+            ("dead", "oaiapp_fake", chrono::Duration::hours(1)),
+        );
+        let f = CodexDisk::answering(&[(name, &file)], 0, OUTER_OK, SIWC_REFUSED).await;
+        let rt = f.rt.clone();
+        // The upstream 401 and its refused SIWC refresh: the gate admits every send it makes.
+        f.gate.add_permits(3);
+        let c = rt.store.get(name).unwrap();
+        assert!(rt.refresh_after_unauthorized(&c, &rt.config()).await.is_none());
+        while let Ok(permit) = f.gate.try_acquire() {
+            permit.forget();
+        }
+        f.grants();
+        assert!(rt.store.tokens_rejected(&rt.store.get(name).unwrap()));
+        let before = reached("prepare", name);
+        let first = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.refresh_credential(name).await.map(|c| c.revision) }
+        });
+        f.granted().await; // The first holds the preparation lock inside its outer grant.
+        let second = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.refresh_credential(name).await.map(|c| c.revision) }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reached("prepare", name) < before + 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second refresh reached preparation");
+        f.gate.add_permits(100);
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.map_err(|e| e.status), Err(401), "the first manual refresh");
+        assert_eq!(second.map_err(|e| e.status), Err(401), "the queued manual refresh");
+        let grants = f.grants();
+        assert_eq!(partition_grants(&grants, "siwc"), 0, "{grants:?}");
+        assert!(rt.store.tokens_rejected(&rt.store.get(name).unwrap()));
         std::fs::remove_dir_all(&f.dir).unwrap();
     }
 

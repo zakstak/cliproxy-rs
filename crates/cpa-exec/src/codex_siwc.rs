@@ -661,7 +661,8 @@ impl CodexOAuth {
                     status,
                     &format!("OpenAI OAuth token request failed ({status}): {code}"),
                 ),
-                terminal: crate::codex_oauth::siwc_terminal(&code),
+                // Read as the first-party client reads the same issuer's codes.
+                terminal: crate::codex_oauth::siwc_terminal(&crate::codex_oauth::grant_code(&body)),
             });
         }
         if status != 200 {

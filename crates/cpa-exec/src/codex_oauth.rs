@@ -368,6 +368,22 @@ impl CodexOAuth {
         body: Vec<u8>,
     ) -> Result<(u16, bytes::Bytes), ExecError> {
         let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
+        match self.post_status(url, content_type, body).await? {
+            (status, Some(body)) => Ok((status, body)),
+            (_, None) => Err(failed()),
+        }
+    }
+
+    /// [`Self::post`], keeping the answer's HTTP status when its body cannot be read
+    /// (`None`), as first-party codex-rs's `TokenRejection` does ("HTTP status survives
+    /// even when its body cannot be read").
+    async fn post_status(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
+        let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
         headers.set("Accept", "application/json");
@@ -379,7 +395,7 @@ impl CodexOAuth {
             .map_err(|_| failed())?;
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
-            .map_err(|_| failed())?;
+            .ok();
         Ok((upstream.status, body))
     }
 
@@ -395,9 +411,19 @@ impl CodexOAuth {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
-        let (status, body) = self
-            .post(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
-            .await?;
+        let (status, body) = match self
+            .post_status(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
+            .await?
+        {
+            (status, Some(body)) => (status, body),
+            // A refusal whose body cannot be read keeps its status (first-party codex-rs
+            // classifies an outer HTTP 401 as refused for good without reading the body).
+            // The code exchange and a 200 keep the transport failure.
+            (status, None) if !exchange && status != 200 => (status, bytes::Bytes::new()),
+            (_, None) => {
+                return Err(ExecError::local(502, FailureScope::Transport, "codex oauth request failed").into());
+            }
+        };
         if status != 200 && exchange {
             let message = format!(
                 "token exchange failed with status {status}: {}",
@@ -408,7 +434,7 @@ impl CodexOAuth {
         if status != 200 {
             return Err(GrantError {
                 error: token_error(status, &body),
-                terminal: outer_terminal(status, &oauth_code(&body)),
+                terminal: outer_terminal(status, &grant_code(&body)),
             });
         }
         // Go appends the decoder error (`failed to parse token response: %w`); serde's
@@ -744,6 +770,26 @@ pub(crate) fn oauth_code(body: &[u8]) -> String {
             _ => None,
         })
         .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
+        .unwrap_or_default()
+}
+
+/// The OAuth error code a refusal is classified by, as first-party codex-rs reads it at
+/// the contract pin (`codex-rs/login/src/oauth/error.rs`, `TokenErrorDetail::parse`): a
+/// non-blank string `error`, else `error.code`, else a top-level `code` ("top-level codes
+/// inform refresh recovery without replacing the legacy full-body display"). Unmodified,
+/// for classification only: messages keep [`oauth_code`]. `""` when there is none.
+pub(crate) fn grant_code(body: &[u8]) -> String {
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return String::new();
+    };
+    text(json.get("error"))
+        .or_else(|| text(json.get("error").and_then(|e| e.get("code"))))
+        .or_else(|| text(json.get("code")))
         .unwrap_or_default()
 }
 

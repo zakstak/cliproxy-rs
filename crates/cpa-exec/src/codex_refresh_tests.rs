@@ -4,6 +4,7 @@
 use super::*;
 use crate::codex_testkit::{Mock, json};
 use std::path::Path;
+use std::sync::Arc;
 
 const OUTER: &str = "/oauth/token";
 const SIWC: &str = "/api/accounts/oauth/token";
@@ -267,5 +268,171 @@ fn a_refusal_follows_its_partition_token() {
     assert!(
         left.active_refused(&native),
         "the outer partition is in use and refused"
+    );
+}
+
+/// Sol review of 8596a77d: the classification reads the error code as first-party
+/// codex-rs does (`TokenErrorDetail::parse`): a string `error`, else `error.code`, else a
+/// top-level `code`. A top-level refusal code is sent once for both token sets; an
+/// `error` string wins over a top-level code, and a code that is terminal only with HTTP
+/// 400 stays transient with another status.
+#[tokio::test]
+async fn top_level_refusal_codes_classify_like_first_party() {
+    assert_eq!(codex_oauth::grant_code(br#"{"code":"invalid_grant"}"#), "invalid_grant");
+    assert_eq!(
+        codex_oauth::grant_code(br#"{"error":"server_error","code":"invalid_grant"}"#),
+        "server_error"
+    );
+    assert_eq!(
+        codex_oauth::grant_code(br#"{"error":{"code":"refresh_token_reused"},"code":"x"}"#),
+        "refresh_token_reused"
+    );
+    assert_eq!(
+        codex_oauth::grant_code(br#"{"error":" ","code":"token_expired"}"#),
+        "token_expired"
+    );
+    assert_eq!(codex_oauth::grant_code(b"not json"), "");
+    let mock = Mock::start().await;
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &format!("{}{OUTER}", mock.url), "", "")
+        .with_siwc_token_url(&format!("{}{SIWC}", mock.url))
+        .with_retry_delay(std::time::Duration::from_millis(1));
+    for (i, (status, body, terminal)) in [
+        (400, r#"{"code":"invalid_grant"}"#, true),
+        (403, r#"{"code":"refresh_token_expired"}"#, true),
+        (400, r#"{"error":"server_error","code":"invalid_grant"}"#, false),
+        (500, r#"{"code":"invalid_grant"}"#, false),
+        (400, r#"{"code":"server_error"}"#, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        mock.script(OUTER, vec![json(status, body); 3]);
+        let error = oauth.refresh_grant(&format!("outer-rt-top-{i}")).await.unwrap_err();
+        let sends = mock.take().len();
+        assert_eq!(
+            (error.terminal, sends),
+            (terminal, if terminal { 1 } else { 3 }),
+            "outer {status} {body}"
+        );
+    }
+    for (i, (status, body, terminal)) in [
+        (400, r#"{"code":"invalid_grant"}"#, true),
+        (401, r#"{"code":"refresh_token_reused"}"#, true),
+        (400, r#"{"error":"server_error","code":"invalid_grant"}"#, false),
+        (400, r#"{"code":"invalid_client"}"#, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        mock.script(SIWC, vec![json(status, body); 3]);
+        let error = oauth
+            .refresh_siwc(&format!("siwc-rt-top-{i}"), "oaiapp_fake", "dev")
+            .await
+            .unwrap_err();
+        let sends = mock.take().len();
+        assert_eq!(
+            (error.terminal, sends),
+            (terminal, if terminal { 1 } else { 3 }),
+            "siwc {status} {body}"
+        );
+    }
+}
+
+/// A token endpoint that reads each request whole, answers it with `head` and `body`
+/// and then closes, and counts the connections.
+async fn raw_endpoint(head: &'static str, body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = connections.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                // The headers, then as many body bytes as they announce.
+                let complete = |r: &[u8]| {
+                    let Some(end) = r.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        return false;
+                    };
+                    let head = String::from_utf8_lossy(&r[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    r.len() >= end + 4 + length
+                };
+                while !complete(&request) {
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = stream.write_all(format!("{head}\r\n\r\n{body}").as_bytes()).await;
+            });
+        }
+    });
+    (url, connections)
+}
+
+/// Sol review of 8596a77d (first-party `TokenRejection`: "HTTP status survives even when
+/// its body cannot be read"): an outer refresh answered 401 with a body cut short is
+/// refused for good, sent once, with its status. Controls: the same cut with 500 or 200
+/// stays a transient transport failure, retried three times, and the code exchange keeps
+/// its transport failure.
+#[tokio::test]
+async fn a_refusal_whose_body_cannot_be_read_keeps_its_status() {
+    for (head, terminal, sends, status) in [
+        (
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nConnection: close",
+            true,
+            1,
+            401,
+        ),
+        (
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\nConnection: close",
+            false,
+            3,
+            502,
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close",
+            false,
+            3,
+            502,
+        ),
+    ] {
+        let (url, connections) = raw_endpoint(head, "partial").await;
+        let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &url, "", "")
+            .with_retry_delay(std::time::Duration::from_millis(1));
+        let error = oauth.refresh_grant("outer-rt-cut").await.unwrap_err();
+        assert_eq!(
+            (
+                error.terminal,
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                error.error.status
+            ),
+            (terminal, sends, status),
+            "{head}"
+        );
+    }
+    let (url, _) = raw_endpoint(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nConnection: close",
+        "partial",
+    )
+    .await;
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &url, "", "");
+    let error = oauth
+        .exchange("code", "http://localhost:1455/auth/callback", "verifier")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status, String::from_utf8_lossy(&error.body).into_owned()),
+        (502, "codex oauth request failed".to_owned()),
+        "the code exchange keeps its transport failure"
     );
 }
