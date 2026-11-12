@@ -613,9 +613,10 @@ async fn the_siwc_refresh_form_is_the_documented_one() {
     let (result, refused) = r
         .refresh_locked(&credential(&metadata), &metadata, RefreshMode::Due, &Refused::default())
         .await;
-    assert!(!result.unwrap().is_empty() && refused.is_empty());
     let sent = mock.take();
-    assert_eq!(sent.len(), 1);
+    assert_eq!(sent.len(), 1, "an answer without `scope` is accepted, not retried");
+    let patch = result.expect("an answer without `scope` keeps the stored grant");
+    assert!(!patch.is_empty() && refused.is_empty());
     assert_eq!(sent[0].header("content-type"), "application/x-www-form-urlencoded");
     assert_eq!(
         String::from_utf8_lossy(&sent[0].body),
