@@ -864,11 +864,14 @@ fn namespace_dispatcher_tool(declarations: &[Res<'_>]) -> Option<Vec<u8>> {
 /// Folded namespaces' dispatchers by namespace name, each built once from all of that
 /// namespace's declarations ([`namespace_dispatcher_tool`]).
 ///
-/// Go rebuilds the dispatcher at each occurrence over every declaration of the name,
-/// which grows with the square of a namespace repeated across a long tool history.
-/// Built once instead, every occurrence emits the dispatcher Go builds at the
-/// namespace's first occurrence; promotion keeps only that one (first wins), so the
-/// tools sent are the same.
+/// Go rebuilds the dispatcher at every occurrence of the namespace, over every
+/// declaration of it, and emits a copy into each tool list; promotion then keeps only
+/// the copy at the first occurrence (first wins by name, top-level tools first). Every
+/// later copy is dropped there, behind either that first copy or an earlier tool of
+/// the same name. So the dispatcher is built once here and emitted only at the
+/// namespace's first occurrence ([`normalize_tool_array`] takes it out of this map):
+/// the tools sent are Go's, without work that grows with the square of a namespace
+/// repeated, or growing, across a long tool history.
 fn namespace_dispatchers(body: &[u8]) -> HashMap<String, Vec<u8>> {
     let mut declarations: HashMap<String, Vec<Res<'_>>> = HashMap::new();
     for tools in tool_lists(body) {
@@ -894,19 +897,19 @@ fn normalize_tools(body: Vec<u8>, fold: bool) -> Vec<u8> {
         return body;
     }
     let keep_image = supports_native_image_generation(&gj::get(&body, "model").str());
-    let dispatchers = if fold {
+    let mut dispatchers = if fold {
         namespace_dispatchers(&body)
     } else {
         HashMap::new()
     };
     let original = body.clone();
     let mut body = body;
-    let at = |body: &mut Vec<u8>, path: &str| -> bool {
+    let mut at = |body: &mut Vec<u8>, path: &str| -> bool {
         let tools = gj::get(body, path);
         if !tools.is_array() {
             return true;
         }
-        match normalize_tool_array(&tools, keep_image, fold, &dispatchers) {
+        match normalize_tool_array(&tools, keep_image, fold, &mut dispatchers) {
             None => false,
             Some(None) => true,
             Some(Some(filtered)) => gj::set_raw(body, path, filtered),
@@ -929,7 +932,7 @@ fn normalize_tools(body: Vec<u8>, fold: bool) -> Vec<u8> {
     for item in input.array() {
         let tools = item.get("tools");
         if &*item.get("type").bytes() == b"additional_tools" && tools.is_array() {
-            match normalize_tool_array(&tools, keep_image, fold, &dispatchers) {
+            match normalize_tool_array(&tools, keep_image, fold, &mut dispatchers) {
                 None => return original,
                 Some(Some(filtered)) => {
                     let mut raw = item.raw().to_vec();
@@ -958,7 +961,7 @@ fn normalize_tool_array(
     tools: &Res<'_>,
     keep_image: bool,
     fold: bool,
-    dispatchers: &HashMap<String, Vec<u8>>,
+    dispatchers: &mut HashMap<String, Vec<u8>>,
 ) -> Option<Option<Vec<u8>>> {
     let mut filtered = Vec::new();
     let mut seen = HashSet::new();
@@ -977,8 +980,10 @@ fn normalize_tool_array(
         if &*tool.get("type").bytes() == NAMESPACE.as_bytes() {
             changed = true;
             if fold {
-                if let Some(dispatcher) = dispatchers.get(&text(&tool.get("name"))) {
-                    push(dispatcher.clone(), &mut filtered);
+                // Only the namespace's first occurrence, in the order lists are
+                // normalized (top-level, then history), emits its dispatcher.
+                if let Some(dispatcher) = dispatchers.remove(&text(&tool.get("name"))) {
+                    push(dispatcher, &mut filtered);
                 }
                 continue;
             }

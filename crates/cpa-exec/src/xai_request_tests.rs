@@ -313,3 +313,81 @@ fn long_histories_of_repeated_namespaces_deduplicate() {
         "{last}"
     );
 }
+
+/// A namespace that grows across history (each item re-declares it with one more
+/// child) folds into one dispatcher listing every child, sent once, whose calls
+/// restore for the first and the last child.
+#[test]
+fn a_namespace_growing_across_history_folds_once() {
+    let n = 260;
+    let mut grown = body(vec![], vec![]);
+    let input = grown["input"].as_array_mut().unwrap();
+    input.clear();
+    for i in 0..n {
+        input.push(json!({"type": "additional_tools", "tools": [namespace("app", tools("tool_", i..i + 1))]}));
+    }
+    input.push(json!({"role": "user", "content": "hi"}));
+    let (fold, refs, out) = prepared(&grown);
+    assert!(fold);
+    assert_eq!(names(&out), ["app"], "{out}");
+    let catalog = out["tools"][0]["description"].as_str().unwrap();
+    assert!(catalog.contains("- tool_0") && catalog.contains(&format!("- tool_{}", n - 1)));
+    for child in ["tool_0".to_owned(), format!("tool_{}", n - 1)] {
+        let restored = restore(&refs, call("app", &format!(r#"{{"name":"{child}","arguments":{{}}}}"#)));
+        assert_eq!(
+            (&restored["item"]["namespace"], &restored["item"]["name"]),
+            (&json!("app"), &json!(child))
+        );
+    }
+}
+
+/// Emitting a folded dispatcher only at the namespace's first occurrence keeps Go's
+/// first-wins outcome: a flat tool of the same name declared earlier, in the same list
+/// or the top level, still wins, and one declared after the first occurrence loses.
+#[test]
+fn a_folded_dispatcher_keeps_first_wins_against_flat_tools() {
+    let filler = namespace("mcp__extra", tools("tool_", 0..210));
+    let flat = |description: &str| json!({"type": "function", "name": "clock", "description": description, "parameters": {"type": "object"}});
+    let clock = namespace(
+        "clock",
+        vec![json!({"type": "function", "name": "sleep", "parameters": {"type": "object"}})],
+    );
+    for (top, history, winner) in [
+        (
+            vec![flat("flat top"), filler.clone()],
+            vec![clock.clone()],
+            Some("flat top"),
+        ),
+        (
+            vec![filler.clone()],
+            vec![flat("flat history"), clock.clone(), clock.clone()],
+            Some("flat history"),
+        ),
+        (
+            vec![clock.clone(), filler.clone()],
+            vec![flat("flat later"), clock.clone()],
+            None,
+        ),
+        (vec![filler.clone()], vec![clock.clone(), flat("flat later")], None),
+    ] {
+        let (fold, _, out) = prepared(&body(top, history));
+        assert!(fold);
+        let clocks: Vec<&Value> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"] == "clock")
+            .collect();
+        assert_eq!(clocks.len(), 1, "{out}");
+        match winner {
+            Some(description) => assert_eq!(clocks[0]["description"], description, "{out}"),
+            None => assert!(
+                clocks[0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Available tools in this namespace"),
+                "the dispatcher wins: {out}"
+            ),
+        }
+    }
+}
