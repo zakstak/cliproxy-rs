@@ -312,13 +312,19 @@ def _run(command, cwd, env, timeout):
         return {"exit": None, "stdout": stdout, "stderr": stderr, "timeout": True}
 
 
-def run_cargo(pins):
-    """Every manifest group. Build, hash, list and run each test binary directly in a
-    loopback-only namespace, then confirm cargo still calls the same binaries fresh."""
+def manifest_targets(pins):
+    """{(package, target): [test names]} for every manifest test."""
     targets = {}
     for group in pins["groups"]:
         for test in group["tests"]:
             targets.setdefault((test["package"], test["target"]), []).append(test["name"])
+    return targets
+
+
+def run_cargo(pins):
+    """Every manifest group. Build, hash, list and run each test binary directly in a
+    loopback-only namespace, then confirm cargo still calls the same binaries fresh."""
+    targets = manifest_targets(pins)
     env = dict(os.environ, CPA_TEST_NO_SKIP="1", CARGO_TERM_COLOR="never")
     source_before = provenance.source_identity()
     packages = sorted({p for p, _ in targets})
@@ -409,6 +415,8 @@ def run_cargo(pins):
     return {"kind": "cargo-groups", "verdict": verdict, "partial": False,
             "rust_revision": source_before["head"], "source": source_before, "source_after": source_after,
             "provenance_verified": not unavailable, "toolchain": _toolchain(),
+            "build": {"commands": {p: before[p]["command"] for p in packages}, "cwd": ".",
+                      "environment": cargo_environment(env)},
             "isolation": "ui/scripts/isolated.sh: loopback-only user+net namespace, caller uid/gid; "
                          "test binaries run directly with CPA_TEST_NO_SKIP=1",
             "counts": {"groups": len(groups), "tests": sum(len(g["tests"]) for g in groups),
@@ -422,14 +430,104 @@ def _quote(part):
     return part if re.fullmatch(r"[A-Za-z0-9_:./=+-]+", part) else "'" + part.replace("'", "'\\''") + "'"
 
 
-def _toolchain():
+def _toolchain(env=None):
     out = {}
     for name, command in (("rustc", ["rustc", "--version"]), ("cargo", ["cargo", "--version"])):
         try:
-            out[name] = subprocess.check_output(command).decode().strip()
+            out[name] = subprocess.check_output(command, env=env).decode().strip()
         except (OSError, subprocess.CalledProcessError) as exc:
             out[name] = f"unavailable: {exc}"
     return out
+
+
+# --- current cargo artifacts ---------------------------------------------------------------
+
+NO_COMPILE_RUSTC = ROOT / "harness/no-compile-rustc"
+# Settings that change cargo's fingerprints, its target directory or the compiler it calls.
+# Recorded with every build and query (values only of these names, never other variables).
+CARGO_ENVIRONMENT = ("CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR",
+                     "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC",
+                     "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME",
+                     "CARGO_NET_OFFLINE")
+
+
+def cargo_environment(env):
+    return {k: env.get(k) for k in CARGO_ENVIRONMENT} | {
+        k: v for k, v in sorted(env.items()) if k.startswith("CARGO_PROFILE_")}
+
+
+def current_cargo_targets(pins, current_source, artifact_root=ROOT):
+    """Cargo's own current identity for every manifest test target, without building.
+
+    Runs the exact per-package selections run_cargo builds (one invocation per package, so
+    feature unification and every artifact hash are the same), offline and locked, with
+    RUSTC_WRAPPER set to harness/no-compile-rustc, which refuses any real compilation.
+    Available only if every invocation exits 0, every compiler artifact is fresh, nothing
+    was refused, each manifest target has exactly one executable with its expected identity
+    and no other test executable appears, the bytes stay the same until the query ends, and
+    the source is the combined source before and after. This names which cached artifacts
+    are current for the source; it builds nothing and is not a cryptographic attestation.
+    artifact_root is for tests only."""
+    targets = manifest_targets(pins)
+    packages = sorted({p for p, _ in targets})
+    problems = []
+    with tempfile.TemporaryDirectory(prefix="cpa-no-compile-") as tmp:
+        log = Path(tmp) / "refused.log"
+        env = dict(os.environ, RUSTC_WRAPPER=str(NO_COMPILE_RUSTC), CPA_NO_COMPILE_LOG=str(log),
+                   CARGO_TERM_COLOR="never")
+        source_before = provenance.source_identity()
+        builds = {p: provenance.cargo_artifacts([*_cargo_selection(p, [t for q, t in targets if q == p]), "--offline"],
+                                                env=env, detail=True) for p in packages}
+        refused = log.read_text().splitlines() if log.exists() else []
+    artifacts, profiles = {}, {}
+    for package, build in builds.items():
+        if build["exit"] != 0:
+            problems.append(f"cargo query for {package} exited {build['exit']}: {build['stderr_tail'][-300:]}")
+        if build["stale"]:
+            problems.append(f"cargo query for {package} reports artifacts that are not fresh: {build['stale'][:10]}")
+        claimed = set()
+        for target in sorted(t for q, t in targets if q == package):
+            key = f"{package} {target}"
+            artifact = _artifact_for(build, package, target)
+            if artifact is None:
+                problems.append(f"{key}: cargo reports no single current test executable")
+                continue
+            mismatch = artifact_problems(package, target, identity(artifact))
+            if mismatch or artifact["fresh"] is not True:
+                problems.append(f"{key}: cargo's current executable is not this target's fresh test binary: {mismatch}")
+                continue
+            artifacts[key], profiles[key] = identity(artifact), artifact.get("profile")
+            claimed.add(artifact["executable"])
+        extra = sorted(a["executable"] for a in build["artifacts"] if a.get("profile_test") and a["executable"] not in claimed)
+        if extra:
+            problems.append(f"cargo query for {package} names test executables outside the manifest targets: {extra}")
+    for key, artifact in artifacts.items():
+        path = Path(artifact_root) / artifact["executable"]
+        if not path.is_file() or provenance.sha256(path) != artifact["sha256"]:
+            problems.append(f"{key}: executable bytes changed during the query")
+    source_after = provenance.source_identity()
+    if not source_before == source_after == current_source:
+        problems.append("the source changed during the cargo query or is not the combined source")
+    if refused:
+        problems.append(f"no-compile-rustc refused {len(refused)} compilation(s): {refused[:3]}")
+    return {"queried": True, "available": not problems, "problems": problems,
+            "evidence": "cached artifacts cargo reports fresh for this source; nothing was built",
+            "commands": {p: b["command"] for p, b in builds.items()}, "exits": {p: b["exit"] for p, b in builds.items()},
+            "cwd": ".", "environment": cargo_environment(env), "toolchain": _toolchain(env), "refused": refused[:20],
+            "artifacts": artifacts, "profiles": profiles, "source_before": source_before, "source_after": source_after}
+
+
+def current_artifact_problems(receipt, cargo):
+    """Executions whose recorded artifact is not the one cargo now reports for its target."""
+    problems = []
+    for execution in receipt["executions"]:
+        key = f"{execution['package']} {execution['target']}"
+        want, got = cargo["artifacts"].get(key), execution["artifact"]
+        if want is None or not judge.same(got, want):
+            current = f" (current: {want['executable']} {want['sha256'][:12]})" if want else ""
+            problems.append(f"{key}: recorded artifact {got['executable']} {got['sha256'][:12]} is not cargo's "
+                            f"current fresh artifact for this target{current}")
+    return problems
 
 
 # --- mutation control --------------------------------------------------------------------
@@ -890,10 +988,16 @@ def _check_cargo(receipt, pins, current, problems, artifact_root):
         problems.append("source after the cargo run is not the current identity")
 
 
-def combine(paths, pins, current_source=None, artifact_root=ROOT):
+def combine(paths, pins, current_source=None, artifact_root=ROOT, current_targets=None):
     """One verdict over exactly the five required receipts. Every record is validated
     individually; totals are recomputed from them, never trusted. Each test executable a
-    cargo receipt names must still be on disk under `artifact_root` with its recorded hash."""
+    cargo receipt names must still be on disk under `artifact_root` with its recorded hash.
+
+    Receipts that pass on their records are then bound to cargo: each execution's artifact
+    must equal the one current_cargo_targets reports for its target now (a well-named real
+    build of the same crate is not enough). If that query is unavailable the verdict is
+    unavailable, never pass. Records that already fail do not query cargo. current_targets
+    replaces the query in tests only; the CLI never passes it."""
     receipts, problems = [], []
     for p in paths:
         try:
@@ -923,8 +1027,18 @@ def combine(paths, pins, current_source=None, artifact_root=ROOT):
         elif receipt["kind"] == "cargo-groups":
             _check_cargo(receipt, pins, current, found, artifact_root)
         problems += [f"{name}: {f}" for f in found]
-    return {"kind": "acceptance", "verdict": "fail" if problems else "pass", "partial": False, "problems": problems,
-            "tested_source": current,
+    if problems:
+        cargo = {"queried": False, "available": None, "reason": "the receipts already fail on their records"}
+    else:
+        cargo = current_targets if current_targets is not None else current_cargo_targets(pins, current)
+        if cargo.get("available") is True:
+            for name, receipt, _ in receipts:
+                if receipt["kind"] == "cargo-groups":
+                    problems += [f"{name}: {p}" for p in current_artifact_problems(receipt, cargo)]
+    verdict = "fail" if problems else ("pass" if cargo.get("available") is True else "unavailable")
+    unavailable = (cargo.get("problems") or ["current cargo artifacts unavailable"]) if verdict == "unavailable" else []
+    return {"kind": "acceptance", "verdict": verdict, "partial": False, "problems": problems,
+            "unavailable": unavailable, "current_cargo": cargo, "tested_source": current,
             "pins": {"go": {n: {k: t[k] for k in ("tag", "commit", "role", "executed")}
                             for n, t in pins["go"]["targets"].items()},
                      "codex": pins["contracts"]["codex"]["commit"], "rust_toolchain": pins["toolchain"]["rust"]},

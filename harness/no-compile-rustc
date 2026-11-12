@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# RUSTC_WRAPPER for cargo queries that must not compile (harness/acceptance.py combine).
+# Cargo calls a wrapper as `wrapper <rustc> <args...>`. Only cargo's compiler-information
+# calls pass through: `rustc -vV` and the target-information probe for crate `___`. Any other
+# invocation is a real compilation; it is refused (exit 101), so cargo fails instead of
+# rebuilding, and is appended to $CPA_NO_COMPILE_LOG.
+# ponytail: a build-script *run* does not go through rustc. A compiled build script whose
+# rerun-if conditions changed would still execute before its dependants' compilation is
+# refused. Ceiling: a query never builds Rust, but cannot stop such a script. Upgrade path: a
+# stable cargo dry-run/freshness report, when one exists.
+rustc=$1
+shift
+for arg in "$@"; do
+    if [[ $arg == -vV || $arg == ___ ]]; then
+        exec "$rustc" "$@"
+    fi
+done
+if [[ -n ${CPA_NO_COMPILE_LOG:-} ]]; then
+    printf '%s\n' "$*" | cut -c1-500 >> "$CPA_NO_COMPILE_LOG"
+fi
+echo "no-compile-rustc: refused a real compilation; the queried artifact is not fresh" >&2
+exit 101

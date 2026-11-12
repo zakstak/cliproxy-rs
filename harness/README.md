@@ -159,8 +159,10 @@ Each execution record keeps what `combine` re-derives its outcome from:
 - the run command, its working directory and isolation, exit and timeout;
 - every individual result line and the parsed summary.
 
-This checks structural consistency only. It is not a cryptographic proof of a build and
-does not detect a coherently fabricated receipt.
+These records check structural consistency. Combine also binds each artifact to the one
+cargo currently reports for its target (below). This is still not a cryptographic proof of a
+build. It does not detect a fabricated receipt whose artifacts are cargo's current ones but
+whose results were never produced.
 
 **Goldens** ([`golden.py`](golden.py), [`expectations/`](expectations/)) are complete per-side
 expectations recorded from the Go side of a pinned, provenance-verified capture, never from
@@ -228,6 +230,38 @@ them. Totals are recomputed from the records, never trusted:
   the Go stamp names the clean pin;
 - every receipt's source before and after equals the current clean worktree and manifest,
   and `rust_revision` matches it.
+
+When every record passes, combine then asks cargo which artifacts are current
+(`current_cargo_targets`). It runs the cargo step's exact per-package selections
+(`cargo test --locked --no-run -p PACKAGE --lib|--test NAME... --offline`, one invocation per
+package so that feature unification and hashes stay the same) with `RUSTC_WRAPPER` set to
+[`no-compile-rustc`](no-compile-rustc). That wrapper passes only `rustc -vV` and cargo's
+target-information probe and refuses every real compilation with exit 101. The query is
+available only if:
+
+- every invocation exits 0 and reports every compiler artifact fresh;
+- the wrapper refused nothing;
+- each of the manifest's test targets has exactly one test executable with its expected
+  identity, and no other test executable appears;
+- the bytes still match cargo's hash after the query;
+- the source is the combined source before and after.
+
+Each execution's recorded artifact (package, kind, name, source file, profile, executable and
+SHA-256) must then equal cargo's current artifact for its target. Another real build of the
+same crate on disk, with its true hash, therefore fails. If the query is unavailable, combine
+is unavailable (exit 2), never pass. Records that already fail do not query cargo. The
+combined receipt keeps the query's argv, the recorded cargo environment (`CARGO_INCREMENTAL`,
+`RUSTFLAGS`, `CARGO_PROFILE_*`, target directory, wrapper, toolchain), each target's cargo
+profile, refusals and source identity before and after. The cargo receipt also keeps its
+build argv and environment.
+
+The query reports that cached artifacts are current for this source. It builds nothing, and
+it is not a build or a cryptographic attestation. Replaying committed receipts later
+passes only while those exact artifacts are still cargo's current fresh ones. A build-script
+*run* does not go through rustc and cannot be refused (see the wrapper's comment). Any
+setting that changes cargo's fingerprints, such as `CARGO_INCREMENTAL`, makes the cached
+artifacts stale, so the query is unavailable. Run combine with the environment that built
+them.
 
 The combined receipt records each input receipt's SHA-256.
 

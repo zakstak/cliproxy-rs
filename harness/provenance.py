@@ -63,18 +63,25 @@ def package_dir(package_id, root=ROOT):
     return os.path.relpath(url[len("path+file://"):], root)
 
 
-def cargo_artifacts(args, root=ROOT, env=None):
+def cargo_artifacts(args, root=ROOT, env=None, detail=False):
     """(exit code, [{package, package_dir, kind, kinds, crate_types, name, src_path, profile_test,
-    executable, fresh, sha256}]) for executables, as cargo's compiler-artifact messages name them."""
+    executable, fresh, sha256}]) for executables, as cargo's compiler-artifact messages name them.
+
+    With detail, each executable also carries cargo's whole `profile` object, and the result
+    lists every compiler artifact cargo did not report fresh (`stale`), executable or not."""
     command = ["cargo", *args, "--message-format=json"]
     done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
-    artifacts = []
+    artifacts, stale = [], []
     for line in done.stdout.splitlines():
         try:
             message = json.loads(line)
         except ValueError:
             continue
-        if message.get("reason") != "compiler-artifact" or not message.get("executable"):
+        if message.get("reason") != "compiler-artifact":
+            continue
+        if message.get("fresh") is not True:
+            stale.append(f"{package_name(message.get('package_id', ''))} {message.get('target', {}).get('name')}")
+        if not message.get("executable"):
             continue
         target = message["target"]
         name = package_name(message["package_id"])
@@ -86,8 +93,13 @@ def cargo_artifacts(args, root=ROOT, env=None):
                           "profile_test": (message.get("profile") or {}).get("test"),
                           "executable": os.path.relpath(executable, root), "fresh": message.get("fresh"),
                           "sha256": sha256(executable)})
-    return {"command": command, "exit": done.returncode, "stderr_tail": done.stderr[-2000:] if done.returncode else "",
-            "artifacts": artifacts}
+        if detail:
+            artifacts[-1]["profile"] = message.get("profile")
+    result = {"command": command, "exit": done.returncode,
+              "stderr_tail": done.stderr[-2000:] if done.returncode else "", "artifacts": artifacts}
+    if detail:
+        result["stale"] = stale
+    return result
 
 
 def go_binary(binary, checkout):

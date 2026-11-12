@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import acceptance
 import golden
@@ -473,14 +474,23 @@ def receipts(tmp, edit=None):
     return paths
 
 
+def current_cargo(items=None):
+    """What a successful current-artifact query reports for the unedited fixture: each
+    target's artifact as cargo built it (tests replace the query; the CLI never does)."""
+    items = items or complete_receipts()
+    return {"queried": True, "available": True, "problems": [],
+            "artifacts": {f"{e['package']} {e['target']}": dict(e["artifact"]) for e in items[4]["executions"]}}
+
+
 def _swap_case(r):
     r[0]["cases"][0] = copy.deepcopy(r[0]["cases"][1])
 
 
 class CombineTests(unittest.TestCase):
-    def verdict(self, edit=None):
+    def verdict(self, edit=None, current=None):
         with tempfile.TemporaryDirectory() as tmp:
-            return acceptance.combine(receipts(tmp, edit), PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts")
+            return acceptance.combine(receipts(tmp, edit), PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts",
+                                      current_targets=current or current_cargo())
 
     def test_complete_consistent_receipts_pass(self):
         self.assertEqual(self.verdict()["verdict"], "pass", self.verdict()["problems"])
@@ -939,6 +949,194 @@ class EvidenceTests(unittest.TestCase):
             (repo / "harness/acceptance.py").write_text("changed logic\n")
             git("commit", "-qam", "logic after the run")
             self.assertEqual(acceptance.verify_evidence(receipt, repo)["verdict"], "fail")
+
+
+
+def _other_build(package, target, tmp):
+    """Re-point one execution at another real, well-named build of the same crate: its bytes
+    are on disk and every hash and command in the record agrees with them."""
+    def edit(r):
+        execution = next(e for e in r[4]["executions"] if (e["package"], e["target"]) == (package, target))
+        old = execution["artifact"]["executable"]
+        new = old[:-16] + "e" * 16
+        data = b"another real build of the same crate\n"
+        path = Path(tmp) / "artifacts" / new
+        path.write_bytes(data)
+        execution.update(json.loads(json.dumps(execution).replace(old, new)))
+        for key in ("artifact", "artifact_after"):
+            execution[key]["sha256"] = provenance.hashlib.sha256(data).hexdigest()
+    return edit
+
+
+class CurrentArtifactTests(unittest.TestCase):
+    """The 1e0aa543 finding: combine accepted a receipt naming another real build of the same
+    crate. Each execution must now be the artifact cargo reports current for its target."""
+
+    def combine(self, edit=None, current=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = receipts(tmp, edit(tmp) if edit else None)
+            return acceptance.combine(paths, PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts",
+                                      current_targets=current or current_cargo())
+
+    def test_another_real_build_of_the_same_crate_fails(self):
+        self.assertEqual(self.combine()["verdict"], "pass")
+        for package in ("cpa-core", "cpa-exec"):
+            with self.subTest(package):
+                result = self.combine(lambda tmp, p=package: _other_build(p, "lib", tmp))
+                self.assertEqual(result["verdict"], "fail")
+                self.assertEqual(len(result["problems"]), 1, result["problems"])
+                self.assertIn(f"{package} lib: recorded artifact", result["problems"][0])
+                self.assertIn("is not cargo's current fresh artifact for this target", result["problems"][0])
+
+    def test_a_replay_passes_only_while_its_artifacts_are_current(self):
+        def current_is_other(tmp):
+            return _other_build("cpa-core", "lib", tmp)
+        with tempfile.TemporaryDirectory() as tmp:
+            items = complete_receipts()
+            paths = receipts(tmp, current_is_other(tmp))
+            edited = [json.loads(Path(p).read_text()) for p in paths]
+            # Cargo reports exactly what the receipt names: a legitimate replay.
+            result = acceptance.combine(paths, PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts",
+                                        current_targets=current_cargo(edited))
+            self.assertEqual(result["verdict"], "pass", result["problems"])
+            # Cargo now reports the original build: the same receipt no longer passes.
+            result = acceptance.combine(paths, PINS, current_source=SOURCE, artifact_root=Path(tmp) / "artifacts",
+                                        current_targets=current_cargo(items))
+            self.assertEqual(result["verdict"], "fail")
+
+    def test_an_unavailable_query_is_never_a_pass(self):
+        for current in ({"queried": True, "available": False, "problems": ["cargo query for cpa-core exited 101"],
+                         "artifacts": {}},
+                        {"queried": True, "available": None, "problems": [], "artifacts": {}}):
+            result = self.combine(current=current)
+            self.assertEqual(result["verdict"], "unavailable")
+            self.assertEqual(acceptance.EXIT[result["verdict"]], 2)
+            self.assertTrue(result["unavailable"])
+
+    def test_a_query_result_missing_one_target_fails(self):
+        current = current_cargo()
+        current["artifacts"].pop(next(iter(current["artifacts"])))
+        result = self.combine(current=current)
+        self.assertEqual(result["verdict"], "fail")
+        self.assertTrue(any("is not cargo's current fresh artifact" in p for p in result["problems"]))
+
+    def test_failing_records_do_not_query_cargo(self):
+        with mock.patch.object(acceptance, "current_cargo_targets", side_effect=AssertionError("queried")):
+            with tempfile.TemporaryDirectory() as tmp:
+                result = acceptance.combine(receipts(tmp, lambda r: r[4].update(partial=True)), PINS,
+                                            current_source=SOURCE, artifact_root=Path(tmp) / "artifacts")
+        self.assertEqual(result["verdict"], "fail")
+        self.assertFalse(result["current_cargo"]["queried"])
+
+
+class CargoQueryTests(unittest.TestCase):
+    """current_cargo_targets with cargo replaced: target-set mismatches, missing or stale
+    current artifacts and an unavailable query must each make the query unavailable."""
+
+    def query(self, change=None, sources=None):
+        items = complete_receipts()
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i, execution in enumerate(items[4]["executions"]):
+                path = root / execution["artifact"]["executable"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(binary(i))
+
+            def cargo(args, env=None, detail=False):
+                calls.append((list(args), env))
+                package = args[args.index("-p") + 1]
+                build = {"command": ["cargo", *args, "--message-format=json"], "exit": 0, "stderr_tail": "", "stale": [],
+                         "artifacts": [dict(e["artifact"], fresh=True, profile={"test": True, "opt_level": "0"})
+                                       for e in items[4]["executions"] if e["package"] == package]}
+                if change:
+                    change(package, build, env)
+                return build
+            source = mock.patch.object(provenance, "source_identity",
+                                       side_effect=sources or (lambda: dict(SOURCE)))
+            with mock.patch.object(provenance, "cargo_artifacts", side_effect=cargo), source, \
+                    mock.patch.object(acceptance, "_toolchain", return_value={"rustc": "rustc test"}):
+                result = acceptance.current_cargo_targets(PINS, dict(SOURCE), artifact_root=root)
+        return result, calls
+
+    def test_a_clean_query_names_every_target_and_records_how_it_ran(self):
+        result, calls = self.query()
+        self.assertTrue(result["available"], result["problems"])
+        self.assertEqual(set(result["artifacts"]), {f"{p} {t}" for p, t in acceptance.manifest_targets(PINS)})
+        self.assertEqual(len(calls), len({p for p, _ in acceptance.manifest_targets(PINS)}))
+        for args, env in calls:
+            self.assertIn("--offline", args)
+            self.assertIn("--locked", args)
+            self.assertIn("--no-run", args)
+            self.assertEqual(env["RUSTC_WRAPPER"], str(acceptance.NO_COMPILE_RUSTC))
+            self.assertTrue(env["CPA_NO_COMPILE_LOG"])
+        self.assertEqual(result["environment"]["RUSTC_WRAPPER"], str(acceptance.NO_COMPILE_RUSTC))
+        self.assertEqual(sorted(result["commands"]), sorted({p for p, _ in acceptance.manifest_targets(PINS)}))
+        self.assertTrue(all(p == {"test": True, "opt_level": "0"} for p in result["profiles"].values()))
+
+    def test_each_unavailable_state(self):
+        def first_target(package, build):
+            return next(iter(build["artifacts"]), None)
+
+        def only(name, edit):
+            return lambda package, build, env: edit(package, build, env) if package == name else None
+        states = {
+            "a target missing": only("cpa-core", lambda p, b, e: b.update(artifacts=[])),
+            "a target duplicated": only("cpa-core", lambda p, b, e: b["artifacts"].append(dict(b["artifacts"][0]))),
+            "an extra test executable": only("cpa-server", lambda p, b, e: b["artifacts"].append(
+                dict(b["artifacts"][0], name="unlisted", src_path="crates/cpa-server/tests/unlisted.rs",
+                     executable="target/debug/deps/unlisted-" + "0" * 16))),
+            "a target not fresh": only("cpa-exec", lambda p, b, e: b["artifacts"][0].update(fresh=False)),
+            "a dependency not fresh": only("cpa-exec", lambda p, b, e: b.update(stale=["tokio tokio"])),
+            "cargo exited nonzero": only("cpa-server", lambda p, b, e: b.update(exit=101)),
+            "a compilation was refused": only("cpa-core", lambda p, b, e: Path(e["CPA_NO_COMPILE_LOG"]).write_text(
+                "--crate-name cpa_core\n")),
+            "another source file": only("cpa-core", lambda p, b, e: b["artifacts"][0].update(src_path="crates/cpa-core/src/x.rs")),
+            "not a test profile": only("cpa-core", lambda p, b, e: b["artifacts"][0].update(profile_test=False)),
+            "bytes differ from cargo's hash": only("cpa-core", lambda p, b, e: b["artifacts"][0].update(sha256="6" * 64)),
+        }
+        for label, change in states.items():
+            with self.subTest(label):
+                result, _ = self.query(change)
+                self.assertFalse(result["available"], label)
+                self.assertTrue(result["problems"], label)
+        changing = iter([dict(SOURCE), dict(SOURCE, head="c" * 40)])
+        result, _ = self.query(sources=lambda: next(changing))
+        self.assertFalse(result["available"])
+        self.assertIn("the source changed during the cargo query or is not the combined source", result["problems"])
+
+
+class NoCompileWrapperTests(unittest.TestCase):
+    """harness/no-compile-rustc passes compiler information through and refuses compilation."""
+
+    def run_wrapper(self, *args, log=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            rustc = Path(tmp) / "rustc"
+            rustc.write_text("#!/bin/sh\necho RAN \"$@\"\n")
+            rustc.chmod(0o755)
+            env = {"PATH": "/usr/bin:/bin"}
+            if log:
+                env["CPA_NO_COMPILE_LOG"] = str(Path(tmp) / "refused.log")
+            done = subprocess.run([str(acceptance.NO_COMPILE_RUSTC), str(rustc), *args], capture_output=True, text=True,
+                                  env=env)
+            refused = (Path(tmp) / "refused.log").read_text() if (Path(tmp) / "refused.log").exists() else ""
+        return done, refused
+
+    def test_compiler_information_passes(self):
+        for args in (["-vV"], ["-", "--crate-name", "___", "--print=file-names", "--crate-type", "bin"]):
+            done, refused = self.run_wrapper(*args)
+            self.assertEqual((done.returncode, refused), (0, ""))
+            self.assertTrue(done.stdout.startswith("RAN"))
+
+    def test_compilation_is_refused_and_logged(self):
+        args = ["--crate-name", "cpa_core", "--edition=2024", "crates/cpa-core/src/lib.rs", "--test"]
+        done, refused = self.run_wrapper(*args)
+        self.assertEqual(done.returncode, 101)
+        self.assertNotIn("RAN", done.stdout)
+        self.assertIn("--crate-name cpa_core", refused)
+        done, _ = self.run_wrapper(*args, log=False)
+        self.assertEqual(done.returncode, 101)
+        self.assertNotIn("RAN", done.stdout)
 
 
 if __name__ == "__main__":
