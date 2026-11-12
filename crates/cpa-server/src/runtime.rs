@@ -124,6 +124,8 @@ impl Runtime {
             config_commit: Mutex::default(),
         };
         rt.publish_policy(policy);
+        rt.store
+            .set_model_aliases(crate::registry::global_aliases(&rt.config()));
         rt.store.configure_cooldown_store(cooldown_dir);
         // Failed attempts publish Go's error events on the RESP `errors` channel.
         let _ = rt.store.error_events.set(rt.usage.clone());
@@ -221,6 +223,7 @@ impl Runtime {
         }
         drop(commit);
         self.publish_policy(policy);
+        self.store.set_model_aliases(crate::registry::global_aliases(&config));
         self.store.configure_cooldown_store(dir);
         self.config_changed.send_replace(());
         true
@@ -264,7 +267,7 @@ impl Runtime {
             return Suspension::None;
         };
         let aliases = crate::registry::global_aliases(&self.config());
-        let key = crate::registry::selection_model(&aliases, &credential, model);
+        let key = crate::registry::cooldown_key(&aliases, &credential, model);
         self.store.suspension(&credential, &key)
     }
 
@@ -1267,7 +1270,8 @@ pub fn admission<'a>(
         let selection_key = crate::scheduler::canonical_model(&key);
         (registry.client_supports(&c.id, route)
             || (selection_key != route && registry.client_supports(&c.id, selection_key)))
-        .then_some(key)
+        // Cooldowns are found under the key dispatch records them under (#95).
+        .then(|| crate::registry::cooldown_key(aliases, c, &selection.model))
     }
 }
 
@@ -1477,6 +1481,9 @@ pub struct CredentialStore {
     /// Go `RegistrationEpoch` and `CredentialVersion` of every credential, registered
     /// with every change to the set ([`crate::registrations::register`]).
     registrations: crate::registrations::Registrations,
+    /// The current config's OAuth model aliases, which cooldown key migration resolves
+    /// spellings with ([`Self::migrate_model_keys`]); set on every config publish.
+    model_aliases: RwLock<Arc<HashMap<String, Vec<crate::registry::OAuthAlias>>>>,
 }
 
 /// Ends the upstream WebSocket sessions of one removed credential.
@@ -1592,7 +1599,38 @@ impl CredentialStore {
             unauthorized_noted: tokio::sync::watch::Sender::new(()),
             session_closer: std::sync::OnceLock::new(),
             registrations,
+            model_aliases: RwLock::default(),
         })
+    }
+
+    /// Records the config's OAuth model aliases and moves cooldowns to the keys their
+    /// spellings now resolve to (#95).
+    pub fn set_model_aliases(&self, aliases: HashMap<String, Vec<crate::registry::OAuthAlias>>) {
+        *self.model_aliases.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(aliases);
+        self.migrate_model_keys();
+    }
+
+    /// Moves every credential's cooldowns kept under a spelling that now resolves to
+    /// another key ([`Scheduler::migrate_model_keys`]), persisting when anything moved.
+    pub fn migrate_model_keys(&self) {
+        if self.migrate_model_keys_locked() {
+            self.persist_cooldowns();
+        }
+    }
+
+    fn migrate_model_keys_locked(&self) -> bool {
+        let aliases = self
+            .model_aliases
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let inner = self.read();
+        let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut moved = false;
+        for c in &inner.creds {
+            moved |= scheduler.migrate_model_keys(c, |m| crate::registry::cooldown_key(&aliases, c, m));
+        }
+        moved
     }
 
     /// Credential `id` and what a refresh of it starts under: its registration and
@@ -1695,15 +1733,26 @@ impl CredentialStore {
                 let Some(c) = inner.creds.iter().find(|c| c.id == record.auth_id.trim()) else {
                     continue;
                 };
-                if c.disabled || policy.cooling_disabled(c) {
+                if c.disabled {
                     continue;
                 }
                 let has_models = records
                     .iter()
                     .any(|r| r.auth_id.trim() == c.id && !r.model.trim().is_empty());
-                scheduler.restore(c, record, has_models, policy.max_trusted_cooldown, now, wall);
+                // With cooling disabled only forced cooldowns come back (Go v8.0.67).
+                scheduler.restore_with(
+                    c,
+                    record,
+                    has_models,
+                    policy.max_trusted_cooldown,
+                    now,
+                    wall,
+                    policy.cooling_disabled(c),
+                );
             }
         }
+        // Records saved under an older spelling come back under their current key.
+        self.migrate_model_keys_locked();
         self.persist_cooldowns();
     }
 
@@ -1719,11 +1768,18 @@ impl CredentialStore {
             let inner = self.read();
             let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
+            // A credential whose cooling is disabled keeps only its forced cooldowns.
             inner
                 .creds
                 .iter()
-                .filter(|c| !c.disabled && !policy.cooling_disabled(c))
-                .flat_map(|c| scheduler.records(c, now, wall))
+                .filter(|c| !c.disabled)
+                .flat_map(|c| {
+                    let forced_only = policy.cooling_disabled(c);
+                    scheduler
+                        .records(c, now, wall)
+                        .into_iter()
+                        .filter(move |r| !forced_only || r.force_cooldown_until.is_some())
+                })
                 .collect::<Vec<_>>()
         };
         records.sort_by(|a, b| (&a.provider, &a.auth_id, &a.model).cmp(&(&b.provider, &b.auth_id, &b.model)));
@@ -1850,7 +1906,7 @@ impl CredentialStore {
             self.scheduler
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .clear_disabled(&inner.creds, &policy)
+                .clear_disabled(&inner.creds, &policy, Instant::now())
         };
         if cleared {
             self.persist_cooldowns();
@@ -2893,6 +2949,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
+        self.migrate_model_keys_locked();
         self.persist_cooldowns();
     }
 
@@ -2926,6 +2983,7 @@ impl CredentialStore {
         drop(inner);
         drop(reload);
         self.clear_disabled_cooldowns();
+        self.migrate_model_keys_locked();
         self.persist_cooldowns();
     }
 

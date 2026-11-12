@@ -1468,9 +1468,25 @@ pub fn selection_model(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Crede
     }
 }
 
-/// Go `stateModelForExecution`.
+/// The model key a credential's cooldowns for `route_model` live under: the state
+/// model dispatch records an attempt under ([`state_model`] of the first execution
+/// model). Selection checks, probe holds and cooldown migration use it, so a cooldown
+/// is found under the key it was recorded under. Two spellings share a key only when
+/// this proxy resolves both to the same upstream model; spellings sent upstream
+/// differently stay apart (the provider decides whether they are one model).
+pub fn cooldown_key(cfg_aliases: &HashMap<String, Vec<OAuthAlias>>, c: &Credential, route_model: &str) -> String {
+    let (models, _) = execution_models(cfg_aliases, c, route_model);
+    let selection = selection_model(cfg_aliases, c, route_model);
+    let upstream = models.first().map(String::as_str).unwrap_or_default();
+    state_model(&selection, route_model, upstream, models.len() > 1)
+}
+
+/// Go `stateModelForExecution`. Go v8.0.67 (098af7d5 `sameCanonicalModelKey`)
+/// compares the selection and upstream models under `strings.ToLower`: when they
+/// differ only in case, the proxy has chosen the upstream spelling, so the state is
+/// keyed by what is sent.
 pub fn state_model(selection: &str, route_model: &str, upstream: &str, pooled: bool) -> String {
-    if !selection.trim().is_empty() && canonical_model(selection) == canonical_model(upstream) {
+    if !selection.trim().is_empty() && canonical_model(selection).go_lower() == canonical_model(upstream).go_lower() {
         return upstream.trim().to_owned();
     }
     if pooled && !upstream.trim().is_empty() {
@@ -1746,6 +1762,51 @@ mod tests {
             &Config::parse("oauth:\n  model-alias:\n    claude:\n      - {name: one, alias: σ}\n").unwrap(),
         );
         assert_eq!(execution_models(&only_sigma, &global, "ς").0, ["ς"]);
+    }
+
+    /// #95 (Go v8.0.67 098af7d5, issue 7360 shape 1): a configured model whose name
+    /// differs from its alias only in case is sent under the configured name, so every
+    /// client spelling of it shares that key (Go `strings.ToLower`, Unicode included).
+    /// Another alias stays keyed by the route (Go `stateModelForExecution`), and an
+    /// OAuth credential sends each client spelling as typed, so those stay apart.
+    #[test]
+    fn cooldown_keys_follow_the_spelling_sent_upstream() {
+        let none = HashMap::new();
+        let c = config(
+            "claude",
+            "claude:apikey:1",
+            serde_json::json!({"models":[
+                {"name":"Claude-Opus-4-6","alias":"claude-opus-4-6"},
+                {"name":"Claude-\u{d6}pus","alias":"claude-\u{f6}pus"},
+                {"name":"claude-sonnet-5","alias":"sonnet"}]}),
+            &[],
+        );
+        for route in ["claude-opus-4-6", "CLAUDE-OPUS-4-6", "Claude-Opus-4-6(high)"] {
+            assert_eq!(
+                canonical_model(&cooldown_key(&none, &c, route)),
+                "Claude-Opus-4-6",
+                "{route}"
+            );
+        }
+        assert_eq!(
+            canonical_model(&cooldown_key(&none, &c, "CLAUDE-\u{d6}PUS")),
+            "Claude-\u{d6}pus"
+        );
+        assert_eq!(cooldown_key(&none, &c, "sonnet"), "sonnet");
+        assert_eq!(
+            cooldown_key(&none, &c, "SONNET"),
+            "SONNET",
+            "an alias route keeps its spelling"
+        );
+        let oauth = file("a.json", serde_json::json!({"type":"claude"}), &[]);
+        assert_eq!(cooldown_key(&none, &oauth, "Claude-Opus-4-6"), "Claude-Opus-4-6");
+        assert_eq!(cooldown_key(&none, &oauth, "claude-opus-4-6"), "claude-opus-4-6");
+        // The comparison itself (Go `sameCanonicalModelKey`).
+        assert_eq!(
+            state_model("claude-opus-4-6", "claude-opus-4-6", "Claude-Opus-4-6", false),
+            "Claude-Opus-4-6"
+        );
+        assert_eq!(state_model("opus", "opus", "claude-opus-4-6", false), "opus");
     }
 
     #[test]

@@ -36,6 +36,15 @@ pub struct Record {
     /// decoder ignores it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cooldown_signals_account: String,
+    /// Go v8.0.67 `ForceCooldownUntil` (9d7d012b): the exact deadline a
+    /// `*-and-cooldown` rule forced, which outlives `disable-cooling`.
+    #[serde(default, with = "go_time", skip_serializing_if = "Option::is_none")]
+    pub force_cooldown_until: Option<SystemTime>,
+    /// Go v8.0.67 `ForceCooldownEvaluated`: the record was written with force
+    /// provenance, so a missing `force_cooldown_until` means an ordinary cooldown. Older
+    /// records lack it and are never treated as forced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_cooldown_evaluated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LastError>,
     #[serde(default, with = "go_time")]
