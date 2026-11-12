@@ -514,6 +514,31 @@
       ]
     },
     {
+      "id": "openai-created-timestamps",
+      "kind": "nondeterministic",
+      "targets": [
+        "historical",
+        "selective"
+      ],
+      "cases": [
+        "chat-completions",
+        "chat-completions-stream",
+        "completions",
+        "completions-stream"
+      ],
+      "may_be_absent": true,
+      "evidence": "Go and cliproxy-rs both stamp translated chat.completion(.chunk) and text_completion objects with the wall-clock second; the collector queries Go then Rust, so they can straddle a second boundary.",
+      "reason": "Only the created values may differ, by at most 5 seconds and the same number of times; every other byte is compared.",
+      "expect": [
+        {
+          "downstream_body_timestamps": {
+            "pattern": "\"created\":([0-9]{10})",
+            "max_skew_seconds": 5
+          }
+        }
+      ]
+    },
+    {
       "id": "credential-refresh-timestamps",
       "kind": "nondeterministic",
       "targets": [

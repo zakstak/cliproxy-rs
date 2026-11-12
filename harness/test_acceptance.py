@@ -153,6 +153,21 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.2")), "fail")
         self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.1", [["X-Extra", "1"]])), "fail")
 
+    def test_created_timestamps_may_only_differ_within_their_skew(self):
+        pins = pins_with(["openai-created-timestamps"])
+
+        def chunk(*created):
+            body = "".join(f'data: {{"object":"chat.completion.chunk","created":{c}}}\n\n' for c in created).encode()
+            return observation(replies=[reply(body, [["Content-Type", "text/event-stream"]])])
+        go = chunk(1794453411, 1794453411)
+        self.assertEqual(verdict("chat-completions", go, chunk(1794453412, 1794453412), pins)["verdict"], "pass")
+        self.assertEqual(verdict("chat-completions", go, chunk(1794457011, 1794457011), pins)["verdict"], "fail")
+        self.assertEqual(verdict("chat-completions", go, chunk(1794453412), pins)["verdict"], "fail")
+        other_bytes = observation(replies=[reply(
+            b'data: {"object":"chat.completion.chunk","created":1794453411,"x":1}\n\n'
+            b'data: {"object":"chat.completion.chunk","created":1794453411}\n\n', [["Content-Type", "text/event-stream"]])])
+        self.assertEqual(verdict("chat-completions", go, other_bytes, pins)["verdict"], "fail")
+
     def test_a_missing_delta_fails_instead_of_passing_silently(self):
         pins = pins_with(["I3-unauthenticated-connection-close"])
         same = observation(requests=[])

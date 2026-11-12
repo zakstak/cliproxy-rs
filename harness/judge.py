@@ -277,6 +277,31 @@ def _apply_edits(predicates, key, pairs):
     return out
 
 
+def _apply_timestamps(predicates, pairs):
+    """Wall-clock seconds minted per response: both sides carry the same number, all
+    within the stated skew of each other; then they are zeroed on both sides."""
+    out = []
+    for go_body, rust_body in pairs:
+        for divergence, index, spec in predicates.of("downstream_body_timestamps"):
+            pattern = re.compile(spec["pattern"].encode())
+            go_values = [int(m.group(1)) for m in pattern.finditer(go_body)]
+            rust_values = [int(m.group(1)) for m in pattern.finditer(rust_body)]
+            values = go_values + rust_values
+            if not go_values or len(go_values) != len(rust_values) \
+                    or max(values) - min(values) > spec["max_skew_seconds"]:
+                predicates.fail(divergence, index, f"timestamps Go {sorted(set(go_values))} Rust "
+                                                   f"{sorted(set(rust_values))} (skew limit {spec['max_skew_seconds']}s)")
+                continue
+            if go_values != rust_values:
+                predicates.hit(divergence)
+
+            def zero(match):
+                return match.group(0)[:match.start(1) - match.start(0)] + b"0" + match.group(0)[match.end(1) - match.start(0):]
+            go_body, rust_body = pattern.sub(zero, go_body), pattern.sub(zero, rust_body)
+        out.append((go_body, rust_body))
+    return out
+
+
 def _header_values(headers, name):
     values = [v for k, v in headers if k.lower() == name]
     return ", ".join(values) if values else None
@@ -502,6 +527,7 @@ def compare(case, go, rust, predicates, pins, run):
 
     if "downstream-body" not in replaced:
         pairs = [(_bytes(g.get("body_hex")), _bytes(r.get("body_hex"))) for g, r in zip(go["downstream"], rust["downstream"])]
+        pairs = _apply_timestamps(predicates, pairs)
         for i, (gb, rb) in enumerate(_apply_edits(predicates, "downstream_body_edit", pairs)):
             if gb == rb:
                 continue

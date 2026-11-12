@@ -434,6 +434,15 @@ def _credential(field, value):
     return edit
 
 
+def _skew_created(observation):
+    reply = observation["downstream"][0]
+    for key in ("body_hex", "raw_response_hex"):
+        data = bytes.fromhex(reply[key])
+        data = re.sub(rb'"created":([0-9]{10})', lambda m: b'"created":' + str(int(m.group(1)) + 3600).encode(), data)
+        reply[key] = data.hex()
+    reply["body_text"] = bytes.fromhex(reply["body_hex"]).decode("utf-8", errors="replace")
+
+
 # (target, case, label, Rust-side edit). Each must turn a passing case into a failure.
 MUTATIONS = [
     ("*", "buffered", "upstream max_tokens 17 -> 18", _replace_body('"max_tokens":17', '"max_tokens":18')),
@@ -447,6 +456,7 @@ MUTATIONS = [
     ("*", "continuity-two-turns", "TLS ClientHello ciphers changed", _tls_cipher),
     ("*", "client-disconnect", "credential persisted disabled: true", _credential("disabled", True)),
     ("*", "upstream-429", "unexpected downstream header", _reply_header("X-Unexpected", "1")),
+    ("*", "chat-completions", "created timestamp skewed by an hour", _skew_created),
     ("historical", "compact-claude", "compaction answer shape changed", _replace_reply('"status":"completed"', '"status":"failed"')),
     ("historical", "models-openai", "catalog entry dropped", _replace_reply('"id":"claude-sonnet-4-6"', '"id":"claude-sonnet-4-7"')),
     ("selective", "buffered", "C1 Rust User-Agent drifts", _header("User-Agent", "claude-cli/2.1.281 (external, cli)")),

@@ -37,6 +37,7 @@ DIVERGENCE_KINDS = {
     "unattributed",
 }
 PREDICATES = {"downstream_header", "upstream_header", "upstream_body_edit", "downstream_body_edit",
+              "downstream_body_timestamps",
               "downstream_json", "tls_extra_go_handshakes", "credential_field", "credential_timestamps", "replace"}
 REPLACE_COVERS = {"status", "downstream-body", "upstream", "tls"}
 SIDE_KEYS = {"status", "body_equals", "body_json", "inference_requests", "upstream_json", "upstream_headers",
@@ -78,6 +79,11 @@ def _predicate(predicate, where, divergence):
             if pattern:
                 re.compile(pattern)
                 _require(not re.fullmatch(pattern, "") and ".*" != pattern, f"{where}: pattern must be specific")
+    elif kind == "downstream_body_timestamps":
+        _require(set(spec) == {"pattern", "max_skew_seconds"} and 0 < spec["max_skew_seconds"] <= 60,
+                 f"{where}: needs a pattern and a skew of at most 60 seconds")
+        _require(re.compile(spec["pattern"]).groups == 1 and "([0-9]{10})" in spec["pattern"],
+                 f"{where}: the pattern captures exactly one 10-digit Unix time")
     elif kind == "downstream_json":
         _require(set(spec) <= {"go_only", "rust_only", "unordered", "generated"} and spec, f"{where}: json form")
         for item in spec.get("generated", []):
