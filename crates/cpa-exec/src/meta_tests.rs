@@ -107,8 +107,54 @@ struct Run {
     error: Option<ExecError>,
 }
 
+/// The fixtures record Go v8.0.35, which deleted `prompt_cache_retention`. The deliberate
+/// difference (docs/DIFFERENCES-FROM-GO.md, "Meta explicit prompt-cache retention"; Go
+/// v8.0.67 f77a3c10) is applied to the expected Meta request and its captured log text:
+/// the client's explicit string, trimmed, appended to Go's body. The recorded fixtures stay
+/// unchanged; the request sent is still the recorded one.
+fn with_retention_difference(mut fx: Value) -> Value {
+    let client = fx["request"]["body"].as_str().unwrap_or_default().to_owned();
+    let value = gj::get(client.as_bytes(), "prompt_cache_retention");
+    if value.kind != Kind::String {
+        return fx;
+    }
+    let retention = go_trim_space(&value.bytes()).to_vec();
+    if retention.is_empty() {
+        return fx;
+    }
+    let mut bodies = Vec::new();
+    for upstream in fx["upstream"].as_array_mut().into_iter().flatten() {
+        if !upstream["target"].as_str().unwrap_or_default().ends_with("/responses") {
+            continue;
+        }
+        assert!(upstream["body_b64"].as_str().unwrap_or_default().is_empty());
+        let go = upstream["body"].as_str().unwrap().to_owned();
+        assert!(!gj::get(go.as_bytes(), "prompt_cache_retention").exists());
+        let mut ours = go.clone().into_bytes();
+        gj::set_str(&mut ours, "prompt_cache_retention", &retention);
+        let ours = String::from_utf8(ours).unwrap();
+        for header in upstream["headers"].as_array_mut().unwrap() {
+            if header[0] == "Content-Length" {
+                header[1] = Value::String(ours.len().to_string());
+            }
+        }
+        upstream["body"] = Value::String(ours.clone());
+        bodies.push((go, ours));
+    }
+    assert!(!bodies.is_empty(), "explicit retention with no Meta request recorded");
+    if let Some(text) = fx["extra"]["capture"]["request"].as_str() {
+        let mut text = text.to_owned();
+        for (go, ours) in &bodies {
+            assert_eq!(text.matches(go.as_str()).count(), 1, "captured body");
+            text = text.replace(go.as_str(), ours);
+        }
+        fx["extra"]["capture"]["request"] = Value::String(text);
+    }
+    fx
+}
+
 async fn run(name: &str) -> Run {
-    let fx = fixture("meta", name);
+    let fx = with_retention_difference(fixture("meta", name));
     let origin = go_origin(&fx).expect("fixture names its capture server");
     let mock = Mock::start_replacing(&fx["responses"], Some(&origin)).await;
     let credential = meta_credential(&fx, &origin, &mock.url);
@@ -1089,6 +1135,144 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
         assert_eq!(captured.len(), usize::from(baseline_only));
         if let Some(sent) = captured.first() {
             assert!(String::from_utf8_lossy(&sent.body).contains(r#""text":"hi""#));
+        }
+    }
+}
+
+/// The body the executor sends upstream for `body` from a `source` client, captured by a
+/// private loopback mock with the fixture's synthetic credential.
+async fn sent_body(source: Format, body: &str, stream: bool, cfg: &Config) -> Vec<u8> {
+    let fx = fixture("meta", "responses-nonstream-collected");
+    let origin = go_origin(&fx).unwrap();
+    let mock = Mock::start(&fx["responses"]).await;
+    let credential = meta_credential(&fx, &origin, &mock.url);
+    let mut req = request(&fx, "");
+    req.source_format = source;
+    req.response_format = source;
+    req.stream = stream;
+    req.body = Bytes::from(body.to_owned());
+    req.original_body = req.body.clone();
+    let response = MetaExecutor::with_client(default_client())
+        .execute(&credential, req, cfg)
+        .await
+        .unwrap_or_else(|e| panic!("{source:?} {body}: {e:?}"));
+    if let ResponseBody::Stream(mut s) = response.body {
+        while s.next().await.is_some() {}
+    }
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1, "{source:?} {body}");
+    captured[0].body.clone()
+}
+
+/// One client body per format Meta serves (a Codex-format client is refused with 501
+/// before anything is sent), with `{}` standing for the `prompt_cache_retention` member
+/// (or nothing) between the model and the rest.
+const RETENTION_BODIES: [(Format, &str); 3] = [
+    (
+        Format::OpenAIResponse,
+        r#"{"model":"muse-spark-1.3"{},"input":"hello","temperature":0.2,"metadata":{"k":"v"}}"#,
+    ),
+    (
+        Format::OpenAI,
+        r#"{"model":"muse-spark-1.3"{},"messages":[{"role":"user","content":"hello"}],"temperature":0.2}"#,
+    ),
+    (
+        Format::Claude,
+        r#"{"model":"muse-spark-1.3"{},"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+    ),
+];
+
+/// M2 (#82), Go v8.0.67 f77a3c10: an explicit string `prompt_cache_retention` that is not
+/// blank reaches Meta trimmed; absent, empty, blank, null and non-string values are not
+/// sent, and nothing invents a default. Every other byte of the prepared body is the one
+/// the same request without the member produces.
+#[tokio::test]
+async fn prompt_cache_retention_passes_through_only_as_an_explicit_string() {
+    let cfg = cfg();
+    let cases: [(&str, Option<&str>); 11] = [
+        (r#","prompt_cache_retention":"24h""#, Some("24h")),
+        (r#","prompt_cache_retention":"in_memory""#, Some("in_memory")),
+        // Unknown values are the upstream's to judge.
+        (r#","prompt_cache_retention":"7d""#, Some("7d")),
+        // Go's strings.TrimSpace, then set as a string.
+        (r#","prompt_cache_retention":" 24h\t""#, Some("24h")),
+        (r#","prompt_cache_retention":"""#, None),
+        (r#","prompt_cache_retention":"   ""#, None),
+        (r#","prompt_cache_retention":null"#, None),
+        (r#","prompt_cache_retention":24"#, None),
+        (r#","prompt_cache_retention":true"#, None),
+        (r#","prompt_cache_retention":{"ttl":"24h"}"#, None),
+        (r#","prompt_cache_retention":["24h"]"#, None),
+    ];
+    for (source, template) in RETENTION_BODIES {
+        for stream in [false, true] {
+            let absent = sent_body(source, &template.replace("{}", ""), stream, &cfg).await;
+            assert!(
+                !gj::get(&absent, "prompt_cache_retention").exists(),
+                "{source:?} stream={stream}: no default when absent: {}",
+                String::from_utf8_lossy(&absent)
+            );
+            for (member, want) in cases {
+                let body = template.replace("{}", member);
+                let mut sent = sent_body(source, &body, stream, &cfg).await;
+                let got = gj::get(&sent, "prompt_cache_retention");
+                let shown = String::from_utf8_lossy(&sent).into_owned();
+                match want {
+                    Some(want) => {
+                        assert_eq!(got.kind, Kind::String, "{source:?} stream={stream} {member}: {shown}");
+                        assert_eq!(
+                            &*got.bytes(),
+                            want.as_bytes(),
+                            "{source:?} stream={stream} {member}: {shown}"
+                        );
+                    }
+                    None => assert!(!got.exists(), "{source:?} stream={stream} {member}: {shown}"),
+                }
+                gj::delete(&mut sent, "prompt_cache_retention");
+                assert_eq!(
+                    String::from_utf8_lossy(&sent),
+                    String::from_utf8_lossy(&absent),
+                    "{source:?} stream={stream} {member}: other bytes unchanged"
+                );
+            }
+        }
+    }
+}
+
+/// The payload rules stay the last change: a `default` rule fills only an omitted
+/// retention (its baseline carries the client's value), `override` replaces it and
+/// `filter` removes it.
+#[tokio::test]
+async fn payload_rules_decide_prompt_cache_retention_after_the_client() {
+    let rule = |kind: &str, params: &str| {
+        Config::parse(&format!(
+            "payload:\n  {kind}:\n    - models: [{{name: \"muse-*\", protocol: meta}}]\n      params: {params}\n"
+        ))
+        .unwrap()
+    };
+    let default = rule("default", r#"{prompt_cache_retention: "24h"}"#);
+    let override_ = rule("override", r#"{prompt_cache_retention: "24h"}"#);
+    let filter = rule("filter", "[prompt_cache_retention]");
+    let explicit = r#"{"model":"muse-spark-1.3","prompt_cache_retention":"in_memory","input":"hello"}"#;
+    let omitted = r#"{"model":"muse-spark-1.3","input":"hello"}"#;
+    let blank = r#"{"model":"muse-spark-1.3","prompt_cache_retention":" ","input":"hello"}"#;
+    let cases: [(&Config, &str, Option<&str>); 6] = [
+        (&default, omitted, Some("24h")),
+        (&default, blank, Some("24h")),
+        (&default, explicit, Some("in_memory")),
+        (&override_, explicit, Some("24h")),
+        (&override_, omitted, Some("24h")),
+        (&filter, explicit, None),
+    ];
+    for (i, (cfg, body, want)) in cases.into_iter().enumerate() {
+        for stream in [false, true] {
+            let sent = sent_body(Format::OpenAIResponse, body, stream, cfg).await;
+            let got = gj::get(&sent, "prompt_cache_retention");
+            let shown = String::from_utf8_lossy(&sent).into_owned();
+            match want {
+                Some(want) => assert_eq!(&*got.bytes(), want.as_bytes(), "case {i} stream={stream}: {shown}"),
+                None => assert!(!got.exists(), "case {i} stream={stream}: {shown}"),
+            }
         }
     }
 }
