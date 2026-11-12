@@ -141,7 +141,7 @@ fn write_with(
 ) -> Response {
     // Go `writeDirectErrorResponse`: the filtered headers as given, JSON by default.
     if let Some(e) = failure.direct() {
-        let delivered = e.delivered_status.unwrap_or(e.status);
+        let delivered = e.delivered_status.map_or(e.status, std::num::NonZeroU16::get);
         let status = StatusCode::from_u16(delivered).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut res = Response::new(axum::body::Body::from(direct_body(delivered, &e.body)));
         *res.status_mut() = status;

@@ -820,8 +820,11 @@ pub struct ExecError {
     pub direct: bool,
     /// For a `direct` error, the status the client receives when it differs from
     /// `status`, which stays the scheduler's classification (the Codex native route
-    /// delivers the upstream's own status while a usage limit is classified as 429).
-    pub delivered_status: Option<u16>,
+    /// delivers the upstream's own status while a usage limit is classified as 429). An
+    /// HTTP status is never zero; `NonZeroU16` also keeps this struct its size beside
+    /// [`Self::sourced`], so no error type that holds one grows (clippy
+    /// `result_large_err`).
+    pub delivered_status: Option<std::num::NonZeroU16>,
     /// How a WebSocket client learns of this failure ([`Delivery`]), apart from `status`
     /// and `body`, which stay the scheduler's classification.
     pub delivery: Delivery,

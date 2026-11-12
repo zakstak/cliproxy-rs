@@ -454,7 +454,7 @@ impl CodexExecutor {
                 // limit is classified 429); the client gets the upstream's own status.
                 error.body = body;
                 error.direct = true;
-                error.delivered_status = Some(status);
+                error.delivered_status = std::num::NonZeroU16::new(status);
             }
             return Err(error);
         }
