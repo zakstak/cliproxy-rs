@@ -7656,3 +7656,235 @@ async fn bootstrap_buffering_holds_response_metadata_and_releases_it_in_order() 
     assert_eq!(got.closed, None);
     assert_eq!(log.lock().unwrap().len(), 2, "the overload failed over");
 }
+
+/// The 401 `error` event a refused frame gets: no key in it.
+fn assert_refused(frame: &str, message: &str) {
+    let event: serde_json::Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(event["type"], "error", "{frame}");
+    assert_eq!(event["status"], 401, "{frame}");
+    assert_eq!(event["error"]["message"], message, "{frame}");
+    for key in ["client-key", "other-key"] {
+        assert!(!frame.contains(key), "{frame}");
+    }
+}
+
+/// The proxy's config with `keys` as the client keys.
+fn keyed(proxy: &Proxy, keys: &str, extra: &str) -> Config {
+    Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [{keys}]\n{extra}",
+        proxy._auth_dir.0.display()
+    ))
+    .unwrap()
+}
+
+/// N1 W2: a client key removed from `api-keys` stops the next create on a connection it
+/// opened, on the reused upstream socket of an ordinary connection and on a steering
+/// connection's duplex stream alike. The refused create reaches no upstream, the client
+/// gets a 401 `error` event that names no key, and the connection stays open: once the
+/// key is accepted again, the next create goes to the same socket as sent. An unrelated
+/// config change (another key added, the keys reordered) changes nothing.
+#[tokio::test]
+async fn a_revoked_client_key_admits_no_later_send_on_a_reused_socket() {
+    for steering in [false, true] {
+        let case = format!("steering={steering}");
+        let extra = if steering { STEERING } else { "" };
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws: replies(&["sse-completed", "sse-completed", "sse-completed"]),
+                ..Script::default()
+            },
+            extra,
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let create = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(create.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "extra-key, client-key", extra)));
+        let continuation = client_frame("ws-create-continuation", "gpt-5.5");
+        socket.send(Message::text(continuation.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}: an unrelated change keeps the connection's authority"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", extra)));
+        let refused = client_frame("ws-create-first", "gpt-5.5").replacen("List the files.", "refused", 1);
+        socket.send(Message::text(refused)).await.unwrap();
+        let got = read(&mut socket, &["error"]).await;
+        assert_eq!(got.frames.len(), 1, "{case}: {got:?}");
+        assert_refused(&got.frames[0], "Invalid API key");
+        assert_eq!(got.closed, None, "{case}: the connection stays open");
+        assert_eq!(
+            upstream_frames(&proxy, 0),
+            [create.clone(), continuation.clone()],
+            "{case}"
+        );
+
+        assert!(proxy.rt.publish_config(keyed(&proxy, "client-key", extra)));
+        let again = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(again.clone())).await.unwrap();
+        assert_eq!(
+            read(&mut socket, &TERMINAL).await.frames,
+            events("sse-completed"),
+            "{case}"
+        );
+        assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: the same socket");
+        assert_eq!(upstream_frames(&proxy, 0), [create, continuation, again], "{case}");
+    }
+}
+
+/// A loopback upstream for the W2 barrier tests: its socket answers the first frame with
+/// [`N1_CREATED`], waits for `release`, then sends [`N1_DONE`]; it answers later frames
+/// with both at once. Records every frame.
+async fn barrier_upstream(release: Arc<tokio::sync::Notify>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::extract::ws::{Message as Upstream, WebSocketUpgrade};
+    let frames = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = {
+        let frames = frames.clone();
+        axum::Router::new().route(
+            "/responses",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (frames, release) = (frames.clone(), release.clone());
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let mut first = true;
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let Upstream::Text(text) = message else { continue };
+                            frames.lock().unwrap().push(text.as_str().to_owned());
+                            let _ = socket.send(Upstream::Text(N1_CREATED.into())).await;
+                            if std::mem::take(&mut first) {
+                                // Frames the proxy forwards meanwhile are still recorded.
+                                let wait = release.notified();
+                                tokio::pin!(wait);
+                                loop {
+                                    tokio::select! {
+                                        () = &mut wait => break,
+                                        next = socket.recv() => match next {
+                                            Some(Ok(Upstream::Text(text))) => {
+                                                frames.lock().unwrap().push(text.as_str().to_owned());
+                                            }
+                                            Some(Ok(_)) => {}
+                                            _ => return,
+                                        },
+                                    }
+                                }
+                            }
+                            let _ = socket.send(Upstream::Text(N1_DONE.into())).await;
+                        }
+                    })
+                }
+            }),
+        )
+    };
+    (format!("http://{}", serve(app).await), frames)
+}
+
+/// N1 W2, queued work: a create the client sent while its previous turn ran waits in the
+/// connection's queue. The key is revoked before that turn ends; the queued create is
+/// then refused when its turn would send it, and never reaches the upstream.
+/// Deterministic: the upstream holds the first turn open until the revocation is
+/// published.
+#[tokio::test]
+async fn a_create_queued_before_revocation_is_refused_when_it_would_be_sent() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (url, frames) = barrier_upstream(release.clone()).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &url, true)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [N1_CREATED]);
+    socket
+        .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+        .await
+        .unwrap();
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    release.notify_one();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames[0], N1_DONE, "the running turn ends as upstream sent it");
+    assert_eq!(got.frames.len(), 2, "{got:?}");
+    assert_refused(&got.frames[1], "Invalid API key");
+    assert_eq!(
+        *frames.lock().unwrap(),
+        [first],
+        "only the first create reached upstream"
+    );
+}
+
+/// N1 W2, control frames: a `response.interrupt` sent after the key was revoked reaches
+/// no upstream (and would end no local turn); the client gets the 401 event, and the
+/// running response goes on to its end.
+#[tokio::test]
+async fn a_revoked_client_key_cannot_interrupt() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (url, frames) = barrier_upstream(release.clone()).await;
+    let proxy = proxy_with(Script::default(), "", |_| {
+        vec![credential(Profile::Chatgpt, &url, true)]
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    let first = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(first.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &["response.created"]).await.frames, [N1_CREATED]);
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    let interrupt = r#"{"type":"response.interrupt","response_id":"resp_n1","mode":"discard_partial_items"}"#;
+    socket.send(Message::text(interrupt)).await.unwrap();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames.len(), 1, "{got:?}");
+    assert_refused(&got.frames[0], "Invalid API key");
+    release.notify_one();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, [N1_DONE]);
+    assert_eq!(*frames.lock().unwrap(), [first], "the interrupt never reached upstream");
+}
+
+/// N1 W2, bound principal: a connection opened with one client key never acts as another
+/// key it also presents. When the bound key is revoked while the other stays accepted,
+/// the next create is refused as a changed credential instead of moving silently to the
+/// other key, as Go refuses a duplex turn (`3e7a21e2`).
+#[tokio::test]
+async fn another_accepted_key_never_replaces_the_bound_principal() {
+    let proxy = proxy(
+        Profile::Chatgpt,
+        Script {
+            ws: replies(&["sse-completed", "sse-completed"]),
+            ..Script::default()
+        },
+        "",
+    )
+    .await;
+    assert!(proxy.rt.publish_config(keyed(&proxy, "client-key, other-key", "")));
+    let mut socket = wreq::Client::new()
+        .websocket(format!("ws://{}/v1/responses", proxy.addr))
+        .header("authorization", "Bearer client-key")
+        .header("x-api-key", "other-key")
+        .header("user-agent", CODEX_UA)
+        .header("originator", "codex_cli_rs")
+        .send()
+        .await
+        .unwrap()
+        .into_websocket()
+        .await
+        .unwrap();
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    socket.send(Message::text(create.clone())).await.unwrap();
+    assert_eq!(read(&mut socket, &TERMINAL).await.frames, events("sse-completed"));
+    assert!(proxy.rt.publish_config(keyed(&proxy, "other-key", "")));
+    socket.send(Message::text(create.clone())).await.unwrap();
+    let got = read(&mut socket, &["error"]).await;
+    assert_eq!(got.frames.len(), 1, "{got:?}");
+    assert_refused(
+        &got.frames[0],
+        "client credential changed during the websocket stream; reconnect",
+    );
+    assert_eq!(upstream_frames(&proxy, 0), [create]);
+}

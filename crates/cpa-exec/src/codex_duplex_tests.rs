@@ -2388,3 +2388,133 @@ async fn pinned_settings_last_only_while_a_steer_names_their_parent() {
     up.ends_with("automatic successor has no retained parent settings", &settled)
         .await;
 }
+
+// ------------------------------------------------------------------ N1 #111 W2: client authority
+
+const REFUSAL_EVENT: &str = r#"{"type":"error","status":401,"error":{"message":"Invalid API key"}}"#;
+
+fn refusal() -> crate::codex_ws::Refusal {
+    crate::codex_ws::Refusal {
+        message: "Invalid API key".into(),
+        event: Bytes::from_static(REFUSAL_EVENT.as_bytes()),
+    }
+}
+
+/// A later create that arrives after the client's key lost its authority gets the
+/// refusal on the open stream and never reaches the upstream; once the key is accepted
+/// again, the next create goes upstream as sent.
+#[tokio::test]
+async fn a_revoked_client_cannot_send_a_later_create_and_stays_connected() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        let next = c.read().await;
+        if !next.contains("allowed") || next.contains("refused") {
+            c.error(format!("only the create sent with authority reaches upstream: {next}"));
+        }
+        c.write(r#"{"type":"response.created","response":{"id":"resp-2","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"resp-2","output":[]}}"#)
+            .await;
+        c.idle().await;
+    })
+    .await;
+    let client = Client::new("authority-test");
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = revoked.clone();
+    client.executor.attach_authority(
+        &client.session,
+        Arc::new(move || flag.load(Ordering::SeqCst).then(refusal)),
+    );
+    let mut stream = client
+        .start(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex)
+        .await;
+    let mut seen = Vec::new();
+    while let Some(chunk) = next(&mut stream).await {
+        let chunk = chunk.expect("the stream stays open");
+        let (event, id) = (get(&chunk, "type"), get(&chunk, "response.id"));
+        seen.push(chunk.clone());
+        if event == "response.completed" && id == "resp-1" {
+            revoked.store(true, Ordering::SeqCst);
+            client
+                .send(
+                    r#"{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"refused"}]}"#,
+                )
+                .await;
+        }
+        if event == "error" {
+            assert_eq!(chunk, REFUSAL_EVENT);
+            revoked.store(false, Ordering::SeqCst);
+            client
+                .send(
+                    r#"{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"allowed"}]}"#,
+                )
+                .await;
+        }
+        if event == "response.completed" && id == "resp-2" {
+            break;
+        }
+    }
+    assert_eq!(seen.iter().filter(|c| *c == REFUSAL_EVENT).count(), 1, "{seen:?}");
+    drop(stream);
+    up.finish().await;
+}
+
+/// A create admitted while the key was accepted is checked again right before the write:
+/// revoked in between (here: the third check, after the bootstrap send and the create's
+/// admission), it is never written, and the stream ends with the refusal, which the
+/// client receives as the refusal event. Deterministic: the authority itself flips.
+#[tokio::test]
+async fn a_create_admitted_before_revocation_is_not_written_after_it() {
+    let up = Scripted::start(|mut c: Peer| async move {
+        c.read().await;
+        c.write(r#"{"type":"response.created","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        c.write(r#"{"type":"response.completed","response":{"id":"resp-1","output":[]}}"#)
+            .await;
+        if let Ok(Some(Ok(axum::extract::ws::Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(5), c.socket.recv()).await
+        {
+            c.error(format!("a frame was written after revocation: {}", text.as_str()));
+        }
+    })
+    .await;
+    let client = Client::new("authority-race");
+    let checks = Arc::new(AtomicUsize::new(0));
+    let counted = checks.clone();
+    client.executor.attach_authority(
+        &client.session,
+        Arc::new(move || (counted.fetch_add(1, Ordering::SeqCst) >= 2).then(refusal)),
+    );
+    let mut stream = client
+        .start(&up.url, r#"{"model":"gpt-6-astra","input":[]}"#, Format::Codex)
+        .await;
+    let mut failure = None;
+    while let Some(chunk) = next(&mut stream).await {
+        match chunk {
+            Ok(chunk) => {
+                if get(&chunk, "type") == "response.completed" {
+                    client
+                        .send(r#"{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"queued"}]}"#)
+                        .await;
+                }
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let failure = failure.expect("the stream ends with the refusal");
+    assert_eq!((failure.status, failure.scope), (401, FailureScope::Request));
+    assert_eq!(
+        failure.delivered_event().map(|b| &b[..]),
+        Some(REFUSAL_EVENT.as_bytes())
+    );
+    assert_eq!(checks.load(Ordering::SeqCst), 3, "bootstrap send, admission, write");
+    drop(stream);
+    up.finish().await;
+}

@@ -27,7 +27,8 @@ use crate::rawjson;
 
 pub use crate::codex_request::DEFAULT_BASE_URL;
 pub use crate::codex_ws::{
-    ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, SessionLosses, SteeringInput, TakenLoss, handshake_metadata_event,
+    Authority, ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, Refusal, SessionLosses, SteeringInput, TakenLoss,
+    handshake_metadata_event,
 };
 pub use native::APPEND_REFUSED;
 
@@ -197,6 +198,12 @@ impl CodexExecutor {
     /// reads them after its first `response.created`; [`Self::close_session`] releases them.
     pub fn attach_steering(&self, session: &str, input: SteeringInput) {
         self.ws.attach_steering(session, input);
+    }
+
+    /// Binds a downstream connection's live client authorization to its session: each
+    /// upstream write of a client frame on that session first asks it (N1 #111 W2).
+    pub fn attach_authority(&self, session: &str, authority: std::sync::Arc<Authority>) {
+        self.ws.attach_authority(session, authority);
     }
 
     /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the

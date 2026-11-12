@@ -543,6 +543,9 @@ pub(crate) struct Session {
     acquired: std::sync::atomic::AtomicU64,
     /// The downstream connection's client frames when response steering is configured.
     steering: Mutex<Option<Arc<SteeringInput>>>,
+    /// Whether the client key the downstream connection was opened with still has
+    /// authority ([`Authority`]); checked right before each upstream write.
+    authority: Mutex<Option<Arc<Authority>>>,
     /// The credential of the last socket dialed (Go keeps `sess.authID` after the socket
     /// is gone, and removing that credential still ends the session).
     credential: Mutex<String>,
@@ -597,6 +600,17 @@ impl Session {
 
     fn steering(&self) -> Option<Arc<SteeringInput>> {
         self.steering.lock().expect("session steering").clone()
+    }
+
+    /// Why the downstream client may no longer send, if it may not. The check runs
+    /// outside the session lock.
+    pub(crate) fn refusal(&self) -> Option<Refusal> {
+        let authority = self.authority.lock().expect("session authority").clone();
+        authority.and_then(|authority| authority())
+    }
+
+    pub(crate) fn authority(&self) -> Option<Arc<Authority>> {
+        self.authority.lock().expect("session authority").clone()
     }
 
     /// `invalidateUpstreamConn`: only the session's current socket is dropped, so a stale
@@ -688,6 +702,7 @@ impl Pool {
                     sockets: Default::default(),
                     acquired: Default::default(),
                     steering: Mutex::default(),
+                    authority: Mutex::default(),
                     credential: Mutex::default(),
                 })
             })
@@ -702,6 +717,11 @@ impl Pool {
     /// `WithWebsocketInput`: binds the downstream connection's frames to its session.
     pub fn attach_steering(&self, id: &str, input: SteeringInput) {
         *self.session(id).steering.lock().expect("session steering") = Some(Arc::new(input));
+    }
+
+    /// Binds the downstream connection's client authority to its session (N1 #111 W2).
+    pub fn attach_authority(&self, id: &str, authority: Arc<Authority>) {
+        *self.session(id).authority.lock().expect("session authority") = Some(authority);
     }
 
     /// `CloseExecutionSession`: the downstream connection ended.
@@ -935,6 +955,31 @@ impl SessionLosses {
 fn transport(message: &str) -> ExecError {
     ExecError::local(502, FailureScope::Transport, message)
 }
+
+/// Why a downstream client may no longer send upstream (N1 #111 W2): the client key
+/// its connection was opened with is no longer accepted, or the connection now presents
+/// another accepted key. Neither the message nor the event names a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub message: String,
+    /// The `error` event the client receives for the refused frame.
+    pub event: Bytes,
+}
+
+impl Refusal {
+    /// The refused request's failure: request-scoped, so nothing fails over, no
+    /// credential cools and no upstream 401 handling runs; the client receives
+    /// [`Self::event`].
+    pub(crate) fn error(&self) -> ExecError {
+        let mut error = ExecError::local(401, FailureScope::Request, self.message.clone());
+        error.delivery = cpa_core::exec::Delivery::AsSent(Box::new(self.event.clone()));
+        error
+    }
+}
+
+/// The downstream connection's live client authorization, checked before each upstream
+/// write of a client frame: `None` while the key bound at the upgrade is still accepted.
+pub type Authority = dyn Fn() -> Option<Refusal> + Send + Sync;
 
 /// A failed upstream write and whether the frame provably never left
 /// ([`Upstream::write_certain`]).
@@ -2135,6 +2180,11 @@ impl CodexExecutor {
         }
         let started = Instant::now();
         let preserves = steering.is_none() && request::codex_client(&req);
+        if let Some(refusal) = session.refusal() {
+            // The client's key lost its authority after the turn was admitted (N1 #111
+            // W2): nothing of this request is written, and the socket stays as it was.
+            return Err(refusal.error());
+        }
         let mut rx = conn.activate(preserves);
         if let Err(WriteFailure { error, unsent }) = conn.send_create(frame.clone()).await {
             wire.ws_exec_error("send", &error);
@@ -2170,6 +2220,9 @@ impl CodexExecutor {
             fresh.bind(&session, exec_session.lease.as_ref())?;
             wire.bind(&fresh.secrets);
             req.usage.sent_credentials(&fresh.secrets);
+            if let Some(refusal) = session.refusal() {
+                return Err(refusal.error());
+            }
             rx = fresh.activate(preserves);
             wire.ws_request(&target.url, &headers, &frame);
             if let Some(handshake) = &fresh_handshake {
