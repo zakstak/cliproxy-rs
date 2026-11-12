@@ -2118,7 +2118,25 @@ impl CredentialStore {
         }
     }
 
+    /// The cooldown key `lease`'s result for `model` is recorded under: the key its
+    /// pick used, or where a config publish since then moved that key's cooldown
+    /// ([`crate::scheduler::migrated_key`], #95), so the lease still answers the state,
+    /// and the probe reservation, its pick took. Only that migration rule redirects:
+    /// never onto another model, and the caller has already checked that the lease's
+    /// credential revision is current. The generation and dispatch fences apply at the
+    /// key as before.
+    fn result_key(&self, lease: &Lease, model: &str) -> String {
+        let aliases = self
+            .model_aliases
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        crate::scheduler::migrated_key(model, |m| crate::registry::cooldown_key(&aliases, &lease.credential, m))
+            .unwrap_or_else(|| model.to_owned())
+    }
+
     fn accept_probe(&self, lease: &Lease) {
+        let model = self.result_key(lease, &lease.execution_model);
         let inner = self.read();
         // Like results: a credential edited or re-created since the pick is left alone.
         if !inner
@@ -2131,7 +2149,7 @@ impl CredentialStore {
         self.scheduler
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accept_probe_picked(&lease.credential, &lease.execution_model, lease.picked, Instant::now());
+            .accept_probe_picked(&lease.credential, &model, lease.picked, Instant::now());
     }
 
     fn record(&self, lease: &Lease, outcome: &Outcome) {
@@ -2148,6 +2166,7 @@ impl CredentialStore {
         if !matches!(outcome, Outcome::Cancelled) {
             self.note_activity(&lease.credential.id, matches!(outcome, Outcome::Success));
         }
+        let key = self.result_key(lease, model);
         let inner = self.read();
         // Outcomes from credentials deleted/re-created during an attempt must not
         // poison the replacement. Metadata edits likewise invalidate stale results.
@@ -2166,7 +2185,7 @@ impl CredentialStore {
             let before = persist.then(|| scheduler.records(&lease.credential, now, wall));
             scheduler.record_dispatched(
                 &lease.credential,
-                model,
+                &key,
                 outcome,
                 &lease.policy,
                 lease.picked,

@@ -716,3 +716,204 @@ mod store_witnesses {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Sol review of #136 at `3efe4c52`: a lease picked before a config-only alias publish
+/// moved its key's cooldown still answers that cooldown, and its accepted stream
+/// releases a reservation the move merged into an unbounded deadline owner. The OAuth
+/// alias is parsed from a real config (`{name: M(high), alias: m}`), which sends `m`
+/// upstream as `M(high)`, so `m`'s cooldown key moves to `M`. The publish leaves the
+/// credential revision unchanged; a replaced or removed credential's lease answers
+/// nothing.
+mod migrated_leases {
+    use super::*;
+    use cpa_core::exec::{ExecError, FailureScope};
+    use cpa_core::registry::dynamic::{OAuthAlias, cooldown_key, global_aliases};
+    use cpa_server::cooldown_store::{Quota, Record};
+    use cpa_server::runtime::{CredentialStore, Lease, Outcome, Selection};
+    use cpa_server::scheduler::Policy;
+    use std::collections::HashMap;
+
+    struct Setup {
+        dir: PathBuf,
+        store: Arc<CredentialStore>,
+        c: Credential,
+        policy: Arc<Policy>,
+    }
+
+    /// One Claude OAuth login with saved cooldowns: `bounded` an ended bounded quota
+    /// window, `unbounded` an ordinary cooldown that ends 100 ms later. Both have ended
+    /// when this returns.
+    fn setup(name: &str, bounded: &str, unbounded: Option<&str>) -> Setup {
+        let dir = auth_dir(name);
+        let meta = json!({"type": "claude", "access_token": "sk-ant-oat01-FAKE", "account_uuid": "synthetic"});
+        let c = Credential::from_file(&dir, &dir.join("a.json"), meta.as_object().unwrap().clone()).unwrap();
+        let now = SystemTime::now();
+        let record = |model: &str, millis: u64, quota: Quota| Record {
+            provider: "claude".into(),
+            auth_id: c.id.clone(),
+            model: model.into(),
+            status: "cooling".into(),
+            next_retry_after: Some(now + Duration::from_millis(millis)),
+            quota,
+            ..Default::default()
+        };
+        let mut records = vec![record(
+            bounded,
+            100,
+            Quota {
+                exceeded: true,
+                reason: "quota".into(),
+                next_recover_at: Some(now + Duration::from_secs(3600)),
+                trust_windows: Some(1),
+                ..Default::default()
+            },
+        )];
+        records.extend(unbounded.map(|m| record(m, 200, Quota::default())));
+        cpa_server::cooldown_store::save(&dir, records, now).unwrap();
+        let store = CredentialStore::new(vec![c.clone()]);
+        store.configure_cooldown_store(Some(dir.clone()));
+        std::thread::sleep(Duration::from_millis(300));
+        Setup {
+            dir,
+            store,
+            c,
+            policy: Arc::new(Policy::default()),
+        }
+    }
+
+    fn aliases() -> HashMap<String, Vec<OAuthAlias>> {
+        let config =
+            Config::parse("oauth:\n  model-alias:\n    claude:\n      - name: M(high)\n        alias: m\n").unwrap();
+        global_aliases(&config)
+    }
+
+    impl Setup {
+        fn pick(&self, key: &str) -> Option<Lease> {
+            let admit = |_: &Credential| Some(key.to_owned());
+            self.store
+                .select_with(Selection::new("claude", key), self.policy.clone(), &admit)
+                .ok()
+        }
+
+        /// Publishes the alias config, as a config reload does, and checks the move.
+        fn publish(&self) {
+            let revision = self.store.get(&self.c.id).unwrap().revision;
+            let aliases = aliases();
+            assert_eq!(
+                cooldown_key(&aliases, &self.c, "m"),
+                "M(high)",
+                "the parsed alias applies"
+            );
+            self.store.set_model_aliases(aliases);
+            assert_eq!(self.store.get(&self.c.id).unwrap().revision, revision, "config only");
+            let keys: Vec<String> = self.store.cooldowns(&self.c.id).into_iter().map(|s| s.model).collect();
+            assert!(!keys.contains(&"m".to_owned()), "moved: {keys:?}");
+        }
+    }
+
+    impl Drop for Setup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_lease_picked_before_an_alias_publish_answers_its_migrated_key() {
+        // Completion and stream acceptance, after one publish and after a repeated one.
+        for (accept, publishes) in [(false, 1), (true, 1), (false, 2), (true, 2)] {
+            let case = format!("accepted {accept}, {publishes} publishes");
+            let s = setup(&format!("old-key-{accept}-{publishes}"), "m", None);
+            let lease = s.pick("m").expect("the ended window's probe");
+            for _ in 0..publishes {
+                s.publish();
+            }
+            assert!(s.pick("M").is_none(), "{case}: the move keeps the hold");
+            if accept {
+                lease.accepted();
+                assert!(
+                    s.pick("M").is_some(),
+                    "{case}: the lease's stream answers the moved key"
+                );
+                lease.complete(Outcome::Success);
+            } else {
+                lease.complete(Outcome::Success);
+                assert!(
+                    s.pick("M").is_some(),
+                    "{case}: the lease's result answers the moved key"
+                );
+            }
+            assert!(
+                s.store.cooldowns(&s.c.id).is_empty(),
+                "{case}: nothing left under either key"
+            );
+        }
+        // A failure of such a lease cools the moved key, not the old spelling.
+        let s = setup("old-key-failure", "m", None);
+        let lease = s.pick("m").unwrap();
+        s.publish();
+        let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+        e.retry_after = Some(Duration::from_secs(600));
+        lease.complete(Outcome::Failure(e));
+        let states = s.store.cooldowns(&s.c.id);
+        assert!(
+            states.len() == 1 && states[0].model == "M" && states[0].remaining > Duration::from_secs(500),
+            "{states:?}"
+        );
+        // Control: without a publish the lease answers its own key.
+        let s = setup("old-key-control", "m", None);
+        let lease = s.pick("m").unwrap();
+        assert!(s.pick("m").is_none());
+        lease.complete(Outcome::Success);
+        assert!(s.pick("m").is_some());
+    }
+
+    #[test]
+    fn an_accepted_stream_releases_a_reservation_merged_into_an_unbounded_owner() {
+        // Both directions: the probe reserved under the key that stays (`M`) or under the
+        // one that moves (`m`); the later, unbounded cooldown owns the merged deadline.
+        for (reserved, other) in [("M", "m"), ("m", "M")] {
+            let s = setup(&format!("unbounded-owner-{reserved}"), reserved, Some(other));
+            let lease = s.pick(reserved).expect("the ended window's probe");
+            assert!(s.pick(reserved).is_none(), "one probe at a time");
+            s.publish();
+            assert!(s.pick("M").is_none(), "{reserved}: the merge keeps the hold");
+            lease.accepted();
+            assert!(s.pick("M").is_some(), "{reserved}: the accepted stream releases it");
+            lease.complete(Outcome::Success);
+        }
+        // Control: without a publish the accepted stream releases its own key.
+        let s = setup("unbounded-owner-control", "M", Some("m"));
+        let lease = s.pick("M").unwrap();
+        assert!(s.pick("M").is_none());
+        lease.accepted();
+        assert!(s.pick("M").is_some());
+        lease.complete(Outcome::Success);
+    }
+
+    #[test]
+    fn a_replaced_or_removed_credential_s_lease_answers_nothing() {
+        // Replaced: a metadata edit gives a new revision; the old lease's stream and
+        // result are ignored, so the moved hold stays until it lapses.
+        let s = setup("stale-replaced", "m", None);
+        let lease = s.pick("m").unwrap();
+        s.publish();
+        let mut edited = s.c.clone();
+        edited.metadata.insert("note".into(), "edited".into());
+        s.store.upsert(edited);
+        lease.accepted();
+        assert!(s.pick("M").is_none(), "a stale lease's stream releases nothing");
+        lease.complete(Outcome::Success);
+        assert!(s.pick("M").is_none(), "a stale lease's result releases nothing");
+        assert_eq!(s.store.cooldowns(&s.c.id).len(), 1, "the moved window stays");
+        // Removed: its cooldowns go with it, and the old lease's result recreates none.
+        let s = setup("stale-removed", "m", None);
+        let lease = s.pick("m").unwrap();
+        s.publish();
+        let revision = s.store.get(&s.c.id).unwrap().revision;
+        let bytes = std::fs::read(s.dir.join("a.json")).unwrap_or_default();
+        s.store.replace_file_backed(&s.c.id, revision, &bytes, None).unwrap();
+        assert!(s.store.get(&s.c.id).is_none());
+        lease.complete(Outcome::Success);
+        assert!(s.store.cooldowns(&s.c.id).is_empty());
+    }
+}

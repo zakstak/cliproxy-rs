@@ -940,21 +940,28 @@ impl Scheduler {
     /// are not newer than the lease change; their count stays until the stream's own
     /// outcome is recorded. When the credential-wide window ended, the model keys that
     /// share its deadline (its copies) are disarmed too; a model's own window is not.
+    /// A probe reservation a key migration carried onto another deadline owner (#95) is
+    /// released the same way, generation-fenced, whatever owns the deadline: the owner's
+    /// deadline, provenance and evidence stay as they are.
     /// Cost: two lookups, and a scan of the cooldown table only when the credential-wide
     /// window ended.
     pub fn accept_probe_picked(&mut self, c: &Credential, model: &str, picked: u32, now: Instant) {
         let model = canonical_model(model);
         let mut credential_window = None;
         for m in [model, ""] {
-            if let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned()))
-                && s.trust.bounded
-                && s.deadline <= now
-                && !s.newer_than(picked)
-            {
+            let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned())) else {
+                continue;
+            };
+            if s.newer_than(picked) {
+                continue;
+            }
+            if s.trust.bounded && s.deadline <= now {
                 s.trust.accept();
                 if m.is_empty() {
                     credential_window = Some(s.deadline);
                 }
+            } else {
+                s.trust.probe = None;
             }
         }
         if let Some(ended) = credential_window {
@@ -2109,16 +2116,11 @@ impl Scheduler {
     /// earned by sending the alias itself and stays where it is. Two entries for one key
     /// merge ([`merge_cooldowns`]). Returns whether anything moved.
     pub fn migrate_model_keys(&mut self, c: &Credential, key_of: impl Fn(&str) -> String, now: Instant) -> bool {
-        use cpa_core::gostr::GoStr;
         let moves: Vec<(String, String)> = self
             .cooldowns
             .keys()
-            .filter(|(id, m)| *id == c.id && !m.is_empty())
-            .filter_map(|(_, m)| {
-                let to = canonical_model(&key_of(m)).to_owned();
-                (!to.is_empty() && to != *m && to.go_lower() == m.go_lower() && canonical_model(&key_of(&to)) == to)
-                    .then(|| (m.clone(), to))
-            })
+            .filter(|(id, _)| *id == c.id)
+            .filter_map(|(_, m)| migrated_key(m, &key_of).map(|to| (m.clone(), to)))
             .collect();
         for (from, to) in &moves {
             let Some(moved) = self.cooldowns.remove(&(c.id.clone(), from.clone())) else {
@@ -2168,6 +2170,22 @@ impl Scheduler {
         self.probes.retain(|id, _| credentials.iter().any(|c| c.id == *id));
         self.rejected.retain(|id, _| credentials.iter().any(|c| c.id == *id));
     }
+}
+
+/// The key a cooldown kept under model key `key` moves to now
+/// ([`Scheduler::migrate_model_keys`]), or `None` when it stays: only to a spelling that
+/// is the same name under Go's `strings.ToLower` and that `key_of` maps to itself. A
+/// result for a lease picked before the move is recorded there too
+/// (`CredentialStore::result_key`), so it answers the state its pick reserved.
+pub(crate) fn migrated_key(key: &str, key_of: impl Fn(&str) -> String) -> Option<String> {
+    use cpa_core::gostr::GoStr;
+    let key = canonical_model(key);
+    if key.is_empty() {
+        return None;
+    }
+    let to = canonical_model(&key_of(key)).to_owned();
+    (!to.is_empty() && to != key && to.go_lower() == key.go_lower() && canonical_model(&key_of(&to)) == to)
+        .then_some(to)
 }
 
 /// Two cooldowns of one key after a migration (Go `mergeModelState`): the entry with
@@ -4520,6 +4538,108 @@ mod tests {
             s.record_picked(&c, "M", &Outcome::Success, &p, g, held);
             assert_eq!(s.wait(&c, "M", held), None, "{case}: its own lease frees it");
         }
+    }
+
+    /// Sol review of #136 at `3efe4c52` (finding 1): a reservation a merge carried onto a
+    /// later, unbounded deadline owner is released by its own lease's accepted stream,
+    /// in both collision orders. The owner keeps its own live deadline, provenance and
+    /// evidence, and an older lease's acceptance releases nothing.
+    #[test]
+    fn an_accepted_stream_releases_a_reservation_carried_onto_an_unbounded_owner() {
+        let t0 = Instant::now();
+        let p = Policy {
+            max_trusted_cooldown: secs(60),
+            ..Policy::default()
+        };
+        let c = cred("a", serde_json::json!({}));
+        let bounded = {
+            let mut e = ExecError::local(429, FailureScope::Model, "slow down".to_owned());
+            e.retry_after = Some(secs(3600));
+            Outcome::Failure(e)
+        };
+        let transient = |hint: u64| {
+            let mut e = ExecError::local(503, FailureScope::Model, "overloaded".to_owned());
+            e.retry_after = Some(secs(hint));
+            Outcome::Failure(e)
+        };
+        let key_of = |m: &str| -> String {
+            if m.eq_ignore_ascii_case("m") {
+                "M".into()
+            } else {
+                m.to_owned()
+            }
+        };
+        let t1 = t0 + secs(61);
+        // (reserved key, other key, the unbounded owner's deadline from t0): 60 s has
+        // ended at the pick, 70 s is still live at the acceptance.
+        for (reserved, other, owner) in [("m", "M", 60), ("M", "m", 60), ("m", "M", 70), ("M", "m", 70)] {
+            let case = format!("reserved {reserved}, unbounded {other} until {owner}s");
+            let setup = || {
+                let mut s = Scheduler::default();
+                s.record(&c, reserved, &bounded, &p, t0);
+                s.record(&c, other, &transient(owner), &p, t0 + secs(1));
+                let g = s.reserve_probe(&c, reserved, t1);
+                assert!(s.migrate_model_keys(&c, key_of, t1), "{case}");
+                let merged = &s.cooldowns[&(c.id.clone(), "M".to_owned())];
+                assert!(!merged.trust.bounded && merged.trust.probe.is_some(), "{case}: carried");
+                (s, g)
+            };
+            let accepted = t1 + secs(1);
+            let (mut s, g) = setup();
+            let provenance = |s: &Scheduler| {
+                let e = &s.cooldowns[&(c.id.clone(), "M".to_owned())];
+                (e.deadline, e.status, e.quota, e.trust.bounded, e.trust.window)
+            };
+            let before = provenance(&s);
+            s.accept_probe_picked(&c, "M", g.wrapping_sub(1), accepted);
+            assert!(s.wait(&c, "M", accepted).is_some(), "{case}: an older lease's stream");
+            assert!(s.wait(&c, "M", t0 + secs(80)).is_some(), "{case}: still held");
+            s.accept_probe_picked(&c, "M", g, accepted);
+            assert_eq!(
+                s.cooldowns[&(c.id.clone(), "M".to_owned())].trust.probe,
+                None,
+                "{case}: its own lease's stream releases it"
+            );
+            assert_eq!(
+                provenance(&s),
+                before,
+                "{case}: the owner's deadline and provenance stay"
+            );
+            let live = (before.0 > accepted).then(|| before.0 - accepted);
+            assert_eq!(
+                s.wait(&c, "M", accepted),
+                live,
+                "{case}: only a live deadline still waits"
+            );
+            assert_eq!(s.wait(&c, "M", t0 + secs(80)), None, "{case}");
+        }
+    }
+
+    /// The migration rule results follow (`migrated_key`): only to the same name under
+    /// Go's `strings.ToLower`, only when the target maps to itself, never from the
+    /// credential-wide key.
+    #[test]
+    fn migrated_keys_follow_only_case_variants_that_map_to_themselves() {
+        let alias = |m: &str| -> String {
+            match m {
+                "m" => "M(high)".into(),
+                other => other.to_owned(),
+            }
+        };
+        assert_eq!(migrated_key("m", alias), Some("M".to_owned()));
+        assert_eq!(
+            migrated_key("m(low)", alias),
+            Some("M".to_owned()),
+            "suffixes are not keys"
+        );
+        assert_eq!(migrated_key("M", alias), None, "the target stays");
+        assert_eq!(migrated_key("", alias), None);
+        assert_eq!(migrated_key("x", |_| "y".to_owned()), None, "never onto another model");
+        assert_eq!(
+            migrated_key("m", |m| if m == "m" { "M".into() } else { "m".into() }),
+            None,
+            "not a fixpoint"
+        );
     }
 
     #[test]
