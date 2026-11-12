@@ -724,6 +724,9 @@ fn image_or_video(id: &str) -> bool {
             | "grok-imagine-video"
             | "grok-imagine-video-1.5"
             | "grok-imagine-video-1.5-preview"
+            // Not in Go v8.0.67's list, which left the Lite video model it added
+            // visible to Codex clients (docs/DIFFERENCES-FROM-GO.md).
+            | "grok-imagine-video-1.5-lite"
             | "grok-tts"
             | "grok-voice-tts-1.0"
     )

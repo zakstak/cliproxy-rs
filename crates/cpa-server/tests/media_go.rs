@@ -266,16 +266,24 @@ async fn media_routes_match_go() {
     // (docs/DIFFERENCES-FROM-GO.md).
     let mut failures = replay("media", &media, |s| {
         if s.name.starts_with("models_grok_shell") {
-            without_compat_models(
-                &s.response
-                    .replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}")),
-            )
+            // Grok Imagine Video 1.5 Lite (#87) comes before the preview alias
+            // (docs/DIFFERENCES-FROM-GO.md).
+            let lite = forward_port::grok_video_lite::grok_shell_catalog(&s.response);
+            without_compat_models(&lite.replace(PREVIEW_ENTRY, &format!("{PREVIEW_ENTRY},{speech_entries}")))
+        } else if s.name == "video_retrieve_preview_model" {
+            // The created model when the poll omits it (#87, v8.0.67 f0ddc38f).
+            forward_port::grok_video_lite::retrieve_fallback_model(&s.response)
         } else {
             forward_port::gpt_image_26::error_message(&s.response)
         }
     })
     .await;
-    failures.extend(replay("speech", &speech, |s| s.response.clone()).await);
+    failures.extend(
+        replay("speech", &speech, |s| {
+            forward_port::grok_video_lite::grok_shell_catalog(&s.response)
+        })
+        .await,
+    );
     let errors: Fixture =
         serde_json::from_str(include_str!("fixtures/passthrough_errors_go.json")).expect("fixture parses");
     failures.extend(replay("errors", &errors, |s| s.response.clone()).await);
