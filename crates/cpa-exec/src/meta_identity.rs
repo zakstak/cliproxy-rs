@@ -28,6 +28,7 @@ use cpa_common::thinking::parse_suffix;
 use cpa_core::credential::Credential;
 use cpa_core::exec::ExecRequest;
 use cpa_core::gostr::GoStr;
+use sha2::{Digest, Sha256};
 
 /// The captured client's `User-Agent`.
 pub const USER_AGENT: &str =
@@ -42,8 +43,16 @@ const SESSION_CAPACITY: usize = 4096;
 
 #[derive(Default)]
 struct Sessions {
-    ids: HashMap<(String, String), String>,
-    order: VecDeque<(String, String)>,
+    ids: HashMap<SessionKey, String>,
+    order: VecDeque<SessionKey>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SessionKey {
+    credential: String,
+    authorization: [u8; 32],
+    caller: String,
+    session: String,
 }
 
 static SESSIONS: LazyLock<Mutex<Sessions>> = LazyLock::new(Mutex::default);
@@ -64,22 +73,46 @@ pub(crate) fn uuid_v7() -> String {
 /// The Muse session id for this request: one per explicit client session and
 /// credential, kept while the process runs; a fresh one per request otherwise.
 ///
-/// Only the client's own session signals count (Go `extractExplicitSessionIDs`). The
+/// Only the client's own conversation signals count (Go `extractExplicitSessionIDs`). The
 /// derived, first-messages and conversation-prefix sessions are guesses that can join
 /// unrelated clients, so a request without an explicit session is its own Muse session,
-/// as in Go v8.0.67. The credential is part of the key, so one client session never
-/// shares a Muse session id across accounts.
+/// as in Go v8.0.67. A plain user identity is not a conversation; in that case a
+/// transport-owned execution session can still supply the conversation identity.
+/// Credential authorization and caller fingerprints fence retained sessions without
+/// retaining credentials. A DCA token survives ordinary minted-key refresh, whereas
+/// another account's DCA token (or a changed API key) starts a separate session.
 pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &[u8]) -> String {
     let meta = cpa_common::session::Meta {
         execution_session: req.execution_session.as_deref(),
         derived: None,
     };
-    let (explicit, ..) = cpa_common::session::explicit_session(&req.headers, original, &meta);
+    let (explicit, _, _, source) = cpa_common::session::explicit_session(&req.headers, original, &meta);
+    let explicit = match source {
+        "header" | "metadata" | "body" | "execution" => explicit,
+        "user_id" => {
+            let execution =
+                cpa_common::session::normalize_explicit_id(req.execution_session.as_deref().unwrap_or_default());
+            if execution.is_empty() {
+                String::new()
+            } else {
+                format!("execution:{execution}")
+            }
+        }
+        _ => String::new(),
+    };
     let explicit = explicit.trim();
     if explicit.is_empty() {
         return uuid_v7();
     }
-    let key = (credential.id.clone(), explicit.to_owned());
+    let Some(authorization) = authorization_scope(credential) else {
+        return uuid_v7();
+    };
+    let key = SessionKey {
+        credential: credential.id.clone(),
+        authorization,
+        caller: cpa_common::session::caller_scope(&req.caller.principal),
+        session: explicit.to_owned(),
+    };
     let mut sessions = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(id) = sessions.ids.get(&key) {
         return id.clone();
@@ -93,6 +126,25 @@ pub(crate) fn session_id(credential: &Credential, req: &ExecRequest, original: &
     sessions.order.push_back(key.clone());
     sessions.ids.insert(key, id.clone());
     id
+}
+
+/// The login root, not a minted key that normal account refresh replaces. Without
+/// a DCA token the effective API key is the only available authorization identity;
+/// changing it conservatively starts a new session.
+fn authorization_scope(credential: &Credential) -> Option<[u8; 32]> {
+    let (kind, secret) = match crate::meta::dca_token(credential) {
+        Some(dca) => ("dca", dca),
+        None => ("api-key", crate::meta::creds(credential).1),
+    };
+    if secret.is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cliproxy-rs muse session authorization\0");
+    hash.update(kind.as_bytes());
+    hash.update(b"\0");
+    hash.update(secret.as_bytes());
+    Some(hash.finalize().into())
 }
 
 /// Go `isMetaContributorModel`: the model, without a thinking suffix, ends in

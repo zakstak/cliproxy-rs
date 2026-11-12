@@ -1375,6 +1375,130 @@ async fn session_ids_follow_explicit_client_sessions() {
     );
 }
 
+/// A user can open unrelated conversations. Only an actual session signal, including
+/// a transport-owned session when a plain user ID masks it, retains the Muse UUID.
+#[tokio::test]
+async fn user_identity_does_not_become_a_muse_conversation() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    let edit = |req: &mut ExecRequest, user: &str| {
+        let mut body: Value = serde_json::from_slice(&req.body).unwrap();
+        body["metadata"] = json!({"user_id": user});
+        req.body = serde_json::to_vec(&body).unwrap().into();
+        req.original_body = req.body.clone();
+    };
+    for user in [format!("plain-{unique}"), json!({"account_uuid": unique}).to_string()] {
+        let first = sent_request(ACCOUNT, |req, _| edit(req, &user), &cfg).await;
+        let next = sent_request(ACCOUNT, |req, _| edit(req, &user), &cfg).await;
+        assert_ne!(
+            assert_session_headers("user first", &first),
+            assert_session_headers("user next", &next)
+        );
+    }
+    let user = format!("user-{unique}");
+    let transport = format!("transport-{unique}");
+    let turn = || {
+        sent_request(
+            ACCOUNT,
+            |req, _| {
+                edit(req, &user);
+                req.execution_session = Some(transport.clone());
+            },
+            &cfg,
+        )
+    };
+    let first = turn().await;
+    let next = turn().await;
+    let id = assert_session_headers("transport first", &first);
+    assert_eq!(id, assert_session_headers("transport next", &next));
+    let other = sent_request(
+        ACCOUNT,
+        |req, _| {
+            edit(req, &user);
+            req.execution_session = Some(format!("other-{transport}"));
+        },
+        &cfg,
+    )
+    .await;
+    assert_ne!(id, assert_session_headers("another transport", &other));
+
+    let named = || {
+        sent_request(
+            ACCOUNT,
+            |req, _| {
+                edit(req, &user);
+                req.headers.insert("Session-Id", transport.parse().unwrap());
+            },
+            &cfg,
+        )
+    };
+    assert_eq!(
+        assert_session_headers("named first", &named().await),
+        assert_session_headers("named next", &named().await),
+    );
+}
+
+/// Session retention follows the authorization root, not the reusable filename or a
+/// short-lived minted key. Caller namespaces also keep equal session names apart.
+#[tokio::test]
+async fn muse_sessions_are_fenced_by_authorization_and_caller() {
+    let cfg = cfg();
+    let unique = uuid::Uuid::new_v4().to_string();
+    async fn turn(fixture: &str, unique: &str, root: &str, key: &str, caller: &str, cfg: &Config) -> Captured {
+        sent_request(
+            fixture,
+            |req, c| {
+                req.headers.insert("Session-Id", unique.parse().unwrap());
+                req.caller.principal = caller.into();
+                c.id = format!("same-file-{unique}.json");
+                if !root.is_empty() {
+                    c.metadata.insert("dca_token".into(), root.into());
+                }
+                c.metadata.insert("api_key".into(), key.into());
+                c.metadata.insert("access_token".into(), key.into());
+                c.attributes.remove("api_key");
+                c.attributes.remove("access_token");
+            },
+            cfg,
+        )
+        .await
+    }
+    let first = turn(
+        ACCOUNT,
+        &unique,
+        "dca:account-a",
+        "fake-minted-a",
+        "fake-caller-a",
+        &cfg,
+    )
+    .await;
+    let refreshed = turn(
+        ACCOUNT,
+        &unique,
+        "dca:account-a",
+        "fake-minted-a-new",
+        "fake-caller-a",
+        &cfg,
+    )
+    .await;
+    let id = assert_session_headers("account a", &first);
+    assert_eq!(id, assert_session_headers("account a refreshed", &refreshed));
+    for (root, key, caller) in [
+        ("dca:account-b", "fake-minted-b", "fake-caller-a"),
+        ("dca:recreated-account-c", "fake-minted-c", "fake-caller-a"),
+        ("dca:account-a", "fake-minted-a", "fake-caller-b"),
+    ] {
+        let replaced = turn(ACCOUNT, &unique, root, key, caller, &cfg).await;
+        assert_ne!(id, assert_session_headers("replaced account or caller", &replaced));
+    }
+    let first_key = turn(API_KEY, &unique, "", "fake-api-a", "fake-caller-a", &cfg).await;
+    let same_key = turn(API_KEY, &unique, "", "fake-api-a", "fake-caller-a", &cfg).await;
+    let other_key = turn(API_KEY, &unique, "", "fake-api-b", "fake-caller-a", &cfg).await;
+    let id = assert_session_headers("api a", &first_key);
+    assert_eq!(id, assert_session_headers("api a again", &same_key));
+    assert_ne!(id, assert_session_headers("api b", &other_key));
+}
+
 /// #81, Go v8.0.67 c2f402b4: contributor mode follows the model the prepared body sends,
 /// after alias resolution and payload rules, not the client's requested name.
 #[tokio::test]
