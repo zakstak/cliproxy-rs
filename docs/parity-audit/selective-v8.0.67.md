@@ -42,7 +42,7 @@ Credential ownership and the native-byte golden are checked on every case regard
 | `error-retry-after` | unattributed | none (tracker #66) | Code path `sdk/api/handlers/handlers_errors.go:127-138`; commit not bisected (candidates referenced by #94 and #111) | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
 | `credential-disabled-persist` | unattributed | none (tracker #66) | No commit located | Leaves `disabled` absent after an abandoned stream where cliproxy-rs and v8.0.10 persist `false` |
 
-Shared entries: `go-openai-model-order` (Go builds the OpenAI model list by ranging over a map),
+Shared entries: `go-openai-model-order` (Go builds the OpenAI model list by ranging over a map), `openai-created-timestamps` (wall-clock `created` within 5 seconds),
 `credential-refresh-timestamps`, `compaction-capsule-generated` and the `plain-upstream-host-label`
 harness boundary. Global rules: downstream header-name case and order
 ([ledger](../DIFFERENCES-FROM-GO.md#deliberate-differences)), chunk boundaries, Content-Length,
