@@ -663,22 +663,46 @@ fn bad_gateway(message: &str, stream: bool) -> Response {
     stream_failed(response, 502, message)
 }
 
-/// Raw upstream bytes; a terminal error becomes an `error` event. A routed stream that
-/// ends without data writes a single newline (`streamRoutedImages`); a compat one writes
-/// nothing (`streamOpenAICompatImages`).
+/// Raw upstream bytes, as they were read, so the body can stop inside an SSE line or
+/// event; heartbeats wait for the next event boundary ([`respond::resume`]). A terminal
+/// error becomes an `error` event, after the line ends that close whatever event the
+/// upstream left open, so the error event is never merged into it (Go v8.0.67 91e0dee8
+/// `ensureImagesSSEEventBoundary`). A routed stream that ends without data writes a
+/// single newline (`streamRoutedImages`); a compat one writes nothing
+/// (`streamOpenAICompatImages`).
 struct Raw {
     started: bool,
     routed: bool,
+    /// Where the bytes written so far end.
+    tail: respond::SseTail,
+}
+
+impl Raw {
+    fn new(routed: bool) -> Self {
+        Raw {
+            started: false,
+            routed,
+            tail: respond::SseTail::START,
+        }
+    }
 }
 
 impl Writer for Raw {
     fn chunk(&mut self, event: Bytes) -> Vec<Bytes> {
         self.started = true;
+        self.tail = self.tail.after(&event);
         vec![event]
     }
     fn error(&mut self, error: &ExecError) -> Vec<Bytes> {
         let failure = Failure::Exec(error.clone());
-        vec![stream_error_event(failure.status(), &failure.text())]
+        let event = stream_error_event(failure.status(), &failure.text());
+        let close = self.tail.close();
+        self.tail = self.tail.after(close).after(&event);
+        if close.is_empty() {
+            vec![event]
+        } else {
+            vec![Bytes::from_static(close), event]
+        }
     }
     fn end(&mut self) -> Vec<Bytes> {
         if self.started || !self.routed {
@@ -710,7 +734,7 @@ async fn raw(p: Prepared, model: &str, body: Vec<u8>, stream: bool, routed: bool
             Ok(Done::Buffered { body, .. }) if !stream => json_ok(body),
             Ok(Done::Buffered { body, .. }) => sse_events(body),
             Ok(Done::Stream { first, rest, .. }) => {
-                let writer = Raw { started: false, routed };
+                let writer = Raw::new(routed);
                 respond::sse(respond::stream(first, rest, writer, keepalive))
             }
         }

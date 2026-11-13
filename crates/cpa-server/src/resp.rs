@@ -310,11 +310,15 @@ fn remote_ip(peer: SocketAddr) -> (String, bool) {
     (host, local)
 }
 
-/// Go `handleRedisConnection`.
-pub(crate) async fn serve<IO>(io: IO, peer: SocketAddr, mgmt: Arc<Management>)
+/// Go `handleRedisConnection`. Until `AUTH` succeeds, every command must have arrived
+/// within `setup_limit` of the call (Go v8.0.67 477605dc sets that read deadline when
+/// the connection is routed here and clears it on `AUTH`), so an unauthenticated client
+/// cannot hold the connection open.
+pub(crate) async fn serve<IO>(io: IO, peer: SocketAddr, mgmt: Arc<Management>, setup_limit: std::time::Duration)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let setup = tokio::time::Instant::now() + setup_limit;
     let (read, write) = tokio::io::split(io);
     let mut reader = BufReader::new(read);
     let mut writer = BufWriter::new(write);
@@ -344,7 +348,16 @@ where
         if !mgmt.routes_enabled() {
             return;
         }
-        let args = match read_command(&mut reader).await {
+        let command = read_command(&mut reader);
+        let command = if authed {
+            command.await
+        } else {
+            match tokio::time::timeout_at(setup, command).await {
+                Ok(command) => command,
+                Err(_) => return,
+            }
+        };
+        let args = match command {
             Ok(args) => args,
             Err(e) => {
                 if let Some(message) = e.message() {

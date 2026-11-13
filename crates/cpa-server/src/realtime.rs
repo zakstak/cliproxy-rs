@@ -193,7 +193,10 @@ async fn authenticate(
         }
     };
     req.extensions_mut().insert(principal);
-    next.run(req).await
+    match crate::request_logging::authenticated_body(req).await {
+        Ok(req) => next.run(req).await,
+        Err(response) => *response,
+    }
 }
 
 /// `writeRealtimeError`: gin.H marshals with sorted keys.
