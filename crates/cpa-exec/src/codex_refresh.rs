@@ -596,3 +596,7 @@ fn rejected_partitions(
 #[cfg(test)]
 #[path = "codex_refresh_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_refresh_head_tests.rs"]
+mod head_tests;
