@@ -73,31 +73,40 @@ fn reasoning_texts(obj: &Res<'_>) -> Vec<Vec<u8>> {
         .unwrap_or_default()
 }
 
+/// The reasoning texts of `node` in document order. Nested arrays wait on a heap stack;
+/// arrays more than [`gj::WALK_DEPTH_LIMIT`] levels below `node` are skipped.
 fn collect_reasoning(node: &Res<'_>, texts: &mut Vec<Vec<u8>>) {
-    if !node.exists() {
-        return;
-    }
-    if node.is_array() {
-        node.each(|_, v| {
-            collect_reasoning(&v, texts);
-            true
-        });
-        return;
-    }
-    match node.kind {
-        Kind::String if !node.s.is_empty() => texts.push(node.s.to_vec()),
-        Kind::Json => {
-            let text = node.get("text");
-            if text.exists() {
-                let text = text.bytes();
-                if !text.is_empty() {
-                    texts.push(text.into_owned());
-                }
-            } else if !node.raw.is_empty() && !node.raw.starts_with(b"{") && !node.raw.starts_with(b"[") {
-                texts.push(node.raw.to_vec());
-            }
+    let mut pending = vec![(node.clone(), 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if !node.exists() {
+            continue;
         }
-        _ => {}
+        if node.is_array() {
+            if depth < gj::WALK_DEPTH_LIMIT {
+                let mut items = vec![];
+                node.each(|_, v| {
+                    items.push((v, depth + 1));
+                    true
+                });
+                pending.extend(items.into_iter().rev());
+            }
+            continue;
+        }
+        match node.kind {
+            Kind::String if !node.s.is_empty() => texts.push(node.s.to_vec()),
+            Kind::Json => {
+                let text = node.get("text");
+                if text.exists() {
+                    let text = text.bytes();
+                    if !text.is_empty() {
+                        texts.push(text.into_owned());
+                    }
+                } else if !node.raw.is_empty() && !node.raw.starts_with(b"{") && !node.raw.starts_with(b"[") {
+                    texts.push(node.raw.to_vec());
+                }
+            }
+            _ => {}
+        }
     }
 }
 

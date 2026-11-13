@@ -228,3 +228,41 @@ fn wildcard_rules_scale_linearly() {
         "16x the elements took {ratio:.0}x the time ({small:?} to {large:?})"
     );
 }
+
+/// Issue #146: a configured filter for a key holding an escaped quote removes the whole
+/// member. sjson v1.2.5 left `{"\"x":,"y":2}`, which is invalid JSON
+/// (docs/DIFFERENCES-FROM-GO.md "sjson deletion of escaped keys").
+#[test]
+fn filter_of_escaped_quote_key_keeps_valid_json() {
+    let source = br#"{"\"x":1,"y":2}"#;
+    for yaml in [
+        "requests:\n  payload:\n    filter:\n      - models:\n          - name: \"*\"\n            protocol: claude\n        params:\n          - '\\\"x'\n",
+        "payload:\n  filter:\n    - models: [{name: \"*\", protocol: claude}]\n      params: ['\\\"x']\n",
+    ] {
+        let cfg = Config::parse(yaml).unwrap();
+        let rules = payload::Rules::of(&cfg);
+        let req = payload::Request {
+            target_executor: "claude",
+            model: "claude-test",
+            requested_model: "claude-test",
+            protocol: "claude",
+            from_protocol: "claude",
+            root: "",
+            original: source,
+            request_path: "/v1/messages",
+            headers: None,
+        };
+        let out = payload::apply(&rules, &req, source.to_vec());
+        assert_eq!(out, br#"{"y":2}"#, "{}", String::from_utf8_lossy(&out));
+        assert!(serde_json::from_slice::<Value>(&out).is_ok());
+        // Untouched members keep their bytes, spacing and number spelling.
+        let spaced = br#"{ "n" : 1.50e0 , "\"x" : {"deep":[1,"\""]}, "u":{"k":"\u00e9"} }"#;
+        let out = payload::apply(&rules, &req, spaced.to_vec());
+        assert_eq!(
+            out,
+            br#"{ "n" : 1.50e0 , "u":{"k":"\u00e9"} }"#,
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}

@@ -392,12 +392,10 @@ fn with_model(raw: &[u8], model: &[u8], original: &[u8], translated: &[u8]) -> V
 /// [`StreamTranslator::tool_input_failed`]: the event's frames end in `response.failed`
 /// and the executor stops with HTTP 502 and [`crate::APPLY_PATCH_UPSTREAM_ERROR`].
 pub fn stream_with_bridge(ctx: &ResponseCtx<'_>, bridge: Bridge) -> Box<dyn StreamTranslator> {
-    let levels = crate::levels(&[ctx.original_request, ctx.translated_request]);
     stream::framed(
         cpa_core::format::Format::OpenAIResponse,
         cpa_core::format::Format::Codex,
         Box::new(events(ctx, Some(bridge))),
-        levels,
     )
 }
 
@@ -405,11 +403,10 @@ pub fn stream_with_bridge(ctx: &ResponseCtx<'_>, bridge: Bridge) -> Box<dyn Stre
 /// rejected body is `Err(APPLY_PATCH_UPSTREAM_ERROR)` (Go returns nil and the executor
 /// answers 502); the bridge keeps the underlying error.
 pub fn non_stream_with_bridge(ctx: &ResponseCtx<'_>, body: &[u8], bridge: &mut Bridge) -> Result<Vec<u8>, Error> {
-    let levels = crate::levels(&[body, ctx.original_request, ctx.translated_request]);
-    crate::deep_stack(levels, || match bridge.transform_non_stream(body) {
+    match bridge.transform_non_stream(body) {
         Ok(converted) => non_stream(ctx, &converted),
         Err(_) => Err(Error(crate::APPLY_PATCH_UPSTREAM_ERROR.into())),
-    })
+    }
 }
 
 fn non_stream(_: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {

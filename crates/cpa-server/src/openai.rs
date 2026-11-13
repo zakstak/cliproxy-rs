@@ -147,12 +147,10 @@ pub async fn chat_completions(
     // sends the converted body.
     if responses_shaped(&body) {
         let model = gojson::gjson_string(fields.get("model"));
-        if let Ok(converted) = cpa_translate::responses_to_chat_completions_body(&model, &body, stream) {
-            body = Bytes::from(converted);
-            stream = peek(&body)
-                .get("stream")
-                .is_some_and(|v| v.as_bool() == Some(true) || truthy(v));
-        }
+        body = Bytes::from(cpa_translate::responses_to_chat_completions_body(&model, &body, stream));
+        stream = peek(&body)
+            .get("stream")
+            .is_some_and(|v| v.as_bool() == Some(true) || truthy(v));
     }
     let model = gojson::gjson_string(peek(&body).get("model"));
     let query = uri.query().unwrap_or_default().to_owned();

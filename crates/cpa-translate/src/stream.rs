@@ -250,12 +250,6 @@ struct Framed {
     upstream: Format,
     inner: Box<dyn GoStream>,
     responses: ResponsesFramer,
-    /// Nesting of the requests the translator reads.
-    request_levels: usize,
-    /// Nesting of everything read from upstream so far (state the translator retains).
-    seen: crate::Depth,
-    /// A stack reservation that failed in `finalize_tool_input`; the stream is broken.
-    failed: Option<Error>,
     options: StreamOptions,
 }
 
@@ -317,19 +311,16 @@ impl StreamTranslator for Framed {
         self.responses.flush()
     }
 
+    /// Runs on the caller's thread for every event: the translators' walkers keep nested
+    /// JSON on the heap (issue #146), whatever the stream has carried so far.
     fn event(&mut self, event: &[u8]) -> Result<Vec<Bytes>, Error> {
-        if let Some(e) = &self.failed {
-            return Err(e.clone());
-        }
-        self.seen.feed(event);
-        crate::deep_stack(self.levels(), || self.translate(event))
+        self.translate(event)
     }
 
     fn finish(&mut self) -> Result<Vec<Bytes>, Error> {
-        if let Some(e) = &self.failed {
-            return Err(e.clone());
-        }
-        crate::deep_stack(self.levels(), || self.finish_frames())
+        let mut out = vec![];
+        self.responses.flush_into(&mut out);
+        Ok(out.into_iter().map(Bytes::from).collect())
     }
 
     fn tool_input_failed(&self) -> bool {
@@ -337,39 +328,16 @@ impl StreamTranslator for Framed {
     }
 
     fn can_finalize_response_stream(&self) -> bool {
-        self.failed.is_none() && self.inner.can_finalize_response_stream()
+        self.inner.can_finalize_response_stream()
     }
 
-    /// A stack that cannot be reserved emits nothing; every later `event` and `finish`
-    /// then returns that error.
     fn finalize_tool_input(&mut self) -> Vec<Bytes> {
-        if self.failed.is_some() {
-            return vec![];
-        }
-        let finalized = crate::deep_stack(self.levels(), || {
-            let chunks = self.inner.finalize_tool_input();
-            Ok(self.framed(chunks))
-        });
-        finalized.unwrap_or_else(|e| {
-            self.failed = Some(e);
-            vec![]
-        })
+        let chunks = self.inner.finalize_tool_input();
+        self.framed(chunks)
     }
 }
 
 impl Framed {
-    fn levels(&self) -> usize {
-        self.request_levels.max(self.seen.levels())
-    }
-
-    fn finish_frames(&mut self) -> Result<Vec<Bytes>, Error> {
-        let mut out = vec![];
-        let mut pending = vec![];
-        self.responses.flush_into(&mut pending);
-        out.extend(pending.into_iter().map(Bytes::from));
-        Ok(out)
-    }
-
     fn translate(&mut self, event: &[u8]) -> Result<Vec<Bytes>, Error> {
         let mut chunks = vec![];
         if self.upstream == Format::OpenAI {
@@ -394,13 +362,8 @@ impl Framed {
 /// Go's OpenAI-compatible executor joins a frame's `data:` lines into one line and feeds
 /// `data: [DONE]` when a non-Responses stream ends without one. Executors that do so pass
 /// those lines as events.
-pub(crate) fn framed(
-    client: Format,
-    upstream: Format,
-    inner: Box<dyn GoStream>,
-    request_levels: usize,
-) -> Box<dyn StreamTranslator> {
-    framed_with(client, upstream, inner, request_levels, StreamOptions::default())
+pub(crate) fn framed(client: Format, upstream: Format, inner: Box<dyn GoStream>) -> Box<dyn StreamTranslator> {
+    framed_with(client, upstream, inner, StreamOptions::default())
 }
 
 /// [`framed`] with a Go executor's [`StreamOptions`].
@@ -408,7 +371,6 @@ pub(crate) fn framed_with(
     client: Format,
     upstream: Format,
     inner: Box<dyn GoStream>,
-    request_levels: usize,
     options: StreamOptions,
 ) -> Box<dyn StreamTranslator> {
     Box::new(Framed {
@@ -416,9 +378,6 @@ pub(crate) fn framed_with(
         upstream,
         inner,
         responses: ResponsesFramer::default(),
-        request_levels,
-        seen: crate::Depth::default(),
-        failed: None,
         options,
     })
 }
@@ -443,19 +402,6 @@ mod tests {
             self.0.push(line.to_vec());
             Ok(vec![line.to_vec()])
         }
-    }
-
-    #[test]
-    fn a_failed_finalize_breaks_the_stream() {
-        let mut s = framed(Format::OpenAI, Format::OpenAI, Box::new(Echo(vec![])), 1000);
-        assert_eq!(s.event(b"data: {}\n\n").unwrap().len(), 1, "deep stack available");
-        crate::FAIL_SPAWN.with(|f| f.set(true));
-        assert!(s.finalize_tool_input().is_empty());
-        crate::FAIL_SPAWN.with(|f| f.set(false));
-        let err = s.finish().unwrap_err();
-        assert!(err.0.contains("stack"), "{err}");
-        assert_eq!(s.event(b"data: {}\n\n").unwrap_err(), err);
-        assert!(s.finalize_tool_input().is_empty());
     }
 
     fn responses(chunks: &[&[u8]]) -> Vec<Vec<u8>> {
@@ -547,7 +493,7 @@ mod tests {
     #[test]
     fn openai_joined_data_payload_stays_one_line() {
         // Go scenario stream_multiline_data: the executor's joined payload keeps its newline.
-        let mut s = framed(Format::OpenAI, Format::OpenAI, Box::new(Echo(vec![])), 0);
+        let mut s = framed(Format::OpenAI, Format::OpenAI, Box::new(Echo(vec![])));
         let out = s.event(b"data: {\"id\":\"m\",\n\"choices\":[]}\n\n").unwrap();
         assert_eq!(
             out,
@@ -564,7 +510,7 @@ mod tests {
 
     #[test]
     fn events_become_scanner_lines_and_chunks_get_client_framing() {
-        let mut s = framed(Format::OpenAI, Format::OpenAI, Box::new(Echo(vec![])), 0);
+        let mut s = framed(Format::OpenAI, Format::OpenAI, Box::new(Echo(vec![])));
         let out = s.event(b"event: x\r\ndata: {}\n\n").unwrap();
         assert_eq!(
             out,
@@ -579,7 +525,7 @@ mod tests {
             [Bytes::from_static(b"data: : keep-alive\n\n")]
         );
         assert!(s.finish().unwrap().is_empty());
-        let mut s = framed(Format::Claude, Format::OpenAI, Box::new(Echo(vec![])), 0);
+        let mut s = framed(Format::Claude, Format::OpenAI, Box::new(Echo(vec![])));
         assert_eq!(
             s.event(b"event: e\ndata: 1\n\n").unwrap(),
             [Bytes::from_static(b"event: e"), Bytes::from_static(b"data: 1")]

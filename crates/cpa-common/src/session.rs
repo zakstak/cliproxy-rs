@@ -1441,42 +1441,49 @@ fn json_part(out: &mut Vec<Part>, value: &GoValue) {
     });
 }
 
+/// Go `appendParts`, with nested values waiting on a heap stack in document order: a
+/// body at encoding/json's nesting limit (10000) would overflow a native stack walked
+/// recursively (issue #146).
 fn append_parts(out: &mut Vec<Part>, value: &GoValue) {
-    match value {
-        GoValue::Null => {}
-        GoValue::String(text) => text_part(out, text),
-        GoValue::Array(items) => items.iter().for_each(|item| append_parts(out, item)),
-        GoValue::Object(object) => {
-            if let Some(GoValue::String(text)) = object.get("text") {
-                return text_part(out, text);
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            GoValue::Null => {}
+            GoValue::String(text) => text_part(out, text),
+            GoValue::Array(items) => pending.extend(items.iter().rev()),
+            GoValue::Object(object) => {
+                if let Some(GoValue::String(text)) = object.get("text") {
+                    text_part(out, text);
+                    continue;
+                }
+                if let Some(nested) = object.get("content").or_else(|| object.get("parts")) {
+                    pending.push(nested);
+                    continue;
+                }
+                let found = if let Some(image) = object.get("image_url") {
+                    Some(("image".to_owned(), image, String::new()))
+                } else if let Some(inline) = first_field(object, &["inlineData", "inline_data"]) {
+                    Some(("inline_data".to_owned(), inline, String::new()))
+                } else if let Some(file) = first_field(object, &["fileData", "file_data"]) {
+                    Some(("file".to_owned(), file, String::new()))
+                } else {
+                    object
+                        .get("source")
+                        .map(|source| (lower(object.get("type")), source, lower(object.get("media_type"))))
+                };
+                match found {
+                    Some((kind, value, mime)) => pending.extend(media(out, &kind, value, &mime)),
+                    None => json_part(out, &without_cache_control(value)),
+                }
             }
-            if let Some(nested) = object.get("content").or_else(|| object.get("parts")) {
-                return append_parts(out, nested);
-            }
-            if let Some(image) = object.get("image_url") {
-                return media(out, "image", image, "");
-            }
-            if let Some(inline) = first_field(object, &["inlineData", "inline_data"]) {
-                return media(out, "inline_data", inline, "");
-            }
-            if let Some(file) = first_field(object, &["fileData", "file_data"]) {
-                return media(out, "file", file, "");
-            }
-            if let Some(source) = object.get("source") {
-                return media(
-                    out,
-                    &lower(object.get("type")),
-                    source,
-                    &lower(object.get("media_type")),
-                );
-            }
-            json_part(out, &without_cache_control(value));
+            scalar => json_part(out, scalar),
         }
-        scalar => json_part(out, scalar),
     }
 }
 
-fn media(out: &mut Vec<Part>, kind: &str, value: &GoValue, fallback_mime: &str) {
+/// Go `appendMedia`. A value that is neither a string nor an object is returned for
+/// [`append_parts`] to continue with.
+fn media<'v>(out: &mut Vec<Part>, kind: &str, value: &'v GoValue, fallback_mime: &str) -> Option<&'v GoValue> {
     let kind = match kind.trim() {
         "" => "media",
         kind => kind,
@@ -1505,21 +1512,64 @@ fn media(out: &mut Vec<Part>, kind: &str, value: &GoValue, fallback_mime: &str) 
                 });
             }
         }
-        other => append_parts(out, other),
+        other => return Some(other),
     }
+    None
 }
 
+/// A copy of `value` without `cache_control` members at any depth, built with open
+/// containers on a heap stack.
 fn without_cache_control(value: &GoValue) -> GoValue {
-    match value {
-        GoValue::Object(object) => GoValue::Object(
-            object
-                .iter()
-                .filter(|(k, _)| !k.trim().eq_ignore_ascii_case("cache_control"))
-                .map(|(k, v)| (k.clone(), without_cache_control(v)))
-                .collect(),
-        ),
-        GoValue::Array(items) => GoValue::Array(items.iter().map(without_cache_control).collect()),
-        other => other.clone(),
+    enum Open<'v> {
+        Array(Vec<GoValue>, std::slice::Iter<'v, GoValue>),
+        Object(Object, std::collections::btree_map::Iter<'v, String, GoValue>, String),
+    }
+    fn open(value: &GoValue) -> Result<Open<'_>, GoValue> {
+        match value {
+            GoValue::Array(items) => Ok(Open::Array(Vec::with_capacity(items.len()), items.iter())),
+            GoValue::Object(object) => Ok(Open::Object(Object::new(), object.iter(), String::new())),
+            scalar => Err(scalar.clone()),
+        }
+    }
+    let mut stack = match open(value) {
+        Ok(open) => vec![open],
+        Err(scalar) => return scalar,
+    };
+    loop {
+        let child = match stack.last_mut().expect("an open container") {
+            Open::Array(_, items) => items.next(),
+            Open::Object(_, members, key) => members
+                .find(|(k, _)| !k.trim().eq_ignore_ascii_case("cache_control"))
+                .map(|(k, v)| {
+                    key.clone_from(k);
+                    v
+                }),
+        };
+        let done = match child {
+            Some(child) => match open(child) {
+                Ok(open) => {
+                    stack.push(open);
+                    continue;
+                }
+                Err(scalar) => scalar,
+            },
+            None => {
+                let done = match stack.pop().expect("an open container") {
+                    Open::Array(items, _) => GoValue::Array(items),
+                    Open::Object(object, _, _) => GoValue::Object(object),
+                };
+                if stack.is_empty() {
+                    return done;
+                }
+                done
+            }
+        };
+        match stack.last_mut().expect("an open container") {
+            Open::Array(items, _) => items.push(done),
+            Open::Object(object, _, key) => {
+                object.insert(std::mem::take(key), done);
+            }
+        }
     }
 }
 
@@ -1765,6 +1815,34 @@ fn session_hash(system: &[u8], user: &[u8], assistant: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::cpa_session_id;
+
+    /// Issue #146: a user turn nested near encoding/json's limit derives an identity on a
+    /// 2 MiB thread (an async worker's stack) instead of aborting the process, and
+    /// `cache_control` is still dropped at depth.
+    #[test]
+    fn deep_user_content_derives_on_a_worker_stack() {
+        use cpa_core::format::Format;
+        let depth = 9_000;
+        let run = |content: String| {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":{content}}}]}}"#);
+            std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || super::derived_id(Format::Claude, &http::HeaderMap::new(), body.as_bytes(), None, "s"))
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let arrays = run(format!("{}\"x\"{}", "[".repeat(depth), "]".repeat(depth)));
+        assert_eq!(
+            arrays,
+            run(r#""x""#.to_owned()),
+            "nested arrays reduce to the text part"
+        );
+        let nested = |extra: &str| format!("[{}{{\"k\":1{extra}}}{}]", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+        let with = run(nested(r#","cache_control":{"type":"ephemeral"}"#));
+        assert!(with.is_some());
+        assert_eq!(with, run(nested("")), "cache_control dropped at depth");
+    }
 
     /// Go `ensureCanonicalSessionMetadata` + `syncMetadataSessionToContext`: every
     /// `ExtractSessionID` result reaches `$CPA-SESSION-ID`, the first-messages hash included,

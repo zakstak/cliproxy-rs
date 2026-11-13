@@ -173,38 +173,40 @@ fn web_search_tool(tool: &Res<'_>) -> Vec<u8> {
     out
 }
 
+/// Drops dialect keywords and unsupported regex escapes from a schema and its
+/// subschemas. Subschemas wait on a heap stack; each edit is local to its schema, so the
+/// visiting order does not matter, and [`GoValue::parse`] bounds the depth at encoding/json's 10000.
 fn strip_dialect_keywords(value: &mut GoValue) {
     let has_escape = |s: &str| common::has_unsupported_unicode_property_escape(s.as_bytes());
-    match value {
-        GoValue::Object(map) => {
-            map.remove("$schema");
-            map.remove("$id");
-            if matches!(map.get("pattern"), Some(GoValue::String(p)) if has_escape(p)) {
-                map.remove("pattern");
-            }
-            if let Some(GoValue::Object(patterns)) = map.get_mut("patternProperties") {
-                patterns.retain(|k, _| !has_escape(k));
-                patterns.values_mut().for_each(strip_dialect_keywords);
-            }
-            for key in common::SCHEMA_MAP_KEYWORDS {
-                let key = std::str::from_utf8(key).unwrap_or_default();
-                if key == "patternProperties" {
-                    continue;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            GoValue::Object(map) => {
+                map.remove("$schema");
+                map.remove("$id");
+                if matches!(map.get("pattern"), Some(GoValue::String(p)) if has_escape(p)) {
+                    map.remove("pattern");
                 }
-                if let Some(GoValue::Object(sub)) = map.get_mut(key) {
-                    sub.values_mut().for_each(strip_dialect_keywords);
+                if let Some(GoValue::Object(patterns)) = map.get_mut("patternProperties") {
+                    patterns.retain(|k, _| !has_escape(k));
+                }
+                // The keyword lists are disjoint, so each child is pushed once.
+                for (key, sub) in map.iter_mut() {
+                    let key = key.as_bytes();
+                    if common::SCHEMA_MAP_KEYWORDS.contains(&key) {
+                        if let GoValue::Object(sub) = sub {
+                            pending.extend(sub.values_mut());
+                        }
+                    } else if common::SCHEMA_VALUE_KEYWORDS.contains(&key)
+                        && matches!(sub, GoValue::Object(_) | GoValue::Array(_))
+                    {
+                        pending.push(sub);
+                    }
                 }
             }
-            for key in common::SCHEMA_VALUE_KEYWORDS {
-                match map.get_mut(std::str::from_utf8(key).unwrap_or_default()) {
-                    Some(sub @ GoValue::Object(_)) => strip_dialect_keywords(sub),
-                    Some(GoValue::Array(items)) => items.iter_mut().for_each(strip_dialect_keywords),
-                    _ => {}
-                }
-            }
+            GoValue::Array(items) => pending.extend(items.iter_mut()),
+            _ => {}
         }
-        GoValue::Array(items) => items.iter_mut().for_each(strip_dialect_keywords),
-        _ => {}
     }
 }
 
@@ -242,43 +244,57 @@ pub(crate) fn normalize_tool_parameters(raw: &[u8]) -> Vec<u8> {
 }
 
 /// codexSchemaMissesRequired: a declared property missing from its sibling `required`.
+/// Subschemas wait on a heap stack; the answer does not depend on the visiting order.
+/// Subschemas more than [`gj::WALK_DEPTH_LIMIT`] levels below `schema` are not inspected.
 fn misses_required(schema: &Res<'_>) -> bool {
-    if !schema.is_object() {
-        return schema.is_array() && schema.array().iter().any(misses_required);
-    }
-    let properties = schema.get("properties");
-    if properties.is_object() {
-        let required = schema.get("required");
-        if !required.is_array() {
-            return !properties.map().is_empty();
+    let mut pending = vec![(schema.clone(), 0usize)];
+    while let Some((schema, depth)) = pending.pop() {
+        if depth > gj::WALK_DEPTH_LIMIT {
+            continue;
         }
-        let names: HashSet<Vec<u8>> = required
-            .array()
-            .iter()
-            .filter(|i| i.kind == Kind::String)
-            .map(|i| i.s.to_vec())
-            .collect();
-        if properties.map().iter().any(|(name, _)| !names.contains(name)) {
-            return true;
+        if !schema.is_object() {
+            if schema.is_array() {
+                pending.extend(schema.array().into_iter().map(|item| (item, depth + 1)));
+            }
+            continue;
         }
-    }
-    for key in common::SCHEMA_MAP_KEYWORDS {
-        let children = schema.get(key);
-        if children.is_object() {
-            let mut miss = false;
-            children.each(|_, child| {
-                miss = misses_required(&child);
-                !miss
-            });
-            if miss {
+        let properties = schema.get("properties");
+        if properties.is_object() {
+            let required = schema.get("required");
+            if !required.is_array() {
+                if !properties.map().is_empty() {
+                    return true;
+                }
+                // Go returns false for this schema without visiting its subschemas.
+                continue;
+            }
+            let names: HashSet<Vec<u8>> = required
+                .array()
+                .iter()
+                .filter(|i| i.kind == Kind::String)
+                .map(|i| i.s.to_vec())
+                .collect();
+            if properties.map().iter().any(|(name, _)| !names.contains(name)) {
                 return true;
             }
         }
+        for key in common::SCHEMA_MAP_KEYWORDS {
+            let children = schema.get(key);
+            if children.is_object() {
+                children.each(|_, child| {
+                    pending.push((child, depth + 1));
+                    true
+                });
+            }
+        }
+        for key in common::SCHEMA_VALUE_KEYWORDS {
+            let child = schema.get(key);
+            if child.exists() {
+                pending.push((child, depth + 1));
+            }
+        }
     }
-    common::SCHEMA_VALUE_KEYWORDS.iter().any(|key| {
-        let child = schema.get(*key);
-        child.exists() && misses_required(&child)
-    })
+    false
 }
 
 /// codexClaudeTargetAcceptsGrokSignature.

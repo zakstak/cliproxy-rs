@@ -160,6 +160,7 @@ fn encoding_matches_encoding_json() {
 fn sjson_go_vectors_match() {
     let vectors: Vec<Value> = serde_json::from_str(include_str!("fixtures/sjson_go_vectors.json")).unwrap();
     let mut seen = 0;
+    let mut differences = 0;
     for v in vectors {
         let input = v["in"].as_str().unwrap_or_default().as_bytes();
         let path = v["path"].as_str().unwrap_or_default();
@@ -173,13 +174,42 @@ fn sjson_go_vectors_match() {
         };
         seen += 1;
         let got = got.map(|b| String::from_utf8(b).unwrap());
+        if let Some(&(_, _, _, go_out, rust_out)) = RUST_DIFFERENCES
+            .iter()
+            .find(|(f, i, p, _, _)| v["fn"] == *f && v["in"] == *i && v["path"] == *p)
+        {
+            // The recorded Go output stays as historical evidence.
+            assert_eq!(v["out"].as_str(), Some(go_out), "{v}");
+            assert_eq!(got.as_deref(), Ok(rust_out), "{v}");
+            differences += 1;
+            continue;
+        }
         match v["err"].as_str() {
             Some(message) => assert_eq!(got, Err(message.to_owned()), "{v}"),
             None => assert_eq!(got.as_deref(), Ok(v["out"].as_str().unwrap()), "{v}"),
         }
     }
     assert!(seen >= 25, "vector extraction lost cases: {seen}");
+    assert_eq!(
+        differences,
+        RUST_DIFFERENCES.len(),
+        "every listed difference has its Go vector"
+    );
 }
+
+/// Go vectors where the port deliberately differs (docs/DIFFERENCES-FROM-GO.md):
+/// `(fn, in, path, Go output, Rust output)`.
+const RUST_DIFFERENCES: &[(&str, &str, &str, &str, &str)] = &[
+    // Issue #146: sjson keeps the key of a deleted member whose key holds an escaped
+    // quote, which is invalid JSON. The port deletes the member.
+    (
+        "sjson_delete",
+        r#"{"\"x":1,"y":2}"#,
+        r#"\"x"#,
+        r#"{"\"x":,"y":2}"#,
+        r#"{"y":2}"#,
+    ),
+];
 
 /// json.Unmarshal into `any` (float64 numbers) and Decoder.UseNumber, each re-marshaled.
 #[test]
