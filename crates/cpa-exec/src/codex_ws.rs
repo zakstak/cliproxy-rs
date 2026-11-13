@@ -691,6 +691,11 @@ pub(crate) struct Pool {
     pub(crate) write: WriteLimit,
     /// Bound on waiting for an interrupt acknowledgement after its response ended.
     pub(crate) ack_wait: Duration,
+    /// Tests: when set, every dial waits here for one permit after its socket's reader
+    /// started and before the attempt activates or writes ([`CodexExecutor::ensure`]), so a
+    /// test orders the reader against the turn instead of racing them.
+    #[cfg(test)]
+    pub(crate) dial_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Default for Pool {
@@ -700,6 +705,8 @@ impl Default for Pool {
             idle: IDLE_TIMEOUT,
             write: WRITE_LIMIT,
             ack_wait: ACK_WAIT,
+            #[cfg(test)]
+            dial_gate: Mutex::default(),
         }
     }
 }
@@ -2116,12 +2123,21 @@ impl CodexExecutor {
         }
         // Publish before the reader runs, so a reader that fails at once still finds its
         // socket current and invalidates it; holding the handle slot keeps a concurrent
-        // shutdown from missing the abort handle.
-        let mut reader = conn.reader.lock().expect("reader handle");
-        session.publish(conn.clone());
-        let task = tokio::spawn(read_loop(stream, Arc::downgrade(session), conn.clone(), self.ws.idle));
-        *reader = Some(task.abort_handle());
-        drop(reader);
+        // shutdown from missing the abort handle. The guard's scope ends with this block,
+        // so the future stays `Send` across a later await.
+        {
+            let mut reader = conn.reader.lock().expect("reader handle");
+            session.publish(conn.clone());
+            let task = tokio::spawn(read_loop(stream, Arc::downgrade(session), conn.clone(), self.ws.idle));
+            *reader = Some(task.abort_handle());
+        }
+        #[cfg(test)]
+        {
+            let gate = self.ws.dial_gate.lock().expect("dial gate").clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("dial gate").forget();
+            }
+        }
         Ok((conn, Some(handshake)))
     }
 
