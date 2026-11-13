@@ -109,6 +109,8 @@ enum Act {
     Pings(Duration, usize),
     /// Send, then close the socket with code 1000 once notified.
     SendCloseOn(Vec<&'static str>, Arc<tokio::sync::Notify>),
+    /// Answer with a binary message, which the reader takes as the socket's loss.
+    SendBinary,
 }
 
 #[derive(Default)]
@@ -182,6 +184,10 @@ async fn serve_socket(up: Arc<Upstream>, mut socket: AxSocket) {
             }
             Some(Act::SendOwned(text)) => {
                 let _ = socket.send(AxMessage::Text(text.into())).await;
+                continue;
+            }
+            Some(Act::SendBinary) => {
+                let _ = socket.send(AxMessage::Binary(vec![1u8, 2, 3].into())).await;
                 continue;
             }
             Some(Act::Pings(every, count)) => {
@@ -798,37 +804,92 @@ fn write_errors_keep_the_message_too_big_413() {
     }
 }
 
-/// A reader that fails before the first turn activates (binary message right after the
-/// handshake) must fail that turn instead of leaving it waiting on a dead socket.
+/// The turn's failure, whether the executor returns it or the turn's stream ends with it.
+async fn turn_failure(turn: impl Future<Output = Result<ExecResponse, ExecError>>) -> Option<ExecError> {
+    match turn.await {
+        Ok(response) => collect(response).await.into_iter().find_map(Result::err),
+        Err(error) => Some(error),
+    }
+}
+
+/// Waits until `done` holds; panics with `what` if it does not within 5 s.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// A reader that fails before the turn activates (a binary message right after the
+/// handshake) fails the turn instead of leaving it waiting on a dead socket. The test
+/// gate holds each dial until the test has taken that socket's loss, so the reader
+/// records it before the turn activates and writes, on the first socket and on the one
+/// fresh socket of the retry. Each write then provably sent nothing (N1 #111 W1), so
+/// the turn ends with the write's transport failure, which may fail over: two dials and
+/// no frame on either socket. This is the order FP2 S2 observed under load; the order in
+/// which a write wins is `a_reader_failure_after_the_write_is_never_replayed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reader_failure_before_the_turn_activates_fails_the_turn() {
-    for _ in 0..20 {
-        let (up, url) = upstream(vec![]).await;
-        *up.binary_first.lock().unwrap() = true;
-        let executor = CodexExecutor::new().unwrap();
-        let (cred, cfg, sess) = (credential(&url), Config::default(), session(false));
-        let turn = executor.execute_in_session(&cred, request(BODY), &cfg, &sess);
-        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
-            match turn.await {
-                Ok(response) => collect(response).await.into_iter().find_map(Result::err),
-                Err(error) => Some(error),
-            }
-        })
+    let (up, url) = upstream(vec![]).await;
+    *up.binary_first.lock().unwrap() = true;
+    let executor = CodexExecutor::new().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *executor.ws.dial_gate.lock().unwrap() = Some(gate.clone());
+    let mut losses = executor.ws.losses("conn-1");
+    let (cred, cfg, sess) = (credential(&url), Config::default(), session(false));
+    let turn = turn_failure(executor.execute_in_session(&cred, request(BODY), &cfg, &sess));
+    let order = async {
+        for socket in ["first", "fresh"] {
+            let loss = tokio::time::timeout(Duration::from_secs(5), losses.next())
+                .await
+                .unwrap_or_else(|_| panic!("the {socket} socket's reader recorded no loss"));
+            assert_eq!(loss.error.body.as_ref(), UNEXPECTED_BINARY.as_bytes(), "{socket}");
+            // The turn activates and writes only now.
+            gate.add_permits(1);
+        }
+    };
+    let (error, ()) = tokio::time::timeout(Duration::from_secs(10), futures_util::future::join(turn, order))
         .await
         .expect("the turn must not hang on a dead socket");
-        let error = outcome.expect("the turn fails");
-        // Either the reader's loss was recorded before every write, so the frame
-        // provably never left (the transport failure may fail over), or a write raced
-        // the reader and the loss is uncertain (request-scoped, never failed over).
-        assert!(
-            matches!(error.scope, FailureScope::Transport | FailureScope::Request),
-            "{error}"
-        );
-        assert!(
-            error.scope == FailureScope::Request || String::from_utf8_lossy(&error.body).contains("unexpected binary"),
-            "{error}"
-        );
-    }
+    let error = error.expect("the turn fails");
+    assert_eq!((error.status, error.scope), (502, FailureScope::Transport), "{error}");
+    assert_eq!(
+        String::from_utf8_lossy(&error.body),
+        "codex websockets executor: write failed"
+    );
+    assert!(!format!("{error:?}").contains("sk-FAKE"), "{error:?}");
+    assert_eq!(up.dials.lock().unwrap().len(), 2, "one retry on a fresh socket");
+    // Once both upstream sockets ended, every frame either one received is recorded.
+    wait_until("both upstream sockets end", || *up.ended.lock().unwrap() == 2).await;
+    assert!(up.frames.lock().unwrap().is_empty(), "no frame left either socket");
+}
+
+/// The other order of [`reader_failure_before_the_turn_activates_fails_the_turn`]: the
+/// write wins and the reader fails after it. The upstream answers the frame it received
+/// with a binary message, so the reader's loss follows a frame that provably left: the
+/// failure is request-scoped and the frame is never sent again, here or on another
+/// socket (N1 #111 W1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_failure_after_the_write_is_never_replayed() {
+    let (up, url) = upstream(vec![Act::SendBinary]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let (cred, cfg, sess) = (credential(&url), Config::default(), session(false));
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        turn_failure(executor.execute_in_session(&cred, request(BODY), &cfg, &sess)),
+    )
+    .await
+    .expect("the turn must not hang on a dead socket")
+    .expect("the turn fails");
+    assert_eq!((error.status, error.scope), (502, FailureScope::Request), "{error}");
+    assert_eq!(error.body.as_ref(), UNEXPECTED_BINARY.as_bytes(), "{error}");
+    assert!(!format!("{error:?}").contains("sk-FAKE"), "{error:?}");
+    assert_eq!(up.dials.lock().unwrap().len(), 1, "never sent again on a fresh socket");
+    wait_until("the upstream socket ends", || *up.ended.lock().unwrap() == 1).await;
+    assert_eq!(up.frames.lock().unwrap().len(), 1, "the frame left exactly once");
 }
 
 /// With model-level cooling, a usage-limit handshake rejection cools only the model
