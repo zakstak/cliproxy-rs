@@ -27,7 +27,18 @@ use crate::tls::Transport;
 use crate::upstream::into_response;
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-pub const SCOPE: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// Scopes a token refresh asks for: the scopes saved logins were granted with, unchanged
+/// (Go ea0b4712). Claude Code 2.1.322's default refresh scopes (`czt()`) add `user:plugins`,
+/// which a refresh may not add to an existing grant (RFC 6749 section 6); see
+/// docs/parity-audit/claude-code-2.1.322-oauth.md.
+pub const REFRESH_SCOPE: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// Scopes an authorization asks for: the Console scope `org:create_api_key` ahead of the
+/// refresh scopes, in Claude Code 2.1.322's `fHo()` order, as Go ea0b4712 sends them; that
+/// client also adds `user:plugins`, which cliproxy-rs does not request. A refresh never asks
+/// for `org:create_api_key`.
+pub const AUTHORIZE_SCOPE: &str =
+    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 pub const REDIRECT_URI: &str = "http://localhost:54545/callback";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -289,7 +300,7 @@ impl OAuth {
                     // Go's map marshaler sorts these four keys lexically.
                     let body = serde_json::to_vec(&json!({
                         "client_id": CLIENT_ID, "grant_type": "refresh_token",
-                        "refresh_token": refresh, "scope": SCOPE,
+                        "refresh_token": refresh, "scope": REFRESH_SCOPE,
                     }))
                     .map_err(|_| acquisition_error("cannot encode OAuth request"));
                     let result = match body {
@@ -685,6 +696,15 @@ fn timestamp(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// The OAuth `state` of a Claude login: 32 random bytes (256 bits), unpadded base64url,
+/// 43 characters, as Claude Code 2.1.322 generates it (`A(E(32))` in its authorize flow)
+/// and Go ea0b4712. The callback must return it byte for byte.
+pub fn state() -> Result<String, ExecError> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(|_| acquisition_error("secure random source unavailable"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// PKCE verifier is 96 random bytes encoded as 128 URL-safe characters, as in Go.
 pub fn pkce() -> Result<(String, String), ExecError> {
     let mut bytes = [0; 96];
@@ -704,7 +724,7 @@ pub(crate) fn authorize_url(state: &str, challenge: &str) -> String {
         ("code_challenge_method", "S256"),
         ("redirect_uri", REDIRECT_URI),
         ("response_type", "code"),
-        ("scope", SCOPE),
+        ("scope", AUTHORIZE_SCOPE),
         ("state", state),
     ]);
     url.into()

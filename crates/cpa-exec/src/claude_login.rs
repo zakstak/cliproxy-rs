@@ -100,7 +100,7 @@ pub struct ManagedLogin {
 impl ManagedLogin {
     pub fn start() -> Result<Self, ExecError> {
         let (verifier, challenge) = pkce()?;
-        let state = random_hex(16)?;
+        let state = crate::oauth::state()?;
         Ok(Self {
             url: authorize_url(&state, &challenge),
             state,
@@ -192,7 +192,7 @@ pub(crate) async fn login_with(
     interaction: Interaction,
 ) -> Result<PathBuf, ExecError> {
     let (verifier, challenge) = pkce()?;
-    let state = random_hex(16)?;
+    let state = crate::oauth::state()?;
     let (results, mut callbacks) = mpsc::channel(1);
     let server = tokio::spawn(serve(listener, results));
     (interaction.show_url)(&authorize_url(&state, &challenge));

@@ -150,7 +150,9 @@ async fn refresh_rotation_preserves_identity_on_optional_profile_failure() {
     assert!(!needs_prepare(&credential, chrono::Utc::now()));
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].2, format!(r#"{{"client_id":"{CLIENT_ID}","grant_type":"refresh_token","refresh_token":"fake-refresh","scope":"{SCOPE}"}}"#).as_bytes());
+    // #76 (C8): a refresh asks for the established scopes (Claude Code 2.1.322's `czt()`
+    // without `user:plugins`), written out here; only authorization asks for the Console scope.
+    assert_eq!(calls[0].2, format!(r#"{{"client_id":"{CLIENT_ID}","grant_type":"refresh_token","refresh_token":"fake-refresh","scope":"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"}}"#).as_bytes());
     assert_eq!(calls[1].1["authorization"], "Bearer sk-ant-oat-new-fake");
 }
 
@@ -393,7 +395,49 @@ fn pkce_and_authorize_url() {
     assert_eq!(verifier.len(), 128);
     assert_eq!(challenge.len(), 43);
     let url = Url::parse(&authorize_url("good-state", &challenge)).unwrap();
-    assert!(url.query_pairs().any(|(key, value)| key == "scope" && value == SCOPE));
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "scope" && value == AUTHORIZE_SCOPE)
+    );
+}
+
+/// #76 (C8): the exact authorization query (Go `url.Values.Encode` order), with the
+/// Console scope ahead of the refresh scopes (Claude Code 2.1.322's `fHo()` order, without
+/// its `user:plugins`), and the state passed through verbatim.
+#[test]
+fn authorize_url_asks_for_the_console_scope_and_keeps_the_state() {
+    let state = "Ab-_09xyzAb-_09xyzAb-_09xyzAb-_09xyzAb-_09x";
+    assert_eq!(
+        authorize_url(state, "challenge-FAKE"),
+        format!(
+            "https://claude.ai/oauth/authorize?client_id={CLIENT_ID}&code=true&code_challenge=challenge-FAKE\
+             &code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback\
+             &response_type=code&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference\
+             +user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&state={state}"
+        )
+    );
+    assert_eq!(
+        AUTHORIZE_SCOPE.strip_prefix("org:create_api_key "),
+        Some(REFRESH_SCOPE),
+        "authorization adds exactly the Console scope"
+    );
+}
+
+/// #76 (C8): a login state is 256 random bits, unpadded base64url (43 characters, the
+/// management OAuth session alphabet), and never repeats.
+#[test]
+fn login_state_is_256_bit_base64url() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let s = state().unwrap();
+        assert_eq!(s.len(), 43, "{s}");
+        assert!(
+            s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "{s}"
+        );
+        assert_eq!(URL_SAFE_NO_PAD.decode(&s).unwrap().len(), 32);
+        assert!(seen.insert(s));
+    }
 }
 
 #[tokio::test]
