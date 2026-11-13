@@ -40,3 +40,67 @@ fn sniffs_like_go() {
         assert_eq!(detect_content_type(input), want, "{input:?}");
     }
 }
+
+/// #105: an image stream forwards upstream reads as they arrive. Whether the upstream
+/// fails inside a line, after a line of an unfinished event (LF, CRLF or lone CR) or at
+/// an event boundary, the client parses every event the upstream finished, then one
+/// complete `error` event: the error is never merged into the cut-off event, and the
+/// body ends with it, heartbeats included, although the upstream stream never ends. The
+/// reads arrive without a pause, so no heartbeat falls due inside an event and this test
+/// does not depend on the heartbeat gate.
+#[tokio::test]
+async fn raw_image_stream_errors_start_on_an_event_boundary_and_end_the_body() {
+    use futures_util::StreamExt;
+    tokio::time::pause();
+    let error = ExecError::local(502, cpa_core::exec::FailureScope::Transport, "upstream reset");
+    let failure = Failure::Exec(error.clone());
+    let error_event = stream_error_event(failure.status(), &failure.text());
+    let (_, error_payload) = respond::parse_sse(&error_event).0.remove(0);
+    let done = r#"data: {"type":"image_generation.partial_image","partial_image_index":0}"#;
+    for (sent, close) in [
+        (format!("{done}\n\ndata: {{\"b64_json\":\"AA"), "\n\n"),
+        (format!("{done}\n\ndata: {{\"b64_json\":\"AA\"}}\n"), "\n"),
+        (format!("{done}\r\n\r\ndata: x\r\n"), "\n"),
+        (format!("{done}\r\rdata: x\r"), "\n\n"),
+        (format!("{done}\n\n"), ""),
+        (format!("{done}\r\n\r\n"), ""),
+        (format!("{done}\r\r"), ""),
+    ] {
+        for routed in [true, false] {
+            let case = format!("routed={routed} sent={sent:?}");
+            let half = sent.len() / 2;
+            let reads = [&sent[..half], &sent[half..]].map(|read| Ok(Bytes::copy_from_slice(read.as_bytes())));
+            let failed = error.clone();
+            let rest = futures_util::stream::iter(reads)
+                .chain(futures_util::stream::once(async move { Err(failed) }))
+                .chain(futures_util::stream::pending())
+                .boxed();
+            let keepalive = Some(std::time::Duration::from_millis(100));
+            let body = respond::stream(None, rest, Raw::new(routed), keepalive);
+            let out = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                axum::body::to_bytes(body, usize::MAX),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the body did not end after the error event"))
+            .unwrap();
+            let want = [sent.as_bytes(), close.as_bytes(), &error_event[..]].concat();
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&want),
+                "{case}: error event merged into the cut-off event, or bytes after it"
+            );
+            let (events, _) = respond::parse_sse(&out);
+            assert_eq!(
+                events.first(),
+                Some(&(String::new(), done["data: ".len()..].to_owned())),
+                "{case}: the finished event"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&("error".to_owned(), error_payload.clone())),
+                "{case}: the error event"
+            );
+        }
+    }
+}

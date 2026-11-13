@@ -35,7 +35,8 @@ pub(crate) fn check(rt: &Runtime, headers: &HeaderMap, query: &str) -> Result<Op
     })
 }
 
-/// Go `AuthMiddleware` over the configured client keys.
+/// Go `AuthMiddleware` over the configured client keys. Request capture reads the body
+/// of an admitted request only ([`crate::request_logging::authenticated_body`]).
 pub async fn require_client_key(State(rt): State<Arc<Runtime>>, mut req: Request, next: Next) -> Response {
     let caller = match check(&rt, req.headers(), req.uri().query().unwrap_or_default()) {
         Ok(Some(caller)) => caller,
@@ -51,7 +52,10 @@ pub async fn require_client_key(State(rt): State<Arc<Runtime>>, mut req: Request
         }
     };
     req.extensions_mut().insert(caller);
-    next.run(req).await
+    match crate::request_logging::authenticated_body(req).await {
+        Ok(req) => next.run(req).await,
+        Err(response) => *response,
+    }
 }
 
 pub(crate) fn authenticate(keys: &[String], headers: &HeaderMap, query: &str) -> Result<Caller, &'static str> {

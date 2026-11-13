@@ -54,7 +54,9 @@ fn listen(domain: Domain, addr: SocketAddr, dual_stack: bool) -> io::Result<std:
 const ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
 /// Go `muxSniffDeadline`: a connection must finish its handshake and send its first
-/// byte within this.
+/// byte within this. Go v8.0.67 (477605dc) also uses it as the HTTP server's
+/// `ReadHeaderTimeout` and as the read deadline of a Redis connection until `AUTH`
+/// succeeds; see [`serve_with_resp`].
 const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The configured TLS settings (`server.tls`, legacy `tls`).
@@ -118,11 +120,30 @@ pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<SslAccept
 /// (`management`'s usage queue, closed without it), anything else to HTTP/1.1, which
 /// never speaks h2c. A connection must finish its handshake and send its first byte
 /// within Go's 10 s sniff deadline.
+///
+/// No client can hold a connection open without authenticating (Go v8.0.67 477605dc,
+/// GHSA-j4xx-x47j-7h54): an HTTP/1.1 request head must arrive within the same 10 s,
+/// an unauthenticated Redis client must finish its commands within 10 s, and request
+/// capture never reads a body before client authentication admits the request
+/// ([`crate::request_logging`]). hyper closes the connection after answering a request
+/// whose body was not read whole.
 pub async fn serve_with_resp(
     listener: TcpListener,
     app: Router,
     tls: Option<Arc<SslAcceptor>>,
     management: Option<Arc<crate::management::Management>>,
+) -> std::io::Result<()> {
+    accept(listener, app, tls, management, HANDSHAKE_DEADLINE).await
+}
+
+/// [`serve_with_resp`] with `limit` in place of [`HANDSHAKE_DEADLINE`], so tests can
+/// observe it.
+async fn accept(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<Arc<SslAcceptor>>,
+    management: Option<Arc<crate::management::Management>>,
+    limit: std::time::Duration,
 ) -> std::io::Result<()> {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -138,7 +159,7 @@ pub async fn serve_with_resp(
         };
         go_socket_defaults(&stream);
         let (app, management, tls) = (app.clone(), management.clone(), tls.clone());
-        let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+        let deadline = tokio::time::Instant::now() + limit;
         tokio::spawn(async move {
             let Some(acceptor) = tls else {
                 let mut first = [0u8; 1];
@@ -148,18 +169,18 @@ pub async fn serve_with_resp(
                 }
                 if crate::resp::is_resp_prefix(first[0]) {
                     if let Some(management) = management {
-                        crate::resp::serve(stream, peer, management).await;
+                        crate::resp::serve(stream, peer, management, limit).await;
                     }
                     return;
                 }
-                return serve_connection(stream, peer, app, false).await;
+                return serve_connection(stream, peer, app, false, limit).await;
             };
             let Some(mut tls) = handshake(&acceptor, stream, peer, deadline).await else {
                 return;
             };
             match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => return serve_connection(tls, peer, app, true).await,
-                Some(b"http/1.1") => return serve_connection(tls, peer, app, false).await,
+                Some(b"h2") => return serve_connection(tls, peer, app, true, limit).await,
+                Some(b"http/1.1") => return serve_connection(tls, peer, app, false, limit).await,
                 _ => {}
             }
             let first = match tokio::time::timeout_at(deadline, tokio::io::AsyncReadExt::read_u8(&mut tls)).await {
@@ -172,11 +193,11 @@ pub async fn serve_with_resp(
             };
             if crate::resp::is_resp_prefix(first) {
                 if let Some(management) = management {
-                    crate::resp::serve(io, peer, management).await;
+                    crate::resp::serve(io, peer, management, limit).await;
                 }
                 return;
             }
-            serve_connection(io, peer, app, false).await;
+            serve_connection(io, peer, app, false, limit).await;
         });
     }
 }
@@ -269,9 +290,16 @@ async fn handshake(
 /// HTTP/2 server keeps Go's defaults where they are visible to clients: 250 concurrent
 /// streams and no extended CONNECT (x/net http2 `defaultMaxStreams`,
 /// `disableExtendedConnectProtocol`).
+///
+/// HTTP/1.1 request heads must arrive within `head_limit` (Go v8.0.67
+/// `ReadHeaderTimeout`). hyper starts that clock whenever the connection waits for a
+/// request, including between keep-alive requests, so an idle keep-alive connection is
+/// closed after it too. The clock never runs while a request body is read or a
+/// response is written.
 // ponytail: other HTTP/2 settings (window sizes, frame and header-list limits) are
-// hyper's defaults, not Go's.
-async fn serve_connection<I>(io: I, peer: SocketAddr, app: Router, h2: bool)
+// hyper's defaults, not Go's, and HTTP/2 has no request-head or idle deadline. Add
+// hyper's HTTP/2 keep-alive or a stream-open deadline if h2 clients need bounding.
+async fn serve_connection<I>(io: I, peer: SocketAddr, app: Router, h2: bool, head_limit: std::time::Duration)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -288,6 +316,8 @@ where
             .await
     } else {
         hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(head_limit)
             .serve_connection(io, service)
             .with_upgrades()
             .await
@@ -296,6 +326,10 @@ where
         tracing::trace!(%peer, "connection error: {e}");
     }
 }
+
+#[cfg(test)]
+#[path = "listener_tests.rs"]
+mod bounds_tests;
 
 #[cfg(test)]
 mod tests {
