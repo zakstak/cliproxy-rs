@@ -4,6 +4,7 @@
 use crate::{
     Registered, apply_patch, codex_chat_response as response,
     common::{UserTurnDrops, go_lower, sanitize, trim_space},
+    responses_controls,
 };
 use cpa_common::json::{self as gj, AnyValue, Kind, Res};
 use std::collections::{HashMap, HashSet};
@@ -156,6 +157,14 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
         br#"{"instructions":""}"#.to_vec()
     };
     gj::set_bool(&mut out, "stream", stream);
+    // The registered pair (Grok, Muse) keeps the client's output limit
+    // (crate::responses_controls). Strict maps it in crate::codex_strict instead.
+    if !strict
+        && let Some(limit) =
+            responses_controls::output_limit(raw, &["max_completion_tokens", "max_tokens", "max_output_tokens"])?
+    {
+        gj::set_raw(&mut out, "max_output_tokens", limit);
+    }
     let effort = gj::get(raw, "reasoning_effort");
     // Strict: only the client's own choice; without one the model's default applies.
     if effort.exists() {
@@ -167,9 +176,14 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
     if !tier.is_empty() {
         gj::set_str(&mut out, "service_tier", tier);
     }
-    // Strict: the client's choice, else the API default (`true`).
+    // The client's choice, else the API default (`true`). Go v8.0.35 forces `true` on
+    // the registered pair; a flag that is not a boolean is refused there
+    // (crate::responses_controls).
+    if !strict {
+        responses_controls::check_bool(raw, "parallel_tool_calls")?;
+    }
     let parallel = root.get("parallel_tool_calls");
-    gj::set_bool(&mut out, "parallel_tool_calls", !strict || parallel.kind != Kind::False);
+    gj::set_bool(&mut out, "parallel_tool_calls", parallel.kind != Kind::False);
     gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
     gj::set_str(&mut out, "model", model);
 

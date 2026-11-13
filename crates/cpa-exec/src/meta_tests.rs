@@ -286,8 +286,54 @@ fn with_retention_difference(mut fx: Value) -> Value {
     fx
 }
 
+/// #80 (crate::controls_testkit; docs/DIFFERENCES-FROM-GO.md, "Output limit and
+/// parallel tool calls on Grok and Muse"): the expected Meta request carries the client's
+/// output limit where the converter writes it and keeps its `parallel_tool_calls: false`,
+/// as Go v8.0.67 does. The recorded fixtures stay unchanged; the request sent is still the
+/// recorded one.
+fn with_controls_difference(mut fx: Value) -> Value {
+    let source = crate::device_fixture::format(fx["request"]["source"].as_str().unwrap());
+    let client = fx["request"]["body"].as_str().unwrap_or_default().to_owned();
+    let mut bodies = Vec::new();
+    for upstream in fx["upstream"].as_array_mut().into_iter().flatten() {
+        if !upstream["target"].as_str().unwrap_or_default().ends_with("/responses")
+            || !upstream["body_b64"].as_str().unwrap_or_default().is_empty()
+        {
+            continue;
+        }
+        let go = upstream["body"].as_str().unwrap().to_owned();
+        let ours = String::from_utf8(crate::controls_testkit::expected_body(
+            source,
+            client.as_bytes(),
+            go.as_bytes(),
+        ))
+        .unwrap();
+        if ours == go {
+            continue;
+        }
+        for header in upstream["headers"].as_array_mut().unwrap() {
+            if header[0] == "Content-Length" {
+                header[1] = Value::String(ours.len().to_string());
+            }
+        }
+        upstream["body"] = Value::String(ours.clone());
+        bodies.push((go, ours));
+    }
+    if let Some(text) = fx["extra"]["capture"]["request"].as_str() {
+        let mut text = text.to_owned();
+        for (go, ours) in &bodies {
+            assert_eq!(text.matches(go.as_str()).count(), 1, "captured body");
+            text = text.replace(go.as_str(), ours);
+        }
+        fx["extra"]["capture"]["request"] = Value::String(text);
+    }
+    fx
+}
+
 async fn run(name: &str) -> Run {
-    let fx = with_identity_difference(with_retention_difference(fixture("meta", name)));
+    let fx = with_identity_difference(with_retention_difference(with_controls_difference(fixture(
+        "meta", name,
+    ))));
     let origin = go_origin(&fx).expect("fixture names its capture server");
     let mock = Mock::start_replacing(&fx["responses"], Some(&origin)).await;
     let credential = meta_credential(&fx, &origin, &mock.url);

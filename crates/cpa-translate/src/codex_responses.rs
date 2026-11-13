@@ -7,7 +7,7 @@
 //! Codex never installs one.
 
 use crate::apply_patch_responses::Bridge;
-use crate::{Error, Registered, RequestCtx, ResponseCtx, StreamTranslator, common, stream};
+use crate::{Error, Registered, RequestCtx, ResponseCtx, StreamTranslator, common, responses_controls, stream};
 use cpa_common::json::{self as gj, Kind};
 use cpa_core::gostr::GoStr;
 
@@ -21,16 +21,26 @@ pub static PAIR: Registered = registered!(
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
     let _ = ctx;
+    // Controls the conversion keeps must be readable (crate::responses_controls).
+    responses_controls::check_bool(body, "parallel_tool_calls")?;
+    responses_controls::output_limit(body, LIMITS)?;
     Ok(convert(body, ResponsesClient::Translated))
 }
 
-/// The client that built a Responses request. It decides whether the conversion forces
-/// `parallel_tool_calls`, rebuilds `include` and drops unlisted `service_tier` values
-/// (see `set_service_tier`).
+/// The output limit, then the legacy names a Responses client may still send.
+const LIMITS: &[&str] = &["max_output_tokens", "max_completion_tokens", "max_tokens"];
+
+/// The client that built a Responses request. It decides whether the conversion
+/// defaults `parallel_tool_calls`, keeps the output limit, rebuilds `include` and drops
+/// unlisted `service_tier` values (see `set_service_tier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesClient {
-    /// Any Responses client other than official Codex. Go's rules apply:
-    /// `parallel_tool_calls` becomes `true` and `include` is rebuilt.
+    /// Any Responses client other than official Codex, on the registered pair that the
+    /// Grok and Muse executors share. Go v8.0.67's rules apply (`99d1698f`, `01b24f1f`):
+    /// `parallel_tool_calls` keeps an explicit `false` and is `true` otherwise,
+    /// `max_output_tokens` is kept (or filled from `max_completion_tokens` or
+    /// `max_tokens`), and `include` is rebuilt. Go v8.0.35 forces `true` and deletes the
+    /// limit (docs/DIFFERENCES-FROM-GO.md).
     Translated,
     /// An official Codex client. Codex sets `parallel_tool_calls` and `include` for the
     /// OpenAI upstream it expects, so `parallel_tool_calls` keeps the client's value or
@@ -54,16 +64,32 @@ pub(crate) fn convert(body: &[u8], client: ResponsesClient) -> Vec<u8> {
     set_required_bool(&mut raw, "store", false);
     let output_replay = match client {
         ResponsesClient::Translated => {
-            set_required_bool(&mut raw, "parallel_tool_calls", true);
+            if gj::get(&raw, "parallel_tool_calls").kind != Kind::False {
+                set_required_bool(&mut raw, "parallel_tool_calls", true);
+            }
             false
         }
         ResponsesClient::NativeCodex { output_replay } => output_replay,
     };
     set_required_include(&mut raw, output_replay);
-    delete_fields(
-        &mut raw,
-        &["max_output_tokens", "max_completion_tokens", "temperature", "top_p"],
-    );
+    match client {
+        ResponsesClient::Translated => {
+            let current = gj::get(&raw, "max_output_tokens");
+            if (!current.exists() || current.kind == Kind::Null)
+                && let Ok(Some(limit)) = responses_controls::output_limit(&raw, &LIMITS[1..])
+            {
+                gj::set_raw(&mut raw, "max_output_tokens", limit);
+            }
+            delete_fields(
+                &mut raw,
+                &["max_completion_tokens", "max_tokens", "temperature", "top_p"],
+            );
+        }
+        ResponsesClient::NativeCodex { .. } => delete_fields(
+            &mut raw,
+            &["max_output_tokens", "max_completion_tokens", "temperature", "top_p"],
+        ),
+    }
     set_service_tier(&mut raw, client != ResponsesClient::Translated);
     // ponytail: native Codex loses its `prompt_cache_options` TTL here too. OpenAI's API
     // documents the field, but no evidence shows that the ChatGPT Codex backend accepts
@@ -494,19 +520,105 @@ mod tests {
         }
     }
 
+    /// #80: the registered pair keeps an explicit `parallel_tool_calls: false` (Go
+    /// v8.0.67 `99d1698f`); absent and `null` become `true`. Go v8.0.35 forces `true`
+    /// (docs/DIFFERENCES-FROM-GO.md). `include` is still rebuilt.
     #[test]
-    fn translated_clients_keep_gos_forced_fields() {
+    fn translated_clients_keep_explicit_parallel_false() {
         let include = r#","include":["reasoning.encrypted_content","output.encrypted_content"]"#;
-        for parallel in [r#","parallel_tool_calls":false"#, ""] {
+        for (parallel, want) in [
+            (r#","parallel_tool_calls":false"#, "false"),
+            (r#","parallel_tool_calls":true"#, "true"),
+            (r#","parallel_tool_calls":null"#, "true"),
+            ("", "true"),
+        ] {
             let out = super::convert(
                 codex_body(parallel, include).as_bytes(),
                 super::ResponsesClient::Translated,
             );
-            assert_eq!(crate::gj::get(&out, "parallel_tool_calls").raw.as_ref(), b"true");
+            assert_eq!(
+                crate::gj::get(&out, "parallel_tool_calls").raw.as_ref(),
+                want.as_bytes(),
+                "{parallel:?}"
+            );
             assert_eq!(
                 crate::gj::get(&out, "include").raw.as_ref(),
                 br#"["reasoning.encrypted_content"]"#
             );
+        }
+    }
+
+    /// #80: the registered pair keeps `max_output_tokens` byte for byte, fills an absent
+    /// or `null` one from `max_completion_tokens`, then `max_tokens` (Go v8.0.67
+    /// `01b24f1f`, with the client's number bytes), and never sends the legacy names.
+    /// Native Codex still drops every output limit.
+    #[test]
+    fn translated_clients_keep_the_output_limit() {
+        let ctx = crate::RequestCtx {
+            model: "grok-4.7",
+            stream: true,
+            tool_search: false,
+        };
+        for (fields, want) in [
+            (r#""max_output_tokens":17"#, Some("17")),
+            (
+                r#""max_output_tokens":17,"max_completion_tokens":9,"max_tokens":8"#,
+                Some("17"),
+            ),
+            (
+                r#""max_output_tokens":null,"max_completion_tokens":9,"max_tokens":8"#,
+                Some("9"),
+            ),
+            (r#""max_completion_tokens":null,"max_tokens":8"#, Some("8")),
+            (r#""max_tokens":1.6e1"#, Some("1.6e1")),
+            (r#""max_output_tokens":null"#, Some("null")),
+            ("", None),
+        ] {
+            let sep = if fields.is_empty() { "" } else { "," };
+            let body = format!(r#"{{"model":"grok-4.7","input":"hi"{sep}{fields}}}"#);
+            let out = super::request(&ctx, body.as_bytes()).unwrap();
+            let got = crate::gj::get(&out, "max_output_tokens");
+            assert_eq!(
+                got.exists().then(|| got.raw.as_ref()),
+                want.map(str::as_bytes),
+                "{fields}"
+            );
+            for legacy in ["max_completion_tokens", "max_tokens"] {
+                assert!(!crate::gj::get(&out, legacy).exists(), "{fields}: {legacy}");
+            }
+            let native = super::convert(body.as_bytes(), NATIVE);
+            assert!(!crate::gj::get(&native, "max_output_tokens").exists(), "{fields}");
+        }
+        // An untouched `max_output_tokens` keeps its place in the client's bytes.
+        let body = br#"{"model":"grok-4.7","max_output_tokens":17,"input":[],"stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"]}"#;
+        assert_eq!(super::request(&ctx, body).unwrap(), body.to_vec());
+    }
+
+    /// #80: a control the Responses body cannot carry is refused, not dropped or
+    /// replaced by the default (Go v8.0.67 forces `true` and drops the limit).
+    #[test]
+    fn translated_clients_refuse_unreadable_controls() {
+        let ctx = crate::RequestCtx {
+            model: "grok-4.7",
+            stream: true,
+            tool_search: false,
+        };
+        for (fields, field) in [
+            (
+                r#""parallel_tool_calls":"false""#,
+                "`parallel_tool_calls` must be a boolean",
+            ),
+            (r#""parallel_tool_calls":0"#, "`parallel_tool_calls` must be a boolean"),
+            (r#""max_output_tokens":"17""#, "`max_output_tokens` must be a number"),
+            (
+                r#""max_completion_tokens":{}"#,
+                "`max_completion_tokens` must be a number",
+            ),
+            (r#""max_tokens":[17]"#, "`max_tokens` must be a number"),
+        ] {
+            let body = format!(r#"{{"model":"grok-4.7","input":"hi",{fields}}}"#);
+            let err = super::request(&ctx, body.as_bytes()).unwrap_err();
+            assert!(err.0.contains(field), "{fields}: {err}");
         }
     }
 

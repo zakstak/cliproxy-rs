@@ -129,28 +129,18 @@ fn translate(
     .map_err(|e| bad_request(e.to_string()))
 }
 
-/// `preserveXAIResponsesOutputControls`: output limits and sampling controls the
-/// translator drops are copied from the client body.
+/// `preserveXAIResponsesOutputControls`: sampling controls the translator drops are
+/// copied from the client body. The output limit is not: the registered converters keep
+/// it for every client format, Claude Messages included (cpa_translate
+/// `responses_controls`), where Go v8.0.35 restores it here for Chat Completions and
+/// Responses clients only.
 fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> Vec<u8> {
-    let usable = |r: &Res<'_>| r.exists() && r.kind != Kind::Null;
-    let max = match from {
-        Format::OpenAI => {
-            let mct = gj::get(source, "max_completion_tokens");
-            if usable(&mct) {
-                mct
-            } else {
-                gj::get(source, "max_tokens")
-            }
-        }
-        Format::OpenAIResponse => gj::get(source, "max_output_tokens"),
-        _ => return body,
-    };
-    if usable(&max) {
-        gj::set_raw(&mut body, "max_output_tokens", max.raw());
+    if !matches!(from, Format::OpenAI | Format::OpenAIResponse) {
+        return body;
     }
     for field in ["temperature", "top_p", "top_k"] {
         let value = gj::get(source, field);
-        if usable(&value) {
+        if value.exists() && value.kind != Kind::Null {
             gj::set_raw(&mut body, field, value.raw());
         }
     }
