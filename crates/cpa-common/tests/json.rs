@@ -160,6 +160,7 @@ fn encoding_matches_encoding_json() {
 fn sjson_go_vectors_match() {
     let vectors: Vec<Value> = serde_json::from_str(include_str!("fixtures/sjson_go_vectors.json")).unwrap();
     let mut seen = 0;
+    let mut differences = 0;
     for v in vectors {
         let input = v["in"].as_str().unwrap_or_default().as_bytes();
         let path = v["path"].as_str().unwrap_or_default();
@@ -173,13 +174,42 @@ fn sjson_go_vectors_match() {
         };
         seen += 1;
         let got = got.map(|b| String::from_utf8(b).unwrap());
+        if let Some(&(_, _, _, go_out, rust_out)) = RUST_DIFFERENCES
+            .iter()
+            .find(|(f, i, p, _, _)| v["fn"] == *f && v["in"] == *i && v["path"] == *p)
+        {
+            // The recorded Go output stays as historical evidence.
+            assert_eq!(v["out"].as_str(), Some(go_out), "{v}");
+            assert_eq!(got.as_deref(), Ok(rust_out), "{v}");
+            differences += 1;
+            continue;
+        }
         match v["err"].as_str() {
             Some(message) => assert_eq!(got, Err(message.to_owned()), "{v}"),
             None => assert_eq!(got.as_deref(), Ok(v["out"].as_str().unwrap()), "{v}"),
         }
     }
     assert!(seen >= 25, "vector extraction lost cases: {seen}");
+    assert_eq!(
+        differences,
+        RUST_DIFFERENCES.len(),
+        "every listed difference has its Go vector"
+    );
 }
+
+/// Go vectors where the port deliberately differs (docs/DIFFERENCES-FROM-GO.md):
+/// `(fn, in, path, Go output, Rust output)`.
+const RUST_DIFFERENCES: &[(&str, &str, &str, &str, &str)] = &[
+    // Issue #146: sjson keeps the key of a deleted member whose key holds an escaped
+    // quote, which is invalid JSON. The port deletes the member.
+    (
+        "sjson_delete",
+        r#"{"\"x":1,"y":2}"#,
+        r#"\"x"#,
+        r#"{"\"x":,"y":2}"#,
+        r#"{"y":2}"#,
+    ),
+];
 
 /// json.Unmarshal into `any` (float64 numbers) and Decoder.UseNumber, each re-marshaled.
 #[test]
@@ -211,4 +241,39 @@ fn std_valid_applies_encoding_json_nesting_limit() {
     assert!(!cpa_common::json::std_valid(&nested(10_001)));
     assert!(cpa_common::json::std_valid(br#"{"a":"[[[\"]]]"}"#));
     assert!(!cpa_common::json::std_valid(b"{"));
+}
+
+/// Issue #146: gjson and sjson descend once per path component. A path of more than
+/// `WALK_DEPTH_LIMIT` components is not found and cannot be edited, instead of
+/// overflowing a 2 MiB worker stack; one at the limit still works.
+#[test]
+fn paths_beyond_the_walk_limit_are_refused_on_a_worker_stack() {
+    let on_worker = |f: Box<dyn FnOnce() + Send>| {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    let doc = |depth: usize| format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+    let path = |depth: usize| vec!["a"; depth].join(".");
+    on_worker(Box::new(move || {
+        let limit = gj::WALK_DEPTH_LIMIT;
+        let at = doc(limit);
+        assert_eq!(gj::get(at.as_bytes(), &path(limit)).raw(), b"1");
+        assert_eq!(gj::try_delete(at.as_bytes(), &path(limit)).unwrap().len(), at.len() - 5);
+        assert!(gj::try_set_raw(b"{}", &path(limit), "2").is_ok());
+        // An escaped dot is part of a key, not a separator.
+        assert!(!gj::get(br#"{"k":1}"#, &format!("{}k", r"\.".repeat(limit + 1))).exists());
+        let deep = doc(2_000);
+        let long = path(2_000);
+        assert!(!gj::get(deep.as_bytes(), &long).exists());
+        let message = format!("path has more than {limit} components");
+        assert_eq!(gj::try_delete(deep.as_bytes(), &long), Err(message.clone()));
+        assert_eq!(gj::try_set_raw(deep.as_bytes(), &long, "2"), Err(message));
+        let mut out = deep.clone().into_bytes();
+        assert!(!gj::set_raw(&mut out, &long, "2"));
+        assert_eq!(out, deep.as_bytes(), "a refused edit keeps the document");
+    }));
 }

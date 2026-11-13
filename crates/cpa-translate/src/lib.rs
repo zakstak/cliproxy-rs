@@ -26,29 +26,21 @@
 //! behaviour Go's translators depend on, so malformed bytes, coercions and escaping
 //! match Go.
 
-/// One Go registration (`translator.Register`). Request and non-stream transforms run
-/// deeply nested inputs (the body and, for responses, both requests the translator reads)
-/// on a stack sized for them ([`deep_stack`]); streams get the same protection in
-/// [`stream::framed`], over everything they have read.
+/// One Go registration (`translator.Register`). Every transform runs on the caller's
+/// thread: walkers of nested JSON keep their open containers on the heap and stop at
+/// [`cpa_common::json::WALK_DEPTH_LIMIT`] (issue #146), so no input depth needs a larger
+/// native stack.
 macro_rules! registered {
     ($client:ident -> $upstream:ident, request: $request:expr, non_stream: $non_stream:expr, go_stream: $go_stream:expr, token_count: $token_count:expr $(,)?) => {
         $crate::Registered {
             pair: $crate::Pair {
-                request: |ctx, body| {
-                    let request: $crate::RequestFn = $request;
-                    $crate::deep_stack($crate::levels(&[body]), || request(ctx, body))
-                },
-                non_stream: |ctx, body| {
-                    let non_stream: $crate::NonStreamFn = $non_stream;
-                    let levels = $crate::levels(&[body, ctx.original_request, ctx.translated_request]);
-                    $crate::deep_stack(levels, || non_stream(ctx, body))
-                },
+                request: $request,
+                non_stream: $non_stream,
                 stream: |ctx| {
                     $crate::stream::framed(
                         cpa_core::format::Format::$client,
                         cpa_core::format::Format::$upstream,
                         ($go_stream)(ctx),
-                        $crate::levels(&[ctx.original_request, ctx.translated_request]),
                     )
                 },
                 count_tokens: None,
@@ -102,39 +94,33 @@ pub fn map_sanitized_function_name(map: &std::collections::HashMap<Vec<u8>, Vec<
 }
 
 // Go's `...WithCompat` request converters, exported beside the registered pairs for
-// compatibility endpoints; deeply nested bodies run on a sized stack as registered
-// requests do.
+// compatibility endpoints.
 
 /// ConvertOpenAIResponsesRequestToOpenAIChatCompletions as Go's Chat Completions handler
 /// calls it: the converted body, even when the conversion would refuse an emptied turn.
-/// The only error left is a failed stack reservation for a deeply nested body.
-pub fn responses_to_chat_completions_body(model: &str, body: &[u8], stream: bool) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || {
-        Ok(openai_responses::convert_with_refusal(model, body, stream).0)
-    })
+pub fn responses_to_chat_completions_body(model: &str, body: &[u8], stream: bool) -> Vec<u8> {
+    openai_responses::convert_with_refusal(model, body, stream).0
 }
 
 /// ConvertOpenAIRequestToClaudeWithCompat.
 pub fn openai_to_claude_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || claude_chat_request::request_with_compat(ctx, body))
+    claude_chat_request::request_with_compat(ctx, body)
 }
 
 /// ConvertClaudeRequestToCodexWithCompat.
 pub fn claude_to_codex_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || codex_claude::request_with_compat(ctx, body))
+    codex_claude::request_with_compat(ctx, body)
 }
 
 /// ConvertClaudeRequestToOpenAIWithCompat.
 pub fn claude_to_openai_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || openai_claude::request_with_compat(ctx, body))
+    openai_claude::request_with_compat(ctx, body)
 }
 
 /// ConvertOpenAIResponsesRequestToClaudeWithCompat: like the registered Responses ->
 /// Claude request, but unsigned reasoning history is kept for compatibility endpoints.
 pub fn responses_to_claude_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || {
-        claude_responses::convert(ctx.model, body, ctx.stream, true, ctx.tool_search)
-    })
+    claude_responses::convert(ctx.model, body, ctx.stream, true, ctx.tool_search)
 }
 
 use bytes::Bytes;
@@ -266,15 +252,7 @@ pub fn stream_with(
     ctx: &ResponseCtx<'_>,
     options: stream::StreamOptions,
 ) -> Option<Box<dyn StreamTranslator>> {
-    registered(client, upstream).map(|r| {
-        stream::framed_with(
-            client,
-            upstream,
-            (r.go_stream)(ctx),
-            levels(&[ctx.original_request, ctx.translated_request]),
-            options,
-        )
-    })
+    registered(client, upstream).map(|r| stream::framed_with(client, upstream, (r.go_stream)(ctx), options))
 }
 
 /// The Go-shaped line translator behind a pair's `stream`, for golden tests.
@@ -310,17 +288,12 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
         _ => return None,
     };
     let upstream = Format::Codex;
-    Some(deep_stack(levels(&[body]), || {
-        let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
-        let mut out = convert(ctx, body)?;
+    let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
+    let converted = convert(ctx, body).and_then(|mut out| {
         codex_strict::controls(client, body, &mut out)?;
-        Ok(thinking::apply_summary_for_model(
-            out,
-            upstream.as_str(),
-            ctx.model,
-            summary,
-        ))
-    }))
+        Ok(out)
+    });
+    Some(converted.map(|out| thinking::apply_summary_for_model(out, upstream.as_str(), ctx.model, summary)))
 }
 
 /// The registered branch of Go `TranslateRequestEnvelope`.
@@ -329,18 +302,16 @@ fn translate_registered(
     upstream: Format,
     ctx: &RequestCtx<'_>,
     body: &[u8],
-    native: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error> + Send,
+    native: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
 ) -> Result<Vec<u8>, Error> {
-    deep_stack(levels(&[body]), || {
-        let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
-        let out = native(body)?;
-        Ok(thinking::apply_summary_for_model(
-            out,
-            upstream.as_str(),
-            ctx.model,
-            summary,
-        ))
-    })
+    let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
+    let out = native(body)?;
+    Ok(thinking::apply_summary_for_model(
+        out,
+        upstream.as_str(),
+        ctx.model,
+        summary,
+    ))
 }
 
 /// The unregistered branch of Go `TranslateRequestEnvelope`.
@@ -371,154 +342,5 @@ pub fn translate_token_count(client: Format, upstream: Format, count: i64, body:
     }
 }
 
-/// Bracket nesting Go's recursive JSON walkers may go through after reading some bytes:
-/// the deepest nesting outside strings, and every bracket opened inside a string (JSON
-/// text, such as tool arguments, that a translator may parse, or accumulate from stream
-/// deltas and parse later). Counting string brackets without closing them keeps the bound
-/// sound for any split, and string brackets written as `\u005b`/`\u007b` count too (text
-/// escaped twice, JSON inside a string inside a string, is not decoded); a body with
-/// much code in its strings over-counts and just runs on a larger stack. Fed in pieces,
-/// it covers what a stream retains.
-#[derive(Default)]
-pub(crate) struct Depth {
-    depth: usize,
-    max: usize,
-    string_opens: usize,
-    in_string: bool,
-    escaped: bool,
-    /// Inside a `\u` escape: (hex digits read, value so far).
-    unicode: Option<(u8, u32)>,
-}
-
-impl Depth {
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
-        for &c in bytes {
-            if self.in_string {
-                if let Some((digits, value)) = self.unicode {
-                    if let Some(d) = (c as char).to_digit(16) {
-                        let value = value * 16 + d;
-                        self.unicode = (digits < 3).then_some((digits + 1, value));
-                        if digits == 3 && (value == u32::from(b'[') || value == u32::from(b'{')) {
-                            self.string_opens += 1;
-                        }
-                        continue;
-                    }
-                    self.unicode = None;
-                }
-                if self.escaped {
-                    self.escaped = false;
-                    if c == b'u' {
-                        self.unicode = Some((0, 0));
-                    }
-                } else if c == b'\\' {
-                    self.escaped = true;
-                } else if c == b'"' {
-                    self.in_string = false;
-                } else if c == b'{' || c == b'[' {
-                    self.string_opens += 1;
-                }
-                continue;
-            }
-            match c {
-                b'"' => self.in_string = true,
-                b'{' | b'[' => {
-                    self.depth += 1;
-                    self.max = self.max.max(self.depth);
-                }
-                b'}' | b']' => self.depth = self.depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-
-    pub(crate) fn levels(&self) -> usize {
-        self.max.max(self.string_opens)
-    }
-}
-
-/// The largest [`Depth::levels`] of separately scanned bodies.
-pub(crate) fn levels(bodies: &[&[u8]]) -> usize {
-    bodies
-        .iter()
-        .map(|body| {
-            let mut depth = Depth::default();
-            depth.feed(body);
-            depth.levels()
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// Runs `f` on a thread with a stack sized for `levels` of nesting when that exceeds what
-/// a caller's stack (a 2 MiB async worker) safely holds. Go's JSON walkers recurse per
-/// nesting level on growable stacks (up to 1 GiB); the ported walkers recurse too, so
-/// deep data would otherwise overflow a native stack and abort the process. A stack that
-/// cannot be reserved (memory limits on a small host) is an error, not a panic.
-// ponytail: the stack is sized from a measured per-level cost of the deepest walkers
-// (under 2 KiB in debug builds, which use more stack than release; 4x margin), clamped
-// to Go's 1 GiB maximum. Once a stream's strings have held more than 256 brackets (code
-// in text deltas), each later event runs on a new thread (about 32 us measured); a
-// per-stream worker thread would remove that cost if it ever matters.
-pub(crate) fn deep_stack<T: Send>(levels: usize, f: impl FnOnce() -> Result<T, Error> + Send) -> Result<T, Error> {
-    const DEEP: usize = 256;
-    const PER_LEVEL: usize = 8 << 10;
-    const MIN_STACK: usize = 8 << 20;
-    thread_local! {
-        static ON_DEEP_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    if ON_DEEP_STACK.with(std::cell::Cell::get) || levels <= DEEP {
-        return f();
-    }
-    #[cfg(test)]
-    if FAIL_SPAWN.with(std::cell::Cell::get) {
-        return Err(Error("translator: test stack reservation failure".into()));
-    }
-    let size = levels.saturating_mul(PER_LEVEL).clamp(MIN_STACK, 1 << 30);
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new().stack_size(size).spawn_scoped(scope, || {
-            ON_DEEP_STACK.with(|flag| flag.set(true));
-            f()
-        });
-        match worker {
-            Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            Err(e) => Err(Error(format!(
-                "translator: cannot reserve a {size}-byte stack for JSON nested {levels} levels deep: {e}"
-            ))),
-        }
-    })
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Makes [`deep_stack`] fail as if its stack could not be reserved.
-    pub(crate) static FAIL_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 #[cfg(test)]
 mod go_helper_tests;
-
-#[cfg(test)]
-mod depth_tests {
-    use super::{Depth, levels};
-
-    #[test]
-    fn depth_counts_string_brackets_written_as_escapes() {
-        // Bare JSON strings: no structural nesting, so the count is the string brackets.
-        assert_eq!(levels(&[br#""\u005b\u005B\u007b x[""#]), 4);
-        assert_eq!(
-            levels(&[br#""\\u005b \u005c \u005bz""#]),
-            1,
-            "escaped backslash, other escapes"
-        );
-        assert_eq!(levels(&[br#""\u05b \u00""#]), 0, "malformed escapes");
-        assert_eq!(levels(&[br#""\"[""#]), 1, "escaped quote stays in the string");
-        // A stream's escapes split anywhere still count.
-        let body = format!(r#""{}""#, r"\u005b".repeat(300));
-        let mut depth = Depth::default();
-        for piece in body.as_bytes().chunks(3) {
-            depth.feed(piece);
-        }
-        assert_eq!(depth.levels(), 300);
-        assert_eq!(levels(&[b"[[[[]]]", br#"{"a":"]]]"}"#]), 4, "the deepest body");
-    }
-}

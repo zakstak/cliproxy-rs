@@ -173,3 +173,27 @@ fn apply_patch_responses_match_go() {
         failures.join("\n")
     );
 }
+
+/// Issue #146: a tool choice is rebuilt once from its bytes and its changed nested
+/// choices. Only the custom apply_patch choices change; spacing, unknown members and
+/// unchanged siblings keep their bytes, at every level.
+#[test]
+fn nested_tool_choice_keeps_unchanged_bytes() {
+    let choice = r#"{ "type" : "allowed_tools", "x": 1.50, "tools" : [ {"type":"function","name":"other"} , { "type" : "custom" , "name":"apply_patch", "u":[1] }, {"type":"allowed_tools","tools":[ {"type":"custom","name":"apply_patch"} ]} ] }"#;
+    let body = format!(
+        r#"{{"model":"m","input":"q","tools":[{{"type":"custom","name":"apply_patch"}}],"tool_choice":{choice}}}"#
+    );
+    let out = cpa_translate::apply_patch_responses::normalize_executor_request(body.as_bytes(), None).unwrap();
+    let expected = choice
+        .replace(r#""type" : "custom""#, r#""type" : "function""#)
+        .replace(
+            r#"{"type":"custom","name":"apply_patch"}"#,
+            r#"{"type":"function","name":"apply_patch"}"#,
+        );
+    assert_eq!(
+        cpa_common::json::get(&out, "tool_choice").raw(),
+        expected.as_bytes(),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}

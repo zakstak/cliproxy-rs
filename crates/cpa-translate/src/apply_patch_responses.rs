@@ -98,6 +98,17 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
         .map(|d| d.name.clone())
         .collect();
     let normalize_tools = |tools: &Res<'_>, namespace: &[u8]| -> Vec<u8> {
+        /// One `tools` list being normalized: its remaining tools, the namespace they are
+        /// declared in, the normalized items so far, and the namespace item (with the key
+        /// of this list) that receives the result.
+        struct Open<'a> {
+            tools: std::vec::IntoIter<Res<'a>>,
+            namespace: Vec<u8>,
+            items: Vec<Vec<u8>>,
+            parent: Option<(Vec<u8>, &'static str)>,
+        }
+        /// Namespaces nest on a heap stack. A namespace more than [`gj::WALK_DEPTH_LIMIT`]
+        /// levels below `tools` keeps its children as they are.
         fn walk(
             tools: &Res<'_>,
             namespace: &[u8],
@@ -105,41 +116,66 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
             affected: &HashSet<Vec<u8>>,
             descriptors: &[responses_tools::Descriptor<'_>],
         ) -> Vec<u8> {
-            let mut items = vec![];
-            for tool in tools.array() {
-                let mut item = tool.raw.to_vec();
+            let mut stack = vec![Open {
+                tools: tools.array().into_iter(),
+                namespace: namespace.to_vec(),
+                items: vec![],
+                parent: None,
+            }];
+            loop {
+                let depth = stack.len();
+                let top = stack.last_mut().expect("an open tools list");
+                let Some(tool) = top.tools.next() else {
+                    let done = stack.pop().expect("an open tools list");
+                    let normalized = join_raw_array(&done.items);
+                    let Some((mut item, key)) = done.parent else {
+                        return normalized;
+                    };
+                    gj::set_raw(&mut item, key, normalized);
+                    stack.last_mut().expect("the parent tools list").items.push(item);
+                    continue;
+                };
+                let item = tool.raw.to_vec();
                 if &*tool.get("type").bytes() == b"namespace" {
-                    for key in ["tools", "children"] {
-                        let children = tool.get(key);
-                        if children.is_array() {
-                            let normalized = walk(&children, &tool.get("name").bytes(), winners, affected, descriptors);
-                            gj::set_raw(&mut item, key, normalized);
-                            break;
-                        }
-                    }
-                } else {
-                    let mut name = str_of(&tool.get("name"));
-                    if name.is_empty() {
-                        name = str_of(&tool.get("function.name"));
-                    }
-                    let qualified = qualify_namespace_name(namespace, &name);
-                    if let Some(&winner) = winners.get(&qualified)
-                        && affected.contains(&qualified)
+                    let nested = ["tools", "children"]
+                        .into_iter()
+                        .map(|key| (key, tool.get(key)))
+                        .find(|(_, children)| children.is_array());
+                    if let Some((key, children)) = nested
+                        && depth <= gj::WALK_DEPTH_LIMIT
                     {
-                        if descriptors[winner].tool.index != tool.index {
-                            continue;
-                        }
-                        if apply_patch::is_custom_tool(&tool) {
-                            gj::set_str(&mut item, "type", "function");
-                            gj::set_str(&mut item, "description", apply_patch::description(&tool));
-                            gj::set_raw(&mut item, "parameters", apply_patch::PARAMETERS);
-                            gj::delete(&mut item, "format");
-                        }
+                        stack.push(Open {
+                            tools: children.array().into_iter(),
+                            namespace: tool.get("name").bytes().into_owned(),
+                            items: vec![],
+                            parent: Some((item, key)),
+                        });
+                        continue;
+                    }
+                    top.items.push(item);
+                    continue;
+                }
+                let mut item = item;
+                let mut name = str_of(&tool.get("name"));
+                if name.is_empty() {
+                    name = str_of(&tool.get("function.name"));
+                }
+                let qualified = qualify_namespace_name(&top.namespace, &name);
+                if let Some(&winner) = winners.get(&qualified)
+                    && affected.contains(&qualified)
+                {
+                    if descriptors[winner].tool.index != tool.index {
+                        continue;
+                    }
+                    if apply_patch::is_custom_tool(&tool) {
+                        gj::set_str(&mut item, "type", "function");
+                        gj::set_str(&mut item, "description", apply_patch::description(&tool));
+                        gj::set_raw(&mut item, "parameters", apply_patch::PARAMETERS);
+                        gj::delete(&mut item, "format");
                     }
                 }
-                items.push(item);
+                top.items.push(item);
             }
-            join_raw_array(&items)
         }
         walk(tools, namespace, &winners, &affected, &descriptors)
     };
@@ -203,27 +239,82 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
     if tools.is_array() {
         gj::set_raw(&mut out, "tools", normalize_tools(&tools, b""));
     }
+    /// The tool choice with custom apply_patch choices made functions, nested `tools`
+    /// included. Nested choices wait on a heap stack; one more than
+    /// [`gj::WALK_DEPTH_LIMIT`] levels below the root stays as it is. A choice is rebuilt
+    /// once from its bytes and its changed children, in one pass: setting each child by
+    /// path would rewrite the parent once per child, quadratic in a long `tools` list.
     fn normalize_choice(
         choice: &Res<'_>,
         winners: &HashMap<Vec<u8>, usize>,
         descriptors: &[responses_tools::Descriptor<'_>],
     ) -> Vec<u8> {
-        let mut out = choice.raw.to_vec();
-        let qualified = qualify_namespace_name(&choice.get("namespace").bytes(), &choice.get("name").bytes());
-        if let Some(&winner) = winners.get(&qualified)
-            && apply_patch::is_custom_tool(&descriptors[winner].tool)
-            && &*choice.get("type").bytes() == b"custom"
-        {
-            gj::set_str(&mut out, "type", "function");
+        /// A choice being normalized, its remaining nested choices, and the children
+        /// that changed: where they sit in its bytes, or their index in `tools` when
+        /// they do not borrow from them.
+        struct Open<'a> {
+            choice: Res<'a>,
+            children: std::iter::Enumerate<std::vec::IntoIter<Res<'a>>>,
+            spliced: Vec<(usize, usize, Vec<u8>)>,
+            by_path: Vec<(usize, Vec<u8>)>,
         }
-        for (i, child) in choice.get("tools").array().iter().enumerate() {
-            gj::set_raw(
-                &mut out,
-                &format!("tools.{i}"),
-                normalize_choice(child, winners, descriptors),
-            );
+        fn open(choice: Res<'_>) -> Open<'_> {
+            let children = choice.get("tools").array().into_iter().enumerate();
+            Open {
+                choice,
+                children,
+                spliced: vec![],
+                by_path: vec![],
+            }
         }
-        out
+        let finish = |done: Open<'_>| -> Vec<u8> {
+            let raw = &done.choice.raw[..];
+            let mut out = Vec::with_capacity(raw.len());
+            let mut at = 0;
+            for (start, end, edited) in &done.spliced {
+                out.extend_from_slice(&raw[at..*start]);
+                out.extend_from_slice(edited);
+                at = *end;
+            }
+            out.extend_from_slice(&raw[at..]);
+            for (i, edited) in done.by_path {
+                gj::set_raw(&mut out, &format!("tools.{i}"), edited);
+            }
+            let qualified =
+                qualify_namespace_name(&done.choice.get("namespace").bytes(), &done.choice.get("name").bytes());
+            if let Some(&winner) = winners.get(&qualified)
+                && apply_patch::is_custom_tool(&descriptors[winner].tool)
+                && &*done.choice.get("type").bytes() == b"custom"
+            {
+                gj::set_str(&mut out, "type", "function");
+            }
+            out
+        };
+        let mut stack = vec![(open(choice.clone()), 0)];
+        loop {
+            let depth = stack.len();
+            let (top, _) = stack.last_mut().expect("an open choice");
+            match top.children.next() {
+                Some((i, child)) if depth <= gj::WALK_DEPTH_LIMIT => stack.push((open(child), i)),
+                // Too deep: the child keeps its bytes.
+                Some(_) => {}
+                None => {
+                    let (done, index) = stack.pop().expect("an open choice");
+                    let child_raw = done.choice.raw.clone();
+                    let out = finish(done);
+                    let Some((parent, _)) = stack.last_mut() else {
+                        return out;
+                    };
+                    if out[..] == child_raw[..] {
+                        continue;
+                    }
+                    match offset_in(&parent.choice.raw, &child_raw) {
+                        Some(start) => parent.spliced.push((start, start + child_raw.len(), out)),
+                        None => parent.by_path.push((index, out)),
+                    }
+                }
+            }
+        }
     }
     let choice = root.get("tool_choice");
     if choice.is_object() {

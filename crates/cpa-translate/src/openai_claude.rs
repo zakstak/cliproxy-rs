@@ -512,38 +512,46 @@ fn tool_result_content(content: &Res<'_>) -> (Vec<u8>, Vec<Vec<u8>>) {
 
 /// normalizeObjectSchemaProperties: object schemas get `properties`, unsupported regex
 /// escapes are dropped, and `true` subschemas become `{}` (except additionalProperties).
+/// Subschemas wait on a heap stack; each edit is local to its schema, so the visiting
+/// order does not matter. [`AnyValue::from_res`] bounds the depth, and its
+/// [`AnyValue::Raw`] containers stay as they are.
 fn normalize_schema(schema: &mut AnyValue) {
-    match schema {
-        AnyValue::Bool(true) => *schema = AnyValue::Object(Default::default()),
-        AnyValue::Array(items) => items.iter_mut().for_each(normalize_schema),
-        AnyValue::Object(map) => {
-            if matches!(map.get(&b"type"[..]), Some(AnyValue::String(t)) if t == b"object") {
-                map.entry(b"properties".to_vec())
-                    .or_insert_with(|| AnyValue::Object(Default::default()));
-            }
-            if matches!(map.get(&b"pattern"[..]), Some(AnyValue::String(p)) if common::has_unsupported_unicode_property_escape(p))
-            {
-                map.remove(&b"pattern"[..]);
-            }
-            for key in common::SCHEMA_MAP_KEYWORDS {
-                if let Some(AnyValue::Object(sub)) = map.get_mut(key) {
-                    if key == b"patternProperties" {
-                        sub.retain(|k, _| !common::has_unsupported_unicode_property_escape(k));
-                    }
-                    sub.values_mut().for_each(normalize_schema);
+    let mut pending = vec![schema];
+    while let Some(schema) = pending.pop() {
+        match schema {
+            AnyValue::Bool(true) => *schema = AnyValue::Object(Default::default()),
+            AnyValue::Array(items) => pending.extend(items.iter_mut()),
+            AnyValue::Object(map) => {
+                if matches!(map.get(&b"type"[..]), Some(AnyValue::String(t)) if t == b"object") {
+                    map.entry(b"properties".to_vec())
+                        .or_insert_with(|| AnyValue::Object(Default::default()));
                 }
-            }
-            for key in common::SCHEMA_VALUE_KEYWORDS {
-                match map.get_mut(key) {
-                    Some(AnyValue::Bool(true)) if key != b"additionalProperties" => {
+                if matches!(map.get(&b"pattern"[..]), Some(AnyValue::String(p)) if common::has_unsupported_unicode_property_escape(p))
+                {
+                    map.remove(&b"pattern"[..]);
+                }
+                if let Some(AnyValue::Object(sub)) = map.get_mut(&b"patternProperties"[..]) {
+                    sub.retain(|k, _| !common::has_unsupported_unicode_property_escape(k));
+                }
+                for key in common::SCHEMA_VALUE_KEYWORDS {
+                    if key != b"additionalProperties" && matches!(map.get(key), Some(AnyValue::Bool(true))) {
                         map.insert(key.to_vec(), AnyValue::Object(Default::default()));
                     }
-                    Some(sub @ AnyValue::Object(_)) => normalize_schema(sub),
-                    Some(AnyValue::Array(items)) => items.iter_mut().for_each(normalize_schema),
-                    _ => {}
+                }
+                // The keyword lists are disjoint, so each child is pushed once.
+                for (key, value) in map.iter_mut() {
+                    if common::SCHEMA_MAP_KEYWORDS.contains(&key.as_slice()) {
+                        if let AnyValue::Object(sub) = value {
+                            pending.extend(sub.values_mut());
+                        }
+                    } else if common::SCHEMA_VALUE_KEYWORDS.contains(&key.as_slice())
+                        && matches!(value, AnyValue::Object(_) | AnyValue::Array(_))
+                    {
+                        pending.push(value);
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
 }

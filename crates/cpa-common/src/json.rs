@@ -1579,8 +1579,13 @@ fn parse_array<'a>(c: &mut Ctx<'a>, mut i: usize, path: &[u8]) -> (usize, bool) 
 }
 
 /// gjson.Get.
+/// gjson.Get. A path of more than [`WALK_DEPTH_LIMIT`] components is not found
+/// ([`path_too_deep`]).
 pub fn get<'a>(json: &'a [u8], path: &(impl JsonPath + ?Sized)) -> Res<'a> {
     let path = path.as_path();
+    if path_too_deep(path) {
+        return Res::default();
+    }
     if path.len() > 1 && path[0] == b'@' && is_dot_piper(path) {
         let end = path[1..]
             .iter()
@@ -2429,56 +2434,54 @@ fn append_build(buf: &mut Vec<u8>, array: bool, paths: &[PathPart], raw: &[u8], 
     }
 }
 
+/// sjson's deleteTailItem: trims what precedes a deleted value, the member's key or the
+/// array separator. True when the value opened its container (then the comma after it
+/// goes instead).
+///
+/// Deliberate difference from sjson v1.2.5 (issue #146, docs/DIFFERENCES-FROM-GO.md
+/// "sjson deletion of escaped keys"): the key's opening quote is the nearest quote before
+/// its closing quote that an even run of backslashes precedes. sjson steps over one byte
+/// after any `\"`, misses the opening quote of a key that holds an escaped quote and
+/// keeps the key, leaving `{"\"x":,"y":2}`.
 fn delete_tail_item(buf: &mut Vec<u8>) -> bool {
-    let mut i = buf.len() as isize - 1;
-    while i >= 0 {
-        match buf[i as usize] {
-            b'[' => return true,
-            b',' => {
-                buf.truncate(i as usize);
-                return false;
-            }
-            b':' => {
-                i -= 1;
-                while i >= 0 {
-                    if buf[i as usize] == b'"' {
-                        i -= 1;
-                        while i >= 0 {
-                            if buf[i as usize] == b'"' {
-                                i -= 1;
-                                if i >= 0 && buf[i as usize] == b'\\' {
-                                    // Go's `continue` also runs the loop's `i--`.
-                                    i -= 2;
-                                    continue;
-                                }
-                                while i >= 0 {
-                                    match buf[i as usize] {
-                                        b'{' => {
-                                            buf.truncate(i as usize + 1);
-                                            return true;
-                                        }
-                                        b',' => {
-                                            buf.truncate(i as usize);
-                                            return false;
-                                        }
-                                        _ => {}
-                                    }
-                                    i -= 1;
-                                }
-                            }
-                            i -= 1;
-                        }
-                        break;
-                    }
-                    i -= 1;
-                }
-                return false;
-            }
-            _ => {}
+    let Some(i) = buf.iter().rposition(|&c| matches!(c, b'[' | b',' | b':')) else {
+        return false;
+    };
+    match buf[i] {
+        b'[' => true,
+        b',' => {
+            buf.truncate(i);
+            false
         }
-        i -= 1;
+        _ => {
+            // White space only between the key's closing quote and the colon.
+            let Some(close) = buf[..i].iter().rposition(|&c| c == b'"') else {
+                return false;
+            };
+            let mut before = close;
+            let open = loop {
+                let Some(quote) = buf[..before].iter().rposition(|&c| c == b'"') else {
+                    return false;
+                };
+                let run = buf[..quote].iter().rev().take_while(|&&c| c == b'\\').count();
+                if run % 2 == 0 {
+                    break quote;
+                }
+                before = quote;
+            };
+            match buf[..open].iter().rposition(|&c| matches!(c, b'{' | b',')) {
+                Some(at) if buf[at] == b'{' => {
+                    buf.truncate(at + 1);
+                    true
+                }
+                Some(at) => {
+                    buf.truncate(at);
+                    false
+                }
+                None => false,
+            }
+        }
     }
-    false
 }
 
 enum SetError {
@@ -2612,6 +2615,11 @@ fn trim_ws(s: &[u8]) -> &[u8] {
 fn set_impl(jstr: &[u8], path: &[u8], raw: &[u8], stringify: bool, del: bool) -> Result<Vec<u8>, SetError> {
     if path.is_empty() {
         return Err(SetError::Invalid("path cannot be empty".into()));
+    }
+    if path_too_deep(path) {
+        return Err(SetError::Invalid(format!(
+            "path has more than {WALK_DEPTH_LIMIT} components"
+        )));
     }
     let Some(paths) = split_path(path) else {
         if del {
@@ -2803,9 +2811,46 @@ pub fn set_items<S: AsRef<[u8]>>(out: &mut Vec<u8>, path: &(impl JsonPath + ?Siz
 // ---------------------------------------------------------------------------------------
 // gjson's `any` model (`Result.Value()`)
 
+/// How many nested arrays and objects a walker of decoded or borrowed JSON descends
+/// through, counted from where its walk starts. Deeper containers are kept as they are:
+/// copied raw, or not inspected; each walker's documentation says which.
+///
+/// Deliberate difference from Go (issue #146, docs/DIFFERENCES-FROM-GO.md "Bounded JSON
+/// walks"): Go's walkers recurse to any depth on growable goroutine stacks, and each level
+/// rescans its subtree. Walks here keep their open containers on the heap, never on the
+/// native stack, and stop at this depth, so a walk costs at most this many passes over
+/// its input: linear in the body size. serde_json's default recursion limit is the same.
+pub const WALK_DEPTH_LIMIT: usize = 128;
+
+/// Whether `path` has more than [`WALK_DEPTH_LIMIT`] components (separated by `.` or `|`
+/// not escaped with `\\`). gjson and sjson descend one level per component, recursively
+/// in this port as in Go, so such a path is refused instead of risking the native stack
+/// (issue #146, docs/DIFFERENCES-FROM-GO.md "Bounded JSON walks"): [`get`] finds nothing
+/// and edits return an error. No translator builds such a path; a configured payload rule
+/// can.
+fn path_too_deep(path: &[u8]) -> bool {
+    if path.len() <= WALK_DEPTH_LIMIT {
+        return false;
+    }
+    let mut separators = 0;
+    let mut i = 0;
+    while i < path.len() {
+        match path[i] {
+            b'\\' => i += 1,
+            b'.' | b'|' => separators += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    separators >= WALK_DEPTH_LIMIT
+}
+
 /// What gjson's `Result.Value()` returns, as Go code then edits and marshals it: objects
 /// keep the first duplicate key, strings keep gjson's unescaped bytes (invalid UTF-8
-/// marshals as `\ufffd`), numbers are float64 and non-container JSON is nil.
+/// marshals as `�`), numbers are float64 and non-container JSON is nil.
+///
+/// Containers nested more than [`WALK_DEPTH_LIMIT`] levels below the converted value are
+/// kept as [`AnyValue::Raw`] when they are valid JSON, and become null otherwise.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnyValue {
     Null,
@@ -2814,27 +2859,101 @@ pub enum AnyValue {
     String(Vec<u8>),
     Array(Vec<AnyValue>),
     Object(std::collections::BTreeMap<Vec<u8>, AnyValue>),
+    /// A valid JSON container beyond [`WALK_DEPTH_LIMIT`], written as its source bytes.
+    Raw(Vec<u8>),
 }
 
 impl AnyValue {
+    /// One pass per nesting level, at most [`WALK_DEPTH_LIMIT`], with open containers on
+    /// a heap stack.
     pub fn from_res(r: &Res<'_>) -> Self {
-        match r.kind {
-            Kind::Null => Self::Null,
-            Kind::True => Self::Bool(true),
-            Kind::False => Self::Bool(false),
-            Kind::Number => Self::Number(r.num),
-            Kind::String => Self::String(r.s.to_vec()),
-            Kind::Json => match r.raw.iter().find(|&&c| c > b' ' || c == b'{' || c == b'[') {
-                Some(b'{') => {
-                    let mut map = std::collections::BTreeMap::new();
-                    for (key, value) in array_or_map(&r.raw, b'{', 0).1 {
-                        map.entry(key).or_insert_with(|| Self::from_res(&value));
+        use std::collections::BTreeMap;
+        enum Open<'d> {
+            Array(Vec<AnyValue>, std::vec::IntoIter<Res<'d>>),
+            Object(
+                BTreeMap<Vec<u8>, AnyValue>,
+                std::vec::IntoIter<(Vec<u8>, Res<'d>)>,
+                Vec<u8>,
+            ),
+        }
+        /// The open container `raw` starts, or the value it converts to (null for JSON
+        /// that is neither an object nor an array).
+        fn open(raw: &[u8]) -> Result<Open<'_>, AnyValue> {
+            match raw.iter().find(|&&c| c > b' ' || c == b'{' || c == b'[') {
+                Some(b'{') => Ok(Open::Object(
+                    BTreeMap::new(),
+                    array_or_map(raw, b'{', 0).1.into_iter(),
+                    vec![],
+                )),
+                Some(b'[') => Ok(Open::Array(vec![], array_or_map(raw, b'[', 0).0.into_iter())),
+                _ => Err(AnyValue::Null),
+            }
+        }
+        fn scalar(r: &Res<'_>) -> AnyValue {
+            match r.kind {
+                Kind::Null | Kind::Json => AnyValue::Null,
+                Kind::True => AnyValue::Bool(true),
+                Kind::False => AnyValue::Bool(false),
+                Kind::Number => AnyValue::Number(r.num),
+                Kind::String => AnyValue::String(r.s.to_vec()),
+            }
+        }
+        if r.kind != Kind::Json {
+            return scalar(r);
+        }
+        let root: &[u8] = &r.raw;
+        let mut stack = match open(root) {
+            Ok(open) => vec![(open, root)],
+            Err(value) => return value,
+        };
+        loop {
+            let (top, raw) = stack.last_mut().expect("an open container");
+            let raw: &[u8] = raw;
+            let child = match top {
+                Open::Array(_, items) => items.next(),
+                Open::Object(_, members, key) => members.next().map(|(k, v)| {
+                    *key = k;
+                    v
+                }),
+            };
+            let value = match child {
+                // array_or_map indexes children within their parent's bytes.
+                Some(child) if child.kind == Kind::Json => {
+                    let bytes = &raw[child.index..child.index + child.raw.len()];
+                    if stack.len() >= WALK_DEPTH_LIMIT {
+                        if valid(bytes) {
+                            AnyValue::Raw(bytes.to_vec())
+                        } else {
+                            AnyValue::Null
+                        }
+                    } else {
+                        match open(bytes) {
+                            Ok(open) => {
+                                stack.push((open, bytes));
+                                continue;
+                            }
+                            Err(value) => value,
+                        }
                     }
-                    Self::Object(map)
                 }
-                Some(b'[') => Self::Array(array_or_map(&r.raw, b'[', 0).0.iter().map(Self::from_res).collect()),
-                _ => Self::Null,
-            },
+                Some(child) => scalar(&child),
+                None => {
+                    let done = match stack.pop().expect("an open container").0 {
+                        Open::Array(items, _) => AnyValue::Array(items),
+                        Open::Object(map, _, _) => AnyValue::Object(map),
+                    };
+                    if stack.is_empty() {
+                        return done;
+                    }
+                    done
+                }
+            };
+            match &mut stack.last_mut().expect("an open container").0 {
+                Open::Array(items, _) => items.push(value),
+                Open::Object(map, _, key) => {
+                    map.entry(std::mem::take(key)).or_insert(value);
+                }
+            }
         }
     }
 
@@ -2846,36 +2965,59 @@ impl AnyValue {
         Some(out)
     }
 
+    /// Writes the value with open containers on a heap stack.
     fn write(&self, out: &mut Vec<u8>) -> Option<()> {
-        match self {
-            Self::Null => out.extend_from_slice(b"null"),
-            Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-            Self::Number(n) => out.extend_from_slice(json_float(*n)?.as_bytes()),
-            Self::String(s) => marshal_str(out, s, true),
-            Self::Array(items) => {
-                out.push(b'[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
+        enum Open<'a> {
+            Array(std::slice::Iter<'a, AnyValue>),
+            Object(std::collections::btree_map::Iter<'a, Vec<u8>, AnyValue>),
+        }
+        let mut stack: Vec<(Open<'_>, bool)> = vec![];
+        let mut next = Some(self);
+        loop {
+            if let Some(value) = next.take() {
+                match value {
+                    Self::Null => out.extend_from_slice(b"null"),
+                    Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+                    Self::Number(n) => out.extend_from_slice(json_float(*n)?.as_bytes()),
+                    Self::String(s) => marshal_str(out, s, true),
+                    Self::Raw(raw) => out.extend_from_slice(raw),
+                    Self::Array(items) => {
+                        out.push(b'[');
+                        stack.push((Open::Array(items.iter()), true));
                     }
-                    item.write(out)?;
+                    Self::Object(map) => {
+                        out.push(b'{');
+                        stack.push((Open::Object(map.iter()), true));
+                    }
                 }
-                out.push(b']');
             }
-            Self::Object(map) => {
-                out.push(b'{');
-                for (i, (key, value)) in map.iter().enumerate() {
-                    if i > 0 {
+            let Some((open, first)) = stack.last_mut() else {
+                return Some(());
+            };
+            let item = match open {
+                Open::Array(items) => items.next(),
+                Open::Object(members) => members.next().map(|(key, item)| {
+                    if !std::mem::take(first) {
                         out.push(b',');
                     }
                     marshal_str(out, key, true);
                     out.push(b':');
-                    value.write(out)?;
+                    item
+                }),
+            };
+            match item {
+                Some(item) => {
+                    if matches!(open, Open::Array(_)) && !std::mem::take(first) {
+                        out.push(b',');
+                    }
+                    next = Some(item);
                 }
-                out.push(b'}');
+                None => {
+                    out.push(if matches!(open, Open::Array(_)) { b']' } else { b'}' });
+                    stack.pop();
+                }
             }
         }
-        Some(())
     }
 
     /// `out, _ = sjson.SetBytes(out, path, value)` for this value: scalars use sjson's
@@ -2889,7 +3031,7 @@ impl AnyValue {
             Self::Bool(b) => set_bool(out, path, *b),
             Self::Number(n) => set_f64(out, path, *n),
             Self::String(s) => set_str(out, path, s),
-            Self::Array(_) | Self::Object(_) => match self.marshal() {
+            Self::Array(_) | Self::Object(_) | Self::Raw(_) => match self.marshal() {
                 Some(raw) => set_raw(out, path, raw),
                 None => {
                     out.clear();
@@ -3555,13 +3697,64 @@ mod tests {
         assert_eq!(del(br#"{"only":true}"#, "only"), "{}");
         assert_eq!(del(body, "missing"), String::from_utf8_lossy(body));
         assert_eq!(del(b"[1,2]", "-1"), "[1]");
-        // Go's backward scan skips a byte after an escaped quote and leaves malformed JSON
-        // for a key that itself contains one; parity keeps sjson's exact output.
-        assert_eq!(del(br#"{"\"x":1,"y":2}"#, "\\\"x"), r#"{"\"x":,"y":2}"#);
+        // sjson leaves `{"\"x":,"y":2}` for a key holding an escaped quote; the port
+        // removes the whole member (issue #146, docs/DIFFERENCES-FROM-GO.md).
+        assert_eq!(del(br#"{"\"x":1,"y":2}"#, "\\\"x"), r#"{"y":2}"#);
+        assert_eq!(del(br#"{"y":2, "\"x" :1}"#, "\\\"x"), r#"{"y":2}"#);
+        assert_eq!(
+            del(br#"{"a\\":1,"y":2}"#, "a\\\\"),
+            r#"{"y":2}"#,
+            "escaped backslash before the closing quote"
+        );
+        assert_eq!(
+            del(br#"{"y":2,"\\\"\"":1}"#, "\\\\\\\"\\\""),
+            r#"{"y":2}"#,
+            "backslash and quote runs"
+        );
+        for (body, path) in [
+            (&br#"{"\"x":1,"y":2}"#[..], "\\\"x"),
+            (br#"{"y":{"\"q\"":[1,{"z":"\""}]},"k":0}"#, "y.\\\"q\\\""),
+            (br#"{"k":{"\\":1}}"#, "k.\\\\"),
+        ] {
+            let out = try_delete(body, path).unwrap();
+            assert!(std_valid(&out), "{}", String::from_utf8_lossy(&out));
+            assert_ne!(out, body, "{path}");
+        }
         assert_eq!(
             del(br#"{"t":{"type":"x","effort":"y"}}"#, "t.effort"),
             r#"{"t":{"type":"x"}}"#
         );
+    }
+
+    /// Issue #146: `Result.Value()` conversion re-encodes WALK_DEPTH_LIMIT levels and keeps
+    /// deeper valid containers as their bytes; deeper invalid ones become null.
+    #[test]
+    fn any_value_keeps_containers_beyond_the_walk_limit_raw() {
+        let wrap = |levels: usize, inner: &str| format!("{}{inner}{}", "[ ".repeat(levels), " ]".repeat(levels));
+        let inner = r#"{"b": 1.50, "a": "<"}"#;
+        // The innermost object is level LIMIT: re-encoded, sorted and escaped.
+        let at = wrap(WALK_DEPTH_LIMIT - 1, inner);
+        let out = parse(at.as_bytes()).value_json().unwrap();
+        assert!(s(out).contains(r#"{"a":"\u003c","b":1.5}"#));
+        // One level deeper: kept as received.
+        let beyond = wrap(WALK_DEPTH_LIMIT, inner);
+        let out = s(parse(beyond.as_bytes()).value_json().unwrap());
+        assert!(out.contains(r#"[{"b": 1.50, "a": "<"}]"#), "{out}");
+        assert!(out.starts_with(&"[".repeat(WALK_DEPTH_LIMIT)));
+        assert!(std_valid(out.as_bytes()));
+        // An invalid container beyond the limit is null.
+        let bad = wrap(WALK_DEPTH_LIMIT, r#"{"b": }"#);
+        let out = s(parse(bad.as_bytes()).value_json().unwrap());
+        assert!(out.contains("[null]") && std_valid(out.as_bytes()), "{out}");
+        // Very deep input converts on a small stack in time linear in its size.
+        let deep = wrap(200_000, "1");
+        let out = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || parse(deep.as_bytes()).value_json().unwrap().len())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(out > 200_000);
     }
 
     #[test]

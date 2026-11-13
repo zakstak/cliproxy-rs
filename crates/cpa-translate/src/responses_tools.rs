@@ -224,37 +224,46 @@ fn sanitize_names(names: &[&[u8]]) -> HashMap<Vec<u8>, Vec<u8>> {
 /// util.functionNamesFromRequest: declared function names of a request's `tools`
 /// (nested `tools`, Gemini declarations, OpenAI `function.name`, then `name`).
 fn function_names_from_request(raw: &[u8]) -> Vec<Vec<u8>> {
-    fn collect(tool: &Res<'_>, names: &mut Vec<Vec<u8>>) {
-        let nested = tool.get("tools");
-        if nested.is_array() {
-            nested.each(|_, t| {
-                collect(&t, names);
-                true
-            });
-            return;
-        }
-        let mut declared = false;
-        for key in ["functionDeclarations", "function_declarations"] {
-            let declarations = tool.get(key);
-            if declarations.is_array() {
-                declared = true;
-                declarations.each(|_, d| {
-                    let name = d.get("name").bytes();
-                    if !name.is_empty() {
-                        names.push(name.into_owned());
-                    }
-                    true
-                });
+    /// Nested `tools` lists wait on a heap stack, in document order; lists more than
+    /// [`gj::WALK_DEPTH_LIMIT`] levels below the request's `tools` are skipped.
+    fn collect(tool: Res<'_>, names: &mut Vec<Vec<u8>>) {
+        let mut pending = vec![(tool, 0usize)];
+        while let Some((tool, depth)) = pending.pop() {
+            let nested = tool.get("tools");
+            if nested.is_array() {
+                if depth < gj::WALK_DEPTH_LIMIT {
+                    let mut tools = vec![];
+                    nested.each(|_, t| {
+                        tools.push((t, depth + 1));
+                        true
+                    });
+                    pending.extend(tools.into_iter().rev());
+                }
+                continue;
             }
-        }
-        if declared {
-            return;
-        }
-        for path in ["function.name", "name"] {
-            let name = tool.get(path).bytes();
-            if !name.is_empty() {
-                names.push(name.into_owned());
-                return;
+            let mut declared = false;
+            for key in ["functionDeclarations", "function_declarations"] {
+                let declarations = tool.get(key);
+                if declarations.is_array() {
+                    declared = true;
+                    declarations.each(|_, d| {
+                        let name = d.get("name").bytes();
+                        if !name.is_empty() {
+                            names.push(name.into_owned());
+                        }
+                        true
+                    });
+                }
+            }
+            if declared {
+                continue;
+            }
+            for path in ["function.name", "name"] {
+                let name = tool.get(path).bytes();
+                if !name.is_empty() {
+                    names.push(name.into_owned());
+                    break;
+                }
             }
         }
     }
@@ -265,7 +274,7 @@ fn function_names_from_request(raw: &[u8]) -> Vec<Vec<u8>> {
     let mut names = vec![];
     if tools.is_array() {
         tools.each(|_, tool| {
-            collect(&tool, &mut names);
+            collect(tool, &mut names);
             true
         });
     }
