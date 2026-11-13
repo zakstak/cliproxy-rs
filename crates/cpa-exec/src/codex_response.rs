@@ -223,15 +223,32 @@ pub(crate) fn request_fault(status: u16, body: &str) -> bool {
 ///
 /// A first-party Codex reading of the status and the body as sent (FP2,
 /// `crate::codex_terminal`, `x-error-json` included) is carried on the error
-/// ([`with_sourced`]), unless the body was reclassified as a usage or capacity limit.
+/// ([`sourced_status_error`]). It is read first: first-party Codex decides a terminal
+/// rejection from its code and status before anything else the body says, so a usage or
+/// capacity message does not turn it into a 429 (review finding 1).
 pub(crate) fn status_error(status: u16, body: &[u8], headers: HeaderMap, model_level_cooling: bool) -> ExecError {
     let raw = String::from_utf8_lossy(body);
-    let sourced = if is_usage_limit(&raw) || is_capacity(&raw) {
-        None
+    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), &raw, &headers);
+    sourced_status_error(status, &raw, headers, model_level_cooling, sourced)
+}
+
+/// The error for `status` and body `raw` with the first-party reading `sourced`. A
+/// terminal rejection keeps its own status and the body as sent: Go's usage, capacity and
+/// context rewrites belong to failures first-party Codex reads otherwise. Any other
+/// failure takes Go's classification ([`go_status_error`]), then the reading.
+fn sourced_status_error(
+    status: u16,
+    raw: &str,
+    headers: HeaderMap,
+    model_level_cooling: bool,
+    sourced: Option<cpa_core::exec::SourcedFault>,
+) -> ExecError {
+    let error = if sourced == Some(cpa_core::exec::SourcedFault::RequestTerminal) {
+        status_error_raw(status, raw, headers, model_level_cooling)
     } else {
-        crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), &raw, &headers)
+        go_status_error(status, raw, headers, model_level_cooling)
     };
-    with_sourced(go_status_error(status, &raw, headers, model_level_cooling), sourced)
+    with_sourced(error, sourced)
 }
 
 /// [`status_error`] by Go's rules alone, for a failure first-party Codex reads without
@@ -422,18 +439,27 @@ pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option
         || is_usage_limit(&body)
         || is_capacity(&body)
         || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
-    let first_party = crate::codex_terminal::reading(crate::codex_terminal::Surface::Stream, &body, &HeaderMap::new());
-    let status = match first_party {
-        Some(_) => crate::codex_terminal::stream_status(rawjson::get(&body, "error.code").str()).unwrap_or(400),
+    let rejection = crate::codex_terminal::stream_rejection_status(&body);
+    let first_party = rejection.map(|_| cpa_core::exec::SourcedFault::RequestTerminal);
+    let status = match rejection {
+        Some(status) => status,
         None if stream_handled => 400,
         None => terminal_status(&body),
     };
-    let error = go_status_error(status, &body, HeaderMap::new(), model_level_cooling);
-    Some((with_sourced(error, first_party), body))
+    Some((
+        sourced_status_error(status, &body, HeaderMap::new(), model_level_cooling, first_party),
+        body,
+    ))
 }
 
 /// `isCodexOverloadBootstrapFailure`: transient capacity rejections another credential may serve.
+/// `body` is an in-stream failure's error body ([`terminal_failure`]); a first-party
+/// terminal rejection is never one, whatever its message says (FP2, review finding 1), so
+/// bootstrap buffering never fails it over.
 pub(crate) fn is_overload(body: &str) -> bool {
+    if crate::codex_terminal::stream_rejection_status(body).is_some() {
+        return false;
+    }
     if is_capacity(body) {
         return true;
     }
@@ -1175,7 +1201,7 @@ mod first_party_terminal_tests {
 
     /// HTTP: the terminal codes with their first-party status are request faults carried
     /// as `RequestTerminal`, with their bodies as sent; the same bodies on a 503 keep Go's
-    /// transient credential failure and no sourced reading.
+    /// transient credential failure, `Retryable` when they name a first-party code.
     #[test]
     fn http_rejections_stop_on_the_account_with_their_bytes() {
         let provider = text("http-error-workspace-provider");
@@ -1211,10 +1237,11 @@ mod first_party_terminal_tests {
             if !body.is_empty() {
                 assert_eq!(error.body, body.as_bytes(), "{body}: the provider's body");
             }
+            let named = !body.is_empty();
             let error = http(503, &body, headers);
             assert_eq!(
                 (error.status, error.scope, error.sourced),
-                (503, FailureScope::Credential, None),
+                (503, FailureScope::Credential, if named { RETRYABLE } else { None }),
                 "{body}"
             );
         }
@@ -1232,7 +1259,6 @@ mod first_party_terminal_tests {
                 r#"{"error":{"code":"runtime_instance_revoked"}}"#.to_owned(),
                 HeaderMap::new(),
             ),
-            (401, text("http-error-workspace-detail"), x_error_json(&provider)),
         ] {
             let error = http(status, &body, headers);
             assert_eq!(
@@ -1241,6 +1267,95 @@ mod first_party_terminal_tests {
                 "{status} {body}"
             );
         }
+        // A 401 never reads the workspace match: first-party retries the code there.
+        let error = http(401, &text("http-error-workspace-detail"), x_error_json(&provider));
+        assert_eq!((error.scope, error.sourced), (FailureScope::Credential, RETRYABLE));
+    }
+
+    /// Review finding 1: a terminal code decides before Go's usage and capacity readings
+    /// of the message, on HTTP and in-stream. The rejection keeps its first-party status
+    /// and body, is no bootstrap overload, and is no 429.
+    #[test]
+    fn a_capacity_message_does_not_override_a_terminal_code() {
+        let capacity = r#"{"error":{"code":"inference_hook_denied","message":"model is at capacity"}}"#;
+        let usage = r#"{"error":{"code":"inference_hook_denied","type":"usage_limit_reached","message":"m"}}"#;
+        for body in [capacity, usage] {
+            let error = http(403, body, HeaderMap::new());
+            assert_eq!(
+                (error.status, error.scope, error.sourced),
+                (403, FailureScope::Request, TERMINAL),
+                "{body}"
+            );
+            assert_eq!(error.body, body.as_bytes(), "{body}: the body as sent");
+            assert_eq!(error.retry_after, None, "{body}");
+        }
+        for event in [
+            r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"inference_hook_denied","message":"model is at capacity"}}}"#,
+            r#"{"type":"error","error":{"code":"content_policy_violation","message":"Selected model is at capacity."}}"#,
+        ] {
+            let (error, body) = terminal_failure(event, false).unwrap();
+            let want = crate::codex_terminal::stream_rejection_status(&body).unwrap();
+            assert_eq!(
+                (error.status, error.scope, error.sourced),
+                (want, FailureScope::Request, TERMINAL),
+                "{event}"
+            );
+            assert!(!is_overload(&body), "{event}: no bootstrap failover");
+        }
+        // Controls: without a terminal code the capacity message is still Go's overload.
+        let plain = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"server_error","message":"model is at capacity"}}}"#;
+        let (error, body) = terminal_failure(plain, false).unwrap();
+        assert!(is_overload(&body) && error.status == 429 && error.sourced.is_none());
+        let http_plain = http(503, r#"{"error":{"message":"model is at capacity"}}"#, HeaderMap::new());
+        assert_eq!((http_plain.status, http_plain.sourced), (429, None));
+    }
+
+    /// Review finding 2: a first-party code on a status first-party retries is no request
+    /// fault, even with Go's `invalid_request_error` type; on 400 Go's rules stay.
+    #[test]
+    fn a_first_party_code_on_a_retried_status_is_no_request_fault() {
+        let typed = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error","message":"m"}}"#;
+        for (status, scope) in [(503, FailureScope::Credential), (403, FailureScope::Credential)] {
+            let error = http(status, typed, HeaderMap::new());
+            assert_eq!(
+                (error.status, error.scope, error.sourced),
+                (status, scope, RETRYABLE),
+                "{status}"
+            );
+            assert_eq!(error.body, typed.as_bytes(), "{status}");
+        }
+        let error = http(400, typed, HeaderMap::new());
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (400, FailureScope::Request, TERMINAL)
+        );
+        let invalid = r#"{"error":{"code":"invalid_access_program","type":"invalid_request_error"}}"#;
+        let error = http(400, invalid, HeaderMap::new());
+        assert_eq!((error.scope, error.sourced), (FailureScope::Request, None), "Go's 400");
+    }
+
+    /// Review finding 4: a refused upgrade with status 426 keeps Go's plain rendering and
+    /// carries the first-party reading; any other status is the ordinary status error.
+    #[test]
+    fn an_upgrade_refusal_carries_its_first_party_reading() {
+        let context = br#"{"error":{"code":"context_length_exceeded","message":"m"}}"#;
+        let error = crate::codex_ws::upgrade_refusal(426, context, HeaderMap::new(), false);
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (426, FailureScope::Credential, RETRYABLE)
+        );
+        assert_eq!(error.body, &context[..], "the plain rendering");
+        let plain = crate::codex_ws::upgrade_refusal(426, b"upgrade required", HeaderMap::new(), false);
+        assert_eq!(
+            (plain.status, plain.scope, plain.sourced),
+            (426, FailureScope::Credential, None)
+        );
+        let workspace = text("http-error-workspace-detail");
+        let error = crate::codex_ws::upgrade_refusal(403, workspace.as_bytes(), HeaderMap::new(), false);
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Request, TERMINAL)
+        );
     }
 
     /// `error.rs:110-112`: `context_length_exceeded` is a context-window failure only
@@ -1384,7 +1499,7 @@ mod first_party_terminal_tests {
         assert_eq!((error.status, error.sourced), (403, TERMINAL), "{detail}");
         // A wrapped 503 workspace frame is an ordinary 503.
         let error = ws(r#"{"type":"error","status":503,"detail":{"code":"codex_workspace_access_denied"}}"#).unwrap();
-        assert_eq!((error.scope, error.sourced), (FailureScope::Credential, None));
+        assert_eq!((error.scope, error.sourced), (FailureScope::Credential, RETRYABLE));
 
         // Unwrapped readings: a notice status and statuses the wrapped struct refuses.
         for status in ["200", "1000", r#""503""#, "429.0", r#""403""#] {

@@ -1319,6 +1319,20 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     Some(error)
 }
 
+/// A refused upstream WebSocket upgrade as an error. Go returns a plain `statusErr` for
+/// 426 on downstream WebSockets; every other status is `newCodexStatusErrWithCooling`.
+/// Both carry the first-party reading of the status and body (FP2, review finding 4):
+/// the 426 keeps its plain rendering, but `context_length_exceeded` on it is retried by
+/// first-party Codex (`error.rs:110-112`), so Go's code rule does not stop it.
+pub(crate) fn upgrade_refusal(status: u16, body: &[u8], handshake: HeaderMap, model_level_cooling: bool) -> ExecError {
+    if status != 426 {
+        return response::status_error(status, body, handshake, model_level_cooling);
+    }
+    let text = String::from_utf8_lossy(body).into_owned();
+    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), &text, &handshake);
+    response::with_sourced(response::status_error_raw(status, &text, handshake, false), sourced)
+}
+
 /// One upstream message, classified.
 enum Frame {
     /// Empty text frame (heartbeat).
@@ -2209,12 +2223,7 @@ impl CodexExecutor {
                 if let Some(wire) = wire {
                     wire.upgrade_rejection(&target.url, request, status, &handshake, &body);
                 }
-                if status == 426 {
-                    // Go returns a plain statusErr for 426 on downstream WebSockets.
-                    let text = String::from_utf8_lossy(&body).into_owned();
-                    return Err(response::status_error_raw(status, &text, handshake, false));
-                }
-                return Err(response::status_error(status, &body, handshake, model_level_cooling));
+                return Err(upgrade_refusal(status, &body, handshake, model_level_cooling));
             }
             // ponytail: Go reports a failed negotiation (and a bad handshake) as a status
             // error carrying 101; here both are transport failures.

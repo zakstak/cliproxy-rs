@@ -2823,3 +2823,71 @@ async fn a_context_labelled_503_is_retried_once_per_account() {
         );
     }
 }
+
+/// FP2 (#116) review findings 1, 3 and 5 on the native HTTP route, with a second account
+/// available: a terminal rejection is read from its code and status before Go's capacity
+/// reading of its message, the 403 workspace match runs whatever else the body names, and
+/// a repeated key reads as its last occurrence (`serde_json::Value`, as first-party
+/// `api_bridge.rs:138-140` reads it). Each stops on the selected account: one attempt, no
+/// cooldown, one failed record, and the provider's status and bytes.
+#[tokio::test]
+async fn terminal_rejections_decide_before_messages_and_repeated_keys() {
+    for body in [
+        r#"{"error":{"code":"inference_hook_denied","message":"model is at capacity"}}"#,
+        r#"{"error":{"code":"other","code":"inference_hook_denied","message":"denied"}}"#,
+        r#"{"detail":{"code":"codex_workspace_access_denied"},"error":{"code":"context_length_exceeded"}}"#,
+    ] {
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![Reply::json(403, body), Reply::sse(fixture("sse-completed").bytes())],
+                ..Script::default()
+            },
+            &[SELECTED, SECOND],
+            "",
+            false,
+        )
+        .await;
+        let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        assert_eq!((got, answer.as_str()), (403, body), "{body}");
+        let exchanges = proxy.upstream.http();
+        assert_eq!(exchanges.len(), 1, "{body}: one attempt, no failover");
+        assert_eq!(
+            exchanges[0].headers["authorization"],
+            format!("Bearer {SELECTED}"),
+            "{body}"
+        );
+        assert_eq!(cooldowns(&proxy), 0, "{body}: no account is cooled");
+        let records = usage_records(&proxy, 1).await;
+        assert_eq!(records.len(), 1, "{body}: one settlement {records:?}");
+        assert_eq!(records[0]["failed"], true, "{body}");
+    }
+}
+
+/// FP2 (#116) review finding 2: a first-party code on a status first-party Codex retries
+/// (`api_bridge.rs:223-312`) is no request fault, even beside Go's `invalid_request_error`
+/// type, which Go reads as one on any status. The 503 moves once to the second account,
+/// which serves the answer; the first account is cooled.
+#[tokio::test]
+async fn a_typed_first_party_code_on_a_503_moves_to_another_account() {
+    let body = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error","message":"m"}}"#;
+    let (proxy, _) = native_accounts(
+        Script {
+            http: vec![Reply::json(503, body), Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        &[SELECTED, SECOND],
+        "",
+        false,
+    )
+    .await;
+    let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((got, answer.as_str()), (200, text_of("sse-completed").as_str()));
+    let tokens: Vec<_> = proxy
+        .upstream
+        .http()
+        .iter()
+        .map(|e| e.headers["authorization"].to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(tokens, [format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")]);
+    assert!(cooldowns(&proxy) > 0, "the failing account is cooled");
+}

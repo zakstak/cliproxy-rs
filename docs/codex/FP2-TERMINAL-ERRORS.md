@@ -43,10 +43,18 @@ evidence. Loopback mocks stand for `chatgpt`.
 | An HTTP error, or a wrapped WebSocket status frame or upgrade refusal, with a terminal code and its first-party status | `Surface::Status` | `SourcedFault::RequestTerminal`: request fault. No failover, no cooldown, no token refresh. |
 | A 403 workspace or access-program denial, in `/detail/code`, `/error/code` or `x-error-json` | `Surface::Status` | `RequestTerminal`. First-party does not retry it, and nothing in the source shows that the account is unhealthy for other requests. A 503 with the same body is an ordinary 503. |
 | An in-stream event, or an unmapped WebSocket `error` frame, with a new code | `Surface::Stream` (no status) | `RequestTerminal`, classified with the code's first-party status: 403 for `inference_hook_denied` and `access_program_not_enabled`, 400 for the others. The pinned reader read on past such a notice; main fails it. |
-| `context_length_exceeded` with any HTTP status except 400 | `Surface::Status` | `SourcedFault::Retryable`: no request fault, and no `context_too_large` rewrite. Its status decides (a 503 fails over and cools). |
+| `context_length_exceeded` with any HTTP status except 400 | `Surface::Status` | `SourcedFault::Retryable`: no request fault, and no `context_too_large` rewrite. Its status decides (a 503 fails over and cools). A 403 whose body or `x-error-json` names a workspace or access-program denial is that denial first. |
+| A first-party code (the stream codes and the two workspace codes) on any other status but 400 | `Surface::Status` | `SourcedFault::Retryable`: first-party retries it (`api_bridge.rs:223-312`), so Go's `invalid_request_error` type, 413 or 422 rule does not stop it. On 400, Go's rules stay; first-party reads it as `InvalidRequest`, also terminal. |
 | `context_length_exceeded` without a status, or with 400 | either | Unchanged context failure. An unmapped notice with this code, which the pinned reader read on, now fails as main does. |
 | Workspace codes in a stream event | `Surface::Stream` | Unchanged. First-party has no stream reading for them. |
 | 401, a bare 403, another 403 code, a runtime authentication denial | none | Unchanged credential failure. |
+
+The reading comes first. A terminal rejection keeps its first-party status and its body as
+sent, whatever its message says: Go's usage-limit, model-capacity and context rewrites do
+not apply to it, and an in-stream one is never a bootstrap overload. Bodies, wrapped
+frames and the `x-error-json` JSON are read as a `serde_json::Value`, as first-party Codex
+reads them: the last of a repeated key. A 426 upgrade refusal keeps Go's plain rendering
+and carries the reading too.
 
 `cpa_exec::codex_terminal` reads the rules. The Codex executor carries the result on
 `ExecError::sourced`, and the server's `classify` functions read it before Go's
@@ -100,6 +108,23 @@ All tests use loopback upstreams, fake tokens and private `auth-dir`s.
 | `codex_native_ws::first_party_terminal_rejections_never_fail_over_on_websocket_turns` | 18 frames, on a socket and on a turn served over HTTP: one upstream frame or request, no cooldown, one failed record. 403 frames are withheld; the others arrive as sent. |
 | `codex_native_ws::a_workspace_upgrade_refusal_stops_on_the_selected_account` | A 403 workspace upgrade refusal: one upgrade, no HTTP request, no cooldown, one failed record, silent close. The bare 403 control fails over. |
 | `codex_native_ws::a_context_labelled_503_fails_over_on_websocket_turns` | The 503 fixture frame and a typed 503 move once to the second account. Only the first account is cooled. |
+
+## Review corrections
+
+A source review at `c4f968fb` found five defects, fixed together with unit and route
+tests:
+
+1. A model-capacity or usage-limit message turned a terminal rejection into an unsourced
+   429, and an in-stream one into a bootstrap overload that failed over.
+2. A first-party code on a status first-party retries became a request fault through Go's
+   `invalid_request_error` type rule.
+3. A context code made a 403 workspace denial retryable before the 403 match ran.
+4. A 426 upgrade refusal carried no reading.
+5. The status reading took the first of a repeated key; first-party's `Value` takes the
+   last.
+
+The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
+evidence for them.
 
 ## Unresolved gates
 

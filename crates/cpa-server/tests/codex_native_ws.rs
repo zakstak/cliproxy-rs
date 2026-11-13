@@ -8533,3 +8533,74 @@ async fn a_context_labelled_503_fails_over_on_websocket_turns() {
         assert_ne!(cooled[0], "codex-second.json", "{frame}: the first account is cooled");
     }
 }
+
+/// FP2 (#116) review finding 1 on the bootstrap path: with `stream-bootstrap-buffering`,
+/// an in-stream `inference_hook_denied` whose message reads as Go's model-capacity
+/// overload is still the first-party terminal rejection, never a bootstrap overload: the
+/// turn stops on the selected account with no second socket and no cooldown, its 403
+/// frame is withheld (#6), and one failed record is kept. A plain capacity failure with
+/// no first-party code is the control: it fails over to the second account.
+#[tokio::test]
+async fn a_capacity_message_never_fails_a_terminal_rejection_over_at_bootstrap() {
+    let buffering = "codex:\n  stream-bootstrap-buffering: true\n";
+    let terminal = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"inference_hook_denied","message":"model is at capacity"}}}"#;
+    let control = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"server_error","message":"model is at capacity"}}}"#;
+    for (frame, stops) in [(terminal, true), (control, false)] {
+        let proxy = proxy_with(
+            Script {
+                ws: vec![vec![Bytes::from(frame)], fixture("sse-completed").frames()],
+                ..Script::default()
+            },
+            buffering,
+            |url| preferred_pair(url, true),
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let got = read(&mut socket, &["response.completed"]).await;
+        let tokens: Vec<_> = proxy
+            .upstream
+            .sockets()
+            .iter()
+            .map(|s| s.headers["authorization"].to_str().unwrap().to_owned())
+            .collect();
+        let cooled = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .filter(|c| !proxy.rt.store().cooldowns(&c.id).is_empty())
+            .count();
+        if stops {
+            assert!(
+                got.frames.is_empty(),
+                "{frame}: withheld, no other account's answer: {got:?}"
+            );
+            assert!(got.closed.is_some(), "{frame}: {got:?}");
+            assert_eq!(
+                tokens,
+                ["Bearer at-FAKE"],
+                "{frame}: one socket on the selected account"
+            );
+            assert_eq!(cooled, 0, "{frame}");
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{frame}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{frame}: one settlement"
+            );
+        } else {
+            assert_eq!(got.frames, events("sse-completed"), "{frame}");
+            assert_eq!(tokens, ["Bearer at-FAKE", "Bearer at-FAKE-second"], "{frame}");
+            assert!(cooled > 0, "{frame}");
+        }
+    }
+}

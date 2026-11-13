@@ -38,8 +38,7 @@
 use base64::Engine;
 use cpa_core::exec::SourcedFault;
 use http::HeaderMap;
-
-use crate::rawjson;
+use serde_json::Value;
 
 /// Which first-party reading a failure gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,14 +82,44 @@ pub(crate) fn stream_status(code: &str) -> Option<u16> {
     }
 }
 
+/// The status an in-stream failure with error body `body` is classified with when it is
+/// a first-party terminal rejection ([`stream_status`] of its code, read as
+/// [`reading`] reads it), or `None`.
+pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let code = value.pointer("/error/code")?.as_str()?;
+    STREAM_TERMINAL.contains(&code).then(|| stream_status(code)).flatten()
+}
+
+/// The codes FP2 reads from first-party sources: the stream codes and the two workspace
+/// codes. With an HTTP status that pairs with none of their terminal readings, and that is
+/// not 400, first-party Codex retries them (`UnexpectedStatus`, `RetryLimit` or
+/// `InternalServerError`, `api_bridge.rs:223-312`, `protocol/src/error.rs:470-534`), so
+/// Go's request-fault rules (an `invalid_request_error` type, a 413 or 422) must not stop
+/// them. A 400 keeps Go's rules: first-party reads it as `InvalidRequest`, also terminal.
+const FIRST_PARTY_CODES: [&str; 7] = [
+    "inference_hook_denied",
+    "invalid_access_program",
+    "unsupported_access_program",
+    "content_policy_violation",
+    "access_program_not_enabled",
+    "invalid_workspace_selected",
+    "codex_workspace_access_denied",
+];
+
 /// The first-party reading of a failure on `surface`, with the JSON `body` (the event's
 /// error object as `{"error":…}` for [`Surface::Stream`]; the HTTP body or the whole
 /// wrapped frame for [`Surface::Status`]) and the `headers` it came with. `None` leaves
-/// the failure to the proxy's Go rules. Codes are compared exactly, as first-party Codex
-/// compares them, and each path is read once.
+/// the failure to the proxy's Go rules.
+///
+/// The body is read as first-party Codex reads it, a `serde_json::Value`
+/// (`api_bridge.rs:138-140`, `293-298`): the last of a repeated key, and serde_json's
+/// private number and raw value tokens resolved. Codes are compared exactly. The body is
+/// an error body or one frame, bounded, and parsed once.
 pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Option<SourcedFault> {
-    let code = rawjson::get(body, "error.code");
-    let code = code.str();
+    let value = serde_json::from_str::<Value>(body).ok();
+    let at = |path: &str| value.as_ref().and_then(|v| v.pointer(path)).and_then(Value::as_str);
+    let code = at("/error/code").unwrap_or_default();
     let status = match surface {
         Surface::Stream => {
             return STREAM_TERMINAL.contains(&code).then_some(SourcedFault::RequestTerminal);
@@ -98,39 +127,39 @@ pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Opti
         Surface::Status(status) => status,
     };
     // `parse_terminal_provider_error` with the status (`api_bridge.rs:138-143`).
-    match (code, status) {
-        ("inference_hook_denied", 403) | ("content_policy_violation", 400) => {
+    if matches!(
+        (code, status),
+        ("inference_hook_denied", 403) | ("content_policy_violation", 400)
+    ) {
+        return Some(SourcedFault::RequestTerminal);
+    }
+    // The 403 match (`api_bridge.rs:293-311`), which runs after that parser declined the
+    // body, whatever else it names: the body's `/detail/code`, else its `/error/code`,
+    // else the `x-error-json` header's code.
+    if status == 403 {
+        let matched = at("/detail/code")
+            .or_else(|| at("/error/code"))
+            .map(str::to_owned)
+            .or_else(|| identity_code(headers));
+        if matched.is_some_and(|c| FORBIDDEN_TERMINAL.contains(&c.as_str())) {
             return Some(SourcedFault::RequestTerminal);
         }
-        ("context_length_exceeded", 400) => return None,
-        ("context_length_exceeded", _) => return Some(SourcedFault::Retryable),
-        _ => {}
     }
-    if status != 403 {
-        return None;
+    // `error.rs:110-112`: a context-window failure only with 400; any other status retries.
+    if code == "context_length_exceeded" {
+        return (status != 400).then_some(SourcedFault::Retryable);
     }
-    // The 403 match (`api_bridge.rs:293-311`): the body's `/detail/code`, else its
-    // `/error/code`, else the `x-error-json` header's code.
-    let body_code = ["detail.code", "error.code"].into_iter().find_map(|path| {
-        let value = rawjson::get(body, path);
-        (value.kind() == rawjson::Kind::String).then(|| value.str().to_owned())
-    });
-    let code = body_code.or_else(|| identity_code(headers))?;
-    FORBIDDEN_TERMINAL
-        .contains(&code.as_str())
-        .then_some(SourcedFault::RequestTerminal)
+    let named = [code, at("/detail/code").unwrap_or_default()];
+    (status != 400 && named.iter().any(|c| FIRST_PARTY_CODES.contains(c))).then_some(SourcedFault::Retryable)
 }
 
-/// The `error.code` of the base64 JSON in `x-error-json` (`api_bridge.rs:342-354`).
+/// The `error.code` of the base64 JSON in `x-error-json` (`api_bridge.rs:342-354`), read
+/// as a `serde_json::Value` too.
 fn identity_code(headers: &HeaderMap) -> Option<String> {
     let encoded = headers.get("x-error-json")?.to_str().ok()?;
     let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-    let decoded = std::str::from_utf8(&decoded).ok()?;
-    if !rawjson::valid(decoded) {
-        return None;
-    }
-    let code = rawjson::get(decoded, "error.code");
-    (code.kind() == rawjson::Kind::String).then(|| code.str().to_owned())
+    let parsed = serde_json::from_slice::<Value>(&decoded).ok()?;
+    parsed.pointer("/error/code")?.as_str().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -185,28 +214,87 @@ mod tests {
     /// `error.rs:103-134` and `api_bridge.rs:138-143` with a status: a code is terminal
     /// only with the status first-party Codex pairs it with. `invalid_access_program` and
     /// `unsupported_access_program` have no status reading: a 400 already is the ordinary
-    /// invalid request (`error.rs:113`).
+    /// invalid request (`error.rs:113`). With any other status but 400 first-party retries
+    /// the code (`api_bridge.rs:223-312`), so it is `Retryable`, whatever type it names
+    /// (review finding 2); a 400 keeps Go's rules.
     #[test]
     fn status_rejections_follow_their_first_party_status() {
         for (code, terminal) in [("inference_hook_denied", 403), ("content_policy_violation", 400)] {
             let body = format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#);
             assert_eq!(reading(Surface::Status(terminal), &body, &none()), TERMINAL, "{code}");
-            for other in [400, 401, 403, 429, 500, 503] {
+            for other in [400, 401, 403, 413, 422, 429, 500, 503] {
                 if other != terminal {
-                    assert_eq!(reading(Surface::Status(other), &body, &none()), None, "{code} {other}");
+                    let want = (other != 400).then_some(SourcedFault::Retryable);
+                    assert_eq!(reading(Surface::Status(other), &body, &none()), want, "{code} {other}");
                 }
             }
         }
         for code in ["invalid_access_program", "unsupported_access_program"] {
-            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
-            for status in [400, 403, 503] {
-                assert_eq!(
-                    reading(Surface::Status(status), &body, &none()),
-                    None,
-                    "{code} {status}"
-                );
+            for body in [
+                format!(r#"{{"error":{{"code":"{code}"}}}}"#),
+                format!(r#"{{"error":{{"code":"{code}","type":"invalid_request_error"}}}}"#),
+            ] {
+                assert_eq!(reading(Surface::Status(400), &body, &none()), None, "{body}");
+                for status in [403, 413, 503] {
+                    assert_eq!(
+                        reading(Surface::Status(status), &body, &none()),
+                        RETRYABLE,
+                        "{status} {body}"
+                    );
+                }
             }
         }
+        // The review's case: a 503 content-policy body with Go's request-fault type.
+        let typed = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error"}}"#;
+        assert_eq!(reading(Surface::Status(503), typed, &none()), RETRYABLE);
+        // A code no first-party rule names keeps Go's rules on every status.
+        let other = r#"{"error":{"code":"x","type":"invalid_request_error"}}"#;
+        for status in [400, 403, 503] {
+            assert_eq!(reading(Surface::Status(status), other, &none()), None, "{status}");
+        }
+    }
+
+    /// Review finding 5: the body and the `x-error-json` JSON are read as a
+    /// `serde_json::Value`, which keeps the last of a repeated key, as first-party Codex
+    /// does (`api_bridge.rs:138-140`, `342-354`).
+    #[test]
+    fn a_repeated_key_reads_as_its_last_occurrence() {
+        let last = r#"{"error":{"code":"other","code":"inference_hook_denied"}}"#;
+        let first = r#"{"error":{"code":"inference_hook_denied","code":"other"}}"#;
+        assert_eq!(reading(Surface::Status(403), last, &none()), TERMINAL);
+        assert_eq!(reading(Surface::Status(403), first, &none()), None);
+        assert_eq!(reading(Surface::Stream, last, &none()), TERMINAL);
+        assert_eq!(reading(Surface::Stream, first, &none()), None);
+        let detail = r#"{"detail":{"code":"route_rate_limited","code":"invalid_workspace_selected"}}"#;
+        assert_eq!(reading(Surface::Status(403), detail, &none()), TERMINAL);
+        let header = x_error_json(r#"{"error":{"code":"x","code":"invalid_workspace_selected"}}"#);
+        assert_eq!(reading(Surface::Status(403), "", &header), TERMINAL);
+        let header = x_error_json(r#"{"error":{"code":"invalid_workspace_selected","code":"x"}}"#);
+        assert_eq!(reading(Surface::Status(403), "", &header), None);
+    }
+
+    /// Review finding 3: the 403 match runs after the status parser declined the body,
+    /// whatever else it names, so a context code does not make a workspace 403 retryable
+    /// (`api_bridge.rs:138-143`, then `293-311`).
+    #[test]
+    fn the_403_match_precedes_the_context_rule() {
+        for body in [
+            r#"{"detail":{"code":"codex_workspace_access_denied"},"error":{"code":"context_length_exceeded"}}"#,
+            r#"{"error":{"code":"context_length_exceeded"},"detail":{"code":"invalid_workspace_selected"}}"#,
+        ] {
+            assert_eq!(reading(Surface::Status(403), body, &none()), TERMINAL, "{body}");
+            assert_eq!(reading(Surface::Status(503), body, &none()), RETRYABLE, "{body}");
+        }
+        // A context code alone on a 403 stays retryable; with x-error-json naming a
+        // workspace it is that denial (the body names no `/detail/code`).
+        let context = r#"{"error":{"code":"context_length_exceeded"}}"#;
+        assert_eq!(reading(Surface::Status(403), context, &none()), RETRYABLE);
+        let header = x_error_json(r#"{"error":{"code":"invalid_workspace_selected"}}"#);
+        assert_eq!(
+            reading(Surface::Status(403), context, &header),
+            RETRYABLE,
+            "a body code wins over the header"
+        );
     }
 
     /// `api_bridge_tests.rs` `only_an_explicit_workspace_403_stops_retries` at
@@ -219,21 +307,23 @@ mod tests {
         let detail = r#"{"detail":{"code":"invalid_workspace_selected"}}"#;
         let access_denied = r#"{"detail":{"code":"codex_workspace_access_denied"}}"#;
         let other = r#"{"detail":{"code":"route_rate_limited"}}"#;
-        for (status, body, with_header, terminal) in [
-            (403, detail, false, true),
-            (403, access_denied, false, true),
-            (503, access_denied, false, false),
-            (403, provider, false, true),
-            (403, "", true, true),
-            (403, "", false, false),
-            (403, "invalid_workspace_selected", false, false),
-            (403, other, true, false),
-            (401, detail, true, false),
+        // First-party's `terminal` column, with the reading of a non-terminal case: a
+        // workspace code on another status is retried there (`Retryable` here).
+        for (status, body, with_header, want) in [
+            (403, detail, false, TERMINAL),
+            (403, access_denied, false, TERMINAL),
+            (503, access_denied, false, RETRYABLE),
+            (403, provider, false, TERMINAL),
+            (403, "", true, TERMINAL),
+            (403, "", false, None),
+            (403, "invalid_workspace_selected", false, None),
+            (403, other, true, None),
+            (401, detail, true, RETRYABLE),
         ] {
             let headers = if with_header { x_error_json(provider) } else { none() };
             assert_eq!(
                 reading(Surface::Status(status), body, &headers),
-                terminal.then_some(SourcedFault::RequestTerminal),
+                want,
                 "{status} {body} header={with_header}"
             );
         }
