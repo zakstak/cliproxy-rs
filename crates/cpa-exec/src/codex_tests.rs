@@ -3288,6 +3288,11 @@ async fn gated_codex_requests_dial_their_own_connection_under_every_keep_alive_s
                     AdmissionUpstream::count(&up.seen.data),
                     AdmissionUpstream::count(&up.seen.http1),
                 );
+                if !reuse {
+                    // The opted-out warm-up connection closes first, so the next ended
+                    // connection below is the gated one.
+                    up.settled().await;
+                }
                 let ended_before = *up.ended.borrow();
                 up.hold_tls.store(true, SeqCst);
                 let (revoked, checks) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
@@ -3470,7 +3475,30 @@ async fn an_opt_out_reload_retires_the_default_pool() {
         up.settled().await;
         ordinary_turn(&executor, &up, &on).await;
         assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 3, "{case}: a new pool");
-        drop(executor);
+        // Sol review: a gated request under the opt-out retires the pool too, though it
+        // never uses it.
+        let credential = oauth_credential("https://chatgpt.com/backend-api/codex");
+        let view = crate::codex_request::View::for_request(&credential, &off);
+        let gated = executor
+            .post_certain(
+                &view,
+                &up.url(),
+                &admission_headers(),
+                Bytes::from_static(ADMISSION_BODY.as_bytes()),
+                Some(Arc::new(|| true)),
+            )
+            .await
+            .map_err(|(error, _)| error.status)
+            .unwrap();
+        let mut body = gated.body;
+        while body.next().await.is_some() {}
+        drop(body);
+        assert_eq!(
+            AdmissionUpstream::count(&up.seen.tcp),
+            4,
+            "{case}: the gated request's own dial"
+        );
         up.settled().await;
+        drop(executor);
     }
 }

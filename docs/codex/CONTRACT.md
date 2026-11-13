@@ -133,8 +133,11 @@ Each effective proxy has its own client, which keeps at most 2 idle connections 
 `chatgpt.com` for 90 seconds, and HTTP/2 requests share one connection.
 `oauth.providers.codex.chatgpt-keep-alive: false` turns reuse off: each request then
 dials a connection and closes it with the response, as Go v8.0.35 does
-(`helps/utls_client.go`). The setting is read for each request, and turning it off
-retires every pooled client.
+(`helps/utls_client.go`). The setting is read for each request. Turning it off
+retires every pooled client at the next Codex HTTP request, on any route, gated requests
+and other origins included. Without such a request the idle connections close at the
+90-second timeout. A reload that changes `requests.tls-handshake-timeout-seconds`
+replaces the proxy's pool instead of adding a second one, so the bound holds per proxy.
 
 - **First-party evidence.** The pinned client builds its HTTP client on a
   `reqwest::ClientBuilder` that leaves reqwest's connection pool on

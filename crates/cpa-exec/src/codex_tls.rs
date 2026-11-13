@@ -74,7 +74,8 @@ impl Transport {
 
     /// The client for one request to `url` (`fallbackRoundTripper.RoundTrip`).
     /// `keep_alive` is `chatgpt-keep-alive` and `handshake` the TLS handshake bound
-    /// ([`crate::tls::handshake_timeout`]); both only affect chatgpt.com.
+    /// ([`crate::tls::handshake_timeout`]); both only affect chatgpt.com, but an opt-out
+    /// retires the pooled chatgpt.com clients whatever `url` is.
     pub fn for_url(
         &self,
         url: &str,
@@ -82,6 +83,7 @@ impl Transport {
         keep_alive: bool,
         handshake: Option<std::time::Duration>,
     ) -> wreq::Client {
+        self.retire_if_off(keep_alive);
         if is_chatgpt(url) {
             self.chatgpt(&(proxy.clone(), keep_alive, handshake))
         } else {
@@ -92,9 +94,17 @@ impl Transport {
     /// [`Self::for_url`] for a gated request ([`crate::proxy::send_routed_certain`]): the
     /// same TLS client, ALPN and proxy, but the request dials its own connection and its
     /// gate decides once that connection is up, before any HTTP byte is written
-    /// ([`crate::proxy::admit_dials`]). `keep_alive` does not apply: no gated request may
-    /// share a connection (N1 #111).
-    pub fn admitting_for_url(&self, url: &str, proxy: &Proxy, handshake: Option<std::time::Duration>) -> wreq::Client {
+    /// ([`crate::proxy::admit_dials`]). `keep_alive` never selects reuse here: no gated
+    /// request may share a connection (N1 #111). An opt-out still retires the pooled
+    /// clients, so a reload to `false` followed only by gated requests leaves no pool.
+    pub fn admitting_for_url(
+        &self,
+        url: &str,
+        proxy: &Proxy,
+        keep_alive: bool,
+        handshake: Option<std::time::Duration>,
+    ) -> wreq::Client {
+        self.retire_if_off(keep_alive);
         if !is_chatgpt(url) {
             return self.admitting.get(proxy);
         }
@@ -123,15 +133,25 @@ impl Transport {
         self.standard.get(proxy)
     }
 
+    /// Keep-alive is off for this request, so it was turned off (or never on): retire every
+    /// pooled chatgpt.com client. Requests in flight hold their own clone and finish; when
+    /// the last clone goes, its pool closes the idle sockets and its timer stops.
+    fn retire_if_off(&self, keep_alive: bool) {
+        if !keep_alive {
+            let mut cache = self.chatgpt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|((_, pooled, _), _)| !pooled);
+        }
+    }
+
     fn chatgpt(&self, key: &ChatgptKey) -> wreq::Client {
         let (proxy, keep_alive, handshake) = key;
         let keep_alive = *keep_alive;
         let mut cache = self.chatgpt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !keep_alive {
-            // Keep-alive is off for this request, so it was turned off (or never on): retire
-            // every pooled client. Requests in flight hold their own clone and finish; when
-            // the last clone goes, its pool closes the idle sockets and its timer stops.
-            cache.retain(|((_, pooled, _), _)| !pooled);
+        if keep_alive {
+            // One pool per proxy: a reload that changed the handshake bound supersedes the
+            // proxy's pool under the old bound, so the proxy never holds more than
+            // [`CHATGPT_IDLE_PER_HOST`] idle connections. In-flight requests keep theirs.
+            cache.retain(|((p, pooled, h), _)| !(*pooled && p == proxy && h != handshake));
         }
         if let Some(i) = cache.iter().position(|(k, _)| k == key) {
             let entry = cache.remove(i);
