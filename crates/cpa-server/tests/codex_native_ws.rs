@@ -8519,7 +8519,7 @@ async fn a_context_labelled_503_fails_over_on_websocket_turns() {
             .map(|s| s.headers["authorization"].to_str().unwrap().to_owned())
             .collect();
         assert_eq!(tokens, ["Bearer at-FAKE", "Bearer at-FAKE-second"], "{frame}");
-        assert_eq!(upstream_frames(&proxy, 0), [create.clone()], "{frame}");
+        assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create), "{frame}");
         assert_eq!(upstream_frames(&proxy, 1), [create], "{frame}");
         let cooled: Vec<_> = proxy
             .rt
