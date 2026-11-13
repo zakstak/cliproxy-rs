@@ -2292,8 +2292,14 @@ impl CredentialStore {
             if changed {
                 self.persist_cooldowns();
             }
-            // Go persists on every recorded result, a client-cancelled stream included.
-            self.persist_credential(&lease.credential);
+            // Go `MarkResult` saves the credential with the request context, and
+            // `beginForegroundStoreSave` refuses a cancelled one before `Store.Save`
+            // (v8.0.35 sdk/cliproxy/auth/conductor_persistence.go): a client that went
+            // away leaves the file as it was. Cooldowns above use a background context
+            // in Go and still persist.
+            if !matches!(outcome, Outcome::Cancelled) {
+                self.persist_credential(&lease.credential);
+            }
         }
     }
 
