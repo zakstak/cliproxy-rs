@@ -44,7 +44,7 @@ evidence. Loopback mocks stand for `chatgpt`.
 | A 403 workspace or access-program denial, in `/detail/code`, `/error/code` or `x-error-json` | `Surface::Status` | `RequestTerminal`. First-party does not retry it, and nothing in the source shows that the account is unhealthy for other requests. A 503 with the same body is an ordinary 503. |
 | An in-stream event, or an unmapped WebSocket `error` frame, with a new code | `Surface::Stream` (no status) | `RequestTerminal`, classified with the code's first-party status: 403 for `inference_hook_denied` and `access_program_not_enabled`, 400 for the others. The pinned reader read on past such a notice; main fails it. |
 | `context_length_exceeded` with any HTTP status except 400 | `Surface::Status` | `SourcedFault::Retryable`: no request fault, and no `context_too_large` rewrite. Its status decides (a 503 fails over and cools). A 403 whose body or `x-error-json` names a workspace or access-program denial is that denial first. |
-| A first-party code (the stream codes and the two workspace codes) on any other status but 400 | `Surface::Status` | `SourcedFault::Retryable`: first-party retries it (`api_bridge.rs:223-312`), so Go's `invalid_request_error` type, 413 or 422 rule does not stop it. On 400, Go's rules stay; first-party reads it as `InvalidRequest`, also terminal. |
+| A first-party code (the stream codes and the two workspace codes) on any other status but 400 | `Surface::Status` | `SourcedFault::Retryable`: first-party retries it (`api_bridge.rs:223-312`), so Go's `invalid_request_error` type, 413 or 422 rule does not stop it. On 400 it is `RequestTerminal`: first-party reads it as `InvalidRequest` (`api_bridge.rs:188-222`), before anything its message says. |
 | `context_length_exceeded` without a status, or with 400 | either | Unchanged context failure. An unmapped notice with this code, which the pinned reader read on, now fails as main does. |
 | Workspace codes in a stream event | `Surface::Stream` | Unchanged. First-party has no stream reading for them. |
 | 401, a bare 403, another 403 code, a runtime authentication denial | none | Unchanged credential failure. |
@@ -122,6 +122,23 @@ tests:
 4. A 426 upgrade refusal carried no reading.
 5. The status reading took the first of a repeated key; first-party's `Value` takes the
    last.
+
+A second review at `b503dce5` found four more, fixed in the next commit:
+
+1. FP2 classified an in-stream rejection with its paired status (for example 400), so a
+   frame whose own error named an account status (an inner 403) or a usage limit was no
+   longer withheld from a native client. The account-safety reading now also keeps Go's
+   status for the frame (`codex_response::go_failure_status`), so such a frame stays
+   withheld (#6), whatever FP2 classifies it with.
+2. On 400, a first-party code and the context code could still become a 429 through Go's
+   capacity or usage reading of the message, or an in-stream context failure a bootstrap
+   overload. They are now read from the code first; a first-party code on 400 is
+   `RequestTerminal`, and the context code keeps the proxy's context classification.
+3. The translated routes classified failure events as written, so a repeated
+   `response.error` read as its first occurrence. They now read the pinned view, as the
+   native routes do.
+4. A wrapped frame's `x-error-json` was trimmed before the reading. The reading now takes
+   the frame's headers as first-party does, unchanged.
 
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.

@@ -254,11 +254,9 @@ fn sourced_status_error(
 /// [`status_error`] by Go's rules alone, for a failure first-party Codex reads without
 /// a status: an in-stream event ([`terminal_failure`]).
 fn go_status_error(status: u16, raw: &str, headers: HeaderMap, model_level_cooling: bool) -> ExecError {
-    let code = if is_usage_limit(raw) || is_capacity(raw) {
-        429
-    } else {
-        status
-    };
+    // A first-party context-window failure is read from its code first (FP2).
+    let limited = (is_usage_limit(raw) || is_capacity(raw)) && !crate::codex_terminal::context_window(status, raw);
+    let code = if limited { 429 } else { status };
     let classified = classify(code, raw);
     status_error_raw(code, &classified, headers, model_level_cooling)
 }
@@ -434,22 +432,63 @@ fn terminal_status(body: &str) -> u16 {
 /// (`crate::codex_terminal::stream_status`), whatever status the error object itself
 /// names, and is a request fault: the request stops on this account (FP2).
 pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
+    let (rejection, status, body) = failure_status(event)?;
+    let first_party = rejection.map(|_| cpa_core::exec::SourcedFault::RequestTerminal);
+    Some((
+        sourced_status_error(status, &body, HeaderMap::new(), model_level_cooling, first_party),
+        body,
+    ))
+}
+
+/// The status Go v8.0.35 classifies the failure event `event` with
+/// (`codexTerminalFailureErrWithCooling`, read as written: the first of a repeated key),
+/// for the account-safety reading alone (`codex_ws::account_reading`, #6). FP2 classifies
+/// a first-party rejection with its own status ([`terminal_failure`]), but a frame Go reads
+/// as an account failure (an inner 403, a usage limit) can still name the pooled account,
+/// so it stays withheld whatever FP2 decides (re-review finding 1).
+pub(crate) fn go_failure_status(event: &str) -> Option<u16> {
+    let body = terminal_failure_body(event)?;
+    let stream_handled = context_length(&body)
+        || is_usage_limit(&body)
+        || is_capacity(&body)
+        || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
+    Some(if is_usage_limit(&body) || is_capacity(&body) {
+        429
+    } else if stream_handled {
+        400
+    } else {
+        terminal_status(&body)
+    })
+}
+
+/// The failure body of `event`, the status it is classified with, and that status when the
+/// event is a first-party terminal rejection.
+fn failure_status(event: &str) -> Option<(Option<u16>, u16, String)> {
     let body = terminal_failure_body(event)?;
     let stream_handled = context_length(&body)
         || is_usage_limit(&body)
         || is_capacity(&body)
         || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
     let rejection = crate::codex_terminal::stream_rejection_status(&body);
-    let first_party = rejection.map(|_| cpa_core::exec::SourcedFault::RequestTerminal);
     let status = match rejection {
         Some(status) => status,
         None if stream_handled => 400,
         None => terminal_status(&body),
     };
-    Some((
-        sourced_status_error(status, &body, HeaderMap::new(), model_level_cooling, first_party),
-        body,
-    ))
+    Some((rejection, status, body))
+}
+
+/// The reading a translated route classifies an upstream event `payload` from, as the
+/// pinned reader decodes it (`crate::codex_event::classification_view`: the last of a
+/// repeated key, private values resolved), like the native routes (FP2, re-review finding
+/// 3). Only a payload that can be a failure event pays for the view: one that names
+/// `error` or `failed`, or holds an escape that could spell either.
+fn failure_view(payload: &str) -> std::borrow::Cow<'_, str> {
+    if ["error", "failed", "\\u"].iter().any(|s| payload.contains(s)) {
+        crate::codex_event::classification_view(payload)
+    } else {
+        std::borrow::Cow::Borrowed(payload)
+    }
 }
 
 /// `isCodexOverloadBootstrapFailure`: transient capacity rejections another credential may serve.
@@ -457,7 +496,9 @@ pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option
 /// terminal rejection is never one, whatever its message says (FP2, review finding 1), so
 /// bootstrap buffering never fails it over.
 pub(crate) fn is_overload(body: &str) -> bool {
-    if crate::codex_terminal::stream_rejection_status(body).is_some() {
+    if crate::codex_terminal::stream_rejection_status(body).is_some()
+        || crate::codex_terminal::context_window(400, body)
+    {
         return false;
     }
     if is_capacity(body) {
@@ -798,7 +839,7 @@ impl Processor {
                         self.usage
                             .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
                     }
-                    if let Some((error, body)) = terminal_failure(payload, self.model_level_cooling) {
+                    if let Some((error, body)) = terminal_failure(&failure_view(payload), self.model_level_cooling) {
                         return Step::Fail {
                             error,
                             body: Some(body),
@@ -884,7 +925,7 @@ impl Processor {
                 if meaningful_delta(payload) {
                     self.saw_delta = true;
                 }
-                if let Some((error, _)) = terminal_failure(payload, self.model_level_cooling) {
+                if let Some((error, _)) = terminal_failure(&failure_view(payload), self.model_level_cooling) {
                     return Err(error);
                 }
                 match rawjson::get(payload, "type").str() {
@@ -1311,7 +1352,7 @@ mod first_party_terminal_tests {
     }
 
     /// Review finding 2: a first-party code on a status first-party retries is no request
-    /// fault, even with Go's `invalid_request_error` type; on 400 Go's rules stay.
+    /// fault, even with Go's `invalid_request_error` type; on 400 it is terminal.
     #[test]
     fn a_first_party_code_on_a_retried_status_is_no_request_fault() {
         let typed = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error","message":"m"}}"#;
@@ -1331,7 +1372,80 @@ mod first_party_terminal_tests {
         );
         let invalid = r#"{"error":{"code":"invalid_access_program","type":"invalid_request_error"}}"#;
         let error = http(400, invalid, HeaderMap::new());
-        assert_eq!((error.scope, error.sourced), (FailureScope::Request, None), "Go's 400");
+        assert_eq!(
+            (error.scope, error.sourced),
+            (FailureScope::Request, TERMINAL),
+            "first-party InvalidRequest"
+        );
+    }
+
+    /// Re-review finding 1: an in-stream rejection that FP2 classifies with 400, but whose
+    /// own error names an account status (or a usage limit), stays withheld from a native
+    /// client: Go's reading of the frame is still an account failure (#6).
+    #[test]
+    fn an_inner_account_status_keeps_the_frame_withheld() {
+        let frame = r#"{"type":"response.failed","response":{"error":{"code":"content_policy_violation","status":403,"message":"workspace org-private denied"}}}"#;
+        let (error, _) = terminal_failure(frame, false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (400, FailureScope::Request, TERMINAL)
+        );
+        assert_eq!(go_failure_status(frame), Some(403));
+        let error = ws(frame).unwrap();
+        assert_eq!((error.status, error.sourced), (400, TERMINAL));
+        assert!(error.withheld(), "Go's 403 reading withholds it");
+        let usage = r#"{"type":"error","error":{"code":"invalid_access_program","type":"usage_limit_reached","message":"plan of acct-x"}}"#;
+        assert_eq!(go_failure_status(usage), Some(429));
+        assert!(ws(usage).unwrap().withheld(), "{usage}");
+        // Control: a 400 rejection that no reading makes an account failure is delivered.
+        let plain = r#"{"type":"response.failed","response":{"error":{"code":"content_policy_violation","message":"rejected"}}}"#;
+        assert!(!ws(plain).unwrap().withheld());
+    }
+
+    /// Re-review finding 2: on 400, a first-party code and the context code are read from
+    /// the code before Go's usage-limit and capacity readings of the message, on HTTP and
+    /// in-stream; neither becomes a 429 or a bootstrap overload.
+    #[test]
+    fn a_400_code_decides_before_its_message() {
+        let invalid = r#"{"error":{"code":"invalid_access_program","message":"model is at capacity"}}"#;
+        let error = http(400, invalid, HeaderMap::new());
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (400, FailureScope::Request, TERMINAL)
+        );
+        assert_eq!(error.body, invalid.as_bytes());
+        let context = r#"{"error":{"code":"context_length_exceeded","message":"model is at capacity"}}"#;
+        let error = http(400, context, HeaderMap::new());
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (400, FailureScope::Request, None)
+        );
+        assert_eq!(
+            rawjson::get(&String::from_utf8_lossy(&error.body), "error.code").str(),
+            "context_too_large",
+            "the proxy's context classification stays"
+        );
+        let event = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"context_length_exceeded","message":"model is at capacity"}}}"#;
+        let (error, body) = terminal_failure(event, false).unwrap();
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+        assert!(!is_overload(&body), "no bootstrap failover");
+    }
+
+    /// Re-review finding 3: a translated route classifies a failure event as the pinned
+    /// reader decodes it, so a repeated `response.error` reads as its last occurrence.
+    #[test]
+    fn translated_failures_read_the_last_repeated_key() {
+        let event = r#"{"type":"response.failed","response":{"error":{"code":"server_error"},"error":{"code":"inference_hook_denied"}}}"#;
+        let (error, _) = terminal_failure(&failure_view(event), false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Request, TERMINAL)
+        );
+        let reversed = r#"{"type":"response.failed","response":{"error":{"code":"inference_hook_denied"},"error":{"code":"server_error"}}}"#;
+        let (error, _) = terminal_failure(&failure_view(reversed), false).unwrap();
+        assert_eq!(error.sourced, None);
+        let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+        assert!(matches!(failure_view(delta), std::borrow::Cow::Borrowed(_)));
     }
 
     /// Review finding 4: a refused upgrade with status 426 keeps Go's plain rendering and

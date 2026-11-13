@@ -96,7 +96,8 @@ pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
 /// not 400, first-party Codex retries them (`UnexpectedStatus`, `RetryLimit` or
 /// `InternalServerError`, `api_bridge.rs:223-312`, `protocol/src/error.rs:470-534`), so
 /// Go's request-fault rules (an `invalid_request_error` type, a 413 or 422) must not stop
-/// them. A 400 keeps Go's rules: first-party reads it as `InvalidRequest`, also terminal.
+/// them. On 400 first-party reads them as the terminal `InvalidRequest`
+/// (`api_bridge.rs:188-222`), before anything the message says.
 const FIRST_PARTY_CODES: [&str; 7] = [
     "inference_hook_denied",
     "invalid_access_program",
@@ -150,7 +151,61 @@ pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Opti
         return (status != 400).then_some(SourcedFault::Retryable);
     }
     let named = [code, at("/detail/code").unwrap_or_default()];
-    (status != 400 && named.iter().any(|c| FIRST_PARTY_CODES.contains(c))).then_some(SourcedFault::Retryable)
+    named
+        .iter()
+        .any(|c| FIRST_PARTY_CODES.contains(c))
+        .then_some(if status == 400 {
+            SourcedFault::RequestTerminal
+        } else {
+            SourcedFault::Retryable
+        })
+}
+
+/// Whether a failure with `status` and error `body` is a first-party context-window
+/// failure: `context_length_exceeded` with 400, or in-stream, where the proxy classifies
+/// it with 400 (`error.rs:110-112`). First-party Codex reads it from its code before
+/// anything else, so Go's usage-limit and model-capacity readings of the message must not
+/// turn it into a 429 or a bootstrap overload. The proxy's own context classification
+/// (`context_too_large`, #5) still applies.
+pub(crate) fn context_window(status: u16, body: &str) -> bool {
+    status == 400
+        && serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(|c| c == "context_length_exceeded")
+            })
+            .unwrap_or(false)
+}
+
+/// The headers of a wrapped WebSocket frame `payload` as first-party Codex reads them
+/// (`responses_headers.rs:10-31`): the `headers` object of its `serde_json::Value`, a
+/// string, number or boolean value each, unchanged (not trimmed), and a name or value
+/// `http` refuses skipped.
+pub(crate) fn frame_headers(payload: &str) -> HeaderMap {
+    let mut mapped = HeaderMap::new();
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return mapped;
+    };
+    let Some(headers) = value.get("headers").and_then(Value::as_object) else {
+        return mapped;
+    };
+    for (name, value) in headers {
+        let text = match value {
+            Value::String(v) => v.clone(),
+            Value::Number(v) => v.to_string(),
+            Value::Bool(v) => v.to_string(),
+            _ => continue,
+        };
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&text),
+        ) {
+            mapped.insert(name, value);
+        }
+    }
+    mapped
 }
 
 /// The `error.code` of the base64 JSON in `x-error-json` (`api_bridge.rs:342-354`), read
@@ -216,7 +271,7 @@ mod tests {
     /// `unsupported_access_program` have no status reading: a 400 already is the ordinary
     /// invalid request (`error.rs:113`). With any other status but 400 first-party retries
     /// the code (`api_bridge.rs:223-312`), so it is `Retryable`, whatever type it names
-    /// (review finding 2); a 400 keeps Go's rules.
+    /// (review finding 2); on 400 it is the terminal `InvalidRequest` (re-review finding 2).
     #[test]
     fn status_rejections_follow_their_first_party_status() {
         for (code, terminal) in [("inference_hook_denied", 403), ("content_policy_violation", 400)] {
@@ -224,7 +279,7 @@ mod tests {
             assert_eq!(reading(Surface::Status(terminal), &body, &none()), TERMINAL, "{code}");
             for other in [400, 401, 403, 413, 422, 429, 500, 503] {
                 if other != terminal {
-                    let want = (other != 400).then_some(SourcedFault::Retryable);
+                    let want = if other == 400 { TERMINAL } else { RETRYABLE };
                     assert_eq!(reading(Surface::Status(other), &body, &none()), want, "{code} {other}");
                 }
             }
@@ -234,7 +289,7 @@ mod tests {
                 format!(r#"{{"error":{{"code":"{code}"}}}}"#),
                 format!(r#"{{"error":{{"code":"{code}","type":"invalid_request_error"}}}}"#),
             ] {
-                assert_eq!(reading(Surface::Status(400), &body, &none()), None, "{body}");
+                assert_eq!(reading(Surface::Status(400), &body, &none()), TERMINAL, "{body}");
                 for status in [403, 413, 503] {
                     assert_eq!(
                         reading(Surface::Status(status), &body, &none()),
@@ -332,7 +387,7 @@ mod tests {
             r#"{"detail":{"code":"access_program_not_enabled"}}"#,
         ] {
             assert_eq!(reading(Surface::Status(403), body, &none()), TERMINAL, "{body}");
-            assert_eq!(reading(Surface::Status(400), body, &none()), None, "{body}");
+            assert_eq!(reading(Surface::Status(400), body, &none()), TERMINAL, "{body}");
         }
         let header = x_error_json(r#"{"error":{"code":"access_program_not_enabled"}}"#);
         assert_eq!(reading(Surface::Status(403), "", &header), TERMINAL);
@@ -347,6 +402,44 @@ mod tests {
             assert_eq!(reading(Surface::Status(403), &body, &none()), None, "{code}");
             assert_eq!(reading(Surface::Status(401), &body, &none()), None, "{code}");
         }
+    }
+
+    /// Re-review finding 2: a context code is a context-window failure with 400 or
+    /// in-stream (read with 400), and with no other status.
+    #[test]
+    fn context_window_names_only_400() {
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"model is at capacity"}}"#;
+        assert!(context_window(400, body));
+        for status in [403, 429, 503] {
+            assert!(!context_window(status, body), "{status}");
+        }
+        assert!(!context_window(400, r#"{"error":{"code":"other"}}"#));
+        assert!(
+            context_window(400, r#"{"error":{"code":"x","code":"context_length_exceeded"}}"#),
+            "the last key"
+        );
+    }
+
+    /// Re-review finding 4: a wrapped frame's headers are read as first-party reads them,
+    /// unchanged; a value with a trailing space is not the base64 it would be trimmed.
+    #[test]
+    fn frame_headers_keep_their_values_as_sent() {
+        let json = r#"{"error":{"code":"invalid_workspace_selected"}}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+        let frame = |v: &str| {
+            format!(
+                r#"{{"type":"error","status":403,"headers":{{"x-error-json":"{v}","x-n":7,"x-b":true,"x-o":{{}}}}}}"#
+            )
+        };
+        let headers = frame_headers(&frame(&encoded));
+        assert_eq!(headers["x-n"], "7");
+        assert_eq!(headers["x-b"], "true");
+        assert!(headers.get("x-o").is_none());
+        assert_eq!(reading(Surface::Status(403), &frame(&encoded), &headers), TERMINAL);
+        let spaced = frame(&format!("{encoded} "));
+        assert_eq!(frame_headers(&spaced)["x-error-json"], format!("{encoded} ").as_str());
+        assert_eq!(reading(Surface::Status(403), &spaced, &frame_headers(&spaced)), None);
+        assert!(frame_headers("not json").is_empty());
     }
 
     /// `error.rs:110-112` and `responses_websocket.rs:1416-1439`: with a status,

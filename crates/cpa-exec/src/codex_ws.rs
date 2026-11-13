@@ -1309,7 +1309,13 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     // FP2: the first-party wrapped mapping reads the whole frame as the HTTP body of its
     // status, and the frame's `headers` as its headers (`responses_websocket.rs:755-806`
     // at 5c3ff1dabf64), so `x-error-json` too.
-    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), payload, &headers);
+    // Its own header reading, as first-party reads it (untrimmed, re-review finding 4); the
+    // trimmed `headers` above stay Go's passthrough and classification copy.
+    let sourced = crate::codex_terminal::reading(
+        crate::codex_terminal::Surface::Status(status),
+        payload,
+        &crate::codex_terminal::frame_headers(payload),
+    );
     let error = response::status_error_raw(status, &out, headers, model_level_cooling);
     let mut error = response::with_sourced(error, sourced);
     error.addon = addon;
@@ -1928,6 +1934,7 @@ fn account_reading(text: &str) -> bool {
     [
         ws_error(text, false).map(|error| error.status),
         response::terminal_failure(text, false).map(|(error, _)| error.status),
+        response::go_failure_status(text),
     ]
     .into_iter()
     .flatten()

@@ -8604,3 +8604,68 @@ async fn a_capacity_message_never_fails_a_terminal_rejection_over_at_bootstrap()
         }
     }
 }
+
+/// FP2 (#116) re-review finding 1 (#6): an in-stream `content_policy_violation` that FP2
+/// classifies with 400 but whose own error names an account status (an inner 403) and the
+/// account is still withheld from a native client, on a socket and on a turn served over
+/// HTTP. It stops on the selected account: one upstream frame or request, no second
+/// account, no cooldown, one failed record. The same rejection without an account status
+/// is the control: delivered as sent.
+#[tokio::test]
+async fn an_inner_account_status_keeps_a_terminal_rejection_withheld() {
+    let leaky = r#"{"type":"response.failed","sequence_number":2,"response":{"id":"resp_fp2","status":"failed","error":{"code":"content_policy_violation","status":403,"message":"workspace org-PRIVATE denied"}}}"#;
+    let plain = r#"{"type":"response.failed","sequence_number":2,"response":{"id":"resp_fp2","status":"failed","error":{"code":"content_policy_violation","message":"rejected"}}}"#;
+    for (frame, withheld) in [(leaky, true), (plain, false)] {
+        for websockets in [true, false] {
+            let case = format!("websockets={websockets}: {frame}");
+            let script = if websockets {
+                Script {
+                    ws: vec![vec![Bytes::from(frame)], fixture("sse-completed").frames()],
+                    ..Script::default()
+                }
+            } else {
+                Script {
+                    http: vec![
+                        cpa_server::testing::codex_capture::Reply::sse(format!("data: {frame}\n\n")),
+                        cpa_server::testing::codex_capture::Reply::sse(fixture("sse-completed").bytes()),
+                    ],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, "", |url| preferred_pair(url, websockets)).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &["response.completed"]).await;
+            assert!(!got.frames.iter().any(|f| f.contains("PRIVATE")), "{case}: {got:?}");
+            if withheld {
+                assert!(got.frames.is_empty(), "{case}: withheld: {got:?}");
+            } else {
+                assert_eq!(got.frames, [frame], "{case}: delivered as sent");
+            }
+            assert!(got.closed.is_some(), "{case}: {got:?}");
+            let attempts = proxy.upstream.sockets().len() + proxy.upstream.http().len();
+            assert_eq!(attempts, 1, "{case}: one attempt on the selected account");
+            for credential in proxy.rt.store().snapshot() {
+                assert!(
+                    proxy.rt.store().cooldowns(&credential.id).is_empty(),
+                    "{case}: {}",
+                    credential.id
+                );
+            }
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{case}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: one settlement"
+            );
+        }
+    }
+}
