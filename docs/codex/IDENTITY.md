@@ -139,10 +139,11 @@ These behaviours keep their existing tests, which use local TLS and proxy mocks 
 - It dials directly or through the configured proxy, never an environment proxy, and
   follows no redirect itself.
 - `requests.tls-handshake-timeout-seconds` still bounds its connection setup.
-- `oauth.providers.codex.chatgpt-keep-alive` still selects between one connection per
-  request (the default, as Go) and up to two idle connections per host and proxy for 90
-  seconds, with HTTP/2 multiplexing, pools isolated per proxy, and stale connections
-  replaced.
+- `oauth.providers.codex.chatgpt-keep-alive` still selects between up to two idle
+  connections per host and proxy for 90 seconds (the default since #147), with HTTP/2
+  multiplexing, pools isolated per proxy and stale connections replaced, and one
+  connection per request (`false`, as Go). Gated requests always use one connection per
+  request ([CONTRACT.md](CONTRACT.md#http-connection-reuse)).
 - Custom `base_url` endpoints, credential and global proxies, request timeouts and the
   WebSocket dialer are unchanged.
 

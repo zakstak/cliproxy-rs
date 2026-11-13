@@ -346,6 +346,8 @@ fn project(value: &mut Value, schema: &Schema, path: &mut Vec<String>) {
 fn null_default(path: &str) -> Option<Value> {
     Some(match path {
         "oauth.providers.aistudio.ws-auth" => Value::Bool(true),
+        // A cliproxy-rs addition, on when unset (#147): a null keeps that default.
+        "oauth.providers.codex.chatgpt-keep-alive" => Value::Bool(true),
         "observability.logs.error-logs-max-files" => Value::from(10),
         "observability.usage.redis-usage-queue-retention-seconds" => Value::from(60),
         "observability.pprof.addr" => Value::from("127.0.0.1:8316"),
@@ -496,6 +498,19 @@ mod tests {
         let mut migrated = on.clone();
         assert!(archive_unknown(&mut migrated).is_empty());
         assert_eq!(migrated, on);
+    }
+
+    /// The key is on when unset (#147), so a management write of null saves that default
+    /// instead of the bool zero, which would opt the operator out.
+    #[test]
+    fn a_null_chatgpt_keep_alive_saves_its_default() {
+        let path = ["oauth", "providers", "codex", "chatgpt-keep-alive"];
+        let mut written = yaml("oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive:\n");
+        typed_projection(&mut written, &path);
+        assert_eq!(
+            written,
+            yaml("oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive: true\n")
+        );
     }
 
     #[test]

@@ -8,10 +8,12 @@
 //!   openai/codex@44ccf394573c), and neither source shows an endpoint that requires a
 //!   Chrome ClientHello, so the impersonation is gone (#26, docs/codex/IDENTITY.md).
 //!   Dialled directly or through the configured proxy, never an environment proxy. By
-//!   default one connection per request, closed with the body, as Go does. With
-//!   `oauth.providers.codex.chatgpt-keep-alive` (a cliproxy-rs addition, off by default)
-//!   the client keeps up to [`CHATGPT_IDLE_PER_HOST`] idle connections per host and proxy
-//!   for 90 seconds (docs/DIFFERENCES-FROM-GO.md).
+//!   default (#147) an ordinary request reuses an idle connection: the client keeps up to
+//!   [`CHATGPT_IDLE_PER_HOST`] idle connections per host and proxy for 90 seconds. Go
+//!   dials one connection per request and closes it with the body; cliproxy-rs does that
+//!   only with `oauth.providers.codex.chatgpt-keep-alive: false` (a cliproxy-rs addition)
+//!   and for every gated request ([`Transport::admitting_for_url`]), whatever the setting
+//!   (docs/DIFFERENCES-FROM-GO.md).
 //! - Every other origin (API-key base URLs, local mocks) and the Responses WebSocket:
 //!   Go's standard transport from [`crate::proxy`].
 //!
@@ -72,7 +74,8 @@ impl Transport {
 
     /// The client for one request to `url` (`fallbackRoundTripper.RoundTrip`).
     /// `keep_alive` is `chatgpt-keep-alive` and `handshake` the TLS handshake bound
-    /// ([`crate::tls::handshake_timeout`]); both only affect chatgpt.com.
+    /// ([`crate::tls::handshake_timeout`]); both only affect chatgpt.com, but an opt-out
+    /// retires the pooled chatgpt.com clients whatever `url` is.
     pub fn for_url(
         &self,
         url: &str,
@@ -80,6 +83,7 @@ impl Transport {
         keep_alive: bool,
         handshake: Option<std::time::Duration>,
     ) -> wreq::Client {
+        self.retire_if_off(keep_alive);
         if is_chatgpt(url) {
             self.chatgpt(&(proxy.clone(), keep_alive, handshake))
         } else {
@@ -90,9 +94,17 @@ impl Transport {
     /// [`Self::for_url`] for a gated request ([`crate::proxy::send_routed_certain`]): the
     /// same TLS client, ALPN and proxy, but the request dials its own connection and its
     /// gate decides once that connection is up, before any HTTP byte is written
-    /// ([`crate::proxy::admit_dials`]). `keep_alive` does not apply: no gated request may
-    /// share a connection (N1 #111).
-    pub fn admitting_for_url(&self, url: &str, proxy: &Proxy, handshake: Option<std::time::Duration>) -> wreq::Client {
+    /// ([`crate::proxy::admit_dials`]). `keep_alive` never selects reuse here: no gated
+    /// request may share a connection (N1 #111). An opt-out still retires the pooled
+    /// clients, so a reload to `false` followed only by gated requests leaves no pool.
+    pub fn admitting_for_url(
+        &self,
+        url: &str,
+        proxy: &Proxy,
+        keep_alive: bool,
+        handshake: Option<std::time::Duration>,
+    ) -> wreq::Client {
+        self.retire_if_off(keep_alive);
         if !is_chatgpt(url) {
             return self.admitting.get(proxy);
         }
@@ -121,15 +133,25 @@ impl Transport {
         self.standard.get(proxy)
     }
 
+    /// Keep-alive is off for this request, so it was turned off (or never on): retire every
+    /// pooled chatgpt.com client. Requests in flight hold their own clone and finish; when
+    /// the last clone goes, its pool closes the idle sockets and its timer stops.
+    fn retire_if_off(&self, keep_alive: bool) {
+        if !keep_alive {
+            let mut cache = self.chatgpt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|((_, pooled, _), _)| !pooled);
+        }
+    }
+
     fn chatgpt(&self, key: &ChatgptKey) -> wreq::Client {
         let (proxy, keep_alive, handshake) = key;
         let keep_alive = *keep_alive;
         let mut cache = self.chatgpt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !keep_alive {
-            // Keep-alive is off for this request, so it was turned off (or never on): retire
-            // every pooled client. Requests in flight hold their own clone and finish; when
-            // the last clone goes, its pool closes the idle sockets and its timer stops.
-            cache.retain(|((_, pooled, _), _)| !pooled);
+        if keep_alive {
+            // One pool per proxy: a reload that changed the handshake bound supersedes the
+            // proxy's pool under the old bound, so the proxy never holds more than
+            // [`CHATGPT_IDLE_PER_HOST`] idle connections. In-flight requests keep theirs.
+            cache.retain(|((p, pooled, h), _)| !(*pooled && p == proxy && h != handshake));
         }
         if let Some(i) = cache.iter().position(|(k, _)| k == key) {
             let entry = cache.remove(i);
@@ -164,12 +186,15 @@ impl Transport {
             builder
         };
         let builder = if keep_alive && !admit {
-            // Opt-in: the same ClientHello and headers, without a handshake per request.
+            // The default (#147): the same ClientHello and headers, without a handshake
+            // per request. No request is retried here: a connection that fails is the
+            // request's failure, as on a dedicated one.
             builder
                 .pool_max_idle_per_host(CHATGPT_IDLE_PER_HOST)
                 .pool_idle_timeout(CHATGPT_IDLE_TIMEOUT)
         } else {
-            // Go opens a dedicated connection per request and closes it with the body.
+            // Opted out, or gated: a dedicated connection per request, closed with the
+            // body, as Go opens one.
             builder.pool_max_idle_per_host(0)
         };
         proxy.apply(self.hooks.apply(builder), false)?.build()

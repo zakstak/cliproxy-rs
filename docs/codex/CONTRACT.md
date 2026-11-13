@@ -124,6 +124,45 @@ transport, not a payload, and it stays. Go's `response.append` frame has no firs
 or documented source on any profile, so it is refused (#28,
 [Native WebSocket route](#native-websocket-route)).
 
+### HTTP connection reuse
+
+Connection reuse is transport, not payload: it changes no request byte, header or
+identity value. On the `chatgpt` profile the proxy reuses idle HTTP connections for
+ordinary requests by default ([#147](https://github.com/zakstak/cliproxy-rs/issues/147)).
+Each effective proxy has its own client, which keeps at most 2 idle connections to
+`chatgpt.com` for 90 seconds, and HTTP/2 requests share one connection.
+`oauth.providers.codex.chatgpt-keep-alive: false` turns reuse off: each request then
+dials a connection and closes it with the response, as Go v8.0.35 does
+(`helps/utls_client.go`). The setting is read for each request. Turning it off
+retires every pooled client at the next Codex HTTP request, on any route, gated requests
+and other origins included. Without such a request the idle connections close at the
+90-second timeout. A reload that changes `requests.tls-handshake-timeout-seconds`
+replaces the proxy's pool instead of adding a second one, so the bound holds per proxy.
+
+- **First-party evidence.** The pinned client builds its HTTP client on a
+  `reqwest::ClientBuilder` that leaves reqwest's connection pool on
+  (`http-client/src/client_builder.rs:391-432`). It can only remove the idle timeout
+  (`disable_pool_idle_timeout`); it never turns the pool off. Whether one first-party
+  client instance serves several turns has not been traced. Reuse across turns is
+  therefore a proxy transport choice that matches the client's pool configuration. It is
+  not a first-party wire fact.
+- **Gated requests.** A request under a client authority (N1 #111,
+  [Native WebSocket route](#native-websocket-route)) never reuses a connection,
+  whatever the setting. It dials its own connection with the same TLS client, ALPN and
+  proxy. Its gate decides after the dial and before any HTTP byte is written.
+- **No added retries.** A pooled connection that fails after the request was written
+  fails that request. The failure may follow the upstream reading the request, so it is
+  not failed over. The HTTP client retries only where the protocol shows the request
+  was not processed: a request never written on a reused connection that closed, and an
+  HTTP/2 stream refused with `REFUSED_STREAM` or never processed under a graceful
+  `GOAWAY`. These retries are the same on dedicated connections.
+- **Isolation.** Connections are never shared across proxies. Requests through the same
+  proxy may share a connection across credentials. Each request carries only its own
+  credential's headers ([Credential isolation](#credential-isolation)).
+- **Unknown.** The effect of reuse on `chatgpt.com` acceptance, rate limits or latency
+  has not been measured against the live service. The local tests count connections and
+  handshakes only.
+
 ## Permitted transformations
 
 A Codex route may change a payload only as this table allows. Every entry names its

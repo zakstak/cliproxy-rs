@@ -111,12 +111,19 @@ pub(crate) fn response_steering(cfg: &Config) -> bool {
         .unwrap_or(false)
 }
 
-/// `oauth.providers.codex.chatgpt-keep-alive`, a cliproxy-rs addition: off unless set to
-/// true (YAML 1.1 spellings such as `yes` are normalised by the config schema).
+/// `chatgpt-keep-alive` when the config does not set it: ordinary chatgpt.com requests
+/// reuse idle connections (#147). Go dials a connection per request; this is a
+/// deliberate difference (docs/DIFFERENCES-FROM-GO.md). Gated requests never reuse one
+/// ([`crate::codex_tls::Transport::admitting_for_url`]).
+pub(crate) const CHATGPT_KEEP_ALIVE_DEFAULT: bool = true;
+
+/// `oauth.providers.codex.chatgpt-keep-alive`, a cliproxy-rs addition: on unless set to
+/// false (YAML 1.1 spellings such as `no` are normalised by the config schema). An absent
+/// or null key takes [`CHATGPT_KEEP_ALIVE_DEFAULT`].
 pub(crate) fn chatgpt_keep_alive(cfg: &Config) -> bool {
     setting(cfg, &["oauth", "providers", "codex", "chatgpt-keep-alive"])
         .and_then(serde_yaml_ng::Value::as_bool)
-        .unwrap_or(false)
+        .unwrap_or(CHATGPT_KEEP_ALIVE_DEFAULT)
 }
 
 fn setting<'a>(cfg: &'a Config, path: &[&str]) -> Option<&'a serde_yaml_ng::Value> {
@@ -280,9 +287,10 @@ pub(crate) struct View<'a> {
     pub proxy: crate::proxy::Proxy,
     /// `$CPA-SESSION-ID`: the request's explicit session, never derived fallbacks.
     pub session: Option<String>,
-    /// `oauth.providers.codex.chatgpt-keep-alive` (cliproxy-rs addition, off by default):
-    /// keep idle chatgpt.com connections instead of Go's connection per request. Read
-    /// from the config snapshot of each request, so a reload applies to the next one.
+    /// `oauth.providers.codex.chatgpt-keep-alive` (cliproxy-rs addition, on by default,
+    /// #147): ordinary chatgpt.com requests reuse idle connections instead of Go's
+    /// connection per request; `false` opts out. Read from the config snapshot of each
+    /// request, so a reload applies to the next one.
     pub chatgpt_keep_alive: bool,
     /// `requests.tls-handshake-timeout-seconds` for chatgpt.com ([`crate::tls::handshake_timeout`]).
     pub handshake: Option<std::time::Duration>,
@@ -343,7 +351,7 @@ impl<'a> View<'a> {
             base_url: base_url.trim_end_matches('/'),
             proxy: crate::proxy::Proxy::Inherit,
             session: None,
-            chatgpt_keep_alive: false,
+            chatgpt_keep_alive: CHATGPT_KEEP_ALIVE_DEFAULT,
             handshake: None,
         }
     }
@@ -1077,17 +1085,24 @@ mod tests {
         assert_eq!(go_duration("+15"), Some(Duration::from_secs(15)));
     }
 
-    /// `chatgpt-keep-alive` is off unless the config turns it on, in the v8 layout or the
-    /// flat one (whose `codex:` section moves to `oauth.providers.codex`), and YAML 1.1
-    /// spellings decode as Go decodes a bool field.
+    /// `chatgpt-keep-alive` is on unless the config turns it off (#147), in the v8 layout
+    /// or the flat one (whose `codex:` section moves to `oauth.providers.codex`); an
+    /// absent or null key is the default, and YAML 1.1 spellings decode as Go decodes a
+    /// bool field.
     #[test]
-    fn chatgpt_keep_alive_is_off_unless_configured() {
+    fn chatgpt_keep_alive_is_on_unless_configured_off() {
         let cases = [
-            ("", false),
+            ("", true),
             (
                 "oauth:\n  providers:\n    codex:\n      disable-codex-cloaking: true\n",
+                true,
+            ),
+            ("oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive:\n", true),
+            (
+                "oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive: no\n",
                 false,
             ),
+            ("codex:\n  chatgpt-keep-alive: false\n", false),
             (
                 "oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive: false\n",
                 false,
