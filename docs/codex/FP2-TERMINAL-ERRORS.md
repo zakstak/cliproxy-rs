@@ -52,8 +52,8 @@ evidence. Loopback mocks stand for `chatgpt`.
 The reading comes first. A terminal rejection keeps its first-party status and its body as
 sent, whatever its message says: Go's usage-limit, model-capacity and context rewrites do
 not apply to it, and an in-stream one is never a bootstrap overload. Bodies, wrapped
-frames and the `x-error-json` JSON are read as a `serde_json::Value`, as first-party Codex
-reads them: the last of a repeated key. A 426 upgrade refusal keeps Go's plain rendering
+frames and the `x-error-json` JSON are read as the first-party build's `serde_json::Value`
+reads them: the last of a repeated key, numbers of any size, private tokens resolved. A 426 upgrade refusal keeps Go's plain rendering
 and carries the reading too.
 
 `cpa_exec::codex_terminal` reads the rules. The Codex executor carries the result on
@@ -166,6 +166,22 @@ A fourth review at `cadfe89a` found three more, fixed in the next commit:
    `error` and a `response.failed`'s `response.error`
    (`codex_terminal::event_rejection_status`); a code only Go's fallbacks name is
    `Retryable`, with Go's status.
+
+A fifth review at `836cde5d` found three more, fixed in the next commit:
+
+1. FP2's readers parsed with this build's `serde_json::Value`, which refuses a number past
+   `f64` (for example `1e400`). The first-party build enables `arbitrary_precision`, so it
+   reads such a body and its terminal code; the proxy fell back to an unsourced failure,
+   and its account-safety readings missed the 403 too. Every FP2 reader now reads the
+   pinned views (`codex_event::value_view` for a body read as a `Value`,
+   `codex_event::logical_view` for an event read as its struct), which accept numbers of
+   any size and resolve serde_json's private tokens as the first-party build does.
+2. `Surface::Stream` was constructed only in tests, a `dead_code` warning that
+   `clippy -D warnings` rejects. The in-stream reading is now its own function, and the
+   status reading takes the status directly.
+3. Reparsing a whole event as a `Value` refused a leading private-token member that the
+   first-party event struct ignores as an unknown field. Events are now read with their
+   own keys plain, as the struct reads them.
 
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.

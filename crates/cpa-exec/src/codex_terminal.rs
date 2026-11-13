@@ -11,15 +11,15 @@
 //!
 //! First-party Codex reads a failure in one of two ways, and the proxy keeps them apart:
 //!
-//! - [`Surface::Stream`]: an `error` or `response.failed` event, which has no outer
-//!   status. `parse_terminal_provider_error` reads the event's `error.code` with no
+//! - In-stream ([`event_rejection_status`]): an `error` or `response.failed` event, which
+//!   has no outer status. `parse_terminal_provider_error` reads the event's `error.code` with no
 //!   status (`sse/responses.rs:379-383`, `sse/responses_error.rs:32`). Over a WebSocket
 //!   this is also the reading of an `error` frame the wrapped mapping does not turn into
 //!   an HTTP error: no status, a status that maps to no error (a 2xx, or one past
 //!   `http::StatusCode`'s range), or a status the wrapped struct cannot read
 //!   (`responses_websocket.rs:747-806`, then `process_responses_event`).
-//! - [`Surface::Status`]: an HTTP error, or a wrapped WebSocket frame whose status maps
-//!   to an HTTP error. The same parser reads the body's `error.code` with that status, and
+//! - With a status ([`reading`]): an HTTP error, or a wrapped WebSocket frame whose status
+//!   maps to an HTTP error. The same parser reads the body's `error.code` with that status, and
 //!   a 403 is then matched on its `/detail/code`, `/error/code` or `x-error-json` header
 //!   code (`api_bridge.rs:138-143`, `283-312`, `342-354`).
 //!
@@ -38,16 +38,8 @@
 use base64::Engine;
 use cpa_core::exec::SourcedFault;
 use http::HeaderMap;
-use serde_json::Value;
 
-/// Which first-party reading a failure gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Surface {
-    /// An in-stream event or an unmapped WebSocket `error` frame: no outer status.
-    Stream,
-    /// An HTTP error, or a wrapped WebSocket frame mapped to one, with its status.
-    Status(u16),
-}
+use crate::rawjson::{self, Kind};
 
 /// The codes `parse_terminal_provider_error` raises without a status that the contract
 /// pin's parser did not have (`error.rs:103-134` at 5c3ff1dabf64).
@@ -69,45 +61,6 @@ const FORBIDDEN_TERMINAL: [&str; 3] = [
     "access_program_not_enabled",
 ];
 
-/// The HTTP status an in-stream rejection, which has none, is classified with: the
-/// status first-party Codex pairs the code with on HTTP. 403 for the account workspace's
-/// policy (`inference_hook_denied`, `access_program_not_enabled`), so the guard that keeps
-/// a frame that can name the pooled account from a native WebSocket client
-/// (`codex_ws::account_failure`, #6) still applies; 400 for the others.
-pub(crate) fn stream_status(code: &str) -> Option<u16> {
-    match code {
-        "inference_hook_denied" | "access_program_not_enabled" => Some(403),
-        "content_policy_violation" | "invalid_access_program" | "unsupported_access_program" => Some(400),
-        _ => None,
-    }
-}
-
-/// The status an in-stream failure with error body `body` is classified with when it is
-/// a first-party terminal rejection ([`stream_status`] of its code, read as
-/// [`reading`] reads it), or `None`.
-pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    let code = value.pointer("/error/code")?.as_str()?;
-    STREAM_TERMINAL.contains(&code).then(|| stream_status(code)).flatten()
-}
-
-/// The status an in-stream failure event `event` (its logical value,
-/// `crate::codex_event::logical_view`) is classified with when first-party Codex reads it
-/// as a terminal rejection, or `None`. Only first-party's locations count: an `error`
-/// event's `error` (`sse/responses.rs:379-383`) and a `response.failed`'s
-/// `response.error` (`sse/responses_error.rs:26-32`), each an object with a string
-/// `code`; Go's fallback locations do not (fourth review finding 3).
-pub(crate) fn event_rejection_status(event: &str) -> Option<u16> {
-    let value = serde_json::from_str::<Value>(event).ok()?;
-    let error = match value.get("type")?.as_str()? {
-        "error" => value.get("error")?,
-        "response.failed" => value.pointer("/response/error")?,
-        _ => return None,
-    };
-    let code = error.get("code")?.as_str()?;
-    STREAM_TERMINAL.contains(&code).then(|| stream_status(code)).flatten()
-}
-
 /// The codes FP2 reads from first-party sources: the stream codes and the two workspace
 /// codes. With an HTTP status that pairs with none of their terminal readings, and that is
 /// not 400, first-party Codex retries them (`UnexpectedStatus`, `RetryLimit` or
@@ -125,39 +78,87 @@ const FIRST_PARTY_CODES: [&str; 7] = [
     "codex_workspace_access_denied",
 ];
 
-/// The first-party reading of a failure on `surface`, with the JSON `body` (the event's
-/// error object as `{"error":…}` for [`Surface::Stream`]; the HTTP body or the whole
-/// wrapped frame for [`Surface::Status`]) and the `headers` it came with. `None` leaves
-/// the failure to the proxy's Go rules.
-///
-/// The body is read as first-party Codex reads it, a `serde_json::Value`
-/// (`api_bridge.rs:138-140`, `293-298`): the last of a repeated key, and serde_json's
-/// private number and raw value tokens resolved. Codes are compared exactly. The body is
-/// an error body or one frame, bounded, and parsed once.
-pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Option<SourcedFault> {
-    let value = serde_json::from_str::<Value>(body).ok();
-    let at = |path: &str| value.as_ref().and_then(|v| v.pointer(path)).and_then(Value::as_str);
-    let code = at("/error/code").unwrap_or_default();
-    let status = match surface {
-        Surface::Stream => {
-            return STREAM_TERMINAL.contains(&code).then_some(SourcedFault::RequestTerminal);
-        }
-        Surface::Status(status) => status,
+/// The HTTP status an in-stream rejection, which has none, is classified with: the
+/// status first-party Codex pairs the code with on HTTP. 403 for the account workspace's
+/// policy (`inference_hook_denied`, `access_program_not_enabled`), so the guard that keeps
+/// a frame that can name the pooled account from a native WebSocket client
+/// (`codex_ws::account_failure`, #6) still applies; 400 for the others. `None` for every
+/// code outside [`STREAM_TERMINAL`].
+pub(crate) fn stream_status(code: &str) -> Option<u16> {
+    match code {
+        "inference_hook_denied" | "access_program_not_enabled" => Some(403),
+        "content_policy_violation" | "invalid_access_program" | "unsupported_access_program" => Some(400),
+        _ => None,
+    }
+}
+
+/// The string at `path` in the JSON text `json`, or `None` when it is absent or no string.
+/// `json` is a pinned view (`crate::codex_event`), so each key occurs once.
+fn string_at(json: &str, path: &str) -> Option<String> {
+    let value = rawjson::get(json, path);
+    (value.kind() == Kind::String).then(|| value.str().to_owned())
+}
+
+/// The status an in-stream failure body `body` (`{"error":…}`, built by
+/// `codex_response::terminal_failure_body`) is classified with when its `error.code` is a
+/// first-party stream rejection code, or `None`. A number of any size in it is fine.
+pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
+    string_at(body, "error.code").as_deref().and_then(stream_status)
+}
+
+/// The status an in-stream failure event is classified with when first-party Codex reads
+/// it as a terminal rejection, or `None`. `event` is its logical value
+/// (`crate::codex_event::logical_view`: the event's own keys plain, as its struct reads
+/// them, member values as the first-party `Value` reads them). Only first-party's
+/// locations count: an `error` event's `error` (`sse/responses.rs:379-383`) and a
+/// `response.failed`'s `response.error` (`sse/responses_error.rs:26-32`), each an object
+/// with a string `code`; Go's fallback locations do not.
+pub(crate) fn event_rejection_status(event: &str) -> Option<u16> {
+    if !rawjson::valid(event.trim()) {
+        return None;
+    }
+    let error = match string_at(event, "type")?.as_str() {
+        "error" => "error",
+        "response.failed" => "response.error",
+        _ => return None,
     };
+    if rawjson::get(event, error).kind() != Kind::Object {
+        return None;
+    }
+    string_at(event, &format!("{error}.code"))
+        .as_deref()
+        .and_then(stream_status)
+}
+
+/// The first-party reading of a failure with HTTP status `status`: an HTTP error, a
+/// wrapped WebSocket frame mapped to one, or a refused upgrade. `body` is the HTTP body or
+/// the whole frame as received, `headers` the response's or the decoded frame's headers.
+/// `None` leaves the failure to the proxy's Go rules.
+///
+/// The body is read as first-party reads it, `serde_json::from_str::<Value>`
+/// (`api_bridge.rs:138-140`, `293-298`), through `crate::codex_event::value_view`: the
+/// last of a repeated key, serde_json's private number and raw value tokens resolved, a
+/// number of any size accepted (`arbitrary_precision`). Codes are compared exactly. The
+/// body is an error body or one frame, bounded, and read in linear passes.
+pub(crate) fn reading(status: u16, body: &str, headers: &HeaderMap) -> Option<SourcedFault> {
+    let value = crate::codex_event::value_view(body);
+    let at = |path: &str| value.as_deref().and_then(|v| string_at(v, path));
+    let code = at("error.code").unwrap_or_default();
     // `parse_terminal_provider_error` with the status (`api_bridge.rs:138-143`).
     if matches!(
-        (code, status),
+        (code.as_str(), status),
         ("inference_hook_denied", 403) | ("content_policy_violation", 400)
     ) {
         return Some(SourcedFault::RequestTerminal);
     }
+    let detail = at("detail.code");
     // The 403 match (`api_bridge.rs:293-311`), which runs after that parser declined the
     // body, whatever else it names: the body's `/detail/code`, else its `/error/code`,
     // else the `x-error-json` header's code.
     if status == 403 {
-        let matched = at("/detail/code")
-            .or_else(|| at("/error/code"))
-            .map(str::to_owned)
+        let matched = detail
+            .clone()
+            .or_else(|| at("error.code"))
             .or_else(|| identity_code(headers));
         if matched.is_some_and(|c| FORBIDDEN_TERMINAL.contains(&c.as_str())) {
             return Some(SourcedFault::RequestTerminal);
@@ -167,7 +168,7 @@ pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Opti
     if code == "context_length_exceeded" {
         return (status != 400).then_some(SourcedFault::Retryable);
     }
-    let named = [code, at("/detail/code").unwrap_or_default()];
+    let named = [code.as_str(), detail.as_deref().unwrap_or_default()];
     named
         .iter()
         .any(|c| FIRST_PARTY_CODES.contains(c))
@@ -186,42 +187,36 @@ pub(crate) fn reading(surface: Surface, body: &str, headers: &HeaderMap) -> Opti
 /// (`context_too_large`, #5) still applies.
 pub(crate) fn context_window(status: u16, body: &str) -> bool {
     status == 400
-        && serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/error/code")
-                    .and_then(Value::as_str)
-                    .map(|c| c == "context_length_exceeded")
-            })
-            .unwrap_or(false)
+        && crate::codex_event::value_view(body)
+            .and_then(|v| string_at(&v, "error.code"))
+            .is_some_and(|c| c == "context_length_exceeded")
 }
 
-/// The headers of a wrapped WebSocket frame `payload` as first-party Codex reads them
-/// (`responses_headers.rs:10-31`): the `headers` object of its `serde_json::Value`, a
-/// string, number or boolean value each, unchanged (not trimmed), and a name or value
-/// `http` refuses skipped.
+/// The headers of a wrapped WebSocket frame as first-party Codex reads them
+/// (`responses_headers.rs:10-31`). `payload` is the frame's pinned view
+/// (`crate::codex_event::classification_view`, the wrapped struct's members): its
+/// `headers` object, a string, number (its digits as written, `arbitrary_precision`) or
+/// boolean value each, unchanged (not trimmed), and a name or value `http` refuses skipped.
 pub(crate) fn frame_headers(payload: &str) -> HeaderMap {
     let mut mapped = HeaderMap::new();
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+    let headers = rawjson::get(payload, "headers");
+    if headers.kind() != Kind::Object {
         return mapped;
-    };
-    let Some(headers) = value.get("headers").and_then(Value::as_object) else {
-        return mapped;
-    };
-    for (name, value) in headers {
-        let text = match value {
-            Value::String(v) => v.clone(),
-            Value::Number(v) => v.to_string(),
-            Value::Bool(v) => v.to_string(),
-            _ => continue,
+    }
+    headers.each(|name, value| {
+        let text = match value.kind() {
+            Kind::String => value.str().to_owned(),
+            Kind::Number | Kind::True | Kind::False => value.json().to_owned(),
+            _ => return true,
         };
         if let (Ok(name), Ok(value)) = (
-            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderName::from_bytes(name.str().as_bytes()),
             http::HeaderValue::from_str(&text),
         ) {
             mapped.insert(name, value);
         }
-    }
+        true
+    });
     mapped
 }
 
@@ -230,8 +225,8 @@ pub(crate) fn frame_headers(payload: &str) -> HeaderMap {
 fn identity_code(headers: &HeaderMap) -> Option<String> {
     let encoded = headers.get("x-error-json")?.to_str().ok()?;
     let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-    let parsed = serde_json::from_slice::<Value>(&decoded).ok()?;
-    parsed.pointer("/error/code")?.as_str().map(str::to_owned)
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    string_at(&crate::codex_event::value_view(decoded)?, "error.code")
 }
 
 #[cfg(test)]
@@ -240,6 +235,12 @@ mod tests {
 
     const TERMINAL: Option<SourcedFault> = Some(SourcedFault::RequestTerminal);
     const RETRYABLE: Option<SourcedFault> = Some(SourcedFault::Retryable);
+
+    /// The in-stream reading of a failure body, as `codex_response::terminal_failure`
+    /// takes it.
+    fn stream(body: &str, _: &HeaderMap) -> Option<SourcedFault> {
+        stream_rejection_status(body).map(|_| SourcedFault::RequestTerminal)
+    }
 
     fn none() -> HeaderMap {
         HeaderMap::new()
@@ -264,7 +265,7 @@ mod tests {
                 format!(r#"{{"error":{{"code":"{code}","headers":{{"retry-after":"300"}},"plan_type":42}}}}"#),
                 format!(r#"{{"error":{{"code":"{code}","status":503}}}}"#),
             ] {
-                assert_eq!(reading(Surface::Stream, &error, &none()), TERMINAL, "{error}");
+                assert_eq!(stream(&error, &none()), TERMINAL, "{error}");
             }
             assert!(stream_status(code).is_some(), "{code}");
         }
@@ -278,7 +279,7 @@ mod tests {
             " inference_hook_denied",
         ] {
             let error = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
-            assert_eq!(reading(Surface::Stream, &error, &none()), None, "{code}");
+            assert_eq!(stream(&error, &none()), None, "{code}");
             assert_eq!(stream_status(code), None, "{code}");
         }
     }
@@ -293,11 +294,11 @@ mod tests {
     fn status_rejections_follow_their_first_party_status() {
         for (code, terminal) in [("inference_hook_denied", 403), ("content_policy_violation", 400)] {
             let body = format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#);
-            assert_eq!(reading(Surface::Status(terminal), &body, &none()), TERMINAL, "{code}");
+            assert_eq!(reading(terminal, &body, &none()), TERMINAL, "{code}");
             for other in [400, 401, 403, 413, 422, 429, 500, 503] {
                 if other != terminal {
                     let want = if other == 400 { TERMINAL } else { RETRYABLE };
-                    assert_eq!(reading(Surface::Status(other), &body, &none()), want, "{code} {other}");
+                    assert_eq!(reading(other, &body, &none()), want, "{code} {other}");
                 }
             }
         }
@@ -306,23 +307,19 @@ mod tests {
                 format!(r#"{{"error":{{"code":"{code}"}}}}"#),
                 format!(r#"{{"error":{{"code":"{code}","type":"invalid_request_error"}}}}"#),
             ] {
-                assert_eq!(reading(Surface::Status(400), &body, &none()), TERMINAL, "{body}");
+                assert_eq!(reading(400, &body, &none()), TERMINAL, "{body}");
                 for status in [403, 413, 503] {
-                    assert_eq!(
-                        reading(Surface::Status(status), &body, &none()),
-                        RETRYABLE,
-                        "{status} {body}"
-                    );
+                    assert_eq!(reading(status, &body, &none()), RETRYABLE, "{status} {body}");
                 }
             }
         }
         // The review's case: a 503 content-policy body with Go's request-fault type.
         let typed = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error"}}"#;
-        assert_eq!(reading(Surface::Status(503), typed, &none()), RETRYABLE);
+        assert_eq!(reading(503, typed, &none()), RETRYABLE);
         // A code no first-party rule names keeps Go's rules on every status.
         let other = r#"{"error":{"code":"x","type":"invalid_request_error"}}"#;
         for status in [400, 403, 503] {
-            assert_eq!(reading(Surface::Status(status), other, &none()), None, "{status}");
+            assert_eq!(reading(status, other, &none()), None, "{status}");
         }
     }
 
@@ -333,16 +330,18 @@ mod tests {
     fn a_repeated_key_reads_as_its_last_occurrence() {
         let last = r#"{"error":{"code":"other","code":"inference_hook_denied"}}"#;
         let first = r#"{"error":{"code":"inference_hook_denied","code":"other"}}"#;
-        assert_eq!(reading(Surface::Status(403), last, &none()), TERMINAL);
-        assert_eq!(reading(Surface::Status(403), first, &none()), None);
-        assert_eq!(reading(Surface::Stream, last, &none()), TERMINAL);
-        assert_eq!(reading(Surface::Stream, first, &none()), None);
+        assert_eq!(reading(403, last, &none()), TERMINAL);
+        assert_eq!(reading(403, first, &none()), None);
+        // An in-stream body is read as given; the routes build it from the pinned view,
+        // where each key occurs once.
+        assert_eq!(stream(&crate::codex_event::pinned_view(last), &none()), TERMINAL);
+        assert_eq!(stream(&crate::codex_event::pinned_view(first), &none()), None);
         let detail = r#"{"detail":{"code":"route_rate_limited","code":"invalid_workspace_selected"}}"#;
-        assert_eq!(reading(Surface::Status(403), detail, &none()), TERMINAL);
+        assert_eq!(reading(403, detail, &none()), TERMINAL);
         let header = x_error_json(r#"{"error":{"code":"x","code":"invalid_workspace_selected"}}"#);
-        assert_eq!(reading(Surface::Status(403), "", &header), TERMINAL);
+        assert_eq!(reading(403, "", &header), TERMINAL);
         let header = x_error_json(r#"{"error":{"code":"invalid_workspace_selected","code":"x"}}"#);
-        assert_eq!(reading(Surface::Status(403), "", &header), None);
+        assert_eq!(reading(403, "", &header), None);
     }
 
     /// Review finding 3: the 403 match runs after the status parser declined the body,
@@ -354,16 +353,16 @@ mod tests {
             r#"{"detail":{"code":"codex_workspace_access_denied"},"error":{"code":"context_length_exceeded"}}"#,
             r#"{"error":{"code":"context_length_exceeded"},"detail":{"code":"invalid_workspace_selected"}}"#,
         ] {
-            assert_eq!(reading(Surface::Status(403), body, &none()), TERMINAL, "{body}");
-            assert_eq!(reading(Surface::Status(503), body, &none()), RETRYABLE, "{body}");
+            assert_eq!(reading(403, body, &none()), TERMINAL, "{body}");
+            assert_eq!(reading(503, body, &none()), RETRYABLE, "{body}");
         }
         // A context code alone on a 403 stays retryable; with x-error-json naming a
         // workspace it is that denial (the body names no `/detail/code`).
         let context = r#"{"error":{"code":"context_length_exceeded"}}"#;
-        assert_eq!(reading(Surface::Status(403), context, &none()), RETRYABLE);
+        assert_eq!(reading(403, context, &none()), RETRYABLE);
         let header = x_error_json(r#"{"error":{"code":"invalid_workspace_selected"}}"#);
         assert_eq!(
-            reading(Surface::Status(403), context, &header),
+            reading(403, context, &header),
             RETRYABLE,
             "a body code wins over the header"
         );
@@ -394,7 +393,7 @@ mod tests {
         ] {
             let headers = if with_header { x_error_json(provider) } else { none() };
             assert_eq!(
-                reading(Surface::Status(status), body, &headers),
+                reading(status, body, &headers),
                 want,
                 "{status} {body} header={with_header}"
             );
@@ -403,22 +402,59 @@ mod tests {
             r#"{"error":{"code":"access_program_not_enabled","message":"m"}}"#,
             r#"{"detail":{"code":"access_program_not_enabled"}}"#,
         ] {
-            assert_eq!(reading(Surface::Status(403), body, &none()), TERMINAL, "{body}");
-            assert_eq!(reading(Surface::Status(400), body, &none()), TERMINAL, "{body}");
+            assert_eq!(reading(403, body, &none()), TERMINAL, "{body}");
+            assert_eq!(reading(400, body, &none()), TERMINAL, "{body}");
         }
         let header = x_error_json(r#"{"error":{"code":"access_program_not_enabled"}}"#);
-        assert_eq!(reading(Surface::Status(403), "", &header), TERMINAL);
+        assert_eq!(reading(403, "", &header), TERMINAL);
         // An unreadable header is no code.
         let mut bad = HeaderMap::new();
         bad.insert("x-error-json", "not base64!".parse().unwrap());
-        assert_eq!(reading(Surface::Status(403), "", &bad), None);
+        assert_eq!(reading(403, "", &bad), None);
         // First-party runtime authentication denials stay credential failures
         // (`protocol/src/error.rs:703-732`).
         for code in ["runtime_assertion_invalid", "runtime_instance_revoked"] {
             let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
-            assert_eq!(reading(Surface::Status(403), &body, &none()), None, "{code}");
-            assert_eq!(reading(Surface::Status(401), &body, &none()), None, "{code}");
+            assert_eq!(reading(403, &body, &none()), None, "{code}");
+            assert_eq!(reading(401, &body, &none()), None, "{code}");
         }
+    }
+
+    /// Fifth review findings 1 and 3: a body or event is read as the first-party build
+    /// reads it, with `arbitrary_precision` (a number of any size) and `raw_value` (a
+    /// private raw value resolved), and an event's own keys plain, as its struct reads them.
+    #[test]
+    fn first_party_value_semantics_hold_for_large_numbers_and_private_tokens() {
+        let big =
+            r#"{"error":{"code":"inference_hook_denied","message":"m","n":1e400,"m":123456789012345678901234567890}}"#;
+        assert_eq!(reading(403, big, &none()), TERMINAL);
+        assert_eq!(stream(big, &none()), TERMINAL);
+        let failed = r#"{"type":"response.failed","response":{"error":{"code":"inference_hook_denied","n":1e400}}}"#;
+        assert_eq!(
+            event_rejection_status(&crate::codex_event::logical_view(failed)),
+            Some(403)
+        );
+        let raw = r#"{"$serde_json::private::RawValue":"{\"error\":{\"code\":\"inference_hook_denied\"}}"}"#;
+        assert_eq!(
+            reading(403, raw, &none()),
+            TERMINAL,
+            "the root raw value is its JSON text"
+        );
+        let leading = r#"{"$serde_json::private::RawValue":"0","type":"response.failed","response":{"error":{"code":"content_policy_violation"}}}"#;
+        assert_eq!(
+            event_rejection_status(&crate::codex_event::logical_view(leading)),
+            Some(400),
+            "an event's leading private key is an unknown member"
+        );
+        assert_eq!(reading(400, leading, &none()), None, "a Value refuses that root");
+        let big_header = format!(
+            r#"{{"type":"error","status":403,"headers":{{"x-error-json":"{}","x-n":1e400}}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(r#"{"error":{"code":"invalid_workspace_selected"}}"#)
+        );
+        let headers = frame_headers(&big_header);
+        assert_eq!(headers["x-n"], "1e400", "a number's digits as written");
+        assert_eq!(reading(403, &big_header, &headers), TERMINAL);
+        assert_eq!(event_rejection_status("not json"), None);
     }
 
     /// Re-review finding 2: a context code is a context-window failure with 400 or
@@ -452,10 +488,10 @@ mod tests {
         assert_eq!(headers["x-n"], "7");
         assert_eq!(headers["x-b"], "true");
         assert!(headers.get("x-o").is_none());
-        assert_eq!(reading(Surface::Status(403), &frame(&encoded), &headers), TERMINAL);
+        assert_eq!(reading(403, &frame(&encoded), &headers), TERMINAL);
         let spaced = frame(&format!("{encoded} "));
         assert_eq!(frame_headers(&spaced)["x-error-json"], format!("{encoded} ").as_str());
-        assert_eq!(reading(Surface::Status(403), &spaced, &frame_headers(&spaced)), None);
+        assert_eq!(reading(403, &spaced, &frame_headers(&spaced)), None);
         assert!(frame_headers("not json").is_empty());
     }
 
@@ -465,12 +501,12 @@ mod tests {
     #[test]
     fn a_context_code_is_a_context_failure_only_with_400() {
         let body = r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error"}}"#;
-        assert_eq!(reading(Surface::Status(400), body, &none()), None);
+        assert_eq!(reading(400, body, &none()), None);
         for status in [401, 403, 404, 413, 500, 502, 503, 504] {
-            assert_eq!(reading(Surface::Status(status), body, &none()), RETRYABLE, "{status}");
+            assert_eq!(reading(status, body, &none()), RETRYABLE, "{status}");
         }
         let wrapped = r#"{"type":"error","status":503,"error":{"code":"context_length_exceeded"}}"#;
-        assert_eq!(reading(Surface::Status(503), wrapped, &none()), RETRYABLE);
-        assert_eq!(reading(Surface::Stream, wrapped, &none()), None);
+        assert_eq!(reading(503, wrapped, &none()), RETRYABLE);
+        assert_eq!(stream(wrapped, &none()), None);
     }
 }

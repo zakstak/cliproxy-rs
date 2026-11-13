@@ -228,7 +228,7 @@ pub(crate) fn request_fault(status: u16, body: &str) -> bool {
 /// capacity message does not turn it into a 429 (review finding 1).
 pub(crate) fn status_error(status: u16, body: &[u8], headers: HeaderMap, model_level_cooling: bool) -> ExecError {
     let raw = String::from_utf8_lossy(body);
-    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), &raw, &headers);
+    let sourced = crate::codex_terminal::reading(status, &raw, &headers);
     sourced_status_error(status, &raw, headers, model_level_cooling, sourced)
 }
 

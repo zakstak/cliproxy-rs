@@ -1322,11 +1322,7 @@ pub(super) fn status_frame_error(payload: &str, original: &str, model_level_cool
     // at 5c3ff1dabf64), so `x-error-json` too.
     // Its own header reading, as first-party reads it (untrimmed, re-review finding 4); the
     // trimmed `headers` above stay Go's passthrough and classification copy.
-    let sourced = crate::codex_terminal::reading(
-        crate::codex_terminal::Surface::Status(status),
-        original,
-        &crate::codex_terminal::frame_headers(payload),
-    );
+    let sourced = crate::codex_terminal::reading(status, original, &crate::codex_terminal::frame_headers(payload));
     let error = response::status_error_raw(status, &out, headers, model_level_cooling);
     let mut error = response::with_sourced(error, sourced);
     error.addon = addon;
@@ -1346,7 +1342,7 @@ pub(crate) fn upgrade_refusal(status: u16, body: &[u8], handshake: HeaderMap, mo
         return response::status_error(status, body, handshake, model_level_cooling);
     }
     let text = String::from_utf8_lossy(body).into_owned();
-    let sourced = crate::codex_terminal::reading(crate::codex_terminal::Surface::Status(status), &text, &handshake);
+    let sourced = crate::codex_terminal::reading(status, &text, &handshake);
     response::with_sourced(response::status_error_raw(status, &text, handshake, false), sourced)
 }
 
