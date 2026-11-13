@@ -17,7 +17,10 @@ rejects a behaviour, update the manifest entry and this table in the same change
 
 ## Adopted from v8.0.67
 
-None yet.
+- C8 [#76](https://github.com/zakstak/cliproxy-rs/issues/76): 256-bit base64url OAuth state
+  and the Console scope on authorization only (Go `ea0b4712`), backed by the Claude Code 2.1.322
+  [bundle source](claude-code-2.1.322-oauth.md). No harness case covers the login flow;
+  `crates/cpa-exec` tests pin it against fake endpoints.
 
 ## Not adopted in this batch
 

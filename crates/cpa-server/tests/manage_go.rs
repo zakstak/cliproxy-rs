@@ -1611,6 +1611,34 @@ mod creds {
                             v["state"] = "<state>".into();
                         }
                     }
+                    // #76 deliberately adds Claude Code's Console scope to authorization
+                    // (docs/DIFFERENCES-FROM-GO.md, Claude OAuth login). Keep the recorded
+                    // Go URL unchanged and adapt only its expected scope, with a literal
+                    // guard so other scope changes still fail this replay.
+                    if name == "oauth_sessions" && req_path == "/oauth/auth-url?provider=CLAUDE" {
+                        let mut parsed = url::Url::parse(want["url"].as_str().unwrap()).unwrap();
+                        let mut scopes = 0;
+                        let pairs: Vec<(String, String)> = parsed
+                            .query_pairs()
+                            .map(|(key, value)| {
+                                let value = if key == "scope" {
+                                    assert_eq!(
+                                        value,
+                                        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+                                        "{at}: recorded Go authorization scopes"
+                                    );
+                                    scopes += 1;
+                                    format!("org:create_api_key {value}")
+                                } else {
+                                    value.into_owned()
+                                };
+                                (key.into_owned(), value)
+                            })
+                            .collect();
+                        assert_eq!(scopes, 1, "{at}: recorded Go scope parameter");
+                        parsed.query_pairs_mut().clear().extend_pairs(pairs);
+                        want["url"] = parsed.to_string().into();
+                    }
                     // api-call relays the upstream's own Date header.
                     for v in [&mut want, &mut got] {
                         if let Some(h) = v.get_mut("header").and_then(Value::as_object_mut) {

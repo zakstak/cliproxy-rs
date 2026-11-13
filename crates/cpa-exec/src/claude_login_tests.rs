@@ -352,3 +352,174 @@ async fn a_busy_port_is_go_port_in_use() {
         );
     }
 }
+
+/// #76 (C8): the authorization scopes (Claude Code 2.1.322's `fHo()` without `user:plugins`,
+/// as Go ea0b4712 sends them), written out here instead of read from the constant under test.
+const CLAUDE_CODE_AUTHORIZE_SCOPE: &str =
+    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+/// Asserts a login state is 256 random bits as unpadded base64url (43 characters).
+fn assert_256_bit_base64url(state: &str) {
+    use base64::Engine as _;
+    assert_eq!(state.len(), 43, "{state}");
+    assert!(
+        state
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{state}"
+    );
+    assert_eq!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(state)
+            .unwrap()
+            .len(),
+        32
+    );
+}
+
+/// A fake token endpoint that records each request body.
+async fn recording_oauth_mock() -> (OAuth, Arc<Mutex<Vec<Value>>>) {
+    let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = bodies.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let seen = seen.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let body = axum::body::to_bytes(request.into_body(), 1 << 20).await.unwrap();
+            match path.as_str() {
+                "/token" => {
+                    seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                    axum::Json(json!({"access_token":"sk-ant-oat-login-fake","refresh_token":"fake-r",
+                        "expires_in":3600,"account":{"uuid":"acct-1","email_address":"a@example.invalid"},
+                        "organization":{"uuid":"org-1","name":"Org"}}))
+                    .into_response()
+                }
+                "/profile" => axum::Json(json!({"account":{"uuid":"acct-1","email":"a@example.invalid"},
+                    "organization":{"uuid":"org-1","name":"Org"}}))
+                .into_response(),
+                _ => axum::Json(json!({})).into_response(),
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let oauth = OAuth::with_endpoints(
+        wreq::Client::builder().no_proxy().build().unwrap(),
+        &format!("{base}/token"),
+        &format!("{base}/profile"),
+        &format!("{base}/roles"),
+    );
+    (oauth, bodies)
+}
+
+/// #76 (C8): a browser login authorizes with the Console scope and a 256-bit base64url
+/// state, exchanges the code with exactly Claude Code's form and that state (no scope),
+/// and logs none of the state, verifier, code or tokens.
+#[tokio::test]
+async fn login_uses_console_scope_256_bit_state_and_logs_no_secret() {
+    let capture = crate::device_fixture::LogCapture::default();
+    let _guard = capture.install();
+    let dir = temp_dir();
+    let (mock, bodies) = recording_oauth_mock().await;
+    let (listener, port) = callback().await;
+    let shown: Arc<Mutex<String>> = Arc::default();
+    let mut interaction = browser(port, state_of);
+    let show = interaction.show_url;
+    let record = shown.clone();
+    interaction.show_url = Box::new(move |url| {
+        *record.lock().unwrap() = url.to_owned();
+        show(url);
+    });
+    login_with(&dir, listener, mock, interaction).await.unwrap();
+    let url = url::Url::parse(&shown.lock().unwrap()).unwrap();
+    let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["scope"], CLAUDE_CODE_AUTHORIZE_SCOPE);
+    let state = &query["state"];
+    assert_256_bit_base64url(state);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let exchange = bodies[0].as_object().unwrap();
+    let mut keys: Vec<&str> = exchange.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut want = vec![
+        "client_id",
+        "code",
+        "code_verifier",
+        "grant_type",
+        "redirect_uri",
+        "state",
+    ];
+    want.sort_unstable();
+    assert_eq!(keys, want, "no scope on the code exchange");
+    assert_eq!(exchange["grant_type"], "authorization_code");
+    assert_eq!(exchange["code"], "fake-code");
+    assert_eq!(exchange["state"], state.as_str());
+    assert_eq!(exchange["redirect_uri"], "http://localhost:54545/callback");
+    assert_eq!(exchange["client_id"], "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+    let verifier = exchange["code_verifier"].as_str().unwrap().to_owned();
+    let logs = capture.0.lock().unwrap().concat();
+    for secret in [
+        state.as_str(),
+        &verifier,
+        "fake-code",
+        "sk-ant-oat-login-fake",
+        "fake-r",
+    ] {
+        assert!(!logs.contains(secret), "{secret} reached the log");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #76 (C8): the callback state is compared byte for byte, so a state that differs
+/// only in letter case is a mismatch and nothing is written.
+#[tokio::test]
+async fn a_state_differing_only_in_case_fails_the_login() {
+    let dir = temp_dir();
+    let mock = oauth_mock().await;
+    let (listener, port) = callback().await;
+    let swapped = |url: &str| {
+        let state = state_of(url);
+        let swapped: String = state
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if swapped == state { format!("{state}A") } else { swapped }
+    };
+    let error = login_with(&dir, listener, mock, browser(port, swapped))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.body,
+        "invalid_state: OAuth state parameter is invalid (caused by: state mismatch)"
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #76 (C8): a management login hands out the same 256-bit base64url state it puts in its
+/// authorization URL, asks for the Console scope, and exchanges the code with that state
+/// and no scope.
+#[tokio::test]
+async fn managed_login_hands_out_a_256_bit_state_and_the_console_scope() {
+    let login = ManagedLogin::start().unwrap();
+    assert_256_bit_base64url(&login.state);
+    let url = url::Url::parse(&login.url).unwrap();
+    let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["state"], login.state);
+    assert_eq!(query["scope"], CLAUDE_CODE_AUTHORIZE_SCOPE);
+    assert_ne!(ManagedLogin::start().unwrap().state, login.state);
+    let (mock, bodies) = recording_oauth_mock().await;
+    login.exchange_with(&mock, "fake-code#ignored").await.unwrap();
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["state"], login.state.as_str());
+    assert_eq!(bodies[0]["code"], "fake-code");
+    assert!(bodies[0].get("scope").is_none(), "no scope on the code exchange");
+}
