@@ -903,6 +903,127 @@ async fn rejected_handshake_is_an_upstream_attempt() {
     server.abort();
 }
 
+/// The headers of one loopback upgrade and the first frame sent on it.
+type Upgrade = Arc<StdMutex<Option<(HeaderMap, String)>>>;
+
+/// Accepts the upgrade, keeps its headers and first frame, and completes the turn.
+async fn witness(State(seen): State<Upgrade>, req: axum::extract::Request) -> Response {
+    let (mut parts, _) = req.into_parts();
+    let headers = parts.headers.clone();
+    let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let mut headers = Some(headers);
+        while let Some(Ok(message)) = socket.recv().await {
+            let AxMessage::Text(text) = message else { continue };
+            if let Some(headers) = headers.take() {
+                *seen.lock().unwrap() = Some((headers, text.as_str().to_owned()));
+            }
+            let completed = r#"{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+            if socket.send(AxMessage::text(completed)).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// #88 on the upstream Responses WebSocket: the handshake takes only `User-Agent` from
+/// the caller (its first value, trimmed, or the Grok CLI's when absent or blank), a
+/// `header:` attribute still wins, and the frame keeps the client's opaque members.
+/// Go's handshake never carries the chat proxy identity. This is local policy evidence,
+/// not evidence that xAI accepts any of these identities.
+#[tokio::test]
+async fn caller_user_agent_on_websocket() {
+    const OPAQUE_MEMBER: &str = r#""future_field" : {"opaque":"\u0061", "big":12345678901234567890}, "#;
+    let payload =
+        format!(r#"{{{OPAQUE_MEMBER}"model":"grok-4.3","input":[{{"type":"message","role":"user","content":"hi"}}]}}"#);
+    let mut frames = Vec::new();
+    for (caller, custom, expected) in [
+        (None, None, "xai-grok-workspace/1.0.44"),
+        (Some(""), None, "xai-grok-workspace/1.0.44"),
+        (Some(" \t "), None, "xai-grok-workspace/1.0.44"),
+        (Some("caller-ws/2.0"), None, "caller-ws/2.0"),
+        (Some("\u{a0} caller-ws/2.0 \t"), None, "caller-ws/2.0"),
+        (Some("caller-\u{e9}/2.0"), None, "caller-\u{e9}/2.0"),
+        (Some("caller-ws/2.0"), Some("operator/3.0"), "operator/3.0"),
+        (Some("caller-ws/2.0"), Some("$X-Explicit-UA"), "referenced/4.0"),
+        (Some("caller-ws/2.0"), Some("$X-Missing"), "caller-ws/2.0"),
+    ] {
+        let case = format!("caller {caller:?}, header:User-Agent {custom:?}");
+        let seen: Upgrade = Arc::default();
+        let app = axum::Router::new().fallback(witness).with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attrs =
+            serde_json::json!({"api_key": "upstream-FAKE", "base_url": "http://UPSTREAM/v1", "websockets": "true"});
+        let mut c = credential("xai-ua", &attrs, &addr);
+        if let Some(custom) = custom {
+            c.attributes.insert("header:User-Agent".into(), custom.into());
+        }
+        let mut req = request(
+            &serde_json::json!({ "payload": payload }),
+            "sess-ua",
+            Default::default(),
+        );
+        for (name, value) in [
+            ("authorization", "Bearer caller-secret-FAKE"),
+            ("cookie", "session=caller-cookie-FAKE"),
+            ("x-api-key", "caller-api-key-FAKE"),
+            ("proxy-authorization", "Basic caller-proxy-FAKE"),
+            ("x-amz-security-token", "caller-token-FAKE"),
+            ("x-unrelated", "caller-extra"),
+            ("x-explicit-ua", "referenced/4.0"),
+        ] {
+            req.headers.insert(name, value.parse().unwrap());
+        }
+        if let Some(caller) = caller {
+            req.headers.insert("user-agent", caller.parse().unwrap());
+            req.headers.append("user-agent", "second-client/9.0".parse().unwrap());
+        }
+        let executor = XaiExecutor::with_client(wreq::Client::new());
+        // A private auth-dir that is never created: a WebSocket turn reads no logins.
+        let cfg = Config {
+            auth_dir: std::env::temp_dir().join(format!("cpa-xai-ws-ua-{}", std::process::id())),
+            ..Default::default()
+        };
+        let session = ExecSession {
+            id: "sess-ua".into(),
+            continuation: false,
+            lease: None,
+        };
+        let response = executor
+            .execute_in_session(&c, req, &cfg, &session)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        let ResponseBody::Stream(stream) = response.body else {
+            panic!("{case}: buffered response");
+        };
+        for chunk in stream.collect::<Vec<_>>().await {
+            chunk.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        }
+        let (headers, frame) = seen.lock().unwrap().take().expect("the upstream saw a frame");
+        server.abort();
+        let agents: Vec<&[u8]> = headers.get_all("user-agent").iter().map(|v| v.as_bytes()).collect();
+        assert_eq!(agents, [expected.as_bytes()], "{case}");
+        assert_eq!(headers["authorization"], "Bearer upstream-FAKE", "{case}");
+        for name in [
+            "cookie",
+            "x-api-key",
+            "proxy-authorization",
+            "x-amz-security-token",
+            "x-unrelated",
+            "x-explicit-ua",
+            "x-xai-token-auth",
+            "x-grok-client-version",
+        ] {
+            assert!(!headers.contains_key(name), "{case}: {name} reached upstream");
+        }
+        assert!(frame.contains(OPAQUE_MEMBER), "{case}: {frame}");
+        frames.push(frame);
+    }
+    assert!(frames.windows(2).all(|w| w[0] == w[1]), "{frames:?}");
+}
+
 /// TestMapXAIWebsocketWriteErrorStopsRetryForMessageTooBig: a write failure after the
 /// upstream closed with 1009 is the request-scoped 413 and never retries; any other write
 /// failure retries on a fresh socket.
