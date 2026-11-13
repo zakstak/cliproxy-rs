@@ -140,6 +140,19 @@ A second review at `b503dce5` found four more, fixed in the next commit:
 4. A wrapped frame's `x-error-json` was trimmed before the reading. The reading now takes
    the frame's headers as first-party does, unchanged.
 
+A third review at `9978805f` found two more, fixed in the next commit:
+
+1. (#6) A context-window failure a Codex client receives ahead of its error (#5) was
+   emitted before the account-safety reading, on a socket and on a turn served over HTTP.
+   A frame that safety withholds is now never preserved either.
+2. FP2 read its codes from the pinned view, which projects an accepted positional
+   `response.error` array into the object the `Error` struct decodes. First-party checks
+   terminal codes before that decode, so such an array names no code there and reaches the
+   struct's default `Retryable` branch. The routes now classify with
+   `codex_response::received_failure`, which reads FP2's codes from the logical value
+   (`codex_event::logical_view`) and keeps Go's classification of the view; a positional
+   array naming an FP2 code is `Retryable`.
+
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.
 

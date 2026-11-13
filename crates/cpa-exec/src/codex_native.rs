@@ -749,11 +749,9 @@ impl Observer {
         // written as a JSON array by its members, the last of a repeated key and the
         // private values resolved (`codex_event::classification_view`). The client
         // receives `delivered_failure`.
-        let view = match event.kind.as_ref() {
-            "error" | "response.failed" => codex_event::classification_view(payload),
-            _ => Cow::Borrowed(payload),
-        };
-        if let Some((error, _classified)) = response::terminal_failure(&view, self.model_level_cooling) {
+        // `response::received_failure` reads the event as the pinned reader decodes it
+        // (`codex_event::classification_view`) and FP2's codes from its logical value.
+        if let Some((error, _classified)) = response::received_failure(payload, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client
@@ -959,13 +957,23 @@ impl Passthrough {
         }
         // #5 as `codex_ws.rs` `preserved_event`: a Codex client gets the context-window
         // event ahead of the error, renamed when it was the status-less `error`.
-        let preserved = deliver.or_else(|| {
-            let context = self.observer.codex_client
-                && parse_frame(&frame)
-                    .1
-                    .is_some_and(|data| codex_event::context_window_event(data.trim()).is_some());
-            context.then(|| frame.clone())
-        });
+        // Never ahead of the account safety (#6): a context-window event that can name the
+        // pooled account is withheld like any other failure frame (third review finding 1).
+        let sensitive = error.withheld()
+            || parse_frame(&frame)
+                .1
+                .is_some_and(|data| crate::codex_ws::account_sensitive(error.status, data.trim()));
+        let preserved = if sensitive {
+            None
+        } else {
+            deliver.or_else(|| {
+                let context = self.observer.codex_client
+                    && parse_frame(&frame)
+                        .1
+                        .is_some_and(|data| codex_event::context_window_event(data.trim()).is_some());
+                context.then(|| frame.clone())
+            })
+        };
         match preserved {
             Some(event) if !retry => self.out.push_back(Ok(event)),
             // The same account safety an upstream socket applies (`codex_ws::reading`):

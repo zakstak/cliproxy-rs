@@ -906,6 +906,19 @@ pub(crate) fn status_present(payload: &str) -> bool {
 /// private raw value is unescaped and read once more at its own level, as
 /// [`value_decodes`] reads it; each such level at least doubles the escapes of the one
 /// inside it, so the levels stay logarithmic in the payload.
+/// [`classification_view`] without the projection of a `response.failed`'s
+/// `response.error` array into the object `parse_failed_response`'s `Error` struct reads:
+/// the logical event value first-party `parse_terminal_provider_error` sees, before that
+/// struct decode (`sse/responses_error.rs:32` at 5c3ff1dabf64). FP2 reads its terminal
+/// codes from this value, so an accepted positional `Error` array names no code for them
+/// (`crate::codex_terminal`).
+pub(crate) fn logical_view(payload: &str) -> Cow<'_, str> {
+    match positional_object(payload) {
+        Some(object) => Cow::Owned(pinned_view(&object).into_owned()),
+        None => pinned_view(payload),
+    }
+}
+
 pub(crate) fn pinned_view(payload: &str) -> Cow<'_, str> {
     if serde_json::from_str::<IgnoredAny>(payload).is_err() {
         return Cow::Borrowed(payload);

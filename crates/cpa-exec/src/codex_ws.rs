@@ -1501,13 +1501,20 @@ impl Turn {
                 // The context-window `error` a Codex client gets as `response.failed` (#5)
                 // is delivered ahead of the error; any other failure of a native turn
                 // travels on the error, for delivery once failover is decided.
-                let event = self.preserved_event(payload);
+                // Never ahead of the account safety (#6): a withheld frame is not
+                // preserved either (third review finding 1).
+                let event = if error.withheld() {
+                    None
+                } else {
+                    self.preserved_event(payload)
+                };
                 if event.is_none() {
                     deliver_as_sent(&mut error, &text);
                 }
+                let overload = response::failure_overload(&error, &body);
                 Frame::Failed {
                     error,
-                    overload: response::is_overload(&body),
+                    overload,
                     read: false,
                     status_frame: false,
                     event,
@@ -1754,8 +1761,10 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         None
     };
     let status_frame = |view: &str| ws_error(view, cooling).map(|error| Reading::Failure { error, body: None });
-    let terminal = |view: &str| {
-        response::terminal_failure(view, cooling).map(|(error, body)| Reading::Failure {
+    // The event as received: `response::received_failure` takes the pinned reader's view
+    // for Go's classification and FP2's codes from the logical value.
+    let terminal = || {
+        response::received_failure(payload, cooling).map(|(error, body)| Reading::Failure {
             error,
             body: Some(body),
         })
@@ -1765,14 +1774,14 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
     // code, as its `Value` reads that code.
     let notice = |event: &crate::codex_event::Event<'_>| {
         if terminal_provider_error(event) {
-            terminal(&view())
+            terminal()
         } else {
             None
         }
     };
     let failure = match (event, wrapped) {
         (_, Some(Wrapped::Status(_) | Wrapped::Retryable(Some(_)))) => status_frame(&view()),
-        (_, Some(Wrapped::Retryable(None))) => terminal(&view()),
+        (_, Some(Wrapped::Retryable(None))) => terminal(),
         (Some(event), Some(Wrapped::Notice)) => notice(event),
         (None, _) => return Reading::Passed { decoded: false },
         // A decoded `error` with a status that is no wrapped frame: the status did not
@@ -1792,14 +1801,14 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         // reading of the status must not turn it into an HTTP-status reading.
         (Some(event), _) if event.kind == "error" && crate::codex_event::status_present(payload) => {
             if main_terminal_code(event) {
-                terminal(&view())
+                terminal()
             } else if terminal_provider_error(event) {
                 let view = view();
                 match status_frame(&view) {
                     Some(Reading::Failure { error, body }) if crate::codex_event::error_status(error.status) => {
                         Some(Reading::Failure { error, body })
                     }
-                    _ => terminal(&view),
+                    _ => terminal(),
                 }
             } else {
                 None
@@ -1808,7 +1817,7 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         // Only a decoded `error` without any status keeps the status-less failure
         // reading (the status-frame reading finds no status in it either); a decoded
         // `response.failed` is classified by its own reading.
-        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(&view()),
+        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(),
         (Some(event), _) => {
             return Reading::Event {
                 terminal: event.outcome().ends_turn(),
@@ -1935,6 +1944,7 @@ fn account_reading(text: &str) -> bool {
         ws_error(text, false).map(|error| error.status),
         response::terminal_failure(text, false).map(|(error, _)| error.status),
         response::go_failure_status(text),
+        response::written_rejection_status(text),
     ]
     .into_iter()
     .flatten()
