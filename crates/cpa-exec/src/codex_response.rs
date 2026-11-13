@@ -454,8 +454,13 @@ pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option
 /// (`crate::codex_event::decode`, `sse/responses.rs:630-640` at 5c3ff1dabf64): one it skips
 /// keeps Go's classification alone, with no sourced reading (seventh review finding 3).
 /// The native routes decode first; the translated routes reach this with any event.
+///
+/// `event` is the event as received, untrimmed: first-party parses it as it is, which
+/// admits JSON whitespace around it and nothing else, so an event led by U+00A0 is no
+/// event there (eighth review finding 1). Go's classification reads it trimmed, as Go's
+/// `strings.TrimSpace` does.
 pub(crate) fn received_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
-    let body = terminal_failure_body(&failure_view(event))?;
+    let body = terminal_failure_body(&failure_view(event.trim()))?;
     if crate::codex_event::decode(event).is_none() {
         let status = go_failure_status_of(&body);
         return Some((
@@ -463,7 +468,8 @@ pub(crate) fn received_failure(event: &str, model_level_cooling: bool) -> Option
             body,
         ));
     }
-    let rejection = crate::codex_terminal::event_rejection_status(&crate::codex_event::logical_view(event));
+    let logical = crate::codex_event::logical_view(crate::codex_event::json_trim(event));
+    let rejection = crate::codex_terminal::event_rejection_status(&logical);
     failure(body, rejection, model_level_cooling)
 }
 
@@ -890,7 +896,8 @@ impl Processor {
                         self.usage
                             .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
                     }
-                    if let Some((error, body)) = received_failure(payload, self.model_level_cooling) {
+                    // As received: the first-party gate admits JSON whitespace only.
+                    if let Some((error, body)) = received_failure(data, self.model_level_cooling) {
                         return Step::Fail {
                             error,
                             body: Some(body),
@@ -976,7 +983,8 @@ impl Processor {
                 if meaningful_delta(payload) {
                     self.saw_delta = true;
                 }
-                if let Some((error, _)) = received_failure(payload, self.model_level_cooling) {
+                // As received: the first-party gate admits JSON whitespace only.
+                if let Some((error, _)) = received_failure(data, self.model_level_cooling) {
                     return Err(error);
                 }
                 match rawjson::get(payload, "type").str() {
@@ -1627,6 +1635,38 @@ mod first_party_terminal_tests {
         let decoded =
             r#"{"type":"response.failed","item_id":"i","response":{"error":{"code":"content_policy_violation"}}}"#;
         assert_eq!(received_failure(decoded, false).unwrap().0.sourced, TERMINAL);
+    }
+
+    /// Eighth review finding 1: the first-party gate reads an event or frame as received,
+    /// where only JSON whitespace may surround it; one led by U+00A0 is no event there and
+    /// gets no first-party reading, though Go still reads it trimmed.
+    #[test]
+    fn only_json_whitespace_admits_an_event_to_the_first_party_reading() {
+        let event = r#"{"type":"response.failed","response":{"error":{"code":"content_policy_violation"}}}"#;
+        let (error, _) = received_failure(&format!("\u{a0}{event}"), false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (502, FailureScope::Credential, None)
+        );
+        let (error, _) = received_failure(&format!(" \t{event}\n"), false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (400, FailureScope::Request, TERMINAL)
+        );
+        let frame = r#"{"type":"error","status":403,"error":{"code":"inference_hook_denied","message":"denied"}}"#;
+        let error = ws(&format!("\u{a0}{frame}")).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Credential, None)
+        );
+        assert!(error.withheld(), "a 403 stays withheld (#6)");
+        let error = ws(&format!("\n{frame} ")).unwrap();
+        assert_eq!((error.status, error.sourced), (403, TERMINAL));
+        let stream = r#"{"type":"error","error":{"code":"inference_hook_denied"}}"#;
+        assert!(
+            ws(&format!("\u{a0}{stream}")).is_none(),
+            "an undecoded stream event is passed"
+        );
     }
 
     /// Review finding 4: a refused upgrade with status 426 keeps Go's plain rendering and

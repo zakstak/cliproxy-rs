@@ -751,7 +751,7 @@ impl Observer {
         // receives `delivered_failure`.
         // `response::received_failure` reads the event as the pinned reader decodes it
         // (`codex_event::classification_view`) and FP2's codes from its logical value.
-        if let Some((error, _classified)) = response::received_failure(payload, self.model_level_cooling) {
+        if let Some((error, _classified)) = response::received_failure(&data, self.model_level_cooling) {
             // #5: the status-less context-window `error` event, renamed for what it is.
             let deliver = self
                 .codex_client

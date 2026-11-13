@@ -1779,11 +1779,11 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         None
     };
     let status_frame =
-        |view: &str| status_frame_error(view, payload, cooling).map(|error| Reading::Failure { error, body: None });
+        |view: &str| status_frame_error(view, text, cooling).map(|error| Reading::Failure { error, body: None });
     // The event as received: `response::received_failure` takes the pinned reader's view
     // for Go's classification and FP2's codes from the logical value.
     let terminal = || {
-        response::received_failure(payload, cooling).map(|(error, body)| Reading::Failure {
+        response::received_failure(text, cooling).map(|(error, body)| Reading::Failure {
             error,
             body: Some(body),
         })

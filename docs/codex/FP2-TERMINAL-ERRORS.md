@@ -213,6 +213,15 @@ A seventh review at `201fd7ca` found three more, fixed in the next commit:
 The S5 session at `201fd7ca` passed every target, control and witness, but it predates
 these fixes and is not acceptance evidence for them.
 
+An eighth review at `a21e3629` found one more, fixed in the next commit: the translated
+routes and the WebSocket reader passed Unicode-trimmed text to the first-party gate, so an
+event or wrapped frame led by U+00A0 decoded and got a terminal reading, where first-party
+rejects that JSON and skips it. The gate and FP2's reading now take the text as received
+(JSON whitespace only); Go's classification still reads it trimmed.
+
+The S6 session at `a21e3629` passed every target, control and witness, but it predates
+this fix and is not acceptance evidence for it.
+
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.
 
