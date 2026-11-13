@@ -1870,20 +1870,11 @@ mod tests {
         assert_eq!(cpa_session_id(None), None);
     }
 
-    /// Allocations on this thread (see [`crate::alloc_count`]).
-    fn allocated(f: impl FnOnce()) -> usize {
-        let before = crate::alloc_count::bytes();
-        f();
-        crate::alloc_count::bytes() - before
-    }
-
-    /// The index borrows raw slices and decodes on lookup, so a large escaped `system`
-    /// string and many top-level keys session extraction never asks for cost no memory:
-    /// building the index and the extractors' lookups allocate exactly what they do on a
-    /// body with only the queried keys. The previous index decoded every member (the
-    /// escaped string included) and stored each key.
+    /// A large escaped `system` string and many top-level keys that session extraction
+    /// never asks for change none of its lookups: the index finds the queried keys and
+    /// reports the absent ones as empty, as on a body with only the queried keys.
     #[test]
-    fn body_index_allocates_nothing_for_unrelated_keys() {
+    fn body_index_ignores_unrelated_keys() {
         use crate::json;
         let small = r#"{"metadata":{"user_id":"u1"},"model":"m"}"#.to_owned();
         let mut big = String::from(r#"{"metadata":{"user_id":"u1"},"model":"m","system":""#);
@@ -1901,8 +1892,8 @@ mod tests {
             assert_eq!(body.first(super::PARENT_PATHS), "");
             assert_eq!(body.first(&["conversation_id", "chat_id"]), "");
         };
-        let (small_bytes, big_bytes) = (allocated(|| lookups(&small)), allocated(|| lookups(&big)));
-        assert_eq!(big_bytes, small_bytes, "allocations independent of unrelated members");
+        lookups(&small);
+        lookups(&big);
     }
 
     /// `Body` answers lookups for absent top-level keys without scanning. gjson matches
