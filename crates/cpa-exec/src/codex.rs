@@ -333,7 +333,7 @@ impl CodexExecutor {
         let gated = gate.is_some();
         let route = |hop: &url::Url| {
             let client = if gated {
-                transport.admitting_for_url(hop.as_str(), proxy, handshake)
+                transport.admitting_for_url(hop.as_str(), proxy, keep_alive, handshake)
             } else {
                 transport.for_url(hop.as_str(), proxy, keep_alive, handshake)
             };

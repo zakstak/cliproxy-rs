@@ -108,7 +108,7 @@ async fn capture() -> Vec<u8> {
         resolve: vec![("chatgpt.com".into(), address)],
     });
     let url = format!("https://chatgpt.com:{}/backend-api/codex/responses", address.port());
-    // The default (keep-alive off), as Go dials it.
+    // Keep-alive off, as Go dials it; the ClientHello is the same either way.
     let client = transport.for_url(&url, &Proxy::Inherit, false, None);
     assert!(client.post(&url).send().await.is_err(), "the listener never answers");
     capture.await.unwrap()
@@ -389,11 +389,11 @@ async fn get_ok_with(transport: &Transport, url: &str, proxy: &Proxy, keep_alive
 const H2: &[u8] = b"\x02h2\x08http/1.1";
 const H1: &[u8] = b"\x08http/1.1";
 
-/// The default, `chatgpt-keep-alive` off, is Go's behaviour: every request dials its own
-/// connection and the client closes it after the response, so none is ever kept idle
+/// The opt-out, `chatgpt-keep-alive: false`, is Go's behaviour: every request dials its
+/// own connection and the client closes it after the response, so none is ever kept idle
 /// (and no idle timer can run), over HTTP/2 and HTTP/1.1.
 #[tokio::test]
-async fn chatgpt_client_keeps_no_idle_connection_by_default() {
+async fn chatgpt_client_keeps_no_idle_connection_when_keep_alive_is_off() {
     for alpn in [H2, H1] {
         let up = Upstream::start(alpn, std::time::Duration::ZERO, Mode::KeepAlive).await;
         let (transport, url) = (up.transport(), up.url());
@@ -440,10 +440,82 @@ async fn chatgpt_keep_alive_switch_applies_per_request() {
     );
 }
 
+/// Sol review of #147: a reload that changes the TLS handshake bound supersedes the
+/// proxy's pool instead of adding a second one, so one proxy never keeps more than
+/// [`CHATGPT_IDLE_PER_HOST`] idle connections. Two HTTP/1.1 connections are kept under
+/// the old bound; the first request under the new bound retires them.
+#[tokio::test]
+async fn a_handshake_bound_reload_keeps_one_pool_per_proxy() {
+    let up = Upstream::start(H1, std::time::Duration::from_millis(100), Mode::KeepAlive).await;
+    let (transport, url) = (up.transport(), up.url());
+    let pooled = || {
+        let cache = transport.chatgpt.lock().unwrap();
+        cache.iter().filter(|((_, keep_alive, _), _)| *keep_alive).count()
+    };
+    let burst = |handshake: Option<std::time::Duration>| {
+        let (transport, url) = (&transport, &url);
+        futures_util::future::join_all((0..2).map(move |_| async move {
+            let response = transport
+                .for_url(url, &Proxy::Inherit, true, handshake)
+                .get(url)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.bytes().await.unwrap(), "ok");
+        }))
+    };
+    burst(Some(std::time::Duration::from_secs(5))).await;
+    assert_eq!((up.accepted(), pooled()), (2, 1));
+    burst(Some(std::time::Duration::from_secs(7))).await;
+    assert_eq!((up.accepted(), pooled()), (4, 1), "one pool for the proxy");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        up.closed_by_client(),
+        2,
+        "the superseded pool's two idle connections closed"
+    );
+}
+
+/// Sol review of #147: an opt-out retires the pooled clients whichever request carries
+/// it first: a gated chatgpt.com request or a request to another origin, neither of
+/// which uses the pooled client itself.
+#[tokio::test]
+async fn an_opt_out_on_any_route_retires_the_pooled_clients() {
+    let up = Upstream::start(H2, std::time::Duration::ZERO, Mode::KeepAlive).await;
+    let (transport, url) = (up.transport(), up.url());
+    let pooled = |transport: &Transport| {
+        let cache = transport.chatgpt.lock().unwrap();
+        cache.iter().filter(|((_, keep_alive, _), _)| *keep_alive).count()
+    };
+    get_ok(&transport, &url, &Proxy::Inherit).await;
+    assert_eq!(pooled(&transport), 1);
+    let _ = transport.admitting_for_url(&url, &Proxy::Inherit, true, None);
+    assert_eq!(
+        pooled(&transport),
+        1,
+        "a gated request under keep-alive leaves the pool"
+    );
+    let _ = transport.admitting_for_url(&url, &Proxy::Inherit, false, None);
+    assert_eq!(pooled(&transport), 0, "a gated request under the opt-out retires it");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(up.closed_by_client(), 1, "its idle connection closed");
+
+    get_ok(&transport, &url, &Proxy::Inherit).await;
+    assert_eq!(pooled(&transport), 1);
+    let _ = transport.for_url("https://api.openai.com/v1/responses", &Proxy::Inherit, false, None);
+    assert_eq!(
+        pooled(&transport),
+        0,
+        "another origin's request under the opt-out retires it"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(up.closed_by_client(), 2);
+}
+
 /// Go dials a dedicated connection for every chatgpt.com request. With
-/// `chatgpt-keep-alive` on, the chatgpt.com client keeps its connections instead
-/// (docs/DIFFERENCES-FROM-GO.md): sequential requests share one connection over HTTP/2
-/// and HTTP/1.1.
+/// `chatgpt-keep-alive` on, the default since #147, the chatgpt.com client keeps its
+/// connections instead (docs/DIFFERENCES-FROM-GO.md): sequential requests share one
+/// connection over HTTP/2 and HTTP/1.1.
 #[tokio::test]
 async fn chatgpt_client_reuses_connections() {
     for alpn in [H2, H1] {
