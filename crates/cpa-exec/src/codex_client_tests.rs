@@ -59,6 +59,12 @@ fn replays_go_translation_and_optimization() {
                     tool_search: false,
                 };
                 let got = translate_request(from, to, &ctx, input, &client).unwrap();
+                // #80: the Codex-shaped pairs keep the client's output controls.
+                let want = if to == Format::Codex {
+                    String::from_utf8(crate::controls_testkit::expected_body(from, input, want.as_bytes())).unwrap()
+                } else {
+                    want.to_owned()
+                };
                 assert_eq!(
                     String::from_utf8(got).unwrap(),
                     want,

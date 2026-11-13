@@ -78,6 +78,7 @@ mod openai_claude;
 mod openai_claude_response;
 mod openai_responses;
 mod openai_responses_response;
+mod responses_controls;
 mod responses_tools;
 pub mod sse;
 pub mod stream;

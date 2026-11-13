@@ -418,6 +418,12 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
             out
         }
     };
+    let differences = controls_difference(client, upstream, f, bytes, &mut actual);
+    let refused_80 = actual.first().is_some_and(|o| o == b"#80-REFUSED");
+    early.extend(differences);
+    if refused_80 {
+        actual = expected.clone();
+    }
     if let Some(variants) = f["variants"].as_array()
         && let Some(out) = actual.first()
         && variants.iter().any(|v| canonical(&field(v, bytes)) == canonical(out))
@@ -449,6 +455,113 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
                 .collect::<Vec<_>>()
         };
         errors.push(format!("\n  go:   {:?}\n  rust: {:?}", show(&expected), show(&actual)));
+    }
+    errors
+}
+
+/// #80 (docs/DIFFERENCES-FROM-GO.md, "Output limit and parallel tool calls on Grok and
+/// Muse"): the registered client -> Codex pairs keep the client's output limit and an
+/// explicit `parallel_tool_calls: false` (Go v8.0.67 `01b24f1f`, `99d1698f`), and refuse
+/// a limit that is not a number or a parallel-tool flag that is not a boolean. Go v8.0.35,
+/// which recorded these fixtures, drops the limit and forces `true`.
+///
+/// For a request fixture on those pairs this checks the new values against the client's
+/// input, then puts the v8.0.35 shape back (limit deleted, `true` restored in place), so
+/// every other byte is still compared with Go's. A refusal is checked against the field
+/// the input gets wrong and then stands in for Go's output. Returns the mismatches.
+fn controls_difference(
+    client: Format,
+    upstream: Format,
+    f: &Value,
+    bytes: bool,
+    actual: &mut [Vec<u8>],
+) -> Vec<String> {
+    if upstream != Format::Codex
+        || !matches!(f["path"].as_str(), Some("request" | "request_compat"))
+        || f["request_error"].is_string()
+    {
+        return vec![];
+    }
+    let input = field(&f["input"], bytes);
+    let (limits, parallel): (&[&str], Option<&str>) = match client {
+        Format::Claude => (&["max_tokens", "max_output_tokens"], None),
+        Format::OpenAI => (
+            &["max_completion_tokens", "max_tokens", "max_output_tokens"],
+            Some("parallel_tool_calls"),
+        ),
+        Format::OpenAIResponse => (
+            &["max_output_tokens", "max_completion_tokens", "max_tokens"],
+            Some("parallel_tool_calls"),
+        ),
+        _ => return vec![],
+    };
+    let flag = parallel.unwrap_or("tool_choice.disable_parallel_tool_use");
+    // The first refusal the converter must give, in its order of checks.
+    let mut refusal = None;
+    let mut limit = None;
+    let flag_value = gj::get(&input, flag);
+    if flag_value.exists() && !matches!(flag_value.kind, gj::Kind::True | gj::Kind::False | gj::Kind::Null) {
+        refusal = Some(format!("`{flag}` must be a boolean"));
+    }
+    for path in limits {
+        let value = gj::get(&input, path);
+        match value.kind {
+            gj::Kind::Number => {
+                limit = Some(value.raw.into_owned());
+                break;
+            }
+            gj::Kind::Null => {}
+            _ if !value.exists() => {}
+            _ => {
+                refusal.get_or_insert(format!("`{path}` must be a number"));
+                break;
+            }
+        }
+    }
+    let Some(out) = actual.first_mut() else {
+        return vec!["no output".to_owned()];
+    };
+    if let Some(want) = refusal {
+        let got = String::from_utf8_lossy(out).into_owned();
+        if !got.starts_with("REFUSED:") || !got.contains(&want) {
+            return vec![format!("#80: expected a refusal naming {want}, got {got}")];
+        }
+        // The refusal replaces Go's output; mark it so the comparison accepts it.
+        out.clear();
+        out.extend_from_slice(b"#80-REFUSED");
+        return vec![];
+    }
+    if out.starts_with(b"REFUSED:") {
+        return vec![];
+    }
+    let mut errors = vec![];
+    let got = gj::get(out, "max_output_tokens");
+    let got = got.exists().then(|| got.raw.into_owned());
+    // A Responses `max_output_tokens: null` with no legacy limit stays as the client sent it.
+    let kept_null = client == Format::OpenAIResponse && limit.is_none() && {
+        let value = gj::get(&input, "max_output_tokens");
+        value.exists() && value.kind == gj::Kind::Null
+    };
+    let want = if kept_null { Some(b"null".to_vec()) } else { limit };
+    if got != want {
+        errors.push(format!(
+            "#80: max_output_tokens {:?}, want {:?}",
+            got.as_deref().map(String::from_utf8_lossy),
+            want.as_deref().map(String::from_utf8_lossy)
+        ));
+    }
+    if got.is_some() {
+        gj::delete(out, "max_output_tokens");
+    }
+    if let Some(path) = parallel {
+        let explicit_false = gj::get(&input, path).kind == gj::Kind::False;
+        let sent = gj::get(out, "parallel_tool_calls").kind;
+        if explicit_false {
+            if sent != gj::Kind::False {
+                errors.push("#80: parallel_tool_calls false not kept".to_owned());
+            }
+            gj::set_bool(out, "parallel_tool_calls", true);
+        }
     }
     errors
 }
