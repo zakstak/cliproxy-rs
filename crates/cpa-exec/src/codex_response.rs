@@ -449,8 +449,20 @@ pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option
 /// value before the positional `Error` projection (`crate::codex_event::logical_view`;
 /// `sse/responses.rs:379-383`, `sse/responses_error.rs:26-34` at 5c3ff1dabf64; third and
 /// fourth review findings).
+///
+/// Only an event the pinned client decodes gets a first-party reading
+/// (`crate::codex_event::decode`, `sse/responses.rs:630-640` at 5c3ff1dabf64): one it skips
+/// keeps Go's classification alone, with no sourced reading (seventh review finding 3).
+/// The native routes decode first; the translated routes reach this with any event.
 pub(crate) fn received_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
     let body = terminal_failure_body(&failure_view(event))?;
+    if crate::codex_event::decode(event).is_none() {
+        let status = go_failure_status_of(&body);
+        return Some((
+            sourced_status_error(status, &body, HeaderMap::new(), model_level_cooling, None),
+            body,
+        ));
+    }
     let rejection = crate::codex_terminal::event_rejection_status(&crate::codex_event::logical_view(event));
     failure(body, rejection, model_level_cooling)
 }
@@ -470,17 +482,21 @@ pub(crate) fn failure_overload(error: &ExecError, body: &str) -> bool {
 /// so it stays withheld whatever FP2 decides (re-review finding 1).
 pub(crate) fn go_failure_status(event: &str) -> Option<u16> {
     let body = terminal_failure_body(event)?;
-    let stream_handled = context_length(&body)
-        || is_usage_limit(&body)
-        || is_capacity(&body)
-        || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
     Some(if is_usage_limit(&body) || is_capacity(&body) {
         429
-    } else if stream_handled {
-        400
     } else {
-        terminal_status(&body)
+        go_failure_status_of(&body)
     })
+}
+
+/// The status Go classifies an in-stream failure body with before its usage-limit and
+/// capacity reclassification (`codexTerminalFailureStatus` and its stream-handled 400).
+fn go_failure_status_of(body: &str) -> u16 {
+    let stream_handled = context_length(body)
+        || is_usage_limit(body)
+        || is_capacity(body)
+        || classification(400, body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
+    if stream_handled { 400 } else { terminal_status(body) }
 }
 
 /// The status FP2 pairs with a first-party rejection in `event` read as written (the first
@@ -498,17 +514,15 @@ pub(crate) fn written_rejection_status(event: &str) -> Option<u16> {
 /// retryable branches (`ApiError::Retryable` or `ApiError::Stream`,
 /// `sse/responses_error.rs:35-44`, `100-103`): `Retryable`, with Go's status.
 fn failure(body: String, rejection: Option<u16>, model_level_cooling: bool) -> Option<(ExecError, String)> {
-    let stream_handled = context_length(&body)
-        || is_usage_limit(&body)
-        || is_capacity(&body)
-        || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
     use cpa_core::exec::SourcedFault;
     let (sourced, status) = match rejection {
         Some(status) => (Some(SourcedFault::RequestTerminal), status),
         None => {
             let projected = crate::codex_terminal::stream_rejection_status(&body).is_some();
-            let status = if stream_handled { 400 } else { terminal_status(&body) };
-            (projected.then_some(SourcedFault::Retryable), status)
+            (
+                projected.then_some(SourcedFault::Retryable),
+                go_failure_status_of(&body),
+            )
         }
     };
     Some((
@@ -1575,6 +1589,44 @@ mod first_party_terminal_tests {
         assert_eq!((error.sourced, error.scope), (RETRYABLE, FailureScope::Credential));
         let nested = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"content_policy_violation"}}}"#;
         assert_eq!(received_failure(nested, false).unwrap().0.sourced, TERMINAL);
+    }
+
+    /// Seventh review finding 2: a wrapped frame with a retryable code is
+    /// `ApiError::Retryable` in first-party before any status mapping
+    /// (`responses_websocket.rs:776-792`), so FP2 reads nothing from it; Go's
+    /// classification stays (a connection limit retries at once).
+    #[test]
+    fn a_wrapped_retryable_code_precedes_the_status_reading() {
+        let limit = r#"{"type":"error","status":403,"error":{"code":"websocket_connection_limit_reached"},"detail":{"code":"invalid_workspace_selected"}}"#;
+        let error = ws(limit).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Credential, None)
+        );
+        assert_eq!(error.retry_after, Some(Duration::ZERO));
+        let previous = r#"{"type":"error","status":403,"error":{"code":"previous_response_not_found","message":"m"},"detail":{"code":"codex_workspace_access_denied"}}"#;
+        assert_eq!(ws(previous).unwrap().sourced, None);
+        // Control: without the retryable code the workspace detail is terminal.
+        let workspace = r#"{"type":"error","status":403,"detail":{"code":"invalid_workspace_selected"}}"#;
+        assert_eq!(ws(workspace).unwrap().sourced, TERMINAL);
+    }
+
+    /// Seventh review finding 3: an event the pinned client does not decode (here a
+    /// numeric `item_id`) is skipped by first-party before any terminal code is read, so a
+    /// translated route keeps Go's classification alone for it.
+    #[test]
+    fn an_undecodable_event_gets_no_first_party_reading() {
+        let event =
+            r#"{"type":"response.failed","item_id":42,"response":{"error":{"code":"content_policy_violation"}}}"#;
+        assert!(crate::codex_event::decode(event).is_none());
+        let (error, _) = received_failure(event, false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (502, FailureScope::Credential, None)
+        );
+        let decoded =
+            r#"{"type":"response.failed","item_id":"i","response":{"error":{"code":"content_policy_violation"}}}"#;
+        assert_eq!(received_failure(decoded, false).unwrap().0.sourced, TERMINAL);
     }
 
     /// Review finding 4: a refused upgrade with status 426 keeps Go's plain rendering and

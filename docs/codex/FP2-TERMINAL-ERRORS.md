@@ -199,6 +199,20 @@ A sixth review at `9adc5188` found three more, fixed in the next commit:
 The S4 session at `9adc5188` ran out of disk space on `/home` after 25 exact targets and is
 an incomplete run, not acceptance evidence.
 
+A seventh review at `201fd7ca` found three more, fixed in the next commit:
+
+1. Wrapped-header de-duplication scanned every earlier member for each header, quadratic
+   in the frame. It now keeps a key-to-position index beside the ordered list.
+2. FP2's status reading ran on a wrapped frame whose code is
+   `websocket_connection_limit_reached` or `previous_response_not_found`; first-party
+   returns `Retryable` for those before any status mapping. FP2 now reads nothing from such
+   a frame, and Go's classification stays.
+3. Translated routes applied FP2 to events the pinned client cannot decode, which
+   first-party skips. Only a decoded event now gets a first-party reading.
+
+The S5 session at `201fd7ca` passed every target, control and witness, but it predates
+these fixes and is not acceptance evidence for them.
+
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.
 

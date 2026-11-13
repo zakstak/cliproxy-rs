@@ -213,12 +213,17 @@ pub(crate) fn frame_headers(frame: &str) -> HeaderMap {
     if headers.kind() != Kind::Object {
         return mapped;
     }
+    // Insertion order with one lookup per member: linear in the frame (AGENTS.md).
     let mut members: Vec<(String, String)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     headers.each(|name, value| {
         let (name, value) = (name.str().to_owned(), value.json().to_owned());
-        match members.iter_mut().find(|(n, _)| *n == name) {
-            Some(member) => member.1 = value,
-            None => members.push((name, value)),
+        match index.get(&name) {
+            Some(&at) => members[at].1 = value,
+            None => {
+                index.insert(name.clone(), members.len());
+                members.push((name, value));
+            }
         }
         true
     });
@@ -553,6 +558,22 @@ mod tests {
         // A positional frame's headers are its fourth member.
         let positional = format!(r#"["error",403,null,{{"x-error-json":"{t}"}}]"#);
         assert_eq!(frame_headers(&positional)["x-error-json"], t.as_str());
+    }
+
+    /// Seventh review finding 1: header de-duplication is one lookup per member. Many
+    /// distinct headers, then a repeated one, keep the first position with the last value.
+    #[test]
+    fn many_wrapped_headers_stay_linear() {
+        let b64 = |json: &str| base64::engine::general_purpose::STANDARD.encode(json);
+        let t = b64(r#"{"error":{"code":"invalid_workspace_selected"}}"#);
+        let mut members: Vec<String> = (0..50_000).map(|i| format!(r#""h{i}":null"#)).collect();
+        members.insert(0, r#""x-error-json":"first""#.to_owned());
+        members.push(format!(r#""x-error-json":"{t}""#));
+        let frame = format!(r#"{{"type":"error","status":403,"headers":{{{}}}}}"#, members.join(","));
+        let headers = frame_headers(&frame);
+        assert_eq!(headers.len(), 1, "null values are skipped");
+        assert_eq!(headers["x-error-json"], t.as_str());
+        assert_eq!(reading(403, &frame, &headers), TERMINAL);
     }
 
     /// Sixth review finding 3: only JSON whitespace surrounds a body the first-party

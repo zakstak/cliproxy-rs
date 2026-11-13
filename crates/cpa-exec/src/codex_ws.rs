@@ -1322,7 +1322,18 @@ pub(super) fn status_frame_error(payload: &str, original: &str, model_level_cool
     // at 5c3ff1dabf64), so `x-error-json` too.
     // Its own header reading, as first-party reads it (untrimmed, re-review finding 4); the
     // trimmed `headers` above stay Go's passthrough and classification copy.
-    let sourced = crate::codex_terminal::reading(status, original, &crate::codex_terminal::frame_headers(original));
+    // First-party returns `ApiError::Retryable` for a wrapped retryable code before any
+    // status mapping (`responses_websocket.rs:776-792` at 5c3ff1dabf64), so FP2 reads no
+    // status there (seventh review finding 2); Go's classification stays.
+    let retryable = matches!(
+        crate::codex_event::wrapped(original),
+        Some(crate::codex_event::Wrapped::Retryable(_))
+    );
+    let sourced = if retryable {
+        None
+    } else {
+        crate::codex_terminal::reading(status, original, &crate::codex_terminal::frame_headers(original))
+    };
     let error = response::status_error_raw(status, &out, headers, model_level_cooling);
     let mut error = response::with_sourced(error, sourced);
     error.addon = addon;
