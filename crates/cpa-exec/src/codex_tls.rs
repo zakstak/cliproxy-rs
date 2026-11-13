@@ -8,10 +8,12 @@
 //!   openai/codex@44ccf394573c), and neither source shows an endpoint that requires a
 //!   Chrome ClientHello, so the impersonation is gone (#26, docs/codex/IDENTITY.md).
 //!   Dialled directly or through the configured proxy, never an environment proxy. By
-//!   default one connection per request, closed with the body, as Go does. With
-//!   `oauth.providers.codex.chatgpt-keep-alive` (a cliproxy-rs addition, off by default)
-//!   the client keeps up to [`CHATGPT_IDLE_PER_HOST`] idle connections per host and proxy
-//!   for 90 seconds (docs/DIFFERENCES-FROM-GO.md).
+//!   default (#147) an ordinary request reuses an idle connection: the client keeps up to
+//!   [`CHATGPT_IDLE_PER_HOST`] idle connections per host and proxy for 90 seconds. Go
+//!   dials one connection per request and closes it with the body; cliproxy-rs does that
+//!   only with `oauth.providers.codex.chatgpt-keep-alive: false` (a cliproxy-rs addition)
+//!   and for every gated request ([`Transport::admitting_for_url`]), whatever the setting
+//!   (docs/DIFFERENCES-FROM-GO.md).
 //! - Every other origin (API-key base URLs, local mocks) and the Responses WebSocket:
 //!   Go's standard transport from [`crate::proxy`].
 //!
@@ -164,12 +166,15 @@ impl Transport {
             builder
         };
         let builder = if keep_alive && !admit {
-            // Opt-in: the same ClientHello and headers, without a handshake per request.
+            // The default (#147): the same ClientHello and headers, without a handshake
+            // per request. No request is retried here: a connection that fails is the
+            // request's failure, as on a dedicated one.
             builder
                 .pool_max_idle_per_host(CHATGPT_IDLE_PER_HOST)
                 .pool_idle_timeout(CHATGPT_IDLE_TIMEOUT)
         } else {
-            // Go opens a dedicated connection per request and closes it with the body.
+            // Opted out, or gated: a dedicated connection per request, closed with the
+            // body, as Go opens one.
             builder.pool_max_idle_per_host(0)
         };
         proxy.apply(self.hooks.apply(builder), false)?.build()

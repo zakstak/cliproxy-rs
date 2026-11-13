@@ -2696,13 +2696,20 @@ struct Seen {
     headers: std::sync::atomic::AtomicUsize,
     data: std::sync::atomic::AtomicUsize,
     http1: std::sync::atomic::AtomicUsize,
+    /// Complete requests read: HTTP/2 streams whose body ended, HTTP/1.1 requests whose
+    /// body arrived in full.
+    requests: std::sync::atomic::AtomicUsize,
 }
 
 /// A local chatgpt.com over TLS. ALPN picks `alpn`. HTTP/2 connections advertise one
 /// concurrent stream. While `hold_tls` is set, each new connection's TLS handshake waits
 /// for `release_tls` after announcing the TCP accept (`tcp_accepted`): the client's dial
 /// is held. While `hold_first` is set, the first HTTP/2 stream's answer waits for
-/// `release_first`, keeping the connection's only stream slot busy.
+/// `release_first`, keeping the connection's only stream slot busy. While `h1_keep_alive`
+/// is set, a new HTTP/1.1 connection answers without `connection: close` and serves
+/// further requests. When `drop_next` is set, the next request read in full gets no
+/// answer: its connection is dropped (a stale or failing connection after the request
+/// was sent).
 struct AdmissionUpstream {
     addr: std::net::SocketAddr,
     ca: Vec<u8>,
@@ -2712,6 +2719,8 @@ struct AdmissionUpstream {
     release_tls: Arc<tokio::sync::Notify>,
     hold_first: Arc<std::sync::atomic::AtomicBool>,
     release_first: Arc<tokio::sync::Notify>,
+    h1_keep_alive: Arc<std::sync::atomic::AtomicBool>,
+    drop_next: Arc<std::sync::atomic::AtomicBool>,
     /// Notified for each HTTP/2 request HEADERS received.
     headers_seen: Arc<tokio::sync::Notify>,
     /// How many connections' server tasks have ended.
@@ -2734,9 +2743,12 @@ impl AdmissionUpstream {
             release_tls: Arc::default(),
             hold_first: Arc::default(),
             release_first: Arc::default(),
+            h1_keep_alive: Arc::default(),
+            drop_next: Arc::default(),
             headers_seen: Arc::default(),
             ended: Arc::new(tokio::sync::watch::Sender::new(0)),
         };
+        let (h1_keep_alive, drop_next) = (up.h1_keep_alive.clone(), up.drop_next.clone());
         let headers_seen = up.headers_seen.clone();
         let ended = up.ended.clone();
         let (seen, hold_tls, tcp_accepted, release_tls, hold_first, release_first) = (
@@ -2753,6 +2765,7 @@ impl AdmissionUpstream {
                 seen.tcp.fetch_add(1, SeqCst);
                 let headers_seen = headers_seen.clone();
                 let ended = ended.clone();
+                let (keep_h1, drop_next) = (h1_keep_alive.load(SeqCst), drop_next.clone());
                 let (acceptor, seen, hold, accepted, release, hold_first, release_first, first_stream) = (
                     acceptor.clone(),
                     seen.clone(),
@@ -2796,13 +2809,28 @@ impl AdmissionUpstream {
                         else {
                             return;
                         };
-                        while let Some(Ok((request, mut respond))) = conn.accept().await {
+                        let (dropped, drop_conn) = (Arc::new(tokio::sync::Notify::new()), drop_next.clone());
+                        loop {
+                            let accepted = tokio::select! {
+                                accepted = conn.accept() => accepted,
+                                () = dropped.notified() => return,
+                            };
+                            let Some(Ok((request, mut respond))) = accepted else {
+                                break;
+                            };
                             let (hold_first, release_first, first_stream) =
                                 (hold_first.clone(), release_first.clone(), first_stream.clone());
+                            let (seen, drop_conn, dropped) = (seen.clone(), drop_conn.clone(), dropped.clone());
                             tokio::spawn(async move {
                                 let mut body = request.into_body();
                                 while let Some(Ok(chunk)) = body.data().await {
                                     let _ = body.flow_control().release_capacity(chunk.len());
+                                }
+                                seen.requests.fetch_add(1, SeqCst);
+                                if drop_conn.swap(false, SeqCst) {
+                                    // No answer: the whole connection goes, without GOAWAY.
+                                    dropped.notify_one();
+                                    return;
                                 }
                                 if first_stream.swap(false, SeqCst) && hold_first.load(SeqCst) {
                                     release_first.notified().await;
@@ -2837,6 +2865,21 @@ impl AdmissionUpstream {
                                     .and_then(|v| v.trim().parse::<usize>().ok())
                                     .unwrap_or(0);
                                 if got.len() >= at + 4 + length {
+                                    seen.requests.fetch_add(1, SeqCst);
+                                    if drop_next.swap(false, SeqCst) {
+                                        return;
+                                    }
+                                    if keep_h1 {
+                                        got.drain(..at + 4 + length);
+                                        if tls
+                                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 10\r\n\r\ndata: {}\n\n")
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                     let _ = tls
                                         .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 10\r\nconnection: close\r\n\r\ndata: {}\n\n")
                                         .await;
@@ -3144,4 +3187,290 @@ async fn a_gated_request_never_queues_headers_on_a_busy_pooled_http2_connection(
         "no HEADERS from the gated request, on the pooled connection or any other"
     );
     assert_eq!(AdmissionUpstream::count(&up.seen.data), ADMISSION_BODY.len());
+}
+
+/// `oauth.providers.codex.chatgpt-keep-alive` as the config file spells it (#147): absent
+/// (the default, reuse), explicit `true`, and explicit `false` (the operator's opt-out,
+/// Go's connection per request).
+const KEEP_ALIVE_CONFIGS: [(&str, &str, bool); 3] = [
+    ("absent", "", true),
+    (
+        "true",
+        "oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive: true\n",
+        true,
+    ),
+    (
+        "false",
+        "oauth:\n  providers:\n    codex:\n      chatgpt-keep-alive: false\n",
+        false,
+    ),
+];
+
+/// One ordinary native streaming request through [`CodexExecutor::execute`], the config
+/// path every Codex HTTP turn takes (`View::for_request`), read to its end.
+async fn ordinary_turn(executor: &CodexExecutor, up: &AdmissionUpstream, cfg: &Config) {
+    let base = format!("https://chatgpt.com:{}/backend-api/codex", up.addr.port());
+    let response = executor
+        .execute(&oauth_credential(&base), plain_request(true, None), cfg)
+        .await;
+    if let Ok(ExecResponse {
+        body: ResponseBody::Stream(mut stream),
+        ..
+    }) = response
+    {
+        while stream.next().await.is_some() {}
+    }
+}
+
+/// #147: with the setting absent or `true`, sequential ordinary chatgpt.com requests
+/// reuse one connection (one TCP accept, one TLS handshake) over HTTP/2 and HTTP/1.1;
+/// with explicit `false` each request dials, handshakes and closes its own, as Go does.
+/// Every request reaches the upstream exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_codex_requests_follow_the_configured_keep_alive() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for (name, yaml, reuse) in KEEP_ALIVE_CONFIGS {
+        let cfg = Config::parse(yaml).unwrap();
+        for (alpn, h2) in [(ADMIT_H2, true), (ADMIT_H1, false)] {
+            let case = format!("{name} h2={h2}");
+            let up = AdmissionUpstream::start(alpn).await;
+            up.h1_keep_alive.store(true, SeqCst);
+            let executor = up.executor();
+            for _ in 0..3 {
+                ordinary_turn(&executor, &up, &cfg).await;
+            }
+            let dials = if reuse { 1 } else { 3 };
+            assert_eq!(
+                AdmissionUpstream::count(&up.seen.requests),
+                3,
+                "{case}: each request once"
+            );
+            assert_eq!(AdmissionUpstream::count(&up.seen.tcp), dials, "{case}: connections");
+            assert_eq!(AdmissionUpstream::count(&up.seen.tls), dials, "{case}: TLS handshakes");
+            if !reuse {
+                // Opted out: none is left open while the executor lives.
+                up.settled().await;
+            }
+            drop(executor);
+            up.settled().await;
+        }
+    }
+}
+
+/// #147 keeps N1 #111: a gated request dials a dedicated connection whatever the
+/// setting, never the idle pooled one an ordinary request left, and its gate decides
+/// after that dial and before any HTTP byte. The upstream holds each new connection's
+/// TLS handshake; the gated request's dial reaching it proves the pooled connection was
+/// not used. Revoked during the dial, the request sends no HTTP/2 HEADERS or DATA and no
+/// HTTP/1.1 byte and provably sent nothing; dropped (cancelled) during the dial, it sends
+/// nothing either; accepted, it is served once. The ordinary connection stays pooled for
+/// the next ordinary request when keep-alive is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gated_codex_requests_dial_their_own_connection_under_every_keep_alive_setting() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Gated {
+        Revoked,
+        Cancelled,
+        Accepted,
+    }
+    for (name, yaml, reuse) in KEEP_ALIVE_CONFIGS {
+        let cfg = Config::parse(yaml).unwrap();
+        for (alpn, h2) in [(ADMIT_H2, true), (ADMIT_H1, false)] {
+            for gated in [Gated::Revoked, Gated::Cancelled, Gated::Accepted] {
+                let case = format!("{name} h2={h2} {gated:?}");
+                let up = AdmissionUpstream::start(alpn).await;
+                up.h1_keep_alive.store(true, SeqCst);
+                let executor = Arc::new(up.executor());
+                ordinary_turn(&executor, &up, &cfg).await;
+                let (headers, data, http1) = (
+                    AdmissionUpstream::count(&up.seen.headers),
+                    AdmissionUpstream::count(&up.seen.data),
+                    AdmissionUpstream::count(&up.seen.http1),
+                );
+                let ended_before = *up.ended.borrow();
+                up.hold_tls.store(true, SeqCst);
+                let (revoked, checks) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+                let send = tokio::spawn({
+                    let (executor, url, gate, cfg) = (
+                        executor.clone(),
+                        up.url(),
+                        admission_gate(&revoked, &checks),
+                        cfg.clone(),
+                    );
+                    async move {
+                        let credential = oauth_credential("https://chatgpt.com/backend-api/codex");
+                        let view = crate::codex_request::View::for_request(&credential, &cfg);
+                        executor
+                            .post_certain(
+                                &view,
+                                &url,
+                                &admission_headers(),
+                                Bytes::from_static(ADMISSION_BODY.as_bytes()),
+                                Some(gate),
+                            )
+                            .await
+                            .map(|upstream| upstream.status)
+                            .map_err(|(error, unsent)| (error.status, unsent))
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), up.tcp_accepted.notified())
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the gated request dials its own connection"));
+                match gated {
+                    Gated::Revoked => revoked.store(true, SeqCst),
+                    Gated::Cancelled => send.abort(),
+                    Gated::Accepted => {}
+                }
+                up.hold_tls.store(false, SeqCst);
+                up.release_tls.notify_one();
+                let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), send)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the gated request ends"));
+                match gated {
+                    Gated::Revoked => {
+                        let (_, unsent) = outcome.unwrap().expect_err("refused");
+                        assert!(unsent, "{case}: a refusal provably sent nothing");
+                    }
+                    Gated::Cancelled => assert!(outcome.unwrap_err().is_cancelled(), "{case}"),
+                    Gated::Accepted => assert_eq!(outcome.unwrap(), Ok(200), "{case}"),
+                }
+                if gated != Gated::Accepted {
+                    // The gated connection is gone before the counts are read: every
+                    // byte the client wrote on it was seen.
+                    let mut ended = up.ended.subscribe();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        ended.wait_for(|n| *n > ended_before),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the gated connection ends"))
+                    .unwrap();
+                    assert_eq!(
+                        AdmissionUpstream::count(&up.seen.headers),
+                        headers,
+                        "{case}: no HEADERS"
+                    );
+                    assert_eq!(AdmissionUpstream::count(&up.seen.data), data, "{case}: no DATA");
+                    assert_eq!(
+                        AdmissionUpstream::count(&up.seen.http1),
+                        http1,
+                        "{case}: no HTTP/1.1 byte"
+                    );
+                    assert_eq!(AdmissionUpstream::count(&up.seen.requests), 1, "{case}");
+                } else {
+                    assert_eq!(AdmissionUpstream::count(&up.seen.requests), 2, "{case}");
+                }
+                assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 2, "{case}: one dedicated dial");
+                // The next ordinary request takes the pooled connection when keep-alive is
+                // on, and dials when it is off.
+                ordinary_turn(&executor, &up, &cfg).await;
+                let dials = if reuse { 2 } else { 3 };
+                assert_eq!(
+                    AdmissionUpstream::count(&up.seen.tcp),
+                    dials,
+                    "{case}: ordinary connections"
+                );
+                drop(executor);
+                up.settled().await;
+            }
+        }
+    }
+}
+
+/// #147 adds no retry: a pooled connection that takes a request in full and then dies
+/// without answering fails that request, over HTTP/2 and HTTP/1.1. The upstream read it
+/// exactly once, no other connection was dialled for it, and the failure is not reported
+/// as provably unsent, so no caller may fail it over. The next request dials afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pooled_connection_lost_after_the_request_is_not_retried() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for (alpn, h2) in [(ADMIT_H2, true), (ADMIT_H1, false)] {
+        let case = format!("h2={h2}");
+        let up = AdmissionUpstream::start(alpn).await;
+        up.h1_keep_alive.store(true, SeqCst);
+        let executor = up.executor();
+        let cfg = Config::default();
+        let credential = oauth_credential("https://chatgpt.com/backend-api/codex");
+        let view = crate::codex_request::View::for_request(&credential, &cfg);
+        assert!(view.chatgpt_keep_alive, "the default reuses connections");
+        let (url, headers) = (up.url(), admission_headers());
+        let post = || {
+            executor.post_certain(
+                &view,
+                &url,
+                &headers,
+                Bytes::from_static(ADMISSION_BODY.as_bytes()),
+                None,
+            )
+        };
+        // Each body is read to its end and dropped: a live HTTP/2 stream keeps its
+        // connection open.
+        let drain = |upstream: crate::proxy::Upstream| async move {
+            let mut body = upstream.body;
+            while body.next().await.is_some() {}
+            upstream.status
+        };
+        let first = post().await.map_err(|(error, _)| error.status).unwrap();
+        assert_eq!(drain(first).await, 200, "{case}");
+        up.drop_next.store(true, SeqCst);
+        let failed = match post().await {
+            Err((_, unsent)) => unsent,
+            Ok(upstream) => {
+                // The head may already have arrived on HTTP/2 when the connection goes:
+                // then the body fails instead.
+                let mut body = upstream.body;
+                let mut broke = false;
+                while let Some(chunk) = body.next().await {
+                    broke |= chunk.is_err();
+                }
+                assert!(broke, "{case}: the lost request fails");
+                false
+            }
+        };
+        assert!(!failed, "{case}: a request the upstream read is not provably unsent");
+        assert_eq!(
+            AdmissionUpstream::count(&up.seen.requests),
+            2,
+            "{case}: read once, never resent"
+        );
+        assert_eq!(
+            AdmissionUpstream::count(&up.seen.tcp),
+            1,
+            "{case}: no dial to resend it"
+        );
+        let third = post().await.map_err(|(error, _)| error.status).unwrap();
+        assert_eq!(drain(third).await, 200, "{case}");
+        assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 2, "{case}: a fresh connection");
+        drop(executor);
+        up.settled().await;
+    }
+}
+
+/// #147: connections the default keeps are retired when a reload sets
+/// `chatgpt-keep-alive: false`. The next request runs on its own connection and the
+/// pooled one closes at once, while the executor lives, over HTTP/2 and HTTP/1.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_opt_out_reload_retires_the_default_pool() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let on = Config::default();
+    let off = Config::parse(KEEP_ALIVE_CONFIGS[2].1).unwrap();
+    for (alpn, h2) in [(ADMIT_H2, true), (ADMIT_H1, false)] {
+        let case = format!("h2={h2}");
+        let up = AdmissionUpstream::start(alpn).await;
+        up.h1_keep_alive.store(true, SeqCst);
+        let executor = up.executor();
+        ordinary_turn(&executor, &up, &on).await;
+        ordinary_turn(&executor, &up, &on).await;
+        assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 1, "{case}: pooled");
+        ordinary_turn(&executor, &up, &off).await;
+        assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 2, "{case}: opted out");
+        // Both connections close with the executor still alive: the retired pool's and
+        // the opted-out request's own.
+        up.settled().await;
+        ordinary_turn(&executor, &up, &on).await;
+        assert_eq!(AdmissionUpstream::count(&up.seen.tcp), 3, "{case}: a new pool");
+        drop(executor);
+        up.settled().await;
+    }
 }
