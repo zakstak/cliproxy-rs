@@ -191,11 +191,19 @@ struct TokenResponse {
 pub struct GrantError {
     pub error: ExecError,
     pub terminal: bool,
+    /// The token endpoint answered 200, but the answer held no usable token set. A
+    /// rotating endpoint may have spent the refresh token by then, so the same refresh
+    /// does not send it again; the failure stays transient, never a refusal (#92).
+    pub answered: bool,
 }
 
 impl GrantError {
     fn transient(error: ExecError) -> Self {
-        Self { error, terminal: false }
+        Self {
+            error,
+            terminal: false,
+            answered: false,
+        }
     }
 }
 
@@ -255,8 +263,10 @@ struct Refreshes {
 
 /// Single-flights `run` per `key` on `table`, detached from the caller so a cancelled
 /// request cannot strand a rotated token. A success is retained for 5 minutes, so a stale
-/// snapshot cannot send the rotated refresh token again; a failure only when
-/// `retain_failures` (the outer tokens' backoff).
+/// snapshot cannot send the rotated refresh token again; a transient failure only when
+/// `retain_failures` (the outer tokens' backoff, and a scheduled SIWC refresh's). A
+/// caller that does not retain failures does not take a retained one either: it asks
+/// again.
 fn single_flight<T: Clone + Send + Sync + 'static>(
     table: &Table<T>,
     key: [u8; 32],
@@ -266,7 +276,10 @@ fn single_flight<T: Clone + Send + Sync + 'static>(
     let mut locked = table.lock().expect("refresh table");
     locked.retain(|_, (until, _)| *until > Instant::now());
     if let Some((_, result)) = locked.get(&key) {
-        return result.clone();
+        let retained_failure = result.peek().is_some_and(|r| r.as_ref().is_err_and(|e| !e.terminal));
+        if retain_failures || !retained_failure {
+            return result.clone();
+        }
     }
     // Retained results are a cache, not an admission limit: evict the oldest completed
     // ones. In-flight entries are bounded by the credential count.
@@ -316,6 +329,8 @@ pub struct CodexOAuth {
     siwc_token_url: String,
     refreshes: Refreshes,
     retry_delay: Duration,
+    /// How long one SIWC refresh attempt may take, the answer's body included (30 s).
+    grant_timeout: Duration,
 }
 
 impl CodexOAuth {
@@ -333,6 +348,7 @@ impl CodexOAuth {
             siwc_token_url: crate::codex_siwc::TOKEN_URL.into(),
             refreshes: Refreshes::default(),
             retry_delay: Duration::from_secs(1),
+            grant_timeout: Duration::from_secs(30),
         }
     }
 
@@ -349,6 +365,12 @@ impl CodexOAuth {
     /// Tests shorten Go's 1s-per-attempt refresh backoff.
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Tests shorten the 30 s a SIWC refresh attempt may take.
+    pub fn with_grant_timeout(mut self, timeout: Duration) -> Self {
+        self.grant_timeout = timeout;
         self
     }
 
@@ -377,11 +399,25 @@ impl CodexOAuth {
     /// [`Self::post`], keeping the answer's HTTP status when its body cannot be read
     /// (`None`), as first-party codex-rs's `TokenRejection` does ("HTTP status survives
     /// even when its body cannot be read").
-    async fn post_status(
+    pub(crate) async fn post_status(
         &self,
         url: &str,
         content_type: &str,
         body: Vec<u8>,
+    ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
+        self.post_status_until(url, content_type, body, None).await
+    }
+
+    /// [`Self::post_status`] within `deadline`: an answer whose status arrived in time
+    /// but whose body did not keeps its status (`None` body), so a caller can tell a
+    /// stalled answer from a request that may not have been read. Without a deadline
+    /// the caller's own timeout applies.
+    pub(crate) async fn post_status_until(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
         let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
         let mut headers = crate::proxy::GoHeaders::new();
@@ -390,12 +426,13 @@ impl CodexOAuth {
         // Every token grant is the proxy's own request: it names cliproxy-rs, where Go
         // sent net/http's `Go-http-client` default (#26, `crate::codex_identity`).
         headers.set("User-Agent", crate::codex_identity::USER_AGENT);
-        let upstream = crate::proxy::send(&self.client, url, headers, body, None)
+        let deadline = deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+        let upstream = tokio::time::timeout_at(deadline, crate::proxy::send(&self.client, url, headers, body, None))
             .await
+            .map_err(|_| failed())?
             .map_err(|_| failed())?;
-        let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
-            .await
-            .ok();
+        let read = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false);
+        let body = tokio::time::timeout_at(deadline, read).await.ok().and_then(Result::ok);
         Ok((upstream.status, body))
     }
 
@@ -435,6 +472,7 @@ impl CodexOAuth {
             return Err(GrantError {
                 error: token_error(status, &body),
                 terminal: outer_terminal(status, &grant_code(&body)),
+                answered: false,
             });
         }
         // Go appends the decoder error (`failed to parse token response: %w`); serde's
@@ -449,6 +487,14 @@ impl CodexOAuth {
         let id_token = parsed.id_token.unwrap_or_default();
         let claims = parse_jwt(&id_token).unwrap_or_default();
         let expires = chrono::TimeDelta::try_seconds(parsed.expires_in.unwrap_or(0)).unwrap_or_default();
+        // An expiry chrono cannot hold leaves `expired` empty, so the access token's JWT
+        // `exp`, else `last_refresh`, schedules the next refresh ([`expiry`]). Adding it
+        // unchecked panicked inside the detached refresh task and lost the rotated token
+        // the endpoint had just issued (#92).
+        let expired = Local::now()
+            .checked_add_signed(expires)
+            .map(rfc3339)
+            .unwrap_or_default();
         Ok(Tokens {
             plan_type: claims.plan_type(),
             account_id: claims.account_id,
@@ -456,7 +502,7 @@ impl CodexOAuth {
             id_token,
             access_token: parsed.access_token.unwrap_or_default(),
             refresh_token: parsed.refresh_token.unwrap_or_default(),
-            expired: rfc3339(Local::now() + expires),
+            expired,
         })
     }
 
@@ -497,12 +543,31 @@ impl CodexOAuth {
     }
 
     /// `RefreshSIWCTokensWithRetry(ctx, token, client, device, 3)`: the `siwc`
-    /// partition's refresh grant, single-flighted per client ID and refresh token.
+    /// partition's refresh grant, single-flighted per client ID and refresh token. An
+    /// explicit refresh: a transient failure is not retained, so the next one asks again
+    /// (Go's singleflight forgets it).
     pub async fn refresh_siwc(
         &self,
         refresh_token: &str,
         client_id: &str,
         device_id: &str,
+    ) -> Result<crate::codex_siwc::Tokens, GrantError> {
+        self.refresh_siwc_as(refresh_token, client_id, device_id, false).await
+    }
+
+    /// [`Self::refresh_siwc`]. A `scheduled` refresh (a due one) retains a transient
+    /// failure for five minutes, as every outer refresh does. A due refresh that fails
+    /// while the token requests use is still valid is tolerated
+    /// ([`crate::codex_refresh::Refresher::prepare`]), and the scheduler looks again after
+    /// 30 s, so without it the same refresh token was sent three times every 30 s for as
+    /// long as the token endpoint failed. OpenAI asks for backoff on temporary failures
+    /// ("SIWC errors and recovery") (#92).
+    pub(crate) async fn refresh_siwc_as(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        device_id: &str,
+        scheduled: bool,
     ) -> Result<crate::codex_siwc::Tokens, GrantError> {
         let (refresh_token, client_id) = (refresh_token.trim(), client_id.trim());
         if refresh_token.is_empty() {
@@ -519,7 +584,7 @@ impl CodexOAuth {
         let oauth = self.clone();
         let (token, client, device) = (refresh_token.to_owned(), client_id.to_owned(), device_id.to_owned());
         let run = async move { oauth.refresh_siwc_with_retry(&token, &client, &device).await }.boxed();
-        single_flight(&self.refreshes.siwc, key, run, false).await
+        single_flight(&self.refreshes.siwc, key, run, scheduled).await
     }
 
     async fn refresh_siwc_with_retry(
@@ -533,8 +598,13 @@ impl CodexOAuth {
             if attempt > 0 {
                 tokio::time::sleep(self.retry_delay * attempt).await;
             }
-            let once = tokio::time::timeout(
-                Duration::from_secs(30),
+            // The attempt's deadline bounds the body read too, so an answer whose 200
+            // arrived but whose body stalls is known as answered (#92) instead of
+            // timing out as an ordinary transient failure that sends the token again.
+            // The outer timeout is a backstop only.
+            let deadline = tokio::time::Instant::now() + self.grant_timeout;
+            let once = tokio::time::timeout_at(
+                deadline + Duration::from_secs(1),
                 self.siwc_token_request(
                     &[
                         ("client_id", client_id),
@@ -545,6 +615,7 @@ impl CodexOAuth {
                     client_id,
                     device_id,
                     false,
+                    Some(deadline),
                 ),
             )
             .await
@@ -553,6 +624,18 @@ impl CodexOAuth {
                 Ok(tokens) => return Ok(tokens),
                 // A refresh token refused for good is not sent again.
                 Err(error) if error.terminal => return Err(error),
+                // Nor is one the endpoint may have spent: it answered 200 without a usable
+                // token set (no replacement refresh token, or no access token). Whether
+                // the token was rotated is unknown; resending a rotated one would be a
+                // reuse. The next refresh tries again after its backoff (#92).
+                Err(mut error) if error.answered => {
+                    error.error.body = format!(
+                        "SIWC token refresh answered without a usable token set; the refresh token was not sent again: {}",
+                        String::from_utf8_lossy(&error.error.body)
+                    )
+                    .into();
+                    return Err(error);
+                }
                 Err(error) => last = Some(error),
             }
         }
