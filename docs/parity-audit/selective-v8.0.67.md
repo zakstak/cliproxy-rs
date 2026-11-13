@@ -21,6 +21,11 @@ rejects a behaviour, update the manifest entry and this table in the same change
   and the Console scope on authorization only (Go `ea0b4712`), backed by the Claude Code 2.1.322
   [bundle source](claude-code-2.1.322-oauth.md). No harness case covers the login flow;
   `crates/cpa-exec` tests pin it against fake endpoints.
+- X5 [#88](https://github.com/zakstak/cliproxy-rs/issues/88), policy only: outside the Grok CLI
+  chat proxy, an xAI request carries the caller's `User-Agent`, else the Grok CLI's (Go
+  `5026f365`). Loopback tests in `crates/cpa-exec` pin it on HTTP and on the WebSocket
+  handshake. The selective cases send no client User-Agent, so `X5-grok-user-agent` now names
+  only the Grok CLI version: 1.0.46 in v8.0.67, 1.0.44 here. That version change stays deferred.
 
 ## Not adopted in this batch
 
@@ -48,7 +53,7 @@ Credential ownership and the native-byte golden are checked on every case regard
 | `I3-unauthenticated-connection-close` | pending | [#103](https://github.com/zakstak/cliproxy-rs/issues/103) | Observed | `Connection: close` on an unauthenticated rejection |
 | `M1-muse-identity-headers` | pending | [#81](https://github.com/zakstak/cliproxy-rs/issues/81) | Observed | muse-build 1.4.14 non-interactive identity and session headers |
 | `P2-claude-connection-reuse` | deferred | [#107](https://github.com/zakstak/cliproxy-rs/issues/107) | Go `2c5b01f4` | One more TLS handshake (a session resumption) for a later request on the same credential |
-| `X5-grok-user-agent` | deferred | [#88](https://github.com/zakstak/cliproxy-rs/issues/88) | Observed | `xai-grok-workspace/1.0.46` User-Agent on the API-key path |
+| `X5-grok-user-agent` | deferred | [#88](https://github.com/zakstak/cliproxy-rs/issues/88) | Observed; caller User-Agent policy from Go `5026f365` | Grok CLI version 1.0.46 in the API-key path's default User-Agent. cliproxy-rs adopted the policy (the caller's User-Agent, else the Grok CLI's) and keeps 1.0.44 |
 | `P1-response-compression-vary` | deferred | [#106](https://github.com/zakstak/cliproxy-rs/issues/106) | `response_compression.go` | `Vary: Accept-Encoding` on every response |
 | `claude-cloak-tool-alias`, `-restore` | not adopted | tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) (decision above) | Executed: Go `e48d780f` against its parent; v8.0.35 matches cliproxy-rs | Alias secret is `CallerScope(api key)`, so the alias spelling differs and the v8.0.10 alias is no longer restored |
 | `error-retry-after` | pending | R1 [#94](https://github.com/zakstak/cliproxy-rs/issues/94), production adoption and integration | Executed: Go `9a35fa12` against its parent; v8.0.35 sends none | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
