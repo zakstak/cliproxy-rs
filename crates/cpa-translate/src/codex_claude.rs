@@ -8,7 +8,7 @@ use cpa_common::signature::{self as sig, BlockKind, Provider};
 use sha2::{Digest, Sha256};
 
 use crate::common::{self, UserTurnDrops, go_lower, trim_space};
-use crate::{Error, Registered, RequestCtx, codex_claude_response as response, openai_claude};
+use crate::{Error, Registered, RequestCtx, codex_claude_response as response, openai_claude, responses_controls};
 
 pub static PAIR: Registered = registered!(
     Claude -> Codex,
@@ -636,6 +636,15 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
     let root = gj::parse(raw);
     let names = original_to_short(raw);
     gj::set_str(&mut out, "model", model);
+    // The registered pair (Grok, Muse) keeps the client's output limit and refuses a
+    // parallel-tool flag it cannot read (crate::responses_controls). Strict maps the
+    // limit in crate::codex_strict instead.
+    if !strict {
+        responses_controls::check_bool(raw, "tool_choice.disable_parallel_tool_use")?;
+        if let Some(limit) = responses_controls::output_limit(raw, &["max_tokens", "max_output_tokens"])? {
+            gj::set_raw(&mut out, "max_output_tokens", limit);
+        }
+    }
     let mut state = Messages {
         model,
         preserve,

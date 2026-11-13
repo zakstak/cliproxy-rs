@@ -676,8 +676,11 @@ MUTATIONS = [
      _replace_body('"description":"Local tool"', '"description":"Other tool"')),
     ("selective", "meta-chat-stream", "M1 Rust client id drifts", _header("X-Client-Id", "tbh:other", "meta")),
     ("selective", "xai-chat-stream", "Muse credential sent to Grok", _header("Authorization", "Bearer sk-meta-FAKE-LOCAL-ONLY", "xai")),
-    ("selective", "xai-messages-stream", "Rust also sends max_output_tokens",
-     _replace_body('"stream":true', '"max_output_tokens":17,"stream":true', "xai")),
+    # #80: both sides carry the Claude max_tokens as max_output_tokens (Go v8.0.67 01b24f1f).
+    ("selective", "xai-messages-stream", "Rust drops max_output_tokens",
+     _replace_body(',"max_output_tokens":17', "", "xai")),
+    ("selective", "meta-messages-stream", "Rust max_output_tokens 17 -> 18",
+     _replace_body('"max_output_tokens":17', '"max_output_tokens":18', "meta")),
     ("selective", "upstream-401", "credential expiry skewed by an hour", _credential("expired", "2099-01-01T00:00:00Z")),
     ("selective", "compact-claude", "compaction capsule prefix changed", _replace_reply("cpa-ag-compact-v1:", "cpa-ag-compact-v2:")),
     ("historical", "compact-claude", "compaction request caller text changed", _replace_body("Local question", "Other question")),

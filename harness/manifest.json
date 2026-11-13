@@ -915,29 +915,6 @@
       ]
     },
     {
-      "id": "T2-messages-max-output-tokens",
-      "kind": "pending-feature",
-      "issue": "https://github.com/zakstak/cliproxy-rs/issues/80",
-      "evidence": "Go 01b24f1f forwards max_output_tokens across request translators (referenced by #80).",
-      "targets": [
-        "selective"
-      ],
-      "cases": [
-        "xai-messages-stream",
-        "meta-messages-stream"
-      ],
-      "reason": "For a Claude Messages client on a Responses upstream, v8.0.67 adds max_output_tokens from max_tokens once; nothing else in the body differs.",
-      "expect": [
-        {
-          "upstream_body_edit": {
-            "go": ",\"max_output_tokens\":17",
-            "rust": null,
-            "count": 1
-          }
-        }
-      ]
-    },
-    {
       "id": "I4-cors-allow-headers",
       "kind": "pending-feature",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/104",

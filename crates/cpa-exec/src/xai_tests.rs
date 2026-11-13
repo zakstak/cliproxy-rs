@@ -44,6 +44,36 @@ fn native_video_request(name: &str, s: &Value) -> Option<String> {
     Some(format!("{head}\r\n\r\n{payload}"))
 }
 
+/// #80 (crate::controls_testkit): a translated request carries the client's output
+/// limit where the converter writes it and keeps its `parallel_tool_calls: false`. The
+/// recorded request stays Go v8.0.35's, with only those fields and `Content-Length`
+/// changed.
+fn with_controls_difference(s: &Value, go: String) -> String {
+    let Some(from) = s["source"].as_str().and_then(Format::parse) else {
+        return go;
+    };
+    let Some(payload) = s["payload"].as_str() else {
+        return go;
+    };
+    let (head, body) = go.split_once("\r\n\r\n").expect("a recorded request");
+    if !head.starts_with("POST /v1/responses ") || from == Format::Codex {
+        return go;
+    }
+    let ours = String::from_utf8(crate::controls_testkit::expected_body(
+        from,
+        payload.as_bytes(),
+        body.as_bytes(),
+    ))
+    .unwrap();
+    if ours == body {
+        return go;
+    }
+    let length = format!("Content-Length: {}\r\n", body.len());
+    assert!(head.contains(&length), "recorded Content-Length");
+    let head = head.replace(&length, &format!("Content-Length: {}\r\n", ours.len()));
+    format!("{head}\r\n\r\n{ours}")
+}
+
 /// Recordings whose buffered body ends without a terminal event: v8.0.35 answered 408
 /// and cooled the credential; this fork follows v8.0.67 (949b43b3) with a request-scoped
 /// 502 (docs/DIFFERENCES-FROM-GO.md, "xAI non-streaming responses"). The rest of each
@@ -309,7 +339,7 @@ async fn go_reference_scenarios() {
                 problems.push(format!("url: {url:?} != {:?}", s["url"]));
             }
             let got = mock.request();
-            let want = native_video_request(name, s);
+            let want = native_video_request(name, s).map(|want| with_controls_difference(s, want));
             if got.as_deref() != want.as_deref() {
                 problems.push(format!("request:\n  rust: {got:?}\n  go:   {want:?}"));
             }
