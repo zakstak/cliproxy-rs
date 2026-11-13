@@ -187,44 +187,111 @@ class PredicateTests(unittest.TestCase):
         extra_go = observation(tls=[cold, dict(resumed, profile={"ciphers": [9]})])
         self.assertEqual(verdict("continuity-two-turns", extra_go, rust, pins, "selective", run)["verdict"], "fail")
 
-    def test_disabled_persist_rejects_disabled_true(self):
-        pins = pins_with(["credential-disabled-persist"])
-        go = observation(credential={"type": "claude"})
-        self.assertEqual(verdict("client-disconnect", go, observation(credential={"type": "claude", "disabled": False}),
-                                 pins, "selective")["verdict"], "pass")
-        self.assertEqual(verdict("client-disconnect", go, observation(credential={"type": "claude", "disabled": True}),
-                                 pins, "selective")["verdict"], "fail")
+    # client-disconnect (H1 #67): Go v8.0.35 refuses the cancelled-context save, so cliproxy-rs
+    # leaves `disabled` absent. v8.0.10 persists false (historical later reference); v8.0.67
+    # leaves it absent and both sides must (selective required absence).
+    DISABLED_PINS = {"historical": "credential-disabled-persist-v8.0.10", "selective": "credential-disabled-absent"}
 
-    def test_optional_disabled_requires_exact_safe_states(self):
-        pins = pins_with(["credential-disabled-persist"])
+    @staticmethod
+    def _saved(value, absent):
+        credential = {"type": "claude"}
+        if value is not absent:
+            credential["disabled"] = value
+        return observation(credential=credential)
+
+    def test_disabled_after_disconnect_is_exact_on_each_target(self):
         absent = object()
+        # Typed states: 0, 0.0, None, "false" and the literal string "<absent>" are not false
+        # or absent, and an equal wrong state on both sides is still wrong.
+        states = (absent, False, True, 0, 0.0, 1, None, "false", "<absent>", [], {})
+        allowed = {"historical": (False, absent), "selective": (absent, absent)}
+        for target, pin in self.DISABLED_PINS.items():
+            pins = pins_with([pin])
+            for go in states:
+                for rust in states:
+                    ok = go is allowed[target][0] and rust is allowed[target][1]
+                    with self.subTest(target=target, go=go, rust=rust):
+                        result = verdict("client-disconnect", self._saved(go, absent), self._saved(rust, absent),
+                                         pins, target)
+                        self.assertEqual(result["verdict"], "pass" if ok else "fail")
+                        if ok:
+                            self.assertEqual(result["hits"], [pin])
+                        else:
+                            self.assertIn("predicates", result["failed"])
 
-        def saved(value):
-            credential = {"type": "claude"}
-            if value is not absent:
-                credential["disabled"] = value
-            return observation(credential=credential)
+    def test_disabled_entries_validate_only_exact_states(self):
+        pins = pins_with(list(self.DISABLED_PINS.values()))
+        revisions.validate(pins)
+        entries = {d["id"]: d for d in pins["divergences"]}
+        historical = entries[self.DISABLED_PINS["historical"]]
+        selective = entries[self.DISABLED_PINS["selective"]]
+        self.assertEqual((historical["kind"], historical["targets"], historical["cases"]),
+                         ("later-reference", ["historical"], ["client-disconnect"]))
+        self.assertEqual(historical["expect"],
+                         [{"credential_field": {"field": "disabled", "go": False, "rust": "<absent>"}}])
+        self.assertEqual((selective["kind"], selective["targets"], selective["cases"]),
+                         ("required-absence", ["selective"], ["client-disconnect"]))
+        self.assertEqual(selective["expect"],
+                         [{"credential_field": {"field": "disabled", "go": "<absent>", "rust": "<absent>"}}])
+        for entry in (historical, selective):
+            self.assertNotIn("may_be_absent", entry)
+            self.assertIn("091ff27f", entry["evidence"])
+            self.assertIn("harness/evidence/attribution-20261112.json.gz", entry["evidence"])
+        self.assertNotIn("credential-disabled-persist", {d["id"] for d in PINS["divergences"]})
 
-        for go, rust in ((absent, False), (absent, absent), (False, False)):
-            with self.subTest(safe=(go, rust)):
-                self.assertEqual(verdict("client-disconnect", saved(go), saved(rust), pins,
-                                         "selective")["verdict"], "pass")
-        for value in (0, 0.0, 1, None, "false", "<absent>", True, [], {}):
-            for go, rust in ((value, False), (absent, value), (value, value)):
-                with self.subTest(unsafe=(go, rust)):
-                    self.assertEqual(verdict("client-disconnect", saved(go), saved(rust), pins,
-                                             "selective")["verdict"], "fail")
+        def spec(entry):
+            return entry["expect"][0]["credential_field"]
 
-    def test_optional_disabled_manifest_names_only_safe_equal_states(self):
-        for allowed in (None, [], [0], [True], ["<absent>", 0]):
-            pins = pins_with(["credential-disabled-persist"])
-            spec = pins["divergences"][0]["expect"][0]["credential_field"]
-            if allowed is None:
-                spec.pop("equal_values", None)
-            else:
-                spec["equal_values"] = allowed
-            with self.subTest(allowed=allowed), self.assertRaises(revisions.ManifestError):
-                revisions.validate(pins)
+        def edited(entry, change):
+            entry = copy.deepcopy(entry)
+            change(entry)
+            return entry
+
+        bad = [
+            ("selective go false", edited(selective, lambda e: spec(e).update(go=False))),
+            ("selective rust false", edited(selective, lambda e: spec(e).update(rust=False))),
+            ("selective both false", edited(selective, lambda e: spec(e).update(go=False, rust=False))),
+            ("selective rust 0", edited(selective, lambda e: spec(e).update(rust=0))),
+            ("selective alternatives", edited(selective, lambda e: spec(e).update(equal_values=["<absent>"]))),
+            ("selective optional", edited(selective, lambda e: e.update(may_be_absent=True))),
+            ("selective on historical", edited(selective, lambda e: e.update(targets=["historical"]))),
+            ("selective on both", edited(selective, lambda e: e.update(targets=["historical", "selective"]))),
+            ("selective without issue", edited(selective, lambda e: e.pop("issue"))),
+            ("selective without evidence", edited(selective, lambda e: e.pop("evidence"))),
+            ("selective without attribution", edited(selective, lambda e: e.pop("attribution"))),
+            ("selective extra predicate", edited(selective, lambda e: e["expect"].append(
+                {"downstream_header": {"name": "vary", "go": None, "rust": {"equals": "a"}}}))),
+            ("equal absence outside its kind", edited(selective, lambda e: e.update(kind="unowned"))),
+            ("historical rust false", edited(historical, lambda e: spec(e).update(rust=False))),
+            ("historical go 0", edited(historical, lambda e: spec(e).update(go=0))),
+            ("historical on selective", edited(historical, lambda e: e.update(targets=["selective"]))),
+        ]
+        for label, entry in bad:
+            with self.subTest(label), self.assertRaises(revisions.ManifestError):
+                revisions.validate(pins_with() | {"divergences": [entry]})
+
+    def test_disabled_mutations_fail_on_each_side(self):
+        absent = object()
+        baseline = {"historical": (False, absent), "selective": (absent, absent)}
+        want = {
+            "historical": {("credential persisted disabled: true", "rust"), ("credential persisted disabled: 0", "rust"),
+                           ("credential persisted disabled: false again", "rust")},
+            "selective": {("credential persisted disabled: true", "rust"), ("credential persisted disabled: 0", "rust"),
+                          ("credential persisted disabled: false again", "rust"),
+                          ("Go credential persisted disabled: 0", "go"), ("Go credential persisted disabled: false", "go")},
+        }
+        for target, pin in self.DISABLED_PINS.items():
+            pins = pins_with([pin])
+            controls = [(label, side, edit) for case, label, side, edit in acceptance.mutations_for(target)
+                        if case == "client-disconnect"]
+            self.assertEqual({(label, side) for label, side, _ in controls}, want[target])
+            go, rust = (self._saved(v, absent) for v in baseline[target])
+            self.assertEqual(verdict("client-disconnect", go, rust, pins, target)["verdict"], "pass")
+            for label, side, edit in controls:
+                g, r = copy.deepcopy(go), copy.deepcopy(rust)
+                edit(r if side == "rust" else g)
+                with self.subTest(target=target, mutation=label):
+                    self.assertEqual(verdict("client-disconnect", g, r, pins, target)["verdict"], "fail")
 
     def test_a_header_delta_must_be_exactly_the_named_one(self):
         pins = pins_with(["X5-grok-user-agent", "plain-upstream-host-label"])

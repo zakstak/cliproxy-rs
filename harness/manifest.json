@@ -758,30 +758,50 @@
       ]
     },
     {
-      "id": "credential-disabled-persist",
-      "kind": "missing-audit",
+      "id": "credential-disabled-persist-v8.0.10",
+      "kind": "later-reference",
       "issue": "https://github.com/zakstak/cliproxy-rs/issues/67",
-      "evidence": "Executed first-parent bisect between 8a01bc02 (persists disabled: false) and 4f2e5270 (field absent): the first change is Go 091ff27f (feat(antigravity): persist model capability hints in auth metadata, which reworks shared auth persistence in sdk/cliproxy/auth/conductor_persistence.go and persist_policy.go). Its parent a2718314 persists disabled: false and 091ff27f leaves the field absent, in 3 of 3 runs each. 091ff27f is in v8.0.35: executed v8.0.35 (ae3ee3be) already leaves disabled absent, so cliproxy-rs differs from the frozen default reference here too, recorded as an unresolved missing audit item in docs/parity-audit/checklist.md. H1 #67 owns the audit and parent tracker #66 owns its unresolved decision (harness/evidence/attribution-20261112.json.gz).",
+      "evidence": "Executed first-parent bisect between 8a01bc02 (persists disabled: false) and 4f2e5270 (field absent): the first change is Go 091ff27f (feat(antigravity): persist model capability hints in auth metadata, which reworks shared auth persistence in sdk/cliproxy/auth/conductor_persistence.go and persist_policy.go). Its parent a2718314 persists disabled: false and 091ff27f leaves the field absent, in 3 of 3 runs each. 091ff27f is in v8.0.35: executed v8.0.35 (ae3ee3be) leaves disabled absent (harness/evidence/attribution-20261112.json.gz (sha256 44630ba22c279e7776fe02fe3b8e9d5fccd2e05371e2362af37f8b4644b41441)). v8.0.10 predates the change and persists disabled: false after the abandoned stream.",
+      "targets": [
+        "historical"
+      ],
+      "cases": [
+        "client-disconnect"
+      ],
+      "reason": "cliproxy-rs follows the v8.0.35 policy reference: Go MarkResult saves with the request context and beginForegroundStoreSave refuses a cancelled one before Store.Save, so after an abandoned stream cliproxy-rs leaves disabled absent where v8.0.10 persists false. Rust disabled: false, true, 0 or any other change fails.",
+      "expect": [
+        {
+          "credential_field": {
+            "field": "disabled",
+            "go": false,
+            "rust": "<absent>"
+          }
+        }
+      ]
+    },
+    {
+      "id": "credential-disabled-absent",
+      "kind": "required-absence",
+      "issue": "https://github.com/zakstak/cliproxy-rs/issues/67",
+      "evidence": "Executed first-parent bisect between 8a01bc02 (persists disabled: false) and 4f2e5270 (field absent): the first change is Go 091ff27f (feat(antigravity): persist model capability hints in auth metadata, which reworks shared auth persistence in sdk/cliproxy/auth/conductor_persistence.go and persist_policy.go). Its parent a2718314 persists disabled: false and 091ff27f leaves the field absent, in 3 of 3 runs each. 091ff27f is in v8.0.35: executed v8.0.35 (ae3ee3be) leaves disabled absent (harness/evidence/attribution-20261112.json.gz (sha256 44630ba22c279e7776fe02fe3b8e9d5fccd2e05371e2362af37f8b4644b41441)). Executed v8.0.67 leaves it absent too.",
       "targets": [
         "selective"
       ],
       "cases": [
         "client-disconnect"
       ],
-      "may_be_absent": true,
-      "reason": "After an abandoned stream, cliproxy-rs and v8.0.10 persist disabled: false; v8.0.67, like v8.0.35, leaves the field absent. disabled: true or any other field change fails.",
+      "reason": "After an abandoned stream neither side persists disabled: cliproxy-rs follows frozen v8.0.35 and v8.0.67 keeps that behaviour. Both sides must leave the field absent; generic equality alone would also accept disabled: false on both sides.",
       "expect": [
         {
           "credential_field": {
             "field": "disabled",
             "go": "<absent>",
-            "rust": false,
-            "equal_values": ["<absent>", false]
+            "rust": "<absent>"
           }
         }
       ],
       "ledger": "docs/parity-audit/checklist.md#unresolved-frozen-reference-discrepancies",
-      "attribution": "Frozen-reference discrepancy: executed v8.0.35 leaves disabled absent after an abandoned stream, while Rust persists false. H1 #67 and parent tracker #66 retain this unresolved missing audit item. No production fix, deliberate-difference policy, or acceptance follows from attribution."
+      "attribution": "H1 #67 authored the production fix (a cancelled lease leaves the auth file unchanged). Real Go acceptance against the fixed head is pending; the audit item stays open until that run executes."
     },
     {
       "id": "plain-upstream-host-label",

@@ -702,8 +702,11 @@ MUTATIONS = [
      _reply_regex(r"cpa-ag-compact-v1:[A-Za-z0-9_-]+", "cpa-ag-compact-v1:A"), "go"),
     ("selective", "compact-claude", "usage integer -> float", _reply_regex(r'"input_tokens":13\b', '"input_tokens":13.0')),
     ("historical", "client-disconnect", "credential persisted disabled: 0", _credential("disabled", 0)),
+    ("historical", "client-disconnect", "credential persisted disabled: false again", _credential("disabled", False)),
     ("selective", "client-disconnect", "credential persisted disabled: 0", _credential("disabled", 0)),
+    ("selective", "client-disconnect", "credential persisted disabled: false again", _credential("disabled", False)),
     ("selective", "client-disconnect", "Go credential persisted disabled: 0", _credential("disabled", 0), "go"),
+    ("selective", "client-disconnect", "Go credential persisted disabled: false", _credential("disabled", False), "go"),
 ]
 
 
