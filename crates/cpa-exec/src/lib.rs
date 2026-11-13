@@ -49,6 +49,8 @@ mod codex_tokens;
 mod codex_ws;
 mod compaction_capsule;
 #[cfg(test)]
+mod controls_testkit;
+#[cfg(test)]
 mod device_fixture;
 mod go_std;
 mod helpers;
