@@ -1,9 +1,11 @@
 //! Reliable credential concurrency release (Go internal/home/concurrency_release.go).
 //!
 //! Releases are cumulative per (credential, model): Home only needs the latest sequence,
-//! so a burst of ends collapses into one frame. Frames go out every flush interval; a
-//! failed round doubles the delay up to the max backoff. Each dirty mark returns a ticket
-//! that completes when Home has acknowledged that sequence.
+//! so a burst of ends collapses into one frame. A mark starts a round at once unless a
+//! failed round is backing off. While a group stays dirty, rounds repeat every flush
+//! interval, and a failed round doubles the delay up to the max backoff. With nothing
+//! dirty the flusher waits without a timer. Each dirty mark returns a ticket that
+//! completes when Home has acknowledged that sequence.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -161,23 +163,36 @@ impl ReleaseFlusher {
     }
 
     /// Go `Run`: sends dirty groups until `shutdown`.
+    ///
+    /// The round timer is armed only while a group is dirty or a failed round is backing
+    /// off, so an idle flusher never wakes on its own (Go v8.0.67 `7d2959a7`). Marks and
+    /// sender changes wake it through `wake`. `Notify` keeps one permit when nobody is
+    /// waiting, so a mark that lands between the idle check and the next wait is not lost.
     pub async fn run(&self, shutdown: CancellationToken) {
         let (mut delay, _) = self.timings();
         let mut backing_off = false;
-        let mut next = tokio::time::Instant::now();
+        // When the next round is due; `None` while nothing is dirty.
+        let mut next = (!self.idle()).then(tokio::time::Instant::now);
         loop {
+            let tick = async move {
+                match next {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             // A round in progress stops at shutdown or at the forced deadline; groups
             // it did not get acknowledged stay dirty.
             let deadline = tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = self.0.wake.notified() => {
+                    // A backoff keeps its retry time, so `next` is already armed.
                     if !backing_off {
-                        next = tokio::time::Instant::now();
+                        next = (!self.idle()).then(tokio::time::Instant::now);
                     }
                     continue;
                 }
                 _ = self.0.force.notified() => self.0.force_deadline.lock().unwrap_or_else(PoisonError::into_inner).take(),
-                _ = tokio::time::sleep_until(next) => None,
+                _ = tick => None,
             };
             let round = async {
                 match deadline {
@@ -189,8 +204,9 @@ impl ReleaseFlusher {
                 _ = shutdown.cancelled() => return,
                 failed = round => failed,
             };
+            let idle = self.idle();
             (delay, backing_off) = self.next_delay(delay, failed);
-            next = tokio::time::Instant::now() + delay;
+            next = (backing_off || !idle).then(|| tokio::time::Instant::now() + delay);
         }
     }
 
@@ -224,13 +240,15 @@ impl ReleaseFlusher {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct Recorder {
         frames: Mutex<Vec<ReleaseFrame>>,
         fail: AtomicBool,
         cfg: CredentialConcurrency,
+        /// `run` reads the limiter once at start and once after every round.
+        limiter_reads: AtomicUsize,
     }
 
     impl ReleaseSender for Recorder {
@@ -246,8 +264,66 @@ mod tests {
         }
 
         fn limiter(&self) -> CredentialConcurrency {
+            self.limiter_reads.fetch_add(1, Ordering::SeqCst);
             self.cfg
         }
+    }
+
+    /// A future that counts its polls. Each poll after the first is one wakeup of the
+    /// wrapped task by the scheduler: a timer, a notification or an I/O event.
+    struct Polls<F> {
+        inner: Pin<Box<F>>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl<F: Future> Future for Polls<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
+    /// Spawns `flusher.run` and returns its task and poll count.
+    fn spawn_counted(
+        flusher: &ReleaseFlusher,
+        shutdown: &CancellationToken,
+    ) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (flusher, shutdown) = (flusher.clone(), shutdown.clone());
+        let task = tokio::spawn(Polls {
+            inner: Box::pin(async move { flusher.run(shutdown).await }),
+            count: count.clone(),
+        });
+        (task, count)
+    }
+
+    /// Lets every task that is ready now run until it waits again.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Asserts that `run` is neither polled nor runs a round during an hour of paused
+    /// time. The paused clock jumps straight to the next timer, so a flusher that kept a
+    /// timer armed would be polled and would read the limiter once per round.
+    async fn assert_parked(polls: &AtomicUsize, recorder: &Recorder) {
+        settle().await;
+        let before = (
+            polls.load(Ordering::SeqCst),
+            recorder.limiter_reads.load(Ordering::SeqCst),
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        let after = (
+            polls.load(Ordering::SeqCst),
+            recorder.limiter_reads.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            after, before,
+            "an idle flusher woke up: (polls, rounds) before and after an hour"
+        );
     }
 
     fn group(id: &str) -> ReleaseGroup {
@@ -309,6 +385,157 @@ mod tests {
             .wait(Duration::ZERO)
             .await
             .unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// Go `TestReleaseFlusherIdleFlushDoesNotAllocate` (v8.0.67 `7d2959a7`): without
+    /// dirty work the flusher arms no timer and runs no rounds. A new mark wakes it at
+    /// once, and it parks again after the acknowledgement.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_flusher_stays_parked_and_wakes_at_once_for_a_mark() {
+        let recorder = Arc::new(Recorder::default());
+        let flusher = ReleaseFlusher::new();
+        flusher.set_sender(Some(recorder.clone()));
+        let shutdown = CancellationToken::new();
+        let (task, polls) = spawn_counted(&flusher, &shutdown);
+        assert_parked(&polls, &recorder).await;
+
+        let start = tokio::time::Instant::now();
+        let ticket = flusher.mark_dirty(group("a"), 1).unwrap();
+        ticket.wait(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the first send does not wait for a tick"
+        );
+        assert_eq!(recorder.frames.lock().unwrap().len(), 1);
+        assert_parked(&polls, &recorder).await;
+
+        // An already acknowledged sequence leaves nothing dirty, so it wakes no round.
+        flusher
+            .mark_dirty(group("a"), 1)
+            .unwrap()
+            .wait(Duration::ZERO)
+            .await
+            .unwrap();
+        assert_parked(&polls, &recorder).await;
+        assert_eq!(recorder.frames.lock().unwrap().len(), 1);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// A sender that marks one more sequence the first time the flusher reads its limiter
+    /// after a send. `run` reads the limiter after its idle check, so the mark lands
+    /// between that check and the next wait.
+    struct MarksAfterSend {
+        flusher: std::sync::OnceLock<ReleaseFlusher>,
+        marked: Mutex<Option<ReleaseTicket>>,
+        frames: Mutex<Vec<i64>>,
+    }
+
+    impl ReleaseSender for MarksAfterSend {
+        fn send<'a>(&'a self, frame: &'a ReleaseFrame) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            self.frames.lock().unwrap().push(frame.release_seq);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn limiter(&self) -> CredentialConcurrency {
+            let mut marked = self.marked.lock().unwrap();
+            if marked.is_none() && !self.frames.lock().unwrap().is_empty() {
+                *marked = self.flusher.get().unwrap().mark_dirty(group("a"), 2);
+            }
+            CredentialConcurrency::default()
+        }
+    }
+
+    /// A mark that arrives while the flusher decides to go idle is not lost: it is sent
+    /// at once, without waiting for a tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_during_the_idle_transition_is_sent_at_once() {
+        let sender = Arc::new(MarksAfterSend {
+            flusher: std::sync::OnceLock::new(),
+            marked: Mutex::default(),
+            frames: Mutex::default(),
+        });
+        let flusher = ReleaseFlusher::new();
+        let _ = sender.flusher.set(flusher.clone());
+        flusher.set_sender(Some(sender.clone()));
+        let first = flusher.mark_dirty(group("a"), 1).unwrap();
+        let shutdown = CancellationToken::new();
+        let (task, _) = spawn_counted(&flusher, &shutdown);
+        let start = tokio::time::Instant::now();
+        first.wait(Duration::from_secs(1)).await.unwrap();
+        settle().await;
+        let second = sender
+            .marked
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the sender marked a second sequence");
+        second.wait(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(*sender.frames.lock().unwrap(), vec![1, 2]);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// A forced flush with nothing dirty runs one bounded round and parks again.
+    #[tokio::test(start_paused = true)]
+    async fn a_forced_flush_on_an_idle_flusher_parks_again() {
+        let recorder = Arc::new(Recorder::default());
+        let flusher = ReleaseFlusher::new();
+        flusher.set_sender(Some(recorder.clone()));
+        let shutdown = CancellationToken::new();
+        let (task, polls) = spawn_counted(&flusher, &shutdown);
+        settle().await;
+        flusher.flush_all(Duration::from_secs(1)).await.unwrap();
+        assert_parked(&polls, &recorder).await;
+        assert!(recorder.frames.lock().unwrap().is_empty());
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// Without a sender a dirty group is retried every flush interval. Setting a sender
+    /// sends it at once; the flusher then parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_sender_sends_pending_work_at_once_and_then_parks() {
+        let flusher = ReleaseFlusher::new();
+        let ticket = flusher.mark_dirty(group("a"), 1).unwrap();
+        let shutdown = CancellationToken::new();
+        let (task, polls) = spawn_counted(&flusher, &shutdown);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let recorder = Arc::new(Recorder::default());
+        let start = tokio::time::Instant::now();
+        flusher.set_sender(Some(recorder.clone()));
+        ticket.wait(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_parked(&polls, &recorder).await;
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// A sender replaced while a failed round backs off: the retry keeps its backoff
+    /// time, goes to the new sender and completes the ticket; then the flusher parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_sender_replaced_during_backoff_retries_on_time_and_then_parks() {
+        let old = Arc::new(Recorder::default());
+        old.fail.store(true, Ordering::SeqCst);
+        let flusher = ReleaseFlusher::new();
+        flusher.set_sender(Some(old.clone()));
+        let ticket = flusher.mark_dirty(group("a"), 1).unwrap();
+        let shutdown = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let (task, polls) = spawn_counted(&flusher, &shutdown);
+        settle().await;
+        assert_eq!(old.frames.lock().unwrap().len(), 1, "the first round failed");
+        let new = Arc::new(Recorder::default());
+        flusher.set_sender(Some(new.clone()));
+        ticket.wait(Duration::from_secs(2)).await.unwrap();
+        // Defaults: 250ms flush interval, so the first retry waits 500ms.
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+        assert_eq!(new.frames.lock().unwrap().len(), 1);
+        assert_parked(&polls, &new).await;
         shutdown.cancel();
         task.await.unwrap();
     }

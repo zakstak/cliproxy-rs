@@ -975,6 +975,62 @@ async fn subscriber_lifetime_applies_updates_until_the_heartbeat_is_lost() {
     assert!(home.count("ping") >= 1);
 }
 
+/// Go `TestManagedSubscriberOrdinaryTrafficDoesNotRenewHeartbeat` (v8.0.67 `c9dad847`):
+/// config and cluster messages arriving faster than the heartbeat timeout do not keep a
+/// lifetime alive without pongs. The 5s bound only turns a regression into a failure
+/// instead of a hang; a correct lifetime ends one 300ms heartbeat after it is ready.
+#[tokio::test]
+async fn non_pong_traffic_does_not_renew_the_heartbeat() {
+    let home = subscriber_home(ACK, Arc::new(AtomicUsize::new(1))).await;
+    let client = home.client();
+    client.set_managed_lifetime(true);
+    short_heartbeat(&client, 0);
+    let applied = Arc::new(AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn({
+        let (client, applied, shutdown) = (client.clone(), applied.clone(), shutdown.clone());
+        async move {
+            client
+                .run_config_subscriber_lifetime(
+                    &shutdown,
+                    |_| {
+                        applied.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || {},
+                )
+                .await
+        }
+    });
+    while !client.heartbeat_ok() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let bound = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut run = run;
+    let ended = loop {
+        home.push(fake::message("config", b"port: 2\n"));
+        home.push(fake::message("cluster", br#"{"ok":true,"nodes":[]}"#));
+        tokio::select! {
+            ended = &mut run => break Some(ended),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if tokio::time::Instant::now() >= bound {
+                    break None;
+                }
+            }
+        }
+    };
+    shutdown.cancel();
+    let error = ended
+        .expect("config and cluster traffic kept a heartbeat without pongs alive")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_timeout(), "{error:?}");
+    assert!(!client.heartbeat_ok());
+    assert!(!client.fenced(), "managed lifetimes are closed by the service");
+    // The initial GET plus at least one published update reached `on_config`.
+    assert!(applied.load(Ordering::SeqCst) >= 2);
+}
+
 /// Go `TestConfigSubscriberUsesAppliedLifecycleRevisionAndRebuildsCommands` and
 /// `TestRunConfigSubscriberLifetimePreservesTakeoverWhenFreshCommandProbeFails`.
 #[tokio::test]
