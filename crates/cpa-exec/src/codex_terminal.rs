@@ -114,7 +114,7 @@ pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
 /// `response.failed`'s `response.error` (`sse/responses_error.rs:26-32`), each an object
 /// with a string `code`; Go's fallback locations do not.
 pub(crate) fn event_rejection_status(event: &str) -> Option<u16> {
-    if !rawjson::valid(event.trim()) {
+    if !rawjson::valid(crate::codex_event::json_trim(event)) {
         return None;
     }
     let error = match string_at(event, "type")?.as_str() {
@@ -192,31 +192,53 @@ pub(crate) fn context_window(status: u16, body: &str) -> bool {
             .is_some_and(|c| c == "context_length_exceeded")
 }
 
-/// The headers of a wrapped WebSocket frame as first-party Codex reads them
-/// (`responses_headers.rs:10-31`). `payload` is the frame's pinned view
-/// (`crate::codex_event::classification_view`, the wrapped struct's members): its
-/// `headers` object, a string, number (its digits as written, `arbitrary_precision`) or
-/// boolean value each, unchanged (not trimmed), and a name or value `http` refuses skipped.
-pub(crate) fn frame_headers(payload: &str) -> HeaderMap {
+/// The headers of a wrapped WebSocket frame `frame`, as received, as first-party Codex
+/// reads them (`responses_websocket.rs:735-745`, `responses_headers.rs:10-31` at
+/// 5c3ff1dabf64): the wrapped struct's `headers` member decoded as a
+/// `Map<String, Value>`, then inserted into a `HeaderMap` in the map's order.
+///
+/// - The map's own keys are plain: a private-token key is an ordinary name, which
+///   `http` refuses (sixth review finding 2).
+/// - The map keeps insertion order (`preserve_order`): a repeated key keeps its first
+///   position and takes its last value, so of two names `http` folds together, the one
+///   inserted later wins (sixth review finding 1).
+/// - Each value is read as the first-party `Value` reads it (a private token resolved,
+///   a number's digits as written): a string, number or boolean, unchanged, else skipped.
+pub(crate) fn frame_headers(frame: &str) -> HeaderMap {
     let mut mapped = HeaderMap::new();
-    let headers = rawjson::get(payload, "headers");
+    let Some(raw) = crate::codex_event::wrapped_headers(frame) else {
+        return mapped;
+    };
+    let headers = rawjson::parse(raw);
     if headers.kind() != Kind::Object {
         return mapped;
     }
+    let mut members: Vec<(String, String)> = Vec::new();
     headers.each(|name, value| {
+        let (name, value) = (name.str().to_owned(), value.json().to_owned());
+        match members.iter_mut().find(|(n, _)| *n == name) {
+            Some(member) => member.1 = value,
+            None => members.push((name, value)),
+        }
+        true
+    });
+    for (name, value) in members {
+        let Some(value) = crate::codex_event::value_view(&value) else {
+            continue;
+        };
+        let value = rawjson::parse(&value);
         let text = match value.kind() {
             Kind::String => value.str().to_owned(),
             Kind::Number | Kind::True | Kind::False => value.json().to_owned(),
-            _ => return true,
+            _ => continue,
         };
         if let (Ok(name), Ok(value)) = (
-            http::HeaderName::from_bytes(name.str().as_bytes()),
+            http::HeaderName::from_bytes(name.as_bytes()),
             http::HeaderValue::from_str(&text),
         ) {
             mapped.insert(name, value);
         }
-        true
-    });
+    }
     mapped
 }
 
@@ -493,6 +515,57 @@ mod tests {
         assert_eq!(frame_headers(&spaced)["x-error-json"], format!("{encoded} ").as_str());
         assert_eq!(reading(403, &spaced, &frame_headers(&spaced)), None);
         assert!(frame_headers("not json").is_empty());
+    }
+
+    /// Sixth review findings 1 and 2: wrapped headers are the struct's `headers` member as
+    /// a `Map<String, Value>`: keys plain, a repeated key in its first position with its
+    /// last value, so the later of two names `http` folds together wins.
+    #[test]
+    fn wrapped_headers_follow_the_first_party_map() {
+        let b64 = |json: &str| base64::engine::general_purpose::STANDARD.encode(json);
+        let t = b64(r#"{"error":{"code":"invalid_workspace_selected"}}"#);
+        let r = b64(r#"{"error":{"code":"route_rate_limited"}}"#);
+        let frame = |headers: &str| format!(r#"{{"type":"error","status":403,"headers":{headers}}}"#);
+        let repeated = frame(&format!(
+            r#"{{"x-error-json":"{r}","X-Error-Json":"{t}","x-error-json":"{r}"}}"#
+        ));
+        let headers = frame_headers(&repeated);
+        assert_eq!(
+            headers["x-error-json"],
+            t.as_str(),
+            "the uppercase name is inserted last"
+        );
+        assert_eq!(reading(403, &repeated, &headers), TERMINAL);
+        let reversed = frame(&format!(r#"{{"X-Error-Json":"{t}","x-error-json":"{r}"}}"#));
+        assert_eq!(reading(403, &reversed, &frame_headers(&reversed)), None);
+        // A private token as the map's own key is a plain name `http` refuses.
+        let token = frame(&format!(
+            r#"{{"$serde_json::private::RawValue":"{{\"x-error-json\":\"{t}\"}}"}}"#
+        ));
+        let headers = frame_headers(&token);
+        assert!(headers.is_empty(), "{headers:?}");
+        assert_eq!(reading(403, &token, &headers), None);
+        // A private token as a value is what the first-party `Value` reads it as.
+        let valued = frame(&format!(
+            r#"{{"x-error-json":{{"$serde_json::private::RawValue":"\"{t}\""}}}}"#
+        ));
+        assert_eq!(frame_headers(&valued)["x-error-json"], t.as_str());
+        // A positional frame's headers are its fourth member.
+        let positional = format!(r#"["error",403,null,{{"x-error-json":"{t}"}}]"#);
+        assert_eq!(frame_headers(&positional)["x-error-json"], t.as_str());
+    }
+
+    /// Sixth review finding 3: only JSON whitespace surrounds a body the first-party
+    /// parser accepts; a body led by U+00A0 is no JSON there.
+    #[test]
+    fn only_json_whitespace_is_trimmed() {
+        let body = r#"{"error":{"code":"inference_hook_denied"}}"#;
+        assert_eq!(reading(403, &format!("\u{a0}{body}"), &none()), None);
+        assert_eq!(reading(403, &format!("{body}\u{2003}"), &none()), None);
+        assert_eq!(reading(403, &format!(" \t\r\n{body}\n"), &none()), TERMINAL);
+        let event = r#"{"type":"error","error":{"code":"inference_hook_denied"}}"#;
+        assert_eq!(event_rejection_status(&format!("\u{a0}{event}")), None);
+        assert_eq!(event_rejection_status(&format!("\n{event} ")), Some(403));
     }
 
     /// `error.rs:110-112` and `responses_websocket.rs:1416-1439`: with a status,

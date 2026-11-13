@@ -183,6 +183,22 @@ A fifth review at `836cde5d` found three more, fixed in the next commit:
    first-party event struct ignores as an unknown field. Events are now read with their
    own keys plain, as the struct reads them.
 
+A sixth review at `9adc5188` found three more, fixed in the next commit:
+
+1. Wrapped headers were read from the de-duplicated view, which keeps a repeated key in
+   its last position. First-party decodes them into an insertion-ordered map, where a
+   repeated key keeps its first position and takes its last value, so a different header
+   could win in the `HeaderMap`.
+2. That view also resolved a private token as the `headers` object's own key. First-party
+   decodes `headers` as a `Map<String, Value>`, whose keys are plain. The headers are now
+   read from the frame as received (`codex_event::wrapped_headers`), with those map rules
+   and each value read as a first-party `Value`.
+3. `value_view` trimmed Unicode whitespace before validating. It now trims only JSON
+   whitespace, so a body led by U+00A0 is no JSON, as for first-party.
+
+The S4 session at `9adc5188` ran out of disk space on `/home` after 25 exact targets and is
+an incomplete run, not acceptance evidence.
+
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.
 

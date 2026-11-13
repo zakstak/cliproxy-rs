@@ -897,6 +897,22 @@ pub(crate) fn logical_view(payload: &str) -> Cow<'_, str> {
     }
 }
 
+/// `text` without leading and trailing JSON whitespace (space, tab, line feed, carriage
+/// return), the only whitespace a JSON parser skips.
+pub(crate) fn json_trim(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
+/// The raw `headers` member of a wrapped status frame `payload` as the first-party
+/// `WrappedWebsocketErrorEvent` decodes it (`responses_websocket.rs:735-745` at
+/// 5c3ff1dabf64), by name or by position, as sent; `None` without one.
+pub(crate) fn wrapped_headers(payload: &str) -> Option<&str> {
+    serde_json::from_str::<WrappedShape<'_>>(payload)
+        .ok()?
+        .headers
+        .map(RawValue::get)
+}
+
 /// `payload`, an HTTP error body or a wrapped frame, as the first-party build's
 /// `serde_json::from_str::<Value>` reads it (FP2, `api_bridge.rs:138-140` at
 /// 5c3ff1dabf64): `None` when that `Value` refuses it ([`value_decodes`], with its root
@@ -904,7 +920,9 @@ pub(crate) fn logical_view(payload: &str) -> Cow<'_, str> {
 /// number and raw value tokens resolved, the root included. A number of any size is
 /// accepted (`arbitrary_precision`), unlike this build's own `Value`.
 pub(crate) fn value_view(payload: &str) -> Option<Cow<'_, str>> {
-    let payload = payload.trim();
+    // JSON whitespace only: the first-party parser refuses any other (sixth review
+    // finding 3), so a body led by U+00A0 is no `Value`.
+    let payload = json_trim(payload);
     if serde_json::from_str::<IgnoredAny>(payload).is_err() || !value_decodes(payload, 1, true) {
         return None;
     }
