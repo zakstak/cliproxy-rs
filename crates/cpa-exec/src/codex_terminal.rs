@@ -91,6 +91,23 @@ pub(crate) fn stream_rejection_status(body: &str) -> Option<u16> {
     STREAM_TERMINAL.contains(&code).then(|| stream_status(code)).flatten()
 }
 
+/// The status an in-stream failure event `event` (its logical value,
+/// `crate::codex_event::logical_view`) is classified with when first-party Codex reads it
+/// as a terminal rejection, or `None`. Only first-party's locations count: an `error`
+/// event's `error` (`sse/responses.rs:379-383`) and a `response.failed`'s
+/// `response.error` (`sse/responses_error.rs:26-32`), each an object with a string
+/// `code`; Go's fallback locations do not (fourth review finding 3).
+pub(crate) fn event_rejection_status(event: &str) -> Option<u16> {
+    let value = serde_json::from_str::<Value>(event).ok()?;
+    let error = match value.get("type")?.as_str()? {
+        "error" => value.get("error")?,
+        "response.failed" => value.pointer("/response/error")?,
+        _ => return None,
+    };
+    let code = error.get("code")?.as_str()?;
+    STREAM_TERMINAL.contains(&code).then(|| stream_status(code)).flatten()
+}
+
 /// The codes FP2 reads from first-party sources: the stream codes and the two workspace
 /// codes. With an HTTP status that pairs with none of their terminal readings, and that is
 /// not 400, first-party Codex retries them (`UnexpectedStatus`, `RetryLimit` or

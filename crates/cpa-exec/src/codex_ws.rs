@@ -1272,8 +1272,19 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
     Some((status, out))
 }
 
-/// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status.
+/// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status,
+/// read as given (also FP2's reading).
 pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecError> {
+    status_frame_error(payload, payload, model_level_cooling)
+}
+
+/// [`ws_error`] of the pinned reader's view `payload` of a wrapped frame received as
+/// `original`. First-party maps a wrapped status frame to the HTTP error of its status
+/// whose body is the frame as received, and whose headers are the decoded struct's
+/// (`responses_websocket.rs:755-806` at 5c3ff1dabf64), so FP2 reads `original` as the body
+/// and the view's `headers`: a positional array has no `/error/code` there, though its
+/// view does (fourth review finding 2). Go's classification reads the view.
+pub(super) fn status_frame_error(payload: &str, original: &str, model_level_cooling: bool) -> Option<ExecError> {
     let (status, out) = ws_error_body(payload)?;
     let mut headers = HeaderMap::new();
     let raw_headers = rawjson::get(payload, "headers");
@@ -1313,7 +1324,7 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     // trimmed `headers` above stay Go's passthrough and classification copy.
     let sourced = crate::codex_terminal::reading(
         crate::codex_terminal::Surface::Status(status),
-        payload,
+        original,
         &crate::codex_terminal::frame_headers(payload),
     );
     let error = response::status_error_raw(status, &out, headers, model_level_cooling);
@@ -1760,7 +1771,8 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
     } else {
         None
     };
-    let status_frame = |view: &str| ws_error(view, cooling).map(|error| Reading::Failure { error, body: None });
+    let status_frame =
+        |view: &str| status_frame_error(view, payload, cooling).map(|error| Reading::Failure { error, body: None });
     // The event as received: `response::received_failure` takes the pinned reader's view
     // for Go's classification and FP2's codes from the logical value.
     let terminal = || {

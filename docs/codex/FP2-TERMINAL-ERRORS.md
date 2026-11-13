@@ -153,6 +153,20 @@ A third review at `9978805f` found two more, fixed in the next commit:
    (`codex_event::logical_view`) and keeps Go's classification of the view; a positional
    array naming an FP2 code is `Retryable`.
 
+A fourth review at `cadfe89a` found three more, fixed in the next commit:
+
+1. A bootstrap guard passed an owned error where a reference was required, which would
+   not compile.
+2. A positional wrapped status frame was read for FP2 from its projected view. First-party
+   maps it to the HTTP error of its status with the frame as received as the body, which
+   names no `/error/code`, and the decoded struct's headers. FP2 now reads exactly that;
+   Go's classification still reads the view.
+3. FP2 took codes from Go's fallback error locations (a `response.failed`'s top-level
+   `error`, an `error` event's top-level `code`). First-party reads only an `error` event's
+   `error` and a `response.failed`'s `response.error`
+   (`codex_terminal::event_rejection_status`); a code only Go's fallbacks name is
+   `Retryable`, with Go's status.
+
 The S3 session at `c4f968fb` passed, but it predates these fixes and is not acceptance
 evidence for them.
 

@@ -437,20 +437,22 @@ fn terminal_status(body: &str) -> u16 {
 /// readings (`codex_ws::account_reading`), which read a frame as written and as viewed.
 pub(crate) fn terminal_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
     let body = terminal_failure_body(event)?;
-    let logical = Some(body.clone());
-    failure(body, logical, model_level_cooling)
+    let rejection = crate::codex_terminal::stream_rejection_status(&body);
+    failure(body, rejection, model_level_cooling)
 }
 
 /// [`terminal_failure`] of an upstream event as received, the reading every route
 /// classifies with. Go's classification reads the event as the pinned reader decodes it
-/// ([`failure_view`]); FP2 reads its terminal codes from the logical value before the
-/// positional `Error` projection (`crate::codex_event::logical_view`), as
-/// `parse_failed_response` reads them before its struct decode (`sse/responses_error.rs:32`
-/// at 5c3ff1dabf64, third review finding 2).
+/// ([`failure_view`]), with Go's fallback error locations. FP2 reads its terminal codes
+/// only where first-party Codex does (`crate::codex_terminal::event_rejection_status`):
+/// an `error` event's `error`, a `response.failed`'s `response.error`, from the logical
+/// value before the positional `Error` projection (`crate::codex_event::logical_view`;
+/// `sse/responses.rs:379-383`, `sse/responses_error.rs:26-34` at 5c3ff1dabf64; third and
+/// fourth review findings).
 pub(crate) fn received_failure(event: &str, model_level_cooling: bool) -> Option<(ExecError, String)> {
     let body = terminal_failure_body(&failure_view(event))?;
-    let logical = terminal_failure_body(&crate::codex_event::logical_view(event));
-    failure(body, logical, model_level_cooling)
+    let rejection = crate::codex_terminal::event_rejection_status(&crate::codex_event::logical_view(event));
+    failure(body, rejection, model_level_cooling)
 }
 
 /// Whether a failure classified as `error`, with failure body `body`, is a bootstrap
@@ -489,18 +491,17 @@ pub(crate) fn written_rejection_status(event: &str) -> Option<u16> {
     terminal_failure_body(event).and_then(|body| crate::codex_terminal::stream_rejection_status(&body))
 }
 
-/// The error for the failure body `body`, with FP2's terminal codes read from the logical
-/// failure body `logical`. An accepted positional array that only its struct decode turns
-/// into a terminal code reaches that struct's default branch, `ApiError::Retryable`
-/// (`sse/responses_error.rs:100-103`): `Retryable`, with Go's status.
-fn failure(body: String, logical: Option<String>, model_level_cooling: bool) -> Option<(ExecError, String)> {
+/// The error for the failure body `body`, with the status FP2 pairs with a first-party
+/// terminal rejection (`rejection`), when there is one. A failure Go's reading names a
+/// first-party code for but first-party Codex does not read as one (an accepted positional
+/// array its struct decode reaches, or a Go fallback location) reaches first-party's
+/// retryable branches (`ApiError::Retryable` or `ApiError::Stream`,
+/// `sse/responses_error.rs:35-44`, `100-103`): `Retryable`, with Go's status.
+fn failure(body: String, rejection: Option<u16>, model_level_cooling: bool) -> Option<(ExecError, String)> {
     let stream_handled = context_length(&body)
         || is_usage_limit(&body)
         || is_capacity(&body)
         || classification(400, &body).is_some_and(|(code, _)| code == "thinking_signature_invalid");
-    let rejection = logical
-        .as_deref()
-        .and_then(crate::codex_terminal::stream_rejection_status);
     use cpa_core::exec::SourcedFault;
     let (sourced, status) = match rejection {
         Some(status) => (Some(SourcedFault::RequestTerminal), status),
@@ -1157,7 +1158,7 @@ pub(crate) async fn bootstrap(
             Step::Fail { error, body, .. }
                 if !gate.released
                     && !gate.timed_out()
-                    && body.as_deref().is_some_and(|body| failure_overload(error, body)) =>
+                    && body.as_deref().is_some_and(|body| failure_overload(&error, body)) =>
             {
                 return Bootstrap::Reject(bootstrap_overload(body.as_deref().unwrap_or_default()));
             }
@@ -1525,6 +1526,55 @@ mod first_party_terminal_tests {
         let capacity = r#"{"type":"response.failed","response":{"error":[null,"inference_hook_denied","model is at capacity",null,null]}}"#;
         let (error, body) = received_failure(capacity, false).unwrap();
         assert!(failure_overload(&error, &body), "first-party retries it");
+    }
+
+    /// Fourth review finding 2: a positional wrapped status frame maps to the HTTP error of
+    /// its status with the frame as received as its body (`responses_websocket.rs:800-806`),
+    /// whose `Value` names no `/error/code`; the decoded struct's headers still count. Go's
+    /// classification reads the view.
+    #[test]
+    fn a_positional_wrapped_frame_reads_its_body_as_received() {
+        let positional = r#"["error",403,{"code":"inference_hook_denied","message":"denied"}]"#;
+        let error = ws(positional).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Credential, None)
+        );
+        assert!(error.withheld(), "a 403 is withheld (#6)");
+        let object = r#"{"type":"error","status":403,"error":{"code":"inference_hook_denied","message":"denied"}}"#;
+        assert_eq!(ws(object).unwrap().sourced, TERMINAL, "the object form names its code");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text("http-error-workspace-provider").trim());
+        let headed = format!(r#"["error",403,null,{{"x-error-json":"{encoded}"}}]"#);
+        let error = ws(&headed).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (403, FailureScope::Request, TERMINAL),
+            "decoded headers count"
+        );
+    }
+
+    /// Fourth review finding 3: FP2 reads its codes only where first-party Codex does, an
+    /// `error` event's `error` and a `response.failed`'s `response.error`
+    /// (`sse/responses_error.rs:26-44`). A code only Go's fallback locations name reaches
+    /// first-party's retryable `Stream` error: `Retryable`, with Go's status.
+    #[test]
+    fn go_fallback_locations_are_no_first_party_evidence() {
+        let top = r#"{"type":"response.failed","response":{"id":"r1"},"error":{"code":"content_policy_violation"}}"#;
+        let (error, body) = received_failure(top, false).unwrap();
+        assert_eq!(
+            (error.status, error.scope, error.sourced),
+            (502, FailureScope::Credential, RETRYABLE)
+        );
+        assert_eq!(
+            rawjson::get(&body, "error.code").str(),
+            "content_policy_violation",
+            "Go's fallback body"
+        );
+        let bare = r#"{"type":"error","code":"inference_hook_denied","message":"m"}"#;
+        let (error, _) = received_failure(bare, false).unwrap();
+        assert_eq!((error.sourced, error.scope), (RETRYABLE, FailureScope::Credential));
+        let nested = r#"{"type":"response.failed","response":{"id":"r1","error":{"code":"content_policy_violation"}}}"#;
+        assert_eq!(received_failure(nested, false).unwrap().0.sourced, TERMINAL);
     }
 
     /// Review finding 4: a refused upgrade with status 426 keeps Go's plain rendering and
