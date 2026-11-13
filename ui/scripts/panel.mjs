@@ -3,7 +3,11 @@
 // the file makes no requests except to the Management API of the server that serves it.
 // Runs after `vite build`. No dependencies: the inlining is plain string work on Vite's output.
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+
+// The Rust server embeds ui/dist and serves /management.html from dist/management.html.
+// `vite build` empties dist/, so copy the entry page back to that path first.
+copyFileSync("dist/index.html", "dist/management.html");
 
 const read = (path) => readFileSync(`dist/${path.replace(/^\.\//, "")}`);
 let html = readFileSync("dist/index.html", "utf8");

@@ -19,7 +19,7 @@ npm test         # unit tests for src/core.ts
 npm run build    # dist/ and dist-panel/
 ```
 
-`npm run build` runs `vite build`, then `scripts/panel.mjs` (inlines JS, CSS, font and favicon into `dist-panel/management.html`, writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md). The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
+`npm run build` runs `vite build`, then `scripts/panel.mjs` (copies `dist/index.html` to `dist/management.html`, the path the Rust server serves; inlines JS, CSS, font and favicon into `dist-panel/management.html`; writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md). The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
 
 Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checked in and embedded at compile time.
 
