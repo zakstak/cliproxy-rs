@@ -329,6 +329,8 @@ pub struct CodexOAuth {
     siwc_token_url: String,
     refreshes: Refreshes,
     retry_delay: Duration,
+    /// How long one SIWC refresh attempt may take, the answer's body included (30 s).
+    grant_timeout: Duration,
 }
 
 impl CodexOAuth {
@@ -346,6 +348,7 @@ impl CodexOAuth {
             siwc_token_url: crate::codex_siwc::TOKEN_URL.into(),
             refreshes: Refreshes::default(),
             retry_delay: Duration::from_secs(1),
+            grant_timeout: Duration::from_secs(30),
         }
     }
 
@@ -362,6 +365,12 @@ impl CodexOAuth {
     /// Tests shorten Go's 1s-per-attempt refresh backoff.
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Tests shorten the 30 s a SIWC refresh attempt may take.
+    pub fn with_grant_timeout(mut self, timeout: Duration) -> Self {
+        self.grant_timeout = timeout;
         self
     }
 
@@ -396,6 +405,20 @@ impl CodexOAuth {
         content_type: &str,
         body: Vec<u8>,
     ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
+        self.post_status_until(url, content_type, body, None).await
+    }
+
+    /// [`Self::post_status`] within `deadline`: an answer whose status arrived in time
+    /// but whose body did not keeps its status (`None` body), so a caller can tell a
+    /// stalled answer from a request that may not have been read. Without a deadline
+    /// the caller's own timeout applies.
+    pub(crate) async fn post_status_until(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(u16, Option<bytes::Bytes>), ExecError> {
         let failed = || ExecError::local(502, FailureScope::Transport, "codex oauth request failed");
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
@@ -403,12 +426,13 @@ impl CodexOAuth {
         // Every token grant is the proxy's own request: it names cliproxy-rs, where Go
         // sent net/http's `Go-http-client` default (#26, `crate::codex_identity`).
         headers.set("User-Agent", crate::codex_identity::USER_AGENT);
-        let upstream = crate::proxy::send(&self.client, url, headers, body, None)
+        let deadline = deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+        let upstream = tokio::time::timeout_at(deadline, crate::proxy::send(&self.client, url, headers, body, None))
             .await
+            .map_err(|_| failed())?
             .map_err(|_| failed())?;
-        let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
-            .await
-            .ok();
+        let read = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false);
+        let body = tokio::time::timeout_at(deadline, read).await.ok().and_then(Result::ok);
         Ok((upstream.status, body))
     }
 
@@ -574,8 +598,13 @@ impl CodexOAuth {
             if attempt > 0 {
                 tokio::time::sleep(self.retry_delay * attempt).await;
             }
-            let once = tokio::time::timeout(
-                Duration::from_secs(30),
+            // The attempt's deadline bounds the body read too, so an answer whose 200
+            // arrived but whose body stalls is known as answered (#92) instead of
+            // timing out as an ordinary transient failure that sends the token again.
+            // The outer timeout is a backstop only.
+            let deadline = tokio::time::Instant::now() + self.grant_timeout;
+            let once = tokio::time::timeout_at(
+                deadline + Duration::from_secs(1),
                 self.siwc_token_request(
                     &[
                         ("client_id", client_id),
@@ -586,6 +615,7 @@ impl CodexOAuth {
                     client_id,
                     device_id,
                     false,
+                    Some(deadline),
                 ),
             )
             .await

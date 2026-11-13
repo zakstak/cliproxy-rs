@@ -397,10 +397,21 @@ fn jwt_exp(token: &str) -> Option<GoTime> {
     }
 }
 
+/// Whether a refresh stored an unknown expiry: `expired` is an explicit `null`
+/// ([`Tokens::to_map`], #92). Every other expiry key the partition may still hold
+/// (`expire`, `expiresAt`, `expires_in`, a nested `token`...) predates that refresh, so
+/// none is read: the new access token's JWT `exp`, else `last_refresh`, decides.
+fn expiry_unknown(siwc: &Map<String, Value>) -> bool {
+    matches!(siwc.get("expired"), Some(Value::Null))
+}
+
 /// Go `SIWCExpirationTime`: the partition's expiration, else its access token's JWT
-/// `exp`; a zero time is no expiration.
+/// `exp`; a zero time is no expiration. After a refresh with an unknown expiry, only
+/// the JWT `exp` ([`expiry_unknown`]).
 fn expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
-    expiration_from_map(siwc)
+    (!expiry_unknown(siwc))
+        .then(|| expiration_from_map(siwc))
+        .flatten()
         .filter(|t| *t != ZERO)
         .or_else(|| jwt_exp(text(siwc, "access_token")).filter(|t| *t != ZERO))
 }
@@ -409,6 +420,9 @@ fn expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
 /// margin-deducted `expired`: `expires_at`, else `expires_in` after the last refresh
 /// (or issue time), else the access token's JWT `exp`.
 fn real_expiry(siwc: &Map<String, Value>) -> Option<GoTime> {
+    if expiry_unknown(siwc) {
+        return jwt_exp(text(siwc, "access_token")).filter(|t| *t != ZERO);
+    }
     if let Some(t) = lookup_time(siwc, &["expires_at", "expiresAt"]).filter(|t| *t != ZERO) {
         return Some(t);
     }
@@ -618,8 +632,9 @@ impl Tokens {
     /// An unknown expiry (`expired` empty, a refresh answer whose `expires_in` could not
     /// be read, see [`token_response`]) writes `expired` and `expires_at` as `null`, so a
     /// refresh merged over the stored partition clears its old expiries instead of
-    /// keeping a past one that would make the new token due at once. A `null` expiry
-    /// reads as unset.
+    /// keeping a past one that would make the new token due at once. An explicit `null`
+    /// `expired` also stops every older expiry alias from being read ([`expiry_unknown`]).
+    /// A Go-compatible reader of the same file does not know that rule.
     pub fn to_map(&self) -> Map<String, Value> {
         let mut out = Map::new();
         let mut set = |k: &str, v: &str| {
@@ -787,21 +802,24 @@ impl CodexOAuth {
         client_id: &str,
         device_id: &str,
         require_id_token: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Tokens, crate::codex_oauth::GrantError> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
             .finish();
         let (status, body) = match self
-            .post_status(
+            .post_status_until(
                 self.siwc_token_url(),
                 "application/x-www-form-urlencoded",
                 body.into_bytes(),
+                deadline,
             )
             .await?
         {
             (status, Some(body)) => (status, body),
-            // A refresh answered 200 whose body could not be read: the endpoint accepted
+            // A refresh answered 200 whose body could not be read (cut short, or stalled
+            // past the attempt's deadline): the endpoint accepted
             // the grant and may have spent the refresh token, so this refresh does not
             // send it again. Transient and ambiguous, never a refusal (#92). The code
             // exchange keeps its transport failure.
@@ -879,6 +897,7 @@ impl CodexOAuth {
             client_id,
             device_id,
             true,
+            None,
         )
         .await
         .map_err(|e| e.error)

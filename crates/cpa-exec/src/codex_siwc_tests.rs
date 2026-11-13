@@ -645,3 +645,59 @@ fn a_grant_without_direct_use_disables_plan_usage() {
     assert!(require_token(&native).is_ok());
     assert_eq!(status(&native, false, at(0)), "off");
 }
+
+/// Sol review of 5daaa76c: a stored partition may hold older expiry aliases (`expire`,
+/// `expiresAt`, `expires_in` with an issue time, a nested `token`). A refresh with an
+/// unknown expiry writes `expired: null`, and then none of those aliases is read: the
+/// new access token's JWT `exp` schedules the refresh and gives the real expiry, so the
+/// replacement is neither due at once nor reported `invalid`. Without a JWT `exp`,
+/// `last_refresh` and the five-minute lead decide. A partition whose `expired` is
+/// absent (not `null`) keeps Go's reading.
+#[test]
+fn an_unknown_expiry_ignores_older_expiry_aliases() {
+    use base64::Engine as _;
+    let past = at(-3600).to_rfc3339();
+    let stale = serde_json::json!({
+        "access_token": "siwc-at-1", "refresh_token": "siwc-rt-1", "client_id": "oaiapp_fake",
+        "expire": past, "expiresAt": past, "expiry": past, "expires": past,
+        "expires_in": 60, "issued_at": at(-7200).to_rfc3339(), "token": {"expired": past},
+    });
+    let claims =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{}}}"#, at(3600).timestamp()));
+    let renewed = read(
+        &format!(r#"{{"access_token":"e30.{claims}.c2ln","refresh_token":"siwc-rt-2","expires_in":"3600"}}"#),
+        false,
+    )
+    .unwrap();
+    let mut c = siwc_credential(&renewed);
+    c.metadata["siwc"] = stale.clone();
+    let merged = refresh_patch(&c, &renewed).set["siwc"].clone();
+    c.metadata["siwc"] = merged;
+    assert_eq!(c.metadata["siwc"]["expiresAt"], past, "the alias is still stored");
+    assert_eq!(c.metadata["siwc"]["expired"], Value::Null);
+    let due = |t| refresh_due(&c, at(t));
+    assert_eq!(
+        (due(0), due(55 * 60 - 1), due(55 * 60)),
+        (Some(false), Some(false), Some(true))
+    );
+    assert!(access_usable(&c, at(0)));
+    assert_eq!(status(&c, false, at(0)), "valid");
+    assert_eq!(status(&c, false, at(3600)), "invalid", "past the JWT `exp`");
+    // An opaque replacement token: `last_refresh` and the lead decide.
+    let opaque = read(
+        r#"{"access_token":"siwc-at-2","refresh_token":"siwc-rt-2","expires_in":"3600"}"#,
+        false,
+    )
+    .unwrap();
+    let mut o = siwc_credential(&opaque);
+    o.metadata["siwc"] = stale.clone();
+    let merged = refresh_patch(&o, &opaque).set["siwc"].clone();
+    o.metadata["siwc"] = merged;
+    let due = |t| refresh_due(&o, at(t));
+    assert_eq!((due(0), due(299), due(300)), (Some(false), Some(false), Some(true)));
+    // Without the explicit null, the aliases keep Go's reading: the stale one is due.
+    let mut go = o.clone();
+    go.metadata["siwc"].as_object_mut().unwrap().remove("expired");
+    go.metadata["siwc"].as_object_mut().unwrap().remove("expires_at");
+    assert_eq!(refresh_due(&go, at(0)), Some(true));
+}
