@@ -421,6 +421,7 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
     let differences = controls_difference(client, upstream, f, bytes, &mut actual);
     let refused_80 = actual.first().is_some_and(|o| o == b"#80-REFUSED");
     early.extend(differences);
+    early.extend(developer_role_difference(client, upstream, f, bytes, &mut actual));
     if refused_80 {
         actual = expected.clone();
     }
@@ -564,6 +565,59 @@ fn controls_difference(
         }
     }
     errors
+}
+
+/// #80 (docs/DIFFERENCES-FROM-GO.md, "Developer messages in Responses-shaped Chat
+/// Completions requests"): the Responses -> Chat converter keeps a `developer` message's
+/// role, which Go v8.0.35, which recorded these fixtures, rewrites to `user`.
+///
+/// For a request fixture on that pair this checks that the output has one `developer`
+/// message for each developer message in the input, then writes Go's `user` back in
+/// place, so every other byte, including each message's position and content, is still
+/// compared with Go's. Returns the mismatches.
+fn developer_role_difference(
+    client: Format,
+    upstream: Format,
+    f: &Value,
+    bytes: bool,
+    actual: &mut [Vec<u8>],
+) -> Vec<String> {
+    if (client, upstream) != (Format::OpenAIResponse, Format::OpenAI) || f["path"] != "request" {
+        return vec![];
+    }
+    let Some(out) = actual.first_mut() else {
+        return vec!["no output".to_owned()];
+    };
+    if out.starts_with(b"REFUSED:") {
+        return vec![];
+    }
+    let input = field(&f["input"], bytes);
+    let want = gj::get(&input, "input")
+        .array()
+        .iter()
+        .filter(|item| {
+            item.get("role").bytes().as_ref() == b"developer"
+                && matches!(item.get("type").bytes().as_ref(), b"" | b"message")
+        })
+        .count();
+    let developer: Vec<usize> = gj::get(out, "messages")
+        .array()
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.get("role").bytes().as_ref() == b"developer")
+        .map(|(i, _)| i)
+        .collect();
+    for i in &developer {
+        gj::set_str(out, &format!("messages.{i}.role"), "user");
+    }
+    if developer.len() == want {
+        vec![]
+    } else {
+        vec![format!(
+            "#80: {} developer messages sent, {want} in the input",
+            developer.len()
+        )]
+    }
 }
 
 /// Pair fixtures (recorded at 6fecc6e) whose behaviour a later Go commit changed, each

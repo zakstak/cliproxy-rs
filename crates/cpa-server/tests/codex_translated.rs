@@ -435,6 +435,51 @@ async fn chat_round_trips_keep_meaning() {
     }
 }
 
+/// #80: a Responses-shaped Chat Completions body keeps its developer messages as
+/// developer items, in place, on the translated route. The pinned client sends developer
+/// messages itself (CONTRACT.md "Retained conversions"); Go v8.0.35 sends them as user
+/// text (docs/DIFFERENCES-FROM-GO.md).
+#[tokio::test]
+async fn responses_shaped_chat_keeps_developer_messages() {
+    for stream in [true, false] {
+        let proxy = proxy(vec![completed()], "").await;
+        let request = json!({"model": "gpt-5.5", "stream": stream, "input": [
+            {"type": "message", "role": "developer", "content": "leading instruction"},
+            {"type": "message", "role": "user", "content": "question"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prior answer"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "later instruction"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ]});
+        let (status, answer) = post(&proxy.url, "/v1/chat/completions", &request).await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        assert!(answer.contains("Done."), "stream={stream}: {answer}");
+        let body = sent(&proxy);
+        assert_nothing_added(&body, &[]);
+        let messages: Vec<(&str, &str, &str)> = items(&body, "message")
+            .into_iter()
+            .map(|m| {
+                let part = &m["content"][0];
+                (
+                    m["role"].as_str().unwrap(),
+                    part["type"].as_str().unwrap(),
+                    part["text"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                ("developer", "input_text", "leading instruction"),
+                ("user", "input_text", "question"),
+                ("assistant", "output_text", "prior answer"),
+                ("developer", "input_text", "later instruction"),
+                ("user", "input_text", "continue"),
+            ],
+            "stream={stream}: {body}"
+        );
+    }
+}
+
 /// Payload rules and the Codex-client rewrites cannot reach a translated body.
 #[tokio::test]
 async fn operator_rules_cannot_rewrite_translated_bodies() {
