@@ -241,53 +241,77 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
     }
     /// The tool choice with custom apply_patch choices made functions, nested `tools`
     /// included. Nested choices wait on a heap stack; one more than
-    /// [`gj::WALK_DEPTH_LIMIT`] levels below the root stays as it is.
+    /// [`gj::WALK_DEPTH_LIMIT`] levels below the root stays as it is. A choice is rebuilt
+    /// once from its bytes and its changed children, in one pass: setting each child by
+    /// path would rewrite the parent once per child, quadratic in a long `tools` list.
     fn normalize_choice(
         choice: &Res<'_>,
         winners: &HashMap<Vec<u8>, usize>,
         descriptors: &[responses_tools::Descriptor<'_>],
     ) -> Vec<u8> {
-        /// A choice being normalized: its bytes so far, its remaining nested choices, and
-        /// its index in its parent's `tools`.
+        /// A choice being normalized, its remaining nested choices, and the children
+        /// that changed: where they sit in its bytes, or their index in `tools` when
+        /// they do not borrow from them.
         struct Open<'a> {
-            out: Vec<u8>,
+            choice: Res<'a>,
             children: std::iter::Enumerate<std::vec::IntoIter<Res<'a>>>,
-            index: usize,
+            spliced: Vec<(usize, usize, Vec<u8>)>,
+            by_path: Vec<(usize, Vec<u8>)>,
         }
-        let open = |choice: &Res<'_>, index: usize| {
-            let mut out = choice.raw.to_vec();
-            let qualified = qualify_namespace_name(&choice.get("namespace").bytes(), &choice.get("name").bytes());
+        fn open(choice: Res<'_>) -> Open<'_> {
+            let children = choice.get("tools").array().into_iter().enumerate();
+            Open {
+                choice,
+                children,
+                spliced: vec![],
+                by_path: vec![],
+            }
+        }
+        let finish = |done: Open<'_>| -> Vec<u8> {
+            let raw = &done.choice.raw[..];
+            let mut out = Vec::with_capacity(raw.len());
+            let mut at = 0;
+            for (start, end, edited) in &done.spliced {
+                out.extend_from_slice(&raw[at..*start]);
+                out.extend_from_slice(edited);
+                at = *end;
+            }
+            out.extend_from_slice(&raw[at..]);
+            for (i, edited) in done.by_path {
+                gj::set_raw(&mut out, &format!("tools.{i}"), edited);
+            }
+            let qualified =
+                qualify_namespace_name(&done.choice.get("namespace").bytes(), &done.choice.get("name").bytes());
             if let Some(&winner) = winners.get(&qualified)
                 && apply_patch::is_custom_tool(&descriptors[winner].tool)
-                && &*choice.get("type").bytes() == b"custom"
+                && &*done.choice.get("type").bytes() == b"custom"
             {
                 gj::set_str(&mut out, "type", "function");
             }
-            (out, index)
+            out
         };
-        let (out, index) = open(choice, 0);
-        let mut stack = vec![Open {
-            out,
-            children: choice.get("tools").array().into_iter().enumerate(),
-            index,
-        }];
+        let mut stack = vec![(open(choice.clone()), 0)];
         loop {
             let depth = stack.len();
-            let top = stack.last_mut().expect("an open choice");
+            let (top, _) = stack.last_mut().expect("an open choice");
             match top.children.next() {
-                Some((i, child)) if depth <= gj::WALK_DEPTH_LIMIT => {
-                    let (out, index) = open(&child, i);
-                    let children = child.get("tools").array().into_iter().enumerate();
-                    stack.push(Open { out, children, index });
-                }
-                // Too deep: the child keeps its bytes, which setting it would rewrite as they are.
+                Some((i, child)) if depth <= gj::WALK_DEPTH_LIMIT => stack.push((open(child), i)),
+                // Too deep: the child keeps its bytes.
                 Some(_) => {}
                 None => {
-                    let done = stack.pop().expect("an open choice");
-                    let Some(parent) = stack.last_mut() else {
-                        return done.out;
+                    let (done, index) = stack.pop().expect("an open choice");
+                    let child_raw = done.choice.raw.clone();
+                    let out = finish(done);
+                    let Some((parent, _)) = stack.last_mut() else {
+                        return out;
                     };
-                    gj::set_raw(&mut parent.out, &format!("tools.{}", done.index), done.out);
+                    if out[..] == child_raw[..] {
+                        continue;
+                    }
+                    match offset_in(&parent.choice.raw, &child_raw) {
+                        Some(start) => parent.spliced.push((start, start + child_raw.len(), out)),
+                        None => parent.by_path.push((index, out)),
+                    }
                 }
             }
         }

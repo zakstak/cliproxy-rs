@@ -1579,8 +1579,13 @@ fn parse_array<'a>(c: &mut Ctx<'a>, mut i: usize, path: &[u8]) -> (usize, bool) 
 }
 
 /// gjson.Get.
+/// gjson.Get. A path of more than [`WALK_DEPTH_LIMIT`] components is not found
+/// ([`path_too_deep`]).
 pub fn get<'a>(json: &'a [u8], path: &(impl JsonPath + ?Sized)) -> Res<'a> {
     let path = path.as_path();
+    if path_too_deep(path) {
+        return Res::default();
+    }
     if path.len() > 1 && path[0] == b'@' && is_dot_piper(path) {
         let end = path[1..]
             .iter()
@@ -2611,6 +2616,11 @@ fn set_impl(jstr: &[u8], path: &[u8], raw: &[u8], stringify: bool, del: bool) ->
     if path.is_empty() {
         return Err(SetError::Invalid("path cannot be empty".into()));
     }
+    if path_too_deep(path) {
+        return Err(SetError::Invalid(format!(
+            "path has more than {WALK_DEPTH_LIMIT} components"
+        )));
+    }
     let Some(paths) = split_path(path) else {
         if del {
             return Err(SetError::Invalid("cannot delete value from a complex path".into()));
@@ -2811,6 +2821,29 @@ pub fn set_items<S: AsRef<[u8]>>(out: &mut Vec<u8>, path: &(impl JsonPath + ?Siz
 /// native stack, and stop at this depth, so a walk costs at most this many passes over
 /// its input: linear in the body size. serde_json's default recursion limit is the same.
 pub const WALK_DEPTH_LIMIT: usize = 128;
+
+/// Whether `path` has more than [`WALK_DEPTH_LIMIT`] components (separated by `.` or `|`
+/// not escaped with `\\`). gjson and sjson descend one level per component, recursively
+/// in this port as in Go, so such a path is refused instead of risking the native stack
+/// (issue #146, docs/DIFFERENCES-FROM-GO.md "Bounded JSON walks"): [`get`] finds nothing
+/// and edits return an error. No translator builds such a path; a configured payload rule
+/// can.
+fn path_too_deep(path: &[u8]) -> bool {
+    if path.len() <= WALK_DEPTH_LIMIT {
+        return false;
+    }
+    let mut separators = 0;
+    let mut i = 0;
+    while i < path.len() {
+        match path[i] {
+            b'\\' => i += 1,
+            b'.' | b'|' => separators += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    separators >= WALK_DEPTH_LIMIT
+}
 
 /// What gjson's `Result.Value()` returns, as Go code then edits and marshals it: objects
 /// keep the first duplicate key, strings keep gjson's unescaped bytes (invalid UTF-8

@@ -242,3 +242,38 @@ fn std_valid_applies_encoding_json_nesting_limit() {
     assert!(cpa_common::json::std_valid(br#"{"a":"[[[\"]]]"}"#));
     assert!(!cpa_common::json::std_valid(b"{"));
 }
+
+/// Issue #146: gjson and sjson descend once per path component. A path of more than
+/// `WALK_DEPTH_LIMIT` components is not found and cannot be edited, instead of
+/// overflowing a 2 MiB worker stack; one at the limit still works.
+#[test]
+fn paths_beyond_the_walk_limit_are_refused_on_a_worker_stack() {
+    let on_worker = |f: Box<dyn FnOnce() + Send>| {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    let doc = |depth: usize| format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+    let path = |depth: usize| vec!["a"; depth].join(".");
+    on_worker(Box::new(move || {
+        let limit = gj::WALK_DEPTH_LIMIT;
+        let at = doc(limit);
+        assert_eq!(gj::get(at.as_bytes(), &path(limit)).raw(), b"1");
+        assert_eq!(gj::try_delete(at.as_bytes(), &path(limit)).unwrap().len(), at.len() - 5);
+        assert!(gj::try_set_raw(b"{}", &path(limit), "2").is_ok());
+        // An escaped dot is part of a key, not a separator.
+        assert!(!gj::get(br#"{"k":1}"#, &format!("{}k", r"\.".repeat(limit + 1))).exists());
+        let deep = doc(2_000);
+        let long = path(2_000);
+        assert!(!gj::get(deep.as_bytes(), &long).exists());
+        let message = format!("path has more than {limit} components");
+        assert_eq!(gj::try_delete(deep.as_bytes(), &long), Err(message.clone()));
+        assert_eq!(gj::try_set_raw(deep.as_bytes(), &long, "2"), Err(message));
+        let mut out = deep.clone().into_bytes();
+        assert!(!gj::set_raw(&mut out, &long, "2"));
+        assert_eq!(out, deep.as_bytes(), "a refused edit keeps the document");
+    }));
+}

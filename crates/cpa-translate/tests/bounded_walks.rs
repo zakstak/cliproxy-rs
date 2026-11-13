@@ -205,9 +205,11 @@ fn pairs() -> Vec<(Format, Format)> {
         .collect()
 }
 
-/// Translates everything at `depth` through every pair; returns how many transforms ran.
-fn translate_all(depth: usize, code_events: usize) -> usize {
-    let mut ran = 0;
+/// Translates everything at `depth` through every pair. Returns each transform's
+/// outcome: whether it succeeded, and for streams how many events failed and how many
+/// frames came out. Successful request outputs must be JSON.
+fn translate_all(depth: usize, code_events: usize) -> Vec<(String, bool, usize, bool)> {
+    let mut outcomes = vec![];
     let requests = requests(depth);
     let responses = responses(depth);
     for (client, upstream) in pairs() {
@@ -219,24 +221,30 @@ fn translate_all(depth: usize, code_events: usize) -> usize {
                 stream,
                 tool_search: false,
             };
-            if let Ok(out) = cpa_translate::translate_request(client, upstream, &ctx, body.as_bytes()) {
+            let out = cpa_translate::translate_request(client, upstream, &ctx, body.as_bytes());
+            if let Ok(out) = &out {
                 assert!(
-                    gj::valid(&out),
+                    gj::valid(out),
                     "{client:?} -> {upstream:?} request output is not JSON at depth {depth}"
                 );
             }
-            ran += 1;
+            outcomes.push((
+                format!("{client:?}->{upstream:?} request stream={stream}"),
+                out.is_ok(),
+                0,
+                true,
+            ));
         }
-        if let Some(Ok(out)) = cpa_translate::codex_request(
-            client,
-            &RequestCtx {
-                model: "m",
-                stream: true,
-                tool_search: false,
-            },
-            body.as_bytes(),
-        ) {
-            assert!(gj::valid(&out), "{client:?} codex request output is not JSON");
+        let codex_ctx = RequestCtx {
+            model: "m",
+            stream: true,
+            tool_search: false,
+        };
+        if let Some(out) = cpa_translate::codex_request(client, &codex_ctx, body.as_bytes()) {
+            if let Ok(out) = &out {
+                assert!(gj::valid(out), "{client:?} codex request output is not JSON");
+            }
+            outcomes.push((format!("{client:?} codex request"), out.is_ok(), 0, true));
         }
         let rctx = ResponseCtx {
             model: "m",
@@ -245,17 +253,21 @@ fn translate_all(depth: usize, code_events: usize) -> usize {
             tool_search: false,
         };
         let response = &responses.iter().find(|(f, _)| *f == upstream).unwrap().1;
-        let _ = (p.non_stream)(&rctx, response.as_bytes());
-        ran += 1;
+        let out = (p.non_stream)(&rctx, response.as_bytes());
+        outcomes.push((format!("{client:?}->{upstream:?} non-stream"), out.is_ok(), 0, true));
         let mut stream = (p.stream)(&rctx);
+        let (mut failed, mut frames) = (0, 0);
         for event in stream_events(upstream, depth, code_events) {
-            let _ = stream.event(&event);
+            match stream.event(&event) {
+                Ok(out) => frames += out.len(),
+                Err(_) => failed += 1,
+            }
         }
-        let _ = stream.finalize_tool_input();
-        let _ = stream.finish();
-        ran += 1;
+        frames += stream.finalize_tool_input().len();
+        let finished = stream.finish().map(|out| frames += out.len()).is_ok();
+        outcomes.push((format!("{client:?}->{upstream:?} stream"), finished, failed, frames > 0));
     }
-    ran
+    outcomes
 }
 
 #[test]
@@ -263,8 +275,19 @@ fn deep_and_embedded_json_translates_on_a_fixed_small_stack() {
     on_small_stack(|| {
         let shallow = translate_all(4, 2);
         let deep = translate_all(20_000, 2);
+        // Depth changes no transform's outcome: the same ones succeed, no stream event
+        // fails, and every stream writes frames.
         assert_eq!(shallow, deep);
-        assert!(deep >= 20, "pairs lost: {deep}");
+        assert!(deep.len() >= 20, "pairs lost: {}", deep.len());
+        for (name, ok, failed, framed) in &deep {
+            assert_eq!(*failed, 0, "{name}");
+            assert!(*framed, "{name}");
+            // The strict Codex route refuses parts of this synthetic Chat body at any
+            // depth; the comparison above covers it.
+            if !name.ends_with("codex request") && (name.contains("request") || name.contains("stream")) {
+                assert!(*ok, "{name}");
+            }
+        }
     });
 }
 

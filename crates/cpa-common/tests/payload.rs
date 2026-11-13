@@ -266,3 +266,38 @@ fn filter_of_escaped_quote_key_keeps_valid_json() {
         );
     }
 }
+
+/// Issue #146: a configured filter with more path components than
+/// `cpa_common::json::WALK_DEPTH_LIMIT` leaves the body as it is on a 2 MiB worker stack;
+/// sjson's recursion per component overflowed it.
+#[test]
+fn filter_with_a_very_long_path_keeps_the_body_on_a_worker_stack() {
+    let depth = 2_000;
+    let yaml = format!(
+        "payload:\n  filter:\n    - models: [{{name: \"*\", protocol: claude}}]\n      params: ['{}']\n",
+        vec!["a"; depth].join(".")
+    );
+    let body = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+    let out = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let cfg = Config::parse(&yaml).unwrap();
+            let rules = payload::Rules::of(&cfg);
+            let req = payload::Request {
+                target_executor: "claude",
+                model: "claude-test",
+                requested_model: "claude-test",
+                protocol: "claude",
+                from_protocol: "claude",
+                root: "",
+                original: b"",
+                request_path: "/v1/messages",
+                headers: None,
+            };
+            (payload::apply(&rules, &req, body.clone().into_bytes()), body)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(out.0, out.1.as_bytes());
+}
