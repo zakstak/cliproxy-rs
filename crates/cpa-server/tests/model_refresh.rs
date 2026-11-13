@@ -635,3 +635,127 @@ async fn a_bounded_cooldown_relists_its_models_once_the_bound_ends() {
         "the stated reset is still ahead: {states:?}"
     );
 }
+
+// Source replacement must also fence reads before an updater session has started.
+async fn source_replacement(started: bool) {
+    let _serial = SERIAL.lock().await;
+    let (mock, base) = mock().await;
+    let url = format!("{base}/models.json");
+    let env = start_env("review-fallback", [&url, ""], false, &["old.json"]).await;
+    if started {
+        cpa_server::model_updater::start(&env.rt, false);
+        until("startup read", || mock.hits().0 == 1).await;
+        until("startup complete", || !static_ids("claude").is_empty()).await;
+    }
+    let hits = mock.hits().0;
+    mock.hold_general.store(true, Ordering::SeqCst);
+    mock.set_general(200, with_models(&[("claude", "claude-review-stale")]));
+    let mut old = Box::pin(cpa_server::model_updater::refresh_now(&env.rt));
+    assert!(poll!(old.as_mut()).is_pending());
+    until("held old read", || mock.hits().0 == hits + 1).await;
+    let path = env.dir.join("replacement.json");
+    std::fs::write(&path, with_models(&[("claude", "claude-review-current")])).unwrap();
+    assert!(env.rt.publish_config(env.config([path.to_str().unwrap(), ""])));
+    if started {
+        until("replacement published", || {
+            pinned().lookup("claude-review-current").is_some()
+        })
+        .await;
+    }
+    mock.release();
+    let report = old.await;
+    let (status, listing, _) = send(&env, wreq::Method::GET, "/v1/models", Some(CLIENT_KEY)).await;
+    assert_eq!(status, 200);
+    let stale_listed = listing["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "claude-review-stale");
+    assert!(!stale_listed, "old fallback source published after config replacement");
+    assert_eq!(
+        report.catalog.outcome,
+        Outcome::Failed("model catalog source changed during refresh")
+    );
+    cpa_core::registry::refresh_catalog(EMBEDDED).unwrap();
+}
+#[tokio::test]
+async fn unstarted_config_replacement() {
+    source_replacement(false).await;
+}
+#[tokio::test]
+async fn started_config_replacement() {
+    source_replacement(true).await;
+}
+
+#[tokio::test]
+async fn client_listing_after_credential_replacement() {
+    let _serial = SERIAL.lock().await;
+    let (mock, base) = mock().await;
+    let url = format!("{base}/models.json");
+    let env = start_env("review-client-listing", [&url, ""], false, &["old.json"]).await;
+    cpa_server::model_updater::start(&env.rt, false);
+    until("startup", || mock.hits().0 == 1).await;
+    let old = credential(&env.dir, "old.json");
+    let new = credential(&env.dir, "new.json");
+    // Only the removed credential can register the refreshed Claude model.
+    let mut new = new;
+    new.provider = "xai".into();
+    new.metadata.insert("type".into(), json!("xai"));
+    mock.hold_general.store(true, Ordering::SeqCst);
+    mock.set_general(200, with_models(&[("claude", "claude-review-credential")]));
+    let mut pending = Box::pin(cpa_server::model_updater::refresh_now(&env.rt));
+    assert!(poll!(pending.as_mut()).is_pending());
+    until("held read", || mock.hits().0 == 2).await;
+    let some = static_ids("claude")[0].clone();
+    assert!(env.rt.registry().client_model(&old.id, &some).is_some());
+    env.rt.store().reconcile(vec![new.clone()]);
+    mock.release();
+    let report = pending.await;
+    assert!(matches!(report.catalog.outcome, Outcome::Refreshed { .. }));
+    assert!(pinned().lookup("claude-review-credential").is_some());
+    let new_model = static_ids("xai")[0].clone();
+    assert!(env.rt.registry().client_model(&new.id, &new_model).is_some());
+    assert!(env.rt.registry().client_model(&old.id, &some).is_none());
+    let (status, listing, _) = send(&env, wreq::Method::GET, "/v1/models", Some(CLIENT_KEY)).await;
+    assert_eq!(status, 200);
+    let ids: Vec<&str> = listing["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&new_model.as_str()));
+    assert!(
+        !ids.contains(&"claude-review-credential"),
+        "removed credential resurrected on client listing"
+    );
+    env.rt.store().reconcile(vec![]);
+    let (status, listing, _) = send(&env, wreq::Method::GET, "/v1/models", Some(CLIENT_KEY)).await;
+    assert_eq!(status, 200);
+    assert!(listing["data"].as_array().unwrap().is_empty());
+    cpa_core::registry::refresh_catalog(EMBEDDED).unwrap();
+}
+
+/// A new fallback request must not join a read invalidated by an intervening commit,
+/// even when the configured URL stays the same.
+#[tokio::test]
+async fn fallback_after_commit_starts_a_new_read() {
+    let _serial = SERIAL.lock().await;
+    let (mock, base) = mock().await;
+    let url = format!("{base}/models.json");
+    let env = start_env("fallback-revision", [&url, ""], false, &["old.json"]).await;
+    mock.hold_general.store(true, Ordering::SeqCst);
+    let mut old = Box::pin(cpa_server::model_updater::refresh_now(&env.rt));
+    assert!(poll!(old.as_mut()).is_pending());
+    until("first held read", || mock.hits().0 == 1).await;
+    assert!(env.rt.publish_config(env.config([&url, ""])));
+    let mut new = Box::pin(cpa_server::model_updater::refresh_now(&env.rt));
+    assert!(poll!(new.as_mut()).is_pending());
+    until("new revision read", || mock.hits().0 == 2).await;
+    mock.release();
+    assert_eq!(
+        old.await.catalog.outcome,
+        Outcome::Failed("model catalog source changed during refresh")
+    );
+    assert!(matches!(new.await.catalog.outcome, Outcome::Refreshed { .. }));
+}

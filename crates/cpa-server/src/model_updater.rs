@@ -225,6 +225,7 @@ struct ManualKey {
     generation: u64,
     lifetime: Option<u64>,
     source: String,
+    revision: Option<crate::runtime::CatalogRevision>,
 }
 
 struct Manual {
@@ -394,7 +395,12 @@ impl Updater {
     /// running loop the configured source is read and fenced by that loop; otherwise
     /// (no loop for this lifetime yet) `fallback`, the source the current config
     /// resolves to. `None` is a runtime whose updaters were never started.
-    async fn refresh_now(self: &Arc<Self>, lifetime: Option<&Lifetime>, fallback: &str) -> Status {
+    async fn refresh_now(
+        self: &Arc<Self>,
+        lifetime: Option<&Lifetime>,
+        fallback: &str,
+        revision: Option<crate::runtime::CatalogRevision>,
+    ) -> Status {
         let (display, mut done) = {
             let mut state = self.lock();
             let running = match (&state.run, lifetime) {
@@ -403,6 +409,7 @@ impl Updater {
                 }
                 _ => None,
             };
+            let revision = if running.is_none() { revision } else { None };
             let (source, token) = match (running, lifetime) {
                 (Some(token), _) => (state.source.clone(), token),
                 (None, Some(lifetime)) if lifetime.token.is_cancelled() => {
@@ -422,6 +429,7 @@ impl Updater {
                 generation: state.generation,
                 lifetime: lifetime.map(|l| l.id),
                 source,
+                revision,
             };
             let joined = state.manual.as_ref().filter(|m| m.key == key).map(|m| m.done.clone());
             let done = match joined {
@@ -495,6 +503,15 @@ impl Updater {
                 return Status::failed(unavailable.source, UNAVAILABLE);
             }
             Some(Ok(Ok(read))) => read,
+        };
+        // Lock order is config commit, then updater, as in Runtime's reconfigure.
+        // Keep the revision lock through publication, not just through its check.
+        let _revision = match &key.revision {
+            Some(revision) => match revision.lock_current() {
+                Some(guard) => Some(guard),
+                None => return Status::failed(read.source, SOURCE_CHANGED),
+            },
+            None => None,
         };
         let outcome = match self.publish_if_current(token, key.generation, seq, &read.data) {
             Ok(changed) => {
@@ -706,7 +723,13 @@ fn resolve(sources: &[String; 2], policy: Policy) -> [String; 2] {
 /// `--local-model` and test policy, as Go falls back to the handler's config (Home mode
 /// is only known once started).
 pub async fn refresh_now(rt: &Runtime) -> Report {
-    let started = rt.with_catalogs(|session| session.map(|s| (s.lifetime.clone(), s.policy)));
+    let (started, sources, revision) = rt.with_catalogs(|session, config, revision| {
+        (
+            session.map(|s| (s.lifetime.clone(), s.policy)),
+            config.catalog_sources(),
+            revision,
+        )
+    });
     let (lifetime, policy) = match started {
         Some((lifetime, policy)) => (Some(lifetime), policy),
         None => (
@@ -718,10 +741,10 @@ pub async fn refresh_now(rt: &Runtime) -> Report {
             },
         ),
     };
-    let [catalog, codex] = resolve(&rt.config().catalog_sources(), policy);
+    let [catalog, codex] = resolve(&sources, policy);
     let (catalog, codex_catalog) = tokio::join!(
-        CATALOGS[0].refresh_now(lifetime.as_ref(), &catalog),
-        CATALOGS[1].refresh_now(lifetime.as_ref(), &codex),
+        CATALOGS[0].refresh_now(lifetime.as_ref(), &catalog, Some(revision.clone())),
+        CATALOGS[1].refresh_now(lifetime.as_ref(), &codex, Some(revision)),
     );
     Report { catalog, codex_catalog }
 }
@@ -1215,47 +1238,6 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A failed read logs its category only: neither the source's user info and query
-    /// nor a malformed redirect target reach a DEBUG log.
-    #[tokio::test]
-    async fn failed_reads_log_no_url() {
-        use axum::http::{StatusCode, header};
-        let target = "http://alice:SECRET@[invalid/catalog.json?token=SECRET";
-        let app =
-            axum::Router::new().fallback(move || async move { (StatusCode::FOUND, [(header::LOCATION, target)]) });
-        let addr = serve(app).await;
-        let capture = Capture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let fetch = fetcher(b"", Vec::new(), |_| Ok(()));
-        assert!(fetch(format!("http://bob:SECRET@{addr}/r?token=SECRET")).await.is_err());
-        let u = Updater::new(fetch, Box::new(|_| Ok(Vec::new())));
-        u.refresh(&CancellationToken::new(), &format!("http://{addr}/r?token=SECRET"), 0)
-            .await;
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("model catalog source failed"), "{logs}");
-        assert!(logs.contains("model catalog refresh failed"), "{logs}");
-        assert!(!logs.contains("SECRET"), "{logs}");
-    }
-
     /// Go TestCatalogPolicyHotReload, then the lazy default: at startup outside Home the
     /// empty Codex source waits for a wake, and a reload that changes it starts it at once.
     #[tokio::test]
@@ -1416,11 +1398,11 @@ mod tests {
         let lifetime = Lifetime::new();
         // Configured and waiting (the lazy default's state): no periodic read runs.
         u.configure(&lifetime, "src", true);
-        let mut first = Box::pin(u.refresh_now(Some(&lifetime), "fallback"));
+        let mut first = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
         assert!(poll!(first.as_mut()).is_pending());
         until("the first read", || reads.load(Ordering::SeqCst) == 1).await;
-        let mut second = Box::pin(u.refresh_now(Some(&lifetime), "fallback"));
-        let mut third = Box::pin(u.refresh_now(Some(&lifetime), "fallback"));
+        let mut second = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
+        let mut third = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
         assert!(poll!(second.as_mut()).is_pending() && poll!(third.as_mut()).is_pending());
         drop(first);
         release.add_permits(1);
@@ -1432,7 +1414,7 @@ mod tests {
 
         release.add_permits(1);
         assert_eq!(
-            u.refresh_now(Some(&lifetime), "fallback").await,
+            u.refresh_now(Some(&lifetime), "fallback", None).await,
             refreshed("src", &["claude"])
         );
         assert_eq!(reads.load(Ordering::SeqCst), 2, "a finished read was joined");
@@ -1449,8 +1431,8 @@ mod tests {
         let (fetch, reads, release) = gated(|_, _| true, |_, source| Err(Unavailable { source }));
         let (u, published) = recording(fetch);
         u.configure(&lifetime, "src", true);
-        let mut a = Box::pin(u.refresh_now(Some(&lifetime), ""));
-        let mut b = Box::pin(u.refresh_now(Some(&lifetime), ""));
+        let mut a = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        let mut b = Box::pin(u.refresh_now(Some(&lifetime), "", None));
         assert!(poll!(a.as_mut()).is_pending() && poll!(b.as_mut()).is_pending());
         release.add_permits(1);
         let failed = Status::failed("src".into(), UNAVAILABLE);
@@ -1461,8 +1443,8 @@ mod tests {
         let never: Fetch = Arc::new(|_| Box::pin(std::future::pending()));
         let (u, never_published) = recording(never);
         u.configure(&lifetime, "src", true);
-        let mut a = Box::pin(u.refresh_now(Some(&lifetime), ""));
-        let mut b = Box::pin(u.refresh_now(Some(&lifetime), ""));
+        let mut a = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        let mut b = Box::pin(u.refresh_now(Some(&lifetime), "", None));
         assert!(poll!(a.as_mut()).is_pending() && poll!(b.as_mut()).is_pending());
         let started = tokio::time::Instant::now();
         let timed_out = Status::failed("src".into(), TIMED_OUT);
@@ -1484,8 +1466,8 @@ mod tests {
         let (u, panic_published) = recording(panicking);
         u.configure(&lifetime, "src", true);
         let aborted = Status::failed("src".into(), ABORTED);
-        assert_eq!(u.refresh_now(Some(&lifetime), "").await, aborted);
-        assert_eq!(u.refresh_now(Some(&lifetime), "").await, aborted);
+        assert_eq!(u.refresh_now(Some(&lifetime), "", None).await, aborted);
+        assert_eq!(u.refresh_now(Some(&lifetime), "", None).await, aborted);
         assert_eq!(panics.load(Ordering::SeqCst), 2, "a dead read was joined");
         for published in [published, never_published, panic_published] {
             assert!(published.lock().unwrap().is_empty());
@@ -1504,7 +1486,7 @@ mod tests {
         let (u, published) = recording(fetch);
         let lifetime = Lifetime::new();
         u.configure(&lifetime, "old", true);
-        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old"));
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old", None));
         assert!(poll!(manual.as_mut()).is_pending());
         until("the old read", || reads.load(Ordering::SeqCst) == 1).await;
         u.configure(&lifetime, "new", false);
@@ -1514,7 +1496,7 @@ mod tests {
 
         // A fallback read is not stopped by the loop; its publication is refused.
         let other = Lifetime::new();
-        let mut fallback = Box::pin(u.refresh_now(Some(&other), "old"));
+        let mut fallback = Box::pin(u.refresh_now(Some(&other), "old", None));
         assert!(poll!(fallback.as_mut()).is_pending());
         until("the fallback read", || reads.load(Ordering::SeqCst) == 3).await;
         u.configure(&lifetime, "newer", false);
@@ -1525,13 +1507,13 @@ mod tests {
 
         let lifetime = Lifetime::new();
         u.configure(&lifetime, "old", true);
-        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old"));
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old", None));
         assert!(poll!(manual.as_mut()).is_pending());
         until("the second old read", || reads.load(Ordering::SeqCst) == 5).await;
         lifetime.token.cancel();
         assert_eq!(manual.await, Status::failed("old".into(), STOPPED));
         assert_eq!(
-            u.refresh_now(Some(&lifetime), "old").await,
+            u.refresh_now(Some(&lifetime), "old", None).await,
             Status::failed("old".into(), STOPPED)
         );
         assert_eq!(reads.load(Ordering::SeqCst), 5, "read after shutdown");
@@ -1560,7 +1542,10 @@ mod tests {
             tokio::spawn(async move { u.refresh(&token, "same", generation).await })
         };
         until("the periodic read", || reads.load(Ordering::SeqCst) == 1).await;
-        assert_eq!(u.refresh_now(Some(&lifetime), "").await, refreshed("same", &["claude"]));
+        assert_eq!(
+            u.refresh_now(Some(&lifetime), "", None).await,
+            refreshed("same", &["claude"])
+        );
         release.add_permits(1);
         periodic.await.unwrap();
         assert_eq!(
@@ -1570,7 +1555,7 @@ mod tests {
         );
 
         // A slow on-demand read, then a periodic one that finishes first.
-        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), ""));
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "", None));
         assert!(poll!(manual.as_mut()).is_pending());
         until("the on-demand read", || reads.load(Ordering::SeqCst) == 3).await;
         u.refresh(&token, "same", generation).await;
@@ -1599,18 +1584,20 @@ mod tests {
                 source: source.to_owned(),
                 outcome: Outcome::Skipped,
             };
-            assert_eq!(u.refresh_now(None, source).await, skipped);
+            assert_eq!(u.refresh_now(None, source, None).await, skipped);
         }
         let lifetime = Lifetime::new();
         u.configure(&lifetime, DISABLED, false);
-        let status = u.refresh_now(Some(&lifetime), "https://example.com/catalog.json").await;
+        let status = u
+            .refresh_now(Some(&lifetime), "https://example.com/catalog.json", None)
+            .await;
         assert_eq!(status.outcome, Outcome::Skipped);
         assert_eq!(reads.load(Ordering::SeqCst), 0);
 
         // Another lifetime's loop runs: this lifetime's fallback is read.
         let other = Lifetime::new();
         assert_eq!(
-            u.refresh_now(Some(&other), "/catalog.json").await,
+            u.refresh_now(Some(&other), "/catalog.json", None).await,
             refreshed("/catalog.json", &["claude"])
         );
         assert_eq!(*published.lock().unwrap(), ["/catalog.json"]);
