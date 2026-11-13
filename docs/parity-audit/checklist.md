@@ -22,13 +22,17 @@ Every checkbox is one independently tracked inventory/contract item. Milestone c
 
 This supplementary audit records confirmed gaps without changing the inventory totals below.
 
-**Missing audit: `credential-disabled-persist`.** After an abandoned Claude stream, Rust and
-historical Go v8.0.10 persist `disabled: false`, while frozen Go v8.0.35 leaves the field absent.
-Executed attribution identifies `091ff27f`, which is already an ancestor of v8.0.35.
-H1 [#67](https://github.com/zakstak/cliproxy-rs/issues/67) owns the comparison and missing audit
-item; parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) owns the unresolved
-decision. Status remains unresolved. This record approves neither a production fix nor a
-deliberate-difference policy. The exact selective comparison predicate stays unchanged.
+**Disabled persistence after an abandoned stream: fix authored, Go acceptance pending.** After an
+abandoned Claude stream, historical Go v8.0.10 persists `disabled: false`, while frozen Go v8.0.35
+leaves the field absent: `MarkResult` saves with the request context, and
+`beginForegroundStoreSave` refuses a cancelled one before `Store.Save`. Executed attribution
+identifies `091ff27f`, which is already an ancestor of v8.0.35. Previously cliproxy-rs persisted
+`false`. H1 [#67](https://github.com/zakstak/cliproxy-rs/issues/67) has authored the production
+fix: a cancelled lease no longer saves the credential file, while successful, failed and neutral
+results still do. The harness now pins `credential-disabled-persist-v8.0.10` (historical later
+reference, Go `false`, Rust absent) and `credential-disabled-absent` (selective, absent on both
+sides). Status remains unresolved until real Go acceptance against the fixed head executes;
+parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) owns that decision.
 See the [selective ledger](selective-v8.0.67.md) and its
 [executed attribution evidence](../../harness/evidence/attribution-20261112.json.gz).
 

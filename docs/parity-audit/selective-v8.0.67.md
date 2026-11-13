@@ -50,21 +50,21 @@ Credential ownership and the native-byte golden are checked on every case regard
 | `P1-response-compression-vary` | deferred | [#106](https://github.com/zakstak/cliproxy-rs/issues/106) | `response_compression.go` | `Vary: Accept-Encoding` on every response |
 | `claude-cloak-tool-alias`, `-restore` | not adopted | tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) (decision above) | Executed: Go `e48d780f` against its parent; v8.0.35 matches cliproxy-rs | Alias secret is `CallerScope(api key)`, so the alias spelling differs and the v8.0.10 alias is no longer restored |
 | `error-retry-after` | pending | R1 [#94](https://github.com/zakstak/cliproxy-rs/issues/94), production adoption and integration | Executed: Go `9a35fa12` against its parent; v8.0.35 sends none | Adds a whole-second `Retry-After` from a local retry deadline to failed attempts |
-| `credential-disabled-persist` | missing audit | H1 [#67](https://github.com/zakstak/cliproxy-rs/issues/67), parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Executed bisect: Go `091ff27f`, which is already in v8.0.35 | Leaves `disabled` absent after an abandoned stream where cliproxy-rs and v8.0.10 persist `false`. **Unresolved frozen-reference discrepancy:** v8.0.35 does the same. The [missing audit item](checklist.md#unresolved-frozen-reference-discrepancies) records the gap; no production fix or deliberate-difference policy is approved |
+| `credential-disabled-absent` | required absence | H1 [#67](https://github.com/zakstak/cliproxy-rs/issues/67), parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) | Executed bisect: Go `091ff27f`, which is already in v8.0.35 | After an abandoned stream, v8.0.67, like v8.0.35, leaves `disabled` absent, and cliproxy-rs must too. Both sides must leave the field absent, so `false` on both sides fails. H1 #67 authored the production fix; the [audit item](checklist.md#unresolved-frozen-reference-discrepancies) stays open until real Go acceptance against the fixed head executes |
 
 Shared entries: `go-openai-model-order` (Go builds the OpenAI model list by ranging over a map), `openai-created-timestamps` (wall-clock `created` within 5 seconds),
 `credential-refresh-timestamps`, `compaction-capsule-generated` and the `plain-upstream-host-label`
 harness boundary. Global rules: downstream header-name case and order
 ([ledger](../DIFFERENCES-FROM-GO.md#deliberate-differences)), chunk boundaries, Content-Length,
-generated values. On the historical target, `cors-expose-etag`, `claude-responses-compact`
-and `claude-catalog-v8.0.35` record behaviour cliproxy-rs follows from v8.0.35 rather than
-v8.0.10. For historical compaction, cliproxy-rs is held to a golden recorded from Go v8.0.35
+generated values. On the historical target, `cors-expose-etag`, `claude-responses-compact`,
+`claude-catalog-v8.0.35` and `credential-disabled-persist-v8.0.10` record behaviour cliproxy-rs
+follows from v8.0.35 rather than v8.0.10. For historical compaction, cliproxy-rs is held to a golden recorded from Go v8.0.35
 itself (`harness/run --target policy --golden`). Its request matched v8.0.35 byte for byte,
 except for the minted request id.
 
 Ownership routes the work; it does not adopt the behavior or accept it as correct.
-R1 #94 owns Retry-After production adoption. H1 #67 and tracker #66 retain the unresolved
-frozen-reference persistence audit. C1 #69 owns only the baseline/version observation;
+R1 #94 owns Retry-After production adoption. H1 #67 authored the persistence fix, and with
+tracker #66 keeps that audit open until real Go acceptance executes. C1 #69 owns only the baseline/version observation;
 C2 #70 detection work and provider wire correctness remain open. A `missing-audit`, pending,
 unowned or unattributed entry stays visible in receipts until its owning decision is resolved.
 

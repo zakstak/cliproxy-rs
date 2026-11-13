@@ -45,6 +45,11 @@ DIVERGENCE_KINDS = {
     # deciding issue, and the executed v8.0.35 comparison that shows Rust matches it
     # (attribution). The predicate stays exact; this is a decision record, not an exemption.
     "not-adopted",
+    # Selective only: both sides must leave a credential field absent, where comparing the
+    # sides alone would also accept the same persisted value on both. Names the owning
+    # issue, the Go evidence and the attribution; each predicate is a credential field
+    # whose go and rust are both absent.
+    "required-absence",
 }
 PREDICATES = {"downstream_header", "upstream_header", "upstream_body_edit", "downstream_body_edit",
               "downstream_body_timestamps",
@@ -132,7 +137,13 @@ def _predicate(predicate, where, divergence, data):
                  f"{where}: credential field needs go/rust and optional explicit equal values")
         _require(spec["field"] not in ("access_token", "refresh_token", "id_token", "type", "email"),
                  f"{where}: credential identity fields cannot diverge")
-        _require(spec["go"] != spec["rust"], f"{where}: go and rust values must differ")
+        required_absence = divergence.get("kind") == "required-absence"
+        if required_absence:
+            _require(spec["go"] == spec["rust"] == "<absent>" and "equal_values" not in spec
+                     and not divergence.get("may_be_absent"),
+                     f"{where}: a required absence names <absent> on both sides, with no alternatives")
+        else:
+            _require(spec["go"] != spec["rust"], f"{where}: go and rust values must differ")
         _require(not divergence.get("may_be_absent") or isinstance(spec.get("equal_values"), list)
                  and spec["equal_values"], f"{where}: optional credential delta needs explicit equal states")
         if spec["field"] == "disabled":
@@ -264,6 +275,12 @@ def validate(data, suite_sizes=None):
                      and divergence.get("attribution") and divergence.get("ledger"),
                      f"{name}: a missing audit is selective-only and names its Go evidence, "
                      "frozen-reference attribution and unresolved audit ledger entry")
+        if kind == "required-absence":
+            _require(divergence["targets"] == ["selective"] and divergence.get("issue") and divergence.get("evidence")
+                     and divergence.get("attribution")
+                     and all(set(p) == {"credential_field"} for p in divergence["expect"]),
+                     f"{name}: a required absence is selective-only, names its issue, Go evidence and "
+                     "attribution, and states only credential fields")
         if kind == "unowned":
             _require(divergence.get("evidence"), f"{name}: an unowned divergence names its Go commit")
         if kind == "unattributed":

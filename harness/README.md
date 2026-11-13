@@ -124,13 +124,15 @@ not name is still compared. There are no path or assertion exemptions, and the m
 validator refuses them. Kinds: `pending-feature` and `deferred-feature` (owning issue),
 `unowned` (Go commit found, no owner), `unattributed` (states what is not known),
 `documented-difference` (ledger entry), `later-reference` (historical only, Go evidence),
-`nondeterministic`, `harness-boundary`, `missing-audit` and `not-adopted`. A `missing-audit`
+`nondeterministic`, `harness-boundary`, `missing-audit`, `not-adopted` and `required-absence`. A `missing-audit`
 entry is selective-only and names its owning issue, Go evidence, frozen-reference attribution
 and unresolved audit ledger entry. It records an open discrepancy, not an adoption or
 deliberate-difference policy. A `not-adopted` entry is
 selective-only and names the deciding issue, the Go commit and the executed v8.0.35
 comparison that shows cliproxy-rs keeps the frozen behaviour; its predicate stays exact. A
-pending or unattributed entry grants no adoption.
+`required-absence` entry is selective-only, names its issue, Go evidence and attribution, and
+states credential fields that both sides must leave absent. Comparing the sides alone would also
+accept the same persisted value on both. A pending or unattributed entry grants no adoption.
 
 **Raw differences** must fall in a dimension whose check passed. Any other path fails,
 including a TLS change, an extra request or a read error.
