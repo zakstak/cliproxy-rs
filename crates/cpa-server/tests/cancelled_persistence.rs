@@ -50,17 +50,12 @@ struct Up {
 
 async fn upstream(State(up): State<Arc<Up>>, req: axum::extract::Request) -> Response {
     up.paths.lock().unwrap().push(req.uri().path().to_owned());
-    let path = req.uri().path().to_owned();
     let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8_lossy(&body);
-    if path.ends_with("/count_tokens") {
-        // A missing count endpoint: availability-neutral (`is_count_endpoint_missing`).
-        return (
-            StatusCode::NOT_FOUND,
-            [("content-type", "text/plain")],
-            "404 page not found",
-        )
-            .into_response();
+    if text.contains("MODE_COMPACT_FAULT") {
+        // A compact request fault: availability-neutral (`is_compact_neutral`).
+        let err = r#"{"type":"error","error":{"type":"invalid_request_error","message":"scripted compact fault"}}"#;
+        return (StatusCode::BAD_REQUEST, [("content-type", "application/json")], err).into_response();
     }
     if text.contains("MODE_HANG_HEADERS") {
         up.parked.notify_one();
@@ -208,7 +203,11 @@ impl Fixture {
                 "a cancelled request must not save the credential file"
             );
             let current = self.rt.store().get(FILE).unwrap();
-            assert_eq!(current.metadata.get("disabled"), None, "no save reached memory either");
+            assert_eq!(
+                current.metadata.get("disabled"),
+                None,
+                "a cancelled request must not save the credential (in memory)"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -315,18 +314,20 @@ async fn a_successful_result_persists_disabled_false() {
     f.persisted_disabled_false().await;
 }
 
-/// Positive control: an availability-neutral result (a missing count_tokens endpoint)
-/// still writes `disabled: false` and cools nothing.
+/// Positive control: an availability-neutral result still writes `disabled: false` and
+/// cools nothing. A Claude `responses/compact` request fault is neutral (`Outcome::Neutral`
+/// from `is_compact_neutral`) and reaches the loopback upstream; count_tokens would not,
+/// as it counts locally for a base URL that is not first-party.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_neutral_result_persists_disabled_false() {
     let f = fixture("neutral").await;
-    let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "count"}]});
-    let (status, reply) = f.post("/v1/messages/count_tokens", body).await;
-    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&reply));
+    let body = json!({"model": MODEL, "input": "MODE_COMPACT_FAULT", "stream": false});
+    let (status, reply) = f.post("/v1/responses/compact", body).await;
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&reply));
     assert_eq!(
         f.up.paths.lock().unwrap().as_slice(),
-        ["/v1/messages/count_tokens"],
-        "the count reached the mock upstream once"
+        ["/v1/messages"],
+        "the compact summary turn reached the mock upstream once"
     );
     f.settled(stats(0, 1, 0)).await;
     assert!(
