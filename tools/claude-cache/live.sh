@@ -3,7 +3,7 @@
 # cliproxy-rs whose Claude login is an OAuth subscription; it is not part of CI and it
 # spends real tokens (about 75k input tokens on Opus, most of them cache reads).
 #
-#   CPA_URL=http://127.0.0.1:8317 CPA_KEY=<client key> bench/claude-cache-live.sh [results.jsonl]
+#   CPA_URL=http://127.0.0.1:8317 CPA_KEY=<client key> tools/claude-cache/live.sh [results.jsonl]
 #
 # It streams one conversation through /v1/messages the way a coding client does (a
 # caller system prompt, tools, a long first user message, a tool call as the first

@@ -11,9 +11,9 @@ it adopts nothing: each feature is adopted by its own issue, with its own eviden
 its divergence below. Codex is never compared against Go; [codex/CONTRACT.md](../codex/CONTRACT.md)
 and first-party `openai/codex` at `44ccf394573c` decide it.
 
-[`harness/manifest.json`](../../harness/manifest.json) is the source of truth for these pins and
-for every named divergence. This page summarizes the first receipt. When an issue adopts or
-rejects a behaviour, update the manifest entry and this table in the same change.
+This ledger is historical. Issue [#45](https://github.com/zakstak/cliproxy-rs/issues/45) retired
+the Go differential harness and its `harness/manifest.json`, which held these pins and the named
+divergences. The page records the receipt as it stood; a change no longer needs to update it.
 
 ## Adopted from v8.0.67
 

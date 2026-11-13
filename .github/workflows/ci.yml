@@ -1,6 +1,5 @@
-# Formatting, lints, the full test suite and the harness build on every pull request and
-# push to master, plus the Linux size and idle gates and a check that native Windows and
-# macOS builds stop with the Linux-only build error.
+# Formatting, lints and the full test suite on every pull request and push to master,
+# plus a check that native Windows and macOS builds stop with the Linux-only build error.
 # One run per change: pushes to master, and pull requests through `pull_request` only. A
 # branch push used to start a second run of every job for the same commit. Runs are
 # grouped per pull request (or per ref outside one), and a newer push cancels the older
@@ -24,8 +23,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # One exact compiler for every job: the size and allocation budgets are exact numbers
-  # from one compiler and std. Bumping it means re-measuring bench/budgets.txt.
+  # One pinned compiler for every job, so lints and test builds match across runs.
   RUST_TOOLCHAIN: "1.99.0"
   CARGO_INCREMENTAL: "0"
 
@@ -50,8 +48,7 @@ jobs:
     env:
       # No debug info in test builds: linking about 55 test binaries with full debug info
       # was most of a warm build (18 GB in target/debug/deps). Panic messages keep their
-      # file and line. Only for this job and the next: rust-cache keys its caches on
-      # CARGO_* variables, and the perf job keeps its own.
+      # file and line.
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
@@ -95,9 +92,8 @@ jobs:
         # A loopback-only network namespace, as the project's merge gates use, so a test
         # that tries to reach a real provider fails instead of sending anything. The tests
         # run as the runner user inside it, so file-permission tests behave as usual.
-        # Nextest runs the test binaries in parallel; .config/nextest.toml runs the memory
-        # gate (crates/cpa-server/tests/alloc_budget.rs) and the tests with wall-clock
-        # bounds alone. Nextest skips doc tests, so cargo test runs those.
+        # Nextest runs the test binaries in parallel; .config/nextest.toml runs the tests
+        # that wait on real timers alone. Nextest skips doc tests, so cargo test runs those.
         # CPA_TEST_NO_SKIP makes a test that would skip for a missing PostgreSQL (or
         # unenforced file permissions) fail instead: a passing test's output is captured, so a printed skip
         # line never reaches the log. The doc tests and the cache replay
@@ -114,7 +110,7 @@ jobs:
           if [ "$SHARD" = 2 ]; then
             tests+='
               cargo test --workspace --doc --locked 2>&1 | tee -a test.log
-              python3 bench/test-claude-cache-replay.py 2>&1 | tee -a test.log
+              python3 tools/claude-cache/test_replay.py 2>&1 | tee -a test.log
             '
           fi
           # shellcheck disable=SC2016 # $1 to $3 belong to the inner shell
@@ -157,10 +153,10 @@ jobs:
           python3 .github/scripts/test-counts.py total counts-1.json counts-2.json
 
   # Everything that does not need the test build: formatting, clippy over every target,
-  # the harness, and the Codex Live media relay tests, which build cpa-server with its
-  # optional media-relay feature. In parallel with the tests above.
+  # and the Codex Live media relay tests, which build cpa-server with its optional
+  # media-relay feature. In parallel with the tests above.
   lint:
-    name: fmt, clippy, harness and media relay tests (Linux)
+    name: fmt, clippy and media relay tests (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -186,9 +182,7 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Fetch dependencies
-        run: |
-          cargo fetch --locked
-          cargo fetch --locked --manifest-path harness/rust/Cargo.toml
+        run: cargo fetch --locked
       - name: Clippy
         env:
           CARGO_NET_OFFLINE: "true"
@@ -200,16 +194,6 @@ jobs:
             echo '::error::CPU profiler and symbol resolver must remain opt-in'
             exit 1
           fi
-      - name: Harness
-        env:
-          CARGO_NET_OFFLINE: "true"
-        run: cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
-      # The revision manifest and the acceptance logic. The Go/Rust differential itself
-      # (harness/accept) needs the Go references and runs locally; see harness/README.md.
-      - name: Harness manifest and acceptance checks
-        run: |
-          python3 harness/manifest.py check
-          python3 -m unittest discover -s harness -p 'test_*.py'
       - name: Media relay and CPU profiler tests, with external network denied
         # The same loopback-only namespace as the tests above. All of cpa-server's unit
         # tests run with the feature on, the 25 behind it included.
@@ -221,51 +205,6 @@ jobs:
             "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG" \
             unshare --net -- sh -c 'ip link set lo up && exec setpriv --reuid="$1" --regid="$2" --init-groups -- cargo nextest run -p cpa-server --features media-relay,pprof --lib --locked --profile ci' \
             sh "$(id -u)" "$(id -g)"
-
-  perf:
-    name: ${{ matrix.gates }} (Linux)
-    # Ubuntu 22.04 matches the historical size measurements, and its unprivileged user
-    # namespaces give bench/idle.sh a loopback-only network. The two
-    # idle gates run on separate runners, so neither waits out the other's 60 s window;
-    # each still has its machine to itself. Both build the same release binary.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { gates: "size and idle gates, 1 auth file", auth-files: 1 }
-          - { gates: "idle gate, 2,000 auth files", auth-files: 2000 }
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build tools
-        run: .github/scripts/apt-install.sh cmake clang libclang-dev perl
-      - name: Rust
-        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
-      # Both entries share one cache; one of them saves it.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/fork') && matrix.auth-files == 1 }}
-      - name: Build
-        run: |
-          cargo tree --locked -p cliproxy --edges normal --prefix none > size-dependencies.txt
-          if grep -qE '^(pprof|backtrace) v' size-dependencies.txt; then
-            echo '::error::Size-gate binaries must exclude CPU profiling and symbol resolution'
-            exit 1
-          fi
-          cargo build --release --locked -p cliproxy
-      # Bytes and counts against bench/budgets.txt, never elapsed time.
-      - name: Size
-        if: matrix.auth-files == 1
-        run: |
-          name=cliproxy-ci-x86_64-unknown-linux-gnu
-          mkdir -p "$name" && cp target/release/cliproxy README.md LICENSE "$name/"
-          tar -czf "$name.tar.gz" "$name"
-          bench/gate.sh size x86_64-unknown-linux-gnu target/release/cliproxy "$name.tar.gz"
-      - name: Idle
-        env:
-          AUTH_FILES: ${{ matrix.auth-files }}
-        run: bench/gate.sh idle linux target/release/cliproxy "$AUTH_FILES"
 
   # This fork builds for Linux only. A native Windows or macOS build must stop at once with
   # the actionable error in crates/cpa-core/src/lib.rs. Checking cpa-core alone needs no C

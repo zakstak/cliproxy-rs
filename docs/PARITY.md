@@ -1,6 +1,6 @@
-# Compatibility and parity with CLIProxyAPI
+# Compatibility with CLIProxyAPI
 
-This fork keeps four built-in upstreams (Claude, Codex, Grok and Muse) and puts provider correctness ahead of Go quirks for them ([DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#compatibility-policy)). The removed providers' contracts (Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and OpenAI-compatible upstreams) are out of scope; checklist and status entries that name them are historical. The compatibility target for everything kept is frozen at CLIProxyAPI [v8.0.35](https://github.com/router-for-me/CLIProxyAPI/tree/ae3ee3be303fb07fb8173279923413005bf32177), commit `ae3ee3be`: the same `config.yaml`, credential files, routes and answers. The source-derived checklist tracks 1,951 contracts and test suites. Moving the reference does not implement those contracts or rerecord existing fixtures.
+This fork keeps four built-in upstreams (Claude, Codex, Grok and Muse). Compatibility means functional compatibility: CLIProxyAPI's `config.yaml`, credential files, client routes and Management API keep working for the clients and operators that use them, and provider documentation, first-party clients and verified wire behaviour decide provider behaviour ([DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#compatibility-policy)). Go's parser quirks and exact wire output are not goals, and no Go comparison or benchmark gates a change ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)). The removed providers' contracts (Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and OpenAI-compatible upstreams) are out of scope; checklist and status entries that name them are historical. The audit below is a historical inventory against CLIProxyAPI [v8.0.35](https://github.com/router-for-me/CLIProxyAPI/tree/ae3ee3be303fb07fb8173279923413005bf32177), commit `ae3ee3be`. Its source-derived checklist tracks 1,951 contracts and test suites.
 
 Most existing fixtures were recorded from the previous reference, `6fecc6e` (v8.0.10). The Claude prompt-cache, prompt-shaping, continuation and error fixtures include selected [v8.0.27](https://github.com/router-for-me/CLIProxyAPI/tree/bf9341629ef2300ac9d846a2e80fe2756f63a671) changes. Those tests retain their provenance; changed Go suites are partial until their current assertions are verified. The [reference update](parity-audit/reference-v8.0.35.md) records additions, retired declarations and count changes. The [upstream inventory](parity-audit/upstream-v8.0.35.md) lists every intervening commit and its porting status. Deliberate differences, including stable caller-system placement, remain in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
@@ -23,7 +23,7 @@ Most existing fixtures were recorded from the previous reference, `6fecc6e` (v8.
 
 The dashboard says when the server lacks an endpoint instead of failing: actions it cannot do are disabled and named, and pages it cannot load say which route is missing. What is still missing is listed under [Upcoming features](../README.md#upcoming-features), and the deliberate differences from Go are in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
-## Where it stands
+## Where the audit stood
 
 <!-- parity-summary:start -->
 Audit of 2026-10-20 (v0.2.6, d1261f2) against CLIProxyAPI v8.0.35 (`ae3ee3be`).
@@ -58,7 +58,7 @@ The audit combines a source scan with saved route probes and manual judgments. R
 
 ## The audit files
 
-Everything behind the numbers is in [`docs/parity-audit/`](parity-audit):
+Everything behind the numbers is in [`docs/parity-audit/`](parity-audit). The audit is reference material, not a gate ([parity-audit/README.md](parity-audit/README.md)):
 
 - [`checklist.md`](parity-audit/checklist.md) lists every item with a link to the Go source it comes from.
 - [`status.md`](parity-audit/status.md) gives each item its status, the evidence (the Rust code and tests that cover it) and a note.
@@ -66,4 +66,4 @@ Everything behind the numbers is in [`docs/parity-audit/`](parity-audit):
 - [`audit.py`](parity-audit/audit.py) rebuilds `status.md`, the table above, and the README parity sentence from the same totals. [`probe.py`](parity-audit/probe.py) starts the binary and requests every route in the checklist with a private test configuration, to see which ones are routed; its results are in `routes.json`.
 - [`verify_reference.py`](parity-audit/verify_reference.py) checks the frozen checklist's IDs and retained text, test declarations, routes (method and full path), config leaves, CLI flags, RPC methods and citation bounds against a read-only Go clone. It does not establish Rust behavior coverage.
 
-Run `python3 docs/parity-audit/audit.py` from the repository root after a change to refresh all three. The [v0.2.6 rebaseline](parity-audit/rebaseline.md) records the review against `6fecc6e`; the [v8.0.35 reference update](parity-audit/reference-v8.0.35.md) records the new target's inventory and count changes.
+To refresh all three, run `python3 docs/parity-audit/audit.py` from the repository root. No change has to. The [v0.2.6 rebaseline](parity-audit/rebaseline.md) records the review against `6fecc6e`; the [v8.0.35 reference update](parity-audit/reference-v8.0.35.md) records the new target's inventory and count changes.

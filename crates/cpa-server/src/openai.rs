@@ -498,7 +498,7 @@ pub async fn responses(
     let path = dispatch::route_path(matched.as_ref(), &original.0);
     let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
     // A body the preparation leaves alone keeps the client's buffer, so a native request
-    // holds one copy of its body, not two (#29, docs/BENCHMARKS.md).
+    // holds one copy of its body, not two (#29).
     let body = match cpa_common::codex_client::prepare_responses_request_if_changed(&headers, &body, &settings) {
         Some(prepared) => Bytes::from(prepared),
         None => body,

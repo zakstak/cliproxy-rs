@@ -1,11 +1,12 @@
 # Codex migration: qualification
 
-This page is the receipt for the Codex migration ([#20](https://github.com/zakstak/cliproxy-rs/issues/20)), written for its final qualification step ([#29](https://github.com/zakstak/cliproxy-rs/issues/29)). It keeps four kinds of evidence apart:
+This page is the receipt for the Codex migration ([#20](https://github.com/zakstak/cliproxy-rs/issues/20)), written for its final qualification step ([#29](https://github.com/zakstak/cliproxy-rs/issues/29)). It keeps three kinds of evidence apart:
 
 1. Source evidence: what the first-party client and the provider documentation define ([CONTRACT.md](CONTRACT.md)).
 2. Local mock results: what the server does at its real ingress and egress, against loopback upstreams, with fake credentials and private `auth-dir`s.
-3. Measured performance: heap per request for sampled workloads ([BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request)).
-4. Unproven live gates: what no local test can show.
+3. Unproven live gates: what no local test can show (section 5).
+
+Qualification covers functional behaviour and security: exact bytes, routing, failure handling and credential isolation. Performance is not part of it (section 3).
 
 No result here comes from a real account, and none was sent to a provider.
 
@@ -73,19 +74,9 @@ The translated route converts Claude Messages and Chat Completions requests into
 
 The meta and xAI executors, which share the registered translators, keep Go's conversion.
 
-## 3. Measured performance
+## 3. Performance is not a qualification gate
 
-[BENCHMARKS.md](../BENCHMARKS.md#codex-request-preparation-heap-per-request) has the setup, commands, compilers and tables. The raw output is in [`bench/results/2026-11-07-codex-alloc.txt`](../../bench/results/2026-11-07-codex-alloc.txt), taken at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`.
-
-These are heap observations from the counting allocator in the test profile, for sampled synthetic workloads. There were six runs, three each on rustc 1.99.1 and on CI's pinned 1.99.0, on one local machine:
-
-- A native request that needs no routing peaked at 84 KB of preparation heap, with 939 allocations, at every sampled size from 122 KB to 7.7 MB. That is down from 2.0x the body, after removing an always-on body copy in the Responses handler.
-- An alias added one copy of the body.
-- The translated route peaked at between 3.8x and 4.5x the body for the sampled Claude and Gemini requests. In the Gemini requests the 48 tool schemas are the same at every size; only the conversation turns grow.
-
-The allocator measures peak live heap and allocation calls, not time or bytes read. So these results establish nothing about computational scaling, and nothing about growth with schema size.
-
-`bench/budgets.txt` gates the values. They were not measured on GitHub's runners.
+Issue [#45](https://github.com/zakstak/cliproxy-rs/issues/45) removed performance from qualification. An earlier version of this section recorded heap-per-request observations from a counting allocator and pointed to a `bench/budgets.txt` gate. Both the allocation gate and the budgets file are deleted. The raw output stays as a dated historical record in [`bench/results/2026-11-07-codex-alloc.txt`](../../bench/results/2026-11-07-codex-alloc.txt), taken at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`. It is not a current claim or a limit.
 
 ## Local verification receipt
 

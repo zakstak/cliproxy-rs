@@ -138,15 +138,15 @@ collector must protect the full record or export an allowlist containing
 
 ## Offline replay
 
-`bench/claude-cache-replay.py` accepts JSONL, one usage record per line, and reports
+`tools/claude-cache/replay.py` accepts JSONL, one usage record per line, and reports
 the last seven days ending at the latest attempt end. Earlier supplied records
 warm the simulation without contributing to that week's costs. Duplicate
 `execution_id` values are skipped. A short export reports its coverage rather
 than claiming to contain a week.
 
 ```sh
-python3 bench/claude-cache-replay.py week.jsonl --wakeups wakeups.jsonl > comparison.json
-python3 bench/test-claude-cache-replay.py
+python3 tools/claude-cache/replay.py week.jsonl --wakeups wakeups.jsonl > comparison.json
+python3 tools/claude-cache/test_replay.py
 ```
 
 The existing usage queue retains records for 60 seconds by default, at most one
@@ -232,33 +232,3 @@ network-free replay fixtures. A week of new production telemetry is still needed
 before choosing a TTL or evaluating a maintenance policy. Publishing a release
 or replacing Core's running proxy requires Vayun's explicit approval. No live
 Claude login is exercised by these tests.
-
-### Mock load check
-
-The existing release latency harness supports telemetry on/off, a synthetic
-base64 image, two proxy workers, and an unrelated 10 ms SSE stream. Run alternating
-off/on pairs at least five times, for both workloads and both transport modes:
-
-```sh
-cargo build --release -p cpa-server --example claude_latency --locked
-for workload in text media; do
-  size=1000000; media=0
-  if [ "$workload" = media ]; then size=30000000; media=1; fi
-  for repeat in 1 2 3 4 5; do
-    for telemetry in off on; do
-      CACHE_TELEMETRY="$telemetry" MEDIA="$media" UNRELATED_STREAM=1 \
-        WORKERS=2 N=2 WARMUP=2 CONC=2 SIZES="$size" \
-        bench/latency.sh /tmp/cache-load.jsonl target/release/examples/claude_latency
-    done
-  done
-done
-```
-
-`bench/latency.sh` requires a loopback-only network namespace. Set `CPUS` to the
-host's permitted CPU list. Every timed request must reach the mock, return HTTP
-200 and `message_stop`; the harness asserts that the telemetry toggle takes effect.
-Compare `proxy.up_first_ms`, `proxy.process_cpu_ms`, `process_vmhwm_kb`, and
-`proxy.unrelated_stream_max_gap_ms`. CPU and peak RSS cover the entire harness
-(proxy, mock, and client), not an isolated proxy process. The media source is
-synthetic and is accepted only by the mock; it is not an Anthropic media validation
-test. These measurements do not substitute for host-specific deployment evidence.

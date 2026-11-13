@@ -68,7 +68,8 @@ and auth files through `cpa_core::config::credentials::load`, runs the request
 pipeline and compares upstream bytes and headers. Random values Go and Rust generate
 independently (`x-client-request-id`, the device and session in non-CLI fake user IDs
 and the CCH over them) are normalized; everything else is byte-exact. Wire header
-order is not observable through a `RoundTripper`; `./harness/run` covers it.
+order is not observable through a `RoundTripper`; the retired Go differential harness
+covered it.
 
 Regenerate with a temporary module inside the reference module's internal-package
 boundary (the reference checkout is not modified):

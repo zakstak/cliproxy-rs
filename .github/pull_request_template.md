@@ -10,5 +10,5 @@
 
 - [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked` pass.
 - [ ] No real keys, tokens or account data in code, tests or logs.
-- [ ] Behaviour matches CLIProxyAPI at `6fecc6e`, or the difference is added to `docs/DIFFERENCES-FROM-GO.md`.
+- [ ] Supported clients, configs and credential files that worked before still work. A change an operator moving from CLIProxyAPI would notice has a note in `docs/DIFFERENCES-FROM-GO.md`.
 - [ ] Docs updated if users see the change.
