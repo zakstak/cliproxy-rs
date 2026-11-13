@@ -2608,3 +2608,286 @@ async fn bootstrap_buffering_holds_response_metadata_on_http() {
     );
     assert!(!answer.contains("omnimod"), "no failed-attempt metadata");
 }
+
+/// FP2 (#116): the base64 `x-error-json` header first-party Codex reads a 403's code from
+/// (`api_bridge.rs:342-354` at 5c3ff1dabf64), naming the `http-error-workspace-provider`
+/// fixture's JSON.
+fn x_error_json(json: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(json.trim())
+}
+
+/// FP2 (#116) on the native HTTP route, with a second account available. First-party
+/// Codex at research main `5c3ff1dabf644169f4bd74b215719f381e4fdb3f` never retries these
+/// (`protocol/src/error.rs` `retry_policy`, `RetryPolicy::Never`):
+///
+/// - HTTP: `inference_hook_denied` on a 403, `content_policy_violation` on a 400, and a
+///   403 whose `/detail/code`, `/error/code` or `x-error-json` code is a workspace or
+///   access-program denial (`api_bridge.rs:138-143`, `293-311`; the workspace bodies
+///   are the `http-error-workspace-*` fixtures);
+/// - in-stream: every event of the `sse-terminal-rejections` fixture, read with no outer
+///   status (`sse/responses.rs:379-383`), as the first event and after output.
+///
+/// Each ends the request on the selected account: one upstream attempt carrying that
+/// account's token (no failover, no refresh-and-retry), no cooldown on any account, and
+/// exactly one failed usage record. The client gets the provider's status and bytes,
+/// unknown fields and IDs included, as the native HTTP route delivers every upstream
+/// error (docs/codex/CONTRACT.md "Native HTTP route"). The 400 `context_length_exceeded`
+/// is the control Go already stopped on.
+#[tokio::test]
+async fn first_party_terminal_rejections_stop_on_the_selected_account() {
+    const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_fp2","output":[]}}"#;
+    const DELTA: &str = r#"{"type":"response.output_text.delta","response_id":"resp_fp2","delta":"partial"}"#;
+    let sse = |events: &[&str]| events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+    let provider = text_of("http-error-workspace-provider");
+    let mut cases: Vec<(String, Reply, u16, String)> = Vec::new();
+    for (status, body) in [
+        (403, r#"{"error":{"code":"inference_hook_denied","message":"denied by policy","param":"input","future_field":{"n":1.50}}}"#.to_owned()),
+        (400, r#"{"error":{"code":"content_policy_violation","message":"denied by policy","param":"input"}}"#.to_owned()),
+        (403, r#"{"error":{"code":"access_program_not_enabled","message":"denied by policy"}}"#.to_owned()),
+        (403, text_of("http-error-workspace-detail")),
+        (403, provider.clone()),
+        (403, r#"{"detail":{"code":"codex_workspace_access_denied"}}"#.to_owned()),
+        (400, r#"{"error":{"code":"context_length_exceeded","message":"too long","param":"input"}}"#.to_owned()),
+    ] {
+        cases.push((format!("HTTP {status} {body}"), Reply::json(status, body.clone()), status, body));
+    }
+    cases.push((
+        "HTTP 403 x-error-json".to_owned(),
+        Reply {
+            status: 403,
+            headers: vec![("x-error-json".into(), x_error_json(&provider))],
+            body: Bytes::new(),
+        },
+        403,
+        String::new(),
+    ));
+    for frame in fixture("sse-terminal-rejections").frames() {
+        let frame = String::from_utf8(frame.to_vec()).unwrap();
+        for (stage, leading) in [("first", &[][..]), ("after output", &[CREATED, DELTA][..])] {
+            let mut events = leading.to_vec();
+            events.push(&frame);
+            let upstream = sse(&events);
+            cases.push((format!("{stage}: {frame}"), Reply::sse(upstream.clone()), 200, upstream));
+        }
+    }
+    assert_eq!(cases.len(), 8 + 24);
+    for (name, reply, status, want) in cases {
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![reply, Reply::sse(fixture("sse-completed").bytes())],
+                ..Script::default()
+            },
+            &[SELECTED, SECOND],
+            "",
+            false,
+        )
+        .await;
+        let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        assert_eq!((got, answer.as_str()), (status, want.as_str()), "{name}");
+        let exchanges = proxy.upstream.http();
+        assert_eq!(
+            exchanges.len(),
+            1,
+            "{name}: one attempt, no failover, no refresh-and-retry"
+        );
+        assert_eq!(
+            exchanges[0].headers["authorization"],
+            format!("Bearer {SELECTED}"),
+            "{name}"
+        );
+        assert_eq!(cooldowns(&proxy), 0, "{name}: no account is cooled");
+        let records = usage_records(&proxy, 1).await;
+        assert_eq!(records.len(), 1, "{name}: one settlement {records:?}");
+        assert_eq!(records[0]["failed"], true, "{name}");
+    }
+}
+
+/// FP2 (#116) controls: failures first-party Codex retries, or that are the account's
+/// own, still move to the second account before anything was delivered, once. A
+/// `context_length_exceeded` with a status other than 400 is no context-window failure
+/// (`error.rs:110-112`, `responses_websocket.rs:1416-1439` at 5c3ff1dabf64), with or
+/// without Anthropic's `invalid_request_error` type; a 503 workspace body is an ordinary
+/// 503 (`only_an_explicit_workspace_403_stops_retries`); a bare 403, a 403 naming another
+/// code beside a workspace `x-error-json`, and a first-party runtime authentication denial
+/// (`protocol/src/error.rs:703-732`) stay credential failures. The first account is
+/// cooled, and the second serves the answer as sent.
+#[tokio::test]
+async fn retryable_and_account_failures_move_to_another_account() {
+    let provider = text_of("http-error-workspace-provider");
+    let header = vec![("x-error-json".to_owned(), x_error_json(&provider))];
+    for (name, status, headers, body) in [
+        (
+            "context 503",
+            503,
+            vec![],
+            r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
+        ),
+        (
+            "typed context 503",
+            503,
+            vec![],
+            r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":null}}"#,
+        ),
+        (
+            "context 403",
+            403,
+            vec![],
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+        ),
+        (
+            "workspace 503",
+            503,
+            vec![],
+            r#"{"detail":{"code":"codex_workspace_access_denied"}}"#,
+        ),
+        ("bare 403", 403, vec![], ""),
+        (
+            "other 403 code",
+            403,
+            header.clone(),
+            r#"{"detail":{"code":"route_rate_limited"}}"#,
+        ),
+        (
+            "runtime denial 403",
+            403,
+            vec![],
+            r#"{"error":{"code":"runtime_instance_revoked"}}"#,
+        ),
+    ] {
+        let reply = Reply {
+            status,
+            headers: [
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+                headers,
+            ]
+            .concat(),
+            body: Bytes::from(body),
+        };
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![reply, Reply::sse(fixture("sse-completed").bytes())],
+                ..Script::default()
+            },
+            &[SELECTED, SECOND],
+            "",
+            false,
+        )
+        .await;
+        let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        assert_eq!(
+            (got, answer.as_str()),
+            (200, text_of("sse-completed").as_str()),
+            "{name}"
+        );
+        let tokens: Vec<_> = proxy
+            .upstream
+            .http()
+            .iter()
+            .map(|e| e.headers["authorization"].to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            tokens,
+            [format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")],
+            "{name}"
+        );
+        assert!(cooldowns(&proxy) > 0, "{name}: the failing account is cooled");
+    }
+}
+
+/// FP2 (#116): the transient retry stays bounded. With `request-retry: 0` and both
+/// accounts answering a context-labelled 503, each account is tried exactly once, both are
+/// cooled, and the client gets the last provider status and body as sent.
+#[tokio::test]
+async fn a_context_labelled_503_is_retried_once_per_account() {
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model.","param":"input"}}"#;
+    let (proxy, _) = native_accounts(
+        Script {
+            http: vec![Reply::json(503, body), Reply::json(503, body)],
+            ..Script::default()
+        },
+        &[SELECTED, SECOND],
+        "routing:\n  retry:\n    request-retry: 0\n",
+        false,
+    )
+    .await;
+    let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((got, answer.as_str()), (503, body));
+    assert_eq!(proxy.upstream.http().len(), 2, "one attempt per account");
+    let store = proxy.rt.store();
+    for credential in store.snapshot() {
+        assert!(
+            !store.cooldowns(&credential.id).is_empty(),
+            "{} is cooled",
+            credential.id
+        );
+    }
+}
+
+/// FP2 (#116) review findings 1, 3 and 5 on the native HTTP route, with a second account
+/// available: a terminal rejection is read from its code and status before Go's capacity
+/// reading of its message, the 403 workspace match runs whatever else the body names, and
+/// a repeated key reads as its last occurrence (`serde_json::Value`, as first-party
+/// `api_bridge.rs:138-140` reads it). Each stops on the selected account: one attempt, no
+/// cooldown, one failed record, and the provider's status and bytes.
+#[tokio::test]
+async fn terminal_rejections_decide_before_messages_and_repeated_keys() {
+    for body in [
+        r#"{"error":{"code":"inference_hook_denied","message":"model is at capacity"}}"#,
+        r#"{"error":{"code":"other","code":"inference_hook_denied","message":"denied"}}"#,
+        r#"{"detail":{"code":"codex_workspace_access_denied"},"error":{"code":"context_length_exceeded"}}"#,
+    ] {
+        let (proxy, _) = native_accounts(
+            Script {
+                http: vec![Reply::json(403, body), Reply::sse(fixture("sse-completed").bytes())],
+                ..Script::default()
+            },
+            &[SELECTED, SECOND],
+            "",
+            false,
+        )
+        .await;
+        let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+        assert_eq!((got, answer.as_str()), (403, body), "{body}");
+        let exchanges = proxy.upstream.http();
+        assert_eq!(exchanges.len(), 1, "{body}: one attempt, no failover");
+        assert_eq!(
+            exchanges[0].headers["authorization"],
+            format!("Bearer {SELECTED}"),
+            "{body}"
+        );
+        assert_eq!(cooldowns(&proxy), 0, "{body}: no account is cooled");
+        let records = usage_records(&proxy, 1).await;
+        assert_eq!(records.len(), 1, "{body}: one settlement {records:?}");
+        assert_eq!(records[0]["failed"], true, "{body}");
+    }
+}
+
+/// FP2 (#116) review finding 2: a first-party code on a status first-party Codex retries
+/// (`api_bridge.rs:223-312`) is no request fault, even beside Go's `invalid_request_error`
+/// type, which Go reads as one on any status. The 503 moves once to the second account,
+/// which serves the answer; the first account is cooled.
+#[tokio::test]
+async fn a_typed_first_party_code_on_a_503_moves_to_another_account() {
+    let body = r#"{"error":{"code":"content_policy_violation","type":"invalid_request_error","message":"m"}}"#;
+    let (proxy, _) = native_accounts(
+        Script {
+            http: vec![Reply::json(503, body), Reply::sse(fixture("sse-completed").bytes())],
+            ..Script::default()
+        },
+        &[SELECTED, SECOND],
+        "",
+        false,
+    )
+    .await;
+    let (got, _, answer) = post(&proxy.url, "/v1/responses", &[], routed("http-request-full")).await;
+    assert_eq!((got, answer.as_str()), (200, text_of("sse-completed").as_str()));
+    let tokens: Vec<_> = proxy
+        .upstream
+        .http()
+        .iter()
+        .map(|e| e.headers["authorization"].to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(tokens, [format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")]);
+    assert!(cooldowns(&proxy) > 0, "the failing account is cooled");
+}

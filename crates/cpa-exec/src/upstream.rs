@@ -80,6 +80,7 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
             delivery: cpa_core::exec::Delivery::Classified,
             addon: None,
             diagnostic: None,
+            sourced: None,
         });
     }
     let is_sse = headers

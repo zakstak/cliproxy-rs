@@ -820,8 +820,11 @@ pub struct ExecError {
     pub direct: bool,
     /// For a `direct` error, the status the client receives when it differs from
     /// `status`, which stays the scheduler's classification (the Codex native route
-    /// delivers the upstream's own status while a usage limit is classified as 429).
-    pub delivered_status: Option<u16>,
+    /// delivers the upstream's own status while a usage limit is classified as 429). An
+    /// HTTP status is never zero; `NonZeroU16` also keeps this struct its size beside
+    /// [`Self::sourced`], so no error type that holds one grows (clippy
+    /// `result_large_err`).
+    pub delivered_status: Option<std::num::NonZeroU16>,
     /// How a WebSocket client learns of this failure ([`Delivery`]), apart from `status`
     /// and `body`, which stay the scheduler's classification.
     pub delivery: Delivery,
@@ -832,6 +835,26 @@ pub struct ExecError {
     pub addon: Option<Box<HeaderMap>>,
     /// Why a transport failed, for the request log only (see [`Diagnostic`]).
     pub diagnostic: Option<Diagnostic>,
+    /// The executor's classification from its provider's own sources, which the server's
+    /// provider-neutral Go request-fault rules defer to ([`SourcedFault`]). `None` keeps
+    /// those rules.
+    pub sourced: Option<SourcedFault>,
+}
+
+/// A failure classification an executor read from its own provider's first-party
+/// sources. The server's request-fault rules are Go's and provider-neutral; this carries
+/// the provider's reading past them for one failure without changing them for any other
+/// provider. Only the Codex executor sets it, for the first-party terminal rejections of
+/// FP2 (#116, `cpa_exec::codex_terminal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcedFault {
+    /// The provider's client never retries it, and it says nothing about the account's
+    /// health: the request stops on this account, with no failover, no cooldown and no
+    /// token refresh.
+    RequestTerminal,
+    /// The provider's client retries it, whatever its code names: not a request fault.
+    /// Its status keeps its own classification.
+    Retryable,
 }
 
 impl ExecError {
@@ -847,6 +870,7 @@ impl ExecError {
             delivery: Delivery::Classified,
             addon: None,
             diagnostic: None,
+            sourced: None,
         }
     }
 

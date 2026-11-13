@@ -675,7 +675,7 @@ async fn upstream_http_status_is_delivered_apart_from_classification() {
             .await
             .err()
             .expect("an error");
-        assert_eq!(error.delivered_status, Some(status));
+        assert_eq!(error.delivered_status, std::num::NonZeroU16::new(status));
         assert_eq!(error.status, 429, "classified as a limit for the scheduler");
         assert_eq!(text(&error.body), body);
         assert!(error.direct);

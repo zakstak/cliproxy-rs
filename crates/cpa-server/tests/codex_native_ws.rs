@@ -8252,3 +8252,490 @@ async fn metadata_beyond_the_bootstrap_bound_passes_in_order() {
         .unwrap();
     assert_eq!(read(&mut socket, &TERMINAL).await.frames, frames);
 }
+
+/// Two Codex credentials on `url` with the `websockets` attribute as given: the first
+/// (`at-FAKE`) preferred by its priority, the second (`at-FAKE-second`) the failover.
+fn preferred_pair(url: &str, websockets: bool) -> Vec<Credential> {
+    let mut first = credential(Profile::Chatgpt, url, websockets);
+    first.attributes.insert("priority".into(), "9".into());
+    let mut second = credential(Profile::Chatgpt, url, websockets);
+    second.id = "codex-second.json".into();
+    second.metadata.insert("access_token".into(), "at-FAKE-second".into());
+    second.attributes.insert("priority".into(), "8".into());
+    vec![first, second]
+}
+
+/// FP2 (#116) on the native WebSocket route, with a second account available. First-party
+/// Codex at research main `5c3ff1dabf644169f4bd74b215719f381e4fdb3f` never retries these
+/// rejections, and it reads them on two surfaces the proxy keeps apart:
+///
+/// - a wrapped status frame is the HTTP error of its status (`responses_websocket.rs:755-806`):
+///   the `ws-error-terminal-rejections` fixture, a 403 workspace frame by `error.code`
+///   and by `x-error-json` in its `headers`, and the 400 `context_length_exceeded`
+///   control of `ws-error-context-length-status`;
+/// - every other `error` frame, and every `response.failed`, is read with no status at
+///   all (`responses_websocket.rs:906-925`, `sse/responses.rs:379-383`): the
+///   `sse-terminal-rejections` fixture's frames, and notices whose status maps to no
+///   error (`200`, `1000`) or that the wrapped struct cannot read (`"503"`).
+///
+/// Each ends the turn on the selected account: one upstream frame on one socket (or one
+/// HTTP request when the turn runs over HTTP), no cooldown, and exactly one failed usage
+/// record. A rejection classified as 403 describes the account's workspace, so its frame
+/// is withheld (#6): the client gets no frame and the connection closes. Any other one
+/// reaches the client as sent, unknown fields included.
+#[tokio::test]
+async fn first_party_terminal_rejections_never_fail_over_on_websocket_turns() {
+    let encoded = {
+        use base64::Engine;
+        let provider = text(fixture("http-error-workspace-provider").bytes());
+        base64::engine::general_purpose::STANDARD.encode(provider.trim())
+    };
+    let wrapped = fixture("ws-error-terminal-rejections").frames();
+    let wrapped: Vec<String> = wrapped.into_iter().map(text).collect();
+    let mut cases: Vec<(String, bool, bool)> = vec![
+        (wrapped[0].clone(), true, true),
+        (wrapped[1].clone(), false, true),
+        (
+            r#"{"type":"error","status":403,"error":{"code":"invalid_workspace_selected"}}"#.to_owned(),
+            false,
+            true,
+        ),
+        (
+            format!(r#"{{"type":"error","status":403,"headers":{{"x-error-json":"{encoded}"}}}}"#),
+            false,
+            true,
+        ),
+        (
+            text(fixture("ws-error-context-length-status").frames()[0].clone()),
+            true,
+            true,
+        ),
+        (
+            r#"{"type":"error","status":200,"error":{"code":"inference_hook_denied","message":"notice"}}"#.to_owned(),
+            false,
+            true,
+        ),
+        (
+            r#"{"type":"error","status":1000,"error":{"code":"context_length_exceeded","message":"notice"}}"#
+                .to_owned(),
+            true,
+            true,
+        ),
+        (
+            r#"{"type":"error","status":"503","error":{"code":"content_policy_violation","message":"notice"}}"#
+                .to_owned(),
+            true,
+            true,
+        ),
+    ];
+    // The stream frames: the context code is the proxy's existing #5 relay, not FP2.
+    for frame in fixture("sse-terminal-rejections").frames().into_iter().map(text) {
+        let code = ["error.code", "response.error.code"]
+            .iter()
+            .map(|p| cpa_common::rawjson::get(&frame, p).str().to_owned())
+            .find(|c| !c.is_empty())
+            .unwrap();
+        if code == "context_length_exceeded" {
+            continue;
+        }
+        let delivered = !matches!(code.as_str(), "inference_hook_denied" | "access_program_not_enabled");
+        cases.push((frame, delivered, false));
+    }
+    assert_eq!(cases.len(), 8 + 10);
+    for (frame, delivered, socket_only) in cases {
+        for websockets in [true, false] {
+            if socket_only && !websockets {
+                continue;
+            }
+            let case = format!("websockets={websockets}: {frame}");
+            let script = if websockets {
+                Script {
+                    ws: vec![vec![Bytes::from(frame.clone())], fixture("sse-completed").frames()],
+                    ..Script::default()
+                }
+            } else {
+                Script {
+                    http: vec![
+                        cpa_server::testing::codex_capture::Reply::sse(format!("data: {frame}\n\n")),
+                        cpa_server::testing::codex_capture::Reply::sse(fixture("sse-completed").bytes()),
+                    ],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, "", |url| preferred_pair(url, websockets)).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            let create = client_frame("ws-create-first", "gpt-5.5");
+            socket.send(Message::text(create.clone())).await.unwrap();
+            // Until the close, or another account's completion if the turn failed over.
+            let got = read(&mut socket, &["response.completed"]).await;
+            if delivered {
+                assert_eq!(got.frames, [frame.as_str()], "{case}: the provider's frame");
+            } else {
+                assert!(
+                    got.frames.is_empty(),
+                    "{case}: withheld, and no other account's answer: {got:?}"
+                );
+            }
+            assert!(got.closed.is_some(), "{case}: {got:?}");
+            if websockets {
+                assert_eq!(proxy.upstream.sockets().len(), 1, "{case}: no second socket");
+                assert_eq!(
+                    proxy.upstream.sockets()[0].headers["authorization"],
+                    "Bearer at-FAKE",
+                    "{case}"
+                );
+                assert_eq!(upstream_frames(&proxy, 0), [create], "{case}: sent once");
+                assert!(proxy.upstream.http().is_empty(), "{case}");
+            } else {
+                let sent = proxy.upstream.http();
+                assert_eq!(sent.len(), 1, "{case}: one attempt");
+                assert_eq!(sent[0].headers["authorization"], "Bearer at-FAKE", "{case}");
+                assert!(proxy.upstream.sockets().is_empty(), "{case}");
+            }
+            for credential in proxy.rt.store().snapshot() {
+                assert!(
+                    proxy.rt.store().cooldowns(&credential.id).is_empty(),
+                    "{case}: {}",
+                    credential.id
+                );
+            }
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{case}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: one settlement"
+            );
+        }
+    }
+}
+
+/// FP2 (#116): a 403 upgrade refusal naming a workspace denial
+/// (`core/tests/suite/websocket_fallback.rs:133-152` at 5c3ff1dabf64, the
+/// `http-error-workspace-detail` body; first-party never retries it or falls back to
+/// HTTP) ends the turn on the selected account: one upgrade, no other account's socket, no
+/// HTTP request, no cooldown, one failed record. Its bytes never reach the client, which
+/// gets a silent close (#6). The bare 403 refusal is the control: an account failure that
+/// moves to the second account, whose upgrade the script refuses too. `request-retry: 0`
+/// keeps both to one round.
+#[tokio::test]
+async fn a_workspace_upgrade_refusal_stops_on_the_selected_account() {
+    use cpa_server::testing::codex_capture::Reply;
+    for (body, terminal) in [
+        (text(fixture("http-error-workspace-detail").bytes()), true),
+        (String::new(), false),
+    ] {
+        let proxy = proxy_with(
+            Script {
+                ws_reject: Some(Reply::json(403, body.clone())),
+                ..Script::default()
+            },
+            "routing:\n  retry:\n    request-retry: 0\n",
+            |url| preferred_pair(url, true),
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let got = read(&mut socket, &[]).await;
+        assert!(got.frames.is_empty(), "{body}: {got:?}");
+        assert!(got.closed.is_some(), "{body}: {got:?}");
+        let tokens: Vec<_> = proxy
+            .upstream
+            .sockets()
+            .iter()
+            .map(|s| s.headers["authorization"].to_str().unwrap().to_owned())
+            .collect();
+        assert!(proxy.upstream.http().is_empty(), "{body}: no HTTP fallback");
+        let cooled = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .filter(|c| !proxy.rt.store().cooldowns(&c.id).is_empty())
+            .count();
+        if terminal {
+            assert_eq!(
+                tokens,
+                ["Bearer at-FAKE"],
+                "{body}: one upgrade on the selected account"
+            );
+            assert_eq!(cooled, 0, "{body}");
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{body}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{body}: one settlement"
+            );
+        } else {
+            assert_eq!(tokens, ["Bearer at-FAKE", "Bearer at-FAKE-second"], "{body}");
+            assert!(cooled > 0, "{body}");
+        }
+    }
+}
+
+/// FP2 (#116): a wrapped `context_length_exceeded` 503 keeps its transient meaning
+/// (`responses_websocket.rs:1416-1439` at 5c3ff1dabf64, the fixture's second frame), with
+/// or without Anthropic's `invalid_request_error` type. It is not a fabricated
+/// context-window failure: the create moves once to the second account before anything
+/// was delivered, the client gets that account's answer and never the 503 frame, and only
+/// the first account is cooled.
+#[tokio::test]
+async fn a_context_labelled_503_fails_over_on_websocket_turns() {
+    let unavailable = text(fixture("ws-error-context-length-status").frames()[1].clone());
+    for frame in [
+        unavailable,
+        r#"{"type":"error","status":503,"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":null}}"#.to_owned(),
+    ] {
+        let proxy = proxy_with(
+            Script {
+                ws: vec![vec![Bytes::from(frame.clone())], fixture("sse-completed").frames()],
+                ..Script::default()
+            },
+            "",
+            |url| preferred_pair(url, true),
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        let create = client_frame("ws-create-first", "gpt-5.5");
+        socket.send(Message::text(create.clone())).await.unwrap();
+        let got = read(&mut socket, &TERMINAL).await;
+        assert_eq!(got.frames, events("sse-completed"), "{frame}");
+        let tokens: Vec<_> = proxy
+            .upstream
+            .sockets()
+            .iter()
+            .map(|s| s.headers["authorization"].to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(tokens, ["Bearer at-FAKE", "Bearer at-FAKE-second"], "{frame}");
+        assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create), "{frame}");
+        assert_eq!(upstream_frames(&proxy, 1), [create], "{frame}");
+        let cooled: Vec<_> = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .filter(|c| !proxy.rt.store().cooldowns(&c.id).is_empty())
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(cooled.len(), 1, "{frame}: {cooled:?}");
+        assert_ne!(cooled[0], "codex-second.json", "{frame}: the first account is cooled");
+    }
+}
+
+/// FP2 (#116) review finding 1 on the bootstrap path: with `stream-bootstrap-buffering`,
+/// an in-stream `inference_hook_denied` whose message reads as Go's model-capacity
+/// overload is still the first-party terminal rejection, never a bootstrap overload: the
+/// turn stops on the selected account with no second socket and no cooldown, its 403
+/// frame is withheld (#6), and one failed record is kept. A plain capacity failure with
+/// no first-party code is the control: it fails over to the second account.
+#[tokio::test]
+async fn a_capacity_message_never_fails_a_terminal_rejection_over_at_bootstrap() {
+    let buffering = "codex:\n  stream-bootstrap-buffering: true\n";
+    let terminal = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"inference_hook_denied","message":"model is at capacity"}}}"#;
+    let control = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"server_error","message":"model is at capacity"}}}"#;
+    for (frame, stops) in [(terminal, true), (control, false)] {
+        let proxy = proxy_with(
+            Script {
+                ws: vec![vec![Bytes::from(frame)], fixture("sse-completed").frames()],
+                ..Script::default()
+            },
+            buffering,
+            |url| preferred_pair(url, true),
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let mut socket = connect(&proxy).await;
+        socket
+            .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+            .await
+            .unwrap();
+        let got = read(&mut socket, &["response.completed"]).await;
+        let tokens: Vec<_> = proxy
+            .upstream
+            .sockets()
+            .iter()
+            .map(|s| s.headers["authorization"].to_str().unwrap().to_owned())
+            .collect();
+        let cooled = proxy
+            .rt
+            .store()
+            .snapshot()
+            .iter()
+            .filter(|c| !proxy.rt.store().cooldowns(&c.id).is_empty())
+            .count();
+        if stops {
+            assert!(
+                got.frames.is_empty(),
+                "{frame}: withheld, no other account's answer: {got:?}"
+            );
+            assert!(got.closed.is_some(), "{frame}: {got:?}");
+            assert_eq!(
+                tokens,
+                ["Bearer at-FAKE"],
+                "{frame}: one socket on the selected account"
+            );
+            assert_eq!(cooled, 0, "{frame}");
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{frame}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{frame}: one settlement"
+            );
+        } else {
+            assert_eq!(got.frames, events("sse-completed"), "{frame}");
+            assert_eq!(tokens, ["Bearer at-FAKE", "Bearer at-FAKE-second"], "{frame}");
+            assert!(cooled > 0, "{frame}");
+        }
+    }
+}
+
+/// FP2 (#116) re-review finding 1 (#6): an in-stream `content_policy_violation` that FP2
+/// classifies with 400 but whose own error names an account status (an inner 403) and the
+/// account is still withheld from a native client, on a socket and on a turn served over
+/// HTTP. It stops on the selected account: one upstream frame or request, no second
+/// account, no cooldown, one failed record. The same rejection without an account status
+/// is the control: delivered as sent.
+#[tokio::test]
+async fn an_inner_account_status_keeps_a_terminal_rejection_withheld() {
+    let leaky = r#"{"type":"response.failed","sequence_number":2,"response":{"id":"resp_fp2","status":"failed","error":{"code":"content_policy_violation","status":403,"message":"workspace org-PRIVATE denied"}}}"#;
+    let plain = r#"{"type":"response.failed","sequence_number":2,"response":{"id":"resp_fp2","status":"failed","error":{"code":"content_policy_violation","message":"rejected"}}}"#;
+    for (frame, withheld) in [(leaky, true), (plain, false)] {
+        for websockets in [true, false] {
+            let case = format!("websockets={websockets}: {frame}");
+            let script = if websockets {
+                Script {
+                    ws: vec![vec![Bytes::from(frame)], fixture("sse-completed").frames()],
+                    ..Script::default()
+                }
+            } else {
+                Script {
+                    http: vec![
+                        cpa_server::testing::codex_capture::Reply::sse(format!("data: {frame}\n\n")),
+                        cpa_server::testing::codex_capture::Reply::sse(fixture("sse-completed").bytes()),
+                    ],
+                    ..Script::default()
+                }
+            };
+            let proxy = proxy_with(script, "", |url| preferred_pair(url, websockets)).await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let mut socket = connect(&proxy).await;
+            socket
+                .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                .await
+                .unwrap();
+            let got = read(&mut socket, &["response.completed"]).await;
+            assert!(!got.frames.iter().any(|f| f.contains("PRIVATE")), "{case}: {got:?}");
+            if withheld {
+                assert!(got.frames.is_empty(), "{case}: withheld: {got:?}");
+            } else {
+                assert_eq!(got.frames, [frame], "{case}: delivered as sent");
+            }
+            assert!(got.closed.is_some(), "{case}: {got:?}");
+            let attempts = proxy.upstream.sockets().len() + proxy.upstream.http().len();
+            assert_eq!(attempts, 1, "{case}: one attempt on the selected account");
+            for credential in proxy.rt.store().snapshot() {
+                assert!(
+                    proxy.rt.store().cooldowns(&credential.id).is_empty(),
+                    "{case}: {}",
+                    credential.id
+                );
+            }
+            let settled = records(&proxy, 1).await;
+            assert_eq!(settled[0]["failed"], true, "{case}: {settled:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                "{case}: one settlement"
+            );
+        }
+    }
+}
+
+/// FP2 (#116) third review finding 1 (#6): a context-window failure a Codex client would
+/// receive ahead of its error (#5) is never emitted when its frame can name the pooled
+/// account: here a usage-limit type with the account in its message. With and without
+/// `stream-bootstrap-buffering`, on a socket and on a turn served over HTTP, the client
+/// gets no frame and the account text never; the turn stops on the selected account with
+/// no cooldown and one failed record. The plain context failure is the control: it still
+/// reaches the client.
+#[tokio::test]
+async fn an_account_shaped_context_failure_is_never_preserved() {
+    let leaky = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"context_length_exceeded","type":"usage_limit_reached","message":"model is at capacity; account org-PRIVATE"}}}"#;
+    let plain = r#"{"type":"response.failed","response":{"id":"resp_fp2","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+    for (frame, withheld) in [(leaky, true), (plain, false)] {
+        for config in ["", "codex:\n  stream-bootstrap-buffering: true\n"] {
+            for websockets in [true, false] {
+                let case = format!("websockets={websockets} config={config:?}: {frame}");
+                let script = if websockets {
+                    Script {
+                        ws: vec![vec![Bytes::from(frame)], fixture("sse-completed").frames()],
+                        ..Script::default()
+                    }
+                } else {
+                    Script {
+                        http: vec![
+                            cpa_server::testing::codex_capture::Reply::sse(format!("data: {frame}\n\n")),
+                            cpa_server::testing::codex_capture::Reply::sse(fixture("sse-completed").bytes()),
+                        ],
+                        ..Script::default()
+                    }
+                };
+                let proxy = proxy_with(script, config, |url| preferred_pair(url, websockets)).await;
+                proxy.rt.usage_queue().configure(
+                    true,
+                    &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+                );
+                let mut socket = connect(&proxy).await;
+                socket
+                    .send(Message::text(client_frame("ws-create-first", "gpt-5.5")))
+                    .await
+                    .unwrap();
+                let got = read(&mut socket, &["response.completed"]).await;
+                assert!(!got.frames.iter().any(|f| f.contains("PRIVATE")), "{case}: {got:?}");
+                if withheld {
+                    assert!(got.frames.is_empty(), "{case}: withheld: {got:?}");
+                } else {
+                    assert!(
+                        got.frames.iter().any(|f| f.contains("context_length_exceeded")),
+                        "{case}: the context failure reaches the client: {got:?}"
+                    );
+                }
+                let attempts = proxy.upstream.sockets().len() + proxy.upstream.http().len();
+                assert_eq!(attempts, 1, "{case}: one attempt on the selected account");
+                for credential in proxy.rt.store().snapshot() {
+                    assert!(
+                        proxy.rt.store().cooldowns(&credential.id).is_empty(),
+                        "{case}: {}",
+                        credential.id
+                    );
+                }
+                let settled = records(&proxy, 1).await;
+                assert_eq!(settled[0]["failed"], true, "{case}: {settled:?}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(
+                    proxy.rt.usage_queue().pop_oldest(10).is_empty(),
+                    "{case}: one settlement"
+                );
+            }
+        }
+    }
+}

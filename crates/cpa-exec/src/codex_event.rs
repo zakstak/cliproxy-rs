@@ -884,6 +884,51 @@ pub(crate) fn status_present(payload: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// [`classification_view`] without the projection of a `response.failed`'s
+/// `response.error` array into the object `parse_failed_response`'s `Error` struct reads:
+/// the logical event value first-party `parse_terminal_provider_error` sees, before that
+/// struct decode (`sse/responses_error.rs:32` at 5c3ff1dabf64). FP2 reads its terminal
+/// codes from this value, so an accepted positional `Error` array names no code for them
+/// (`crate::codex_terminal`).
+pub(crate) fn logical_view(payload: &str) -> Cow<'_, str> {
+    match positional_object(payload) {
+        Some(object) => Cow::Owned(pinned_view(&object).into_owned()),
+        None => pinned_view(payload),
+    }
+}
+
+/// `text` without leading and trailing JSON whitespace (space, tab, line feed, carriage
+/// return), the only whitespace a JSON parser skips.
+pub(crate) fn json_trim(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
+/// The raw `headers` member of a wrapped status frame `payload` as the first-party
+/// `WrappedWebsocketErrorEvent` decodes it (`responses_websocket.rs:735-745` at
+/// 5c3ff1dabf64), by name or by position, as sent; `None` without one.
+pub(crate) fn wrapped_headers(payload: &str) -> Option<&str> {
+    serde_json::from_str::<WrappedShape<'_>>(payload)
+        .ok()?
+        .headers
+        .map(RawValue::get)
+}
+
+/// `payload`, an HTTP error body or a wrapped frame, as the first-party build's
+/// `serde_json::from_str::<Value>` reads it (FP2, `api_bridge.rs:138-140` at
+/// 5c3ff1dabf64): `None` when that `Value` refuses it ([`value_decodes`], with its root
+/// classified), else its text with the last of each repeated key and serde_json's private
+/// number and raw value tokens resolved, the root included. A number of any size is
+/// accepted (`arbitrary_precision`), unlike this build's own `Value`.
+pub(crate) fn value_view(payload: &str) -> Option<Cow<'_, str>> {
+    // JSON whitespace only: the first-party parser refuses any other (sixth review
+    // finding 3), so a body led by U+00A0 is no `Value`.
+    let payload = json_trim(payload);
+    if serde_json::from_str::<IgnoredAny>(payload).is_err() || !value_decodes(payload, 1, true) {
+        return None;
+    }
+    Some(view(payload, true, false, true))
+}
+
 /// `payload`, an event, as the pinned client's `serde_json::Value` holds it, for
 /// classification only (#25). Two readings differ from the bytes as sent:
 ///

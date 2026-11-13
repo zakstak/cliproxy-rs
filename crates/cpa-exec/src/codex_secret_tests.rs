@@ -89,7 +89,7 @@ fn a_failure_keeps_its_classification_and_loses_its_delivery() {
     let mut error = ExecError::local(400, FailureScope::Request, r#"{"error":{"message":"bad"}}"#);
     error.delivery = Delivery::AsSent(Box::new(frame));
     error.direct = true;
-    error.delivered_status = Some(400);
+    error.delivered_status = std::num::NonZeroU16::new(400);
     let guarded = s.guarded(error);
     assert_eq!(guarded.delivery, Delivery::Confidential(s.clone()));
     assert_eq!((guarded.status, guarded.scope), (400, FailureScope::Request));

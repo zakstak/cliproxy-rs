@@ -1358,6 +1358,21 @@ Passive accounting reads a copy and changes nothing.
   and `limit_window_minutes`, plus the `x-codex-*` rate-limit headers, becomes a usage
   limit in the client (`codex-api/src/api_bridge.rs:207-255`). Status, body and those
   headers reach the client.
+- Terminal request rejections (FP2, #116, research main `5c3ff1dabf64`, not the pin).
+  `error.rs:92-162` adds `inference_hook_denied` (no status or 403),
+  `content_policy_violation` (no status or 400), `invalid_access_program`,
+  `unsupported_access_program` and `access_program_not_enabled` (no status), and
+  `api_bridge.rs:293-311` makes a 403 whose `/detail/code`, `/error/code` or
+  `x-error-json` code is a workspace or access-program denial terminal. The client never
+  retries them. The proxy stops the request on the selected account: no failover, no
+  cooldown, no refresh. An in-stream event, and a WebSocket `error` frame the wrapped
+  mapping leaves unmapped, are read with no status (an in-stream one takes the 403 or 400
+  the code pairs with); a wrapped status frame or an upgrade refusal with its status.
+  `context_length_exceeded` is a context-window failure only without a status or with
+  400. Frames reach the client as sent, except that a 403 is withheld from a native
+  WebSocket client (#6). `cpa_exec::codex_terminal` holds the rules and
+  `ExecError::sourced` carries them to the scheduler;
+  [FP2-TERMINAL-ERRORS.md](FP2-TERMINAL-ERRORS.md) lists the evidence and open gates.
 - WebSocket errors. A wrapped `{"type":"error","status":...,"error":...,"headers":...}` frame
   is classified by `responses_websocket.rs:712-764`. `previous_response_not_found` and
   `websocket_connection_limit_reached` are retryable, and the client retries

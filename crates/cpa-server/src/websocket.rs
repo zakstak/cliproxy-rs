@@ -278,6 +278,8 @@ struct Failure {
     /// The values a confidential failure carries, which the timeline keeps `text`
     /// scrubbed of ([`cpa_core::exec::Delivery::Confidential`]).
     sent: cpa_core::exec::SentCredentials,
+    /// The executor's sourced request-fault reading (`classify::sourced_request_fault`).
+    sourced: Option<bool>,
 }
 
 impl Failure {
@@ -293,6 +295,7 @@ impl Failure {
             delivered: delivered(e),
             withheld: withheld(e),
             sent: sent(e),
+            sourced: classify::sourced_request_fault(e),
         }
     }
 
@@ -310,6 +313,7 @@ impl Failure {
                     delivered: delivered(e),
                     withheld: withheld(e),
                     sent: sent(e),
+                    sourced: classify::sourced_request_fault(e),
                 }
             }
             // A trusted control-plane rejection keeps its Go rendering; only the limit
@@ -321,6 +325,7 @@ impl Failure {
                 delivered: delivered(e),
                 withheld: withheld(e),
                 sent: sent(e),
+                sourced: classify::sourced_request_fault(e),
                 ..Self::local(failure.status(), &failure.text())
             },
             dispatch::Failure::Cooldown {
@@ -347,6 +352,7 @@ impl Failure {
             delivered: None,
             withheld: false,
             sent: Default::default(),
+            sourced: None,
         }
     }
 
@@ -361,6 +367,7 @@ impl Failure {
             delivered: None,
             withheld: false,
             sent: Default::default(),
+            sourced: None,
         }
     }
 }
@@ -1962,9 +1969,22 @@ fn preserved_failure(failure: &Failure) -> bool {
 /// native Codex client's subscription limit (`Failure::limit`) is sent before this check
 /// (docs/DIFFERENCES-FROM-GO.md). A withheld native Codex failure is never exposed: its
 /// `text` is the provider's error, which can name the pooled account (#6).
+///
+/// A sourced terminal rejection (FP2) is a request fault, but one classified as an
+/// account status (401, 402, 403, 429) stays unexposed, as it was before: a workspace or
+/// access-program denial describes the pooled account, and its bytes never reach a
+/// WebSocket client through this path (#6), whether it came as a frame or as an upgrade
+/// refusal.
 // ponytail: Go also exposes terminal upstream-auth errors; no executor reports them yet.
 fn exposed(failure: &Failure) -> bool {
-    !failure.withheld && classify::is_request_fault(failure.status, &failure.text)
+    if failure.withheld {
+        return false;
+    }
+    match failure.sourced {
+        Some(true) => !matches!(failure.status, 401 | 402 | 403 | 429),
+        Some(false) => false,
+        None => classify::is_request_fault(failure.status, &failure.text),
+    }
 }
 
 /// `closeForUpstreamError` then `writeResponsesWebsocketTerminalError`: a close code,

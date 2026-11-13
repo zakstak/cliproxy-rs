@@ -1208,6 +1208,7 @@ fn turn_error(lost: &ExecError) -> ExecError {
     if lost.status == 413 {
         ExecError {
             diagnostic: lost.diagnostic.clone(),
+            sourced: None,
             ..message_too_big()
         }
     } else {
@@ -1271,8 +1272,19 @@ fn ws_error_body(payload: &str) -> Option<(u16, String)> {
     Some((status, out))
 }
 
-/// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status.
+/// `parseCodexWebsocketErrorWithCooling`: an `error` frame that carries an HTTP status,
+/// read as given (also FP2's reading).
 pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecError> {
+    status_frame_error(payload, payload, model_level_cooling)
+}
+
+/// [`ws_error`] of the pinned reader's view `payload` of a wrapped frame received as
+/// `original`. First-party maps a wrapped status frame to the HTTP error of its status
+/// whose body is the frame as received, and whose headers are the decoded struct's
+/// (`responses_websocket.rs:755-806` at 5c3ff1dabf64), so FP2 reads `original` as the body
+/// and the view's `headers`: a positional array has no `/error/code` there, though its
+/// view does (fourth review finding 2). Go's classification reads the view.
+pub(super) fn status_frame_error(payload: &str, original: &str, model_level_cooling: bool) -> Option<ExecError> {
     let (status, out) = ws_error_body(payload)?;
     let mut headers = HeaderMap::new();
     let raw_headers = rawjson::get(payload, "headers");
@@ -1305,12 +1317,44 @@ pub(crate) fn ws_error(payload: &str, model_level_cooling: bool) -> Option<ExecE
     .any(|p| rawjson::get(payload, p).str().trim() == "websocket_connection_limit_reached");
     // Go `statusErrWithHeaders`: the frame's headers reach the client under passthrough.
     let addon = (!headers.is_empty()).then(|| Box::new(headers.clone()));
-    let mut error = response::status_error_raw(status, &out, headers, model_level_cooling);
+    // FP2: the first-party wrapped mapping reads the whole frame as the HTTP body of its
+    // status, and the frame's `headers` as its headers (`responses_websocket.rs:755-806`
+    // at 5c3ff1dabf64), so `x-error-json` too.
+    // Its own header reading, as first-party reads it (untrimmed, re-review finding 4); the
+    // trimmed `headers` above stay Go's passthrough and classification copy.
+    // First-party returns `ApiError::Retryable` for a wrapped retryable code before any
+    // status mapping (`responses_websocket.rs:776-792` at 5c3ff1dabf64), so FP2 reads no
+    // status there (seventh review finding 2); Go's classification stays.
+    let retryable = matches!(
+        crate::codex_event::wrapped(original),
+        Some(crate::codex_event::Wrapped::Retryable(_))
+    );
+    let sourced = if retryable {
+        None
+    } else {
+        crate::codex_terminal::reading(status, original, &crate::codex_terminal::frame_headers(original))
+    };
+    let error = response::status_error_raw(status, &out, headers, model_level_cooling);
+    let mut error = response::with_sourced(error, sourced);
     error.addon = addon;
     if error.retry_after.is_none() && connection_limit {
         error.retry_after = Some(Duration::ZERO);
     }
     Some(error)
+}
+
+/// A refused upstream WebSocket upgrade as an error. Go returns a plain `statusErr` for
+/// 426 on downstream WebSockets; every other status is `newCodexStatusErrWithCooling`.
+/// Both carry the first-party reading of the status and body (FP2, review finding 4):
+/// the 426 keeps its plain rendering, but `context_length_exceeded` on it is retried by
+/// first-party Codex (`error.rs:110-112`), so Go's code rule does not stop it.
+pub(crate) fn upgrade_refusal(status: u16, body: &[u8], handshake: HeaderMap, model_level_cooling: bool) -> ExecError {
+    if status != 426 {
+        return response::status_error(status, body, handshake, model_level_cooling);
+    }
+    let text = String::from_utf8_lossy(body).into_owned();
+    let sourced = crate::codex_terminal::reading(status, &text, &handshake);
+    response::with_sourced(response::status_error_raw(status, &text, handshake, false), sourced)
 }
 
 /// One upstream message, classified.
@@ -1475,13 +1519,20 @@ impl Turn {
                 // The context-window `error` a Codex client gets as `response.failed` (#5)
                 // is delivered ahead of the error; any other failure of a native turn
                 // travels on the error, for delivery once failover is decided.
-                let event = self.preserved_event(payload);
+                // Never ahead of the account safety (#6): a withheld frame is not
+                // preserved either (third review finding 1).
+                let event = if error.withheld() {
+                    None
+                } else {
+                    self.preserved_event(payload)
+                };
                 if event.is_none() {
                     deliver_as_sent(&mut error, &text);
                 }
+                let overload = response::failure_overload(&error, &body);
                 Frame::Failed {
                     error,
-                    overload: response::is_overload(&body),
+                    overload,
                     read: false,
                     status_frame: false,
                     event,
@@ -1700,8 +1751,9 @@ fn invalidate_failed(turn: &Turn, error: &ExecError) {
 ///   `previous_response_not_found`) fails it whatever the status: as a status frame when
 ///   the status is an error status, otherwise by `response::terminal_failure`.
 /// - A status that maps to no error (2xx, or not an HTTP status) makes the frame a
-///   notice. A decoded one fails the turn only when the pinned `error` branch raises it
-///   anyway (a terminal provider code, `error.rs:79-127`); otherwise it is passed.
+///   notice. A decoded one fails the turn only when the first-party `error` branch raises
+///   it anyway (a terminal provider code of the pin, `error.rs:79-127`, or of research
+///   main, FP2), read with no status; otherwise it is passed.
 /// - Without a status or a recognised code, a decoded `error` keeps the status-less
 ///   failure reading ([`ws_error`], then `response::terminal_failure`), and an
 ///   undecoded frame is passed.
@@ -1726,9 +1778,12 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
     } else {
         None
     };
-    let status_frame = |view: &str| ws_error(view, cooling).map(|error| Reading::Failure { error, body: None });
-    let terminal = |view: &str| {
-        response::terminal_failure(view, cooling).map(|(error, body)| Reading::Failure {
+    let status_frame =
+        |view: &str| status_frame_error(view, text, cooling).map(|error| Reading::Failure { error, body: None });
+    // The event as received: `response::received_failure` takes the pinned reader's view
+    // for Go's classification and FP2's codes from the logical value.
+    let terminal = || {
+        response::received_failure(text, cooling).map(|(error, body)| Reading::Failure {
             error,
             body: Some(body),
         })
@@ -1738,14 +1793,14 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
     // code, as its `Value` reads that code.
     let notice = |event: &crate::codex_event::Event<'_>| {
         if terminal_provider_error(event) {
-            terminal(&view())
+            terminal()
         } else {
             None
         }
     };
     let failure = match (event, wrapped) {
         (_, Some(Wrapped::Status(_) | Wrapped::Retryable(Some(_)))) => status_frame(&view()),
-        (_, Some(Wrapped::Retryable(None))) => terminal(&view()),
+        (_, Some(Wrapped::Retryable(None))) => terminal(),
         (Some(event), Some(Wrapped::Notice)) => notice(event),
         (None, _) => return Reading::Passed { decoded: false },
         // A decoded `error` with a status that is no wrapped frame: the status did not
@@ -1758,14 +1813,21 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         // unless its logical code is a terminal provider code. Go's integer reading of
         // the status ([`ws_error`]) decides nothing here; it only keeps the scheduler's
         // status for a terminal provider failure the pinned reader raises anyway.
+        //
+        // FP2: a code only research main raises there (`main_terminal_code`) is read as
+        // main reads it, with no status at all (`responses_websocket.rs:906-925` at
+        // 5c3ff1dabf64, then `parse_terminal_provider_error(.., None)`): Go's integer
+        // reading of the status must not turn it into an HTTP-status reading.
         (Some(event), _) if event.kind == "error" && crate::codex_event::status_present(payload) => {
-            if terminal_provider_error(event) {
+            if main_terminal_code(event) {
+                terminal()
+            } else if terminal_provider_error(event) {
                 let view = view();
                 match status_frame(&view) {
                     Some(Reading::Failure { error, body }) if crate::codex_event::error_status(error.status) => {
                         Some(Reading::Failure { error, body })
                     }
-                    _ => terminal(&view),
+                    _ => terminal(),
                 }
             } else {
                 None
@@ -1774,7 +1836,7 @@ pub(super) fn reading(text: &str, event: Option<&crate::codex_event::Event<'_>>,
         // Only a decoded `error` without any status keeps the status-less failure
         // reading (the status-frame reading finds no status in it either); a decoded
         // `response.failed` is classified by its own reading.
-        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(&view()),
+        (Some(event), _) if matches!(event.kind.as_ref(), "error" | "response.failed") => terminal(),
         (Some(event), _) => {
             return Reading::Event {
                 terminal: event.outcome().ends_turn(),
@@ -1806,25 +1868,38 @@ pub(super) enum Reading {
     Passed { decoded: bool },
 }
 
-/// Whether the pinned `error` branch fails the response on a decoded `error` event
-/// without a status (`parse_terminal_provider_error`, `codex-api/src/error.rs:79-127`):
-/// its last `error.code` is a terminal provider code.
+/// Whether the first-party `error` branch fails the response on a decoded `error` event
+/// read without a status (`parse_terminal_provider_error`): its last `error.code` is a
+/// terminal provider code, of the contract pin (`codex-api/src/error.rs:79-127` at
+/// 44ccf394573c) or of research main ([`main_terminal_code`]).
 fn terminal_provider_error(event: &crate::codex_event::Event<'_>) -> bool {
     let code = event.error_str("code");
-    matches!(
-        code.as_deref(),
-        Some(
-            "budget_reached"
-                | "audio_too_large"
-                | "audio_too_short"
-                | "invalid_audio"
-                | "invalid_audio_data"
-                | "invalid_audio_format"
-                | "missing_audio_sample_rate"
-                | "flex_unavailable"
-                | "model_not_found"
+    main_terminal_code(event)
+        || matches!(
+            code.as_deref(),
+            Some(
+                "budget_reached"
+                    | "audio_too_large"
+                    | "audio_too_short"
+                    | "invalid_audio"
+                    | "invalid_audio_data"
+                    | "invalid_audio_format"
+                    | "missing_audio_sample_rate"
+                    | "flex_unavailable"
+                    | "model_not_found"
+            )
         )
-    )
+}
+
+/// Whether the last `error.code` of a decoded `error` event is one research main's
+/// `parse_terminal_provider_error` raises without a status and the contract pin's does
+/// not (FP2, #116, `codex-api/src/error.rs:103-134` at 5c3ff1dabf64):
+/// `context_length_exceeded` and `crate::codex_terminal::STREAM_TERMINAL`. The pinned
+/// reader reads on past such a notice; main fails the response, and so does the proxy.
+fn main_terminal_code(event: &crate::codex_event::Event<'_>) -> bool {
+    event.error_str("code").is_some_and(|code| {
+        code == "context_length_exceeded" || crate::codex_terminal::STREAM_TERMINAL.contains(&code.as_str())
+    })
 }
 
 /// A frame [`reading`] passes: delivered as sent, as content. A frame that would read as
@@ -1887,6 +1962,8 @@ fn account_reading(text: &str) -> bool {
     [
         ws_error(text, false).map(|error| error.status),
         response::terminal_failure(text, false).map(|(error, _)| error.status),
+        response::go_failure_status(text),
+        response::written_rejection_status(text),
     ]
     .into_iter()
     .flatten()
@@ -2182,12 +2259,7 @@ impl CodexExecutor {
                 if let Some(wire) = wire {
                     wire.upgrade_rejection(&target.url, request, status, &handshake, &body);
                 }
-                if status == 426 {
-                    // Go returns a plain statusErr for 426 on downstream WebSockets.
-                    let text = String::from_utf8_lossy(&body).into_owned();
-                    return Err(response::status_error_raw(status, &text, handshake, false));
-                }
-                return Err(response::status_error(status, &body, handshake, model_level_cooling));
+                return Err(upgrade_refusal(status, &body, handshake, model_level_cooling));
             }
             // ponytail: Go reports a failed negotiation (and a bad handshake) as a status
             // error carrying 101; here both are transport failures.
