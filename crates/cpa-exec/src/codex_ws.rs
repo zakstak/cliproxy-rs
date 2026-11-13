@@ -2150,12 +2150,14 @@ impl CodexExecutor {
         }
         // Publish before the reader runs, so a reader that fails at once still finds its
         // socket current and invalidates it; holding the handle slot keeps a concurrent
-        // shutdown from missing the abort handle.
-        let mut reader = conn.reader.lock().expect("reader handle");
-        session.publish(conn.clone());
-        let task = tokio::spawn(read_loop(stream, Arc::downgrade(session), conn.clone(), self.ws.idle));
-        *reader = Some(task.abort_handle());
-        drop(reader);
+        // shutdown from missing the abort handle. The guard's scope ends with this block,
+        // so the future stays `Send` across a later await.
+        {
+            let mut reader = conn.reader.lock().expect("reader handle");
+            session.publish(conn.clone());
+            let task = tokio::spawn(read_loop(stream, Arc::downgrade(session), conn.clone(), self.ws.idle));
+            *reader = Some(task.abort_handle());
+        }
         #[cfg(test)]
         {
             let gate = self.ws.dial_gate.lock().expect("dial gate").clone();
