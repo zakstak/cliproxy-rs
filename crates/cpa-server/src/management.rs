@@ -566,6 +566,18 @@ pub fn router(state: Arc<Management>) -> Router {
             "routing/cooldown/reset",
             methods().post(guarded!(s, auth_files::cooldown_reset)),
         ),
+        // Go CLIProxyAPI 10417e5b (after v8.0.35): on-demand model catalog refresh. A GET
+        // still reads the `refresh` channel, as gin's GET `:channel` route does.
+        (
+            "routing/model-definitions/refresh",
+            methods()
+                .get(guarded!(s, auth_files::model_definitions_refresh_channel))
+                .post(guarded!(s, auth_files::refresh_model_definitions)),
+        ),
+        (
+            "models/refresh",
+            methods().post(guarded!(s, auth_files::refresh_model_definitions)),
+        ),
         (
             "observability/usage/api-keys",
             methods().get(guarded!(s, observability::api_key_usage)),

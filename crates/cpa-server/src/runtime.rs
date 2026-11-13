@@ -179,6 +179,11 @@ impl Runtime {
         drop(previous);
     }
 
+    /// Calls `f` with the model catalog session, `None` before `model_updater::start`.
+    pub(crate) fn with_catalogs<T>(&self, f: impl FnOnce(Option<&crate::model_updater::Session>) -> T) -> T {
+        f(self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref())
+    }
+
     /// Whether [`Runtime::publish_config_and_policy`] would commit `config`: Go
     /// `commitConfigUpdate` rejects the whole update over invalid catalog sources.
     /// Callers that apply other state before publishing check this first.

@@ -182,7 +182,15 @@ service-name ports such as `:http` are not accepted.
 
 | Setting | What it does |
 |---|---|
-| `catalog`, `codex-catalog` | Where the model catalog (`models.json`) and the Codex client catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cliproxy-rs checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
+| `catalog`, `codex-catalog` | Where the model catalog (`models.json`) and the Codex client catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. Each catalog is read at start (the default Codex client catalog when it is first needed) and every three hours; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
+
+To read both catalogs now instead of waiting for the next three-hourly read, send `POST /v8/management/models/refresh` (or `POST /v8/management/routing/model-definitions/refresh`) with the management key:
+
+```sh
+curl -X POST -H "Authorization: Bearer $MANAGEMENT_KEY" http://127.0.0.1:8317/v8/management/models/refresh
+```
+
+The answer names each catalog's source, whether it was read, and the providers whose models changed. It is 200 when every catalog was read or skipped, and 502 when one failed. A failed catalog keeps its last valid data. A catalog whose source is `embed` (`--local-model`) or `disabled` (models.json in Home mode) is skipped. Requests sent while a read is running wait for that read instead of starting another.
 
 ## worker-threads
 
