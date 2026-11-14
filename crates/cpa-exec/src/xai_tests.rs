@@ -84,6 +84,149 @@ const V8_0_67_ENDINGS: &[&str] = &["disconnected_before_completed", "usage_done_
 /// and listed, so integration can remove an entry and see the scenario run.
 const PENDING: &[&str] = &[];
 
+/// #88 (docs/DIFFERENCES-FROM-GO.md, "xAI User-Agent"): outside the Grok CLI chat proxy,
+/// a request without a caller `User-Agent` sends the Grok CLI's, as Go v8.0.67 does
+/// (5026f365), where v8.0.35 sent net/http's default. No recording has a caller
+/// User-Agent, so every recorded default becomes the Grok CLI's; the rest compares.
+fn with_user_agent_difference(s: &Value, go: String) -> String {
+    let caller = s["headers"]
+        .as_object()
+        .is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("user-agent")));
+    assert!(!caller, "{}: a recording with a caller User-Agent", s["name"]);
+    go.replacen(
+        "\r\nUser-Agent: Go-http-client/1.1\r\n",
+        "\r\nUser-Agent: xai-grok-workspace/1.0.44\r\n",
+        1,
+    )
+}
+
+/// Caller headers that must never reach xAI, with a header a `$X-Explicit-UA`
+/// attribute may reference.
+const CALLER_HEADERS: [(&str, &str); 7] = [
+    ("authorization", "Bearer caller-secret-FAKE"),
+    ("cookie", "session=caller-cookie-FAKE"),
+    ("x-api-key", "caller-api-key-FAKE"),
+    ("proxy-authorization", "Basic caller-proxy-FAKE"),
+    ("x-amz-security-token", "caller-token-FAKE"),
+    ("x-unrelated", "caller-extra"),
+    ("x-explicit-ua", "referenced/4.0"),
+];
+
+/// The caller's first User-Agent value (a second one follows it), an optional
+/// `header:User-Agent` attribute and the User-Agent upstream must see outside the Grok
+/// CLI chat proxy.
+const USER_AGENT_CASES: [(Option<&str>, Option<&str>, &str); 10] = [
+    (None, None, "xai-grok-workspace/1.0.44"),
+    (Some(""), None, "xai-grok-workspace/1.0.44"),
+    (Some(" \t "), None, "xai-grok-workspace/1.0.44"),
+    (Some("caller-client/2.0"), None, "caller-client/2.0"),
+    (Some("  caller-client/2.0 \t"), None, "caller-client/2.0"),
+    // Go's strings.TrimSpace removes Unicode white space such as U+00A0.
+    (Some("\u{a0}caller-client/2.0\u{a0}"), None, "caller-client/2.0"),
+    (Some("caller-\u{e9}/2.0"), None, "caller-\u{e9}/2.0"),
+    (Some("caller-client/2.0"), Some("operator/3.0"), "operator/3.0"),
+    (Some("caller-client/2.0"), Some("$X-Explicit-UA"), "referenced/4.0"),
+    (Some("caller-client/2.0"), Some("$X-Missing"), "caller-client/2.0"),
+];
+
+/// Lexically unusual members the client sends that no rule rewrites.
+const OPAQUE_MEMBER: &str = r#""future_field" : {"opaque":"\u0061", "big":12345678901234567890}, "#;
+
+/// #88 on the HTTP paths, over a loopback upstream: only `User-Agent` is taken from the
+/// caller, on the API, an OAuth custom base URL, OAuth compact and the native media
+/// path, while the chat proxy keeps the fixed Grok CLI identity. A `header:` attribute
+/// still wins. The native body is unchanged. This is local policy evidence, not
+/// evidence that xAI accepts any of these identities.
+#[tokio::test]
+async fn caller_user_agent_on_http() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    for name in [
+        "api_key_default_base",
+        "oauth_custom_base_without_cli_headers",
+        "compact_oauth_uses_official_api",
+        "videos_create_idempotency",
+        "oauth_default_chat_proxy",
+    ] {
+        let mut scenario = fixture["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap()
+            .clone();
+        let payload = scenario["payload"]
+            .as_str()
+            .unwrap()
+            .replacen('{', &format!("{{{OPAQUE_MEMBER}"), 1);
+        scenario["payload"] = Value::String(payload);
+        // The native video body is the client's payload, opaque member included.
+        let recorded = native_video_request(name, &scenario).unwrap();
+        let (_, recorded_body) = recorded.split_once("\r\n\r\n").unwrap();
+        let want_body = if NATIVE_VIDEO_BODIES.contains(&name) {
+            recorded_body.to_owned()
+        } else {
+            recorded_body.replacen('{', &format!("{{{OPAQUE_MEMBER}"), 1)
+        };
+        assert!(want_body.contains(OPAQUE_MEMBER), "{name}");
+        let chat_proxy = name == "oauth_default_chat_proxy";
+        for (caller, custom, expected) in USER_AGENT_CASES {
+            let mock = Mock::start(&scenario["upstream"]).await;
+            let addr = mock.addr.clone();
+            let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+            // A private auth-dir that is never created: these paths read no logins.
+            let cfg = Config {
+                auth_dir: std::env::temp_dir().join(format!("cpa-xai-ua-{}", std::process::id())),
+                ..Default::default()
+            };
+            let mut c = credential(&scenario, &cfg);
+            if let Some(custom) = custom {
+                c.attributes.insert("header:User-Agent".into(), custom.into());
+            }
+            let mut req = request(&scenario, Default::default());
+            for (header, value) in CALLER_HEADERS {
+                req.headers.insert(header, value.parse().unwrap());
+            }
+            if let Some(caller) = caller {
+                req.headers.insert("user-agent", caller.parse().unwrap());
+                // Go's Header.Get reads the first value, also when it is blank.
+                req.headers.append("user-agent", "second-client/9.0".parse().unwrap());
+            }
+            let result = if scenario["op"] == "videos" {
+                let path = scenario["request_path"].as_str().unwrap().to_owned();
+                executor.videos(&c, req, &path, &cfg).await
+            } else {
+                executor.execute(&c, req, &cfg, false).await
+            };
+            let case = format!("{name}, caller {caller:?}, header:User-Agent {custom:?}");
+            assert!(result.is_ok(), "{case}: {:?}", result.err());
+            let raw = mock.request().unwrap();
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+            let lines: Vec<(&str, &str)> = head.lines().skip(1).filter_map(|l| l.split_once(": ")).collect();
+            let get = |header: &str| -> Vec<&str> {
+                lines
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case(header))
+                    .map(|(_, v)| *v)
+                    .collect()
+            };
+            // The chat proxy's fixed identity gives way only to a resolved attribute.
+            let expected = if chat_proxy && matches!(custom, None | Some("$X-Missing")) {
+                "xai-grok-workspace/1.0.44"
+            } else {
+                expected
+            };
+            assert_eq!(get("User-Agent"), [expected], "{case}");
+            assert_eq!(get("Authorization"), [format!("Bearer {}", creds(&c).0)], "{case}");
+            for (header, _) in &CALLER_HEADERS[1..] {
+                assert_eq!(get(header), Vec::<&str>::new(), "{case}: {header} reached upstream");
+            }
+            let cli = if chat_proxy { vec!["xai-grok-cli"] } else { vec![] };
+            assert_eq!(get("X-XAI-Token-Auth"), cli, "{case}");
+            assert_eq!(body, want_body, "{case}: native body changed");
+        }
+    }
+}
+
 /// One-shot raw HTTP/1.1 capture server answering with the scripted response.
 struct Mock {
     addr: String,
@@ -339,7 +482,9 @@ async fn go_reference_scenarios() {
                 problems.push(format!("url: {url:?} != {:?}", s["url"]));
             }
             let got = mock.request();
-            let want = native_video_request(name, s).map(|want| with_controls_difference(s, want));
+            let want = native_video_request(name, s)
+                .map(|want| with_controls_difference(s, want))
+                .map(|want| with_user_agent_difference(s, want));
             if got.as_deref() != want.as_deref() {
                 problems.push(format!("request:\n  rust: {got:?}\n  go:   {want:?}"));
             }

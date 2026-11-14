@@ -16,6 +16,14 @@
 //! The empty source of the Codex client catalog starts lazily outside Home mode: with the
 //! first Codex credential or the first request from a Codex client that needs the
 //! catalog. Go starts it at launch.
+//!
+//! [`refresh_now`] reads both current sources once on demand (the management refresh
+//! routes; Go CLIProxyAPI `10417e5b`, after v8.0.35). Every read, periodic or on demand,
+//! takes a sequence number when it starts, and a read publishes only while its source's
+//! generation is current and no read that started later has published. Concurrent
+//! on-demand requests for the same source, generation and lifetime share one read, which
+//! runs in its own task: a caller that goes away stops neither the read nor the other
+//! callers. Go starts one read per request.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
+use serde_json::{Value, json};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::Runtime;
@@ -45,14 +55,135 @@ const MAX_SIZE: usize = 8 << 20;
 // ponytail: Go's DefaultClient has no timeout, so a stalled source holds its updater
 // until the next reconfigure; 30 seconds per remote read is the bound here.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// The bound on one on-demand read: both default sources at [`FETCH_TIMEOUT`] each, and
+/// a local file that never ends (a FIFO). Go bounds it by the request context only.
+const REFRESH_NOW_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// Go `embeddedCatalogSource`.
 const EMBED: &str = "embed";
 const DISABLED: &str = "disabled";
 
-type Fetch = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync>;
-type Publish = Box<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+/// A catalog one source served, and the source that served it (the empty source tries
+/// several).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Read {
+    data: Vec<u8>,
+    source: String,
+}
+
+/// No source served a valid catalog; `source` is the first one tried (Go's reported
+/// source).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Unavailable {
+    source: String,
+}
+
+type Fetch = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Read, Unavailable>> + Send>> + Send + Sync>;
+/// Installs a catalog and returns the providers whose models changed.
+type Publish = Box<dyn Fn(&[u8]) -> Result<Vec<String>, String> + Send + Sync>;
 type Validate = fn(&[u8]) -> Result<(), String>;
+
+/// Go `CatalogSourceStatus` texts.
+const UNAVAILABLE: &str = "no valid model catalog source";
+const SOURCE_CHANGED: &str = "model catalog source changed during refresh";
+const STOPPED: &str = "model catalog updaters stopped";
+const TIMED_OUT: &str = "model catalog refresh timed out";
+const REJECTED: &str = "model catalog rejected; keeping last valid catalog";
+const ABORTED: &str = "model catalog refresh ended without a result";
+
+/// What became of one catalog in an on-demand refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// `disabled` or `embed`: nothing to read.
+    Skipped,
+    /// The source served a valid catalog. `changed` names the providers whose models it
+    /// changed; it is empty when the catalog was unchanged or a read that started later
+    /// already published.
+    Refreshed { changed: Vec<String> },
+    /// The last valid catalog stays.
+    Failed(&'static str),
+}
+
+/// Go `CatalogSourceStatus`: one catalog's source and [`Outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    /// The source read: for the empty source, the default that served the catalog (or
+    /// the first default when none did).
+    pub source: String,
+    pub outcome: Outcome,
+}
+
+impl Status {
+    fn failed(source: String, reason: &'static str) -> Self {
+        Self {
+            source,
+            outcome: Outcome::Failed(reason),
+        }
+    }
+
+    /// Go's JSON for `CatalogSourceStatus` (`omitempty` members left out).
+    pub fn to_json(&self) -> Value {
+        let mut out = serde_json::Map::new();
+        if !self.source.is_empty() {
+            out.insert("source".into(), self.source.clone().into());
+        }
+        out.insert(
+            "refreshed".into(),
+            matches!(self.outcome, Outcome::Refreshed { .. }).into(),
+        );
+        match &self.outcome {
+            Outcome::Skipped => {
+                out.insert("skipped".into(), true.into());
+            }
+            Outcome::Refreshed { changed } if !changed.is_empty() => {
+                out.insert("changed_providers".into(), json!(changed));
+            }
+            Outcome::Refreshed { .. } => {}
+            Outcome::Failed(reason) => {
+                out.insert("error".into(), (*reason).into());
+            }
+        }
+        Value::Object(out)
+    }
+}
+
+/// Go `CatalogRefreshResult` without the removed Devin catalog (issue #49).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// models.json.
+    pub catalog: Status,
+    /// The Codex client catalog.
+    pub codex_catalog: Status,
+}
+
+impl Report {
+    /// Go `mergeProviderNames` over both catalogs, in order, each provider once.
+    pub fn changed_providers(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for status in [&self.catalog, &self.codex_catalog] {
+            if let Outcome::Refreshed { changed } = &status.outcome {
+                for provider in changed {
+                    if !out.contains(provider) {
+                        out.push(provider.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Go `errors.Join` of the catalogs' errors: `None` when every catalog succeeded.
+    pub fn error(&self) -> Option<String> {
+        let errors: Vec<&str> = [&self.catalog, &self.codex_catalog]
+            .into_iter()
+            .filter_map(|s| match s.outcome {
+                Outcome::Failed(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        (!errors.is_empty()).then(|| errors.join("\n"))
+    }
+}
 
 /// A service lifetime (the context Go hands `StartModelCatalogUpdaters`): cancelling it
 /// stops every loop started under it, and a reload after that starts nothing.
@@ -78,6 +209,39 @@ struct State {
     generation: u64,
     /// The lifetime the current source runs under, and the token that stops it.
     run: Option<(u64, CancellationToken)>,
+    /// The sequence number of the last read started (Go `requestSeq`) and of the last
+    /// read published (Go `publishedSeq`). Numbers never repeat, so a read of an older
+    /// generation can never pass for a newer one.
+    started: u64,
+    published: u64,
+    /// The on-demand read in flight, which on-demand requests for the same read join.
+    manual: Option<Manual>,
+}
+
+/// What an on-demand read reads, under which generation and lifetime: requests share a
+/// read only when all three match.
+#[derive(Clone, PartialEq, Eq)]
+struct ManualKey {
+    generation: u64,
+    lifetime: Option<u64>,
+    source: String,
+    revision: Option<crate::runtime::CatalogRevision>,
+}
+
+struct Manual {
+    key: ManualKey,
+    seq: u64,
+    done: watch::Receiver<Option<Status>>,
+}
+
+/// Why a finished read was not published.
+enum Fence {
+    /// The source's generation changed, or its loop was stopped, while it ran.
+    Stale,
+    /// A read that started later already published.
+    Superseded,
+    /// The publisher refused the catalog.
+    Rejected,
 }
 
 /// Go `catalogUpdater`: source changes are serialized with publication, not with reads.
@@ -87,16 +251,28 @@ pub(crate) struct Updater {
     pending: AtomicBool,
     fetch: Fetch,
     publish: Publish,
+    /// The source the empty source reports before a read names one (Go `defaultURLs[0]`).
+    first_default: &'static str,
 }
 
 impl Updater {
+    #[cfg(test)]
     fn new(fetch: Fetch, publish: Publish) -> Arc<Self> {
+        Self::with_default(fetch, publish, "")
+    }
+
+    fn with_default(fetch: Fetch, publish: Publish, first_default: &'static str) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             pending: AtomicBool::new(false),
             fetch,
             publish,
+            first_default,
         })
+    }
+
+    fn display(&self, source: &str) -> String {
+        if source.is_empty() { self.first_default } else { source }.to_owned()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -160,10 +336,46 @@ impl Updater {
         });
     }
 
+    /// The sequence number of a read starting now.
+    fn begin(&self) -> u64 {
+        let mut state = self.lock();
+        state.started += 1;
+        state.started
+    }
+
+    /// Publishes `data`, read as `seq` under `generation`, while that generation is
+    /// current, `token` runs and no later read has published. Returns the changed
+    /// providers.
+    fn publish_if_current(
+        &self,
+        token: &CancellationToken,
+        generation: u64,
+        seq: u64,
+        data: &[u8],
+    ) -> Result<Vec<String>, Fence> {
+        let mut state = self.lock();
+        if state.generation != generation || token.is_cancelled() {
+            return Err(Fence::Stale);
+        }
+        if seq <= state.published {
+            return Err(Fence::Superseded);
+        }
+        let published = (self.publish)(data);
+        if published.is_ok() {
+            state.published = seq;
+        }
+        drop(state);
+        published.map_err(|_| {
+            tracing::warn!("{REJECTED}");
+            Fence::Rejected
+        })
+    }
+
     /// Go `catalogUpdater.refresh`: publishes only while `generation` is current.
     async fn refresh(&self, token: &CancellationToken, source: &str, generation: u64) {
-        let data = match (self.fetch)(source.to_owned()).await {
-            Ok(data) => data,
+        let seq = self.begin();
+        let read = match (self.fetch)(source.to_owned()).await {
+            Ok(read) => read,
             Err(_) => {
                 if !token.is_cancelled() {
                     tracing::warn!("model catalog refresh failed; keeping last valid catalog");
@@ -171,14 +383,152 @@ impl Updater {
                 return;
             }
         };
-        let state = self.lock();
-        if state.generation != generation || token.is_cancelled() {
-            return;
+        if let Ok(changed) = self.publish_if_current(token, generation, seq, &read.data)
+            && !changed.is_empty()
+        {
+            tracing::info!("model catalog updated, changes detected for providers: {changed:?}");
         }
-        let published = (self.publish)(&data);
-        drop(state);
-        if published.is_err() {
-            tracing::warn!("model catalog rejected; keeping last valid catalog");
+    }
+
+    /// Go `catalogUpdater.refreshOnDemand`: one read of the current source, joined with
+    /// an on-demand read of the same source already in flight. Under `lifetime`'s
+    /// running loop the configured source is read and fenced by that loop; otherwise
+    /// (no loop for this lifetime yet) `fallback`, the source the current config
+    /// resolves to. `None` is a runtime whose updaters were never started.
+    async fn refresh_now(
+        self: &Arc<Self>,
+        lifetime: Option<&Lifetime>,
+        fallback: &str,
+        revision: Option<crate::runtime::CatalogRevision>,
+    ) -> Status {
+        let (display, mut done) = {
+            let mut state = self.lock();
+            let running = match (&state.run, lifetime) {
+                (Some((id, token)), Some(lifetime)) if *id == lifetime.id && !token.is_cancelled() => {
+                    Some(token.clone())
+                }
+                _ => None,
+            };
+            let revision = if running.is_none() { revision } else { None };
+            let (source, token) = match (running, lifetime) {
+                (Some(token), _) => (state.source.clone(), token),
+                (None, Some(lifetime)) if lifetime.token.is_cancelled() => {
+                    return Status::failed(self.display(fallback), STOPPED);
+                }
+                (None, Some(lifetime)) => (fallback.to_owned(), lifetime.token.child_token()),
+                (None, None) => (fallback.to_owned(), CancellationToken::new()),
+            };
+            if source == DISABLED || source == EMBED {
+                return Status {
+                    source,
+                    outcome: Outcome::Skipped,
+                };
+            }
+            let display = self.display(&source);
+            let key = ManualKey {
+                generation: state.generation,
+                lifetime: lifetime.map(|l| l.id),
+                source,
+                revision,
+            };
+            let joined = state.manual.as_ref().filter(|m| m.key == key).map(|m| m.done.clone());
+            let done = match joined {
+                Some(done) => done,
+                None => self.start_manual(&mut state, key, token),
+            };
+            (display, done)
+        };
+        match done.wait_for(Option::is_some).await {
+            Ok(status) => status.clone().expect("waited for a status"),
+            // The read's task ended without a status (a panic, or runtime shutdown).
+            Err(_) => Status::failed(display, ABORTED),
+        }
+    }
+
+    /// Starts the on-demand read `key` names in its own task, so that no caller's
+    /// cancellation stops it, and records it for later requests to join.
+    fn start_manual(
+        self: &Arc<Self>,
+        state: &mut State,
+        key: ManualKey,
+        token: CancellationToken,
+    ) -> watch::Receiver<Option<Status>> {
+        state.started += 1;
+        let seq = state.started;
+        let (tx, rx) = watch::channel(None);
+        state.manual = Some(Manual {
+            key: key.clone(),
+            seq,
+            done: rx.clone(),
+        });
+        /// Forgets the read when its task ends, however it ends, so that no request
+        /// joins a read that can no longer answer.
+        struct Forget(Arc<Updater>, u64);
+        impl Drop for Forget {
+            fn drop(&mut self) {
+                let mut state = self.0.lock();
+                if state.manual.as_ref().is_some_and(|m| m.seq == self.1) {
+                    state.manual = None;
+                }
+            }
+        }
+        let forget = Forget(self.clone(), seq);
+        tokio::spawn(async move {
+            let status = forget.0.manual_read(&token, &key, seq).await;
+            drop(forget);
+            tx.send_replace(Some(status));
+        });
+        rx
+    }
+
+    async fn manual_read(&self, token: &CancellationToken, key: &ManualKey, seq: u64) -> Status {
+        let read = token
+            .run_until_cancelled(tokio::time::timeout(
+                REFRESH_NOW_TIMEOUT,
+                (self.fetch)(key.source.clone()),
+            ))
+            .await;
+        let stale = || {
+            let changed = self.lock().generation != key.generation;
+            if changed { SOURCE_CHANGED } else { STOPPED }
+        };
+        let read = match read {
+            None => return Status::failed(self.display(&key.source), stale()),
+            Some(Err(_elapsed)) => {
+                tracing::warn!("model catalog refresh timed out; keeping last valid catalog");
+                return Status::failed(self.display(&key.source), TIMED_OUT);
+            }
+            Some(Ok(Err(unavailable))) => {
+                tracing::warn!("model catalog refresh failed; keeping last valid catalog");
+                return Status::failed(unavailable.source, UNAVAILABLE);
+            }
+            Some(Ok(Ok(read))) => read,
+        };
+        // Lock order is config commit, then updater, as in Runtime's reconfigure.
+        // Keep the revision lock through publication, not just through its check.
+        let _revision = match &key.revision {
+            Some(revision) => match revision.lock_current() {
+                Some(guard) => Some(guard),
+                None => return Status::failed(read.source, SOURCE_CHANGED),
+            },
+            None => None,
+        };
+        let outcome = match self.publish_if_current(token, key.generation, seq, &read.data) {
+            Ok(changed) => {
+                if !changed.is_empty() {
+                    tracing::info!("model catalog updated, changes detected for providers: {changed:?}");
+                }
+                Outcome::Refreshed { changed }
+            }
+            Err(Fence::Stale) => Outcome::Failed(stale()),
+            // Go reports a read a later one overtook as refreshed: the catalog in place
+            // is at least as new.
+            Err(Fence::Superseded) => Outcome::Refreshed { changed: Vec::new() },
+            Err(Fence::Rejected) => Outcome::Failed(REJECTED),
+        };
+        Status {
+            source: read.source,
+            outcome,
         }
     }
 }
@@ -246,28 +596,39 @@ async fn read_source(source: &str) -> Result<Vec<u8>, ReadError> {
 
 /// Go `catalogFetcher`: `embed` is the built-in catalog, the empty source tries
 /// `defaults` in order, and any other source is the only one tried. A candidate must
-/// pass `validate`.
+/// pass `validate`. Go `catalogFetcherWithSource` (`10417e5b`) also names the candidate
+/// that served the catalog, or the first one tried.
 fn fetcher(embedded: &'static [u8], defaults: Vec<String>, validate: Validate) -> Fetch {
     let defaults: Arc<[String]> = defaults.into();
     Arc::new(move |source: String| {
         let defaults = defaults.clone();
         Box::pin(async move {
             if source == EMBED {
-                return Ok(embedded.to_vec());
+                return Ok(Read {
+                    data: embedded.to_vec(),
+                    source,
+                });
             }
             let candidates = if source.is_empty() {
                 defaults.to_vec()
             } else {
                 vec![source]
             };
-            for candidate in candidates {
-                let read = read_source(&candidate).await;
+            for candidate in &candidates {
+                let read = read_source(candidate).await;
                 match read.and_then(|data| validate(&data).map(|()| data).map_err(|_| ReadError::Invalid)) {
-                    Ok(data) => return Ok(data),
+                    Ok(data) => {
+                        return Ok(Read {
+                            data,
+                            source: candidate.clone(),
+                        });
+                    }
                     Err(reason) => tracing::debug!(?reason, "model catalog source failed"),
                 }
             }
-            Err("no valid model catalog source".to_owned())
+            Err(Unavailable {
+                source: candidates.into_iter().next().unwrap_or_default(),
+            })
         })
     })
 }
@@ -282,26 +643,30 @@ fn general_fetcher(defaults: Vec<String>) -> Fetch {
     })
 }
 
-/// Go `publishCatalogBytes`: a changed section rebuilds the registries that use it.
-fn publish_general(data: &[u8]) -> Result<(), String> {
-    let changed = cpa_core::registry::refresh_catalog(&String::from_utf8_lossy(data))?;
-    if !changed.is_empty() {
-        tracing::info!("model catalog updated, changes detected for providers: {changed:?}");
-    }
-    Ok(())
+/// Go `publishCatalogBytes`: a changed section rebuilds the registries that use it
+/// ([`Runtime::registry`] keys on the catalog generation and rebuilds from the current
+/// credentials). Returns the changed providers.
+fn publish_general(data: &[u8]) -> Result<Vec<String>, String> {
+    cpa_core::registry::refresh_catalog(&String::from_utf8_lossy(data))
 }
 
 /// The process-wide updaters: models.json and the Codex client catalog.
 static CATALOGS: LazyLock<[Arc<Updater>; 2]> = LazyLock::new(|| {
     [
-        Updater::new(general_fetcher(owned(&MODELS_URLS)), Box::new(publish_general)),
-        Updater::new(
+        Updater::with_default(
+            general_fetcher(owned(&MODELS_URLS)),
+            Box::new(publish_general),
+            MODELS_URLS[0],
+        ),
+        Updater::with_default(
             fetcher(
                 cpa_common::codex_client::CLIENT_MODELS_JSON.as_bytes(),
                 owned(&CODEX_URLS),
                 cpa_common::codex_catalog::validate,
             ),
-            Box::new(|data| cpa_common::codex_catalog::load(data).map(drop)),
+            // Go reports no changed provider for the Codex client catalog.
+            Box::new(|data| cpa_common::codex_catalog::load(data).map(|_| Vec::new())),
+            CODEX_URLS[0],
         ),
     ]
 });
@@ -333,16 +698,55 @@ fn configure(updaters: &[Arc<Updater>; 2], lifetime: &Lifetime, sources: &[Strin
     if lifetime.token.is_cancelled() {
         return;
     }
-    let effective = effective_sources(sources, policy.local, policy.home);
-    for (index, (updater, source)) in updaters.iter().zip(effective).enumerate() {
-        let source = if policy.deny_default && source.is_empty() {
-            DISABLED.to_owned()
-        } else {
-            source
-        };
+    for (index, (updater, source)) in updaters.iter().zip(resolve(sources, policy)).enumerate() {
         let lazy = startup && !policy.home && index > 0 && source.is_empty();
         updater.configure(lifetime, &source, lazy);
     }
+}
+
+/// The source each updater runs for `sources` under `policy`: [`effective_sources`],
+/// and `disabled` for the empty source of a test runtime.
+fn resolve(sources: &[String; 2], policy: Policy) -> [String; 2] {
+    effective_sources(sources, policy.local, policy.home).map(|source| {
+        if policy.deny_default && source.is_empty() {
+            DISABLED.to_owned()
+        } else {
+            source
+        }
+    })
+}
+
+/// Go `RefreshModelCatalogsWithPolicy` for both updaters at once: reads each current
+/// source once and publishes it as the periodic read would ([`Updater::refresh_now`]).
+/// Under a started runtime the running loops' sources are read; a runtime whose updaters
+/// were never started reads the sources its current config resolves to under its
+/// `--local-model` and test policy, as Go falls back to the handler's config (Home mode
+/// is only known once started).
+pub async fn refresh_now(rt: &Runtime) -> Report {
+    let (started, sources, revision) = rt.with_catalogs(|session, config, revision| {
+        (
+            session.map(|s| (s.lifetime.clone(), s.policy)),
+            config.catalog_sources(),
+            revision,
+        )
+    });
+    let (lifetime, policy) = match started {
+        Some((lifetime, policy)) => (Some(lifetime), policy),
+        None => (
+            None,
+            Policy {
+                local: rt.local_model(),
+                home: false,
+                deny_default: test_runtime(rt),
+            },
+        ),
+    };
+    let [catalog, codex] = resolve(&sources, policy);
+    let (catalog, codex_catalog) = tokio::join!(
+        CATALOGS[0].refresh_now(lifetime.as_ref(), &catalog, Some(revision.clone())),
+        CATALOGS[1].refresh_now(lifetime.as_ref(), &codex, Some(revision)),
+    );
+    Report { catalog, codex_catalog }
 }
 
 /// The catalog policy of one runtime's lifetime (Go's `catalogRuntime` and service
@@ -443,9 +847,9 @@ fn test_runtime(rt: &Runtime) -> bool {
 /// empty source's reader with other defaults). For tests against local mocks.
 pub async fn refresh(urls: &[String]) {
     match general_fetcher(urls.to_vec())(String::new()).await {
-        Ok(data) => {
-            if publish_general(&data).is_err() {
-                tracing::warn!("model catalog rejected; keeping last valid catalog");
+        Ok(read) => {
+            if publish_general(&read.data).is_err() {
+                tracing::warn!("{REJECTED}");
             }
         }
         Err(_) => tracing::warn!("model catalog refresh failed; keeping last valid catalog"),
@@ -457,14 +861,27 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+    /// A read of `source` whose bytes are its name.
+    fn read(source: String) -> Read {
+        served(source.clone(), source)
+    }
+
+    /// A read of `source` that served `data`.
+    fn served(source: String, data: String) -> Read {
+        Read {
+            data: data.into_bytes(),
+            source,
+        }
+    }
+
     /// An updater whose read returns the source's name and whose publications arrive on
     /// the returned channel.
     fn echo() -> (Arc<Updater>, UnboundedReceiver<String>) {
         let (tx, rx) = unbounded_channel();
-        let fetch: Fetch = Arc::new(|source: String| Box::pin(async move { Ok(source.into_bytes()) }));
+        let fetch: Fetch = Arc::new(|source: String| Box::pin(async move { Ok(read(source)) }));
         let publish: Publish = Box::new(move |data| {
             tx.send(String::from_utf8_lossy(data).into_owned()).unwrap();
-            Ok(())
+            Ok(Vec::new())
         });
         (Updater::new(fetch, publish), rx)
     }
@@ -534,7 +951,7 @@ mod tests {
                     started.send(()).unwrap();
                     release.notified().await;
                 }
-                Ok(source.into_bytes())
+                Ok(read(source))
             })
         });
         let (tx, mut published) = unbounded_channel();
@@ -542,7 +959,7 @@ mod tests {
             fetch,
             Box::new(move |data| {
                 tx.send(String::from_utf8_lossy(data).into_owned()).unwrap();
-                Ok(())
+                Ok(Vec::new())
             }),
         );
         u.lock().generation = 1;
@@ -574,14 +991,14 @@ mod tests {
                         return Err("invalid".into());
                     }
                     *last.lock().unwrap() = String::from_utf8_lossy(data).into_owned();
-                    Ok(())
+                    Ok(Vec::new())
                 }),
             )
         };
         let token = CancellationToken::new();
-        let unavailable: Fetch = Arc::new(|_| Box::pin(async { Err("unavailable".to_owned()) }));
+        let unavailable: Fetch = Arc::new(|_| Box::pin(async { Err(Unavailable { source: String::new() }) }));
         keep(unavailable, true).refresh(&token, "", 0).await;
-        let invalid: Fetch = Arc::new(|_| Box::pin(async { Ok(b"invalid".to_vec()) }));
+        let invalid: Fetch = Arc::new(|_| Box::pin(async { Ok(read("invalid".into())) }));
         keep(invalid, false).refresh(&token, "", 0).await;
         assert_eq!(*last.lock().unwrap(), "last valid");
 
@@ -589,7 +1006,7 @@ mod tests {
         let counted = reads.clone();
         let fetch: Fetch = Arc::new(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(Vec::new()) })
+            Box::pin(async { Ok(read(String::new())) })
         });
         let u = keep(fetch, true);
         u.configure(&Lifetime::new(), DISABLED, false);
@@ -615,14 +1032,14 @@ mod tests {
             fetch.clone(),
             Box::new(move |data| {
                 sink.lock().unwrap().push(data.to_vec());
-                Ok(())
+                Ok(Vec::new())
             }),
         );
         assert!(fetch(String::new()).await.is_err(), "a refused default source was read");
         u.refresh(&CancellationToken::new(), "", 0).await;
         assert!(published.lock().unwrap().is_empty(), "an unavailable source published");
 
-        let embedded = fetch(EMBED.to_owned()).await.expect("embed always reads");
+        let embedded = fetch(EMBED.to_owned()).await.expect("embed always reads").data;
         let catalog = cpa_core::registry::Catalog::parse(std::str::from_utf8(&embedded).unwrap()).unwrap();
         let ids = |channel: &str| {
             catalog
@@ -693,7 +1110,11 @@ mod tests {
             let path = path.to_str().unwrap().to_owned();
             let fetch = fetcher(data, vec![format!("{base}/official")], validate);
             for source in [EMBED.to_owned(), format!("{base}/custom"), path.clone()] {
-                assert_eq!(fetch(source.clone()).await.as_deref(), Ok(data), "{name}: {source}");
+                assert_eq!(
+                    fetch(source.clone()).await.map(|r| r.data).as_deref(),
+                    Ok(data),
+                    "{name}: {source}"
+                );
             }
             for source in [
                 format!("{base}/broken"),
@@ -707,7 +1128,11 @@ mod tests {
                 0,
                 "{name}: fell back to the default"
             );
-            assert_eq!(fetch(String::new()).await.as_deref(), Ok(data), "{name}");
+            assert_eq!(
+                fetch(String::new()).await.map(|r| r.data).as_deref(),
+                Ok(data),
+                "{name}"
+            );
             assert_eq!(official_hits.load(Ordering::SeqCst), 1, "{name}: default not read");
             std::fs::write(&path, "invalid").unwrap();
             assert!(fetch(path.clone()).await.is_err(), "{name}: file was not read again");
@@ -813,47 +1238,6 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A failed read logs its category only: neither the source's user info and query
-    /// nor a malformed redirect target reach a DEBUG log.
-    #[tokio::test]
-    async fn failed_reads_log_no_url() {
-        use axum::http::{StatusCode, header};
-        let target = "http://alice:SECRET@[invalid/catalog.json?token=SECRET";
-        let app =
-            axum::Router::new().fallback(move || async move { (StatusCode::FOUND, [(header::LOCATION, target)]) });
-        let addr = serve(app).await;
-        let capture = Capture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let fetch = fetcher(b"", Vec::new(), |_| Ok(()));
-        assert!(fetch(format!("http://bob:SECRET@{addr}/r?token=SECRET")).await.is_err());
-        let u = Updater::new(fetch, Box::new(|_| Ok(())));
-        u.refresh(&CancellationToken::new(), &format!("http://{addr}/r?token=SECRET"), 0)
-            .await;
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("model catalog source failed"), "{logs}");
-        assert!(logs.contains("model catalog refresh failed"), "{logs}");
-        assert!(!logs.contains("SECRET"), "{logs}");
-    }
-
     /// Go TestCatalogPolicyHotReload, then the lazy default: at startup outside Home the
     /// empty Codex source waits for a wake, and a reload that changes it starts it at once.
     #[tokio::test]
@@ -941,5 +1325,348 @@ mod tests {
             assert!(!updater.pending.load(Ordering::SeqCst));
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fetch that counts its reads and passes each read's number and source to
+    /// `result`. A read for which `hold` is true waits for a permit on the returned
+    /// semaphore first.
+    fn gated(
+        hold: impl Fn(u64, &str) -> bool + Send + Sync + 'static,
+        result: impl Fn(u64, String) -> Result<Read, Unavailable> + Send + Sync + 'static,
+    ) -> (Fetch, Arc<AtomicU64>, Arc<tokio::sync::Semaphore>) {
+        let reads = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (counted, gate) = (reads.clone(), release.clone());
+        let (hold, result) = (Arc::new(hold), Arc::new(result));
+        let fetch: Fetch = Arc::new(move |source: String| {
+            let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+            let (gate, hold, result) = (gate.clone(), hold.clone(), result.clone());
+            Box::pin(async move {
+                if hold(n, &source) {
+                    gate.acquire().await.unwrap().forget();
+                }
+                result(n, source)
+            })
+        });
+        (fetch, reads, release)
+    }
+
+    /// An updater over `fetch` whose publications are recorded and report `claude`.
+    fn recording(fetch: Fetch) -> (Arc<Updater>, Arc<Mutex<Vec<String>>>) {
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let sink = published.clone();
+        let publish: Publish = Box::new(move |data| {
+            sink.lock().unwrap().push(String::from_utf8_lossy(data).into_owned());
+            Ok(vec!["claude".to_owned()])
+        });
+        (Updater::new(fetch, publish), published)
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    fn refreshed(source: &str, changed: &[&str]) -> Status {
+        Status {
+            source: source.to_owned(),
+            outcome: Outcome::Refreshed {
+                changed: changed.iter().map(|p| (*p).to_owned()).collect(),
+            },
+        }
+    }
+
+    /// #98: concurrent on-demand requests share one read of the running source (not the
+    /// fallback), the read outlives a caller that goes away, and a request after it ends
+    /// starts a new read.
+    #[tokio::test]
+    async fn on_demand_requests_share_one_read_that_outlives_its_callers() {
+        use futures_util::poll;
+        let (fetch, reads, release) = gated(
+            |_, _| true,
+            |n, source| {
+                let data = format!("{source}-{n}");
+                Ok(served(source, data))
+            },
+        );
+        let (u, published) = recording(fetch);
+        let lifetime = Lifetime::new();
+        // Configured and waiting (the lazy default's state): no periodic read runs.
+        u.configure(&lifetime, "src", true);
+        let mut first = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
+        assert!(poll!(first.as_mut()).is_pending());
+        until("the first read", || reads.load(Ordering::SeqCst) == 1).await;
+        let mut second = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
+        let mut third = Box::pin(u.refresh_now(Some(&lifetime), "fallback", None));
+        assert!(poll!(second.as_mut()).is_pending() && poll!(third.as_mut()).is_pending());
+        drop(first);
+        release.add_permits(1);
+        let (second, third) = tokio::join!(second, third);
+        assert_eq!(second, refreshed("src", &["claude"]));
+        assert_eq!(third, second);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "joined requests read again");
+        assert_eq!(*published.lock().unwrap(), ["src-1"]);
+
+        release.add_permits(1);
+        assert_eq!(
+            u.refresh_now(Some(&lifetime), "fallback", None).await,
+            refreshed("src", &["claude"])
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "a finished read was joined");
+        assert_eq!(*published.lock().unwrap(), ["src-1", "src-2"]);
+        assert!(u.lock().manual.is_none());
+    }
+
+    /// #98: a failed, timed-out or aborted on-demand read answers every waiting request,
+    /// publishes nothing, and leaves no read behind for later requests to join.
+    #[tokio::test(start_paused = true)]
+    async fn failed_timed_out_and_aborted_reads_answer_every_waiter() {
+        use futures_util::poll;
+        let lifetime = Lifetime::new();
+        let (fetch, reads, release) = gated(|_, _| true, |_, source| Err(Unavailable { source }));
+        let (u, published) = recording(fetch);
+        u.configure(&lifetime, "src", true);
+        let mut a = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        let mut b = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        assert!(poll!(a.as_mut()).is_pending() && poll!(b.as_mut()).is_pending());
+        release.add_permits(1);
+        let failed = Status::failed("src".into(), UNAVAILABLE);
+        assert_eq!(tokio::join!(a, b), (failed.clone(), failed));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // A read that never ends is bounded (virtual time).
+        let never: Fetch = Arc::new(|_| Box::pin(std::future::pending()));
+        let (u, never_published) = recording(never);
+        u.configure(&lifetime, "src", true);
+        let mut a = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        let mut b = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        assert!(poll!(a.as_mut()).is_pending() && poll!(b.as_mut()).is_pending());
+        let started = tokio::time::Instant::now();
+        let timed_out = Status::failed("src".into(), TIMED_OUT);
+        assert_eq!(tokio::join!(a, b), (timed_out.clone(), timed_out));
+        let waited = started.elapsed();
+        assert!(
+            waited >= REFRESH_NOW_TIMEOUT && waited < REFRESH_NOW_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(u.lock().manual.is_none());
+
+        // A read whose task panics answers its waiters and is forgotten.
+        let panics = Arc::new(AtomicU64::new(0));
+        let counted = panics.clone();
+        let panicking: Fetch = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { panic!("synthetic catalog read panic") })
+        });
+        let (u, panic_published) = recording(panicking);
+        u.configure(&lifetime, "src", true);
+        let aborted = Status::failed("src".into(), ABORTED);
+        assert_eq!(u.refresh_now(Some(&lifetime), "", None).await, aborted);
+        assert_eq!(u.refresh_now(Some(&lifetime), "", None).await, aborted);
+        assert_eq!(panics.load(Ordering::SeqCst), 2, "a dead read was joined");
+        for published in [published, never_published, panic_published] {
+            assert!(published.lock().unwrap().is_empty());
+        }
+    }
+
+    /// #98: an on-demand read still running when its source changes is not published,
+    /// and the new source does not wait for it: a read under the running loop stops with
+    /// the loop, and a read of a fallback source (no loop of its lifetime) is refused at
+    /// publication. A lifetime that ends answers its waiters at once, and later requests
+    /// under it read nothing.
+    #[tokio::test]
+    async fn a_source_change_or_shutdown_fences_an_on_demand_read() {
+        use futures_util::poll;
+        let (fetch, reads, release) = gated(|_, source| source == "old", |_, source| Ok(read(source)));
+        let (u, published) = recording(fetch);
+        let lifetime = Lifetime::new();
+        u.configure(&lifetime, "old", true);
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old", None));
+        assert!(poll!(manual.as_mut()).is_pending());
+        until("the old read", || reads.load(Ordering::SeqCst) == 1).await;
+        u.configure(&lifetime, "new", false);
+        assert_eq!(manual.await, Status::failed("old".into(), SOURCE_CHANGED));
+        until("the new source", || published.lock().unwrap().len() == 1).await;
+        assert_eq!(*published.lock().unwrap(), ["new"]);
+
+        // A fallback read is not stopped by the loop; its publication is refused.
+        let other = Lifetime::new();
+        let mut fallback = Box::pin(u.refresh_now(Some(&other), "old", None));
+        assert!(poll!(fallback.as_mut()).is_pending());
+        until("the fallback read", || reads.load(Ordering::SeqCst) == 3).await;
+        u.configure(&lifetime, "newer", false);
+        until("the newer source", || published.lock().unwrap().len() == 2).await;
+        release.add_permits(1);
+        assert_eq!(fallback.await, Status::failed("old".into(), SOURCE_CHANGED));
+        assert_eq!(*published.lock().unwrap(), ["new", "newer"], "stale publication");
+
+        let lifetime = Lifetime::new();
+        u.configure(&lifetime, "old", true);
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "old", None));
+        assert!(poll!(manual.as_mut()).is_pending());
+        until("the second old read", || reads.load(Ordering::SeqCst) == 5).await;
+        lifetime.token.cancel();
+        assert_eq!(manual.await, Status::failed("old".into(), STOPPED));
+        assert_eq!(
+            u.refresh_now(Some(&lifetime), "old", None).await,
+            Status::failed("old".into(), STOPPED)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 5, "read after shutdown");
+        assert_eq!(*published.lock().unwrap(), ["new", "newer"]);
+        assert_eq!(release.available_permits(), 0);
+    }
+
+    /// #98 (Go `10417e5b` same-source ordering): reads of one source publish in the
+    /// order they started, whichever finishes first, periodic or on demand.
+    #[tokio::test]
+    async fn reads_publish_in_start_order_whatever_order_they_finish() {
+        use futures_util::poll;
+        // Odd reads wait for a permit.
+        let (fetch, reads, release) = gated(|n, _| n % 2 == 1, |n, source| Ok(served(source, format!("v{n}"))));
+        let (u, published) = recording(fetch);
+        let lifetime = Lifetime::new();
+        u.configure(&lifetime, "same", true);
+        let (generation, token) = {
+            let state = u.lock();
+            (state.generation, state.run.as_ref().unwrap().1.clone())
+        };
+
+        // A slow periodic read, then an on-demand one that finishes first.
+        let periodic = {
+            let (u, token) = (u.clone(), token.clone());
+            tokio::spawn(async move { u.refresh(&token, "same", generation).await })
+        };
+        until("the periodic read", || reads.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            u.refresh_now(Some(&lifetime), "", None).await,
+            refreshed("same", &["claude"])
+        );
+        release.add_permits(1);
+        periodic.await.unwrap();
+        assert_eq!(
+            *published.lock().unwrap(),
+            ["v2"],
+            "an older periodic read overwrote a newer one"
+        );
+
+        // A slow on-demand read, then a periodic one that finishes first.
+        let mut manual = Box::pin(u.refresh_now(Some(&lifetime), "", None));
+        assert!(poll!(manual.as_mut()).is_pending());
+        until("the on-demand read", || reads.load(Ordering::SeqCst) == 3).await;
+        u.refresh(&token, "same", generation).await;
+        release.add_permits(1);
+        assert_eq!(
+            manual.await,
+            refreshed("same", &[]),
+            "overtaken: refreshed, nothing changed"
+        );
+        assert_eq!(
+            *published.lock().unwrap(),
+            ["v2", "v4"],
+            "an older on-demand read overwrote a newer one"
+        );
+    }
+
+    /// #98: `disabled` and `embed` read nothing; the running loop's source wins over the
+    /// fallback; without a loop for the lifetime the fallback is read; and the fallback
+    /// follows `--local-model`, Home mode and the test runtime's no-download rule.
+    #[tokio::test]
+    async fn on_demand_reads_follow_the_configured_policy() {
+        let (fetch, reads, _release) = gated(|_, _| false, |_, source| Ok(read(source)));
+        let (u, published) = recording(fetch);
+        for source in [DISABLED, EMBED] {
+            let skipped = Status {
+                source: source.to_owned(),
+                outcome: Outcome::Skipped,
+            };
+            assert_eq!(u.refresh_now(None, source, None).await, skipped);
+        }
+        let lifetime = Lifetime::new();
+        u.configure(&lifetime, DISABLED, false);
+        let status = u
+            .refresh_now(Some(&lifetime), "https://example.com/catalog.json", None)
+            .await;
+        assert_eq!(status.outcome, Outcome::Skipped);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        // Another lifetime's loop runs: this lifetime's fallback is read.
+        let other = Lifetime::new();
+        assert_eq!(
+            u.refresh_now(Some(&other), "/catalog.json", None).await,
+            refreshed("/catalog.json", &["claude"])
+        );
+        assert_eq!(*published.lock().unwrap(), ["/catalog.json"]);
+
+        let policy = |local, home, deny_default| Policy {
+            local,
+            home,
+            deny_default,
+        };
+        let sources = |a: &str, b: &str| [a.to_owned(), b.to_owned()];
+        assert_eq!(
+            resolve(&sources("", ""), policy(false, false, true)),
+            [DISABLED, DISABLED]
+        );
+        assert_eq!(resolve(&sources("", ""), policy(true, false, true)), [EMBED, EMBED]);
+        assert_eq!(resolve(&sources("", ""), policy(false, false, false)), ["", ""]);
+        assert_eq!(
+            resolve(&sources("https://example.com/a", "/b.json"), policy(false, true, true)),
+            [DISABLED, "/b.json"]
+        );
+    }
+
+    /// Go `CatalogSourceStatus` and `CatalogRefreshResult`, without the Devin catalog.
+    #[test]
+    fn reports_render_go_catalog_source_statuses() {
+        let render = |s: &Status| serde_json::to_string(&s.to_json()).unwrap();
+        let ok = refreshed("https://example.com/models.json", &["claude", "xai"]);
+        assert_eq!(
+            render(&ok),
+            r#"{"source":"https://example.com/models.json","refreshed":true,"changed_providers":["claude","xai"]}"#
+        );
+        let skipped = Status {
+            source: DISABLED.into(),
+            outcome: Outcome::Skipped,
+        };
+        assert_eq!(
+            render(&skipped),
+            r#"{"source":"disabled","refreshed":false,"skipped":true}"#
+        );
+        assert_eq!(
+            render(&refreshed("embed", &[])),
+            r#"{"source":"embed","refreshed":true}"#
+        );
+        let failed = Status::failed("/catalog.json".into(), UNAVAILABLE);
+        assert_eq!(
+            render(&failed),
+            r#"{"source":"/catalog.json","refreshed":false,"error":"no valid model catalog source"}"#
+        );
+        let report = Report {
+            catalog: ok.clone(),
+            codex_catalog: skipped,
+        };
+        assert_eq!(
+            (report.changed_providers(), report.error()),
+            (vec!["claude".into(), "xai".into()], None)
+        );
+        let report = Report {
+            catalog: refreshed("a", &["codex", "claude"]),
+            codex_catalog: refreshed("b", &["codex"]),
+        };
+        assert_eq!(report.changed_providers(), ["codex", "claude"]);
+        let report = Report {
+            catalog: failed.clone(),
+            codex_catalog: Status::failed("b".into(), TIMED_OUT),
+        };
+        assert_eq!(
+            report.error().as_deref(),
+            Some("no valid model catalog source\nmodel catalog refresh timed out")
+        );
+        assert!(report.changed_providers().is_empty());
     }
 }

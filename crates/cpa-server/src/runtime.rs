@@ -61,8 +61,31 @@ pub struct Runtime {
     codex_refreshes: CodexRefreshes,
     /// The model catalog updaters' policy, once started (`model_updater::start`).
     catalogs: Mutex<Option<crate::model_updater::Session>>,
-    /// Serializes config commits through their catalog reconfigure.
-    config_commit: Mutex<()>,
+    /// Config revision, serialized through catalog reconfigure and fallback publication.
+    config_commit: Arc<Mutex<u64>>,
+}
+
+/// A fallback read's config revision. Publication holds the same lock as config
+/// commits, so checking the revision and publishing cannot straddle a replacement.
+#[derive(Clone)]
+pub(crate) struct CatalogRevision {
+    expected: u64,
+    current: Arc<Mutex<u64>>,
+}
+
+impl PartialEq for CatalogRevision {
+    fn eq(&self, other: &Self) -> bool {
+        self.expected == other.expected && Arc::ptr_eq(&self.current, &other.current)
+    }
+}
+
+impl Eq for CatalogRevision {}
+
+impl CatalogRevision {
+    pub(crate) fn lock_current(&self) -> Option<std::sync::MutexGuard<'_, u64>> {
+        let current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        (*current == self.expected).then_some(current)
+    }
 }
 
 /// The Codex refresh transactions under a credential file's lock: shutdown stops the
@@ -122,7 +145,7 @@ impl Runtime {
             refresh_done: tokio::sync::watch::Sender::new(()),
             codex_refreshes: CodexRefreshes::default(),
             catalogs: Mutex::default(),
-            config_commit: Mutex::default(),
+            config_commit: Arc::default(),
         };
         rt.publish_policy(policy);
         rt.store
@@ -179,6 +202,23 @@ impl Runtime {
         drop(previous);
     }
 
+    /// Captures catalog sources and their config revision under the commit lock.
+    pub(crate) fn with_catalogs<T>(
+        &self,
+        f: impl FnOnce(Option<&crate::model_updater::Session>, &Config, CatalogRevision) -> T,
+    ) -> T {
+        let commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
+        let revision = CatalogRevision {
+            expected: *commit,
+            current: self.config_commit.clone(),
+        };
+        f(
+            self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref(),
+            &self.config(),
+            revision,
+        )
+    }
+
     /// Whether [`Runtime::publish_config_and_policy`] would commit `config`: Go
     /// `commitConfigUpdate` rejects the whole update over invalid catalog sources.
     /// Callers that apply other state before publishing check this first.
@@ -216,7 +256,8 @@ impl Runtime {
         // Commits are serialized, so the catalogs are configured in commit order; the
         // config lock itself is released first, as Go releases cfgMu before
         // `UpdateModelCatalogSources`, so readers never wait on a catalog publish.
-        let commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut commit = self.config_commit.lock().unwrap_or_else(PoisonError::into_inner);
+        *commit += 1;
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         // Go `UpdateModelCatalogSources`; the reads stay async.
         if let Some(catalogs) = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
