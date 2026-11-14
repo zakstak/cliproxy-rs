@@ -1191,8 +1191,9 @@ Request fields and controls:
 - any top-level field without a rule;
 - Claude `top_k`, non-empty `stop_sequences`, `service_tier: standard_only` or another
   tier other than `auto`, `fast` and `priority`, an unknown `speed`, an unknown
-  `tool_choice` type (or `tool` without a name), an unknown `thinking` type, or an
-  `output_config` member other than `effort` and `format`;
+  `tool_choice` type (or `tool` without a name), an unknown `thinking` type, an
+  `output_config` member other than `effort` and `format`, or an `output_config.effort`
+  without a `thinking` type (#80; a `null` or blank effort counts as absent);
 - Chat `stop`, `n` above 1, a non-zero penalty, `seed`, `logit_bias`, `logprobs`,
   `store: true` (the encrypted-reasoning round trip needs `store: false`), audio or
   other non-text modalities, a message `name` or `refusal`, or a `response_format`

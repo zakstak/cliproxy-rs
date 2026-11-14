@@ -1108,3 +1108,44 @@ async fn claude_cache_telemetry_lookup_boundaries_and_automatic_targets() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// #80 control: the translated routes refuse `output_config.effort` without a `thinking`
+/// type, but native Claude takes it. It reaches the upstream with the rest of
+/// `output_config`, an unknown member included, byte for byte, buffered and streamed.
+#[tokio::test]
+async fn native_claude_keeps_standalone_effort() {
+    let _registry = REGISTRY.lock().await;
+    let log: Log = Arc::default();
+    let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
+    let dir = auth_dir(
+        "effort",
+        &[(
+            "claude-a.json",
+            r#"{"type":"claude","access_token":"tok-A","email":"a@example.com"}"#,
+        )],
+    );
+    let proxy = proxy(&dir, &upstream_url).await;
+    let output_config = r#""output_config":{ "effort":"low", "x_opaque":{"k":[1, 2]} }"#;
+    for stream in [false, true] {
+        let body = format!(
+            r#"{{"model":"claude-opus-5-5","stream":{stream},{output_config},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let res = wreq::Client::new()
+            .post(format!("{proxy}/v1/messages"))
+            .header("x-api-key", "client-key-1")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200, "stream={stream}");
+        res.text().await.unwrap();
+    }
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    for s in &seen {
+        let body = String::from_utf8_lossy(&s.body);
+        assert!(body.contains(output_config), "{body}");
+        assert!(!s.client_key_leaked);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
