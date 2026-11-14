@@ -1235,6 +1235,9 @@ pub struct Selection {
     /// The caller scope that binds this session; a child inherits only bindings of the
     /// same caller ([`crate::session::Session::caller`]). Empty without a client key.
     pub caller: String,
+    /// The Codex thread this request belongs to, as a Guardian reviewer names it
+    /// ([`crate::session::Session::thread`]).
+    pub session_thread: Option<String>,
     /// A request without an explicit session, for the LCP matcher (Go `pickLCP`). Set
     /// only with session affinity on; it then decides the binding instead of `session`.
     pub lcp: Option<Arc<crate::lcp::Request>>,

@@ -13,12 +13,26 @@ pub type Key = (String, String, String);
 const MAX_ENTRIES: usize = 65536;
 const MAX_STABLE_ALIASES: usize = 64;
 
+/// Who made a binding: the caller scope (only its own children inherit the binding)
+/// and, for a Codex request, its `codex:<thread>`, by which a Guardian reviewer names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Owner {
+    pub caller: String,
+    pub thread: Option<String>,
+}
+
 struct Group {
     auth: String,
-    /// The caller scope that made the binding; only its own children inherit it.
-    caller: String,
+    owner: Owner,
     deadline: Instant,
     aliases: Vec<Key>,
+}
+
+impl Group {
+    /// The sessions [`Cache::latest`] finds this group by: its aliases' and its thread.
+    fn sessions(&self) -> impl Iterator<Item = &String> {
+        self.aliases.iter().map(|a| &a.2).chain(self.owner.thread.iter())
+    }
 }
 
 #[derive(Default)]
@@ -28,7 +42,8 @@ pub struct Cache {
     groups: BTreeMap<u64, Group>,
     /// Group ID by its first alias (Go keys groups by primary alias).
     primaries: HashMap<Key, u64>,
-    /// Group IDs by the session of each alias, across scopes and models ([`Self::latest`]).
+    /// Group IDs by each of their sessions ([`Group::sessions`]), across scopes and
+    /// models ([`Self::latest`]).
     sessions: HashMap<String, Vec<u64>>,
     next: u64,
     /// Next expired-group sweep (Go's cleanup loop runs every ttl/2).
@@ -61,9 +76,9 @@ impl Cache {
             self.remove(id);
             return None;
         };
-        let (auth, caller) = (group.auth.clone(), group.caller.clone());
+        let (auth, owner) = (group.auth.clone(), group.owner.clone());
         let aliases = compact(merge(vec![key.clone()], &group.aliases));
-        self.replace(&auth, &caller, now + ttl, aliases, &[id]);
+        self.replace(&auth, &owner, now + ttl, aliases, &[id]);
         Some(auth)
     }
 
@@ -72,25 +87,25 @@ impl Cache {
     pub fn get_for(&mut self, key: &Key, caller: &str, now: Instant) -> Option<String> {
         let auth = self.get(key, now)?;
         let group = self.groups.get(self.entries.get(key)?)?;
-        (group.caller == caller).then_some(auth)
+        (group.owner.caller == caller).then_some(auth)
     }
 
-    /// The credential of the newest live binding of `session` (on any scope and model)
-    /// that `caller` made and `eligible` accepts, without refreshing it. Cost: the
-    /// session's own groups.
+    /// The credential of the newest live binding of `session` (an alias's session or the
+    /// binding request's thread, on any scope and model) that `caller` made and
+    /// `eligible` accepts, without refreshing it. Cost: the session's own groups.
     pub fn latest(&self, session: &str, caller: &str, now: Instant, eligible: impl Fn(&str) -> bool) -> Option<String> {
         self.sessions
             .get(session)?
             .iter()
             .filter_map(|id| Some((*id, self.groups.get(id)?)))
-            .filter(|(_, g)| now < g.deadline && g.caller == caller && eligible(&g.auth))
+            .filter(|(_, g)| now < g.deadline && g.owner.caller == caller && eligible(&g.auth))
             .max_by_key(|(id, _)| *id)
             .map(|(_, g)| g.auth.clone())
     }
 
     /// Go `SetAliases`: binds `keys` (and the live groups they belong to) to `auth` for
-    /// `caller`.
-    pub fn bind(&mut self, auth: &str, caller: &str, keys: &[Key], now: Instant, ttl: Duration) {
+    /// `owner`.
+    pub fn bind(&mut self, auth: &str, owner: &Owner, keys: &[Key], now: Instant, ttl: Duration) {
         let mut aliases = merge(Vec::new(), keys);
         let mut previous = Vec::new();
         for key in keys {
@@ -107,7 +122,7 @@ impl Cache {
         }
         let aliases = compact(aliases);
         if !aliases.is_empty() {
-            self.replace(auth, caller, now + ttl, aliases, &previous);
+            self.replace(auth, owner, now + ttl, aliases, &previous);
         }
     }
 
@@ -119,9 +134,9 @@ impl Cache {
         if group.auth != auth {
             return;
         }
-        let caller = group.caller.clone();
+        let owner = group.owner.clone();
         let aliases = compact(merge(vec![key.clone()], &group.aliases));
-        self.replace(auth, &caller, now + ttl, aliases, &[id]);
+        self.replace(auth, &owner, now + ttl, aliases, &[id]);
     }
 
     /// Go `CompareAndDelete`: drops `key` from its group if bound to `auth`.
@@ -135,11 +150,11 @@ impl Cache {
         if group.auth != auth {
             return;
         }
-        let (deadline, caller) = (group.deadline, group.caller.clone());
+        let (deadline, owner) = (group.deadline, group.owner.clone());
         let surviving: Vec<Key> = group.aliases.iter().filter(|a| *a != key).cloned().collect();
         self.remove(id);
         if !surviving.is_empty() {
-            self.replace(auth, &caller, deadline, surviving, &[]);
+            self.replace(auth, &owner, deadline, surviving, &[]);
         }
     }
 
@@ -200,17 +215,19 @@ impl Cache {
             if self.entries.get(alias) == Some(&id) {
                 self.entries.remove(alias);
             }
-            if let Some(ids) = self.sessions.get_mut(&alias.2) {
+        }
+        for session in group.sessions() {
+            if let Some(ids) = self.sessions.get_mut(session) {
                 ids.retain(|g| *g != id);
                 if ids.is_empty() {
-                    self.sessions.remove(&alias.2);
+                    self.sessions.remove(session);
                 }
             }
         }
     }
 
     /// Go `replaceAliasGroupsLocked`.
-    fn replace(&mut self, auth: &str, caller: &str, deadline: Instant, aliases: Vec<Key>, previous: &[u64]) {
+    fn replace(&mut self, auth: &str, owner: &Owner, deadline: Instant, aliases: Vec<Key>, previous: &[u64]) {
         previous.iter().for_each(|id| self.remove(*id));
         if let Some(&existing) = self.primaries.get(&aliases[0]) {
             self.remove(existing);
@@ -219,21 +236,21 @@ impl Cache {
         self.next += 1;
         for alias in &aliases {
             self.entries.insert(alias.clone(), id);
-            let ids = self.sessions.entry(alias.2.clone()).or_default();
+        }
+        self.primaries.insert(aliases[0].clone(), id);
+        let group = Group {
+            auth: auth.to_owned(),
+            owner: owner.clone(),
+            deadline,
+            aliases,
+        };
+        for session in group.sessions() {
+            let ids = self.sessions.entry(session.clone()).or_default();
             if !ids.contains(&id) {
                 ids.push(id);
             }
         }
-        self.primaries.insert(aliases[0].clone(), id);
-        self.groups.insert(
-            id,
-            Group {
-                auth: auth.to_owned(),
-                caller: caller.to_owned(),
-                deadline,
-                aliases,
-            },
-        );
+        self.groups.insert(id, group);
         while self.entries.len() > MAX_ENTRIES {
             let Some(oldest) = self.groups.keys().next().copied() else {
                 break;
@@ -285,9 +302,28 @@ mod tests {
         let t0 = Instant::now();
         let on = |model: &str| ("claude".to_owned(), model.to_owned(), "parent".to_owned());
         let mut cache = Cache::default();
-        cache.bind("a", "me", &[on("m1")], t0, ttl);
-        cache.bind("b", "me", &[on("m2")], t0, ttl);
-        cache.bind("c", "other", &[on("m3")], t0, ttl);
+        let owner = |caller: &str| Owner {
+            caller: caller.into(),
+            thread: None,
+        };
+        cache.bind("a", &owner("me"), &[on("m1")], t0, ttl);
+        cache.bind("b", &owner("me"), &[on("m2")], t0, ttl);
+        cache.bind("c", &owner("other"), &[on("m3")], t0, ttl);
+        // A named agent's binding is found by its thread too.
+        let worker = Owner {
+            caller: "me".into(),
+            thread: Some("worker-thread".into()),
+        };
+        cache.bind(
+            "d",
+            &worker,
+            &[("claude".into(), "m1".into(), "root:agent:worker".into())],
+            t0,
+            ttl,
+        );
+        assert_eq!(cache.latest("worker-thread", "me", t0, |_| true).as_deref(), Some("d"));
+        assert_eq!(cache.latest("worker-thread", "other", t0, |_| true), None);
+        cache.invalidate("d");
         let any = |_: &str| true;
         assert_eq!(cache.latest("parent", "me", t0, any).as_deref(), Some("b"));
         assert_eq!(cache.latest("parent", "me", t0, |id| id != "b").as_deref(), Some("a"));
@@ -310,7 +346,7 @@ mod tests {
         let ttl = Duration::from_secs(10);
         let t0 = Instant::now();
         let mut cache = Cache::default();
-        cache.bind("a", "", &[key("pck:1"), key("conv:1")], t0, ttl);
+        cache.bind("a", &Owner::default(), &[key("pck:1"), key("conv:1")], t0, ttl);
         // Refreshing one alias extends the whole group.
         let t1 = t0 + Duration::from_secs(8);
         assert_eq!(cache.get_and_refresh(&key("pck:1"), t1, ttl).as_deref(), Some("a"));
@@ -322,7 +358,7 @@ mod tests {
         assert_eq!(cache.get(&key("pck:1"), t2).as_deref(), Some("a"));
         assert_eq!(cache.get(&key("pck:1"), t1 + ttl), None, "deadline kept, not refreshed");
         // A different credential's failure changes nothing.
-        cache.bind("a", "", &[key("s")], t0, ttl);
+        cache.bind("a", &Owner::default(), &[key("s")], t0, ttl);
         cache.compare_and_delete(&key("s"), "b");
         assert_eq!(cache.get(&key("s"), t0).as_deref(), Some("a"));
         // Touch only refreshes the current owner.
@@ -335,10 +371,10 @@ mod tests {
         let ttl = Duration::from_secs(10);
         let t0 = Instant::now();
         let mut cache = Cache::default();
-        cache.bind("a", "", &[key("pck:1"), key("conv:1")], t0, ttl);
+        cache.bind("a", &Owner::default(), &[key("pck:1"), key("conv:1")], t0, ttl);
         // A new prompt-cache key on the same conversation joins the group; the older
         // prompt-cache alias is compacted away.
-        cache.bind("b", "", &[key("pck:2"), key("conv:1")], t0, ttl);
+        cache.bind("b", &Owner::default(), &[key("pck:2"), key("conv:1")], t0, ttl);
         assert_eq!(cache.get(&key("pck:2"), t0).as_deref(), Some("b"));
         assert_eq!(cache.get(&key("conv:1"), t0).as_deref(), Some("b"));
         assert_eq!(cache.get(&key("pck:1"), t0), None);
@@ -352,7 +388,7 @@ mod tests {
         let t0 = Instant::now();
         let mut cache = Cache::default();
         for i in 0..=MAX_ENTRIES {
-            cache.bind("a", "", &[key(&format!("s{i}"))], t0, ttl);
+            cache.bind("a", &Owner::default(), &[key(&format!("s{i}"))], t0, ttl);
         }
         assert_eq!(cache.entries.len(), MAX_ENTRIES);
         assert_eq!(cache.get(&key("s0"), t0), None);

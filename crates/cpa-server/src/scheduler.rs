@@ -1218,7 +1218,11 @@ impl Scheduler {
                 .pick_unbound(candidates, selection, policy.strategy, ranks)
                 .ok_or(NoPick::Empty)?,
         };
-        self.affinity.bind(&picked.id, &selection.caller, &bind_keys, now, ttl);
+        let owner = crate::affinity::Owner {
+            caller: selection.caller.clone(),
+            thread: selection.session_thread.clone(),
+        };
+        self.affinity.bind(&picked.id, &owner, &bind_keys, now, ttl);
         Ok(picked)
     }
 
@@ -3309,6 +3313,52 @@ mod tests {
                 .unwrap()
                 .id,
             "a"
+        );
+    }
+
+    /// #113: a named Codex agent's session key is `codex:<root>:agent:<name>`, but its
+    /// Guardian reviewer names it by its thread; the reviewer still finds its binding.
+    /// In a mixed pool the parent's account is inherited only when it is a candidate for
+    /// the reviewer's model.
+    #[test]
+    fn guardian_reviewers_find_named_agents_by_thread_and_need_eligible_providers() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let p = affinity_policy(60);
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        let worker = Selection {
+            session: Some("codex:root:agent:worker".into()),
+            session_parent: Some("codex:root".into()),
+            session_thread: Some("codex:worker-thread".into()),
+            caller: "me".into(),
+            ..selection("big")
+        };
+        s.pick(&tag(&[&b]), &worker, &p, now).unwrap();
+        let review = reviewer("worker-thread", "small", "me", true);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &review, &p, now).unwrap().id, "b");
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("type".into(), "codex".into());
+        let x = Credential::from_file(Path::new("/mock"), &Path::new("/mock").join("x"), metadata).unwrap();
+        let mut s = Scheduler::default();
+        let parent = Selection {
+            providers: vec!["codex".into()],
+            ..codex_session("root", "gpt", "me")
+        };
+        s.pick(&[(&x, "codex")], &parent, &p, now).unwrap();
+        let claude_only = Selection {
+            providers: vec!["claude".into()],
+            ..reviewer("root", "small", "me", true)
+        };
+        assert_eq!(s.pick(&tag(&[&a]), &claude_only, &p, now).unwrap().id, "a");
+        let mixed = Selection {
+            session: Some("codex:reviewer-2".into()),
+            providers: vec!["claude".into(), "codex".into()],
+            ..reviewer("root", "small", "me", true)
+        };
+        assert_eq!(
+            s.pick(&[(&a, "claude"), (&x, "codex")], &mixed, &p, now).unwrap().id,
+            "x"
         );
     }
 

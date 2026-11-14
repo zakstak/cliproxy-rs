@@ -33,6 +33,10 @@ pub struct Session {
     /// The matched client key's caller scope ([`identity::caller_scope`]): bindings a
     /// child inherits from its parent must come from the same caller.
     pub caller: String,
+    /// `codex:<thread>` for a request naming a Codex thread ([`identity::codex_thread`]):
+    /// the parent identity a Guardian reviewer names, which can differ from `id` (a named
+    /// agent resolves to `codex:<root>:agent:<name>`).
+    pub thread: Option<String>,
 }
 
 /// Resolves the session of a request in `format` from its client headers and body.
@@ -59,6 +63,7 @@ pub fn resolve(format: Format, headers: &HeaderMap, body: &[u8], execution: Opti
         .get("x-openai-subagent")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim().go_eq_fold("guardian"));
+    let thread = identity::codex_thread(headers);
     Session {
         id: some(primary),
         parent: some(parent),
@@ -68,6 +73,7 @@ pub fn resolve(format: Format, headers: &HeaderMap, body: &[u8], execution: Opti
         source,
         guardian,
         caller: scope,
+        thread: (!thread.is_empty()).then(|| identity::bound_session_identity(&format!("codex:{thread}"))),
     }
 }
 
@@ -131,6 +137,39 @@ mod tests {
             "client-key",
         );
         assert!(!other.guardian, "only the Guardian reviewer");
+        // A named agent resolves to `codex:<root>:agent:<name>`; its reviewer names its
+        // thread, which the session carries.
+        let worker_thread = "019a0000-0000-7000-8000-000000000005";
+        let metadata = format!(r#"{{"session_id":"{root}","thread_id":"{worker_thread}","agent_name":"worker"}}"#);
+        let worker = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[
+                ("session-id", root),
+                ("thread-id", worker_thread),
+                ("x-openai-subagent", "collab_spawn"),
+                ("x-codex-turn-metadata", &metadata),
+            ]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert_eq!(
+            worker.id.as_deref(),
+            Some(format!("codex:{root}:agent:worker").as_str())
+        );
+        let worker_review = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[
+                ("session-id", root),
+                ("thread-id", "019a0000-0000-7000-8000-000000000006"),
+                ("x-openai-subagent", "guardian"),
+                ("x-codex-parent-thread-id", worker_thread),
+            ]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert_eq!(worker_review.parent, worker.thread, "named by the worker's thread");
     }
 
     /// Goldens from Go `session.ExtractSessionInfo`, `session.Enrich` and
