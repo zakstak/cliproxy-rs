@@ -75,9 +75,9 @@ routing:
 
 With `never`, a bound conversation is served only by its account:
 
-- When that account fails during a request, the client gets the account's own error. Retry rounds (`routing.retry.request-retry`) retry only that account.
-- While that account cannot serve the conversation (it is cooling down, out of quota, disabled, removed, or its sign-in was refused), requests in the conversation fail with status 503 and code `session_auth_unavailable`. The response names no account. While the account's cooldown has a known end, the response has a `Retry-After` header with the remaining seconds.
-- A failure, a removed account file and the Reset cooldown button keep the binding. An account that comes back under the same file serves its conversations again.
+- When that account fails during a request, the client gets the account's own error. Retry rounds (`routing.retry.request-retry`) retry only that account, and `routing.retry.max-retry-interval` waits only for that account's cooldown.
+- While that account cannot serve the conversation (it is cooling down, out of quota, disabled, removed, or its sign-in was refused), requests in the conversation fail with status 503 and code `session_auth_unavailable` (`error.code` on OpenAI routes; the start of the message on Claude routes). The response names no account. While the account's cooldown has a known end, the response has a `Retry-After` header with the remaining seconds.
+- A failure, a removed account file and the Reset cooldown button keep the binding. An account that comes back under the same file serves its conversations again. Bindings are kept per set of providers that serve the model, so removing the last account of one provider changes that set: when another provider also serves the model, the conversation starts there; when none does, the request fails as one for an unknown model.
 - The binding ends `session-affinity-ttl` after the last request the account served. Failed requests do not extend it. After that, the conversation's next request picks an account by the routing strategy.
 - Bindings are per model: the same conversation on another model picks its own account. A fork or a subagent that would only inherit its parent's account picks by the strategy when that account is unavailable.
 - Changing `strategy`, `session-affinity`, `session-affinity-ttl` or `session-affinity-subagents` clears every binding. Changing `session-affinity-rebind-on` keeps them.

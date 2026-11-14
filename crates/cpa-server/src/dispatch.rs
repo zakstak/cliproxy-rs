@@ -329,7 +329,11 @@ impl Failure {
                 cause,
                 ..
             } => unavailable_text(code, "no auth available", providers, model, cause.as_deref()),
-            Failure::Bound { .. } => BOUND_TEXT.to_owned(),
+            // JSON, like `Cooldown`: OpenAI-shaped routes pass the code through, Claude
+            // routes keep the message (which starts with the code).
+            Failure::Bound { .. } => gojson::sorted(&serde_json::json!({
+                "error": { "code": "session_auth_unavailable", "message": BOUND_TEXT }
+            })),
             Failure::Cooldown {
                 model,
                 provider,
@@ -391,7 +395,7 @@ impl Failure {
     }
 }
 
-/// [`Failure::Bound`]'s text: why the request failed and what the client can do, without
+/// [`Failure::Bound`]'s message: why the request failed and what the client can do, without
 /// naming the account.
 const BOUND_TEXT: &str = "session_auth_unavailable: the account this session is bound to is unavailable, and \
      routing.session-affinity-rebind-on is never, so the session is not moved to another account; \
@@ -1103,6 +1107,8 @@ async fn run_routed(
     loop {
         let mut last: Option<Fault> = None;
         let mut attempted: Vec<String> = Vec::new();
+        // The credential a `never`-rebind session is bound to, once a pick refused it.
+        let mut bound: Option<String> = None;
         let pick_failure = loop {
             if policy.max_retry_credentials > 0 && attempted.len() >= policy.max_retry_credentials {
                 break None;
@@ -1129,7 +1135,10 @@ async fn run_routed(
                         signals: Box::new(signals),
                     });
                 }
-                Err(AcquireError::Bound { retry_after }) => break Some(Failure::Bound { retry_after }),
+                Err(AcquireError::Bound { id, retry_after }) => {
+                    bound = Some(id);
+                    break Some(Failure::Bound { retry_after });
+                }
                 Err(AcquireError::Unavailable { retry_after, cause }) => {
                     break Some(Failure::Unavailable {
                         code: if retry_after.is_some() {
@@ -1215,6 +1224,9 @@ async fn run_routed(
             Failure::Cooldown { .. } => (429, true),
             Failure::Unavailable {
                 retry_after: Some(_), ..
+            }
+            | Failure::Bound {
+                retry_after: Some(_), ..
             } => (503, true),
             _ => (0, false),
         };
@@ -1224,7 +1236,13 @@ async fn run_routed(
         }
         let wait = {
             let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors);
-            rt.store().retry_wait(&selection, &policy, status, &attempted, &admit)
+            // A bound session's next round can only use its own credential: wait for that
+            // one, not for a spare it will never move to.
+            let admit_bound = |c: &cpa_core::credential::Credential| {
+                bound.as_ref().is_none_or(|id| *id == c.id).then(|| admit(c)).flatten()
+            };
+            rt.store()
+                .retry_wait(&selection, &policy, status, &attempted, &admit_bound)
         };
         let Some(wait) = wait else {
             return Err(terminal(round_error));

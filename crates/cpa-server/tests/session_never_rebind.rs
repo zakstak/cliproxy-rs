@@ -8,7 +8,6 @@
 //! naming no account. The default policy keeps moving the session.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,9 +27,20 @@ const SESSION: &str = "6f0e8a51-3c2d-4b7a-9e10-2a4b6c8d0e1f";
 /// The upstream key of every call, in order.
 type Calls = Arc<Mutex<Vec<String>>>;
 
-/// A mock where `sk-fake-a` answers with the status in `a` (200, 429 with a one-hour
-/// reset, or 500) and `sk-fake-b` always succeeds.
-async fn mock(a: Arc<AtomicU16>) -> (String, Calls) {
+/// The statuses `sk-fake-a` answers with, in order; the last one repeats.
+type Statuses = Arc<Mutex<Vec<u16>>>;
+
+fn statuses(first: &[u16]) -> Statuses {
+    Arc::new(Mutex::new(first.to_vec()))
+}
+
+fn set(a: &Statuses, next: &[u16]) {
+    *a.lock().unwrap() = next.to_vec();
+}
+
+/// A mock where `sk-fake-a` answers with the statuses in `a` (200; 429 with a one-hour
+/// reset; 500 without a hint) and `sk-fake-b` always succeeds.
+async fn mock(a: Statuses) -> (String, Calls) {
     let calls: Calls = Arc::default();
     let seen = calls.clone();
     let app = axum::Router::new().fallback(move |req: Request| {
@@ -46,7 +56,8 @@ async fn mock(a: Arc<AtomicU16>) -> (String, Calls) {
                 .to_owned();
             seen.lock().unwrap().push(key.clone());
             let status = if key == "sk-fake-a" {
-                a.load(Ordering::SeqCst)
+                let mut a = a.lock().unwrap();
+                if a.len() > 1 { a.remove(0) } else { a[0] }
             } else {
                 200
             };
@@ -55,12 +66,14 @@ async fn mock(a: Arc<AtomicU16>) -> (String, Calls) {
                 429 => LIMIT,
                 _ => BROKEN,
             };
-            (
-                StatusCode::from_u16(status).unwrap(),
-                [("content-type", "application/json"), ("retry-after", "3600")],
-                body,
-            )
-                .into_response()
+            let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
+            response
+                .headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            if status == 429 {
+                response.headers_mut().insert("retry-after", "3600".parse().unwrap());
+            }
+            response
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -110,9 +123,13 @@ struct Reply {
 }
 
 async fn post(url: &str, session: Option<&str>) -> Reply {
+    post_to(url, "/v1/messages", session).await
+}
+
+async fn post_to(url: &str, path: &str, session: Option<&str>) -> Reply {
     let body = json!({"model": "claude-opus-4-6", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
     let mut request = wreq::Client::new()
-        .post(format!("{url}/v1/messages"))
+        .post(format!("{url}{path}"))
         .header("x-api-key", "client-key")
         .header("content-type", "application/json");
     if let Some(session) = session {
@@ -147,12 +164,12 @@ fn assert_anonymous(reply: &Reply, rt: &cpa_server::Runtime) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_exhausted_bound_account_fails_the_session_instead_of_moving_it() {
     let dir = auth_dir("exhausted");
-    let a = Arc::new(AtomicU16::new(200));
+    let a = statuses(&[200]);
     let (upstream, calls) = mock(a.clone()).await;
     let (rt, url) = start(config(&dir, &upstream, "  session-affinity-rebind-on: never\n")).await;
 
     assert_eq!(post(&url, Some(SESSION)).await.status, 200);
-    a.store(429, Ordering::SeqCst);
+    set(&a, &[429]);
     let limited = post(&url, Some(SESSION)).await;
     assert_eq!(limited.status, 429, "the bound key's own error: {}", limited.body);
     assert!(limited.body.contains("slow down"), "{}", limited.body);
@@ -161,6 +178,12 @@ async fn an_exhausted_bound_account_fails_the_session_instead_of_moving_it() {
     assert_anonymous(&refused, &rt);
     let wait: u64 = refused.retry_after.as_deref().expect("Retry-After").parse().unwrap();
     assert!((3000..=3600).contains(&wait), "the bound key's cooldown: {wait}");
+    // An OpenAI-shaped route carries the code as `error.code`.
+    let chat = post_to(&url, "/v1/chat/completions", Some(SESSION)).await;
+    assert_eq!(chat.status, 503, "{}", chat.body);
+    assert_anonymous(&chat, &rt);
+    let parsed: serde_json::Value = serde_json::from_str(&chat.body).unwrap();
+    assert_eq!(parsed["error"]["code"], "session_auth_unavailable", "{}", chat.body);
     assert_eq!(
         *calls.lock().unwrap(),
         ["sk-fake-a", "sk-fake-a"],
@@ -174,11 +197,11 @@ async fn an_exhausted_bound_account_fails_the_session_instead_of_moving_it() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let dir = auth_dir("exhausted-default");
-    let a = Arc::new(AtomicU16::new(200));
+    let a = statuses(&[200]);
     let (upstream, calls) = mock(a.clone()).await;
     let (_rt, url) = start(config(&dir, &upstream, "")).await;
     assert_eq!(post(&url, Some(SESSION)).await.status, 200);
-    a.store(429, Ordering::SeqCst);
+    set(&a, &[429]);
     assert_eq!(post(&url, Some(SESSION)).await.status, 200, "default moves the session");
     assert_eq!(*calls.lock().unwrap(), ["sk-fake-a", "sk-fake-a", "sk-fake-b"]);
     let _ = std::fs::remove_dir_all(&dir);
@@ -189,13 +212,13 @@ async fn an_exhausted_bound_account_fails_the_session_instead_of_moving_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_rounds_retry_only_the_bound_account() {
     let dir = auth_dir("retry");
-    let a = Arc::new(AtomicU16::new(200));
+    let a = statuses(&[200]);
     let (upstream, calls) = mock(a.clone()).await;
     let routing = "  session-affinity-rebind-on: never\n  retry: {request-retry: 1}\n  \
                    cooldown: {transient-error-cooldown-seconds: -1}\n";
     let (_rt, url) = start(config(&dir, &upstream, routing)).await;
     assert_eq!(post(&url, Some(SESSION)).await.status, 200);
-    a.store(500, Ordering::SeqCst);
+    set(&a, &[500]);
     let failed = post(&url, Some(SESSION)).await;
     assert_eq!(failed.status, 500, "{}", failed.body);
     assert!(failed.body.contains("upstream broke"), "{}", failed.body);
@@ -207,13 +230,32 @@ async fn retry_rounds_retry_only_the_bound_account() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The retry wait follows the bound key alone: with a ready spare, the next round still
+/// waits out the bound key's one-second cooldown and retries it, instead of starting at
+/// once and ending on the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_rounds_wait_for_the_bound_account_not_a_spare() {
+    let dir = auth_dir("retry-wait");
+    let a = statuses(&[200]);
+    let (upstream, calls) = mock(a.clone()).await;
+    let routing = "  session-affinity-rebind-on: never\n  retry: {request-retry: 1, max-retry-interval: 5}\n  \
+                   cooldown: {transient-error-cooldown-seconds: 1}\n";
+    let (_rt, url) = start(config(&dir, &upstream, routing)).await;
+    assert_eq!(post(&url, Some(SESSION)).await.status, 200);
+    set(&a, &[500, 200]);
+    let retried = post(&url, Some(SESSION)).await;
+    assert_eq!(retried.status, 200, "{}", retried.body);
+    assert_eq!(*calls.lock().unwrap(), ["sk-fake-a", "sk-fake-a", "sk-fake-a"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A removed bound key refuses the session (without `Retry-After`) until the binding
 /// expires one TTL after the last request the key served; then the session starts
 /// again on the remaining key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_bound_account_fails_the_session_until_the_pin_expires() {
     let dir = auth_dir("removed");
-    let a = Arc::new(AtomicU16::new(200));
+    let a = statuses(&[200]);
     let (upstream, calls) = mock(a.clone()).await;
     let routing = "  session-affinity-rebind-on: never\n  session-affinity-ttl: 1s\n";
     let (rt, url) = start(config(&dir, &upstream, routing)).await;

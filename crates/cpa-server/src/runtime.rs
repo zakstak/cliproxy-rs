@@ -1204,10 +1204,11 @@ pub enum AcquireError {
         id: String,
         error: ExecError,
     },
-    /// Under `session-affinity-rebind-on: never`, the session's credential cannot serve
-    /// it now. `retry_after` is that credential's cooldown, when it has one. Deliberately
-    /// carries no credential identity.
+    /// Under `session-affinity-rebind-on: never`, the session's credential `id` cannot
+    /// serve it now. `retry_after` is that credential's cooldown, when it has one. `id`
+    /// only scopes the retry decision ([`Store::retry_wait`]); clients never see it.
     Bound {
+        id: String,
         retry_after: Option<Duration>,
     },
 }
@@ -2043,7 +2044,7 @@ impl CredentialStore {
                         .iter()
                         .find(|(c, _)| c.id == id)
                         .and_then(|(c, m)| scheduler.wait(c, m, now));
-                    return Err(AcquireError::Bound { retry_after });
+                    return Err(AcquireError::Bound { id, retry_after });
                 }
             };
             let (c, m) = eligible.iter().find(|(c, _)| c.id == picked.id).unwrap();

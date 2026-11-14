@@ -1119,8 +1119,14 @@ impl Scheduler {
         }
         if let Some(request) = selection.lcp.as_deref().filter(|_| self.affinity(policy)) {
             let namespace = request.namespace(&selection.model);
-            // A known trajectory stays on its credential while that one is available.
-            if let Some(found) = self.lcp.find(&namespace, request.prepared(), now) {
+            // A known trajectory stays on its credential while that one is available. Under
+            // `never` the lookup does not extend the pin; a served request's success does.
+            let found = if never {
+                self.lcp.peek(&namespace, request.prepared(), now)
+            } else {
+                self.lcp.find(&namespace, request.prepared(), now)
+            };
+            if let Some(found) = found {
                 if let Some((c, _)) = candidates.iter().find(|(c, _)| c.id == found.auth) {
                     return Ok((c, Some(found)));
                 }
@@ -3101,6 +3107,45 @@ mod tests {
         assert_eq!(
             s.pick_session(&tag(&[&a, &b]), &mine, &p, &ranks, now).unwrap().0.id,
             "a"
+        );
+    }
+
+    /// #97: refused message-matched requests do not extend the pin either: it expires one
+    /// TTL after its last served request, however often the client retries meanwhile.
+    #[test]
+    fn never_message_matched_pin_expires_despite_refusals() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let p = never_policy(10);
+        let ranks = |_: &Credential| Windows::default();
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        let body = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let sel = Selection {
+            lcp: Some(std::sync::Arc::new(
+                crate::lcp::Request::new("openai", body, "client-one").unwrap(),
+            )),
+            ..selection("m")
+        };
+        assert_eq!(
+            s.pick_session(&tag(&[&a, &b]), &sel, &p, &ranks, now).unwrap().0.id,
+            "a"
+        );
+        for at in [3, 6, 9] {
+            assert_eq!(
+                s.pick_session(&tag(&[&b]), &sel, &p, &ranks, now + secs(at))
+                    .unwrap_err(),
+                NoPick::Bound("a".into()),
+                "{at}s"
+            );
+        }
+        assert_eq!(
+            s.pick_session(&tag(&[&b]), &sel, &p, &ranks, now + secs(11))
+                .unwrap()
+                .0
+                .id,
+            "b",
+            "expired"
         );
     }
 
