@@ -63,6 +63,27 @@ With affinity on, a conversation stays on the account that served its first requ
 
 When `session-affinity` is omitted, both cliproxy-rs and CLIProxyAPI default to off. Affinity works with the routing strategy: a bound conversation keeps its account; new conversations follow the strategy. When the bound account cools down or is disabled, the conversation moves to another account. `session-affinity-ttl` (default `"1h"`) controls how long an idle conversation keeps its account. `session-affinity-subagents` (default `true`) binds child sessions to their parent's account too.
 
+### Never move a conversation
+
+By default a conversation moves to another ready account when its own account cools down, fails or is disabled, so the request succeeds but the prompt cache starts again. To keep every conversation on its first account instead, opt in:
+
+```yaml
+routing:
+  session-affinity: true
+  session-affinity-rebind-on: never
+```
+
+With `never`, a bound conversation is served only by its account:
+
+- When that account fails during a request, the client gets the account's own error. Retry rounds (`routing.retry.request-retry`) retry only that account.
+- While that account cannot serve the conversation (it is cooling down, out of quota, disabled, removed, or its sign-in was refused), requests in the conversation fail with status 503 and code `session_auth_unavailable`. The response names no account. While the account's cooldown has a known end, the response has a `Retry-After` header with the remaining seconds.
+- A failure, a removed account file and the Reset cooldown button keep the binding. An account that comes back under the same file serves its conversations again.
+- The binding ends `session-affinity-ttl` after the last request the account served. Failed requests do not extend it. After that, the conversation's next request picks an account by the routing strategy.
+- Bindings are per model: the same conversation on another model picks its own account. A fork or a subagent that would only inherit its parent's account picks by the strategy when that account is unavailable.
+- Changing `strategy`, `session-affinity`, `session-affinity-ttl` or `session-affinity-subagents` clears every binding. Changing `session-affinity-rebind-on` keeps them.
+
+To leave a stuck conversation, start a new session in the client. `any` is the default. CLIProxyAPI's `quota` value is not supported and works as `any`. Home mode picks accounts remotely and ignores this setting.
+
 ## Cooldowns and limits
 
 When a provider answers 429 (too many requests, or a used-up limit), the proxy rests that account for that model and sends the request to the next ready account:

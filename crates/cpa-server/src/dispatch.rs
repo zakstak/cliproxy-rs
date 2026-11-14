@@ -276,6 +276,9 @@ pub enum Failure {
         cause: Option<String>,
         retry_after: Option<Duration>,
     },
+    /// Under `session-affinity-rebind-on: never`, the session's account cannot serve it
+    /// ([`AcquireError::Bound`]). Names no account.
+    Bound { retry_after: Option<Duration> },
     /// Every candidate is cooling down for this model.
     Cooldown {
         model: String,
@@ -293,7 +296,7 @@ impl Failure {
         match self {
             Failure::Exec(e) | Failure::Remote { error: e, .. } => classify::response_status(e),
             Failure::UnknownModel(_) | Failure::SpeechOnly(_) => 400,
-            Failure::ImageOnly(_) | Failure::Unavailable { .. } => 503,
+            Failure::ImageOnly(_) | Failure::Unavailable { .. } | Failure::Bound { .. } => 503,
             Failure::Cooldown { .. } => 429,
         }
     }
@@ -326,6 +329,7 @@ impl Failure {
                 cause,
                 ..
             } => unavailable_text(code, "no auth available", providers, model, cause.as_deref()),
+            Failure::Bound { .. } => BOUND_TEXT.to_owned(),
             Failure::Cooldown {
                 model,
                 provider,
@@ -369,6 +373,9 @@ impl Failure {
             Failure::Unavailable {
                 retry_after: Some(wait),
                 ..
+            }
+            | Failure::Bound {
+                retry_after: Some(wait),
             } if !wait.is_zero() => Some(ceil_seconds(*wait).max(1)),
             _ => None,
         }
@@ -383,6 +390,12 @@ impl Failure {
         }
     }
 }
+
+/// [`Failure::Bound`]'s text: why the request failed and what the client can do, without
+/// naming the account.
+const BOUND_TEXT: &str = "session_auth_unavailable: the account this session is bound to is unavailable, and \
+     routing.session-affinity-rebind-on is never, so the session is not moved to another account; \
+     retry later or start a new session";
 
 /// Go `enrichAuthSelectionError`: a selection error's `code: message` text with the
 /// providers, the model and the last upstream error.
@@ -1116,6 +1129,7 @@ async fn run_routed(
                         signals: Box::new(signals),
                     });
                 }
+                Err(AcquireError::Bound { retry_after }) => break Some(Failure::Bound { retry_after }),
                 Err(AcquireError::Unavailable { retry_after, cause }) => {
                     break Some(Failure::Unavailable {
                         code: if retry_after.is_some() {

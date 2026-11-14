@@ -275,6 +275,12 @@ pub struct Policy {
     /// routing.session-affinity-ttl: duration string, default 1h.
     pub session_affinity_ttl: Duration,
     pub session_affinity_subagents: bool,
+    /// routing.session-affinity-rebind-on: `never` (with affinity on). A bound session
+    /// stays on its credential: while that one cannot serve, the session's requests fail
+    /// ([`NoPick::Bound`]) instead of moving, and failures, removals and cooldown resets
+    /// keep the binding. Bindings still end when they expire or the routing policy
+    /// changes. Default false (Go's `any`).
+    pub session_affinity_never_rebind: bool,
     /// routing.cooldown.save-cooldown-status: persist cooldowns as `.cds` files in
     /// `auth-dir` (cooldown_store.rs), never in credential files.
     pub save_cooldown_status: bool,
@@ -299,6 +305,7 @@ impl Default for Policy {
             session_affinity: false,
             session_affinity_ttl: Duration::from_secs(3600),
             session_affinity_subagents: true,
+            session_affinity_never_rebind: false,
             save_cooldown_status: false,
             max_trusted_cooldown: DEFAULT_TRUSTED_COOLDOWN,
             force_model_prefix: false,
@@ -315,6 +322,7 @@ pub struct RawRouting<'a> {
     pub session_affinity: bool,
     pub session_affinity_ttl: &'a str,
     pub session_affinity_subagents: Option<bool>,
+    pub session_affinity_rebind_on: &'a str,
     pub request_retry: i64,
     pub max_retry_credentials: i64,
     pub max_retry_interval: i64,
@@ -334,6 +342,7 @@ impl From<&cpa_core::config::RoutingConfig> for Policy {
             session_affinity: r.session_affinity,
             session_affinity_ttl: &r.session_affinity_ttl,
             session_affinity_subagents: r.session_affinity_subagents,
+            session_affinity_rebind_on: &r.session_affinity_rebind_on,
             request_retry: r.retry.request_retry,
             max_retry_credentials: r.retry.max_retry_credentials,
             max_retry_interval: r.retry.max_retry_interval,
@@ -362,6 +371,7 @@ pub fn normalize(raw: RawRouting<'_>) -> Policy {
         session_affinity: raw.session_affinity,
         session_affinity_ttl: ttl,
         session_affinity_subagents: !raw.session_affinity || raw.session_affinity_subagents.unwrap_or(true),
+        session_affinity_never_rebind: raw.session_affinity && never_rebind(raw.session_affinity_rebind_on),
         request_retry: raw.request_retry.max(0) as usize,
         max_retry_credentials: raw.max_retry_credentials.max(0) as usize,
         max_retry_interval: Duration::from_secs(raw.max_retry_interval.max(0) as u64),
@@ -374,6 +384,29 @@ pub fn normalize(raw: RawRouting<'_>) -> Policy {
 }
 
 const DEFAULT_TRUSTED_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// `session-affinity-rebind-on`: `never` keeps bound sessions; empty and `any` move them.
+/// Go's `quota` mode is not implemented and, like any other value, reads as `any`, with
+/// a warning (Go reads unknown values as `any` silently).
+fn never_rebind(raw: &str) -> bool {
+    let mode = raw.trim().go_lower();
+    match mode.as_str() {
+        "never" => true,
+        "" | "any" => false,
+        _ => {
+            static WARNED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let mut last = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *last != mode {
+                mode.clone_into(&mut last);
+                tracing::warn!(
+                    "routing.session-affinity-rebind-on {raw:?} is not supported; using \"any\" \
+                     (supported: \"any\", \"never\")"
+                );
+            }
+            false
+        }
+    }
+}
 
 /// `max-trusted-cooldown`: a Go duration (`"90m"`) or a bare number of seconds. Empty
 /// means the one-hour default and zero or negative turns the bound off; a positive value
@@ -752,6 +785,9 @@ pub(crate) struct Scheduler {
     /// The live policy turned session affinity off: results of leases picked while it
     /// was on no longer bind anything (Go's replacement selector has no affinity).
     affinity_off: bool,
+    /// The live policy never rebinds sessions ([`Policy::session_affinity_never_rebind`]):
+    /// removing a credential or resetting its cooldowns keeps its bindings.
+    never_rebind: bool,
     /// Bounded windows opened, probes reserved and key migrations; each lease carries
     /// the value at its pick ([`Trust::generation`]).
     generation: u32,
@@ -769,6 +805,16 @@ pub(crate) struct Scheduler {
     /// `hasUnauthorizedAuthFailure` from `refreshAuthForRequestAtEpoch`). Neither
     /// selected nor refreshed until their tokens change ([`Self::tokens_rejected`]).
     rejected: HashMap<String, std::sync::Arc<Credential>>,
+}
+
+/// Why [`Scheduler::pick_session`] picked nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoPick {
+    /// No candidate (or none the strategy accepts).
+    Empty,
+    /// Under `session-affinity-rebind-on: never`, the session is bound to this credential,
+    /// which cannot serve it now. The ID stays server-side: clients never see it.
+    Bound(String),
 }
 
 /// One model-key migration of a credential's cooldown ([`Scheduler::migrate_model_keys`]).
@@ -848,6 +894,7 @@ fn transient(policy: &Policy, hint: Option<Duration>, disabled: bool) -> Option<
 impl Scheduler {
     pub fn configure(&mut self, previous: &Policy, next: &Policy) {
         self.affinity_off = !next.session_affinity;
+        self.never_rebind = next.session_affinity_never_rebind;
         if previous.strategy != next.strategy
             || previous.session_affinity != next.session_affinity
             || previous.session_affinity_ttl != next.session_affinity_ttl
@@ -1047,11 +1094,17 @@ impl Scheduler {
         now: Instant,
     ) -> Option<&'a Credential> {
         self.pick_session(candidates, selection, policy, ranks, now)
+            .ok()
             .map(|(c, _)| c)
     }
 
     /// [`Self::pick_ranked`], with the LCP binding of a request without an explicit
     /// session (Go `pickLCP`): its session identity, lineage and access generation.
+    ///
+    /// Under [`Policy::session_affinity_never_rebind`], a session bound to a credential
+    /// that is not among `candidates` (which may then be empty) is refused with
+    /// [`NoPick::Bound`] and keeps its binding. Forks and subagents that would only
+    /// inherit their parent's binding are new sessions and pick as usual.
     pub fn pick_session<'a>(
         &mut self,
         candidates: &[(&'a Credential, &str)],
@@ -1059,23 +1112,29 @@ impl Scheduler {
         policy: &Policy,
         ranks: &Ranks<'_>,
         now: Instant,
-    ) -> Option<(&'a Credential, Option<crate::lcp::Match>)> {
-        if candidates.is_empty() {
-            return None;
+    ) -> Result<(&'a Credential, Option<crate::lcp::Match>), NoPick> {
+        let never = self.affinity(policy) && policy.session_affinity_never_rebind;
+        if candidates.is_empty() && !never {
+            return Err(NoPick::Empty);
         }
         if let Some(request) = selection.lcp.as_deref().filter(|_| self.affinity(policy)) {
             let namespace = request.namespace(&selection.model);
             // A known trajectory stays on its credential while that one is available.
-            if let Some(found) = self.lcp.find(&namespace, request.prepared(), now)
-                && let Some((c, _)) = candidates.iter().find(|(c, _)| c.id == found.auth)
-            {
-                return Some((c, Some(found)));
+            if let Some(found) = self.lcp.find(&namespace, request.prepared(), now) {
+                if let Some((c, _)) = candidates.iter().find(|(c, _)| c.id == found.auth) {
+                    return Ok((c, Some(found)));
+                }
+                if never && !found.fork {
+                    return Err(NoPick::Bound(found.auth));
+                }
             }
-            let picked = self.pick_unbound(candidates, selection, policy.strategy, ranks)?;
+            let picked = self
+                .pick_unbound(candidates, selection, policy.strategy, ranks)
+                .ok_or(NoPick::Empty)?;
             let bound = self.lcp.bind(&namespace, request.prepared(), &picked.id, now);
-            return Some((picked, bound));
+            return Ok((picked, bound));
         }
-        self.pick_legacy(candidates, selection, policy, ranks, now)
+        self.pick_legacy(candidates, selection, policy, never, ranks, now)
             .map(|c| (c, None))
     }
 
@@ -1085,12 +1144,15 @@ impl Scheduler {
         candidates: &[(&'a Credential, &str)],
         selection: &Selection,
         policy: &Policy,
+        never: bool,
         ranks: &Ranks<'_>,
         now: Instant,
-    ) -> Option<&'a Credential> {
+    ) -> Result<&'a Credential, NoPick> {
         let ttl = policy.session_affinity_ttl;
         let Some(keys) = self.affinity(policy).then(|| session_keys(selection)).flatten() else {
-            return self.pick_unbound(candidates, selection, policy.strategy, ranks);
+            return self
+                .pick_unbound(candidates, selection, policy.strategy, ranks)
+                .ok_or(NoPick::Empty);
         };
         self.affinity.sweep(now, ttl);
         let fork = selection.session_fork;
@@ -1100,22 +1162,39 @@ impl Scheduler {
             _ => vec![keys.primary.clone()],
         };
         let find = |id: &str| candidates.iter().find(|(c, _)| c.id == id).map(|(c, _)| *c);
-        let reuse = match self.affinity.get_and_refresh(&keys.primary, now, ttl) {
+        // Under `never`, a refused request does not refresh the binding: it expires one
+        // TTL after the last request its credential served.
+        let primary = if never {
+            self.affinity.get(&keys.primary, now)
+        } else {
+            self.affinity.get_and_refresh(&keys.primary, now, ttl)
+        };
+        let reuse = match primary {
             // A bound credential that is no longer available is replaced, not inherited.
-            Some(id) => find(&id),
-            None => keys
+            Some(id) => match find(&id) {
+                None if never => return Err(NoPick::Bound(id)),
+                found => found,
+            },
+            None => match keys
                 .fallback
                 .as_ref()
                 .and_then(|fallback| self.affinity.get(fallback, now))
-                .filter(|_| !subagent || policy.session_affinity_subagents)
-                .and_then(|id| find(&id)),
+            {
+                // The session's own conversation alias (not a fork's or subagent's parent).
+                Some(id) if never && !subagent && !fork && find(&id).is_none() => return Err(NoPick::Bound(id)),
+                bound => bound
+                    .filter(|_| !subagent || policy.session_affinity_subagents)
+                    .and_then(|id| find(&id)),
+            },
         };
         let picked = match reuse {
             Some(c) => c,
-            None => self.pick_unbound(candidates, selection, policy.strategy, ranks)?,
+            None => self
+                .pick_unbound(candidates, selection, policy.strategy, ranks)
+                .ok_or(NoPick::Empty)?,
         };
         self.affinity.bind(&picked.id, &bind_keys, now, ttl);
-        Some(picked)
+        Ok(picked)
     }
 
     /// Go `SessionAffinitySelector.OnResult`: success refreshes the session's bindings to
@@ -1139,6 +1218,8 @@ impl Scheduler {
         }
         let success = match outcome {
             Outcome::Success => true,
+            // Under `never`, a failure keeps the session on its credential.
+            Outcome::Failure(_) if policy.session_affinity_never_rebind => return,
             Outcome::Failure(error) if policy.error_action(c, error).cooldown => false,
             _ => return,
         };
@@ -1847,8 +1928,10 @@ impl Scheduler {
             .map(|(_, m)| m.clone())
             .collect();
         self.cooldowns.retain(|(cid, _), _| cid != id);
-        self.affinity.invalidate(id);
-        self.lcp.invalidate(id);
+        if !self.never_rebind {
+            self.affinity.invalidate(id);
+            self.lcp.invalidate(id);
+        }
         self.probes.remove(id);
         models.sort();
         models
@@ -2247,8 +2330,12 @@ impl Scheduler {
         self.cooldowns
             .retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
         self.moved.retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
-        self.affinity.retain(|id| credentials.iter().any(|c| c.id == id));
-        self.lcp.retain(|id| credentials.iter().any(|c| c.id == id));
+        // A session bound to a removed credential fails until its binding expires (or the
+        // credential returns under the same ID) instead of moving.
+        if !self.never_rebind {
+            self.affinity.retain(|id| credentials.iter().any(|c| c.id == id));
+            self.lcp.retain(|id| credentials.iter().any(|c| c.id == id));
+        }
         self.probes.retain(|id, _| credentials.iter().any(|c| c.id == *id));
         self.rejected.retain(|id, _| credentials.iter().any(|c| c.id == *id));
     }
@@ -2760,6 +2847,261 @@ mod tests {
             "a"
         );
         assert_eq!(s.pick(&tag(&[&low, &high]), &selection("m"), &p, now).unwrap().id, "b");
+    }
+
+    fn never_policy(ttl: u64) -> Policy {
+        Policy {
+            strategy: Strategy::FillFirst,
+            session_affinity: true,
+            session_affinity_never_rebind: true,
+            session_affinity_ttl: Duration::from_secs(ttl),
+            ..Default::default()
+        }
+    }
+
+    /// #97: `session-affinity-rebind-on` reads `never` (any case) only with affinity on;
+    /// empty, `any`, Go's unimplemented `quota` and anything else keep the default.
+    #[test]
+    fn rebind_on_reads_never_only_with_affinity() {
+        let read = |affinity, raw| {
+            normalize(RawRouting {
+                session_affinity: affinity,
+                session_affinity_rebind_on: raw,
+                ..Default::default()
+            })
+            .session_affinity_never_rebind
+        };
+        assert!(read(true, "never"));
+        assert!(read(true, " NEVER "));
+        assert!(!read(false, "never"), "ignored without affinity");
+        for other in ["", "any", "quota", "sometimes"] {
+            assert!(!read(true, other), "{other}");
+        }
+        assert!(!Policy::default().session_affinity_never_rebind);
+    }
+
+    /// #97: under `never`, a session whose account is unavailable (cooling, exhausted,
+    /// disabled or already tried: absent from the candidates) is refused and stays
+    /// bound; a failure keeps the binding; once the account is back the session resumes
+    /// on it. The default policy moves the same session.
+    #[test]
+    fn never_refuses_instead_of_moving_and_keeps_the_binding() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let sel = Selection {
+            session: Some("s1".into()),
+            ..selection("m")
+        };
+        let ranks = |_: &Credential| Windows::default();
+        let now = Instant::now();
+        let p = never_policy(60);
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &p, now).unwrap().id, "a");
+        let failure = Outcome::Failure(ExecError::local(429, FailureScope::Credential, "quota"));
+        s.session_result(&a, &sel, &failure, &p, None, now);
+        for candidates in [vec![&b], vec![]] {
+            assert_eq!(
+                s.pick_session(&tag(&candidates), &sel, &p, &ranks, now).unwrap_err(),
+                NoPick::Bound("a".into())
+            );
+        }
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &p, now).unwrap().id, "a", "resumes");
+        // Another session is unaffected and an empty pool without a binding is empty.
+        let other = Selection {
+            session: Some("s2".into()),
+            ..selection("m")
+        };
+        assert_eq!(s.pick(&tag(&[&b]), &other, &p, now).unwrap().id, "b");
+        assert_eq!(
+            s.pick_session(&[], &selection("m"), &p, &ranks, now).unwrap_err(),
+            NoPick::Empty
+        );
+
+        let any = Policy {
+            session_affinity_never_rebind: false,
+            ..p.clone()
+        };
+        let mut s = Scheduler::default();
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &any, now).unwrap().id, "a");
+        assert_eq!(s.pick(&tag(&[&b]), &sel, &any, now).unwrap().id, "b", "default moves");
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &any, now).unwrap().id, "b");
+        assert_eq!(s.pick_session(&[], &sel, &any, &ranks, now).unwrap_err(), NoPick::Empty);
+    }
+
+    /// #97: a refused request does not refresh the binding, so it expires one TTL after
+    /// the last pick its account served; after that the session picks afresh.
+    #[test]
+    fn never_binding_expires_one_ttl_after_its_last_served_pick() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let sel = Selection {
+            session: Some("s1".into()),
+            ..selection("m")
+        };
+        let p = never_policy(10);
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &p, now).unwrap().id, "a");
+        for at in [5, 9] {
+            assert!(s.pick(&tag(&[&b]), &sel, &p, now + secs(at)).is_none(), "{at}s");
+        }
+        assert_eq!(
+            s.pick(&tag(&[&b]), &sel, &p, now + secs(10)).unwrap().id,
+            "b",
+            "expired"
+        );
+        assert_eq!(
+            s.pick(&tag(&[&a, &b]), &sel, &p, now + secs(11)).unwrap().id,
+            "b",
+            "rebound"
+        );
+    }
+
+    /// #97: removing the bound credential, or resetting its cooldowns, keeps the
+    /// binding under `never` (the default drops it); a credential that returns under the
+    /// same ID serves its sessions again.
+    #[test]
+    fn never_keeps_bindings_of_removed_and_reset_credentials() {
+        use std::sync::Arc;
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let sel = Selection {
+            session: Some("s1".into()),
+            ..selection("m")
+        };
+        let ranks = |_: &Credential| Windows::default();
+        let now = Instant::now();
+        let p = never_policy(60);
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &p, now).unwrap().id, "a");
+        s.reconcile(&[Arc::new(b.clone())]);
+        s.reset("a");
+        assert_eq!(
+            s.pick_session(&tag(&[&b]), &sel, &p, &ranks, now).unwrap_err(),
+            NoPick::Bound("a".into())
+        );
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &p, now).unwrap().id, "a", "re-added");
+
+        let any = Policy {
+            session_affinity_never_rebind: false,
+            ..p.clone()
+        };
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &any);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel, &any, now).unwrap().id, "a");
+        s.reconcile(&[Arc::new(b.clone())]);
+        assert_eq!(
+            s.pick(&tag(&[&a, &b]), &sel, &any, now).unwrap().id,
+            "a",
+            "fill-first, unbound"
+        );
+        assert!(s.affinity.get(&session_keys(&sel).unwrap().primary, now).is_some());
+        s.reset("a");
+        assert!(s.affinity.get(&session_keys(&sel).unwrap().primary, now).is_none());
+    }
+
+    /// #97: bindings are per model, so another model in the same session picks by the
+    /// strategy and leaves the first model's binding alone. Turning `never` on or off
+    /// keeps existing bindings.
+    #[test]
+    fn never_binds_per_model_and_toggling_it_keeps_bindings() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let session = |model: &str| Selection {
+            session: Some("s1".into()),
+            ..selection(model)
+        };
+        let any = Policy {
+            session_affinity_never_rebind: false,
+            ..never_policy(60)
+        };
+        let p = never_policy(60);
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &any);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &session("m"), &any, now).unwrap().id, "a");
+        s.configure(&any, &p);
+        assert_eq!(s.pick(&tag(&[&b]), &session("other"), &p, now).unwrap().id, "b");
+        assert!(
+            s.pick(&tag(&[&b]), &session("m"), &p, now).is_none(),
+            "m still bound to a"
+        );
+        assert_eq!(s.pick(&tag(&[&a, &b]), &session("other"), &p, now).unwrap().id, "b");
+        s.configure(&p, &any);
+        assert_eq!(s.pick(&tag(&[&a, &b]), &session("m"), &any, now).unwrap().id, "a");
+    }
+
+    /// #97: a session bound through its own conversation alias is refused like its
+    /// primary binding; forks and subagents only inherit a parent's binding, so with the
+    /// parent's account unavailable they start on another account.
+    #[test]
+    fn never_refuses_conversation_aliases_but_not_forks_or_subagents() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let p = never_policy(60);
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        let parent = Selection {
+            session: Some("parent".into()),
+            ..selection("m")
+        };
+        assert_eq!(s.pick(&tag(&[&a, &b]), &parent, &p, now).unwrap().id, "a");
+        let alias = Selection {
+            session: Some("sess:1".into()),
+            session_parent: Some("pck:conv".into()),
+            ..selection("m")
+        };
+        assert_eq!(s.pick(&tag(&[&a, &b]), &alias, &p, now).unwrap().id, "a");
+        let continued = Selection {
+            session: Some("sess:2".into()),
+            ..alias.clone()
+        };
+        assert!(s.pick(&tag(&[&b]), &continued, &p, now).is_none(), "same conversation");
+        let subagent = Selection {
+            session: Some("child".into()),
+            session_parent: Some("parent".into()),
+            ..selection("m")
+        };
+        let fork = Selection {
+            session_fork: true,
+            session: Some("forked".into()),
+            ..subagent.clone()
+        };
+        assert_eq!(s.pick(&tag(&[&b]), &subagent, &p, now).unwrap().id, "b");
+        assert_eq!(s.pick(&tag(&[&b]), &fork, &p, now).unwrap().id, "b");
+    }
+
+    /// #97: a conversation matched by its messages (no session header) is refused while
+    /// its account is unavailable, and the match is per client key: another client
+    /// sending the same messages is not bound to it.
+    #[test]
+    fn never_refuses_message_matched_conversations_per_client() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let p = never_policy(60);
+        let ranks = |_: &Credential| Windows::default();
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.configure(&Policy::default(), &p);
+        let body = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let lcp = |caller: &str| Selection {
+            lcp: Some(std::sync::Arc::new(
+                crate::lcp::Request::new("openai", body, caller).unwrap(),
+            )),
+            ..selection("m")
+        };
+        let (mine, theirs) = (lcp("client-one"), lcp("client-two"));
+        let (picked, bound) = s.pick_session(&tag(&[&a, &b]), &mine, &p, &ranks, now).unwrap();
+        assert_eq!((picked.id.as_str(), bound.is_some()), ("a", true));
+        let failure = Outcome::Failure(ExecError::local(500, FailureScope::Credential, "boom"));
+        s.session_result(&a, &mine, &failure, &p, bound.as_ref(), now);
+        assert_eq!(
+            s.pick_session(&tag(&[&b]), &mine, &p, &ranks, now).unwrap_err(),
+            NoPick::Bound("a".into())
+        );
+        assert_eq!(s.pick_session(&tag(&[&b]), &theirs, &p, &ranks, now).unwrap().0.id, "b");
+        assert_eq!(
+            s.pick_session(&tag(&[&a, &b]), &mine, &p, &ranks, now).unwrap().0.id,
+            "a"
+        );
     }
 
     #[test]
@@ -4269,7 +4611,7 @@ mod tests {
         s.session_result(&a, &explicit, &Outcome::Success, &on, None, now);
         let retry = s.pick_session(&tag(&[&a]), &lcp, &on, &ranks, now).unwrap().1;
         assert!(retry.is_none());
-        s.pick_session(&tag(&[&a]), &explicit, &on, &ranks, now);
+        s.pick_session(&tag(&[&a]), &explicit, &on, &ranks, now).unwrap();
         assert!(s.lcp.find(&namespace, request.prepared(), now).is_none());
         assert!(s.affinity.get(&session_keys(&explicit).unwrap().primary, now).is_none());
         // Turning it back on binds again.
