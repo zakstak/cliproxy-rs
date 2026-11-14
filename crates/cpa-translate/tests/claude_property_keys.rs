@@ -1071,3 +1071,31 @@ fn a_const_its_positions_disagree_on_declines_the_rename() {
         }
     }
 }
+
+#[test]
+fn a_const_deeper_than_the_argument_walk_declines_the_rename() {
+    // `p`'s const nests `x y` 128 objects below the root, where replayed and returned
+    // arguments are no longer renamed, so the tool is sent as written. Built as text:
+    // serde_json refuses values nested this deep.
+    let mut instance = r#"{"x y":1}"#.to_owned();
+    for _ in 0..127 {
+        instance = format!(r#"{{"next":{instance}}}"#);
+    }
+    let schema = format!(
+        r##"{{"$defs":{{"n":{{"properties":{{"x y":{{}},"next":{{"$ref":"#/$defs/n"}}}}}}}},"properties":{{"p":{{"$ref":"#/$defs/n","const":{instance}}}}}}}"##
+    );
+    let arguments = serde_json::to_string(&format!(r#"{{"p":{instance}}}"#)).unwrap();
+    let responses = format!(
+        r#"{{"model":"claude-opus-5-5","tools":[{{"type":"function","name":"f","parameters":{schema}}}],"input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]}},{{"type":"function_call","call_id":"call_1","name":"f","arguments":{arguments}}},{{"type":"function_call_output","call_id":"call_1","output":"ok"}}]}}"#
+    );
+    let chat = format!(
+        r#"{{"model":"claude-opus-5-5","tools":[{{"type":"function","function":{{"name":"f","parameters":{schema}}}}}],"messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}},{{"role":"tool","tool_call_id":"call_1","content":"ok"}}]}}"#
+    );
+    for (client, request) in [(Format::OpenAIResponse, responses), (Format::OpenAI, chat)] {
+        let out = translate_request(client, Format::Claude, &CTX, request.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("x_y"), "{client:?}: renamed");
+        // Schema property, const leaf and replayed leaf all keep the client's key.
+        assert_eq!(out.matches(r#""x y""#).count(), 3, "{client:?}");
+    }
+}

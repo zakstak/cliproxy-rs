@@ -42,6 +42,9 @@
 //! the same names. Otherwise the tool is not renamed at all, as past
 //! [`MAX_SCHEMA_NODES`]: its schema, history and calls stay as written and Claude refuses
 //! it as before #77, rather than receiving a constraint no renamed argument can meet.
+//! Every renamed instance key must also stay within the argument walk's depth ceiling
+//! at every possible use, including uses reached through recursive references; a tool
+//! that cannot prove that is declined as a whole.
 //! Generated names avoid every key inside instances. Scalars, `default`, `examples` and
 //! other data are kept.
 //! ponytail: a tool whose instance fits some of its positions and not others is declined;
@@ -648,7 +651,7 @@ impl PropertyKeys {
         // it is, so a generated name equal to it would merge two members.
         let mut instance_keys: Vec<Vec<u8>> = vec![];
         for (_, instance) in &tokens.instances {
-            object_keys(instance, |key| instance_keys.push(key));
+            object_keys(instance, |key, _| instance_keys.push(key));
         }
         taken.extend(instance_keys.iter().map(|k| &k[..]));
         let mut to_claude = HashMap::new();
@@ -713,11 +716,12 @@ impl PropertyKeys {
             .nodes
             .iter()
             .any(|n| !n.unevaluated.is_empty() || !n.unevaluated_items.is_empty());
+        let depths = keys.tree.instance_depths();
         // An instance that cannot take one spelling everywhere declines the workaround.
         tokens
             .instances
             .iter()
-            .all(|&(node, instance)| keys.located_instance(node, instance, unevaluated))
+            .all(|&(node, instance)| keys.located_instance(node, instance, unevaluated, depths[node]))
             .then_some(keys)
     }
 
@@ -728,12 +732,25 @@ impl PropertyKeys {
     /// chain between them, or at the deepest node on that chain a `$ref` enters. More
     /// nodes name more keys, except through `unevaluated*` keywords, so a tool with those
     /// (`unevaluated`) never passes.
-    fn located_instance(&self, node: NodeId, instance: &[u8], unevaluated: bool) -> bool {
+    fn located_instance(&self, node: NodeId, instance: &[u8], unevaluated: bool, depth: Option<usize>) -> bool {
         let every = rename_keys(instance, &self.to_claude);
         if every == instance {
             return true;
         }
         if unevaluated {
+            return false;
+        }
+        // The proof starts at this instance, but replay and answers start at the tool
+        // root. Every renamed key must fit the walk's budget at every possible use.
+        let mut deepest = 0;
+        object_keys(instance, |key, at| {
+            if self.to_claude.contains_key(&key) {
+                deepest = deepest.max(at);
+            }
+        });
+        // ponytail: unproved use depths decline the tool; an indexed instance walk
+        // without a depth-dependent rescan ceiling would remove this fallback.
+        if depth.is_some_and(|at| at + deepest >= WALK_DEPTH_LIMIT) {
             return false;
         }
         let tree = &self.tree;
@@ -1395,6 +1412,27 @@ impl<'k> Sets<'k> {
 }
 
 impl Tree {
+    /// Maximum possible depth of each node's instance from the tool root, capped at
+    /// the argument walk's ceiling. In-place edges cost zero; member/element edges
+    /// cost one. References can form cycles, so depths only grow up to the ceiling:
+    /// each node is revisited at most WALK_DEPTH_LIMIT + 1 times.
+    fn instance_depths(&self) -> Vec<Option<usize>> {
+        let mut depths = vec![None; self.nodes.len()];
+        depths[ROOT] = Some(0);
+        let mut queue = vec![ROOT];
+        while let Some(n) = queue.pop() {
+            let depth = depths[n].unwrap();
+            for (child, moving) in self.children(n) {
+                let next = (depth + usize::from(moving)).min(WALK_DEPTH_LIMIT);
+                if depths[child].is_none_or(|old| next > old) {
+                    depths[child] = Some(next);
+                    queue.push(child);
+                }
+            }
+        }
+        depths
+    }
+
     /// Each subschema of `n`, and whether it describes a different instance position.
     fn children(&self, n: NodeId) -> impl Iterator<Item = (NodeId, bool)> + '_ {
         let node = &self.nodes[n];
@@ -1915,7 +1953,7 @@ fn rename_keys(json: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
 
 /// Each object key in `value`, a valid JSON value, decoded, at any depth up to
 /// [`WALK_DEPTH_LIMIT`].
-fn object_keys(value: &[u8], mut f: impl FnMut(Vec<u8>)) {
+fn object_keys(value: &[u8], mut f: impl FnMut(Vec<u8>, usize)) {
     let mut stack: Vec<(&[u8], usize)> = vec![(value, 0)];
     while let Some((node, depth)) = stack.pop() {
         if depth >= WALK_DEPTH_LIMIT {
@@ -1924,7 +1962,7 @@ fn object_keys(value: &[u8], mut f: impl FnMut(Vec<u8>)) {
         let mut children: Vec<&[u8]> = vec![];
         match node.first() {
             Some(b'{') => gj::object_members(node, |key, escaped, value| {
-                f(if escaped { gj::unescape(key) } else { key.to_vec() });
+                f(if escaped { gj::unescape(key) } else { key.to_vec() }, depth);
                 children.push(value);
                 true
             }),
@@ -2745,6 +2783,35 @@ mod tests {
         let p = keys.tree.resolve(b"#/properties/p").unwrap();
         assert_eq!(keys.instance_to_claude(p, br##"{"x y":1}"##), br##"{"x_y":1}"##);
         assert_eq!(keys.instance_to_claude(ROOT, br##"{"x y":1}"##), br##"{"x y":1}"##);
+    }
+
+    #[test]
+    fn instance_constraints_respect_the_budget_at_every_use_depth() {
+        for nested in [WALK_DEPTH_LIMIT - 2, WALK_DEPTH_LIMIT - 1] {
+            let mut instance = r#"{"x y":1}"#.to_owned();
+            for _ in 0..nested {
+                instance = format!(r#"{{"next":{instance}}}"#);
+            }
+            let schema = format!(
+                r##"{{"$defs":{{"n":{{"properties":{{"x y":{{}},"next":{{"$ref":"#/$defs/n"}}}}}}}},"properties":{{"p":{{"$ref":"#/$defs/n","const":{instance}}}}}}}"##
+            );
+            if nested + 1 >= WALK_DEPTH_LIMIT {
+                // The const's local proof could rename the leaf, but replay adds p.
+                assert!(PropertyKeys::of(schema.as_bytes()).is_none());
+            } else {
+                let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
+                let client = format!(r#"{{"p":{instance}}}"#);
+                let wire = client.replace("x y", "x_y");
+                assert_eq!(String::from_utf8(keys.to_claude(client.as_bytes())).unwrap(), wire);
+                assert_eq!(String::from_utf8(keys.to_client(wire.as_bytes())).unwrap(), client);
+            }
+        }
+        // A constraint inside a recursive definition can occur at unbounded depth.
+        let reused = br##"{"$defs":{"n":{"properties":{"x y":{},"next":{"$ref":"#/$defs/n"}},"const":{"x y":1}}},"properties":{"p":{"$ref":"#/$defs/n"}}}"##;
+        assert!(PropertyKeys::of(reused).is_none());
+        // A cycle that stays at the same position does not spend the depth budget.
+        let in_place = br##"{"properties":{"x y":{}},"const":{"x y":1},"allOf":[{"$ref":"#"}]}"##;
+        assert!(PropertyKeys::of(in_place).is_some());
     }
 
     #[test]
