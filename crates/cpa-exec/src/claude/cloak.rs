@@ -993,6 +993,35 @@ mod tests {
         );
     }
 
+    /// The `cc_version` suffix Claude Code 2.1.325 computed for its own requests
+    /// (testdata/claude_code_2_1_325.json): it samples the prompt, after the reminder
+    /// block the fixture keeps verbatim so that the fingerprint has to skip it.
+    #[test]
+    fn billing_fingerprint_matches_claude_code_2_1_325_capture() {
+        let doc = include_str!("testdata/claude_code_2_1_325.json");
+        let mut checked = 0;
+        for capture in rawjson::get(doc, "captures").array() {
+            let body = capture.get("body");
+            let billing = body.get("system.0.text").str().to_owned();
+            let Some(version) = billing
+                .strip_prefix("x-anthropic-billing-header: cc_version=")
+                .and_then(|rest| rest.split(';').next())
+            else {
+                continue;
+            };
+            let message = fingerprint_message(body.json());
+            assert_eq!(message, "say ok");
+            assert_eq!(
+                format!("2.1.325.{}", fingerprint(&message, "2.1.325")),
+                version,
+                "{}",
+                capture.get("name").str()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 9, "every capture but the quota probe");
+    }
+
     #[test]
     fn cache_control_walk_reads_each_block_in_go_order() {
         // Evaluation order is tools, system, messages; the 1h marker on tools comes

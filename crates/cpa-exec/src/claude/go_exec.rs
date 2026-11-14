@@ -553,7 +553,8 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         upstream.plain,
     );
     let cfg = Config::parse(&config).map_err(|e| format!("config does not parse: {e:?}"))?;
-    let cfg = super::settings::as_recorded_before_fallback_switch(cfg);
+    let cfg =
+        super::settings::as_recorded_with_2_1_280_profile(super::settings::as_recorded_before_fallback_switch(cfg));
     let auth = relocate_json(&record["auth"], &go_origins, upstream.plain);
     let mut credential = Credential {
         id: auth["id"].as_str().unwrap_or_default().to_owned(),
@@ -748,6 +749,13 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         let mut go_body = text(&bytes(&go["body"]));
         if RELOCATES_API_KEY_SYSTEM.contains(&test) {
             go_body = super::tests::with_relocated_system(&go_body);
+        }
+        // Go assembled its betas in the 2.1.280 order (`betas::from_2_1_280`).
+        if let (Some(ours), Some(theirs)) = (got.get("anthropic-beta"), want.get_mut("anthropic-beta"))
+            && let ([ours], [go_betas]) = (ours.as_slice(), theirs.as_mut_slice())
+            && super::betas::matches_go(ours, go_betas, &go_body)
+        {
+            *go_betas = ours.clone();
         }
         sent.push((got, want, text(&rust.body), go_body));
     }
