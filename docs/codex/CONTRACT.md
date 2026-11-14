@@ -1185,6 +1185,7 @@ The strict mode is the Codex route's alone.
 | The Claude Code billing line in system text (`x-anthropic-billing-header:`) is not sent | Claude | Anthropic billing metadata, not an instruction to the model |
 | Claude tool `cache_control` is not sent | Claude | An Anthropic-only caching hint; Responses caches automatically |
 | Claude system-role messages inside `messages` move after the pending tool results | Claude | Responses requires a call's output to follow the call |
+| Claude tool search (#79): a deferred tool (`defer_loading: true`) is not in top-level `tools`. A `tool_result` whose `tool_reference` blocks name it loads it: its definition, converted as a top-level tool would be and without `defer_loading`, follows the turn's tool results in one `{"type":"additional_tools","role":"developer","tools":[...]}` item, the first time it is referenced. The call output keeps the result's other blocks, or is `""` when it held references only. A reference to an eager tool or to one already loaded adds nothing, and a deferred tool that is never referenced is never sent. Top-level `tools` therefore stay the same as tools load | Claude | Anthropic keeps a deferred tool out of the model's context until a `tool_reference` expands it at that point. The Responses `AdditionalTools` input item is "a list of additional tools made available at this item" (API reference); the first-party client places such items after earlier context (`core/src/context/world_state/top_level_tools.rs:212-218`). Fixture `http-request-tools-at-item` |
 
 #### Refusals
 
@@ -1220,7 +1221,9 @@ Content, including content nested in tool results and system prompts:
 - a `tool_result` with `is_error: true`: Responses `function_call_output` has no failure
   status, so the result is refused rather than sent as an ordinary result;
 - a non-text system block;
-- a tool without an object `input_schema`, or a deferred tool (`defer_loading: true`);
+- a tool without an object `input_schema`;
+- a `tool_reference` that names no tool the request declares; Claude `tool_addition` and
+  `tool_removal` blocks, which are unknown blocks here (#170);
 - a Chat `refusal` part, an audio part without data, a tool result without its call, a
   duplicated call ID, or a call of an unknown type;
 - Gemini `executableCode` and other parts it cannot convert, a thought with text, a
@@ -1291,6 +1294,11 @@ and neither synthesizes a prompt-cache key. Both read the client's JSON through 
 - #33 owns the image model IDs.
 
 ### Remaining limits
+
+- Mid-input `additional_tools` beside top-level `tools` is documented as an input item,
+  and the SIWC preview documents it as a way to supply tools. The first-party client
+  sends it only for Responses Lite models, which have no top-level `tools`. Whether a
+  standard model on the ChatGPT backend honours it is a live gate, not a local result.
 
 - A Gemini `thoughtSignature` is not sent: it is Gemini's state for its own model, and
   no other model reads it.
