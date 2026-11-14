@@ -2329,13 +2329,71 @@ pub(crate) async fn model_definitions(
     State(state): State<Arc<Management>>,
     UrlPath(channel): UrlPath<String>,
 ) -> Response {
+    definitions(&state, &channel)
+}
+
+/// `GET .../routing/model-definitions/refresh`: gin matches the GET `:channel` route,
+/// so the channel is `refresh`; only POST refreshes.
+pub(crate) async fn model_definitions_refresh_channel(State(state): State<Arc<Management>>) -> Response {
+    definitions(&state, "refresh")
+}
+
+/// Go CLIProxyAPI `RefreshModelDefinitions` (`10417e5b`, after v8.0.35), at
+/// `POST /v8/management/routing/model-definitions/refresh` and
+/// `POST /v8/management/models/refresh`: reads models.json and the Codex client catalog
+/// from their current sources now ([`crate::model_updater::refresh_now`]). 200 when
+/// every catalog was read or skipped, 502 when one failed (its last valid catalog
+/// stays), 400 for invalid sources. Go's `devin_catalog` members are left out with the
+/// removed provider (issue #49).
+pub(crate) async fn refresh_model_definitions(State(state): State<Arc<Management>>) -> Response {
+    let config = state.rt.config();
+    // Published configs passed this check already (`Runtime::accepts_config`).
+    if let Err(error) = cpa_core::config::validate_catalog_sources(config.document.get("models")) {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            [("ok", Value::Bool(false)), ("error", error.to_string().into())],
+        );
+    }
+    drop(config);
+    let report = crate::model_updater::refresh_now(&state.rt).await;
+    let mut sources = serde_json::Map::new();
+    for (name, status) in [("catalog", &report.catalog), ("codex-catalog", &report.codex_catalog)] {
+        if !status.source.is_empty() {
+            sources.insert(name.into(), status.source.clone().into());
+        }
+    }
+    let catalogs = json!({
+        "catalog": report.catalog.to_json(),
+        "codex-catalog": report.codex_catalog.to_json(),
+    });
+    let mut pairs = vec![
+        ("catalog", Value::from(report.catalog.source.clone())),
+        ("codex_catalog", report.codex_catalog.source.clone().into()),
+        ("sources", Value::Object(sources)),
+        ("catalogs", catalogs),
+        ("changed_providers", json!(report.changed_providers())),
+    ];
+    let status = match report.error() {
+        None => {
+            pairs.extend([("ok", Value::Bool(true)), ("status", "ok".into())]);
+            StatusCode::OK
+        }
+        Some(error) => {
+            pairs.extend([("ok", Value::Bool(false)), ("error", error.into())]);
+            StatusCode::BAD_GATEWAY
+        }
+    };
+    reply_ordered(status, pairs)
+}
+
+fn definitions(state: &Management, channel: &str) -> Response {
     let channel = channel.trim().to_owned();
     if channel.is_empty() {
         return fail(StatusCode::BAD_REQUEST, "channel is required");
     }
     let models = match cpa_core::registry::dynamic::static_definitions(&channel) {
         Some(models) if !models.is_empty() => models.iter().filter_map(|m| go_model_info(&m.raw)).collect(),
-        _ => dynamic_definitions(&state, &channel),
+        _ => dynamic_definitions(state, &channel),
     };
     if models.is_empty() {
         return reply(
