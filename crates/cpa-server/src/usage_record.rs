@@ -52,7 +52,26 @@ pub struct Detail {
     /// Claude `usage.server_tool_use` counts, when the provider sent them (U1, #99).
     pub web_search_requests: Option<i64>,
     pub web_fetch_requests: Option<i64>,
+    /// xAI `usage.cost_in_usd_ticks` (10^10 ticks per dollar), when sent (#178).
+    pub cost_in_usd_ticks: Option<i64>,
+    /// xAI `usage.server_side_tool_usage_details`: the documented counters it sent, in
+    /// [`XAI_TOOL_COUNTERS`] order (#178).
+    pub server_side_tools: Vec<(&'static str, i64)>,
 }
+
+/// The counters xAI documents in `usage.server_side_tool_usage_details` (docs.x.ai API
+/// reference, Responses `usage`, read 2026-11-14). Other members are not carried.
+const XAI_TOOL_COUNTERS: [&str; 9] = [
+    "code_interpreter_calls",
+    "document_search_calls",
+    "file_search_calls",
+    "image_generation_calls",
+    "mcp_calls",
+    "web_search_calls",
+    "x_search_calls",
+    "x_posts_fetched",
+    "x_users_fetched",
+];
 
 /// Go `nonNegativeSum`.
 fn sum(values: &[i64]) -> Option<i64> {
@@ -481,6 +500,16 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
     });
     if d.total == 0 {
         d.total = d.breakdown.map_or(0, |b| b.total);
+    }
+    // xAI's provider-reported cost and server-side tool counts (#178), when sent.
+    let number = |n: Res<'_>| (n.kind == Kind::Number).then(|| n.int());
+    d.cost_in_usd_ticks = number(node.get("cost_in_usd_ticks"));
+    let tools = node.get("server_side_tool_usage_details");
+    if tools.is_object() {
+        d.server_side_tools = XAI_TOOL_COUNTERS
+            .iter()
+            .filter_map(|name| number(tools.get(name)).map(|n| (*name, n)))
+            .collect();
     }
     d
 }
@@ -1187,6 +1216,8 @@ impl Record {
             breakdown: _,
             web_search_requests: _,
             web_fetch_requests: _,
+            cost_in_usd_ticks: _,
+            server_side_tools: _,
         } = detail;
         let headers = response_headers
             .iter_mut()
@@ -1412,6 +1443,17 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
             }
             if let Some(n) = detail.web_fetch_requests {
                 s.int("web_fetch_requests", n);
+            }
+        });
+    }
+    // Not in Go v8.0.35's record: xAI's reported cost and server-side tool counts (#178).
+    if let Some(ticks) = detail.cost_in_usd_ticks {
+        w.int("cost_in_usd_ticks", ticks);
+    }
+    if !detail.server_side_tools.is_empty() {
+        w.object("server_side_tool_usage_details", |s| {
+            for (name, n) in &detail.server_side_tools {
+                s.int(name, *n);
             }
         });
     }
@@ -2752,6 +2794,48 @@ mod tests {
         }
         let detail = chat.detail().unwrap();
         assert_eq!((detail.total, detail.response_service_tier.as_str()), (5, "flex"));
+    }
+
+    /// #178: xAI's documented `usage.cost_in_usd_ticks` and
+    /// `usage.server_side_tool_usage_details` counts (docs.x.ai API reference, Responses
+    /// `usage`, read 2026-11-14) reach the record, buffered and streamed. A member the
+    /// provider did not send, or sent as `null`, stays absent; a reported zero stays zero;
+    /// undocumented members are not carried.
+    #[test]
+    fn xai_cost_and_server_side_tool_counts_are_recorded() {
+        let record = |detail: Detail| -> Value {
+            let record = Record {
+                detail,
+                ..Record::default()
+            };
+            serde_json::from_slice(&queued(&record, &Client::default())).unwrap()
+        };
+        let completed = r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"cost_in_usd_ticks":123456,"cost_in_nano_usd":12345,"num_server_side_tools_used":2,"server_side_tool_usage_details":{"web_search_calls":1,"x_search_calls":1,"x_posts_fetched":0,"future_calls":9}}}}"#;
+        let buffered = parse_codex(completed.as_bytes()).unwrap();
+        let mut streamed = StreamUsage::default();
+        streamed.line(Format::Codex, format!("data: {completed}").as_bytes());
+        for (case, detail) in [
+            ("buffered", buffered),
+            ("streamed", streamed.detail().cloned().unwrap()),
+        ] {
+            let got = record(detail);
+            assert_eq!(got["cost_in_usd_ticks"], 123456, "{case}: {got}");
+            assert_eq!(
+                got["server_side_tool_usage_details"],
+                serde_json::json!({"web_search_calls": 1, "x_search_calls": 1, "x_posts_fetched": 0}),
+                "{case}: {got}"
+            );
+            assert!(got.get("cost_in_nano_usd").is_none(), "{case}: {got}");
+        }
+        let null_cost = r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"cost_in_usd_ticks":null}}}"#;
+        for plain in [
+            parse_codex(null_cost.as_bytes()).unwrap(),
+            parse_openai(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#),
+        ] {
+            let got = record(plain);
+            assert!(got.get("cost_in_usd_ticks").is_none(), "{got}");
+            assert!(got.get("server_side_tool_usage_details").is_none(), "{got}");
+        }
     }
 
     /// U1 (#99): Claude's documented `usage.service_tier` and `usage.server_tool_use`

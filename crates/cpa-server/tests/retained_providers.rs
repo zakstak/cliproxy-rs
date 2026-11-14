@@ -476,6 +476,40 @@ async fn a_failed_response_keeps_the_usage_it_reported() {
     }
 }
 
+/// #178: a Grok record carries the cost and server-side tool counts xAI reported in the
+/// terminal event's `usage` (docs.x.ai API reference, read 2026-11-14), buffered and
+/// streamed: the executor passes them to usage unchanged.
+#[tokio::test]
+async fn xai_records_carry_the_reported_cost_and_tool_counts() {
+    let usage = r#""usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cost_in_usd_ticks":98765,"server_side_tool_usage_details":{"web_search_calls":2}}"#;
+    let body = completed_stream(Provider::Xai.model()).replace(
+        r#""usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}"#,
+        usage,
+    );
+    assert!(body.contains("cost_in_usd_ticks"), "the fixture carries the cost");
+    for stream in [false, true] {
+        let proxy = proxy(Provider::Xai, vec![Reply::sse(body.clone())]).await;
+        record_usage(&proxy);
+        let answer = send(
+            &proxy,
+            Client::Responses,
+            Client::Responses.body(Provider::Xai.model(), stream),
+        )
+        .await;
+        assert_eq!(answer.status, 200, "stream={stream}: {}", answer.body);
+        let records = usage_records(&proxy, 1).await;
+        let [record] = records.as_slice() else {
+            panic!("stream={stream}: one record, got {records:?}");
+        };
+        assert_eq!(record["cost_in_usd_ticks"], 98765, "stream={stream}: {record}");
+        assert_eq!(
+            record["server_side_tool_usage_details"],
+            serde_json::json!({"web_search_calls": 2}),
+            "stream={stream}: {record}"
+        );
+    }
+}
+
 /// #178: a Grok record's `service_tier` is the tier the request carried upstream, after
 /// translation and payload rules, not the client's: here the translation drops the
 /// client's `flex`, an override sets `priority`, and a filter removes the tier again.
