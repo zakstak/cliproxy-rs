@@ -13,9 +13,11 @@
 //! member key is renamed only where a subschema applying to that position names it (in
 //! `properties`, `required` or a dependency keyword). The walk follows `allOf`, local
 //! `$ref` pointers, member and element subschemas, and the branches the instance can
-//! take: an `anyOf` or `oneOf` alternative, or the `if` side, that the instance's
-//! `type`, scalar `const`/`enum`, `required` keys or member values of those kinds rule
-//! out does not apply. Keys of a free-form object (`additionalProperties`,
+//! take: an `anyOf` or `oneOf` alternative, the `if` side, or a `contains` schema for
+//! an element, that the instance's `type`, scalar `const`/`enum`, `required` keys or
+//! member values of those kinds (through `allOf` and `$ref`) rule out does not apply.
+//! `unevaluatedProperties` and `unevaluatedItems` apply only to members and elements
+//! that nothing applying beside them evaluates. Keys of a free-form object (`additionalProperties`,
 //! `patternProperties`, no schema) are data and stay as sent, in both directions, even
 //! when they spell a renamed key.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
@@ -133,15 +135,22 @@ struct Node {
     properties: HashMap<Vec<u8>, Vec<NodeId>>,
     /// `patternProperties`: the pattern and its subschema.
     patterns: Vec<(Pattern, NodeId)>,
-    /// Members no property or pattern covers: `additionalProperties`,
-    /// `unevaluatedProperties`.
+    /// Members no property or pattern of this node covers: `additionalProperties`.
     additional: Vec<NodeId>,
+    /// Members that neither this node nor a subschema applying in place beside it
+    /// evaluates: `unevaluatedProperties`.
+    unevaluated: Vec<NodeId>,
     /// Elements by position: `prefixItems`, or `items` as an array.
     prefix: Vec<Option<NodeId>>,
-    /// Elements past `prefix`: `items` as a schema, `additionalItems`, `unevaluatedItems`.
+    /// Elements past `prefix`: `items` as a schema, `additionalItems`.
     rest: Vec<NodeId>,
-    /// Any element: `contains`.
+    /// Elements nothing applying here evaluates: `unevaluatedItems`.
+    unevaluated_items: Vec<NodeId>,
+    /// Elements that match it: `contains`.
     every: Vec<NodeId>,
+    /// What this node evaluates whatever the keyword's value (`true` included), for
+    /// `unevaluatedProperties` and `unevaluatedItems` beside it.
+    evaluates: Evaluates,
     /// Subschemas that always apply here too: `allOf`, a resolved local `$ref`.
     all_of: Vec<NodeId>,
     /// Alternatives, each applying unless the instance rules it out: `anyOf`, `oneOf`.
@@ -155,6 +164,18 @@ struct Node {
     reference: Option<Vec<u8>>,
     /// The part of this schema an instance can be checked against cheaply.
     check: Check,
+}
+
+#[derive(Debug, Default)]
+struct Evaluates {
+    /// `additionalProperties`: every member.
+    members: bool,
+    /// `items` as a schema or `additionalItems`: every element past `prefix`.
+    rest: bool,
+    /// `unevaluatedProperties` and `unevaluatedItems`: whatever is left, as seen by an
+    /// enclosing schema.
+    unevaluated_members: bool,
+    unevaluated_items: bool,
 }
 
 #[derive(Debug)]
@@ -339,8 +360,8 @@ impl PropertyKeys {
         let mut sets = Sets::new(self, direction);
         let start = sets.intern(vec![position]);
         let mut edits: Vec<(Token, &Vec<u8>)> = vec![];
-        let mut stack: Vec<(&[u8], usize, usize)> = vec![(root, start, 0)];
-        while let Some((value, start, depth)) = stack.pop() {
+        let mut stack: Vec<(&[u8], usize, usize, usize)> = vec![(root, start, NONE, 0)];
+        while let Some((value, start, maybe, depth)) = stack.pop() {
             if depth >= WALK_DEPTH_LIMIT {
                 continue;
             }
@@ -357,7 +378,7 @@ impl PropertyKeys {
                         members.push((token, member));
                         true
                     });
-                    let set = sets.apply(start, &instance);
+                    let set = sets.apply(start, maybe, &instance);
                     for (token, member) in members {
                         let rename = self.place(&sets, set, &token.text, direction);
                         let client = match (direction, rename) {
@@ -369,7 +390,7 @@ impl PropertyKeys {
                             edits.push((token, name));
                         }
                         if child != EMPTY && matches!(member.first(), Some(b'{' | b'[')) {
-                            stack.push((member, child, depth + 1));
+                            stack.push((member, child, NONE, depth + 1));
                         }
                     }
                 }
@@ -378,13 +399,13 @@ impl PropertyKeys {
                         raw: value,
                         members: HashMap::new(),
                     };
-                    let set = sets.apply(start, &instance);
+                    let set = sets.apply(start, maybe, &instance);
                     let mut index = 0;
                     array_items(value, |raw, _, _| {
-                        let child = sets.element(set, index);
+                        let (child, maybe) = sets.element(set, index);
                         index += 1;
-                        if child != EMPTY && matches!(raw.first(), Some(b'{' | b'[')) {
-                            stack.push((raw, child, depth + 1));
+                        if (child != EMPTY || maybe != NONE) && matches!(raw.first(), Some(b'{' | b'[')) {
+                            stack.push((raw, child, maybe, depth + 1));
                         }
                     });
                 }
@@ -420,6 +441,18 @@ enum Direction {
 
 /// The empty node set: nothing below it is renamed.
 const EMPTY: usize = 0;
+/// The empty list of [`Maybe`] nodes.
+const NONE: usize = 0;
+
+/// A node that applies to an array element depending on the element.
+#[derive(Debug)]
+enum Maybe {
+    /// `contains`: applies to the elements it does not rule out.
+    Matching(NodeId),
+    /// `unevaluatedItems` beside `contains` schemas: applies unless one of them
+    /// certainly matches (and so evaluates) the element.
+    Unless(NodeId, Vec<NodeId>),
+}
 
 /// Interned sets of schema nodes, with memoized transitions. A "start" set holds the
 /// nodes reached through a member or element keyword; [`Sets::apply`] adds the nodes
@@ -430,7 +463,10 @@ struct Sets<'k> {
     sets: Vec<Vec<NodeId>>,
     ids: HashMap<Vec<NodeId>, usize>,
     members: HashMap<(usize, Vec<u8>), usize>,
-    elements: HashMap<(usize, usize), usize>,
+    elements: HashMap<(usize, usize), (usize, usize)>,
+    /// Lists of nodes that apply to an element only if it matches or fails a check;
+    /// index [`NONE`] is the empty list.
+    maybes: Vec<Vec<Maybe>>,
     /// Start sets whose closure takes no branch, with that closure.
     plain: HashMap<usize, usize>,
     /// Per set, the longest `prefix` among its nodes: elements past it share a set.
@@ -446,6 +482,7 @@ impl<'k> Sets<'k> {
             ids: HashMap::new(),
             members: HashMap::new(),
             elements: HashMap::new(),
+            maybes: vec![vec![]],
             plain: HashMap::new(),
             prefix: vec![],
         };
@@ -473,18 +510,35 @@ impl<'k> Sets<'k> {
 
     /// The nodes that apply to `instance` given the start set: the start nodes, `allOf`
     /// and `$ref` targets, alternatives the instance does not rule out, the `if` branch
-    /// it takes (both when the check cannot tell) and dependent schemas whose key it has.
-    /// `not` never applies: it says what the instance is not.
-    fn apply(&mut self, start: usize, instance: &Instance<'_>) -> usize {
-        if start == EMPTY {
+    /// it takes (both when the check cannot tell) and dependent schemas whose key it has,
+    /// plus the `maybe` nodes the element check admits. `not` never applies: it says what
+    /// the instance is not.
+    fn apply(&mut self, start: usize, maybe: usize, instance: &Instance<'_>) -> usize {
+        if start == EMPTY && maybe == NONE {
             return EMPTY;
         }
-        if let Some(&id) = self.plain.get(&start) {
+        if maybe == NONE
+            && let Some(&id) = self.plain.get(&start)
+        {
             return id;
         }
-        let mut branched = false;
+        let mut branched = maybe != NONE;
         let mut seen: HashSet<NodeId> = HashSet::new();
         let mut queue = self.sets[start].clone();
+        for m in &self.maybes[maybe] {
+            match m {
+                Maybe::Matching(n) => {
+                    if self.check(*n, instance) != Some(false) {
+                        queue.push(*n);
+                    }
+                }
+                Maybe::Unless(n, contains) => {
+                    if !contains.iter().any(|&c| self.check(c, instance) == Some(true)) {
+                        queue.push(*n);
+                    }
+                }
+            }
+        }
         while let Some(n) = queue.pop() {
             if !seen.insert(n) {
                 continue;
@@ -557,14 +611,57 @@ impl<'k> Sets<'k> {
                 let Some(value) = instance.members.get(self.keys.spelling(key, self.direction)) else {
                     continue;
                 };
-                let child = &self.node(*child).check;
-                if !scalar_check(child, value) {
-                    return Some(false);
+                match self.check_member(*child, value) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => sure = false,
                 }
-                sure &= child.complete && child.required.is_empty() && child.members.is_empty();
             }
         }
         sure.then_some(true)
+    }
+
+    /// A member value against its property subschema and that subschema's `allOf` and
+    /// `$ref` targets: scalar keywords only, so an object or array value whose schemas
+    /// constrain its members is never certain.
+    fn check_member(&self, n: NodeId, value: &[u8]) -> Option<bool> {
+        let structured = matches!(value.first(), Some(b'{' | b'['));
+        let mut verdict = Some(true);
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut queue = vec![n];
+        while let Some(n) = queue.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let check = &self.node(n).check;
+            if !scalar_check(check, value) {
+                return Some(false);
+            }
+            if !check.complete || (structured && !(check.required.is_empty() && check.members.is_empty())) {
+                verdict = None;
+            }
+            queue.extend(&self.node(n).all_of);
+        }
+        verdict
+    }
+
+    /// `n` and the nodes of `set` that apply in place beneath it: the subschemas whose
+    /// evaluation `n`'s `unevaluated*` keywords see.
+    fn beneath(&self, set: usize, n: NodeId) -> Vec<NodeId> {
+        let nodes = &self.sets[set];
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut queue = vec![n];
+        while let Some(m) = queue.pop() {
+            if !nodes.binary_search(&m).is_ok() || !seen.insert(m) {
+                continue;
+            }
+            let node = self.node(m);
+            queue.extend(&node.all_of);
+            queue.extend(&node.any_of);
+            queue.extend(node.condition.iter().flatten());
+            queue.extend(node.dependent.iter().map(|(_, d)| *d));
+        }
+        seen.into_iter().collect()
     }
 
     /// Whether a schema in `set` names property `key` (client spelling).
@@ -595,33 +692,70 @@ impl<'k> Sets<'k> {
                 None if !matched => next.extend(&node.additional),
                 None => {}
             }
+            if !node.unevaluated.is_empty() {
+                let evaluated = self.beneath(set, n).into_iter().any(|m| {
+                    let other = self.node(m);
+                    other.properties.contains_key(key)
+                        || other.evaluates.members
+                        || (m != n && other.evaluates.unevaluated_members)
+                        || other.patterns.iter().any(|(p, _)| p.matches(key))
+                });
+                if !evaluated {
+                    next.extend(&node.unevaluated);
+                }
+            }
         }
         let id = self.intern(next);
         self.members.insert((set, key.to_vec()), id);
         id
     }
 
-    /// The start set at element `index` of an array at `set`.
-    fn element(&mut self, set: usize, index: usize) -> usize {
+    /// The start set at element `index` of an array at `set`, and the nodes that apply
+    /// depending on the element ([`Maybe`]).
+    fn element(&mut self, set: usize, index: usize) -> (usize, usize) {
         if set == EMPTY {
-            return EMPTY;
+            return (EMPTY, NONE);
         }
         let index = index.min(self.prefix[set]);
-        if let Some(&id) = self.elements.get(&(set, index)) {
-            return id;
+        if let Some(&ids) = self.elements.get(&(set, index)) {
+            return ids;
         }
         let mut next = vec![];
+        let mut maybe = vec![];
         for &n in &self.sets[set] {
             let node = self.node(n);
             match node.prefix.get(index) {
                 Some(child) => next.extend(child),
                 None => next.extend(&node.rest),
             }
-            next.extend(&node.every);
+            maybe.extend(node.every.iter().map(|&c| Maybe::Matching(c)));
+            if !node.unevaluated_items.is_empty() {
+                let beneath = self.beneath(set, n);
+                let evaluated = beneath.iter().any(|&m| {
+                    let other = self.node(m);
+                    index < other.prefix.len() || other.evaluates.rest || (m != n && other.evaluates.unevaluated_items)
+                });
+                if !evaluated {
+                    let contains: Vec<NodeId> = beneath.iter().flat_map(|&m| &self.node(m).every).copied().collect();
+                    for &u in &node.unevaluated_items {
+                        if contains.is_empty() {
+                            next.push(u);
+                        } else {
+                            maybe.push(Maybe::Unless(u, contains.clone()));
+                        }
+                    }
+                }
+            }
         }
-        let id = self.intern(next);
-        self.elements.insert((set, index), id);
-        id
+        let start = self.intern(next);
+        let maybe = if maybe.is_empty() {
+            NONE
+        } else {
+            self.maybes.push(maybe);
+            self.maybes.len() - 1
+        };
+        self.elements.insert((set, index), (start, maybe));
+        (start, maybe)
     }
 }
 
@@ -742,6 +876,14 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
             let object = member.first() == Some(&b'{');
             let array = member.first() == Some(&b'[');
             complete &= CHECKED_KEYWORDS.contains(&&name[..]);
+            match &name[..] {
+                b"additionalProperties" => node.evaluates.members = true,
+                b"items" if !array => node.evaluates.rest = true,
+                b"additionalItems" => node.evaluates.rest = true,
+                b"unevaluatedProperties" => node.evaluates.unevaluated_members = true,
+                b"unevaluatedItems" => node.evaluates.unevaluated_items = true,
+                _ => {}
+            }
             if name == b"properties" && object {
                 gj::object_members(member, |k, e, v| {
                     let token = key_token(schema, k, e);
@@ -897,9 +1039,11 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                     },
                     child_id,
                 )),
-                b"additionalProperties" | b"unevaluatedProperties" => node.additional.push(child_id),
+                b"additionalProperties" => node.additional.push(child_id),
+                b"unevaluatedProperties" => node.unevaluated.push(child_id),
                 _ if tuple => node.prefix.push(Some(child_id)),
-                b"items" | b"additionalItems" | b"unevaluatedItems" => node.rest.push(child_id),
+                b"items" | b"additionalItems" => node.rest.push(child_id),
+                b"unevaluatedItems" => node.unevaluated_items.push(child_id),
                 b"contains" => node.every.push(child_id),
                 b"allOf" => node.all_of.push(child_id),
                 b"anyOf" | b"oneOf" => node.any_of.push(child_id),
@@ -1217,6 +1361,90 @@ mod tests {
         assert_eq!(
             keys.to_client(br##"{"kind":"b","body":{"x_y":1}}"##),
             br##"{"kind":"b","body":{"x_y":1}}"##
+        );
+    }
+
+    #[test]
+    fn member_checks_follow_references() {
+        // The condition's member schema is a `$ref` to a scalar `const`.
+        let schema = br##"{"$defs":{"kindA":{"const":"a"}},"properties":{"payload":{
+            "if":{"properties":{"kind":{"$ref":"#/$defs/kindA"}},"required":["kind"]},
+            "then":{"properties":{"data":{"properties":{"x y":{"type":"string"}}}}},
+            "else":{"properties":{"data":{"additionalProperties":true}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"payload":{"kind":"b","data":{"x_y":"opaque"}}}"##,
+            r##"{"payload":{"kind":"b","data":{"x_y":"opaque"}}}"##,
+        );
+        round_trip(
+            schema,
+            r##"{"payload":{"kind":"a","data":{"x y":"declared"}}}"##,
+            r##"{"payload":{"kind":"a","data":{"x_y":"declared"}}}"##,
+        );
+        // A member schema with structure of its own decides nothing for an object value.
+        let nested = br##"{"properties":{"p":{"anyOf":[
+            {"properties":{"meta":{"type":"object","required":["v"]},"data":{"properties":{"x y":{}}}}},
+            {"properties":{"meta":{"type":"object"},"data":{"additionalProperties":true}}}
+        ]}}}"##;
+        round_trip(
+            nested,
+            r##"{"p":{"meta":{},"data":{"x y":1}}}"##,
+            r##"{"p":{"meta":{},"data":{"x_y":1}}}"##,
+        );
+    }
+
+    #[test]
+    fn contains_applies_only_to_matching_elements() {
+        let schema = br##"{"properties":{"items":{"type":"array","contains":{"type":"object",
+            "properties":{"kind":{"const":"a"},"x y":{"type":"string"}},"required":["kind","x y"]}}}}"##;
+        round_trip(
+            schema,
+            r##"{"items":[{"kind":"a","x y":"declared"},{"kind":"b","x_y":"opaque"},"s"]}"##,
+            r##"{"items":[{"kind":"a","x_y":"declared"},{"kind":"b","x_y":"opaque"},"s"]}"##,
+        );
+    }
+
+    #[test]
+    fn unevaluated_properties_skip_members_evaluated_beside_them() {
+        let schema = br##"{"properties":{"payload":{"type":"object",
+            "allOf":[{"properties":{"data":{"type":"object","additionalProperties":true}}}],
+            "unevaluatedProperties":{"type":"object","properties":{"x y":{"type":"string"}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"payload":{"data":{"x_y":"opaque"},"extra":{"x y":"declared"}}}"##,
+            r##"{"payload":{"data":{"x_y":"opaque"},"extra":{"x_y":"declared"}}}"##,
+        );
+        // Members a taken branch evaluates are evaluated; an untaken branch's are not.
+        let branches = br##"{"properties":{"p":{"properties":{"kind":{}},
+            "oneOf":[{"properties":{"kind":{"const":"a"},"data":{"additionalProperties":true}}},
+                     {"properties":{"kind":{"const":"b"}}}],
+            "unevaluatedProperties":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            branches,
+            r##"{"p":{"kind":"a","data":{"x_y":1}}}"##,
+            r##"{"p":{"kind":"a","data":{"x_y":1}}}"##,
+        );
+        round_trip(
+            branches,
+            r##"{"p":{"kind":"b","data":{"x y":1}}}"##,
+            r##"{"p":{"kind":"b","data":{"x_y":1}}}"##,
+        );
+        // `additionalProperties` beside it evaluates every member.
+        let additional = br##"{"properties":{"p":{"properties":{"q":{"properties":{"x y":{}}}},
+            "additionalProperties":true,"unevaluatedProperties":{"properties":{"x y":{}}}}}}"##;
+        round_trip(additional, r##"{"p":{"m":{"x_y":1}}}"##, r##"{"p":{"m":{"x_y":1}}}"##);
+    }
+
+    #[test]
+    fn unevaluated_items_skip_elements_evaluated_beside_them() {
+        let schema = br##"{"properties":{"list":{
+            "allOf":[{"prefixItems":[{"additionalProperties":true}]}],
+            "contains":{"properties":{"kind":{"const":"c"}},"required":["kind"]},
+            "unevaluatedItems":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"list":[{"x_y":0},{"kind":"c","x_y":1},{"x y":2}]}"##,
+            r##"{"list":[{"x_y":0},{"kind":"c","x_y":1},{"x_y":2}]}"##,
         );
     }
 
