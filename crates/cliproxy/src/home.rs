@@ -985,7 +985,15 @@ async fn run_lifetimes(
                 tracing::warn!("home config subscription lifetime ended; retrying in {delay:?}: {error}");
             }
             tokio::select! {
-                _ = shutdown.cancelled() => return,
+                _ = shutdown.cancelled() => {
+                    // Go's deferred drain: end the executions the registry kept for the
+                    // next lifetime. No lifetime is left to send their releases.
+                    registry.set_release_sink(None);
+                    if let Err(error) = registry.drain(bound).await {
+                        tracing::error!("failed to drain Home executions at shutdown: {error}");
+                    }
+                    return;
+                }
                 _ = tokio::time::sleep(delay) => {}
             }
             previous = Some(client);
@@ -5999,7 +6007,8 @@ mod tests {
     }
 
     /// Go `ce433b37`: a lifetime that published and then lost its heartbeat is retried
-    /// only after the reconnect backoff, and shutdown cuts that wait short.
+    /// only after the reconnect backoff, and shutdown cuts that wait short, ending the
+    /// executions the registry kept for the next lifetime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lost_published_lifetime_backs_off_before_resubscribing() {
         const CONFIG: &str = "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-heartbeat-timeout: 200ms\n  cpa-cancel-bound: 100ms\n";
@@ -6017,7 +6026,32 @@ mod tests {
         })
         .await;
         let node = Bare::start(&home).await;
-        node.published().await;
+        let registry = node.published().await.registry;
+        let pending = registry.begin_dispatch().unwrap();
+        let scope = registry
+            .install(
+                pending,
+                cpa_home::registry::ScopeSpec {
+                    request_id: String::new(),
+                    credential_id: String::new(),
+                    model: String::new(),
+                    kind: String::new(),
+                    started_at: std::time::SystemTime::UNIX_EPOCH,
+                    accounted: false,
+                },
+            )
+            .unwrap();
+        let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
+        scope
+            .bind({
+                let scope = scope.clone();
+                move || {
+                    let _ = closed_tx.send(());
+                    std::thread::spawn(move || scope.end());
+                }
+            })
+            .unwrap();
+        drop(scope);
 
         let first = subscribes.recv().await.unwrap();
         let second = subscribes.recv().await.unwrap();
@@ -6030,11 +6064,18 @@ mod tests {
 
         // The second lifetime ends 200ms after its ACK; its backoff is at least 1s.
         tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            closed_rx.try_recv().is_err(),
+            "a lost heartbeat ended the kept execution"
+        );
         node.shutdown.cancel();
         tokio::time::timeout(Duration::from_millis(300), node.task)
             .await
             .expect("shutdown waited out the reconnect backoff")
             .unwrap();
         assert!(subscribes.try_recv().is_err(), "resubscribed after shutdown");
+        closed_rx
+            .try_recv()
+            .expect("shutdown during the backoff left the kept execution running");
     }
 }
