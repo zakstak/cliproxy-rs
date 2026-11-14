@@ -195,8 +195,8 @@ const PENDING: &[(&str, &str, &str)] = &[
 ];
 
 /// Fixtures recorded at an older reference whose behaviour this fork deliberately
-/// takes from the selective Go v8.0.67 target (8bba7a77), each listed in
-/// docs/DIFFERENCES-FROM-GO.md. Like PENDING, every fixture an entry matches must
+/// takes from the selective Go v8.0.67 target (8bba7a77) or changes itself (#168), each
+/// listed in docs/DIFFERENCES-FROM-GO.md. Like PENDING, every fixture an entry matches must
 /// still fail, so an entry cannot hide a regression elsewhere. The fixtures keep their
 /// recorded provenance; Rust unit tests assert the new behaviour.
 const SELECTIVE: &[(&str, &str, &str)] = &[
@@ -249,6 +249,16 @@ const SELECTIVE: &[(&str, &str, &str)] = &[
         "openai-response->claude",
         "TestTextSearchTextOrderPreservedInStreamingAndReplay:literal#5",
         "#72: a continuation's search result keeps its ID (aadb34f9)",
+    ),
+    (
+        "claude->codex",
+        "codex-events/non-stream/0",
+        "#168: buffered summary parts join with a blank line, as streamed",
+    ),
+    (
+        "claude->codex",
+        "codex-claude/non-stream/0",
+        "#168: buffered summary parts join with a blank line, as streamed",
     ),
 ];
 
@@ -422,6 +432,9 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
     let refused_80 = actual.first().is_some_and(|o| o == b"#80-REFUSED");
     early.extend(differences);
     early.extend(developer_role_difference(client, upstream, f, bytes, &mut actual));
+    if reasoning_flush_moved(client, upstream, f, bytes, &actual, &expected) {
+        actual = expected.clone();
+    }
     if refused_80 {
         actual = expected.clone();
     }
@@ -566,6 +579,30 @@ fn controls_difference(
     }
     errors
 }
+
+/// #168 (docs/DIFFERENCES-FROM-GO.md, "Reasoning summaries for Claude clients"): the
+/// Responses -> Claude stream opens a thinking block with a summary part's first text
+/// that is not whitespace, not at `response.reasoning_summary_part.added`, so the block
+/// start and the part separator are written with a later input line. For a stream
+/// fixture with summary parts on that pair, Go's bytes in Go's order are accepted.
+fn reasoning_flush_moved(
+    client: Format,
+    upstream: Format,
+    f: &Value,
+    bytes: bool,
+    actual: &[Vec<u8>],
+    expected: &[Vec<u8>],
+) -> bool {
+    (client, upstream) == (Format::Claude, Format::Codex)
+        && f["path"] == "stream"
+        && f["lines"].as_array().unwrap().iter().any(|line| {
+            let line = field(line, bytes);
+            line.windows(PART_ADDED.len()).any(|w| w == PART_ADDED)
+        })
+        && actual.concat() == expected.concat()
+}
+
+const PART_ADDED: &[u8] = b"response.reasoning_summary_part.added";
 
 /// #80 (docs/DIFFERENCES-FROM-GO.md, "Developer messages in Responses-shaped Chat
 /// Completions requests"): the Responses -> Chat converter keeps a `developer` message's

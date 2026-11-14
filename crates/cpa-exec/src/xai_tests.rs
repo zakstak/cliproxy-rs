@@ -80,6 +80,12 @@ fn with_controls_difference(s: &Value, go: String) -> String {
 /// recording (request, usage record) still compares.
 const V8_0_67_ENDINGS: &[&str] = &["disconnected_before_completed", "usage_done_ignored_execute"];
 
+/// Recordings of a reasoning summary streamed to a Claude client. The thinking block now
+/// opens with the summary's first text, not at `response.reasoning_summary_part.added`
+/// (#168, docs/DIFFERENCES-FROM-GO.md, "Reasoning summaries for Claude clients"), so the
+/// block start shares a frame with that text. Go's frames, joined, must still match.
+const REASONING_FLUSH: &[&str] = &["reasoning_to_claude_stream", "replay_claude_turn1"];
+
 /// Shared helpers whose real port has not landed: scenarios that need them are skipped
 /// and listed, so integration can remove an entry and see the scenario run.
 const PENDING: &[&str] = &[];
@@ -561,7 +567,8 @@ async fn go_reference_scenarios() {
                 .map(|f| String::from_utf8_lossy(&f).into_owned())
                 .collect()
         };
-        if chunks != want {
+        let moved = REASONING_FLUSH.contains(&name) && chunks.concat() == want.concat();
+        if chunks != want && !moved {
             problems.push(format!("frames:\n  rust: {chunks:?}\n  go:   {want:?}"));
         }
         // Go publishes at most one record per attempt; the server publishes what the
@@ -1183,5 +1190,55 @@ async fn historical_additional_tools_are_sent_once() {
                 );
             }
         }
+    }
+}
+
+// --- Responses reasoning for Claude clients (#168) ------------------------------------
+
+/// A Claude client of Grok reads the same thinking blocks streamed and buffered: summary
+/// parts joined with a blank line, and no thinking block for a whitespace-only summary
+/// (a signed one keeps its signature-only block).
+#[tokio::test]
+async fn claude_clients_read_the_same_reasoning_streamed_and_buffered() {
+    for op in ["stream", "execute"] {
+        let mock = Mock::start(&serde_json::json!({
+            "status": 200,
+            "headers": [["Content-Type", "text/event-stream"]],
+            "body": crate::reasoning_testkit::answer("grok-4.3"),
+        }))
+        .await;
+        let addr = mock.addr.clone();
+        let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+        let s = serde_json::json!({
+            "config_auth": -1,
+            "attributes": {"api_key": "sk-fake-xai"},
+            "model": "grok-4.3",
+            "payload": format!(r#"{{"model":"grok-4.3","max_tokens":16,"stream":{},"messages":[{{"role":"user","content":"hi"}}]}}"#, op == "stream"),
+            "source": "claude",
+            "op": op,
+        });
+        let cfg = Config::default();
+        let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
+        let response = executor
+            .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+            .await
+            .unwrap_or_else(|e| panic!("{op}: {e:?}"));
+        let answer = match response.body {
+            ResponseBody::Buffered(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            ResponseBody::Stream(mut stream) => {
+                let mut text = String::new();
+                while let Some(item) = stream.next().await {
+                    text.push_str(&String::from_utf8_lossy(
+                        &item.unwrap_or_else(|e| panic!("{op}: {e:?}")),
+                    ));
+                }
+                text
+            }
+        };
+        assert_eq!(
+            crate::reasoning_testkit::blocks(&answer),
+            crate::reasoning_testkit::want(),
+            "{op}: {answer}"
+        );
     }
 }

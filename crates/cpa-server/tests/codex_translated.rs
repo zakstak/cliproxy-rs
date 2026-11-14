@@ -1321,3 +1321,104 @@ async fn commentary_is_visible_text_and_replays_without_a_phase() {
     assert_eq!(said[0]["content"][0]["text"], "Checking the context.", "{body}");
     assert!(said[0].get("phase").is_none(), "no inferred phase: {body}");
 }
+
+/// A Responses answer with a two-part summary signed `signature`, a whitespace-only
+/// summary signed the same, and an unsigned whitespace-only summary, then text. Its
+/// `response.completed` lists no output, so a buffered client gets the aggregate of the
+/// done items.
+fn reasoning_answer(signature: &str) -> Reply {
+    let events = [
+        json!({"type":"response.created","response":{"id":"resp_r","model":"gpt-5.5"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_a","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"one"}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":1,"delta":"two"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_a","encrypted_content":signature,"summary":[{"type":"summary_text","text":"one"},{"type":"summary_text","text":"two"}]}}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_b","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":1,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":1,"summary_index":0,"delta":" \n"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_b","encrypted_content":signature,"summary":[{"type":"summary_text","text":" \n"}]}}),
+        json!({"type":"response.output_item.added","output_index":2,"item":{"type":"reasoning","id":"rs_c","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":2,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":2,"summary_index":0,"delta":"\n"}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":2,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.output_item.done","output_index":2,"item":{"type":"reasoning","id":"rs_c","summary":[{"type":"summary_text","text":"\n"},{"type":"summary_text","text":""}]}}),
+        json!({"type":"response.output_item.added","output_index":3,"item":{"type":"message","id":"msg","role":"assistant","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":3,"content_index":0,"part":{"type":"output_text","text":""}}),
+        json!({"type":"response.output_text.delta","output_index":3,"content_index":0,"delta":"hi"}),
+        json!({"type":"response.content_part.done","output_index":3,"content_index":0,"part":{"type":"output_text","text":"hi"}}),
+        json!({"type":"response.output_item.done","output_index":3,"item":{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}),
+        json!({"type":"response.completed","response":{"id":"resp_r","status":"completed","model":"gpt-5.5","output":[],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}),
+    ];
+    let sse: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    Reply::sse(sse)
+}
+
+/// The content blocks of a Claude answer: a buffered message's `content`, or a stream's
+/// blocks with their deltas folded in.
+fn claude_blocks(answer: &str) -> Vec<Value> {
+    if let Ok(message) = serde_json::from_str::<Value>(answer) {
+        return message["content"].as_array().cloned().unwrap_or_default();
+    }
+    let mut blocks: Vec<Value> = vec![];
+    for e in answer
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+    {
+        match e["type"].as_str() {
+            Some("content_block_start") => blocks.push(e["content_block"].clone()),
+            Some("content_block_delta") => {
+                let block = &mut blocks[e["index"].as_u64().unwrap() as usize];
+                let delta = &e["delta"];
+                let (field, value) = match delta["type"].as_str().unwrap() {
+                    "thinking_delta" => ("thinking", &delta["thinking"]),
+                    "text_delta" => ("text", &delta["text"]),
+                    "signature_delta" => ("signature", &delta["signature"]),
+                    other => panic!("unexpected delta {other}"),
+                };
+                let joined = block[field].as_str().unwrap_or_default().to_owned() + value.as_str().unwrap();
+                block[field] = json!(joined);
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// #168: a Claude client reads the same thinking blocks streamed and buffered. A
+/// reasoning item's summary parts join with a blank line, and a whitespace-only summary
+/// is no thinking text: unsigned it opens no block, signed it keeps the signature-only
+/// block that carries the encrypted reasoning. Replayed as the next turn, that answer
+/// converts: an unsigned blank thinking block would be refused, because Codex cannot
+/// carry reasoning text without its encrypted content.
+#[tokio::test]
+async fn reasoning_summaries_read_the_same_streamed_and_buffered() {
+    let signature = codex_signature();
+    let want = vec![
+        json!({"type":"thinking","thinking":"one\n\ntwo","signature":signature}),
+        json!({"type":"thinking","thinking":"","signature":signature}),
+        json!({"type":"text","text":"hi"}),
+    ];
+    for stream in [true, false] {
+        let first = proxy(vec![reasoning_answer(&signature)], "").await;
+        let (status, answer) = post(&first.url, "/v1/messages", &claude_request(stream)).await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        let blocks = claude_blocks(&answer);
+        assert_eq!(blocks, want, "stream={stream}: {answer}");
+
+        let mut replay = claude_request(false);
+        let messages = replay["messages"].as_array_mut().unwrap();
+        messages.push(json!({"role": "assistant", "content": blocks}));
+        messages.push(json!({"role": "user", "content": "Thanks."}));
+        let next = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&next.url, "/v1/messages", &replay).await;
+        assert_eq!(status, 200, "stream={stream}: the answer replays: {answer}");
+        let reasoning = items(&sent(&next), "reasoning").len();
+        assert_eq!(reasoning, 3, "stream={stream}: the earlier one and both signed items");
+    }
+}

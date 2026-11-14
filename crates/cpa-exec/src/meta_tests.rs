@@ -2013,3 +2013,48 @@ async fn payload_rules_decide_prompt_cache_retention_after_the_client() {
         }
     }
 }
+
+/// #168: a Claude client of Muse reads the same thinking blocks streamed and buffered:
+/// summary parts joined with a blank line, and no thinking block for a whitespace-only
+/// summary (a signed one keeps its signature-only block).
+#[tokio::test]
+async fn claude_clients_read_the_same_reasoning_streamed_and_buffered() {
+    let fx = fixture("meta", "responses-nonstream-collected");
+    let origin = go_origin(&fx).unwrap();
+    for stream in [true, false] {
+        let responses = json!([{
+            "status": 200,
+            "headers": [["Content-Type", "text/event-stream"]],
+            "body": crate::reasoning_testkit::answer("muse-spark-1.3"),
+        }]);
+        let mock = Mock::start(&responses).await;
+        let credential = meta_credential(&fx, &origin, &mock.url);
+        let mut req = request(&fx, "");
+        req.source_format = Format::Claude;
+        req.response_format = Format::Claude;
+        req.stream = stream;
+        req.body = Bytes::from(format!(
+            r#"{{"model":"muse-spark-1.3","max_tokens":16,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ));
+        req.original_body = req.body.clone();
+        let response = MetaExecutor::with_client(default_client())
+            .execute(&credential, req, &cfg())
+            .await
+            .unwrap_or_else(|e| panic!("stream={stream}: {e:?}"));
+        let answer = match response.body {
+            ResponseBody::Buffered(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            ResponseBody::Stream(mut s) => {
+                let mut text = String::new();
+                while let Some(item) = s.next().await {
+                    text.push_str(&String::from_utf8_lossy(&item.unwrap()));
+                }
+                text
+            }
+        };
+        assert_eq!(
+            crate::reasoning_testkit::blocks(&answer),
+            crate::reasoning_testkit::want(),
+            "stream={stream}: {answer}"
+        );
+    }
+}
