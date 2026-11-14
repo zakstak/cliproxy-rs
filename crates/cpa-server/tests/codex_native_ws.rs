@@ -8739,3 +8739,86 @@ async fn an_account_shaped_context_failure_is_never_preserved() {
         }
     }
 }
+
+// ---------------------------------------------------------------------- FP4 #118: budgets
+
+/// The proxy's 101 advertises its own receive limit for one client message, the header
+/// first-party Codex reads from the upgrade (openai/codex `ed7ca22bb60a`). It is the
+/// proxy's limit, whatever upstream later serves the connection.
+#[tokio::test]
+async fn the_upgrade_advertises_the_proxy_receive_limit() {
+    let proxy = proxy(Profile::Chatgpt, Script::default(), "").await;
+    let response = wreq::Client::new()
+        .websocket(format!("ws://{}/v1/responses", proxy.addr))
+        .header("authorization", "Bearer client-key")
+        .header("user-agent", CODEX_UA)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get("x-codex-websocket-max-message-bytes").unwrap(),
+        cpa_server::MAX_REQUEST_BYTES.to_string().as_str()
+    );
+}
+
+/// An upstream that advertises a limit smaller than a create: the client's connection
+/// closes with 1009 before any text of the turn, which first-party Codex reads as
+/// `WebsocketMessageTooLarge` (it then switches the session to HTTP), and the upstream
+/// socket received nothing. The client's own HTTP retry of the same request reaches the
+/// upstream unchanged: the one dispatch. A create exactly at the limit runs on the socket.
+#[tokio::test]
+async fn a_create_over_the_upstream_limit_closes_1009_before_any_text() {
+    let create = client_frame("ws-create-first", "gpt-5.5");
+    for (limit, admitted) in [(create.len(), true), (create.len() - 1, false)] {
+        let proxy = proxy(
+            Profile::Chatgpt,
+            Script {
+                ws_handshake: vec![("x-codex-websocket-max-message-bytes".into(), limit.to_string())],
+                ws: replies(&["sse-completed"]),
+                http: vec![cpa_server::testing::codex_capture::Reply::sse(
+                    fixture("sse-completed").bytes(),
+                )],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        let mut socket = connect(&proxy).await;
+        socket.send(Message::text(create.clone())).await.unwrap();
+        let turn = read(&mut socket, &TERMINAL).await;
+        if admitted {
+            assert_eq!(turn.frames, events("sse-completed"), "limit {limit}");
+            assert_eq!(upstream_frames(&proxy, 0), std::slice::from_ref(&create));
+            continue;
+        }
+        assert_eq!((turn.frames.len(), turn.closed), (0, Some(1009)), "{turn:?}");
+        assert_eq!(proxy.upstream.sockets().len(), 1, "no other socket");
+        assert!(upstream_frames(&proxy, 0).is_empty(), "nothing was written");
+        assert!(proxy.upstream.http().is_empty(), "the proxy sends it nowhere else");
+
+        // First-party Codex sends the same request over HTTP: the frame without its tag.
+        let body = String::from_utf8(
+            cpa_common::codex_body::CodexBody::parse(create.as_bytes())
+                .unwrap()
+                .without_member("type"),
+        )
+        .unwrap();
+        let answer = wreq::Client::new()
+            .post(format!("http://{}/v1/responses", proxy.addr))
+            .bearer_auth("client-key")
+            .header("content-type", "application/json")
+            .header("user-agent", CODEX_UA)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(answer.contains("response.completed"), "{answer}");
+        let http = proxy.upstream.http();
+        assert_eq!(http.len(), 1);
+        assert_eq!(text(http[0].body.clone()), body, "the full request, unchanged");
+        assert!(upstream_frames(&proxy, 0).is_empty());
+    }
+}

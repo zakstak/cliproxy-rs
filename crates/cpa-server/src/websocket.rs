@@ -83,6 +83,7 @@ const CLOSE_SERVICE_RESTART: u16 = 1012;
 /// Close code 1009 (message too big).
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const TURN_STATE: &str = "x-codex-turn-state";
+const MAX_MESSAGE_BYTES: &str = "x-codex-websocket-max-message-bytes";
 
 /// The error a `generate: false` prewarm gets under Home before this connection's first
 /// pick, when no credential or transport is known yet.
@@ -239,6 +240,14 @@ async fn upgrade(
     if let Some(turn_state) = turn_state {
         response.headers_mut().insert(TURN_STATE, turn_state);
     }
+    // FP4 #118: the proxy's own receive limit for one client message, read by first-party
+    // Codex from this 101 (`x-codex-websocket-max-message-bytes`), which sends a longer
+    // request over HTTP instead. No upstream's limit is known yet: the first request
+    // chooses the credential. A smaller upstream limit is refused per request
+    // (`cpa_exec::codex`), with close 1009.
+    response
+        .headers_mut()
+        .insert(MAX_MESSAGE_BYTES, HeaderValue::from(MAX_MESSAGE));
     response
 }
 

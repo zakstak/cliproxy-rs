@@ -11,27 +11,29 @@ const MIB: usize = 1 << 20;
 
 /// One client frame as it crossed the wire, unmasked.
 #[derive(Debug)]
-struct WireFrame {
+pub(super) struct WireFrame {
     fin: bool,
     rsv1: bool,
-    opcode: u8,
+    pub(super) opcode: u8,
     payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Plan {
+#[derive(Clone, Default)]
+pub(super) struct Plan {
     /// Agree to permessage-deflate (the proxy reads compressed, never writes compressed).
-    deflate: bool,
+    pub(super) deflate: bool,
+    /// `x-codex-websocket-max-message-bytes` on the 101, as given.
+    pub(super) limit: Option<String>,
     /// Stop reading once this many frames arrived, with a small receive buffer.
-    stall_after: Option<usize>,
+    pub(super) stall_after: Option<usize>,
     /// Ping once this many frames arrived.
-    ping_after: Option<usize>,
+    pub(super) ping_after: Option<usize>,
     /// Answer each finished data message with `response.created` and `.completed`.
-    answer: bool,
+    pub(super) answer: bool,
 }
 
 /// A WebSocket upstream on raw TCP for one connection; each client frame is reported.
-async fn raw_upstream(plan: Plan) -> (String, mpsc::UnboundedReceiver<WireFrame>) {
+pub(super) async fn raw_upstream(plan: Plan) -> (String, mpsc::UnboundedReceiver<WireFrame>) {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     if plan.stall_after.is_some() {
         socket.set_recv_buffer_size(16 << 10).unwrap();
@@ -42,7 +44,7 @@ async fn raw_upstream(plan: Plan) -> (String, mpsc::UnboundedReceiver<WireFrame>
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let (mut tcp, _) = listener.accept().await.unwrap();
-        accept(&mut tcp, plan.deflate).await;
+        accept(&mut tcp, &plan).await;
         let mut count = 0;
         loop {
             if plan.stall_after == Some(count) {
@@ -74,7 +76,7 @@ async fn raw_upstream(plan: Plan) -> (String, mpsc::UnboundedReceiver<WireFrame>
     (url, rx)
 }
 
-async fn accept(tcp: &mut tokio::net::TcpStream, deflate: bool) {
+async fn accept(tcp: &mut tokio::net::TcpStream, plan: &Plan) {
     let mut request = Vec::new();
     let mut buf = [0u8; 4096];
     while !request.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -92,11 +94,14 @@ async fn accept(tcp: &mut tokio::net::TcpStream, deflate: bool) {
         })
         .unwrap();
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-    let extensions = if deflate {
+    let mut extensions = if plan.deflate {
         format!("Sec-WebSocket-Extensions: {}\r\n", deflate::OFFER)
     } else {
         String::new()
     };
+    if let Some(limit) = &plan.limit {
+        extensions.push_str(&format!("x-codex-websocket-max-message-bytes: {limit}\r\n"));
+    }
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n{extensions}\r\n"
@@ -139,15 +144,18 @@ async fn read_frame(tcp: &mut tokio::net::TcpStream) -> Option<WireFrame> {
 
 /// A reassembled data message and the sizes of its frames.
 #[derive(Debug, PartialEq)]
-struct Reassembled {
-    bytes: Vec<u8>,
+pub(super) struct Reassembled {
+    pub(super) bytes: Vec<u8>,
     frames: Vec<usize>,
 }
 
 /// Reads frames until `count` data messages finished. Control frames between fragments
 /// are allowed (RFC 6455 5.4) and returned apart; a data message starting inside an
 /// unfinished one, a compressed frame, or a binary frame fails the test.
-async fn messages(rx: &mut mpsc::UnboundedReceiver<WireFrame>, count: usize) -> (Vec<Reassembled>, Vec<WireFrame>) {
+pub(super) async fn messages(
+    rx: &mut mpsc::UnboundedReceiver<WireFrame>,
+    count: usize,
+) -> (Vec<Reassembled>, Vec<WireFrame>) {
     let mut done = Vec::new();
     let mut control = Vec::new();
     let mut open: Option<Reassembled> = None;
