@@ -1017,14 +1017,32 @@ impl Matcher {
     }
 
     /// Go `MatchFingerprintsWithContext`: the longest known prefix, a fork of it, or a
-    /// compaction continuation.
+    /// compaction continuation. The matched sequence lives another TTL.
     pub fn find(&mut self, namespace: &str, prepared: &Prepared, now: Instant) -> Option<Match> {
+        self.matching(namespace, prepared, now, true)
+    }
+
+    /// [`Self::find`] without extending the matched sequence's lifetime: a request that
+    /// may be refused (`session-affinity-rebind-on: never`) must not keep its pin alive.
+    pub fn peek(&mut self, namespace: &str, prepared: &Prepared, now: Instant) -> Option<Match> {
+        self.matching(namespace, prepared, now, false)
+    }
+
+    fn matching(&mut self, namespace: &str, prepared: &Prepared, now: Instant, refresh: bool) -> Option<Match> {
         if namespace.is_empty() {
             return None;
         }
         let (fingerprints, tails, environment) = self.context(prepared)?;
         self.tick(now);
-        self.match_locked(namespace, fingerprints, &tails, &environment, prepared.min_prefix, now)
+        self.match_locked(
+            namespace,
+            fingerprints,
+            &tails,
+            &environment,
+            prepared.min_prefix,
+            now,
+            refresh,
+        )
     }
 
     /// Go `BindFingerprintsWithContext`: records the sequence for `auth`; the result
@@ -1299,7 +1317,7 @@ impl Matcher {
             }
         }
         let mut auth = auth.to_owned();
-        let found = self.match_locked(namespace, fingerprints, &tails, &environment, min_prefix, now);
+        let found = self.match_locked(namespace, fingerprints, &tails, &environment, min_prefix, now, true);
         let mut bound = Match::default();
         if let Some(found) = found {
             if found.compaction && !found.auth.is_empty() && auth.is_empty() {
@@ -1421,6 +1439,8 @@ impl Matcher {
     }
 
     /// Go `matchLocked`: binary search for the longest live prefix.
+    /// `refresh` extends the matched sequence's lifetime by a TTL.
+    #[allow(clippy::too_many_arguments)]
     fn match_locked(
         &mut self,
         namespace: &str,
@@ -1429,6 +1449,7 @@ impl Matcher {
         environment: &str,
         min_prefix: usize,
         now: Instant,
+        refresh: bool,
     ) -> Option<Match> {
         if !self.namespaces.contains_key(namespace)
             || fingerprints.is_empty()
@@ -1462,12 +1483,15 @@ impl Matcher {
                 min_prefix,
                 0,
                 now,
+                refresh,
             );
         };
         let access = self.next_access();
         let ttl = self.limits.ttl;
         let group = self.groups.get_mut(&id).expect("indexed group");
-        group.expires = now + ttl;
+        if refresh {
+            group.expires = now + ttl;
+        }
         group.last_access = access;
         let (mut session, mut parent, mut node_kind) =
             (group.session.clone(), group.parent.clone(), group.node_kind.clone());
@@ -1486,6 +1510,7 @@ impl Matcher {
                 min_prefix,
                 best_len,
                 now,
+                refresh,
             ) {
                 return Some(found);
             }
@@ -1551,6 +1576,7 @@ impl Matcher {
         min_prefix: usize,
         best_len: usize,
         now: Instant,
+        refresh: bool,
     ) -> Option<Match> {
         let owned;
         let candidate_tail = if tails.is_empty() {
@@ -1634,7 +1660,9 @@ impl Matcher {
         let access = self.next_access();
         let ttl = self.limits.ttl;
         let group = self.groups.get_mut(&id).expect("indexed group");
-        group.expires = now + ttl;
+        if refresh {
+            group.expires = now + ttl;
+        }
         group.last_access = access;
         let (auth, parent) = (group.auth.clone(), group.session.clone());
         self.move_to_back(id);

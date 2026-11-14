@@ -212,6 +212,10 @@ async fn alpha_search(
         Err(AcquireError::Prepare { error: e, .. }) => {
             return error(e.status, &String::from_utf8_lossy(&e.body));
         }
+        Err(AcquireError::Bound { retry_after, .. }) => {
+            let failure = crate::dispatch::Failure::Bound { retry_after };
+            return with_retry_after(error(failure.status(), &failure.text()), failure.retry_after());
+        }
     };
     search(&rt, lease, &body, &headers, &model, &cfg, &capture, None).await
 }

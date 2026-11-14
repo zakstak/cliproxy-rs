@@ -27,7 +27,7 @@ use serde_json::{Map, Value};
 
 use crate::refresh::RefreshState;
 use crate::registry::Registry;
-use crate::scheduler::{Policy, Scheduler};
+use crate::scheduler::{NoPick, Policy, Scheduler};
 
 /// The config snapshot and credential epoch a registry was built from.
 type RegistryCache = (Arc<Config>, (u64, u64, u64), Arc<Registry>);
@@ -1128,9 +1128,8 @@ fn refresh_workers(cfg: &Config) -> usize {
 }
 
 /// A selection's eligible credentials with their execution models, and those of them
-/// that are ready now with their provider keys; when none is ready, the error Go's
-/// availability check reports. The configured selector's own filter applies (weighted
-/// round-robin skips non-positive weights).
+/// that are ready now with their provider keys. The configured selector's own filter
+/// applies (weighted round-robin skips non-positive weights).
 #[allow(clippy::type_complexity)]
 fn ready<'a>(
     creds: &'a [Arc<Credential>],
@@ -1139,7 +1138,7 @@ fn ready<'a>(
     policy: &Policy,
     admit: &Admit<'_>,
     now: Instant,
-) -> Result<(Vec<(&'a Arc<Credential>, String)>, Vec<(&'a Arc<Credential>, String)>), AcquireError> {
+) -> (Vec<(&'a Arc<Credential>, String)>, Vec<(&'a Arc<Credential>, String)>) {
     let eligible: Vec<_> = creds
         .iter()
         .filter(|c| !c.disabled && !selection.exclude.contains(&c.id))
@@ -1151,32 +1150,38 @@ fn ready<'a>(
         .filter(|(c, m)| scheduler.wait(c, m, now).is_none() && !scheduler.tokens_rejected(c))
         .map(|(c, _)| (*c, crate::registry::provider_key(c)))
         .collect();
-    if candidates.is_empty() {
-        let cause = eligible
-            .iter()
-            .filter_map(|(c, m)| scheduler.last_error(c, m))
-            .max_by_key(|s| s.deadline)
-            .map(|s| s.error.clone());
-        let soonest = eligible
-            .iter()
-            .filter_map(|(c, m)| scheduler.wait(c, m, now).map(|w| (w, c, m)))
-            .min_by_key(|(w, ..)| *w);
-        let wait = soonest.map(|(w, ..)| w);
-        if !eligible.is_empty() && eligible.iter().all(|(c, m)| scheduler.quota_cooling(c, m, now)) {
-            return Err(AcquireError::Cooldown {
-                wait: wait.unwrap_or_default(),
-                cause,
-                signals: soonest
-                    .map(|(_, c, m)| scheduler.cooldown_signals(c, m, now).clone())
-                    .unwrap_or_default(),
-            });
-        }
-        return Err(AcquireError::Unavailable {
-            retry_after: if eligible.is_empty() { None } else { wait },
+    (eligible, candidates)
+}
+
+/// The error Go's availability check reports when none of `eligible` is ready.
+fn unready(
+    eligible: &[(&Arc<Credential>, String)],
+    scheduler: &crate::scheduler::Scheduler,
+    now: Instant,
+) -> AcquireError {
+    let cause = eligible
+        .iter()
+        .filter_map(|(c, m)| scheduler.last_error(c, m))
+        .max_by_key(|s| s.deadline)
+        .map(|s| s.error.clone());
+    let soonest = eligible
+        .iter()
+        .filter_map(|(c, m)| scheduler.wait(c, m, now).map(|w| (w, c, m)))
+        .min_by_key(|(w, ..)| *w);
+    let wait = soonest.map(|(w, ..)| w);
+    if !eligible.is_empty() && eligible.iter().all(|(c, m)| scheduler.quota_cooling(c, m, now)) {
+        return AcquireError::Cooldown {
+            wait: wait.unwrap_or_default(),
             cause,
-        });
+            signals: soonest
+                .map(|(_, c, m)| scheduler.cooldown_signals(c, m, now).clone())
+                .unwrap_or_default(),
+        };
     }
-    Ok((eligible, candidates))
+    AcquireError::Unavailable {
+        retry_after: if eligible.is_empty() { None } else { wait },
+        cause,
+    }
 }
 
 #[derive(Debug)]
@@ -1198,6 +1203,13 @@ pub enum AcquireError {
     Prepare {
         id: String,
         error: ExecError,
+    },
+    /// Under `session-affinity-rebind-on: never`, the session's credential `id` cannot
+    /// serve it now. `retry_after` is that credential's cooldown, when it has one. `id`
+    /// only scopes the retry decision ([`Store::retry_wait`]); clients never see it.
+    Bound {
+        id: String,
+        retry_after: Option<Duration>,
     },
 }
 
@@ -2035,11 +2047,19 @@ impl CredentialStore {
         let credential = {
             let inner = self.read();
             let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
-            let (eligible, candidates) = ready(&inner.creds, &scheduler, &selection, &policy, admit, now)?;
+            let (eligible, candidates) = ready(&inner.creds, &scheduler, &selection, &policy, admit, now);
             let refs: Vec<(&Credential, &str)> = candidates.iter().map(|(c, p)| (c.as_ref(), p.as_str())).collect();
-            let (picked, lcp) = scheduler
-                .pick_session(&refs, &selection, &policy, ranks, now)
-                .expect("ready candidates exist");
+            let (picked, lcp) = match scheduler.pick_session(&refs, &selection, &policy, ranks, now) {
+                Ok(picked) => picked,
+                Err(NoPick::Empty) => return Err(unready(&eligible, &scheduler, now)),
+                Err(NoPick::Bound(id)) => {
+                    let retry_after = eligible
+                        .iter()
+                        .find(|(c, _)| c.id == id)
+                        .and_then(|(c, m)| scheduler.wait(c, m, now));
+                    return Err(AcquireError::Bound { id, retry_after });
+                }
+            };
             let (c, m) = eligible.iter().find(|(c, _)| c.id == picked.id).unwrap();
             let generation = scheduler.reserve_probe(c, m, now);
             // The key admission gave the pick, which its probe reservation used: admitting

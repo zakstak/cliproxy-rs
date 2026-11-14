@@ -373,6 +373,14 @@ async fn select_oauth(
                 text: String::from_utf8_lossy(&error.body).into_owned(),
                 retry_after: None,
             },
+            AcquireError::Bound { retry_after, .. } => {
+                let failure = crate::dispatch::Failure::Bound { retry_after };
+                Rejection {
+                    status: failure.status(),
+                    text: failure.text(),
+                    retry_after: failure.retry_after(),
+                }
+            }
         })
         .map(|lease| (lease, String::new()))
 }

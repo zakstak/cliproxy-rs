@@ -530,6 +530,10 @@ pub struct RoutingConfig {
     #[serde(deserialize_with = "de_go_string")]
     pub session_affinity_ttl: String,
     pub session_affinity_subagents: Option<bool>,
+    /// `never` keeps a bound session on its account and fails its requests while that
+    /// account is unavailable; anything else (Go's default `any`) moves it.
+    #[serde(deserialize_with = "de_go_string", skip_serializing_if = "String::is_empty")]
+    pub session_affinity_rebind_on: String,
     pub retry: RetryConfig,
     pub cooldown: CooldownConfig,
 }
@@ -1280,6 +1284,7 @@ mod tests {
              transient-error-cooldown-seconds: -3\nforce-model-prefix: true\n\
              routing:\n  strategy: fill-first\n  session-affinity: true\n\
              \x20 session-affinity-ttl: 37m\n  session-affinity-subagents: false\n\
+             \x20 session-affinity-rebind-on: never\n\
              \x20 retry: {request-retry: 0}\n  cooldown: {disable-cooling: false}\n",
         )
         .unwrap();
@@ -1287,6 +1292,7 @@ mod tests {
         assert!(cfg.routing.force_model_prefix && cfg.routing.session_affinity);
         assert_eq!(cfg.routing.session_affinity_ttl, "37m");
         assert_eq!(cfg.routing.session_affinity_subagents, Some(false));
+        assert_eq!(cfg.routing.session_affinity_rebind_on, "never");
         assert_eq!(cfg.routing.retry.request_retry, 0);
         assert_eq!(cfg.routing.retry.max_retry_credentials, 0);
         assert_eq!(cfg.routing.retry.max_retry_interval, 41);

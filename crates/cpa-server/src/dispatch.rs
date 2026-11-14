@@ -276,6 +276,9 @@ pub enum Failure {
         cause: Option<String>,
         retry_after: Option<Duration>,
     },
+    /// Under `session-affinity-rebind-on: never`, the session's account cannot serve it
+    /// ([`AcquireError::Bound`]). Names no account.
+    Bound { retry_after: Option<Duration> },
     /// Every candidate is cooling down for this model.
     Cooldown {
         model: String,
@@ -293,7 +296,7 @@ impl Failure {
         match self {
             Failure::Exec(e) | Failure::Remote { error: e, .. } => classify::response_status(e),
             Failure::UnknownModel(_) | Failure::SpeechOnly(_) => 400,
-            Failure::ImageOnly(_) | Failure::Unavailable { .. } => 503,
+            Failure::ImageOnly(_) | Failure::Unavailable { .. } | Failure::Bound { .. } => 503,
             Failure::Cooldown { .. } => 429,
         }
     }
@@ -326,6 +329,11 @@ impl Failure {
                 cause,
                 ..
             } => unavailable_text(code, "no auth available", providers, model, cause.as_deref()),
+            // JSON, like `Cooldown`: OpenAI-shaped routes pass the code through, Claude
+            // routes keep the message (which starts with the code).
+            Failure::Bound { .. } => gojson::sorted(&serde_json::json!({
+                "error": { "code": "session_auth_unavailable", "message": BOUND_TEXT }
+            })),
             Failure::Cooldown {
                 model,
                 provider,
@@ -369,6 +377,9 @@ impl Failure {
             Failure::Unavailable {
                 retry_after: Some(wait),
                 ..
+            }
+            | Failure::Bound {
+                retry_after: Some(wait),
             } if !wait.is_zero() => Some(ceil_seconds(*wait).max(1)),
             _ => None,
         }
@@ -383,6 +394,12 @@ impl Failure {
         }
     }
 }
+
+/// [`Failure::Bound`]'s message: why the request failed and what the client can do, without
+/// naming the account.
+const BOUND_TEXT: &str = "session_auth_unavailable: the account this session is bound to is unavailable, and \
+     routing.session-affinity-rebind-on is never, so the session is not moved to another account; \
+     retry later or start a new session";
 
 /// Go `enrichAuthSelectionError`: a selection error's `code: message` text with the
 /// providers, the model and the last upstream error.
@@ -1090,6 +1107,9 @@ async fn run_routed(
     loop {
         let mut last: Option<Fault> = None;
         let mut attempted: Vec<String> = Vec::new();
+        // The credential a `never`-rebind session is bound to: every pick for a session
+        // binds (or reuses) the credential it returns, and a refused pick names it.
+        let mut bound: Option<String> = None;
         let pick_failure = loop {
             if policy.max_retry_credentials > 0 && attempted.len() >= policy.max_retry_credentials {
                 break None;
@@ -1116,6 +1136,10 @@ async fn run_routed(
                         signals: Box::new(signals),
                     });
                 }
+                Err(AcquireError::Bound { id, retry_after }) => {
+                    bound = Some(id);
+                    break Some(Failure::Bound { retry_after });
+                }
                 Err(AcquireError::Unavailable { retry_after, cause }) => {
                     break Some(Failure::Unavailable {
                         code: if retry_after.is_some() {
@@ -1130,6 +1154,9 @@ async fn run_routed(
                     });
                 }
             };
+            if policy.session_affinity_never_rebind && (selection.session.is_some() || selection.lcp.is_some()) {
+                bound = Some(lease.credential.id.clone());
+            }
             selection.exclude.push(lease.credential.id.clone());
             trace.selected(&lease.credential);
             let (mut models, alias) = registry::execution_models(&aliases, &lease.credential, &selection.model);
@@ -1201,6 +1228,9 @@ async fn run_routed(
             Failure::Cooldown { .. } => (429, true),
             Failure::Unavailable {
                 retry_after: Some(_), ..
+            }
+            | Failure::Bound {
+                retry_after: Some(_), ..
             } => (503, true),
             _ => (0, false),
         };
@@ -1210,7 +1240,13 @@ async fn run_routed(
         }
         let wait = {
             let admit = crate::runtime::admission(&registry, &aliases, &selection, &rt.executors);
-            rt.store().retry_wait(&selection, &policy, status, &attempted, &admit)
+            // A bound session's next round can only use its own credential: wait for that
+            // one, not for a spare it will never move to.
+            let admit_bound = |c: &cpa_core::credential::Credential| {
+                bound.as_ref().is_none_or(|id| *id == c.id).then(|| admit(c)).flatten()
+            };
+            rt.store()
+                .retry_wait(&selection, &policy, status, &attempted, &admit_bound)
         };
         let Some(wait) = wait else {
             return Err(terminal(round_error));
