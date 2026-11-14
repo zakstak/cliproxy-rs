@@ -1072,11 +1072,14 @@ ordinary stream error (`core/src/responses_retry.rs`, `bc3ccba6e1cb`). The proxy
   missing or unreadable value is no limit; `0` is a limit of zero. A message on that socket
   longer than the limit (a create, a steering frame, an interrupt; equal passes) is
   refused before any byte is written, as a request-scoped 413 `message_too_big`: no
-  failover, no cooldown, no retry on another socket. A WebSocket client's connection then
-  closes with 1009 before any text of that turn, since handshake metadata goes out only
-  with the turn's first event. First-party Codex retries the request over HTTP itself; the
-  proxy carries that HTTP request like any other ([Native HTTP route](#native-http-route)).
-  A limit above the proxy's own never refuses anything.
+  failover, no cooldown, no retry on another socket. For a turn's create, the client's
+  connection then closes with 1009 before any text of that turn, since handshake metadata
+  goes out only with the turn's first event; first-party Codex retries the request over
+  HTTP itself, and the proxy carries that HTTP request like any other
+  ([Native HTTP route](#native-http-route)). A refused steering frame ends its stream
+  with that error after the response's text, and a refused interrupt is answered with a
+  400 `error` event as any rejected interrupt is; neither is the no-text signal. A limit
+  above the proxy's own never refuses anything.
 - **Upstream close 1009.** An upstream close with 1009 is the same request-scoped 413
   and reaches the client as close 1009 ([Socket and account ownership](#socket-and-account-ownership)).
   Before any event of the turn, the client sees no text before it; after an event, it
