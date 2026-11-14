@@ -16,8 +16,26 @@ use super::profile;
 use super::settings::Settings;
 use crate::rawjson;
 
-/// Entrypoints whose wire behaviour was captured and reviewed for passthrough.
-pub(crate) const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "claude-vscode"];
+/// Entrypoints whose wire behaviour was captured and reviewed for passthrough. The
+/// Agent SDK entrypoints send what sdk-cli sends (testdata/claude_code_2_1_325_clients.json).
+const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "sdk-ts", "sdk-py", "claude-vscode"];
+
+/// A built-in native entrypoint, or one configured in `header-defaults.native-entrypoints`
+/// for a host that drives Claude Code under its own name (T3 Code: `t3-code`).
+pub(crate) fn native_entrypoint(entrypoint: &str, settings: &Settings) -> bool {
+    NATIVE_ENTRYPOINTS.contains(&entrypoint)
+        || settings
+            .header_defaults
+            .native_entrypoints
+            .iter()
+            .any(|e| e == entrypoint)
+}
+
+/// The fields Claude Code 2.1.325 writes after the entrypoint, in this order, each at
+/// most once: `agent-sdk/` (an Agent SDK host's version), `client-app/`
+/// (`CLAUDE_AGENT_SDK_CLIENT_APP`) and `workload/`. The last two describe one request,
+/// not the installation.
+const UA_FIELDS: [&str; 3] = ["agent-sdk/", "client-app/", "workload/"];
 pub(crate) const HELPER_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,7 +111,8 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .then(|| &s[prefix.len()..])
 }
 
-/// `(?i)^claude-cli/N.N.N\s+\(external,\s*[^,)]+(?:,\s*agent-sdk/N.N.N)?\)$`
+/// `claude-cli/N.N.N (external, ENTRYPOINT[, agent-sdk/N.N.N][, client-app/APP][, workload/NAME])`,
+/// with the prefix and field names matched case-insensitively.
 pub(crate) fn native_user_agent(user_agent: &str) -> bool {
     let Some(rest) = strip_prefix_ci(user_agent, "claude-cli/") else {
         return false;
@@ -114,18 +133,55 @@ pub(crate) fn native_user_agent(user_agent: &str) -> bool {
     let Some(inner) = rest.strip_suffix(')') else {
         return false;
     };
-    let inner = inner.trim_start();
-    let (entry, sdk) = match inner.find([',', ')']) {
-        Some(i) if inner.as_bytes()[i] == b',' => (&inner[..i], Some(inner[i + 1..].trim_start())),
-        Some(_) => return false,
-        None => (inner, None),
-    };
-    if entry.is_empty() {
+    if inner.contains(['(', ')']) {
         return false;
     }
-    match sdk {
-        None => true,
-        Some(sdk) => strip_prefix_ci(sdk, "agent-sdk/").is_some_and(semver),
+    let mut fields = inner.split(',');
+    if fields.next().is_none_or(|entry| entry.trim_start().is_empty()) {
+        return false;
+    }
+    let mut next = 0;
+    for field in fields {
+        let field = field.trim_start();
+        let Some((kind, value)) = UA_FIELDS
+            .iter()
+            .enumerate()
+            .skip(next)
+            .find_map(|(i, name)| strip_prefix_ci(field, name).map(|v| (i, v)))
+        else {
+            return false;
+        };
+        if if kind == 0 {
+            !semver(value)
+        } else {
+            value.trim().is_empty()
+        } {
+            return false;
+        }
+        next = kind + 1;
+    }
+    true
+}
+
+/// A native User-Agent without its per-request fields (`client-app/`, `workload/`), and
+/// those fields as written (`, client-app/APP, workload/NAME`), so that a stored device
+/// profile never carries one request's fields into another's.
+pub(crate) fn split_request_fields(user_agent: &str) -> (String, &str) {
+    let user_agent = user_agent.trim();
+    if !native_user_agent(user_agent) {
+        return (user_agent.to_owned(), "");
+    }
+    let comment = user_agent.find('(').unwrap_or_default();
+    let start = user_agent[comment..]
+        .match_indices(',')
+        .map(|(i, _)| comment + i)
+        .find(|&i| {
+            let field = user_agent[i + 1..].trim_start();
+            UA_FIELDS[1..].iter().any(|name| strip_prefix_ci(field, name).is_some())
+        });
+    match start {
+        Some(i) => (format!("{})", &user_agent[..i]), &user_agent[i..user_agent.len() - 1]),
+        None => (user_agent.to_owned(), ""),
     }
 }
 
@@ -161,7 +217,8 @@ pub(crate) fn valid_user_id(user_id: &str) -> bool {
 pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, settings: &Settings) -> Detection {
     let user_agent = raw_header(headers, "user-agent");
     let (entrypoint, _) = user_agent_details(user_agent);
-    let x_app = raw_header(headers, "x-app") == "cli";
+    // Background sessions send cli-bg (testdata/claude_code_2_1_325_clients.json).
+    let x_app = matches!(raw_header(headers, "x-app"), "cli" | "cli-bg");
     // A release other than the baseline counts only with its own well-formed SDK and
     // runtime versions:
     // otherwise its forwarded User-Agent would go upstream with baseline versions.
@@ -169,7 +226,7 @@ pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, set
     let betas = has_claude_code_beta(headers);
     let user_id = rawjson::get(payload, "metadata.user_id");
     let metadata_user_id = user_id.kind() == rawjson::Kind::String && valid_user_id(user_id.str());
-    let native = NATIVE_ENTRYPOINTS.contains(&entrypoint.as_str());
+    let native = native_entrypoint(&entrypoint, settings);
     let standard = x_app && ua && betas && (count_tokens || metadata_user_id);
     let helper = native
         && !count_tokens
@@ -480,6 +537,89 @@ mod tests {
             "a".repeat(64)
         );
         serde_json::to_string(&identity).unwrap()
+    }
+
+    /// Claude Code 2.1.325's client forms (testdata/claude_code_2_1_325_clients.json):
+    /// the Agent SDK entrypoints, the client-app User-Agent field, background sessions'
+    /// `x-app: cli-bg`, and T3 Code's `t3-code` entrypoint, native only when configured.
+    #[test]
+    fn claude_code_2_1_325_client_forms() {
+        let doc = include_str!("testdata/claude_code_2_1_325_clients.json");
+        let mut t3 = Settings::default();
+        t3.header_defaults.native_entrypoints = vec!["t3-code".into()];
+        for capture in rawjson::get(doc, "captures").array() {
+            let name = capture.get("name").str().to_owned();
+            let h: HeaderMap = capture
+                .get("headers")
+                .array()
+                .iter()
+                .map(|h| (h.get("0").str().parse().unwrap(), h.get("1").str().parse().unwrap()))
+                .collect();
+            let body = capture.get("body");
+            let default = detect(&h, body.json(), false, &Settings::default()).confirmed;
+            let configured = detect(&h, body.json(), false, &t3).confirmed;
+            if name.starts_with("t3-code") {
+                assert!(!default && configured, "{name}");
+            } else {
+                assert!(default && configured, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_fields_split_from_the_identity() {
+        let ua = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12, client-app/my-app/1.0, workload/cron)";
+        assert_eq!(
+            split_request_fields(ua),
+            (
+                "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12)".to_owned(),
+                ", client-app/my-app/1.0, workload/cron"
+            )
+        );
+        let plain = "claude-cli/2.1.325 (external, cli)";
+        assert_eq!(split_request_fields(plain), (plain.to_owned(), ""));
+        let foreign = "my-app (external, cli, client-app/x)";
+        assert_eq!(split_request_fields(foreign), (foreign.to_owned(), ""));
+    }
+
+    /// Malformed or unknown client identities stay cloaked.
+    #[test]
+    fn client_identity_rejections() {
+        let s = Settings::default();
+        let body = format!(
+            r#"{{"model":"claude-sonnet-4-6","metadata":{{"user_id":{}}},"messages":[]}}"#,
+            user_id()
+        );
+        let confirmed = |ua: &str, x_app: &str| {
+            let h = headers(&[
+                ("user-agent", ua),
+                ("x-app", x_app),
+                ("anthropic-beta", "claude-code-20250219"),
+                ("x-stainless-package-version", "0.128.0"),
+                ("x-stainless-runtime-version", "v26.12.1"),
+            ]);
+            detect(&h, &body, false, &s).confirmed
+        };
+        let ok = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12, client-app/my-app/1.0, workload/cron)";
+        assert!(confirmed(ok, "cli"));
+        assert!(confirmed(ok, "cli-bg"));
+        for x_app in ["", "CLI", "cli-fg", "cli,cli-bg"] {
+            assert!(!confirmed(ok, x_app), "{x_app:?}");
+        }
+        for ua in [
+            "claude-cli/2.1.325 (external, claude-desktop)",
+            "claude-cli/2.1.325 (external, t3-code, agent-sdk/0.3.321)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a, agent-sdk/0.3.12)",
+            "claude-cli/2.1.325 (external, sdk-ts, workload/a, client-app/b)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a, client-app/b)",
+            "claude-cli/2.1.325 (external, sdk-ts, other/1)",
+            "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a(b))",
+            "claude-cli/2.1.325 (external, sdk-ts,)",
+        ] {
+            assert!(!confirmed(ua, "cli"), "{ua}");
+        }
     }
 
     /// A Haiku session-title helper in the measured Title280 shape.

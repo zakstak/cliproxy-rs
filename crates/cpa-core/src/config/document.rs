@@ -197,6 +197,10 @@ pub(super) const SHARED_PATHS: &[(&str, &str)] = &[
         "oauth.providers.claude.header-defaults.stabilize-device-profile",
         "upstream.claude.header-defaults.stabilize-device-profile",
     ),
+    (
+        "oauth.providers.claude.header-defaults.native-entrypoints",
+        "upstream.claude.header-defaults.native-entrypoints",
+    ),
     ("oauth.providers.xai.inject-x-search", "upstream.xai.inject-x-search"),
 ];
 // Go `v8SharedStructPaths`: an empty or null historical container is an empty
