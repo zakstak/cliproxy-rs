@@ -77,6 +77,9 @@ CI checks formatting, lints, the test suite and the Linux-only build refusal. Up
 may still carry such gates. When you integrate upstream changes, drop them and keep the
 functional tests. [AGENTS.md](../AGENTS.md) states the compatibility policy.
 
+[Features this fork does not adopt](NOT-ADOPTED.md) records the Go features this fork declines
+and the reason for each.
+
 ## Keep fork-specific changes separate
 
 Fork-specific material includes this file, the `fork` entries in `.github/workflows/ci.yml`, and
