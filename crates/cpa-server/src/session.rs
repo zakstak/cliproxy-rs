@@ -5,6 +5,7 @@
 use axum::http::HeaderMap;
 use cpa_common::session::{self as identity, Meta};
 use cpa_core::format::Format;
+use cpa_core::gostr::GoStr;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Session {
@@ -25,6 +26,17 @@ pub struct Session {
     /// leading instructions and first user input) or `messages` (the first-messages
     /// hash); empty without `id`.
     pub source: &'static str,
+    /// A Codex Guardian reviewer (`X-Openai-Subagent: guardian`, first-party
+    /// openai/codex `core/src/client.rs`): a subagent that may inherit its parent's
+    /// binding on another model.
+    pub guardian: bool,
+    /// The matched client key's caller scope ([`identity::caller_scope`]): bindings a
+    /// child inherits from its parent must come from the same caller.
+    pub caller: String,
+    /// `codex:<thread>` for a request naming a Codex thread ([`identity::codex_thread`]):
+    /// the parent identity a Guardian reviewer names, which can differ from `id` (a named
+    /// agent resolves to `codex:<root>:agent:<name>`).
+    pub thread: Option<String>,
 }
 
 /// Resolves the session of a request in `format` from its client headers and body.
@@ -47,6 +59,11 @@ pub fn resolve(format: Format, headers: &HeaderMap, body: &[u8], execution: Opti
         };
     }
     let some = |s: String| (!s.is_empty()).then(|| identity::bound_session_identity(&s));
+    let guardian = headers
+        .get("x-openai-subagent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().go_eq_fold("guardian"));
+    let thread = identity::codex_thread(headers);
     Session {
         id: some(primary),
         parent: some(parent),
@@ -54,6 +71,9 @@ pub fn resolve(format: Format, headers: &HeaderMap, body: &[u8], execution: Opti
         derived,
         explicit,
         source,
+        guardian,
+        caller: scope,
+        thread: (!thread.is_empty()).then(|| identity::bound_session_identity(&format!("codex:{thread}"))),
     }
 }
 
@@ -63,6 +83,94 @@ mod tests {
     use cpa_common::session::{self as identity, Meta};
     use cpa_core::format::Format;
     use serde_json::Value;
+
+    /// #113: first-party Codex (openai/codex@44ccf394573c `core/src/client.rs`,
+    /// `core/src/responses_metadata.rs`, `core/src/codex_delegate.rs`) sends a Guardian
+    /// reviewer's request with the root's `session-id`, its own `thread-id`,
+    /// `x-openai-subagent: guardian` and `x-codex-parent-thread-id`. It resolves to a
+    /// subagent of the parent's own session key, marked as a Guardian reviewer, with the
+    /// caller's scope.
+    #[test]
+    fn codex_guardian_reviewers_name_their_parents_session() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = super::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        };
+        let root = "019a0000-0000-7000-8000-000000000001";
+        let parent = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[("session-id", root), ("thread-id", root)]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert_eq!(parent.id.as_deref(), Some(format!("codex:{root}").as_str()));
+        assert!(!parent.guardian);
+        let review = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[
+                ("session-id", root),
+                ("thread-id", "019a0000-0000-7000-8000-000000000002"),
+                ("x-openai-subagent", "guardian"),
+                ("x-codex-parent-thread-id", root),
+            ]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert!(review.guardian);
+        assert_eq!(review.parent, parent.id, "the parent's own session key");
+        assert_ne!(review.id, parent.id);
+        assert_eq!(review.caller, identity::caller_scope("client-key"));
+        assert!(identity::is_subagent_session(
+            review.id.as_deref().unwrap(),
+            review.parent.as_deref().unwrap()
+        ));
+        let other = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[("session-id", root), ("x-openai-subagent", "review")]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert!(!other.guardian, "only the Guardian reviewer");
+        // A named agent resolves to `codex:<root>:agent:<name>`; its reviewer names its
+        // thread, which the session carries.
+        let worker_thread = "019a0000-0000-7000-8000-000000000005";
+        let metadata = format!(r#"{{"session_id":"{root}","thread_id":"{worker_thread}","agent_name":"worker"}}"#);
+        let worker = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[
+                ("session-id", root),
+                ("thread-id", worker_thread),
+                ("x-openai-subagent", "collab_spawn"),
+                ("x-codex-turn-metadata", &metadata),
+            ]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert_eq!(
+            worker.id.as_deref(),
+            Some(format!("codex:{root}:agent:worker").as_str())
+        );
+        let worker_review = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[
+                ("session-id", root),
+                ("thread-id", "019a0000-0000-7000-8000-000000000006"),
+                ("x-openai-subagent", "guardian"),
+                ("x-codex-parent-thread-id", worker_thread),
+            ]),
+            b"{}",
+            None,
+            "client-key",
+        );
+        assert_eq!(worker_review.parent, worker.thread, "named by the worker's thread");
+    }
 
     /// Goldens from Go `session.ExtractSessionInfo`, `session.Enrich` and
     /// `auth.ExtractSessionID` (tests/reference/server/main.go).
