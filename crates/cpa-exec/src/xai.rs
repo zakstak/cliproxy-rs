@@ -181,22 +181,15 @@ fn compact_base_url(c: &Credential) -> String {
     }
 }
 
-/// `TrackHTTPClient` on a response: the first body byte marks TTFT (the caller marked
-/// the round-trip start before sending).
-fn track_first_byte(mut upstream: wire::Upstream, usage: &cpa_core::exec::UsageSink) -> wire::Upstream {
-    if usage.enabled() {
-        let usage = usage.clone();
-        let mut marked = false;
-        upstream.body = upstream
-            .body
-            .inspect(move |chunk| {
-                if !marked && chunk.as_ref().is_ok_and(|b| !b.is_empty()) {
-                    marked = true;
-                    usage.first_byte();
-                }
-            })
-            .boxed();
-    }
+/// `TrackHTTPClient` on a response (the caller marked the round-trip start before
+/// sending): the first body byte marks TTFT, or for a stream (`packet_only`) only its
+/// fallback, while the stream marks TTFT at its first output event (#178).
+fn track_first_byte(
+    mut upstream: wire::Upstream,
+    usage: &cpa_core::exec::UsageSink,
+    packet_only: bool,
+) -> wire::Upstream {
+    upstream.body = crate::helpers::track_first_byte(upstream.body, usage, packet_only);
     upstream
 }
 
@@ -484,6 +477,7 @@ impl XaiExecutor {
         req.usage.usage_required();
         req.usage.request_for(PROVIDER, &prepared.body);
         prepared.finalize_body(cfg, &req);
+        req.usage.request_sent(&prepared.body);
         let headers = chat_headers(credential, &token, true, &prepared.session_id, &req);
         let client = self.clients.for_credential(credential, cfg);
         let url = self.url(endpoint(&base, "/responses"));
@@ -492,7 +486,7 @@ impl XaiExecutor {
         let send = wire::send(&client, &url, headers, Bytes::from(prepared.body.clone()));
         let upstream = fail_if_canceled(&req.usage, send).await;
         capture.sent(&upstream);
-        let upstream = track_first_byte(upstream?, &req.usage);
+        let upstream = track_first_byte(upstream?, &req.usage, req.stream);
         if !(200..300).contains(&upstream.status) {
             return Err(fail_if_canceled(&req.usage, upstream_error(upstream, &capture)).await);
         }
@@ -555,6 +549,7 @@ impl XaiExecutor {
         }
         req.usage.request_for(PROVIDER, &body);
         p.body = p.finalize(cfg, req, body);
+        req.usage.request_sent(&p.body);
         let headers = plain_headers(credential, &token, false, &p.session_id, req);
         let client = self.clients.for_credential(credential, cfg);
         let url = self.url(endpoint(&base, "/responses/compact"));
@@ -563,7 +558,7 @@ impl XaiExecutor {
         let send = wire::send(&client, &url, headers, Bytes::from(p.body.clone()));
         let upstream = fail_if_canceled(&req.usage, send).await;
         capture.sent(&upstream);
-        let upstream = track_first_byte(upstream?, &req.usage);
+        let upstream = track_first_byte(upstream?, &req.usage, false);
         let status = upstream.status;
         let headers = upstream.headers.clone();
         let data = fail_if_canceled(&req.usage, wire::read_all(upstream)).await;
@@ -814,7 +809,7 @@ impl XaiExecutor {
         let send = crate::proxy::send_request(&route, method, url, headers, body.map(Bytes::from), None);
         let upstream = fail_if_canceled(&req.usage, send).await;
         capture.sent(&upstream);
-        let upstream = track_first_byte(upstream?, &req.usage);
+        let upstream = track_first_byte(upstream?, &req.usage, false);
         let status = upstream.status;
         let headers = upstream.headers.clone();
         let data = fail_if_canceled(&req.usage, wire::read_all(upstream)).await;
@@ -977,7 +972,9 @@ fn buffered(
         }
         let event = response::normalize_summary_data(raw.to_vec());
         if let Some(error) = failure(frame.event, &event) {
-            req.usage.response_model_line(&event);
+            // The served model, and the usage a `response.failed` reports for the work
+            // done before the failure (#178), which the failure record keeps.
+            req.usage.response_line(Format::Codex, &event);
             return Err(error);
         }
         p.apply_patch.remember_dispatcher_event(&event);
@@ -1194,6 +1191,10 @@ impl Pipeline {
             let events = response::normalize_summary_data_events(trim_space(rest).to_vec());
             let had_pending = self.pending.is_some();
             for (i, event) in events.into_iter().enumerate() {
+                // TTFT at the first upstream event with output (#178).
+                if self.usage.enabled() {
+                    self.usage.token_event(crate::helpers::responses_token_event(&event));
+                }
                 self.apply_patch.remember_dispatcher_event(&event);
                 let mut event = self.restorer.restore(event);
                 if !self.alias.is_empty() {

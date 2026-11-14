@@ -1585,6 +1585,10 @@ impl Turn {
         let event = crate::codex_event::decode(&text);
         let reading = reading(&text, event.as_ref(), self.cooling);
         if event.is_some() || matches!(reading, Reading::Failure { .. }) {
+            if self.usage.enabled() {
+                self.usage
+                    .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+            }
             self.observe(payload, event.as_ref().is_none_or(crate::codex_event::Event::accounted));
         }
         crate::ws_observation::observe(&mut self.observing, self.wire.ws_response_observation(payload)).await;
@@ -2499,6 +2503,9 @@ impl CodexExecutor {
         // socket (N1 #111 W2): a refusal writes nothing and leaves the socket as it was.
         let authority = session.authority();
         let mut rx = conn.activate(preserves);
+        // TTFT runs from the create's write to the first event with output (#178). A
+        // retry on a fresh socket keeps this start.
+        req.usage.round_trip_started();
         if let Err(WriteFailure { error, unsent, refusal }) =
             conn.send_create(frame.clone(), authority.as_deref()).await
         {

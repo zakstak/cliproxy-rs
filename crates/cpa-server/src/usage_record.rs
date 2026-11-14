@@ -1543,15 +1543,13 @@ impl Facts {
         stream: bool,
         trace: &crate::dispatch::Trace,
     ) -> Self {
-        let tier = gj::get(body, "service_tier");
-        let tier = tier.str().trim().to_owned();
         let generate = gj::get(body, "generate");
         Self {
             client,
             format: response,
             alias: model.trim().to_owned(),
             reasoning_effort: cpa_common::thinking::extract_reasoning_effort(body, entry.as_str(), model),
-            service_tier: if tier.is_empty() { "auto".into() } else { tier },
+            service_tier: requested_tier(body),
             generate: !(generate.is_bool() && !generate.bool()),
             stream,
             clock: trace.clock(),
@@ -1572,21 +1570,28 @@ impl Facts {
             "" => self.alias.clone(),
             model => model.to_owned(),
         };
-        let tier = gj::get(body, "service_tier");
-        let tier = tier.str().trim().to_owned();
         let generate = gj::get(body, "generate");
         Self {
             client: self.client.clone(),
             format: self.format,
             reasoning_effort: cpa_common::thinking::extract_reasoning_effort(body, self.format.as_str(), &alias),
             alias,
-            service_tier: if tier.is_empty() { "auto".into() } else { tier },
+            service_tier: requested_tier(body),
             generate: !(generate.is_bool() && !generate.bool()),
             stream: self.stream,
             clock: self.clock.clone(),
             prompt_prefix_hash: prompt_prefix(self.format, body),
             attempts: self.attempts.clone(),
         }
+    }
+}
+
+/// Go `setServiceTierMetadata`: the request's `service_tier`, `auto` when it names none.
+fn requested_tier(body: &[u8]) -> String {
+    let tier = gj::get(body, "service_tier");
+    match tier.str().trim() {
+        "" => "auto".into(),
+        tier => tier.to_owned(),
     }
 }
 
@@ -1780,6 +1785,10 @@ struct Reported {
     stream: StreamUsage,
     model: ResponseModel,
     effort: Option<String>,
+    /// The service tier the request carried upstream ([`UsageObserver::request_sent`]).
+    ///
+    /// [`UsageObserver::request_sent`]: cpa_core::exec::UsageObserver::request_sent
+    sent_tier: Option<String>,
     upstream_model: String,
     ttft: Ttft,
     usage_required: bool,
@@ -2077,6 +2086,10 @@ impl cpa_core::exec::UsageObserver for Observer {
         ));
     }
 
+    fn request_sent(&self, payload: &[u8]) {
+        self.lock().sent_tier = Some(requested_tier(payload));
+    }
+
     fn upstream_model(&self, model: &str) {
         self.lock().upstream_model = model.trim().to_owned();
     }
@@ -2183,8 +2196,8 @@ fn timings(facts: &Facts, exchange: &Exchange) -> Timings {
 }
 
 /// What every record takes from its report once its outcome, detail, timings and prompt
-/// prefix are set: latency, TTFT, returned cache buckets, Claude cache telemetry and
-/// the reported reasoning effort. Then it is queued.
+/// prefix are set: latency, TTFT, returned cache buckets, Claude cache telemetry, the
+/// reported reasoning effort and the service tier sent. Then it is queued.
 fn finish(
     queue: &crate::usage::UsageQueue,
     mut record: Record,
@@ -2234,6 +2247,9 @@ fn finish(
     }
     if let Some(effort) = reported.effort {
         record.reasoning_effort = effort;
+    }
+    if let Some(tier) = reported.sent_tier {
+        record.service_tier = tier;
     }
     queue.enqueue(queued(&record, stamp.client));
     warn_model_substitution(&record, &reported.upstream_model, stamp.auth_id);

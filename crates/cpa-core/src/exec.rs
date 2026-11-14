@@ -140,6 +140,13 @@ pub trait UsageObserver: Send + Sync {
     fn request_for(&self, identifier: &str, payload: &[u8]) {
         let _ = (identifier, payload);
     }
+    /// The request body as sent upstream, after translation and payload rules (#178):
+    /// the record's `service_tier` is the tier it names (`auto` when it names none)
+    /// instead of the client's. Claude Messages and xAI Responses report it; elsewhere
+    /// the client's stands.
+    fn request_sent(&self, payload: &[u8]) {
+        let _ = payload;
+    }
     /// Go `SetUpstreamModel`: the model the upstream is expected to serve, for the
     /// substitution warning only.
     fn upstream_model(&self, model: &str) {
@@ -401,6 +408,13 @@ impl UsageSink {
     pub fn request_for(&self, identifier: &str, payload: &[u8]) {
         if let Some(o) = &self.0 {
             o.request_for(identifier, payload);
+        }
+    }
+
+    /// [`UsageObserver::request_sent`].
+    pub fn request_sent(&self, payload: &[u8]) {
+        if let Some(o) = &self.0 {
+            o.request_sent(payload);
         }
     }
 

@@ -954,7 +954,10 @@ impl Turn {
         if payload.is_empty() {
             return;
         }
-        self.usage.first_byte();
+        // Every message is a frame; TTFT is the first with output (#178).
+        if self.usage.enabled() {
+            self.usage.token_event(crate::helpers::responses_token_event(payload));
+        }
         crate::ws_observation::observe(&mut self.observing, self.capture.response(payload)).await;
         if let Some(error) = ws_error(payload) {
             self.capture.error("upstream_error", &error);
@@ -1175,6 +1178,7 @@ impl XaiExecutor {
         req.usage.request_for(crate::xai::PROVIDER, &prepared.body);
         let headers = handshake_headers(credential, &token, &prepared.session_id, &req);
         let frame = request_frame(&prepared.body, |b| prepared.finalize(cfg, &req, b));
+        req.usage.request_sent(&frame);
         let request_type = text(&gj::get(&req.body, "type"));
         let transcript_reset = text(&gj::get(&frame, "previous_response_id")).trim().is_empty()
             && (request_type.trim() != "response.append" || mapper.as_ref().is_some_and(|m| m.replayed_compacted));

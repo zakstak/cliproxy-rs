@@ -136,11 +136,17 @@ fn completed_stream(model: &str) -> String {
 struct Proxy {
     url: String,
     upstream: CaptureUpstream,
+    rt: Arc<cpa_server::Runtime>,
     _auth_dir: AuthDir,
 }
 
 /// A proxy with one configured API key for `provider`, pointed at a capture upstream.
 async fn proxy(provider: Provider, replies: Vec<Reply>) -> Proxy {
+    proxy_with(provider, replies, "").await
+}
+
+/// [`proxy`] with `extra` appended to its configuration.
+async fn proxy_with(provider: Provider, replies: Vec<Reply>, extra: &str) -> Proxy {
     let upstream = CaptureUpstream::start(Script {
         http: replies,
         ..Script::default()
@@ -148,7 +154,7 @@ async fn proxy(provider: Provider, replies: Vec<Reply>) -> Proxy {
     .await;
     let auth_dir = AuthDir::new();
     let cfg = Config::parse(&format!(
-        "auth-dir: {}\naccess:\n  api-keys: [{CLIENT_KEY}]\nrouting:\n  retry:\n    request-retry: 0\napi-keys:\n  {}:\n    - name: {}-fixture\n      base-url: {}/v1\n      keys:\n        - api-key: {}\n",
+        "auth-dir: {}\naccess:\n  api-keys: [{CLIENT_KEY}]\nrouting:\n  retry:\n    request-retry: 0\napi-keys:\n  {}:\n    - name: {}-fixture\n      base-url: {}/v1\n      keys:\n        - api-key: {}\n{extra}",
         auth_dir.0.display(),
         provider.family(),
         provider.family(),
@@ -168,11 +174,12 @@ async fn proxy(provider: Provider, replies: Vec<Reply>) -> Proxy {
     cpa_server::install_registry(&rt);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = cpa_server::router(rt);
+    let app = cpa_server::router(rt.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Proxy {
         url,
         upstream,
+        rt,
         _auth_dir: auth_dir,
     }
 }
@@ -399,6 +406,123 @@ async fn meta_chat_completions_http_and_stream() {
 async fn meta_messages_http_and_stream() {
     round_trip(Provider::Meta, Client::Messages, false).await;
     round_trip(Provider::Meta, Client::Messages, true).await;
+}
+
+/// Turns on usage statistics for `proxy`.
+fn record_usage(proxy: &Proxy) {
+    proxy.rt.usage_queue().configure(
+        true,
+        &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+    );
+}
+
+/// The first `count` usage records `proxy` queued, then any that follow within 100 ms.
+async fn usage_records(proxy: &Proxy, count: usize) -> Vec<Value> {
+    let queue = proxy.rt.usage_queue();
+    let mut records: Vec<Value> = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while records.len() < count {
+            records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    records.extend(queue.pop_oldest(10).iter().map(|r| serde_json::from_slice(r).unwrap()));
+    records
+}
+
+/// #178: a turn that ends in `response.failed` keeps, in its record, the usage the
+/// provider reported in that event (OpenAI's Responses streaming reference: the event
+/// carries the `response`, `usage` included), buffered and streamed, for Grok and Muse.
+/// The record is a failure, except for a Grok stream, which passes the event to the
+/// client as any other ("xAI non-streaming responses" in DIFFERENCES-FROM-GO.md).
+#[tokio::test]
+async fn a_failed_response_keeps_the_usage_it_reported() {
+    let created = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_f","object":"response","status":"in_progress","output":[]}}"#;
+    let failed = r#"{"type":"response.failed","sequence_number":1,"response":{"id":"resp_f","object":"response","status":"failed","output":[],"error":{"code":"server_error","message":"scripted failure"},"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":4},"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":16}}}"#;
+    for provider in [Provider::Xai, Provider::Meta] {
+        for stream in [false, true] {
+            let label = format!("{provider:?} stream={stream}");
+            let reply = Reply::sse(format!("data: {created}\n\ndata: {failed}\n\n"));
+            let proxy = proxy(provider, vec![reply]).await;
+            record_usage(&proxy);
+            let _ = send(
+                &proxy,
+                Client::Responses,
+                Client::Responses.body(provider.model(), stream),
+            )
+            .await;
+            let records = usage_records(&proxy, 1).await;
+            let [record] = records.as_slice() else {
+                panic!("{label}: one record, got {records:?}");
+            };
+            let failed = !(provider == Provider::Xai && stream);
+            assert_eq!(record["failed"], failed, "{label}: {record}");
+            let tokens = &record["tokens"];
+            assert_eq!(
+                [
+                    &tokens["input_tokens"],
+                    &tokens["cached_tokens"],
+                    &tokens["output_tokens"],
+                    &tokens["reasoning_tokens"],
+                    &tokens["total_tokens"],
+                ],
+                [11, 4, 5, 2, 16],
+                "{label}: {record}"
+            );
+            assert!(record.get("usage_observed").is_none(), "{label}: {record}");
+        }
+    }
+}
+
+/// #178: a Grok record's `service_tier` is the tier the request carried upstream, after
+/// translation and payload rules, not the client's: here the translation drops the
+/// client's `flex`, an override sets `priority`, and a filter removes the tier again.
+/// A request without a tier records the provider's default, `auto`.
+#[tokio::test]
+async fn xai_records_the_service_tier_sent_after_payload_rules() {
+    let rule = |kind: &str, params: &str| {
+        format!("payload:\n  {kind}:\n    - models: [{{name: \"grok-*\"}}]\n      params: {params}\n")
+    };
+    let cases = [
+        (String::new(), "auto"),
+        (rule("override", "{service_tier: priority}"), "priority"),
+        (
+            format!(
+                "{}  filter:\n    - models: [{{name: \"grok-*\"}}]\n      params: [service_tier]\n",
+                rule("override", "{service_tier: priority}")
+            ),
+            "auto",
+        ),
+    ];
+    for (rules, want) in cases {
+        for stream in [false, true] {
+            let label = format!("{rules:?} stream={stream}");
+            let reply = Reply::sse(completed_stream(Provider::Xai.model()));
+            let proxy = proxy_with(Provider::Xai, vec![reply], &rules).await;
+            record_usage(&proxy);
+            let body = serde_json::json!({"model": Provider::Xai.model(), "input": QUESTION, "stream": stream, "service_tier": "flex"});
+            let answer = send(&proxy, Client::Responses, body.to_string()).await;
+            assert_eq!(answer.status, 200, "{label}: {}", answer.body);
+            let [exchange] = proxy
+                .upstream
+                .http()
+                .try_into()
+                .unwrap_or_else(|_| panic!("{label}: one request"));
+            let sent: Value = serde_json::from_slice(&exchange.body).unwrap();
+            assert_eq!(
+                sent["service_tier"].as_str().unwrap_or("auto"),
+                want,
+                "{label}: sent {sent}"
+            );
+            let records = usage_records(&proxy, 1).await;
+            let [record] = records.as_slice() else {
+                panic!("{label}: one record, got {records:?}");
+            };
+            assert_eq!(record["service_tier"], want, "{label}: {record}");
+        }
+    }
 }
 
 /// An upstream rate limit keeps its status for each provider and client format, and the

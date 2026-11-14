@@ -1242,3 +1242,67 @@ async fn claude_clients_read_the_same_reasoning_streamed_and_buffered() {
         );
     }
 }
+
+/// #178: a streamed answer marks TTFT at the first upstream event that carries output
+/// (`helpers::responses_token_event`), not at the first body byte, `response.created`,
+/// an announced item or an empty delta. The first body chunk is a frame, TTFT's
+/// fallback. A buffered answer is read whole first: its TTFT stays the first body byte.
+#[tokio::test]
+async fn stream_ttft_is_marked_at_the_first_output_event() {
+    let events = [
+        CREATED_EVENT,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","status":"in_progress","content":[]}}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":""}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"hi"}"#,
+        COMPLETED_READY,
+    ];
+    let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    for op in ["stream", "execute"] {
+        let mock = Mock::start(&serde_json::json!({
+            "status": 200,
+            "headers": [["Content-Type", "text/event-stream"]],
+            "body": body,
+        }))
+        .await;
+        let addr = mock.addr.clone();
+        let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
+        let s = serde_json::json!({
+            "config_auth": -1,
+            "attributes": {"api_key": "sk-fake-xai"},
+            "model": "grok-4.3",
+            "payload": PLAIN,
+            "source": "openai-response",
+            "op": op,
+        });
+        let cfg = Config::default();
+        let (recorder, _capture, sink) = crate::usage_testkit::sinks();
+        let response = executor
+            .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
+            .await
+            .unwrap_or_else(|e| panic!("{op}: {e:?}"));
+        if let ResponseBody::Stream(mut stream) = response.body {
+            while let Some(item) = stream.next().await {
+                item.unwrap_or_else(|e| panic!("{op}: {e:?}"));
+            }
+        }
+        let marks: Vec<&str> = recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                crate::usage_testkit::Report::RoundTrip => Some("start"),
+                crate::usage_testkit::Report::FirstByte => Some("byte"),
+                crate::usage_testkit::Report::TokenEvent(false) => Some("frame"),
+                crate::usage_testkit::Report::TokenEvent(true) => Some("token"),
+                _ => None,
+            })
+            .collect();
+        let want: &[&str] = if op == "stream" {
+            &["start", "frame", "frame", "frame", "frame", "token", "token"]
+        } else {
+            &["start", "byte"]
+        };
+        assert_eq!(marks, want, "{op}");
+    }
+}
