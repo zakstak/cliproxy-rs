@@ -1234,7 +1234,22 @@ impl Pipeline {
         {
             return false;
         }
-        self.emit(line.to_vec())
+        if !self.emit(line.to_vec()) {
+            return false;
+        }
+        // A blank line ends the upstream event. The Responses translator joins its lines
+        // into frames but never sees that line, so an `event:` line that starts the next
+        // event would join this one (#114). Close the frame here, as meta does.
+        if line.is_empty() && self.responses {
+            let frames = self.translator.flush_frames();
+            self.ready.extend(
+                frames
+                    .into_iter()
+                    .filter(|f| !f.is_empty())
+                    .map(|f| Ok(Bytes::from(ensure_responses_usage_details(&f)))),
+            );
+        }
+        true
     }
 
     /// The end of the scan: a pending event line, the bridge's closing events, then the
