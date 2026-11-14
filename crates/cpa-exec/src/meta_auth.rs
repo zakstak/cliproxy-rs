@@ -836,6 +836,21 @@ pub struct LoginOutcome {
 /// token store do: merge an existing file's settings, normalize keys, validate the weight,
 /// stamp `disabled`, then the custom writer.
 pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Result<LoginOutcome, String> {
+    save_login_at(auth_dir, bundle, now, None)
+}
+
+/// [`save_login`] into the existing credential file `target` (a targeted re-login,
+/// #90), merged with it under its own name.
+pub fn save_login_to(target: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Result<LoginOutcome, String> {
+    save_login_at(target.parent().unwrap_or(Path::new(".")), bundle, now, Some(target))
+}
+
+fn save_login_at(
+    auth_dir: &Path,
+    bundle: &Bundle,
+    now: DateTime<Utc>,
+    target: Option<&Path>,
+) -> Result<LoginOutcome, String> {
     let storage = create_token_storage(bundle, now);
     if storage.access_token.trim().is_empty() {
         return Err("meta token storage missing access token".into());
@@ -846,7 +861,7 @@ pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Resul
         email => email.to_owned(),
     };
     let mut metadata = login_metadata(&storage, bundle);
-    let path = auth_dir.join(&file_name);
+    let path = target.map_or_else(|| auth_dir.join(&file_name), Path::to_path_buf);
     let mut disabled = false;
     // Manager.Login merges only a cleanly decoded, non-empty existing file.
     if let Ok(raw) = std::fs::read(&path)

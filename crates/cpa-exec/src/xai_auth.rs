@@ -931,6 +931,27 @@ pub fn save_login(
     Ok((path, superseded))
 }
 
+/// [`save_login`] into the existing credential file `target` (a targeted re-login,
+/// #90): merged with it under its own name, with no earlier file adopted or replaced.
+/// Nothing is written unless `target` is this account's xAI credential
+/// ([`owned_destination`]).
+pub fn save_login_to(
+    target: &Path,
+    record: LoginRecord,
+    write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<PathBuf, SaveError> {
+    let field = |key: &str| match record.metadata.get(key) {
+        Some(GoValue::String(s)) => s.trim().to_owned(),
+        _ => String::new(),
+    };
+    let Some(existing) = owned_destination(target, &field("email"), &field("sub"))? else {
+        return Err(SaveError::Unreadable("xai: the target credential file is gone".into()));
+    };
+    let document = saved_document(record.metadata, Some(&existing), None).map_err(SaveError::Refused)?;
+    write(target, &GoValue::Object(document).encode_indented()).map_err(SaveError::Write)?;
+    Ok(target.to_path_buf())
+}
+
 /// A finished login: file name, the saved document and label.
 pub struct LoginRecord {
     pub file_name: String,

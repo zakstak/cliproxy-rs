@@ -13,6 +13,19 @@ Sign in to each account once, from the dashboard (Connect account) or the comman
 
 The provider's sign-in page uses whatever account your browser is logged into. To add a second Claude account, log out of claude.ai first, or open the sign-in link in a private window or another browser profile; `--no-browser` prints the link instead of opening it. The dashboard's Credentials page lists every account with its state, and lets you disable one without deleting it.
 
+### Sign one account in again
+
+When one account's sign-in has expired or was revoked, sign that account in again without touching the others. Start the sign-in through the Management API with the account's file name:
+
+```sh
+curl -H "Authorization: Bearer $MANAGEMENT_KEY" \
+  "http://127.0.0.1:8317/v8/management/oauth/auth-url?name=work-claude.json"
+```
+
+`name` takes the file name or credential ID shown on the Credentials page, or use `auth_index`. The v0 routes (`anthropic-auth-url`, `codex-auth-url`, `xai-auth-url`, `meta-auth-url`) take the same parameters. `provider` is optional and, when given, must be the account's provider. The answer is the usual sign-in link and `state`; finish the sign-in as for a new account. This works for Claude, Codex, xAI and Muse (`meta`) accounts.
+
+The signed-in account must be the one the file stores (the same account ID, organization or email, where the file records them). The proxy then updates that file in place: it keeps the file name and every setting in it (priority, weight, label, `proxy_url`, `disabled` and the rest), and replaces only the tokens. If the browser signed in to another account, or the file records no account identity to compare with, nothing is saved and the sign-in reports why without naming either account. The sign-in's own requests to the provider go through the account's `proxy_url` (else `requests.proxy-url`), the way its other requests do.
+
 ## Routing strategies
 
 `routing.strategy` decides which ready account serves the next request.

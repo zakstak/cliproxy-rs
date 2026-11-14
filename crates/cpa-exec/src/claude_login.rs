@@ -126,7 +126,15 @@ impl ManagedLogin {
     /// and the legacy file the caller removes once the canonical one is stored (Go
     /// `saveTokenRecord` deletes it through the store only after a successful save).
     pub fn save(auth_dir: &Path, patch: MetadataPatch) -> Result<(PathBuf, Option<PathBuf>), ExecError> {
-        write_canonical(auth_dir, patch)
+        write_canonical(auth_dir, patch, None)
+    }
+
+    /// [`ManagedLogin::save`] into the existing credential file `target` (a targeted
+    /// re-login, #90): merged with that file under its own name; no legacy file is
+    /// looked for or replaced. Blocking.
+    pub fn save_to(target: &Path, patch: MetadataPatch) -> Result<PathBuf, ExecError> {
+        let directory = target.parent().unwrap_or(Path::new("."));
+        write_canonical(directory, patch, Some(target)).map(|(path, _)| path)
     }
 }
 
@@ -649,7 +657,7 @@ fn go_encode(value: &Value, out: &mut Vec<u8>) {
 /// atomically (0600, which is stricter than Go's `os.Create`) and then removes the
 /// matching legacy file.
 pub(crate) fn write_login(directory: &Path, patch: MetadataPatch) -> Result<PathBuf, ExecError> {
-    let (path, legacy) = write_canonical(directory, patch)?;
+    let (path, legacy) = write_canonical(directory, patch, None)?;
     if let Some(legacy) = legacy {
         std::fs::remove_file(&legacy).map_err(|_| {
             login_error("cliproxy auth: canonical Claude credential saved but legacy credential cleanup failed")
@@ -659,8 +667,13 @@ pub(crate) fn write_login(directory: &Path, patch: MetadataPatch) -> Result<Path
 }
 
 /// [`write_login`] without the legacy removal: the canonical path and the legacy file
-/// it replaces.
-fn write_canonical(directory: &Path, patch: MetadataPatch) -> Result<(PathBuf, Option<PathBuf>), ExecError> {
+/// it replaces. With `target`, the login is written to that file instead, without a
+/// legacy file.
+fn write_canonical(
+    directory: &Path,
+    patch: MetadataPatch,
+    target: Option<&Path>,
+) -> Result<(PathBuf, Option<PathBuf>), ExecError> {
     let string = |key: &str| {
         patch
             .set
@@ -678,7 +691,7 @@ fn write_canonical(directory: &Path, patch: MetadataPatch) -> Result<(PathBuf, O
         return Err(login_error("invalid credential email filename"));
     }
     let name = credential_file_name(&email, &string("organization_uuid"), &string("account_uuid"));
-    let path = directory.join(&name);
+    let path = target.map_or_else(|| directory.join(&name), Path::to_path_buf);
     let mut metadata: BTreeMap<String, Value> = patch.set.clone().into_iter().collect();
     for key in &patch.remove {
         metadata.remove(key);
@@ -686,7 +699,10 @@ fn write_canonical(directory: &Path, patch: MetadataPatch) -> Result<(PathBuf, O
     if let Some(existing) = read_json(&path) {
         merge_existing(&mut metadata, &existing);
     }
-    let legacy = legacy_credential(directory, &name, &metadata);
+    let legacy = target
+        .is_none()
+        .then(|| legacy_credential(directory, &name, &metadata))
+        .flatten();
     if let Some(existing) = legacy.as_ref().and_then(|p| read_json(p)) {
         merge_existing(&mut metadata, &existing);
     }
