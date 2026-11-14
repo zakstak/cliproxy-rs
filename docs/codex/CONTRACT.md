@@ -180,7 +180,9 @@ Failures (`siwc_structured_errors_reach_the_client_unchanged`):
   another account in the pool once, never the same account again, and each account that
   answered cools for its status. Credentials are kept. No failure here refuses a token set,
   so the credential's outer ChatGPT OAuth tokens stay unchanged. Requests never move from
-  the SIWC tokens to the outer tokens while `use_siwc` is on (#92).
+  the SIWC tokens to the outer tokens while `use_siwc` is on (#92). When an operator turns
+  `use_siwc` off, the cooldowns the SIWC tokens earned are cleared, and the outer tokens
+  serve the next request (`a_siwc_failure_leaves_the_outer_partition_usable`).
 - A 401, such as `subscription_sharing_invalid_user`, follows the SIWC refresh rules of
   #92, which this profile does not repeat.
 

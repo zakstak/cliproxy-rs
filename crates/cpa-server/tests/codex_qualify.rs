@@ -728,3 +728,38 @@ async fn siwc_websocket_continuation_stays_on_its_connection() {
     assert_eq!(sent, frames, "both frames, unchanged, on that socket");
     assert_isolated("siwc continuation", Profile::Siwc, &sockets[0].headers);
 }
+
+/// FP5 (#119): a SIWC failure cools the account for SIWC only. When the operator turns
+/// `use_siwc` off, the credential's outer ChatGPT OAuth tokens serve the next request at
+/// once: the cooldown the SIWC tokens earned does not hold back the other token set.
+#[tokio::test]
+async fn a_siwc_failure_leaves_the_outer_partition_usable() {
+    for (name, status) in [
+        ("siwc-error-not-eligible", 403),
+        ("siwc-error-usage-limit", 429),
+        ("siwc-error-usage-unavailable", 503),
+    ] {
+        let (proxy, rt) = proxy_with_runtime(
+            Script {
+                http: vec![
+                    Reply::json(status, fixture(name).bytes()),
+                    Reply::sse(fixture("sse-completed").bytes()),
+                ],
+                ..Script::default()
+            },
+            |url| vec![siwc_credential("account", url)],
+        )
+        .await;
+        let body = client_body("http-request-full");
+        let (got, _) = post(&proxy, "/v1/responses", &body).await;
+        assert_eq!(got, status, "{name}: the SIWC failure");
+        let mut outer = Credential::clone(&rt.store().get("account").unwrap());
+        outer.metadata.insert("use_siwc".into(), false.into());
+        rt.store().upsert(outer);
+        let (got, answer) = post(&proxy, "/v1/responses", &body).await;
+        assert_eq!(got, 200, "{name}: the outer tokens serve: {answer}");
+        let sent = proxy.upstream.http();
+        assert_eq!(sent.len(), 2, "{name}");
+        assert_eq!(sent[1].headers["authorization"], "Bearer at-FAKE", "{name}");
+    }
+}
