@@ -1,7 +1,0 @@
-{
-  "kind": "acceptance",
-  "verdict": "fail",
-  "partial": false
-}
-  problems: ['cargo-groups.json: cpa-core lib: target/debug/deps/cpa_core-bd184f74f32568ca is not on disk with the recorded SHA-256', 'cargo-groups.json: group refusals: not every test passed in a verified execution', "cargo-groups.json: counts {'groups': 6, 'tests': 32, 'passed': 32, 'failed': 0, 'unknown_tests': 0} are not the recomputed {'groups': 6, 'tests': 32, 'passed': 30, 'failed': 2, 'unknown_tests': 0}"]
-receipt: /review/cli-changed-bytes/acceptance.json

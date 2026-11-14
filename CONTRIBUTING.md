@@ -10,17 +10,19 @@ Thanks for helping. Bug reports, fixes and new tests are all welcome.
 
 ## Building and testing
 
-You need Rust (stable), `cmake`, `clang` and `perl` for BoringSSL. PostgreSQL lets the storage tests run instead of skipping; with `CPA_TEST_NO_SKIP=1`, as in CI, those tests fail instead.
+You need Rust (stable), `cmake`, `clang` and `perl` for BoringSSL. Set `CPA_TEST_PG_BIN` to your PostgreSQL `bin` directory to run the storage tests. With `CPA_TEST_NO_SKIP=1`, missing PostgreSQL binaries fail those tests instead of skipping them.
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo test -p cpa-server --features media-relay,pprof --lib --locked
+python3 tools/claude-cache/test_replay.py
 ```
 
-CI runs the same tests with [cargo-nextest](https://nexte.st), which runs test binaries in parallel (`cargo nextest run --workspace --locked`; its settings are in `.config/nextest.toml`), then the doc tests, the prompt-cache replay tests (`python3 tools/claude-cache/test_replay.py`), and cpa-server's unit tests with the optional relay: `cargo test -p cpa-server --features media-relay --lib`.
+This fork has no GitHub Actions workflows. Run these checks locally before opening a pull request.
 
-Tests use local mock upstreams only. Never point a test at a real provider or use a real account or key, and run the tests with external network access blocked if you can; CI runs them in a network namespace with only a loopback interface. The BoringSSL build and the release link use a lot of memory, so on a small machine set `CARGO_BUILD_JOBS=2`.
+Tests use local mock upstreams only. Never point a test at a real provider or use a real account or key, and run the tests with external network access blocked and loopback available. The BoringSSL build and the release link use a lot of memory, so on a small machine set `CARGO_BUILD_JOBS=2`.
 
 Tests check behaviour. Do not add benchmark scores, wall-clock speed bounds, allocation counts or memory limits as test assertions or CI gates ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)). Tests of a configured timeout, a cancellation or a resource limit that protects the server are behaviour and are welcome.
 
@@ -32,6 +34,6 @@ The dashboard lives in `ui/` (Svelte 5). `npm ci`, `npm run check`, `npm test` a
 - Request bodies are forwarded byte for byte unless a ported rule rewrites them; do not re-serialize JSON just to pass it through.
 - Never log or forward credentials or client keys to the wrong side.
 - Mark a deliberate simplification with a `ponytail:` comment that names its limit and how to lift it.
-- CI must pass: format, clippy, tests, and the check that native Windows and macOS builds stop with the Linux-only error (`.github/scripts/check-unsupported-targets.sh`). This fork builds for Linux only.
+- Run the local checks above. This fork builds for Linux only; native Windows and macOS builds must stop with the Linux-only error in `crates/cpa-core/src/lib.rs`.
 
 By contributing you agree that your work is released under the [MIT license](LICENSE).

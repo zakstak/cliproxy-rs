@@ -77,7 +77,7 @@ unowned or unattributed entry stays visible in receipts until its owning decisio
 
 ## Executed attribution evidence (v8.0.35 and bisect pairs)
 
-[`harness/evidence/attribution-20261112.json.gz`](../../harness/evidence/attribution-20261112.json.gz)
+[`harness/evidence/attribution-20261112.json.gz`](https://github.com/zakstak/cliproxy-rs/blob/f6bff59c4c1646747caced0fbb08388fd66626e0/harness/evidence/attribution-20261112.json.gz)
 records what the attributions above rest on. It is separate from the acceptance receipts:
 the historical v8.0.10 and selective v8.0.67 pins, their goldens and receipts do not change.
 The real collector ran selected cases against Go builds of single commits, each built

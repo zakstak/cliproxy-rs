@@ -77,7 +77,7 @@ The meta and xAI executors, which share the registered translators, keep Go's co
 
 ## 3. Performance is not a qualification gate
 
-Issue [#45](https://github.com/zakstak/cliproxy-rs/issues/45) removed performance from qualification. An earlier version of this section recorded heap-per-request observations from a counting allocator and pointed to a `bench/budgets.txt` gate. Both the allocation gate and the budgets file are deleted. The raw output stays as a dated historical record in [`bench/results/2026-11-07-codex-alloc.txt`](../../bench/results/2026-11-07-codex-alloc.txt), taken at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`. It is not a current claim or a limit.
+Issue [#45](https://github.com/zakstak/cliproxy-rs/issues/45) removed performance from qualification. An earlier version of this section recorded heap-per-request observations from a counting allocator and pointed to a `bench/budgets.txt` gate. Both the allocation gate and the budgets file are deleted. The raw output stays as a dated historical record in [`bench/results/2026-11-07-codex-alloc.txt`](https://github.com/zakstak/cliproxy-rs/blob/f6bff59c4c1646747caced0fbb08388fd66626e0/bench/results/2026-11-07-codex-alloc.txt), taken at `894e24c7e2443263ed2bf1a977b52637f3b9e4df`. It is not a current claim or a limit.
 
 ## Local verification receipt
 

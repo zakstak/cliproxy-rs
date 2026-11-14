@@ -34,7 +34,7 @@ reference, Go `false`, Rust absent) and `credential-disabled-absent` (selective,
 sides). Status remains unresolved until real Go acceptance against the fixed head executes;
 parent tracker [#66](https://github.com/zakstak/cliproxy-rs/issues/66) owns that decision.
 See the [selective ledger](selective-v8.0.67.md) and its
-[executed attribution evidence](../../harness/evidence/attribution-20261112.json.gz).
+[executed attribution evidence](https://github.com/zakstak/cliproxy-rs/blob/f6bff59c4c1646747caced0fbb08388fd66626e0/harness/evidence/attribution-20261112.json.gz).
 
 ### Item totals
 

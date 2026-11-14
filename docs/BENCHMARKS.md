@@ -22,10 +22,9 @@ What was removed:
 Tests that check a configured timeout, a cancellation, a deadline or a resource limit stay.
 Those limits are behaviour, not benchmarks.
 
-The raw results of earlier runs stay in [`bench/results/`](../bench/results) as dated
-historical records. This page's earlier tables, methods and comparisons with Go are in Git
-history, at any commit before #45. Treat them as observations from that time, not as
-current claims.
+The raw results of earlier runs are available in Git history under `bench/results/`.
+This page's earlier tables, methods and comparisons with Go are also in Git history,
+at any commit before #45. Treat them as observations from that time, not as current claims.
 
 The prompt-cache check and offline replay tools are functional tests of cache behaviour.
 They moved to [`tools/claude-cache/`](../tools/claude-cache); see

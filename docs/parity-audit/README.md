@@ -12,4 +12,4 @@ first-party clients and verified wire behaviour decide what is correct; see
 [AGENTS.md](../../AGENTS.md) for the compatibility policy.
 
 The Go differential harness that `selective-v8.0.67.md` and the receipts refer to is
-retired. Its evidence is archived in [`harness/`](../../harness/README.md).
+retired. Its evidence is available in Git history under [`harness/`](https://github.com/zakstak/cliproxy-rs/blob/f6bff59c4c1646747caced0fbb08388fd66626e0/harness/README.md).
