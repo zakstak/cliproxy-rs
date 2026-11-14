@@ -17,7 +17,10 @@
 //! an element, that the instance's `type`, scalar `const`/`enum`, `required` keys or
 //! member values of those kinds (through `allOf` and `$ref`) rule out does not apply.
 //! `unevaluatedProperties` and `unevaluatedItems` apply only to members and elements
-//! that nothing applying beside them evaluates. Keys of a free-form object (`additionalProperties`,
+//! that nothing applying beside them evaluates.
+//! A failed `if`, a ruled-out alternative and `not` are still evaluated at the
+//! position: the keys they name there are renamed (so both sides reach the same
+//! verdict), but none of their subschemas apply below it. Keys of a free-form object (`additionalProperties`,
 //! `patternProperties`, no schema) are data and stay as sent, in both directions, even
 //! when they spell a renamed key.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
@@ -176,6 +179,8 @@ struct Node {
     any_of: Vec<NodeId>,
     /// `if`, `then`, `else`.
     condition: [Option<NodeId>; 3],
+    /// `not`: evaluated here, never applied.
+    not: Vec<NodeId>,
     /// Subschemas that apply when the instance has the key: `dependentSchemas`, the
     /// schema form of `dependencies`.
     dependent: Vec<(Vec<u8>, NodeId)>,
@@ -310,12 +315,15 @@ fn ecma_pattern(source: &str) -> Option<String> {
             ('[', false) => {
                 in_class = true;
                 out.push('[');
-                // A leading `^` negates. ECMA's `[]` and `[^]` close at once and reach the
-                // crate as `[]`/`[^]`, which it rejects, so the pattern is unknown.
+                // A leading `^` negates. ECMA's `[]` and `[^]` are empty classes, where
+                // the crate reads a leading `]` as a member (`[]a]`), so they are unknown.
                 let rest = chars.as_str();
                 if let Some(stripped) = rest.strip_prefix('^') {
                     out.push('^');
                     chars = stripped.chars();
+                }
+                if chars.as_str().starts_with(']') {
+                    return None;
                 }
             }
             ('[', true) => return None,
@@ -766,8 +774,12 @@ enum Maybe {
 struct Sets<'k> {
     keys: &'k PropertyKeys,
     direction: Direction,
+    /// Per set, the nodes that apply.
     sets: Vec<Vec<NodeId>>,
-    ids: HashMap<Vec<NodeId>, usize>,
+    /// Per set, nodes evaluated at the position without applying (a failed `if` or
+    /// alternative, `not`): they name keys there, but nothing below them applies.
+    evaluated: Vec<Vec<NodeId>>,
+    ids: HashMap<(Vec<NodeId>, Vec<NodeId>), usize>,
     members: HashMap<(usize, Vec<u8>), usize>,
     elements: HashMap<(usize, usize), (usize, usize)>,
     /// Lists of nodes that apply to an element only if it matches or fails a check;
@@ -816,6 +828,7 @@ impl<'k> Sets<'k> {
             keys,
             direction,
             sets: vec![],
+            evaluated: vec![],
             ids: HashMap::new(),
             members: HashMap::new(),
             elements: HashMap::new(),
@@ -832,18 +845,26 @@ impl<'k> Sets<'k> {
         &self.keys.tree.nodes[n]
     }
 
-    fn intern(&mut self, mut nodes: Vec<NodeId>) -> usize {
+    fn intern(&mut self, nodes: Vec<NodeId>) -> usize {
+        self.intern_evaluated(nodes, vec![])
+    }
+
+    fn intern_evaluated(&mut self, mut nodes: Vec<NodeId>, mut evaluated: Vec<NodeId>) -> usize {
         nodes.sort_unstable();
         nodes.dedup();
-        if let Some(&id) = self.ids.get(&nodes) {
+        evaluated.sort_unstable();
+        evaluated.dedup();
+        let key = (nodes, evaluated);
+        if let Some(&id) = self.ids.get(&key) {
             return id;
         }
         let id = self.sets.len();
-        let prefix = nodes.iter().map(|&n| self.node(n).prefix.len()).max().unwrap_or(0);
+        let prefix = key.0.iter().map(|&n| self.node(n).prefix.len()).max().unwrap_or(0);
         self.prefix.push(prefix);
         self.index.push(None);
-        self.ids.insert(nodes.clone(), id);
-        self.sets.push(nodes);
+        self.ids.insert(key.clone(), id);
+        self.sets.push(key.0);
+        self.evaluated.push(key.1);
         id
     }
 
@@ -865,9 +886,13 @@ impl<'k> Sets<'k> {
         let mut memo = Memo::default();
         let mut seen: HashSet<NodeId> = HashSet::new();
         let mut queue = self.sets[start].clone();
+        // Evaluated here without applying: their keys are named at this position.
+        let mut evaluated: Vec<NodeId> = vec![];
         for m in &self.maybes[maybe] {
             match m {
                 Maybe::Matching(n) => {
+                    // An element `contains` rules out keeps its keys: the array's
+                    // verdict does not hang on that element.
                     if self.check(*n, instance, &mut memo) != Some(false) {
                         queue.push(*n);
                     }
@@ -888,10 +913,13 @@ impl<'k> Sets<'k> {
             }
             let node = self.node(n);
             queue.extend(&node.all_of);
+            evaluated.extend(&node.not);
             for &alternative in &node.any_of {
                 branched = true;
                 if self.check(alternative, instance, &mut memo) != Some(false) {
                     queue.push(alternative);
+                } else {
+                    evaluated.push(alternative);
                 }
             }
             // Without `if`, `then` and `else` are ignored.
@@ -899,7 +927,10 @@ impl<'k> Sets<'k> {
                 branched = true;
                 match self.check(condition, instance, &mut memo) {
                     Some(true) => queue.extend([Some(condition), then].into_iter().flatten()),
-                    Some(false) => queue.extend(otherwise),
+                    Some(false) => {
+                        evaluated.push(condition);
+                        queue.extend(otherwise);
+                    }
                     None => queue.extend([Some(condition), then, otherwise].into_iter().flatten()),
                 }
             }
@@ -913,7 +944,21 @@ impl<'k> Sets<'k> {
                 }
             }
         }
-        let id = self.intern(seen.into_iter().collect());
+        // What those evaluate in place is evaluated too (their `allOf`, alternatives,
+        // conditions, dependent schemas and `not`), less what applies.
+        let mut named: HashSet<NodeId> = HashSet::new();
+        while let Some(n) = evaluated.pop() {
+            if seen.contains(&n) || !named.insert(n) {
+                continue;
+            }
+            let node = self.node(n);
+            evaluated.extend(&node.all_of);
+            evaluated.extend(&node.any_of);
+            evaluated.extend(node.condition.iter().flatten());
+            evaluated.extend(node.dependent.iter().map(|(_, d)| *d));
+            evaluated.extend(&node.not);
+        }
+        let id = self.intern_evaluated(seen.into_iter().collect(), named.into_iter().collect());
         if !branched {
             self.plain.insert(start, id);
         }
@@ -926,6 +971,9 @@ impl<'k> Sets<'k> {
             return;
         }
         let mut index = Index::default();
+        for &n in &self.evaluated[set] {
+            index.named.extend(self.node(n).named.iter().cloned());
+        }
         for &n in &self.sets[set] {
             let node = self.node(n);
             index.named.extend(node.named.iter().cloned());
@@ -1483,6 +1531,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                 b"unevaluatedItems" => node.unevaluated_items.push(child_id),
                 b"contains" => node.every.push(child_id),
                 b"allOf" => node.all_of.push(child_id),
+                b"not" => node.not.push(child_id),
                 b"anyOf" | b"oneOf" => node.any_of.push(child_id),
                 b"if" => node.condition[0] = Some(child_id),
                 b"then" => node.condition[1] = Some(child_id),
@@ -1705,10 +1754,12 @@ mod tests {
             "remote":{"$ref":"https://example.com/d"},
             "n":{"not":{"properties":{"a b":{}}}}
         }}"##;
+        // `not` is evaluated at `n`, so the key it names there is renamed (nothing
+        // below it applies).
         round_trip(
             schema,
             r##"{"r":{"a b":1},"s":{"a b":2},"esc":{"a b":3},"remote":{"a b":4},"n":{"a b":5}}"##,
-            r##"{"r":{"a_b":1},"s":{"a_b":2},"esc":{"a_b":3},"remote":{"a b":4},"n":{"a b":5}}"##,
+            r##"{"r":{"a_b":1},"s":{"a_b":2},"esc":{"a_b":3},"remote":{"a b":4},"n":{"a_b":5}}"##,
         );
     }
 
@@ -2047,6 +2098,8 @@ mod tests {
         assert_eq!(pattern(r"^[^\d]$").matches(b"x"), Some(true));
         // Unknown: no faithful translation, a rejected construct, a non-BMP key.
         assert_eq!(pattern(r"^[\D]$").matches(b"x"), None);
+        assert_eq!(pattern(r"^[]a]$").matches(b"a"), None);
+        assert_eq!(pattern(r"^[^]a]$").matches(b"a"), None);
         assert_eq!(pattern(r"^(?=a)").matches(b"a"), None);
         assert_eq!(pattern(r"^.$").matches("😀".as_bytes()), None);
 
@@ -2183,6 +2236,36 @@ mod tests {
             &format!(
                 r##"{{"rows":[{{"{claude}":"a","d":{{"x_y":1}},"e":{{"z_w":2}}}},{{"{claude}":"b","d":{{"x_y":3}}}},{{"e":{{"z w":4}}}}]}}"##
             ),
+        );
+    }
+
+    #[test]
+    fn keys_named_by_evaluated_schemas_are_renamed_where_they_are_named() {
+        // A failed `if` still reads its discriminator: renaming it keeps the verdict.
+        let condition = br##"{"properties":{"p":{
+            "if":{"properties":{"kind key":{"const":"a"}},"required":["kind key"]},
+            "then":{"additionalProperties":true},"else":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            condition,
+            r##"{"p":{"kind key":"b","x y":1}}"##,
+            r##"{"p":{"kind_key":"b","x_y":1}}"##,
+        );
+        round_trip(
+            condition,
+            r##"{"p":{"kind key":"a","x_y":1}}"##,
+            r##"{"p":{"kind_key":"a","x_y":1}}"##,
+        );
+        // `not` names its keys at the position, so they are renamed there.
+        let not = br##"{"properties":{"p":{"not":{"properties":{"x y":{}},"required":["x y"]},"additionalProperties":true}}}"##;
+        round_trip(not, r##"{"p":{"x y":1}}"##, r##"{"p":{"x_y":1}}"##);
+        // A ruled-out alternative names its own keys, but nothing below it applies.
+        let alternative = br##"{"properties":{"p":{"properties":{"kind":{}},"oneOf":[
+            {"properties":{"kind":{"const":"a"},"tag key":{},"d":{"properties":{"x y":{}}}}},
+            {"properties":{"kind":{"const":"b"},"d":{"additionalProperties":true}}}]}}}"##;
+        round_trip(
+            alternative,
+            r##"{"p":{"kind":"b","tag key":1,"d":{"x_y":2}}}"##,
+            r##"{"p":{"kind":"b","tag_key":1,"d":{"x_y":2}}}"##,
         );
     }
 
