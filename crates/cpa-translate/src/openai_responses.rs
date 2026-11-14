@@ -838,13 +838,11 @@ impl Conversation<'_> {
     }
 
     fn message(&mut self, item: &Res<'_>) {
-        let mut role = item.get("role").bytes().into_owned();
-        // Only a real user turn can be refused; developer text is sent as user text but
-        // never counts as the user's own turn.
+        let role = item.get("role").bytes().into_owned();
+        // Only a real user turn can be refused. A developer message keeps its role and
+        // place, since Chat Completions takes `developer` messages as instructions that
+        // outrank user text; Go v8.0.35 sends it as user text (docs/DIFFERENCES-FROM-GO.md).
         let user_turn = role == b"user";
-        if role == b"developer" {
-            role = b"user".to_vec();
-        }
         self.mergeable_assistant = None;
         if role != b"assistant" {
             self.append_pending_reasoning();
