@@ -226,12 +226,37 @@ struct Check {
     never: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum Scalar {
     Null,
     Bool(bool),
-    Number(f64),
+    Number(Number),
     String(Vec<u8>),
+}
+
+/// A JSON number as `f64`, and whether that holds it exactly.
+#[derive(Debug, Clone, Copy)]
+struct Number {
+    value: f64,
+    exact: bool,
+}
+
+impl Number {
+    fn parse(raw: &[u8]) -> Option<Number> {
+        let value: f64 = std::str::from_utf8(raw).ok()?.parse().ok()?;
+        // ponytail: up to 15 significant digits round-trip through f64; longer literals
+        // compare as unknown rather than parsing big decimals.
+        let mantissa = raw.split(|&b| b == b'e' || b == b'E').next().unwrap_or_default();
+        let digits = mantissa
+            .iter()
+            .filter(|b| b.is_ascii_digit())
+            .skip_while(|&&b| b == b'0')
+            .count();
+        Some(Number {
+            value,
+            exact: value.is_finite() && digits <= 15,
+        })
+    }
 }
 
 impl Scalar {
@@ -241,9 +266,36 @@ impl Scalar {
             b't' => Some(Scalar::Bool(true)),
             b'f' => Some(Scalar::Bool(false)),
             b'"' => Some(Scalar::String(gj::parse(raw).s.into_owned())),
-            _ => std::str::from_utf8(raw).ok()?.parse().ok().map(Scalar::Number),
+            _ => Number::parse(raw).map(Scalar::Number),
         }
     }
+
+    /// JSON Schema equality (`1` equals `1.0`); `None` when two numbers round to the
+    /// same `f64` but either is not held exactly. Different `f64` values always differ,
+    /// since rounding keeps order.
+    fn same(&self, other: &Scalar) -> Option<bool> {
+        match (self, other) {
+            (Scalar::Null, Scalar::Null) => Some(true),
+            (Scalar::Bool(a), Scalar::Bool(b)) => Some(a == b),
+            (Scalar::String(a), Scalar::String(b)) => Some(a == b),
+            (Scalar::Number(a), Scalar::Number(b)) if a.value != b.value => Some(false),
+            (Scalar::Number(a), Scalar::Number(b)) => (a.exact && b.exact).then_some(true),
+            _ => Some(false),
+        }
+    }
+}
+
+/// At least one `Some(true)`: `Some(true)`; else any `None`: `None`; else `Some(false)`.
+fn any_of(verdicts: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut verdict = Some(false);
+    for v in verdicts {
+        match v {
+            Some(true) => return Some(true),
+            None => verdict = None,
+            Some(false) => {}
+        }
+    }
+    verdict
 }
 
 /// An instance value being renamed, as the branch checks read it.
@@ -253,35 +305,50 @@ struct Instance<'a> {
     members: HashMap<Vec<u8>, &'a [u8]>,
 }
 
-fn type_is(raw: &[u8], name: &[u8]) -> bool {
-    match (raw.first(), name) {
+/// Whether `raw` is of JSON Schema type `name`; `None` for `integer` on a number `f64`
+/// does not hold exactly.
+fn type_is(raw: &[u8], name: &[u8]) -> Option<bool> {
+    Some(match (raw.first(), name) {
         (Some(b'{'), b"object") | (Some(b'['), b"array") | (Some(b'"'), b"string") => true,
         (Some(b'n'), b"null") | (Some(b't' | b'f'), b"boolean") => true,
         (Some(b'-' | b'0'..=b'9'), b"number") => true,
-        (Some(b'-' | b'0'..=b'9'), b"integer") => std::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .is_some_and(|n| n.fract() == 0.0),
+        (Some(b'-' | b'0'..=b'9'), b"integer") => {
+            let n = Number::parse(raw)?;
+            if !n.exact {
+                return None;
+            }
+            n.value.fract() == 0.0
+        }
         _ => false,
-    }
+    })
 }
 
 /// Whether `type`, `const` and `enum` allow `raw` (a structured value matches no
-/// scalar list).
-fn scalar_check(check: &Check, raw: &[u8]) -> bool {
+/// scalar list); `None` when a number comparison cannot be made exactly.
+fn scalar_check(check: &Check, raw: &[u8]) -> Option<bool> {
     if check.never {
-        return false;
+        return Some(false);
     }
-    if let Some(types) = &check.types
-        && !types.iter().any(|t| type_is(raw, t))
-    {
-        return false;
+    let mut verdict = Some(true);
+    if let Some(types) = &check.types {
+        match any_of(types.iter().map(|t| type_is(raw, t))) {
+            Some(false) => return Some(false),
+            None => verdict = None,
+            Some(true) => {}
+        }
     }
     let value = Scalar::parse(raw).filter(|_| !matches!(raw.first(), Some(b'{' | b'[')));
-    check
-        .values
-        .iter()
-        .all(|list| value.as_ref().is_some_and(|v| list.contains(v)))
+    for list in &check.values {
+        let Some(value) = &value else {
+            return Some(false);
+        };
+        match any_of(list.iter().map(|v| value.same(v))) {
+            Some(false) => return Some(false),
+            None => verdict = None,
+            Some(true) => {}
+        }
+    }
+    verdict
 }
 
 impl PropertyKeys {
@@ -692,10 +759,12 @@ impl<'k> Sets<'k> {
     /// [`Self::check`] for one node's own keywords.
     fn check_one(&self, n: NodeId, instance: &Instance<'_>, memo: &mut Memo) -> Option<bool> {
         let check = &self.node(n).check;
-        if !scalar_check(check, instance.raw) {
-            return Some(false);
-        }
         let mut sure = check.complete;
+        match scalar_check(check, instance.raw) {
+            Some(false) => return Some(false),
+            None => sure = false,
+            Some(true) => {}
+        }
         if instance.raw.first() == Some(&b'{') {
             for key in &check.required {
                 if !instance.members.contains_key(self.keys.spelling(key, self.direction)) {
@@ -727,12 +796,12 @@ impl<'k> Sets<'k> {
         memo.members.insert(key, None);
         let check = &self.node(n).check;
         let structured = matches!(value.first(), Some(b'{' | b'['));
-        let mut verdict = if !scalar_check(check, value) {
-            Some(false)
-        } else if !check.complete || (structured && !(check.required.is_empty() && check.members.is_empty())) {
-            None
-        } else {
-            Some(true)
+        let mut verdict = match scalar_check(check, value) {
+            Some(false) => Some(false),
+            None => None,
+            Some(true) if !check.complete => None,
+            Some(true) if structured && !(check.required.is_empty() && check.members.is_empty()) => None,
+            Some(true) => Some(true),
         };
         if verdict != Some(false) {
             for &target in &self.node(n).all_of {
@@ -976,6 +1045,8 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
         let mut children: Vec<Child<'_>> = vec![];
         let mut node = std::mem::take(&mut tree.nodes[id]);
         let mut complete = true;
+        // `additionalItems` applies only beside an array-valued `items`.
+        let (mut tuple_items, mut additional_items) = (false, false);
         gj::object_members(value, |key, escaped, member| {
             let name = if escaped { gj::unescape(key) } else { key.to_vec() };
             let object = member.first() == Some(&b'{');
@@ -984,7 +1055,8 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
             match &name[..] {
                 b"additionalProperties" => node.evaluates.members = true,
                 b"items" if !array => node.evaluates.rest = true,
-                b"additionalItems" => node.evaluates.rest = true,
+                b"items" => tuple_items = true,
+                b"additionalItems" => additional_items = true,
                 b"unevaluatedProperties" => node.evaluates.unevaluated_members = true,
                 b"unevaluatedItems" => node.evaluates.unevaluated_items = true,
                 _ => {}
@@ -1094,6 +1166,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
             true
         });
         node.check.complete = complete;
+        node.evaluates.rest |= tuple_items && additional_items;
         for Child {
             keyword,
             segment,
@@ -1159,7 +1232,8 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                 b"additionalProperties" => node.additional.push(child_id),
                 b"unevaluatedProperties" => node.unevaluated.push(child_id),
                 _ if tuple => node.prefix.push(Some(child_id)),
-                b"items" | b"additionalItems" => node.rest.push(child_id),
+                b"items" => node.rest.push(child_id),
+                b"additionalItems" if tuple_items => node.rest.push(child_id),
                 b"unevaluatedItems" => node.unevaluated_items.push(child_id),
                 b"contains" => node.every.push(child_id),
                 b"allOf" => node.all_of.push(child_id),
@@ -1659,6 +1733,46 @@ mod tests {
 
         let wide = wide_schema((MAX_SCHEMA_NODES - 3) / 2 + 1);
         assert!(PropertyKeys::of(wide.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn numbers_past_f64_precision_are_unknown_not_equal() {
+        // 9007199254740993 rounds to 9007199254740992 in f64: the `if` cannot be decided,
+        // so both sides apply and `else`'s declared key is renamed.
+        let schema = br##"{"properties":{"p":{"properties":{"id":{}},
+            "if":{"properties":{"id":{"const":9007199254740992}},"required":["id"]},
+            "then":{},"else":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"p":{"id":9007199254740993,"x y":1}}"##,
+            r##"{"p":{"id":9007199254740993,"x_y":1}}"##,
+        );
+        // Exact numbers still decide: 1 equals 1.0, 2 does not.
+        let exact = br##"{"properties":{"p":{"properties":{"id":{}},
+            "if":{"properties":{"id":{"const":1}},"required":["id"]},
+            "then":{"properties":{"x y":{}}},"else":{"additionalProperties":true}}}}"##;
+        round_trip(exact, r##"{"p":{"id":1.0,"x y":1}}"##, r##"{"p":{"id":1.0,"x_y":1}}"##);
+        round_trip(exact, r##"{"p":{"id":2,"x_y":1}}"##, r##"{"p":{"id":2,"x_y":1}}"##);
+        assert_eq!(type_is(b"9007199254740993", b"integer"), None);
+        assert_eq!(type_is(b"1.5", b"integer"), Some(false));
+        assert_eq!(type_is(b"3", b"integer"), Some(true));
+    }
+
+    #[test]
+    fn additional_items_needs_tuple_items() {
+        // Without array-valued `items`, `additionalItems` evaluates nothing.
+        let ignored = br##"{"properties":{"list":{"additionalItems":true,
+            "unevaluatedItems":{"properties":{"x y":{}},"required":["x y"]}}}}"##;
+        round_trip(ignored, r##"{"list":[{"x y":1}]}"##, r##"{"list":[{"x_y":1}]}"##);
+        let schema_form = br##"{"properties":{"list":{"additionalItems":{"properties":{"x y":{}}}}}}"##;
+        round_trip(schema_form, r##"{"list":[{"x_y":1}]}"##, r##"{"list":[{"x_y":1}]}"##);
+        // Beside tuple `items`, it covers the rest.
+        let tuple = br##"{"properties":{"list":{"items":[true],"additionalItems":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            tuple,
+            r##"{"list":[{"x_y":0},{"x y":1}]}"##,
+            r##"{"list":[{"x_y":0},{"x_y":1}]}"##,
+        );
     }
 
     #[test]
