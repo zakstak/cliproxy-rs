@@ -1050,6 +1050,53 @@ show which model served each generation. `x-reasoning-included` has no event con
 the pinned client, so copying it into JSON could not deliver it, and the proxy never
 infers it from body content. Reasoning-included metadata stays undelivered.
 
+### Message size limits
+
+FP4 [#118](https://github.com/zakstak/cliproxy-rs/issues/118). First-party Codex at research
+main `5c3ff1dabf64` reads `x-codex-websocket-max-message-bytes` from the 101 of its socket
+and sends a request longer than that limit over HTTP, without writing it
+(`codex-api/src/endpoint/responses_websocket.rs`, `ed7ca22bb60a`). It reads a close 1009
+that arrives before any text frame of the request as `WebsocketMessageTooLarge`, switches
+the session to HTTP and sends the request there in full; a 1009 after any text is an
+ordinary stream error (`core/src/responses_retry.rs`, `bc3ccba6e1cb`). The proxy's rules:
+
+- **Local advertisement.** The proxy's 101 on the Responses WebSocket carries
+  `x-codex-websocket-max-message-bytes: 67108864`, its own receive limit for one client
+  message (`MAX_REQUEST_BYTES`; the client socket negotiates no compression, so this is
+  the length the client measures). That 101 precedes credential selection, so it never
+  states an upstream's limit, and the header is never copied into `response.metadata`: the
+  client reads it only from the 101. A client message above the limit still ends the
+  connection as before; a client that honours the header never sends one.
+- **Upstream limit.** Each Codex upstream socket reads the same header from its own 101
+  with the first-party parser: the first value as a decimal `usize` (`str::parse`). A
+  missing or unreadable value is no limit; `0` is a limit of zero. A message on that socket
+  longer than the limit (a create, a steering frame, an interrupt; equal passes) is
+  refused before any byte is written, as a request-scoped 413 `message_too_big`: no
+  failover, no cooldown, no retry on another socket. For a turn's create, the client's
+  connection then closes with 1009 before any text of that turn, since handshake metadata
+  goes out only with the turn's first event; first-party Codex retries the request over
+  HTTP itself, and the proxy carries that HTTP request like any other
+  ([Native HTTP route](#native-http-route)). A refused steering frame ends its stream
+  with that error after the response's text, and a refused interrupt is answered with a
+  400 `error` event as any rejected interrupt is; neither is the no-text signal. A limit
+  above the proxy's own never refuses anything.
+- **Upstream close 1009.** An upstream close with 1009 is the same request-scoped 413
+  and reaches the client as close 1009 ([Socket and account ownership](#socket-and-account-ownership)).
+  Before any event of the turn, the client sees no text before it; after an event, it
+  sees the close after that event. The proxy never sends the request again on any path:
+  once a message was written, an early close does not prove the upstream did not run it,
+  and only the client decides to retry. The proxy closes with 1009 only after the
+  upstream's own 1009 or its advertised limit; both are size rejections.
+
+Not covered: an isolated run of the first-party client against the proxy. The tests pin
+the parser's cases (absent, unreadable, zero, below, at and above the limit, above the
+proxy's own) and the client-visible sequence (close 1009 with no text, nothing written
+upstream, the client's HTTP request forwarded unchanged as the one dispatch) with
+loopback mocks. Building the first-party client for that harness takes its whole
+workspace and pinned git dependencies, and its decision rests on two inputs these tests
+already fix: the 101 header and a close 1009 before any text. No live upstream has been
+seen to send the header.
+
 ### WebSocket HTTP fallback
 
 A Codex credential without `websockets` has no upstream socket, so a turn on it goes

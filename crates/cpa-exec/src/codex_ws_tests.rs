@@ -1921,6 +1921,9 @@ mod interrupt;
 #[path = "codex_ws_fragment_tests.rs"]
 mod fragment;
 
+#[path = "codex_ws_budget_tests.rs"]
+mod budget;
+
 /// `buildCodexResponsesWebsocketURL` answers, recorded from Go v8.0.35 with the inputs of `url.Parse` and
 /// `URL.String()` (tests/reference/go_url).
 #[test]
