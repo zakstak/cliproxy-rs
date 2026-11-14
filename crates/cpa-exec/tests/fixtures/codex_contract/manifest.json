@@ -465,6 +465,135 @@
       ],
       "contract": "A 403 body naming invalid_workspace_selected in /error/code. Encoded as base64 in x-error-json, the same JSON names the code for a 403 with an empty body.",
       "notes": "Source-refresh evidence at the research pin, not the contract pin. Classification belongs to FP2 (#116); first-party commit 4b345a8de9b3."
+    },
+    {
+      "name": "siwc-request-namespace",
+      "file": "http/siwc_request_namespace.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations Responses API requirements: HTTP needs store false and stream true, full context in an input array, instructions or developer messages instead of system items; function and custom tools grouped in namespaces; web search subject to model and account policy; text, image and file inputs when the model accepts them",
+        "codex-rs/tools/src/responses_api.rs:47-80 the namespace tool shape (type, name, description, function and custom tools)"
+      ],
+      "contract": "A Responses body the SIWC preview limits allow over HTTP: store false, stream true, instructions plus developer and user messages with an image input, a namespaced function call with its output, and function and custom tools inside a namespace beside web_search.",
+      "notes": "Read 2026-11-14; the page shows no revision date. The namespace shape follows the pinned first-party type; tool contents and the image are placeholders. Web search stays subject to the upstream's model and account policy."
+    },
+    {
+      "name": "siwc-request-additional-tools",
+      "file": "http/siwc_request_additional_tools.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations function and custom tools supplied through additional_tools input items",
+        "codex-rs/core/src/client.rs:1198-1213 the additional_tools input item shape"
+      ],
+      "contract": "The other documented SIWC tool form: no top-level tools, a leading additional_tools developer item, store false and stream true.",
+      "notes": "Read 2026-11-14; the page shows no revision date. The item shape follows the pinned first-party Responses Lite builder; the tool is a placeholder. The x-openai-internal-codex-responses-lite header is not part of the SIWC documentation."
+    },
+    {
+      "name": "siwc-request-unsupported",
+      "file": "http/siwc_request_unsupported.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations unsupported fields, previous_response_id over HTTP, rejected system items, unsupported hosted tools and audio input"
+      ],
+      "contract": "A body with fields, tools and inputs the SIWC preview limits name as unsupported: store true, previous_response_id over HTTP, background, max_output_tokens, max_tool_calls, metadata, temperature, top_p, top_logprobs, truncation, user, safety_identifier, prompt_cache_retention, a system item, audio input, a top-level function tool outside a namespace, tool_search, image_generation, file_search and code_interpreter. The proxy forwards it unchanged and the upstream judges it.",
+      "notes": "Read 2026-11-14; the page shows no revision date. Tool definitions beyond type are placeholders. The documentation does not say which field the upstream reports first, so tests do not tie error.param to a field."
+    },
+    {
+      "name": "siwc-error-unsupported-capability",
+      "file": "http/siwc_error_unsupported_capability.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery structured Responses errors: subscription_sharing_unsupported_capability, HTTP 400; check error.param and do not resend the same body",
+        "https://developers.openai.com/api/reference/overview Debugging requests: x-request-id"
+      ],
+      "contract": "A 400 subscription_sharing_unsupported_capability with error.param. The client gets status, body and x-request-id unchanged, and the same body is not resent on another account.",
+      "notes": "Read 2026-11-14; the page shows no revision date. The documentation names the status, error.code and error.param only; message is a placeholder and no error.type is given."
+    },
+    {
+      "name": "siwc-error-not-eligible",
+      "file": "http/siwc_error_not_eligible.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery structured Responses errors: subscription_sharing_user_not_eligible, HTTP 403; do not repeat the request or loop through OAuth"
+      ],
+      "contract": "A 403 subscription_sharing_user_not_eligible. The client gets status, body and x-request-id unchanged, the sign-in is not refreshed, and the account's native ChatGPT partition stays usable.",
+      "notes": "Read 2026-11-14; the page shows no revision date. message is a placeholder and no error.type is given."
+    },
+    {
+      "name": "siwc-error-usage-limit",
+      "file": "http/siwc_error_usage_limit.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery structured Responses errors: subscription_sharing_usage_limit_exceeded, HTTP 429; do not infer a reset time from this code alone, an app-specific limit may apply"
+      ],
+      "contract": "A 429 subscription_sharing_usage_limit_exceeded without reset fields. The client gets status, body and x-request-id unchanged, with no Retry-After or reset time the upstream did not send.",
+      "notes": "Read 2026-11-14; the page shows no revision date. message is a placeholder and no error.type is given. Unlike the ChatGPT backend's usage_limit_reached body, it carries no resets_at."
+    },
+    {
+      "name": "siwc-error-usage-unavailable",
+      "file": "http/siwc_error_usage_unavailable.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery structured Responses errors: subscription_sharing_usage_unavailable, HTTP 503; keep credentials and retry later with bounded backoff"
+      ],
+      "contract": "A 503 subscription_sharing_usage_unavailable. Credentials are kept; the account's native ChatGPT partition stays usable.",
+      "notes": "Read 2026-11-14; the page shows no revision date. message is a placeholder and no error.type is given."
+    },
+    {
+      "name": "siwc-error-admission-detail",
+      "file": "http/siwc_error_admission_detail.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery before a stream opens: direct-route admission may answer {\"detail\":\"...\"}, diagnostic text rather than a stable code; 401, 403 and 503 statuses"
+      ],
+      "contract": "An admission failure in the detail shape, which has no error object. The client gets it unchanged; the proxy reads no code from it.",
+      "notes": "Read 2026-11-14; the page shows no revision date. The detail text is a placeholder."
+    },
+    {
+      "name": "siwc-ws-continuation",
+      "file": "ws/siwc_continuation.jsonl",
+      "format": "jsonl",
+      "transport": "websocket",
+      "direction": "to-upstream",
+      "endpoints": ["siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations over WebSocket, continuation can reference only responses from the same authenticated connection and gives no persistent storage"
+      ],
+      "contract": "A first response.create and a continuation naming previous_response_id. Both go on one upstream socket of one account, unchanged.",
+      "notes": "Read 2026-11-14; the page shows no revision date. The frame bodies follow the HTTP requirements above; the documented app-server setup itself uses HTTP (supports_websockets false)."
     }
   ]
 }
