@@ -947,7 +947,15 @@ pub fn save_login_to(
     let Some(existing) = owned_destination(target, &field("email"), &field("sub"))? else {
         return Err(SaveError::Unreadable("xai: the target credential file is gone".into()));
     };
-    let document = saved_document(record.metadata, Some(&existing), None).map_err(SaveError::Refused)?;
+    let mut document = saved_document(record.metadata, Some(&existing), None).map_err(SaveError::Refused)?;
+    // The account's endpoint stays: a targeted re-login changes only the sign-in.
+    if let Some(url) = serde_json::from_slice::<serde_json::Map<String, Value>>(&existing)
+        .ok()
+        .and_then(|doc| doc.get("base_url")?.as_str().map(str::to_owned))
+        .filter(|url| !url.trim().is_empty())
+    {
+        document.insert("base_url".into(), GoValue::String(url));
+    }
     write(target, &GoValue::Object(document).encode_indented()).map_err(SaveError::Write)?;
     Ok(target.to_path_buf())
 }

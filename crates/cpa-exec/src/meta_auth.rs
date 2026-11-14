@@ -851,7 +851,7 @@ fn save_login_at(
     now: DateTime<Utc>,
     target: Option<&Path>,
 ) -> Result<LoginOutcome, String> {
-    let storage = create_token_storage(bundle, now);
+    let mut storage = create_token_storage(bundle, now);
     if storage.access_token.trim().is_empty() {
         return Err("meta token storage missing access token".into());
     }
@@ -864,12 +864,22 @@ fn save_login_at(
     let path = target.map_or_else(|| auth_dir.join(&file_name), Path::to_path_buf);
     let mut disabled = false;
     // Manager.Login merges only a cleanly decoded, non-empty existing file.
-    if let Ok(raw) = std::fs::read(&path)
-        && let Some((existing, true)) = go_map_from_json(&raw)
-        && !existing.is_empty()
-        && let Some(flag) = merge_existing(&mut metadata, &existing, "meta")
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| go_map_from_json(&raw))
+        .and_then(|(existing, clean)| (clean && !existing.is_empty()).then_some(existing));
+    if let Some(existing) = &existing
+        && let Some(flag) = merge_existing(&mut metadata, existing, "meta")
     {
         disabled = flag;
+    }
+    // A targeted re-login keeps the account's endpoint: it changes only the sign-in.
+    if target.is_some()
+        && let Some(GoValue::String(url)) = existing.as_ref().and_then(|e| e.get("base_url"))
+        && !url.trim().is_empty()
+    {
+        storage.base_url = url.clone();
+        metadata.insert("base_url".into(), GoValue::String(url.clone()));
     }
     normalize_metadata(&mut metadata);
     if let Some(weight) = metadata.get("weight") {

@@ -5659,7 +5659,8 @@ fn relogin_targets(other: bool) -> Vec<(&'static str, &'static str, Value, &'sta
             "work-claude.json",
             settings(
                 json!({"type": "claude", "access_token": "sk-ant-oat-old", "refresh_token": "old-r",
-                "email": "a@example.invalid", "account_uuid": pick("acct-1", "acct-2"), "organization_uuid": "org-1"}),
+                "email": "a@example.invalid", "account_uuid": pick("acct-1", "acct-2"), "organization_uuid": "org-1",
+                "claude_device_ids": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]}),
             ),
             "sk-ant-oat-fake",
         ),
@@ -5677,7 +5678,8 @@ fn relogin_targets(other: bool) -> Vec<(&'static str, &'static str, Value, &'sta
             "work-xai.json",
             settings(
                 json!({"type": "xai", "auth_kind": "oauth", "access_token": "old-xai-at",
-                "refresh_token": "old-xai-rt", "email": "x@example.invalid", "sub": pick("xai-user-1", "xai-user-2")}),
+                "refresh_token": "old-xai-rt", "email": "x@example.invalid", "sub": pick("xai-user-1", "xai-user-2"),
+                "base_url": "https://xai.example.invalid/v1"}),
             ),
             "fake-xai-at",
         ),
@@ -5686,7 +5688,7 @@ fn relogin_targets(other: bool) -> Vec<(&'static str, &'static str, Value, &'sta
             "work-meta.json",
             settings(
                 json!({"type": "meta", "auth_kind": "oauth", "access_token": "old-meta-key",
-                "email": pick("m@example.invalid", "other@example.invalid")}),
+                "email": pick("m@example.invalid", "other@example.invalid"), "base_url": "https://meta.example.invalid/v1"}),
             ),
             "fake-meta-key",
         ),
@@ -5705,7 +5707,7 @@ async fn targeted_relogin_updates_the_accounts_own_file_and_keeps_its_settings()
     let f = with_auth_files("relogin", &files);
     let (base, _state, server) = login_server(&f, &fake).await;
     let before = auth_names(&f);
-    for (i, (provider, name, _, token)) in targets.iter().enumerate() {
+    for (i, (provider, name, original, token)) in targets.iter().enumerate() {
         // Every other start names the provider too.
         let query = if i % 2 == 0 {
             format!("/oauth/auth-url?name={name}")
@@ -5730,6 +5732,12 @@ async fn targeted_relogin_updates_the_accounts_own_file_and_keeps_its_settings()
             ("disabled", json!(false)),
         ] {
             assert_eq!(saved[key], want, "{provider}: {key} kept");
+        }
+        // The account's endpoint and device identity stay too.
+        for key in ["base_url", "claude_device_ids"] {
+            if original.get(key).is_some() {
+                assert_eq!(saved[key], original[key], "{provider}: {key} kept");
+            }
         }
     }
     assert_eq!(auth_names(&f), before, "no other file appeared");

@@ -697,6 +697,16 @@ fn write_canonical(
         metadata.remove(key);
     }
     if let Some(existing) = read_json(&path) {
+        // A targeted re-login keeps the account's device identity, as Claude Code keeps
+        // its device across sign-ins; a new login brings a fresh pool.
+        if target.is_some()
+            && let Some(pool) = existing.get("claude_device_ids").filter(|v| {
+                v.as_array()
+                    .is_some_and(|ids| !ids.is_empty() && ids.iter().all(Value::is_string))
+            })
+        {
+            metadata.insert("claude_device_ids".into(), pool.clone());
+        }
         merge_existing(&mut metadata, &existing);
     }
     let legacy = target
