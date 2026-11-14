@@ -8,6 +8,8 @@ import {
   cleanEvent,
   credState,
   accountRow,
+  authUrl,
+  canSignInAgain,
   equal,
   fieldPath,
   keepEvents,
@@ -444,4 +446,18 @@ test("account rows: status words, honest unknowns, low, last used and weekly ord
   const refused = row({ status: "error", status_message: "401 unauthorized" }, checked([w("Current session", 41)], 3 * 3_600_000));
   assert.deepEqual([refused.word, refused.sub, refused.stale, refused.attention], ["Sign in again", "token refused", true, true]);
   assert.deepEqual(refused.session, { used: 41, reset: "3h old" });
+});
+
+test("sign in again: only a sign-in provider's OAuth file, started by name without a provider", () => {
+  const file = { name: "claude-a@example.invalid.json", provider: "claude", account_type: "oauth", auth_index: "1a2b" };
+  assert.equal(canSignInAgain(file), true);
+  assert.equal(canSignInAgain({ ...file, provider: "anthropic" }), true);
+  assert.equal(canSignInAgain({ ...file, account_type: "api_key" }), false);
+  assert.equal(canSignInAgain({ ...file, runtime_only: true }), false);
+  assert.equal(canSignInAgain({ ...file, provider: "gemini" }), false);
+  // No provider: a server that cannot target an account refuses instead of adding a new one.
+  assert.equal(authUrl("claude", file), "/oauth/auth-url?name=claude-a%40example.invalid.json&auth_index=1a2b&is_webui=true");
+  assert.equal(authUrl("meta", { name: "m b.json", provider: "meta" }), "/oauth/auth-url?name=m+b.json");
+  assert.equal(authUrl("codex"), "/oauth/auth-url?provider=codex&is_webui=true");
+  assert.equal(authUrl("xai"), "/oauth/auth-url?provider=xai&is_webui=true");
 });

@@ -41,7 +41,7 @@ Place the file before the first visit to `/management.html`: if the file is miss
 
 SHA-256 of the `dist-panel/management.html` built from this commit:
 
-<!-- sha256 -->`d32d1c1c023dc7334b38d2cc5111cef19d3894e17b601e95f3a09d3a4a0a0705`<!-- /sha256 -->
+<!-- sha256 -->`2463683cea038bbcbf49fc695d072152e4a34628937a26550b8236e441be4b2c`<!-- /sha256 -->
 
 ```sh
 sha256sum static/management.html
