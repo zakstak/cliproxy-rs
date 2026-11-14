@@ -462,3 +462,313 @@ fn whitespace_before_arguments_does_not_skip_restoration() {
     let (_, args) = chat_call(&stream(Format::OpenAI, &chat_request(), &events));
     assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), restored_input());
 }
+
+// --- free-form data (#195) ---
+
+/// The issue's schema: a declared key Claude rejects next to a free-form map, plus a
+/// discriminated union whose `b` branch makes `event.body` free-form. (A union at the
+/// schema root is folded into its properties before renaming.)
+fn opaque_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "x y": {"type": "string"},
+            "data": {"type": "object", "additionalProperties": true},
+            "event": {
+                "type": "object",
+                "properties": {"kind": {"type": "string"}, "body": {"type": "object"}},
+                "oneOf": [
+                    {"properties": {"kind": {"const": "a"}, "body": {"properties": {"x y": {"type": "integer"}}}}},
+                    {"properties": {"kind": {"const": "b"}, "body": {"additionalProperties": true}}}
+                ]
+            }
+        }
+    })
+}
+
+/// Arguments in the client's spelling, and in Claude's: only declared positions differ.
+fn opaque_client_args() -> Value {
+    json!({"x y": "declared", "data": {"x y": "kept", "x_y": "opaque", "n": [{"x_y": 1}]}, "event": {"kind": "b", "body": {"x_y": "opaque"}}})
+}
+
+fn opaque_claude_args() -> Value {
+    json!({"x_y": "declared", "data": {"x y": "kept", "x_y": "opaque", "n": [{"x_y": 1}]}, "event": {"kind": "b", "body": {"x_y": "opaque"}}})
+}
+
+fn opaque_branch_a() -> (Value, Value) {
+    (
+        json!({"event": {"kind": "a", "body": {"x y": 1}}, "data": {"x_y": 2}}),
+        json!({"event": {"kind": "a", "body": {"x_y": 1}}, "data": {"x_y": 2}}),
+    )
+}
+
+fn opaque_chat_request(history: &Value) -> Vec<u8> {
+    json!({
+        "model": "claude-opus-5-5",
+        "stream": true,
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": opaque_schema()}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": history.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn opaque_responses_request(history: &Value) -> Vec<u8> {
+    json!({
+        "model": "claude-opus-5-5",
+        "stream": true,
+        "tools": [{"type": "function", "name": "f", "parameters": opaque_schema()}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": history.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The arguments each translated client receives for a Claude call with `input`:
+/// Chat buffered, Chat streamed, Responses buffered, Responses streamed.
+fn client_arguments(input: &Value) -> Vec<(&'static str, Value)> {
+    let chat = opaque_chat_request(&json!({}));
+    let responses = opaque_responses_request(&json!({}));
+    let events = claude_events(input, "f");
+    let body = sse(&events).concat();
+
+    let answer = non_stream(Format::OpenAI, &chat, &body);
+    let chat_buffered = parse_args(&answer["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]);
+    let (_, args) = chat_call(&stream(Format::OpenAI, &chat, &events));
+    let chat_streamed = serde_json::from_str(&args).unwrap();
+
+    let answer = non_stream(Format::OpenAIResponse, &responses, &body);
+    let responses_buffered = parse_args(&responses_function_call(&answer)["arguments"]);
+    let streamed = stream(Format::OpenAIResponse, &responses, &events);
+    let done = streamed
+        .iter()
+        .find(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    let responses_streamed = parse_args(&done["arguments"]);
+    let deltas: String = streamed
+        .iter()
+        .filter(|e| e["type"] == "response.function_call_arguments.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    let responses_deltas = serde_json::from_str(&deltas).unwrap();
+
+    vec![
+        ("chat buffered", chat_buffered),
+        ("chat streamed", chat_streamed),
+        ("responses buffered", responses_buffered),
+        ("responses streamed", responses_streamed),
+        ("responses deltas", responses_deltas),
+    ]
+}
+
+#[test]
+fn returned_calls_keep_free_form_keys() {
+    for (path, args) in client_arguments(&opaque_claude_args()) {
+        assert_eq!(args, opaque_client_args(), "{path}");
+    }
+    let (client, claude) = opaque_branch_a();
+    for (path, args) in client_arguments(&claude) {
+        assert_eq!(args, client, "{path}");
+    }
+}
+
+#[test]
+fn replayed_calls_keep_free_form_keys() {
+    let (client, claude) = opaque_branch_a();
+    for (history, expected) in [(opaque_client_args(), opaque_claude_args()), (client, claude)] {
+        let out = translate(Format::OpenAI, &opaque_chat_request(&history));
+        assert_eq!(tool_use_input(&out), &expected, "chat");
+        let out = translate(Format::OpenAIResponse, &opaque_responses_request(&history));
+        assert_eq!(tool_use_input(&out), &expected, "responses");
+    }
+}
+
+/// Keys under a local `$ref` are declared where the reference points them, as before.
+#[test]
+fn referenced_definitions_still_rename_arguments() {
+    let request = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object",
+            "$defs": {"page": {"type": "object", "properties": {"page[size]": {"type": "integer"}}}},
+            "properties": {"pages": {"type": "array", "items": {"$ref": "#/$defs/page"}}}
+        }}}],
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+    .to_string();
+    let answer = non_stream(
+        Format::OpenAI,
+        request.as_bytes(),
+        &claude_answer(json!({"pages": [{"page_size_": 5}]}), "f"),
+    );
+    let args = parse_args(&answer["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]);
+    assert_eq!(args, json!({"pages": [{"page[size]": 5}]}));
+}
+
+/// A schema past the subschema cap (512) is declined as a whole: the schema, replayed
+/// arguments and returned arguments all keep the client's spelling, never a mix.
+#[test]
+fn schemas_past_the_node_cap_are_left_as_sent() {
+    let branches = vec![json!({"additionalProperties": {}}); 300];
+    let schema = json!({"type": "object", "properties": {"p": {"properties": {"x y": {}}, "allOf": branches}}});
+    let args = json!({"p": {"x y": 1, "x_y": 2}});
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": args.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": args.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string();
+    for (format, body) in [(Format::OpenAI, &chat), (Format::OpenAIResponse, &responses)] {
+        let out = translate(format, body.as_bytes());
+        let sent = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(sent["properties"]["p"]["properties"], json!({"x y": {}}), "{format:?}");
+        assert_eq!(tool_use_input(&out), &args, "{format:?}");
+    }
+    let answer = claude_answer(args.clone(), "f");
+    let body = non_stream(Format::OpenAI, chat.as_bytes(), &answer);
+    assert_eq!(
+        parse_args(&body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+        args
+    );
+    let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
+    assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
+}
+
+/// A pattern that would match the generated name but not the client's key
+/// (`^x_y$`) declines the tool as a whole, on both formats: renaming `x y` would put
+/// `{"free":1}` under that pattern's `required`/`additionalProperties: false`.
+#[test]
+fn patterns_that_change_applicability_leave_the_tool_as_sent() {
+    let schema = json!({"type": "object", "properties": {"p": {
+        "properties": {"x y": {"type": "object"}},
+        "patternProperties": {"^x_y$": {"properties": {"a b": {}}, "required": ["a b"], "additionalProperties": false}}
+    }}});
+    let args = json!({"p": {"x y": {"free": 1}}});
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": args.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": args.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string();
+    for (format, body) in [(Format::OpenAI, &chat), (Format::OpenAIResponse, &responses)] {
+        let out = translate(format, body.as_bytes());
+        let sent = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(sent["properties"]["p"], schema["properties"]["p"], "{format:?}");
+        assert_eq!(tool_use_input(&out), &args, "{format:?}");
+    }
+    let answer = claude_answer(args.clone(), "f");
+    let body = non_stream(Format::OpenAI, chat.as_bytes(), &answer);
+    assert_eq!(
+        parse_args(&body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+        args
+    );
+    let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
+    assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
+}
+
+/// A declined tool: on Chat and Responses, the schema Claude receives, the replayed
+/// arguments and the returned arguments all keep the client's spelling.
+fn assert_left_as_sent(schema: Value, args: Value) {
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": args.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": args.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string();
+    for (format, body) in [(Format::OpenAI, &chat), (Format::OpenAIResponse, &responses)] {
+        let out = translate(format, body.as_bytes());
+        let sent = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(sent["properties"], schema["properties"], "{format:?}");
+        assert_eq!(tool_use_input(&out), &args, "{format:?}");
+    }
+    let answer = claude_answer(args.clone(), "f");
+    let body = non_stream(Format::OpenAI, chat.as_bytes(), &answer);
+    assert_eq!(
+        parse_args(&body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+        args
+    );
+    let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
+    assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
+}
+
+/// `[{"kind key":"a"},{"kind key":"b"}]` is valid under `maxContains: 1`; renaming the
+/// key only in the matching element would let the other match too.
+#[test]
+fn contains_naming_a_renamed_key_leaves_the_tool_as_sent() {
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"list": {"type": "array", "maxContains": 1,
+            "contains": {"properties": {"kind key": {"const": "a"}}}}}}),
+        json!({"list": [{"kind key": "a"}, {"kind key": "b"}]}),
+    );
+}
+
+/// `propertyNames` is kept as written, so `x_y` would fail `^x y$`.
+#[test]
+fn property_names_beside_a_renamed_key_leave_the_tool_as_sent() {
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"p": {"properties": {"x y": {}},
+            "propertyNames": {"pattern": "^x y$"}}}}),
+        json!({"p": {"x y": 1}}),
+    );
+    // Through an `allOf` sibling that constrains the same member.
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"payload": {
+            "properties": {"p": {"properties": {"x y": {}}}},
+            "allOf": [{"properties": {"p": {"propertyNames": {"pattern": "^x y$"}}}}]}}}),
+        json!({"payload": {"p": {"x y": 1}}}),
+    );
+}
