@@ -1243,3 +1243,81 @@ async fn unexpressible_tool_loading_is_refused_before_the_send() {
         assert!(proxy.upstream.http().is_empty(), "{named}: nothing sent");
     }
 }
+
+/// Codex `phase: commentary` through a Claude client (#112; `docs/codex/CONTRACT.md`
+/// "Translated route"). Commentary is visible mid-turn assistant text that tool calls may
+/// follow (first-party `MessagePhase`), which is what a Claude text block before
+/// `tool_use` is. So it reaches the client as an ordinary text block, in order, streamed
+/// and buffered: no thinking block, no signature marker, no `phase` member. On replay
+/// the Claude text carries no phase, and the converted assistant message has none, which
+/// first-party Codex reads as "phase unknown". Nothing is inferred or injected.
+#[tokio::test]
+async fn commentary_is_visible_text_and_replays_without_a_phase() {
+    for stream in [true, false] {
+        let proxy = proxy(vec![Reply::sse(fixture("sse-commentary-then-call").bytes())], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &claude_request(stream)).await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        for absent in ["thinking", "phase", "commentary", "signature"] {
+            assert!(!answer.contains(absent), "stream={stream}: no {absent}: {answer}");
+        }
+        let blocks: Vec<(String, String)> = if stream {
+            answer
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .filter(|e| e["type"] == "content_block_start")
+                .map(|e| {
+                    let block = &e["content_block"];
+                    (
+                        block["type"].as_str().unwrap().to_owned(),
+                        block["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect()
+        } else {
+            let message: Value = serde_json::from_str(&answer).unwrap();
+            message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["type"].as_str().unwrap().to_owned(),
+                        b["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            blocks,
+            [
+                ("text".to_owned(), String::new()),
+                ("tool_use".to_owned(), "get_weather".to_owned())
+            ],
+            "stream={stream}: {answer}"
+        );
+        assert!(answer.contains("Checking the context."), "stream={stream}: {answer}");
+        assert_eq!(
+            client_stop(&answer).as_deref(),
+            Some("tool_use"),
+            "stream={stream}: {answer}"
+        );
+    }
+
+    let mut replay = claude_request(false);
+    replay["messages"][1]["content"] = json!([
+        {"type": "text", "text": "Checking the context."},
+        {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}
+    ]);
+    let proxy = proxy(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &replay).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    let said: Vec<&Value> = items(&body, "message")
+        .into_iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(said.len(), 1, "{body}");
+    assert_eq!(said[0]["content"][0]["text"], "Checking the context.", "{body}");
+    assert!(said[0].get("phase").is_none(), "no inferred phase: {body}");
+}
