@@ -355,6 +355,9 @@ impl CodexExecutor {
             wire.exec_error(&error);
             return Err(error);
         }
+        if call != Call::Compact {
+            req.usage.round_trip_started();
+        }
         let opened = self
             .open_for(
                 view,
@@ -387,6 +390,7 @@ impl CodexExecutor {
             usage: req.usage.clone(),
             wire,
             capture_lines: call == Call::Stream,
+            token_marks: call == Call::Stream,
             model_level_cooling: settings.model_level_cooling,
             codex_client: request::codex_client(&req),
         };
@@ -423,8 +427,12 @@ impl CodexExecutor {
             });
         }
         // Every byte that arrived is recorded, an unfinished tail included, then any read
-        // error (the buffered call sites' policy).
-        let mut body = upstream.body;
+        // error (the buffered call sites' policy). A generation's TTFT is its first body byte.
+        let mut body = if call == Call::Compact {
+            upstream.body
+        } else {
+            crate::helpers::track_first_byte(upstream.body, &req.usage, false)
+        };
         let (mut data, mut failed) = (Vec::new(), None);
         while let Some(chunk) = body.next().await {
             match chunk {
@@ -597,6 +605,9 @@ struct Observer {
     /// Record each scanned line in the request log, as the streaming call site does; a
     /// buffered body is recorded whole instead.
     capture_lines: bool,
+    /// Mark TTFT at the first event with output (a streamed call). A buffered answer is
+    /// read whole first, so its TTFT stays the first body byte.
+    token_marks: bool,
     model_level_cooling: bool,
     codex_client: bool,
 }
@@ -741,6 +752,10 @@ impl Observer {
             return Seen::Undecoded;
         };
         let payload = data.trim();
+        if self.token_marks && self.usage.enabled() {
+            self.usage
+                .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+        }
         let outcome = event.outcome();
         if self.usage.enabled() && event.accounted() && outcome != codex_event::Outcome::Recorded {
             self.usage.response_line(Format::Codex, payload.as_bytes());

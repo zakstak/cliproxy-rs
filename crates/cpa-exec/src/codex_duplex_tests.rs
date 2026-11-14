@@ -1665,6 +1665,9 @@ impl cpa_core::exec::UsageObserver for Ledger {
     fn publish_failure(&self, status: u16, _: &str) {
         self.settle(status);
     }
+    fn publish_failure_with_usage(&self, status: u16, _: &str) {
+        self.settle(status);
+    }
     fn detach(&self) -> Option<Arc<dyn cpa_core::exec::UsageObserver>> {
         self.record("bootstrap".into())
     }

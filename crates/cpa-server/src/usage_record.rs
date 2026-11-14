@@ -49,6 +49,9 @@ pub struct Detail {
     pub total: i64,
     pub breakdown: Option<Breakdown>,
     pub response_service_tier: String,
+    /// Claude `usage.server_tool_use` counts, when the provider sent them (U1, #99).
+    pub web_search_requests: Option<i64>,
+    pub web_fetch_requests: Option<i64>,
 }
 
 /// Go `nonNegativeSum`.
@@ -342,6 +345,12 @@ pub fn ensure_breakdown(mut d: Detail, provider: &str, executor_type: &str) -> D
 }
 
 /// Go `hasNonZeroTokenUsage`.
+/// Whether `usage` holds token counts the provider reported (zeros included), not just a
+/// service tier or nothing: a record without them says `usage_observed: false` (U1, #99).
+fn usage_reported(usage: Option<&Detail>) -> bool {
+    usage.is_some_and(|d| d.breakdown.is_some())
+}
+
 fn has_tokens(d: &Detail) -> bool {
     d.input != 0
         || d.output != 0
@@ -549,6 +558,14 @@ fn parse_claude_node(node: &Res<'_>) -> Detail {
     if d.cached == 0 {
         d.cached = d.cache_creation;
     }
+    // Claude's documented `usage.service_tier` and `usage.server_tool_use` (U1, #99).
+    d.response_service_tier = node.get("service_tier").str().trim().to_owned();
+    let count = |path: &str| {
+        let n = node.get(path);
+        (n.kind == Kind::Number).then(|| n.int())
+    };
+    d.web_search_requests = count("server_tool_use.web_search_requests");
+    d.web_fetch_requests = count("server_tool_use.web_fetch_requests");
     d.total = d
         .input
         .wrapping_add(output)
@@ -602,9 +619,13 @@ pub struct StreamUsage {
 impl StreamUsage {
     /// Go `StreamUsageBuffer.Observe`: the latest usage wins; a tier-only update keeps
     /// the usage and replaces the tier.
+    ///
+    /// Reported zero usage with a tier is usage, not a tier-only update, while nothing
+    /// was reported before (U1, #99); it never replaces earlier usage.
     fn observe(&mut self, detail: Detail) {
         let tier = detail.response_service_tier.trim().to_owned();
-        if tier.is_empty() || has_tokens(&detail) {
+        let first_usage = detail.breakdown.is_some() && self.detail.breakdown.is_none();
+        if tier.is_empty() || has_tokens(&detail) || first_usage {
             let preserved = std::mem::take(&mut self.detail.response_service_tier);
             self.detail = detail;
             if self.detail.response_service_tier.is_empty() {
@@ -641,6 +662,8 @@ impl StreamUsage {
         }
         m.cache_creation_5m = m.cache_creation_5m.or(existing.cache_creation_5m);
         m.cache_creation_1h = m.cache_creation_1h.or(existing.cache_creation_1h);
+        m.web_search_requests = m.web_search_requests.or(existing.web_search_requests);
+        m.web_fetch_requests = m.web_fetch_requests.or(existing.web_fetch_requests);
         let mut cached = m.cache_read + m.cache_creation;
         if cached == 0 {
             cached = m.cached;
@@ -697,13 +720,14 @@ impl StreamUsage {
                 }
             }
             Format::OpenAI => self.observe_openai(line),
-            // Go's Codex executor publishes the first terminal event's usage.
+            // The first terminal event's usage. A `response.failed` carries the usage of
+            // the work done before the failure (U1, #99), which its failure record keeps.
             Format::OpenAIResponse | Format::Codex => {
                 let Some(payload) = json_payload(line) else { return };
                 let kind = gj::get(payload, "type");
                 if !matches!(
                     kind.str().as_ref(),
-                    "response.completed" | "response.incomplete" | "response.done"
+                    "response.completed" | "response.incomplete" | "response.done" | "response.failed"
                 ) || self.ok
                 {
                     return;
@@ -1161,6 +1185,8 @@ impl Record {
             cache_creation_1h: _,
             total: _,
             breakdown: _,
+            web_search_requests: _,
+            web_fetch_requests: _,
         } = detail;
         let headers = response_headers
             .iter_mut()
@@ -1378,6 +1404,17 @@ pub fn queued(record: &Record, client: &Client) -> Vec<u8> {
         }
         t.int("total_tokens", detail.total);
     });
+    if detail.web_search_requests.is_some() || detail.web_fetch_requests.is_some() {
+        // Not in Go v8.0.35's record: provider-reported server tool counts (U1, #99).
+        w.object("server_tool_use", |s| {
+            if let Some(n) = detail.web_search_requests {
+                s.int("web_search_requests", n);
+            }
+            if let Some(n) = detail.web_fetch_requests {
+                s.int("web_fetch_requests", n);
+            }
+        });
+    }
     w.bool("failed", record.failed);
     if let Some(observed) = record.usage_observed {
         w.bool("usage_observed", observed);
@@ -1674,6 +1711,8 @@ impl Ttft {
 /// with what Go's `buildRecord` reads at that moment.
 struct Outcome {
     failed: bool,
+    /// `detail` is usage the provider reported, not an absence of usage.
+    observed: bool,
     status: i64,
     body: String,
     detail: Detail,
@@ -1864,16 +1903,13 @@ impl Observer {
             if r.outcome.is_some() {
                 return;
             }
-            let detail = if failed && !keep_usage {
-                Detail::default()
-            } else {
-                r.usage().unwrap_or_default()
-            };
+            let usage = if failed && !keep_usage { None } else { r.usage() };
             r.outcome = Some(Outcome {
                 failed,
+                observed: usage_reported(usage.as_ref()),
                 status,
                 body: body.trim().to_owned(),
-                detail,
+                detail: usage.unwrap_or_default(),
                 model: r.model.get().to_owned(),
                 latency: self.started.elapsed(),
                 ttft: if self.own.is_some() && !r.ttft.tracked {
@@ -1922,6 +1958,9 @@ impl Observer {
             record.fail_status = outcome.status;
             record.fail_body = outcome.body;
             record.detail = outcome.detail;
+            if !outcome.observed {
+                record.usage_observed = Some(false);
+            }
             record.response_model = outcome.model;
             (latency, ttft) = (outcome.latency, outcome.ttft);
         } else {
@@ -1933,6 +1972,9 @@ impl Observer {
                 record.usage_observed = Some(false);
                 Detail::default()
             } else {
+                if !usage_reported(usage.as_ref()) {
+                    record.usage_observed = Some(false);
+                }
                 usage.unwrap_or_default()
             };
             record.response_model = reported.model.get().to_owned();
@@ -2349,9 +2391,8 @@ impl Tracker {
         self.publish(Ending::Done);
     }
 
-    /// Go `PublishFailure`: the error's status and body without usage. Claude's
-    /// executor fails through its stream buffer (`StreamUsageBuffer.PublishFailure`),
-    /// which keeps the usage seen so far.
+    /// The error's status and body, with the usage the provider reported before the
+    /// failure (U1, #99; Go v8.0.35 kept it only for Claude).
     pub fn fail(self, error: &cpa_core::exec::ExecError) {
         self.fail_classified(error, "");
     }
@@ -2391,6 +2432,9 @@ impl Tracker {
             record.fail_status = outcome.status;
             record.fail_body = outcome.body;
             record.detail = outcome.detail;
+            if !outcome.observed {
+                record.usage_observed = Some(false);
+            }
             record.response_model = outcome.model;
             (latency, ttft) = (outcome.latency, outcome.ttft);
         } else {
@@ -2399,6 +2443,10 @@ impl Tracker {
             } else {
                 self.body.take().or_else(|| self.stream.detail().cloned())
             };
+            // Missing usage stays distinct from zero usage (U1, #99).
+            if !usage_reported(usage.as_ref()) {
+                record.usage_observed = Some(false);
+            }
             let detail = match ending {
                 Ending::Done if reported.usage_required && usage.is_none() => {
                     if reported.claude_cache.is_none() {
@@ -2417,11 +2465,7 @@ impl Tracker {
                     if record.response_headers.is_empty() {
                         record.response_headers = go_headers(&error.headers);
                     }
-                    if self.observer.provider == "claude" {
-                        usage.unwrap_or_default()
-                    } else {
-                        Detail::default()
-                    }
+                    usage.unwrap_or_default()
                 }
             };
             record.detail = detail;
@@ -2634,6 +2678,8 @@ pub fn publish_home_unauthorized(
         } else {
             body.to_owned()
         },
+        // No provider usage (U1, #99).
+        usage_observed: Some(false),
         ..Record::default()
     };
     // Go 37fe2608: the record carries the request's client key and access provider.
@@ -2670,6 +2716,67 @@ mod tests {
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/server_go.json");
+
+    /// U1 (#99): reported zero usage is usage, also when the terminal event names a
+    /// service tier; it never replaces usage an earlier event reported.
+    #[test]
+    fn zero_usage_with_a_tier_is_reported_usage() {
+        let zero = r#"data: {"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#;
+        let mut stream = StreamUsage::default();
+        stream.line(Format::Codex, zero.as_bytes());
+        assert!(usage_reported(stream.detail()), "{:?}", stream.detail());
+        assert_eq!(stream.detail().unwrap().response_service_tier, "default");
+
+        let mut chat = StreamUsage::default();
+        for line in [
+            r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+            r#"data: {"service_tier":"flex","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        ] {
+            chat.line(Format::OpenAI, line.as_bytes());
+        }
+        let detail = chat.detail().unwrap();
+        assert_eq!((detail.total, detail.response_service_tier.as_str()), (5, "flex"));
+    }
+
+    /// U1 (#99): Claude's documented `usage.service_tier` and `usage.server_tool_use`
+    /// counts (platform.claude.com service-tiers, web-search and web-fetch pages, read
+    /// 2026-11-14) reach the record, buffered and streamed. A count the provider did not
+    /// send stays absent; a reported zero stays zero.
+    #[test]
+    fn claude_service_tier_and_server_tool_counts_are_recorded() {
+        let record = |detail: Detail| -> Value {
+            let record = Record {
+                detail,
+                ..Record::default()
+            };
+            serde_json::from_slice(&queued(&record, &Client::default())).unwrap()
+        };
+        let buffered = parse_claude(
+            br#"{"usage":{"input_tokens":10,"output_tokens":4,"service_tier":"priority","server_tool_use":{"web_search_requests":2,"web_fetch_requests":0}}}"#,
+        );
+        let mut streamed = StreamUsage::default();
+        for line in [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"service_tier":"priority"}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"server_tool_use":{"web_search_requests":2,"web_fetch_requests":0}}}"#,
+        ] {
+            streamed.line(Format::Claude, line.as_bytes());
+        }
+        for (case, detail) in [
+            ("buffered", buffered),
+            ("streamed", streamed.detail().cloned().unwrap()),
+        ] {
+            let got = record(detail);
+            assert_eq!(got["response_service_tier"], "priority", "{case}: {got}");
+            assert_eq!(
+                got["server_tool_use"],
+                serde_json::json!({"web_search_requests": 2, "web_fetch_requests": 0}),
+                "{case}: {got}"
+            );
+        }
+        let plain = record(parse_claude(br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#));
+        assert!(plain.get("server_tool_use").is_none(), "{plain}");
+        assert!(plain.get("response_service_tier").is_none(), "{plain}");
+    }
 
     /// #71: usage names the model a server-side fallback served with, from the
     /// documented signals (a `fallback` block's `to.model`, a `fallback_message`
@@ -3550,6 +3657,8 @@ mod tests {
             fields.insert("api_key".into(), "fake-client-key".into());
             fields.insert("is_native_key".into(), true.into());
             fields.insert("access_provider".into(), "config-inline".into());
+            // Not in Go's record (U1, #99): a record without provider usage says so.
+            fields.insert("usage_observed".into(), false.into());
             for record in [&mut want, &mut got[0]] {
                 let record = record.as_object_mut().unwrap();
                 assert!(record.remove("timestamp").is_some(), "{name}");

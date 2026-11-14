@@ -521,6 +521,7 @@ fn observer() -> Observer {
         usage: Default::default(),
         wire: Default::default(),
         capture_lines: true,
+        token_marks: true,
         model_level_cooling: false,
         codex_client: false,
     }
@@ -1246,7 +1247,11 @@ async fn an_upstream_failure_is_never_recorded_as_a_cancellation() {
         }
     }
     drop(stream);
-    let expected = (error.status, String::from_utf8_lossy(&error.body).into_owned());
+    // The failure keeps the usage reported before it (U1, #99).
+    let expected = (
+        error.status,
+        format!("with usage: {}", String::from_utf8_lossy(&error.body)),
+    );
     assert_ne!(expected.0, 499);
     assert_eq!(settled(&record), [expected]);
 }
@@ -1370,4 +1375,38 @@ fn a_processing_error_ends_a_buffered_answer_only_at_a_clean_end() {
             .unwrap_err();
         assert!(error.direct, "clean={clean}: {error:?}");
     }
+}
+
+/// U1 (#99): a streamed answer marks TTFT at the first event that carries output, not at
+/// `response.created`, an announced item, encrypted-only reasoning or an empty delta.
+/// Every decoded event is a frame (the first one is the fallback when no output comes).
+#[tokio::test]
+async fn ttft_is_marked_at_the_first_output_event() {
+    let events = [
+        r#"{"type":"response.created","response":{"id":"r1"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"OPAQUE","summary":[]}}"#,
+        r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"OPAQUE","summary":[]}}"#,
+        r#"{"type":"response.output_text.delta","delta":""}"#,
+        r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+        r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
+    ];
+    let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    let recorder = std::sync::Arc::new(crate::usage_testkit::Recorder::default());
+    let recorded = Observer {
+        usage: cpa_core::exec::UsageSink::new(recorder.clone()),
+        ..observer()
+    };
+    let (_, error) = through_with(recorded, &[sse.as_bytes()], None, false).await;
+    assert!(error.is_none(), "{error:?}");
+    let marks: Vec<bool> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            crate::usage_testkit::Report::TokenEvent(token) => Some(*token),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks, [false, false, false, false, true, true]);
 }

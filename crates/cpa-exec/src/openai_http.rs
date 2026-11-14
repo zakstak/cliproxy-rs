@@ -54,9 +54,10 @@ pub(crate) fn lines(
     crate::proxy::lines(upstream.body, max)
 }
 
-/// `reporter.PublishFailure(err)`, called before any failure frame reaches the client (a
+/// Publishes the attempt's failure, called before any failure frame reaches the client (a
 /// client-facing writer may stop at that frame and never take the error): Go's status
-/// (none for a transport fault) and the error text, as the server records a failure.
+/// (none for a transport fault), the error text, and the usage the provider reported
+/// before the failure (U1, #99; Go v8.0.35's `PublishFailure` dropped it).
 pub(crate) fn publish_failure(usage: &UsageSink, error: &ExecError) {
     let status = if error.scope == FailureScope::Transport {
         0
@@ -68,7 +69,7 @@ pub(crate) fn publish_failure(usage: &UsageSink, error: &ExecError) {
     } else {
         String::from_utf8_lossy(&error.body).into_owned()
     };
-    usage.publish_failure(status, &body);
+    usage.publish_failure_with_usage(status, &body);
 }
 
 // --- upstream request capture (helps/logging_helpers.go) --------------------------------

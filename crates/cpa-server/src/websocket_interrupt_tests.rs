@@ -1391,9 +1391,9 @@ mod steering_usage {
         }
     }
 
-    /// A terminal event without usage stays without it: the record has no tokens and no
-    /// usage flag, exactly as a turn without steering records it, and the event reaches
-    /// the client unchanged.
+    /// A terminal event without usage stays without it: the record has no tokens and is
+    /// marked `usage_observed: false` (U1, #99), exactly as a turn without steering records
+    /// it, and the event reaches the client unchanged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_response_without_usage_is_recorded_as_a_turn_records_it() {
         const BARE_END2: &str =
@@ -1415,7 +1415,7 @@ mod steering_usage {
             assert_eq!(open.len(), 2, "{case}: {open:?}");
             success(&open[0], [5, 3, 8], &case);
             success(&open[1], [0, 0, 0], &case);
-            assert!(open[1].get("usage_observed").is_none(), "{case}: {}", open[1]);
+            assert_eq!(open[1]["usage_observed"], false, "{case}: {}", open[1]);
             shapes.push((open[1]["tokens"].clone(), open[1]["token_breakdown"].clone()));
         }
         assert_eq!(shapes[0], shapes[1], "the same record shape with and without steering");
@@ -1774,6 +1774,7 @@ mod interrupt_route_matrix {
             return Err(format!("records {records:?}"));
         }
         let mut executions = std::collections::HashSet::new();
+        let mut unobserved = 0;
         for r in &records {
             if r["failed"] != false || r["fail"]["status_code"] != 200 {
                 return Err(format!("a failed record {r}"));
@@ -1781,10 +1782,19 @@ mod interrupt_route_matrix {
             if r["source"] != expected_source || r["auth_index"] != expected_auth || r["model"] != "gpt-fixture" {
                 return Err("record identity does not name the serving credential/model".into());
             }
-            if r.get("usage_observed").is_some() || r["provider"] != "codex" {
+            // A response without usage is marked as such (U1, #99); nothing else is.
+            match r.get("usage_observed") {
+                None => {}
+                Some(serde_json::Value::Bool(false)) => unobserved += 1,
+                Some(_) => return Err(format!("record shape {r}")),
+            }
+            if r["provider"] != "codex" {
                 return Err(format!("record shape {r}"));
             }
             executions.insert(r["execution_id"].as_str().unwrap_or_default().to_owned());
+        }
+        if unobserved != usize::from(!usage) {
+            return Err(format!("usage_observed markers {records:?}"));
         }
         if executions.len() != 2 {
             return Err(format!("execution IDs {records:?}"));

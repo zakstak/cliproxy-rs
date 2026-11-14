@@ -30,12 +30,12 @@ An additional queue observation marked `usage_observed: false` is emitted on
   collection to be enabled.
 - The usage queue accepts records (management and usage statistics are enabled).
 
-Failed attempts do not receive the marker. A native non-streaming Claude JSON response without usage
-still calls `UsageSink::publish()` without `usage_required()`: its pre-set outcome
-produces an ordinary record without this marker. Absence of the marker therefore
-does not prove that usage was observed. The additional records' zero tokens mean
-unknown usage, and `failed: false` does not establish successful completion.
-Ordinary records retain Go's accounting.
+Every other record without reported token usage carries the same marker
+([#99](https://github.com/zakstak/cliproxy-rs/issues/99)), with or without telemetry:
+a failed attempt before usage arrived, or a native non-streaming Claude JSON response
+without usage. Absence of the marker therefore means the provider reported usage.
+Zero tokens on a marked record mean unknown usage, and `failed: false` on an
+additional record does not establish successful completion.
 
 - `breakpoints` lists the final upstream cache markers in tools, system, and
   messages order. Each entry has `path`, `ttl`, a cumulative `prefix`, and
