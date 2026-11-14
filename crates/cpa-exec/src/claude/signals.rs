@@ -215,7 +215,8 @@ pub(crate) fn subagent_requests_1h(headers: &HeaderMap, body: &str) -> bool {
             .contains("extended-cache-ttl-2025-04-11")
 }
 
-/// `IsClaudeNewPromptTurn`.
+/// `IsClaudeNewPromptTurn`. Trailing `role: system` turns are skipped: a system item
+/// kept in place after the new user message (#183) does not make the turn a continuation.
 pub(crate) fn new_prompt_turn(body: &str) -> bool {
     if probe_or_helper(body) {
         return false;
@@ -225,7 +226,12 @@ pub(crate) fn new_prompt_turn(body: &str) -> bool {
         return true;
     }
     let messages = messages.array();
-    let Some(last) = messages.last() else { return true };
+    if messages.is_empty() {
+        return true;
+    }
+    let Some(last) = messages.iter().rev().find(|m| m.get("role").str() != "system") else {
+        return false;
+    };
     if last.get("role").str() != "user" {
         return false;
     }
@@ -267,6 +273,21 @@ pub(crate) fn billing_tags(body: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trailing_system_turn_keeps_a_new_prompt_turn() {
+        let user = r#"{"role":"user","content":"next"}"#;
+        let result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}"#;
+        let system = r#"{"role":"system","content":[{"type":"text","text":"mid"}]}"#;
+        let body = |messages: &[&str]| format!(r#"{{"messages":[{}]}}"#, messages.join(","));
+        assert!(new_prompt_turn(&body(&[user, system])));
+        assert!(!new_prompt_turn(&body(&[result, system])));
+        assert!(!new_prompt_turn(&body(&[
+            r#"{"role":"assistant","content":"a"}"#,
+            system
+        ])));
+        assert!(!new_prompt_turn(&body(&[system])));
+    }
 
     #[test]
     fn probe_helper_and_tags() {
