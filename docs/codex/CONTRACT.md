@@ -1308,7 +1308,7 @@ Content, including content nested in tool results and system prompts:
 - a tool without an object `input_schema`;
 - a `tool_reference` that names no tool the request declares; Claude `tool_addition` and
   `tool_removal` blocks, which are unknown blocks here. Anthropic does not document them
-  and no retained client sends them, so they stay refused; revisit only if Anthropic
+  and no retained client is known to send them, so they stay refused; revisit only if Anthropic
   documents them and Claude Code sends them (#170);
 - a Chat `refusal` part, an audio part without data, a tool result without its call, a
   duplicated call ID, or a call of an unknown type;
