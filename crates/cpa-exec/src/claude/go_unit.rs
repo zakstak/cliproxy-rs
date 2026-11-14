@@ -58,6 +58,12 @@ const SUPERSEDED: &[&str] = &[
     "TestClaudeExecutor_PayloadOverrideDoesNotClaimMatchingCallerTurn",
 ];
 
+/// Go tests of payload-rule conditions that observe Go deleting a Claude client's own
+/// thinking under forced tool use. cliproxy-rs forwards that thinking
+/// (docs/DIFFERENCES-FROM-GO.md); `claude::tests::claude_clients_keep_their_thinking_with_forced_tools`
+/// covers it. Translated routes still delete it before the payload rules, as Go does.
+const KEEPS_CALLER_THINKING: &[&str] = &["TestClaudePayloadConditionsObserveBuiltinThinkingRemoval"];
+
 /// 6fecc6e tests Go deleted in 868e137: they checked the repairs that ran after the
 /// payload rules. Their v8.0.35 successors are in the v8.0.35 recording under new names.
 const REMOVED_IN_868E137: &[&str] = &[
@@ -184,6 +190,9 @@ async fn replay_file(fixture: &Value, file: &str) {
             continue;
         }
         if std::ptr::eq(fixture, self::fixture()) && REMOVED_IN_868E137.contains(&test.as_str()) {
+            continue;
+        }
+        if KEEPS_CALLER_THINKING.contains(&test.as_str()) {
             continue;
         }
         for (i, record) in records.as_array().unwrap().iter().enumerate() {
