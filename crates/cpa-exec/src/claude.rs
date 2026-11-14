@@ -382,9 +382,11 @@ impl ClaudeExecutor {
         } else {
             translated
         };
-        // reporter.SetTranslatedReasoningEffort on the body sent upstream.
+        // reporter.SetTranslatedReasoningEffort on the body sent upstream, and the
+        // service tier it carries after payload rules (#178).
         if req.usage.enabled() {
             req.usage.request(Format::Claude, prepared.body.as_bytes());
+            req.usage.request_sent(prepared.body.as_bytes());
         }
         if req.usage.wants_claude_cache()
             && let Some(telemetry) = telemetry::collect(&ctx, &req, &prepared)

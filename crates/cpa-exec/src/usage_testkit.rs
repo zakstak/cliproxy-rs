@@ -90,11 +90,13 @@ impl cpa_core::exec::UsageObserver for Recorder {
 }
 
 /// Go's TTFT marks for one attempt: `StartResponseTTFT` when a request went upstream,
-/// before the first `MarkFirstResponseByte`, which comes only once a body byte (or a
-/// non-empty message) arrived.
+/// before the first `MarkFirstResponseByte` or frame mark (`ObserveTokenEvent`), which
+/// comes only once a body byte (or a non-empty message) arrived.
 pub(crate) fn ttft_problem(reports: &[Report], sent: bool, body_arrived: bool) -> Option<String> {
     let started = reports.iter().position(|r| matches!(r, Report::RoundTrip));
-    let first = reports.iter().position(|r| matches!(r, Report::FirstByte));
+    let first = reports
+        .iter()
+        .position(|r| matches!(r, Report::FirstByte | Report::TokenEvent(_)));
     let ok = started.is_some() == sent
         && first.is_some() == body_arrived
         && match (started, first) {

@@ -150,12 +150,6 @@ impl Accounting {
         Self { usage, settled: false }
     }
 
-    fn observe(&self, payload: &str) {
-        if self.usage.enabled() {
-            self.usage.response_line(Format::Codex, payload.as_bytes());
-        }
-    }
-
     /// The upstream ended the response: the record has the usage its terminal event
     /// reported, or none.
     fn complete(mut self) {
@@ -599,16 +593,23 @@ impl Duplex {
 
     /// Feeds one upstream event to the usage record it belongs to: the attempt's own
     /// until the attempt is detached, then the open response the event names (or the
-    /// latest). An event of no open response feeds none.
-    fn account(&self, payload: &str, kind: &str, response_id: Option<&str>) {
-        if !self.detached {
-            if self.turn.usage.enabled() {
-                self.turn.usage.response_line(Format::Codex, payload.as_bytes());
+    /// latest). An event of no open response feeds none. Every event is a TTFT frame
+    /// (#178); an `accounted` one also feeds usage.
+    fn account(&self, payload: &str, kind: &str, response_id: Option<&str>, accounted: bool) {
+        let usage = if self.detached {
+            match self.open_index(kind, response_id) {
+                Some(i) => &self.open[i].accounting.usage,
+                None => return,
             }
+        } else {
+            &self.turn.usage
+        };
+        if !usage.enabled() {
             return;
         }
-        if let Some(i) = self.open_index(kind, response_id) {
-            self.open[i].accounting.observe(payload);
+        usage.token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+        if accounted {
+            usage.response_line(Format::Codex, payload.as_bytes());
         }
     }
 
@@ -629,6 +630,19 @@ impl Duplex {
         }
     }
 
+    /// The oldest pending create, which `payload` rejects before it started: the failure
+    /// is its only upstream frame, so its TTFT ends there (#178). `account` cannot route
+    /// the frame to it, because no response of it is open.
+    fn mark_rejection(&self, payload: &str) {
+        if let Some(accounting) = self.pending.front().and_then(|pending| pending.accounting.as_ref())
+            && accounting.usage.enabled()
+        {
+            accounting
+                .usage
+                .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+        }
+    }
+
     /// What an upstream message settles, apart from its delivery: a terminal event its
     /// response's record, a failure the record of the request it belongs to, and a
     /// withheld failure every record. `reading` is the message's classification. The
@@ -641,6 +655,9 @@ impl Duplex {
             // rate-limit error, say): neither may reach the client as an event, so the
             // stream ends on it, as on any account failure. Its classified status stays.
             if error.withheld() {
+                if !self.first_response && matches!(self.failure_owner(payload), Owner::Rejected) {
+                    self.mark_rejection(payload);
+                }
                 self.fail_records(error);
                 return Settlement::Account(error.clone());
             }
@@ -648,6 +665,7 @@ impl Duplex {
                 match self.failure_owner(payload) {
                     Owner::Ambiguous => return Settlement::Ambiguous,
                     Owner::Rejected => {
+                        self.mark_rejection(payload);
                         if let Some(rejected) = self.pending.pop_front()
                             && let Some(accounting) = rejected.accounting
                         {
@@ -993,6 +1011,8 @@ impl Duplex {
         if usage.enabled() {
             usage.request(Format::Codex, frame.as_bytes());
         }
+        // The record's TTFT runs from this write to its first event with output (#178).
+        usage.round_trip_started();
         let accounting = self.detached.then(|| Accounting::new(usage.clone()));
         let prepared = Prepared {
             native: self.initial.native,
@@ -1063,9 +1083,7 @@ impl Duplex {
                 return;
             }
             self.turn.signals(payload);
-            if accounted {
-                self.account(payload, &kind, response_id.as_deref());
-            }
+            self.account(payload, &kind, response_id.as_deref(), accounted);
         }
         match self.turn.wire.ws_response_observation(payload) {
             Some(observation) => {
@@ -1247,9 +1265,11 @@ impl Duplex {
                 self.current = prepared;
                 accounting.or_else(|| self.detach())
             }
-            // An automatic successor keeps its parent's facts, without announcing.
+            // An automatic successor keeps its parent's facts, without announcing. No
+            // request started it: its TTFT runs from its `response.created` (#178).
             None => self.detached.then(|| {
                 self.current.usage = self.current.usage.successor(None);
+                self.current.usage.round_trip_started();
                 Accounting::new(self.current.usage.clone())
             }),
         };

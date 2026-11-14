@@ -3392,3 +3392,39 @@ async fn a_key_revoked_while_an_http_turn_dials_sends_no_request() {
     // leaves, so the upstream has no request at all.
     assert!(received.is_empty(), "no request bytes reached the upstream");
 }
+
+/// #178: a WebSocket turn starts its TTFT clock at the create's write and marks TTFT at
+/// the first upstream event with output (`helpers::responses_token_event`):
+/// `response.created` and an empty delta are frames only.
+#[tokio::test]
+async fn ttft_is_marked_at_the_first_output_event() {
+    const EMPTY: &str =
+        r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":""}"#;
+    const DELTA: &str =
+        r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"hi"}"#;
+    let (_up, url) = upstream(vec![Act::Send(vec![CREATED, EMPTY, DELTA, COMPLETED])]).await;
+    let executor = CodexExecutor::new().unwrap();
+    let (recorder, _capture, usage) = crate::usage_testkit::sinks();
+    let mut req = request(BODY);
+    req.usage = usage;
+    let response = executor
+        .execute_in_session(&credential(&url), req, &Config::default(), &session(false))
+        .await
+        .unwrap();
+    assert!(collect(response).await.iter().all(Result::is_ok));
+    let marks: Vec<&str> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            crate::usage_testkit::Report::RoundTrip => Some("start"),
+            crate::usage_testkit::Report::FirstByte => Some("byte"),
+            crate::usage_testkit::Report::TokenEvent(false) => Some("frame"),
+            crate::usage_testkit::Report::TokenEvent(true) => Some("token"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks, ["start", "frame", "frame", "token", "token"]);
+    executor.close_session("conn-1");
+}

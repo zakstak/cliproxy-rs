@@ -534,9 +534,14 @@ async fn slow_upstream(seen: Arc<Mutex<Vec<(usize, bool)>>>) -> String {
 /// A proxy whose usage queue keeps records, in front of a Claude API key on
 /// `upstream_url`: the runtime, and the proxy's `/v1/messages` URL.
 async fn usage_proxy(dir: &Path, upstream_url: &str) -> (Arc<cpa_server::Runtime>, String) {
+    usage_proxy_with(dir, upstream_url, "").await
+}
+
+/// [`usage_proxy`] with `extra` appended to its configuration.
+async fn usage_proxy_with(dir: &Path, upstream_url: &str, extra: &str) -> (Arc<cpa_server::Runtime>, String) {
     let mut config = Config::parse(&format!(
         "observability:\n  usage:\n    usage-statistics-enabled: true\n    claude-cache-telemetry: true\n\
-         claude-api-key:\n  - api-key: sk-upstream-usage\n    base-url: {upstream_url}\n"
+         claude-api-key:\n  - api-key: sk-upstream-usage\n    base-url: {upstream_url}\n{extra}"
     ))
     .unwrap();
     config.api_keys = vec!["client-key-1".into()];
@@ -1107,6 +1112,56 @@ async fn claude_cache_telemetry_lookup_boundaries_and_automatic_targets() {
         "invalid controls do not invent writes"
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #178: a Claude record's `service_tier` is the tier the request carried upstream after
+/// payload rules, not the client's: an override replaces it, a filter removes it (the
+/// API's default, `auto`), and without a rule the client's tier is sent and recorded.
+#[tokio::test]
+async fn usage_record_names_the_service_tier_sent_after_payload_rules() {
+    let _registry = REGISTRY.lock().await;
+    let rule = |kind: &str, params: &str| {
+        format!("payload:\n  {kind}:\n    - models: [{{name: \"claude-*\"}}]\n      params: {params}\n")
+    };
+    let cases = [
+        (String::new(), "standard_only"),
+        (rule("override", "{service_tier: auto}"), "auto"),
+        (rule("filter", "[service_tier]"), "auto"),
+    ];
+    for (i, (rules, want)) in cases.into_iter().enumerate() {
+        for stream in [false, true] {
+            let label = format!("{rules:?} stream={stream}");
+            let log: Log = Arc::default();
+            let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
+            let dir = auth_dir(&format!("tier-{i}-{stream}"), &[]);
+            let (rt, url) = usage_proxy_with(&dir, &upstream_url, &rules).await;
+            let body = format!(
+                r#"{{"model":"claude-opus-5-5","stream":{stream},"max_tokens":16,"service_tier":"standard_only","messages":[{{"role":"user","content":"hi"}}]}}"#
+            );
+            let res = wreq::Client::new()
+                .post(&url)
+                .header("x-api-key", "client-key-1")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200, "{label}");
+            res.text().await.unwrap();
+            let seen = log.lock().unwrap().clone();
+            let [seen] = seen.as_slice() else {
+                panic!("{label}: one upstream request");
+            };
+            let sent: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+            assert_eq!(
+                sent["service_tier"].as_str().unwrap_or("auto"),
+                want,
+                "{label}: sent {sent}"
+            );
+            let records = usage_records(&rt, 1).await;
+            assert_eq!(records[0]["service_tier"], want, "{label}: {}", records[0]);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }
 
 /// #80 control: the translated routes refuse `output_config.effort` without a `thinking`

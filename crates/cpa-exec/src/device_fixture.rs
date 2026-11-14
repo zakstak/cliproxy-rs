@@ -684,9 +684,11 @@ pub(crate) fn assert_usage_like_go(name: &str, fx: &Value, log: &UsageLog, failu
         "{name}: translated reasoning effort"
     );
     let payloads = log.payloads();
+    // A fixture whose failure keeps its usage by a deliberate difference says so (#178).
     let kept = events
         .iter()
-        .any(|e| matches!(e, UsageEvent::PublishFailureWithUsage(..)));
+        .any(|e| matches!(e, UsageEvent::PublishFailureWithUsage(..)))
+        || fx["extra"]["failure_keeps_usage"].as_bool() == Some(true);
     let tokens = if record["failed"].as_bool() == Some(true) && !kept {
         // Go's `PublishFailure` publishes an empty detail: nothing reported may carry tokens.
         let carried: Vec<_> = payloads

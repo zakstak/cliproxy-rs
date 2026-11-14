@@ -1272,10 +1272,26 @@ async fn usage_reports_match_go_records() {
         "stream-nbsp-data",
         "claude-stream-input-estimate",
     ] {
-        let r = run(name).await;
+        let mut r = run(name).await;
+        if name == "stream-completed-then-error" {
+            r.fx = with_failure_usage_difference(r.fx, [5, 2, 7]);
+        }
         let failure = r.error.as_ref().map(crate::device_fixture::go_failure);
         crate::device_fixture::assert_usage_like_go(name, &r.fx, &r.usage, failure.as_ref());
     }
+}
+
+/// #178: a Muse failure record keeps the usage the stream reported before the failure,
+/// where Go's `PublishFailure` published an empty detail. Go's record takes the reported
+/// `(input, output, total)` tokens.
+fn with_failure_usage_difference(mut fx: Value, [input, output, total]: [i64; 3]) -> Value {
+    let record = &mut fx["extra"]["usage"][0];
+    assert_eq!(record["failed"], true);
+    record["input_tokens"] = input.into();
+    record["output_tokens"] = output.into();
+    record["total_tokens"] = total.into();
+    fx["extra"]["failure_keeps_usage"] = true.into();
+    fx
 }
 
 #[tokio::test]
