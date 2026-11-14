@@ -1070,11 +1070,21 @@ pub fn encode_go_json(value: &Value) -> String {
 /// Writes a login record into `auth_dir` (atomic, 0600), merging an existing file the way
 /// Go's login manager does. Blocking.
 pub fn write_login(auth_dir: &Path, tokens: &Tokens) -> Result<PathBuf, ExecError> {
+    write_login_at(auth_dir, tokens, None)
+}
+
+/// [`write_login`] into the existing credential file `target` (a targeted re-login,
+/// #90), merged with it under its own name.
+pub fn write_login_to(target: &Path, tokens: &Tokens) -> Result<PathBuf, ExecError> {
+    write_login_at(target.parent().unwrap_or(Path::new(".")), tokens, Some(target))
+}
+
+fn write_login_at(auth_dir: &Path, tokens: &Tokens, target: Option<&Path>) -> Result<PathBuf, ExecError> {
     let (name, mut record) = login_record(tokens, &rfc3339(Local::now()))?;
     if name.contains(['/', '\\']) {
         return Err(oauth_error(400, "invalid credential email filename"));
     }
-    let path = auth_dir.join(&name);
+    let path = target.map_or_else(|| auth_dir.join(&name), Path::to_path_buf);
     if let Ok(raw) = std::fs::read(&path)
         && let Ok(existing) = serde_json::from_slice::<Map<String, Value>>(&raw)
     {
