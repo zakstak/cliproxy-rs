@@ -1381,6 +1381,15 @@ the response ends), not a local estimate, and its final `message_delta` carries 
 provider's counts. Upstream errors keep their classification and reach the client in
 its own error format.
 
+A reasoning item reaches a Claude client as one thinking block, streamed and buffered
+alike: its summary parts joined with a blank line, and its `encrypted_content` as the
+signature. A summary part that is empty or only whitespace is not thinking text, so it
+adds no separator, and an item with no other text opens no block. A signed item still
+gets a signature-only block, which the client sends back as the opaque `reasoning`
+item; an unsigned blank block would be refused on that replay, because Codex cannot
+carry reasoning text without its encrypted content (#168). Test: `codex_translated.rs`
+`reasoning_summaries_read_the_same_streamed_and_buffered`.
+
 An assistant message's `phase` (#112) is not translated. `commentary` is visible mid-turn
 text that tool calls may follow, and `final_answer` the turn's answer
 (`protocol/src/models.rs:979-995`). Claude Messages and Chat Completions show both as
