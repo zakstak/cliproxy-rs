@@ -2605,9 +2605,11 @@ async fn a_create_waiting_for_the_socket_is_refused_after_revocation() {
 /// (`helpers::responses_token_event`). The bootstrap's clock starts at the turn's
 /// create (in `codex_ws`, before the socket write) and moves with the attempt's
 /// accounting; a later create's at its write; an automatic successor's, which no request
-/// started, at its `response.created`. Lifecycle events and empty deltas are frames.
+/// started, at its `response.created`. Lifecycle events and empty deltas are frames. A
+/// create upstream rejects before it starts ends its TTFT at the rejection.
 #[tokio::test]
 async fn each_response_marks_ttft_at_its_first_output_event() {
+    const REJECTED: &str = r#"{"type":"error","status":400,"response_id":"never-started","error":{"type":"invalid_request_error","message":"rejected before it started"}}"#;
     let delta = |text: &str| {
         format!(
             r#"{{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"{text}"}}"#
@@ -2626,6 +2628,8 @@ async fn each_response_marks_ttft_at_its_first_output_event() {
         c.write(&event("response.created", "r3")).await;
         c.write(&delta("c")).await;
         c.write(&event("response.completed", "r3")).await;
+        c.read().await;
+        c.write(REJECTED).await;
         c.idle().await;
     })
     .await;
@@ -2639,7 +2643,8 @@ async fn each_response_marks_ttft_at_its_first_output_event() {
         let chunk = chunk.unwrap();
         match (get(&chunk, "type").as_str(), get(&chunk, "response.id").as_str()) {
             ("response.completed", "r1") => client.send(&tiered("flex")).await,
-            ("response.completed", "r3") => break,
+            ("response.completed", "r3") => client.send(&tiered("priority")).await,
+            ("error", _) => break,
             _ => {}
         }
     }
@@ -2660,6 +2665,8 @@ async fn each_response_marks_ttft_at_its_first_output_event() {
         ("flex+auto", "frame"),
         ("flex+auto", "token"),
         ("flex+auto", "token"),
+        ("priority", "start"),
+        ("priority", "token"),
     ]
     .into_iter()
     .map(|(label, mark)| (label.to_owned(), mark))

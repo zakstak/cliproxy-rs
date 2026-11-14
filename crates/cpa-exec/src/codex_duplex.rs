@@ -652,6 +652,13 @@ impl Duplex {
                         if let Some(rejected) = self.pending.pop_front()
                             && let Some(accounting) = rejected.accounting
                         {
+                            // The rejection is the create's only upstream frame: its TTFT
+                            // ends there (#178), which `account` cannot route to it.
+                            if accounting.usage.enabled() {
+                                accounting
+                                    .usage
+                                    .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+                            }
                             accounting.fail(error);
                         }
                     }
