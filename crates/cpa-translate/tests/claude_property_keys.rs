@@ -772,3 +772,330 @@ fn property_names_beside_a_renamed_key_leave_the_tool_as_sent() {
         json!({"payload": {"p": {"x y": 1}}}),
     );
 }
+// --- instance-valued constraints (#194) ---
+
+/// Whether `instance` satisfies the subset of JSON Schema these tests use: `type`
+/// (object, string, integer), `properties`, `required`, `additionalProperties: false`,
+/// `const` and `enum`.
+fn satisfies(schema: &Value, instance: &Value) -> bool {
+    let Some(schema) = schema.as_object() else {
+        return true;
+    };
+    let typed = match schema.get("type").and_then(Value::as_str) {
+        Some("object") => instance.is_object(),
+        Some("string") => instance.is_string(),
+        Some("integer") => instance.is_i64() || instance.is_u64(),
+        _ => true,
+    };
+    let constant = schema.get("const").is_none_or(|c| c == instance);
+    let listed = schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.contains(instance));
+    let members = instance.as_object().is_none_or(|object| {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        let declared = |k: &str| properties.is_some_and(|p| p.contains_key(k));
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|k| k.as_str().is_some_and(|k| object.contains_key(k)));
+        let closed = schema.get("additionalProperties") == Some(&json!(false));
+        let extra = closed && object.keys().any(|k| !declared(k));
+        let nested = object
+            .iter()
+            .all(|(k, v)| properties.and_then(|p| p.get(k)).is_none_or(|s| satisfies(s, v)));
+        required && !extra && nested
+    });
+    typed && constant && listed && members
+}
+
+/// A satisfiable tool schema whose `const` and `enum` constraints hold objects keyed by
+/// renamed properties, at the root and nested, next to scalar literals, data keywords
+/// and keys the rename does not cover.
+fn instance_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "x y": {"type": "string", "enum": ["x y", "ok"]},
+            "filter": {
+                "type": "object",
+                "properties": {"a b": {"type": "integer"}},
+                "required": ["a b"],
+                "additionalProperties": false,
+                "enum": [{"a b": 1}, {"a b": 2}, "a b", 3]
+            },
+            "meta": {
+                "type": "object",
+                "const": {"note": "x y", "q r": [{"z": 4}]},
+                "default": {"x y": 0},
+                "examples": [{"a b": 1}]
+            }
+        },
+        "required": ["x y", "filter"],
+        "additionalProperties": false,
+        "const": {"x y": "ok", "filter": {"a b": 1}, "meta": {"note": "x y", "q r": [{"z": 4}]}}
+    })
+}
+
+/// The schema Claude receives for [`instance_schema`].
+fn renamed_instance_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "x_y": {"type": "string", "enum": ["x y", "ok"]},
+            "filter": {
+                "type": "object",
+                "properties": {"a_b": {"type": "integer"}},
+                "required": ["a_b"],
+                "additionalProperties": false,
+                "enum": [{"a_b": 1}, {"a_b": 2}, "a b", 3]
+            },
+            "meta": {
+                "type": "object",
+                "const": {"note": "x y", "q r": [{"z": 4}]},
+                "default": {"x y": 0},
+                "examples": [{"a b": 1}]
+            }
+        },
+        "required": ["x_y", "filter"],
+        "additionalProperties": false,
+        "const": {"x_y": "ok", "filter": {"a_b": 1}, "meta": {"note": "x y", "q r": [{"z": 4}]}}
+    })
+}
+
+/// The one instance [`instance_schema`] accepts, in the client's keys.
+fn instance_witness() -> Value {
+    json!({"x y": "ok", "filter": {"a b": 1}, "meta": {"note": "x y", "q r": [{"z": 4}]}})
+}
+
+fn instance_requests() -> [(Format, Vec<u8>); 2] {
+    requests_for(instance_schema(), instance_witness())
+}
+
+/// A Responses and a Chat request declaring tool `f` with `schema`, whose history calls
+/// it with `witness`.
+fn requests_for(schema: Value, witness: Value) -> [(Format, Vec<u8>); 2] {
+    let arguments = witness.to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": arguments},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    });
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": arguments}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    });
+    [
+        (Format::OpenAIResponse, responses.to_string().into_bytes()),
+        (Format::OpenAI, chat.to_string().into_bytes()),
+    ]
+}
+
+#[test]
+fn object_const_and_enum_follow_the_rename_and_stay_satisfiable() {
+    assert!(satisfies(&instance_schema(), &instance_witness()));
+    for (client, request) in instance_requests() {
+        let out = translate(client, &request);
+        let schema = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(schema, &renamed_instance_schema(), "{client:?}");
+        // The client's instance, as replayed to Claude, satisfies the schema Claude gets.
+        let replayed = tool_use_input(&out);
+        assert!(satisfies(schema, replayed), "{client:?}: {replayed} against {schema}");
+        // Claude answering with that instance gives the client its own instance back.
+        let answer = non_stream(client, &request, &claude_answer(replayed.clone(), "f"));
+        let arguments = match client {
+            Format::OpenAI => &answer["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            _ => &responses_function_call(&answer)["arguments"],
+        };
+        assert_eq!(parse_args(arguments), instance_witness(), "{client:?}");
+    }
+}
+
+#[test]
+fn renamed_keys_avoid_keys_inside_const_and_enum_instances() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"x y": {"type": "integer"}},
+        "required": ["x y"],
+        "const": {"x y": 1, "x_y": 2},
+        "enum": [{"x y": 1, "x_y": 2}, {"x y": 1, "x_y": 2, "x_y_2": 3}]
+    });
+    let witness = json!({"x y": 1, "x_y": 2});
+    assert!(satisfies(&schema, &witness));
+    let body = json!({"model": "m", "tools": [{"type": "function", "name": "t", "parameters": schema}], "input": "hi"});
+    let out = translate(Format::OpenAIResponse, body.to_string().as_bytes());
+    let renamed = &claude_tool(&out, "t")["input_schema"];
+    assert_eq!(renamed["required"], json!(["x_y_3"]));
+    assert_eq!(renamed["const"], json!({"x_y_3": 1, "x_y": 2}));
+    assert!(satisfies(renamed, &json!({"x_y_3": 1, "x_y": 2})));
+}
+
+#[test]
+fn const_in_an_in_place_applicator_follows_properties_declared_beside_it() {
+    // `allOf` and `anyOf` apply to the same instance as the schema holding them, so
+    // their `const` and `enum` are mapped with the properties declared beside them.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "x y": {"type": "string"},
+            "inner": {
+                "type": "object",
+                "properties": {"a b": {"type": "integer"}},
+                "required": ["a b"],
+                "additionalProperties": false,
+                "allOf": [{"enum": [{"a b": 1}]}, {"anyOf": [{"const": {"a b": 1}}]}]
+            }
+        },
+        "required": ["x y", "inner"],
+        "additionalProperties": false,
+        "allOf": [{"const": {"x y": "ok", "inner": {"a b": 1}}}]
+    });
+    let witness = json!({"x y": "ok", "inner": {"a b": 1}});
+    assert!(satisfies(&schema, &witness));
+    assert!(satisfies(&schema["allOf"][0], &witness));
+    let claude_witness = json!({"x_y": "ok", "inner": {"a_b": 1}});
+    for (client, request) in instance_requests() {
+        let mut request: Value = serde_json::from_slice(&request).unwrap();
+        match client {
+            Format::OpenAI => request["tools"][0]["function"]["parameters"] = schema.clone(),
+            _ => request["tools"][0]["parameters"] = schema.clone(),
+        }
+        let out = translate(client, request.to_string().as_bytes());
+        let renamed = &claude_tool(&out, "f")["input_schema"];
+        // A root-level union is folded away before renaming, as before #194: Claude
+        // refuses top-level `allOf`, so the root `const` is dropped (looser, still
+        // satisfiable) rather than sent in either namespace.
+        assert!(renamed.get("allOf").is_none(), "{client:?}: {renamed}");
+        let inner = &renamed["properties"]["inner"]["allOf"];
+        assert_eq!(inner[0]["enum"], json!([{"a_b": 1}]), "{client:?}");
+        assert_eq!(inner[1]["anyOf"][0]["const"], json!({"a_b": 1}), "{client:?}");
+        assert!(satisfies(renamed, &claude_witness), "{client:?}");
+        for branch in [&inner[0], &inner[1]["anyOf"][0]] {
+            assert!(satisfies(branch, &claude_witness["inner"]), "{client:?}: {branch}");
+        }
+    }
+}
+
+#[test]
+fn root_allof_const_is_mapped_where_the_schema_keeps_it() {
+    // Below the root nothing folds the union away, so the `allOf` `const` stays and
+    // takes the names declared beside it.
+    let schema = br#"{"type":"object","properties":{"x y":{"type":"string"}},"required":["x y"],"additionalProperties":false,"allOf":[{"const":{"x y":"ok"}}]}"#;
+    let wrapped = json!({"type": "object", "properties": {"p": serde_json::from_slice::<Value>(schema).unwrap()}, "required": ["p"]});
+    let body =
+        json!({"model": "m", "tools": [{"type": "function", "name": "t", "parameters": wrapped}], "input": "hi"});
+    let out = translate(Format::OpenAIResponse, body.to_string().as_bytes());
+    let p = &claude_tool(&out, "t")["input_schema"]["properties"]["p"];
+    assert_eq!(p["allOf"][0]["const"], json!({"x_y": "ok"}));
+    assert!(satisfies(p, &json!({"x_y": "ok"})));
+    assert!(satisfies(&p["allOf"][0], &json!({"x_y": "ok"})));
+}
+
+/// `f`'s call arguments in a buffered answer, as the client receives them.
+fn answered_arguments(client: Format, request: &[u8], claude_input: &Value) -> Value {
+    let answer = non_stream(client, request, &claude_answer(claude_input.clone(), "f"));
+    parse_args(match client {
+        Format::OpenAI => &answer["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        _ => &responses_function_call(&answer)["arguments"],
+    })
+}
+
+#[test]
+fn a_const_placed_by_location_leaves_free_form_data_alone() {
+    // `p`'s const takes `p`'s names; `other` is free-form, and its keys, one of them
+    // spelling the generated name, reach Claude and come back as sent.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "p": {"type": "object", "properties": {"x y": {"type": "integer"}}, "required": ["x y"], "const": {"x y": 1}},
+            "other": {"type": "object", "additionalProperties": true}
+        },
+        "required": ["p"]
+    });
+    let witness = json!({"p": {"x y": 1}, "other": {"x_y": "opaque", "x y": 2}});
+    let claude = json!({"p": {"x_y": 1}, "other": {"x_y": "opaque", "x y": 2}});
+    assert!(satisfies(&schema, &witness));
+    for (client, request) in requests_for(schema.clone(), witness.clone()) {
+        let out = translate(client, &request);
+        let renamed = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(renamed["properties"]["p"]["const"], json!({"x_y": 1}), "{client:?}");
+        assert_eq!(tool_use_input(&out), &claude, "{client:?}");
+        assert!(satisfies(renamed, &claude), "{client:?}");
+        assert_eq!(answered_arguments(client, &request, &claude), witness, "{client:?}");
+    }
+}
+
+#[test]
+fn a_const_its_positions_disagree_on_declines_the_rename() {
+    // `$defs/c` applies at `p`, which declares `x y`; `c`'s own nodes do not, and `q`
+    // applies it where `x y` is free-form. No one spelling fits, so the tool is sent as
+    // written (Claude refuses it, as before #77) and no argument is rewritten, free-form
+    // `other` included.
+    let other = json!({
+        "$defs": {"c": {"const": {"x y": 1}}},
+        "type": "object",
+        "properties": {
+            "p": {"$ref": "#/$defs/c", "properties": {"x y": {}}, "required": ["x y"]},
+            "other": {"additionalProperties": true}
+        }
+    });
+    let mut shared = other.clone();
+    shared["properties"]["q"] = json!({"$ref": "#/$defs/c", "additionalProperties": true});
+    let cases = [
+        (other, json!({"p": {"x y": 1}, "other": {"x_y": "opaque"}})),
+        (
+            shared,
+            json!({"p": {"x y": 1}, "q": {"x y": 1}, "other": {"x_y": "opaque"}}),
+        ),
+    ];
+    for (schema, witness) in cases {
+        for (client, request) in requests_for(schema.clone(), witness.clone()) {
+            let out = translate(client, &request);
+            let sent = &claude_tool(&out, "f")["input_schema"];
+            assert_eq!(sent["properties"]["p"]["properties"], json!({"x y": {}}), "{client:?}");
+            assert_eq!(sent["$defs"], schema["$defs"], "{client:?}");
+            assert_eq!(tool_use_input(&out), &witness, "{client:?}");
+            assert_eq!(answered_arguments(client, &request, &witness), witness, "{client:?}");
+        }
+    }
+}
+
+#[test]
+fn a_const_deeper_than_the_argument_walk_declines_the_rename() {
+    // `p`'s const nests `x y` 128 objects below the root, where replayed and returned
+    // arguments are no longer renamed, so the tool is sent as written. Built as text:
+    // serde_json refuses values nested this deep.
+    let mut instance = r#"{"x y":1}"#.to_owned();
+    for _ in 0..127 {
+        instance = format!(r#"{{"next":{instance}}}"#);
+    }
+    let schema = format!(
+        r##"{{"$defs":{{"n":{{"properties":{{"x y":{{}},"next":{{"$ref":"#/$defs/n"}}}}}}}},"properties":{{"p":{{"$ref":"#/$defs/n","const":{instance}}}}}}}"##
+    );
+    let arguments = serde_json::to_string(&format!(r#"{{"p":{instance}}}"#)).unwrap();
+    let responses = format!(
+        r#"{{"model":"claude-opus-5-5","tools":[{{"type":"function","name":"f","parameters":{schema}}}],"input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]}},{{"type":"function_call","call_id":"call_1","name":"f","arguments":{arguments}}},{{"type":"function_call_output","call_id":"call_1","output":"ok"}}]}}"#
+    );
+    let chat = format!(
+        r#"{{"model":"claude-opus-5-5","tools":[{{"type":"function","function":{{"name":"f","parameters":{schema}}}}}],"messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}},{{"role":"tool","tool_call_id":"call_1","content":"ok"}}]}}"#
+    );
+    for (client, request) in [(Format::OpenAIResponse, responses), (Format::OpenAI, chat)] {
+        let out = translate_request(client, Format::Claude, &CTX, request.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("x_y"), "{client:?}: renamed");
+        // Schema property, const leaf and replayed leaf all keep the client's key.
+        assert_eq!(out.matches(r#""x y""#).count(), 3, "{client:?}");
+    }
+}

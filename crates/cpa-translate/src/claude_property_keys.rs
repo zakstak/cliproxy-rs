@@ -29,6 +29,26 @@
 //! renamed key when sibling applicators and references share member/element paths.
 //! Keys of a free-form object (`additionalProperties`, `patternProperties`, no schema)
 //! are data and stay as sent, in both directions, even when they spell a renamed key.
+//!
+//! `const` and `enum` are instance values, not schemas: they constrain the arguments
+//! wherever their schema applies, so their objects must take the names those arguments
+//! take, or `{"properties":{"x y":{}},"required":["x y"],"const":{"x y":1}}` would demand
+//! both spellings at once (#194). One instance is shared by every position its schema
+//! applies at (a `$defs` entry reached through several `$ref`s, an `allOf` member), and
+//! those positions can disagree: one declares the key, another holds it as free-form
+//! data. So every renamed key in an instance is renamed, at any depth, and only when the
+//! nodes applying wherever the instance's schema does already name each of those keys
+//! there ([`PropertyKeys::located_instance`]), so arguments at each such position take
+//! the same names. Otherwise the tool is not renamed at all, as past
+//! [`MAX_SCHEMA_NODES`]: its schema, history and calls stay as written and Claude refuses
+//! it as before #77, rather than receiving a constraint no renamed argument can meet.
+//! Every renamed instance key must also stay within the argument walk's depth ceiling
+//! at every possible use, including uses reached through recursive references; a tool
+//! that cannot prove that is declined as a whole.
+//! Generated names avoid every key inside instances. Scalars, `default`, `examples` and
+//! other data are kept.
+//! ponytail: a tool whose instance fits some of its positions and not others is declined;
+//! giving each incompatible use of a definition its own renamed copy is the upgrade.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
 //! in one and a declared object in another at the same position gets the declared
 //! renames; a fuller validator (for example `jsonschema`) is the upgrade.
@@ -90,12 +110,14 @@ struct Token {
     text: Vec<u8>,
 }
 
-/// What the schema walk found: declared property keys, and the keys and strings that
-/// name properties (`required`, `dependentRequired`, `dependentSchemas`, `dependencies`).
+/// What the schema walk found: declared property keys, the keys and strings that name
+/// properties (`required`, `dependentRequired`, `dependentSchemas`, `dependencies`), and
+/// the structured `const` values and `enum` items of each node, as slices of the schema.
 #[derive(Default)]
-struct SchemaTokens {
+struct SchemaTokens<'a> {
     keys: Vec<Token>,
     references: Vec<Token>,
+    instances: Vec<(NodeId, &'a [u8])>,
 }
 
 /// Keywords whose member keys name properties (`dependencies` is the older spelling of
@@ -150,6 +172,8 @@ struct Tree {
     /// The walk stopped at [`MAX_SCHEMA_NODES`]: the tree is incomplete and the schema
     /// is declined.
     overflow: bool,
+    /// Nodes some resolved `$ref` points at.
+    referenced: HashSet<NodeId>,
 }
 
 #[derive(Debug, Default)]
@@ -611,9 +635,25 @@ impl PropertyKeys {
                 rejected.push(&key.text);
             }
         }
+        // `required` and dependency keywords name keys a client may send without a
+        // `properties` entry; a generated name equal to one would merge two members.
+        taken.extend(
+            tokens
+                .references
+                .iter()
+                .filter(|t| accepted(&t.text))
+                .map(|t| &t.text[..]),
+        );
         if rejected.is_empty() {
             return None;
         }
+        // A key inside a `const` or `enum` instance that is not renamed there stays as
+        // it is, so a generated name equal to it would merge two members.
+        let mut instance_keys: Vec<Vec<u8>> = vec![];
+        for (_, instance) in &tokens.instances {
+            object_keys(instance, |key, _| instance_keys.push(key));
+        }
+        taken.extend(instance_keys.iter().map(|k| &k[..]));
         let mut to_claude = HashMap::new();
         let mut to_client = HashMap::new();
         let mut assigned: HashSet<Vec<u8>> = HashSet::new();
@@ -665,21 +705,101 @@ impl PropertyKeys {
         for node in &mut tree.nodes {
             node.keys = [KeyIndex::new(node, None), KeyIndex::new(node, Some(&to_claude))];
         }
-        Some(PropertyKeys {
+        // The proof below renames instances through the key indexes built above.
+        let keys = PropertyKeys {
             to_claude,
             to_client,
             tree,
-        })
+        };
+        let unevaluated = keys
+            .tree
+            .nodes
+            .iter()
+            .any(|n| !n.unevaluated.is_empty() || !n.unevaluated_items.is_empty());
+        let depths = keys.tree.instance_depths();
+        // An instance that cannot take one spelling everywhere declines the workaround.
+        tokens
+            .instances
+            .iter()
+            .all(|&(node, instance)| keys.located_instance(node, instance, unevaluated, depths[node]))
+            .then_some(keys)
     }
 
-    /// `schema` with its rejected property keys, and the references naming them, renamed.
+    /// Whether `instance`, a `const` value or `enum` item of `node`, takes the same names
+    /// wherever `node` applies when arguments are renamed by location: the nodes every
+    /// such position applies already name each renamed key in it at its path. Those
+    /// nodes start at `node`, or at its position when no `$ref` enters the in-place
+    /// chain between them, or at the deepest node on that chain a `$ref` enters. More
+    /// nodes name more keys, except through `unevaluated*` keywords, so a tool with those
+    /// (`unevaluated`) never passes.
+    fn located_instance(&self, node: NodeId, instance: &[u8], unevaluated: bool, depth: Option<usize>) -> bool {
+        let every = rename_keys(instance, &self.to_claude);
+        if every == instance {
+            return true;
+        }
+        if unevaluated {
+            return false;
+        }
+        // The proof starts at this instance, but replay and answers start at the tool
+        // root. Every renamed key must fit the walk's budget at every possible use.
+        let mut deepest = 0;
+        object_keys(instance, |key, at| {
+            if self.to_claude.contains_key(&key) {
+                deepest = deepest.max(at);
+            }
+        });
+        // ponytail: unproved use depths decline the tool; an indexed instance walk
+        // without a depth-dependent rescan ceiling would remove this fallback.
+        if depth.is_some_and(|at| at + deepest >= WALK_DEPTH_LIMIT) {
+            return false;
+        }
+        let tree = &self.tree;
+        let anchor = tree.nodes[node].position;
+        let pointer = &tree.nodes[node].pointer;
+        let below = tree.nodes[anchor].pointer.len();
+        let mut start = anchor;
+        for (i, _) in pointer.iter().enumerate().filter(|&(i, b)| *b == b'/' && i > below) {
+            if let Some(&m) = tree.pointers.get(&pointer[..i])
+                && tree.referenced.contains(&m)
+            {
+                start = m;
+            }
+        }
+        if node != anchor && tree.referenced.contains(&node) {
+            start = node;
+        }
+        self.rename_from(start, instance, Direction::ToClaude) == every
+    }
+
+    /// `schema` with its rejected property keys, and the references naming them, renamed,
+    /// and every renamed key in its `const` and `enum` instances, which [`Self::of`]
+    /// checked arguments take wherever those apply.
     pub(crate) fn schema(&self, schema: &[u8]) -> Vec<u8> {
         let (tokens, _) = walk(schema);
-        let edits = tokens
+        let mut edits: Vec<Edit> = tokens
             .keys
             .iter()
             .chain(&tokens.references)
-            .filter_map(|t| self.to_claude.get(&t.text).map(|name| (t, name)));
+            .filter_map(|t| {
+                let name = self.to_claude.get(&t.text)?;
+                Some(Edit {
+                    start: t.start,
+                    end: t.end,
+                    with: Replacement::Name(name),
+                })
+            })
+            .collect();
+        for &(_, instance) in &tokens.instances {
+            let renamed = rename_keys(instance, &self.to_claude);
+            if renamed != instance {
+                let start = offset(schema, instance);
+                edits.push(Edit {
+                    start,
+                    end: start + instance.len(),
+                    with: Replacement::Raw(renamed),
+                });
+            }
+        }
         splice(schema, edits)
     }
 
@@ -712,9 +832,14 @@ impl PropertyKeys {
     /// and element transitions are computed once per node set, and a set without
     /// branches resolves once, so like elements of a long array cost a lookup each.
     fn rename(&self, node: NodeId, json: &[u8], direction: Direction) -> Vec<u8> {
-        let Some(position) = self.tree.nodes.get(node).map(|n| n.position) else {
-            return json.to_vec();
-        };
+        match self.tree.nodes.get(node) {
+            Some(n) => self.rename_from(n.position, json, direction),
+            None => json.to_vec(),
+        }
+    }
+
+    /// [`Self::rename`] with `position` alone as the start set.
+    fn rename_from(&self, position: NodeId, json: &[u8], direction: Direction) -> Vec<u8> {
         if !gj::valid(json) {
             return json.to_vec();
         }
@@ -779,8 +904,15 @@ impl PropertyKeys {
                 _ => {}
             }
         }
-        let edits: Vec<(&Token, &Vec<u8>)> = edits.iter().map(|(t, n)| (t, *n)).collect();
-        splice(json, edits.into_iter())
+        let edits = edits
+            .iter()
+            .map(|(t, name)| Edit {
+                start: t.start,
+                end: t.end,
+                with: Replacement::Name(name),
+            })
+            .collect();
+        splice(json, edits)
     }
 
     /// A member key's new name when a schema in `set` names the renamed key.
@@ -1280,6 +1412,27 @@ impl<'k> Sets<'k> {
 }
 
 impl Tree {
+    /// Maximum possible depth of each node's instance from the tool root, capped at
+    /// the argument walk's ceiling. In-place edges cost zero; member/element edges
+    /// cost one. References can form cycles, so depths only grow up to the ceiling:
+    /// each node is revisited at most WALK_DEPTH_LIMIT + 1 times.
+    fn instance_depths(&self) -> Vec<Option<usize>> {
+        let mut depths = vec![None; self.nodes.len()];
+        depths[ROOT] = Some(0);
+        let mut queue = vec![ROOT];
+        while let Some(n) = queue.pop() {
+            let depth = depths[n].unwrap();
+            for (child, moving) in self.children(n) {
+                let next = (depth + usize::from(moving)).min(WALK_DEPTH_LIMIT);
+                if depths[child].is_none_or(|old| next > old) {
+                    depths[child] = Some(next);
+                    queue.push(child);
+                }
+            }
+        }
+        depths
+    }
+
     /// Each subschema of `n`, and whether it describes a different instance position.
     fn children(&self, n: NodeId) -> impl Iterator<Item = (NodeId, bool)> + '_ {
         let node = &self.nodes[n];
@@ -1434,7 +1587,7 @@ fn moves_position(keyword: &[u8]) -> bool {
 /// keys and the references naming them, and the [`Tree`] of its subschemas. Walks keep
 /// their open subschemas on the heap and stop at [`WALK_DEPTH_LIMIT`] nested subschemas,
 /// leaving deeper ones as they are.
-fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
+fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
     let mut tokens = SchemaTokens::default();
     let mut tree = Tree::default();
     if !gj::valid(schema) {
@@ -1551,6 +1704,9 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                     node.check.types = Some(types);
                 }
             } else if name == b"const" {
+                if object || array {
+                    tokens.instances.push((id, member));
+                }
                 match Scalar::parse(member).filter(|_| !object && !array) {
                     Some(value) => node.check.values.push(Values::new(vec![value])),
                     None => complete = false,
@@ -1558,6 +1714,10 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
             } else if name == b"enum" && array {
                 let mut values = Some(vec![]);
                 array_items(member, |raw, _, _| {
+                    if matches!(raw.first(), Some(b'{' | b'[')) {
+                        // Each item is a whole instance of this node, not an element.
+                        tokens.instances.push((id, raw));
+                    }
                     let value = Scalar::parse(raw).filter(|_| !matches!(raw.first(), Some(b'{' | b'[')));
                     match (&mut values, value) {
                         (Some(list), Some(v)) => list.push(v),
@@ -1684,7 +1844,10 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
     for n in 0..tree.nodes.len() {
         if let Some(reference) = tree.nodes[n].reference.take() {
             match tree.resolve(&reference) {
-                Some(target) => tree.nodes[n].all_of.push(target),
+                Some(target) => {
+                    tree.nodes[n].all_of.push(target);
+                    tree.referenced.insert(target);
+                }
                 // An unresolved reference may hold any constraint.
                 None => tree.nodes[n].check.complete = false,
             }
@@ -1747,19 +1910,104 @@ fn string_token(doc: &[u8], raw: &[u8], text: &[u8]) -> Token {
     }
 }
 
-/// `doc` with each token replaced by its quoted name, in one pass.
-fn splice<'a>(doc: &[u8], edits: impl Iterator<Item = (&'a Token, &'a Vec<u8>)>) -> Vec<u8> {
-    let mut edits: Vec<_> = edits.collect();
+/// Every object key of `json` found in `map`, renamed, at any depth up to
+/// [`WALK_DEPTH_LIMIT`]; values are never touched. Only for `const` and `enum` instances
+/// ([`PropertyKeys::located_instance`]): arguments are renamed by location.
+fn rename_keys(json: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    if !gj::valid(json) {
+        return json.to_vec();
+    }
+    let root = &json[json.iter().take_while(|b| b.is_ascii_whitespace()).count()..];
+    let mut edits: Vec<Edit> = vec![];
+    let mut stack: Vec<(&[u8], usize)> = vec![(root, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= WALK_DEPTH_LIMIT {
+            continue;
+        }
+        let mut children: Vec<&[u8]> = vec![];
+        match node.first() {
+            Some(b'{') => gj::object_members(node, |key, escaped, value| {
+                let token = key_token(json, key, escaped);
+                if let Some(name) = map.get(&token.text) {
+                    edits.push(Edit {
+                        start: token.start,
+                        end: token.end,
+                        with: Replacement::Name(name),
+                    });
+                }
+                children.push(value);
+                true
+            }),
+            Some(b'[') => array_items(node, |raw, _, _| children.push(raw)),
+            _ => {}
+        }
+        stack.extend(
+            children
+                .into_iter()
+                .filter(|c| matches!(c.first(), Some(b'{' | b'[')))
+                .map(|c| (c, depth + 1)),
+        );
+    }
+    splice(json, edits)
+}
+
+/// Each object key in `value`, a valid JSON value, decoded, at any depth up to
+/// [`WALK_DEPTH_LIMIT`].
+fn object_keys(value: &[u8], mut f: impl FnMut(Vec<u8>, usize)) {
+    let mut stack: Vec<(&[u8], usize)> = vec![(value, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= WALK_DEPTH_LIMIT {
+            continue;
+        }
+        let mut children: Vec<&[u8]> = vec![];
+        match node.first() {
+            Some(b'{') => gj::object_members(node, |key, escaped, value| {
+                f(if escaped { gj::unescape(key) } else { key.to_vec() }, depth);
+                children.push(value);
+                true
+            }),
+            Some(b'[') => array_items(node, |raw, _, _| children.push(raw)),
+            _ => {}
+        }
+        stack.extend(
+            children
+                .into_iter()
+                .filter(|c| matches!(c.first(), Some(b'{' | b'[')))
+                .map(|c| (c, depth + 1)),
+        );
+    }
+}
+
+/// One replacement in a document: the byte range `start..end` becomes `with`.
+struct Edit<'a> {
+    start: usize,
+    end: usize,
+    with: Replacement<'a>,
+}
+
+enum Replacement<'a> {
+    /// A key or string, written quoted.
+    Name(&'a [u8]),
+    /// JSON written as it is.
+    Raw(Vec<u8>),
+}
+
+/// `doc` with each edit applied, in one pass. Edits never overlap: names come from
+/// schema positions, instances from `const` and `enum` values, which are not walked.
+fn splice(doc: &[u8], mut edits: Vec<Edit>) -> Vec<u8> {
     if edits.is_empty() {
         return doc.to_vec();
     }
-    edits.sort_by_key(|(t, _)| t.start);
+    edits.sort_by_key(|e| e.start);
     let mut out = Vec::with_capacity(doc.len() + edits.len() * 4);
     let mut at = 0;
-    for (token, name) in edits {
-        out.extend_from_slice(&doc[at..token.start]);
-        gj::marshal_str(&mut out, name, false);
-        at = token.end;
+    for edit in edits {
+        out.extend_from_slice(&doc[at..edit.start]);
+        match &edit.with {
+            Replacement::Name(name) => gj::marshal_str(&mut out, name, false),
+            Replacement::Raw(raw) => out.extend_from_slice(raw),
+        }
+        at = edit.end;
     }
     out.extend_from_slice(&doc[at..]);
     out
@@ -2535,6 +2783,114 @@ mod tests {
         let p = keys.tree.resolve(b"#/properties/p").unwrap();
         assert_eq!(keys.instance_to_claude(p, br##"{"x y":1}"##), br##"{"x_y":1}"##);
         assert_eq!(keys.instance_to_claude(ROOT, br##"{"x y":1}"##), br##"{"x y":1}"##);
+    }
+
+    #[test]
+    fn instance_constraints_respect_the_budget_at_every_use_depth() {
+        for nested in [WALK_DEPTH_LIMIT - 2, WALK_DEPTH_LIMIT - 1] {
+            let mut instance = r#"{"x y":1}"#.to_owned();
+            for _ in 0..nested {
+                instance = format!(r#"{{"next":{instance}}}"#);
+            }
+            let schema = format!(
+                r##"{{"$defs":{{"n":{{"properties":{{"x y":{{}},"next":{{"$ref":"#/$defs/n"}}}}}}}},"properties":{{"p":{{"$ref":"#/$defs/n","const":{instance}}}}}}}"##
+            );
+            if nested + 1 >= WALK_DEPTH_LIMIT {
+                // The const's local proof could rename the leaf, but replay adds p.
+                assert!(PropertyKeys::of(schema.as_bytes()).is_none());
+            } else {
+                let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
+                let client = format!(r#"{{"p":{instance}}}"#);
+                let wire = client.replace("x y", "x_y");
+                assert_eq!(String::from_utf8(keys.to_claude(client.as_bytes())).unwrap(), wire);
+                assert_eq!(String::from_utf8(keys.to_client(wire.as_bytes())).unwrap(), client);
+            }
+        }
+        // A constraint inside a recursive definition can occur at unbounded depth.
+        let reused = br##"{"$defs":{"n":{"properties":{"x y":{},"next":{"$ref":"#/$defs/n"}},"const":{"x y":1}}},"properties":{"p":{"$ref":"#/$defs/n"}}}"##;
+        assert!(PropertyKeys::of(reused).is_none());
+        // A cycle that stays at the same position does not spend the depth budget.
+        let in_place = br##"{"properties":{"x y":{}},"const":{"x y":1},"allOf":[{"$ref":"#"}]}"##;
+        assert!(PropertyKeys::of(in_place).is_some());
+    }
+
+    #[test]
+    fn generated_names_avoid_keys_named_only_by_required_or_dependencies() {
+        let schema = br##"{"properties":{"p":{"properties":{"x y":{}},"required":["x_y"],"dependentRequired":{"x_y_2":["z"]}}}}"##;
+        let keys = PropertyKeys::of(schema).unwrap();
+        assert_eq!(
+            String::from_utf8(keys.schema(schema)).unwrap(),
+            r##"{"properties":{"p":{"properties":{"x_y_3":{}},"required":["x_y"],"dependentRequired":{"x_y_2":["z"]}}}}"##
+        );
+        round_trip(
+            schema,
+            r##"{"p":{"x y":1,"x_y":2,"x_y_2":3,"z":true}}"##,
+            r##"{"p":{"x_y_3":1,"x_y":2,"x_y_2":3,"z":true}}"##,
+        );
+    }
+
+    #[test]
+    fn instances_the_nodes_at_their_schema_name_keep_location_renames() {
+        // The root names `a b` for its `anyOf` const; `o` names `c d` for its enum items
+        // wherever `$ref` applies it. Free-form data keeps its keys in arguments.
+        let schema = br##"{"properties":{"kind":{},"a b":{"const":"a b"},"p":{"$ref":"#/$defs/o"},"m":{"additionalProperties":true}},"$defs":{"o":{"properties":{"c d":{}},"enum":[{"c d":1},"c d",null]}},"anyOf":[{"const":{"kind":"x","a b":3}}],"default":{"a b":4}}"##;
+        let keys = PropertyKeys::of(schema).unwrap();
+        assert_eq!(
+            String::from_utf8(keys.schema(schema)).unwrap(),
+            r##"{"properties":{"kind":{},"a_b":{"const":"a b"},"p":{"$ref":"#/$defs/o"},"m":{"additionalProperties":true}},"$defs":{"o":{"properties":{"c_d":{}},"enum":[{"c_d":1},"c d",null]}},"anyOf":[{"const":{"kind":"x","a_b":3}}],"default":{"a b":4}}"##
+        );
+        round_trip(
+            schema,
+            r##"{"kind":"x","a b":3,"p":{"c d":1},"m":{"a b":5,"a_b":6}}"##,
+            r##"{"kind":"x","a_b":3,"p":{"c_d":1},"m":{"a b":5,"a_b":6}}"##,
+        );
+    }
+
+    #[test]
+    fn an_instance_its_positions_disagree_on_declines_the_tool() {
+        // `c` applies at `p`, which declares `x y`, and at free-form `q`: one const cannot
+        // hold both spellings.
+        let shared = br##"{"$defs":{"c":{"const":{"x y":1}}},"properties":{"p":{"$ref":"#/$defs/c","properties":{"x y":{}},"required":["x y"]},"q":{"$ref":"#/$defs/c","additionalProperties":true}}}"##;
+        // Even with `c` used only at `p`, `c`'s own nodes do not name `x y`.
+        let one_use = br##"{"$defs":{"c":{"const":{"x y":1}}},"properties":{"p":{"$ref":"#/$defs/c","properties":{"x y":{}},"required":["x y"]},"other":{"additionalProperties":true}}}"##;
+        // Free-form `m` holds `a b` data in its const; an array enum item has no element
+        // schema naming `c d`; a sibling `allOf` declares what `p`'s own const holds.
+        let free = br##"{"properties":{"a b":{},"m":{"additionalProperties":true,"const":{"a b":1}}}}"##;
+        let items = br##"{"properties":{"c d":{}},"enum":[[{"c d":2}]]}"##;
+        let sibling =
+            br##"{"properties":{"p":{"const":{"x y":1}}},"allOf":[{"properties":{"p":{"properties":{"x y":{}}}}}]}"##;
+        for schema in [&shared[..], one_use, free, items, sibling] {
+            assert!(
+                PropertyKeys::of(schema).is_none(),
+                "{}",
+                String::from_utf8_lossy(schema)
+            );
+        }
+    }
+
+    #[test]
+    fn a_ref_into_an_in_place_member_starts_there() {
+        // `#/properties/p/allOf/0` is also applied at free-form `q`, so `p`'s names do not
+        // reach it everywhere.
+        let schema = br##"{"properties":{"p":{"properties":{"x y":{}},"allOf":[{"const":{"x y":1}}]},"q":{"$ref":"#/properties/p/allOf/0"}}}"##;
+        assert!(PropertyKeys::of(schema).is_none());
+        let alone = br##"{"properties":{"p":{"properties":{"x y":{}},"allOf":[{"const":{"x y":1}}]}}}"##;
+        let keys = PropertyKeys::of(alone).unwrap();
+        assert_eq!(
+            String::from_utf8(keys.schema(alone)).unwrap(),
+            r##"{"properties":{"p":{"properties":{"x_y":{}},"allOf":[{"const":{"x_y":1}}]}}}"##
+        );
+    }
+
+    #[test]
+    fn unevaluated_keywords_or_plain_instances_decide_whether_to_rename() {
+        // `unevaluated*` can drop names as nodes are added, so the check never passes.
+        let unevaluated =
+            br##"{"properties":{"x y":{}},"unevaluatedProperties":{"properties":{"z":{}}},"const":{"x y":1}}"##;
+        assert!(PropertyKeys::of(unevaluated).is_none());
+        // An instance without a renamed key fits every position as it is.
+        let plain = br##"{"properties":{"x y":{},"m":{"additionalProperties":true,"const":{"z":1}}},"unevaluatedProperties":false}"##;
+        assert!(PropertyKeys::of(plain).is_some());
     }
 
     #[test]
