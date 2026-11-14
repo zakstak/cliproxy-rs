@@ -31,8 +31,9 @@
 //! stay as sent. A `$ref` pointer into a renamed property keeps the client's key (#196).
 //! Schemas past [`MAX_SCHEMA_NODES`] subschemas are sent unchanged (no renames at all),
 //! which bounds the per-member and per-element work of the argument walk.
-//! ponytail: a `patternProperties` pattern the `regex` crate cannot compile (ECMA-262
-//! lookaround, backreferences) is treated as matching every key.
+//! `patternProperties` patterns are matched with ECMA-262's character classes; a
+//! pattern the `regex` crate cannot express (lookaround, backreferences) is unknown,
+//! and both its subschema and `additionalProperties` apply.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -203,14 +204,76 @@ struct Pattern {
 }
 
 impl Pattern {
-    /// Whether `key` may match; a pattern this crate cannot compile matches everything.
-    fn matches(&self, key: &[u8]) -> bool {
+    /// Whether `key` matches, with ECMA-262's (non-`u`) meaning of the pattern; `None`
+    /// when the pattern has no faithful translation here or `key` holds a character
+    /// outside the BMP, which ECMA-262 reads as two code units.
+    fn matches(&self, key: &[u8]) -> Option<bool> {
         let compiled = self.compiled.get_or_init(|| {
-            let source = std::str::from_utf8(&self.source).ok()?;
-            RegexBuilder::new(source).size_limit(1 << 20).build().ok()
+            let source = ecma_pattern(std::str::from_utf8(&self.source).ok()?)?;
+            RegexBuilder::new(&source).size_limit(1 << 20).build().ok()
         });
-        compiled.as_ref().is_none_or(|r| r.is_match(key))
+        let key_is_bmp = !key.iter().any(|&b| b >= 0xF0);
+        compiled.as_ref().filter(|_| key_is_bmp).map(|r| r.is_match(key))
     }
+}
+
+/// ECMA-262 white space and line terminators, as a class body.
+const ECMA_SPACE: &str =
+    r"\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+
+/// An ECMA-262 pattern rewritten for the `regex` crate: `\d`, `\w`, `\s` and their
+/// negations, `\b`, `\B` and `.` get ECMA's character sets instead of Unicode's.
+/// Other syntax passes through, and what the crate rejects (lookaround,
+/// backreferences, `\c`, `[^]`) leaves the pattern unknown. `None` for a negated
+/// class escape inside a character class, which has no class-body equivalent.
+/// ponytail: case-insensitive and other flags do not occur in JSON Schema patterns;
+/// a full ECMA-262 regex engine is the upgrade if a schema needs lookaround.
+fn ecma_pattern(source: &str) -> Option<String> {
+    let mut out = String::with_capacity(source.len() + 16);
+    let mut in_class = false;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        match (c, in_class) {
+            ('\\', _) => {
+                let escaped = chars.next()?;
+                let replacement = match (escaped, in_class) {
+                    ('d', false) => "[0-9]".to_owned(),
+                    ('D', false) => "[^0-9]".to_owned(),
+                    ('w', false) => "[0-9A-Za-z_]".to_owned(),
+                    ('W', false) => "[^0-9A-Za-z_]".to_owned(),
+                    ('s', false) => format!("[{ECMA_SPACE}]"),
+                    ('S', false) => format!("[^{ECMA_SPACE}]"),
+                    ('b', false) => r"(?-u:\b)".to_owned(),
+                    ('B', false) => r"(?-u:\B)".to_owned(),
+                    ('d', true) => "0-9".to_owned(),
+                    ('w', true) => "0-9A-Za-z_".to_owned(),
+                    ('s', true) => ECMA_SPACE.to_owned(),
+                    ('b', true) => r"\x08".to_owned(),
+                    ('D' | 'W' | 'S', true) => return None,
+                    (other, _) => format!("\\{other}"),
+                };
+                out.push_str(&replacement);
+            }
+            ('[', false) => {
+                in_class = true;
+                out.push('[');
+                // A leading `^` negates. ECMA's `[]` and `[^]` close at once and reach the
+                // crate as `[]`/`[^]`, which it rejects, so the pattern is unknown.
+                let rest = chars.as_str();
+                if let Some(stripped) = rest.strip_prefix('^') {
+                    out.push('^');
+                    chars = stripped.chars();
+                }
+            }
+            (']', true) => {
+                in_class = false;
+                out.push(']');
+            }
+            ('.', false) => out.push_str(r"[^\n\r\x{2028}\x{2029}]"),
+            (other, _) => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 /// The keywords a branch discriminator usually uses (`type`, scalar `const` and
@@ -936,11 +999,17 @@ impl<'k> Sets<'k> {
         let mut next = index.properties.get(key).cloned().unwrap_or_default();
         for &n in &index.open {
             let node = self.node(n);
+            // A pattern that may match applies; `additionalProperties` applies unless one
+            // certainly matches. An unknown pattern applies both, as undecided branches do.
             let mut matched = false;
             for (pattern, child) in &node.patterns {
-                if pattern.matches(key) {
-                    matched = true;
-                    next.push(*child);
+                match pattern.matches(key) {
+                    Some(true) => {
+                        matched = true;
+                        next.push(*child);
+                    }
+                    None => next.push(*child),
+                    Some(false) => {}
                 }
             }
             if !matched && !node.properties.contains_key(key) {
@@ -952,7 +1021,7 @@ impl<'k> Sets<'k> {
                 evaluated
                     .patterns
                     .iter()
-                    .any(|&m| self.node(m).patterns.iter().any(|(p, _)| p.matches(key)))
+                    .any(|&m| self.node(m).patterns.iter().any(|(p, _)| p.matches(key) == Some(true)))
             };
             if !evaluated.all && !evaluated.keys.contains(key) && !matched() {
                 next.extend(&self.node(*n).unevaluated);
@@ -1849,6 +1918,46 @@ mod tests {
         assert_eq!(type_is(b"9007199254740993", b"integer"), None);
         assert_eq!(type_is(b"1.5", b"integer"), Some(false));
         assert_eq!(type_is(b"3", b"integer"), Some(true));
+    }
+
+    #[test]
+    fn patterns_use_ecma_character_classes() {
+        let pattern = |p: &str| Pattern {
+            source: p.as_bytes().to_vec(),
+            compiled: OnceLock::new(),
+        };
+        assert_eq!(pattern(r"^\d+$").matches("١".as_bytes()), Some(false));
+        assert_eq!(pattern(r"^\d+$").matches(b"12"), Some(true));
+        assert_eq!(pattern(r"^\w$").matches("é".as_bytes()), Some(false));
+        assert_eq!(pattern(r"^\W$").matches("é".as_bytes()), Some(true));
+        assert_eq!(pattern(r"^[\d_]+$").matches(b"1_2"), Some(true));
+        assert_eq!(pattern(r"^[\d]+$").matches("٣".as_bytes()), Some(false));
+        assert_eq!(pattern(r"^\s$").matches("\u{FEFF}".as_bytes()), Some(true));
+        assert_eq!(pattern(r"^\s$").matches("\u{85}".as_bytes()), Some(false));
+        assert_eq!(pattern(r"^.$").matches(b"\r"), Some(false));
+        assert_eq!(pattern(r"^.$").matches("é".as_bytes()), Some(true));
+        // Multibyte literals and `.` read one character, not one byte.
+        assert_eq!(pattern("^é$").matches("é".as_bytes()), Some(true));
+        assert_eq!(pattern("^[éa]$").matches("é".as_bytes()), Some(true));
+        assert_eq!(pattern(r"^..$").matches("é".as_bytes()), Some(false));
+        assert_eq!(pattern(r"a\b").matches("aé".as_bytes()), Some(true));
+        assert_eq!(pattern(r"^[^\d]$").matches(b"x"), Some(true));
+        // Unknown: no faithful translation, a rejected construct, a non-BMP key.
+        assert_eq!(pattern(r"^[\D]$").matches(b"x"), None);
+        assert_eq!(pattern(r"^(?=a)").matches(b"a"), None);
+        assert_eq!(pattern(r"^.$").matches("😀".as_bytes()), None);
+
+        let schema = br##"{"properties":{"map":{"patternProperties":{"^\\d+$":true},
+            "additionalProperties":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"map":{"١":{"x y":1},"1":{"x_y":2}}}"##,
+            r##"{"map":{"١":{"x_y":1},"1":{"x_y":2}}}"##,
+        );
+        // An unknown pattern applies with `additionalProperties`.
+        let unknown = br##"{"properties":{"map":{"patternProperties":{"^(?=k)":true},
+            "additionalProperties":{"properties":{"x y":{}}}}}}"##;
+        round_trip(unknown, r##"{"map":{"k":{"x y":1}}}"##, r##"{"map":{"k":{"x_y":1}}}"##);
     }
 
     #[test]
