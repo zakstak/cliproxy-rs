@@ -657,3 +657,50 @@ fn schemas_past_the_node_cap_are_left_as_sent() {
     let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
     assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
 }
+
+/// A pattern that would match the generated name but not the client's key
+/// (`^x_y$`) declines the tool as a whole, on both formats: renaming `x y` would put
+/// `{"free":1}` under that pattern's `required`/`additionalProperties: false`.
+#[test]
+fn patterns_that_change_applicability_leave_the_tool_as_sent() {
+    let schema = json!({"type": "object", "properties": {"p": {
+        "properties": {"x y": {"type": "object"}},
+        "patternProperties": {"^x_y$": {"properties": {"a b": {}}, "required": ["a b"], "additionalProperties": false}}
+    }}});
+    let args = json!({"p": {"x y": {"free": 1}}});
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": args.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": args.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string();
+    for (format, body) in [(Format::OpenAI, &chat), (Format::OpenAIResponse, &responses)] {
+        let out = translate(format, body.as_bytes());
+        let sent = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(sent["properties"]["p"], schema["properties"]["p"], "{format:?}");
+        assert_eq!(tool_use_input(&out), &args, "{format:?}");
+    }
+    let answer = claude_answer(args.clone(), "f");
+    let body = non_stream(Format::OpenAI, chat.as_bytes(), &answer);
+    assert_eq!(
+        parse_args(&body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+        args
+    );
+    let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
+    assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
+}

@@ -36,7 +36,9 @@
 //! which bounds the per-member and per-element work of the argument walk.
 //! `patternProperties` patterns are matched with ECMA-262's character classes; a
 //! pattern the `regex` crate cannot express (lookaround, backreferences) is unknown,
-//! and both its subschema and `additionalProperties` apply.
+//! and both its subschema and `additionalProperties` apply. Claude's schema keeps
+//! patterns as written, so a tool is declined as a whole when any pattern matches a
+//! renamed key and its generated name differently, or cannot be decided for either.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -612,6 +614,18 @@ impl PropertyKeys {
             assigned.insert(name.clone());
             to_claude.insert(original.to_vec(), name.clone());
             to_client.insert(name, original.to_vec());
+        }
+        // The wire schema keeps patterns unchanged. A generated name must therefore
+        // match exactly the same patterns as its original spelling, or arbitrary
+        // constraints (not only member names) would apply to a different value.
+        // ponytail: unproved pattern equivalence declines the whole tool; translating
+        // pattern applicability per renamed property is the upgrade.
+        if tree.nodes.iter().flat_map(|n| &n.patterns).any(|(pattern, _)| {
+            to_claude.iter().any(|(client, wire)| {
+                !matches!((pattern.matches(client), pattern.matches(wire)), (Some(a), Some(b)) if a == b)
+            })
+        }) {
+            return None;
         }
         let mut tree = tree;
         for node in &mut tree.nodes {
@@ -2141,10 +2155,10 @@ mod tests {
             r##"{"map":{"١":{"x y":1},"1":{"x_y":2}}}"##,
             r##"{"map":{"١":{"x_y":1},"1":{"x_y":2}}}"##,
         );
-        // An unknown pattern applies with `additionalProperties`.
+        // Unproved pattern applicability declines renaming.
         let unknown = br##"{"properties":{"map":{"patternProperties":{"^(?=k)":true},
             "additionalProperties":{"properties":{"x y":{}}}}}}"##;
-        round_trip(unknown, r##"{"map":{"k":{"x y":1}}}"##, r##"{"map":{"k":{"x_y":1}}}"##);
+        assert!(PropertyKeys::of(unknown).is_none());
     }
 
     #[test]
@@ -2301,11 +2315,17 @@ mod tests {
     }
 
     #[test]
-    fn patterns_match_either_spelling_of_a_renamed_key() {
-        // Claude sees `x_y` and the unchanged pattern `^x_y$`; the client sees `x y`.
-        let schema = br##"{"properties":{"p":{"properties":{"x y":{}},
-            "patternProperties":{"^x_y$":{"properties":{"a b":{}}}}}}}"##;
-        round_trip(schema, r##"{"p":{"x y":{"a b":1}}}"##, r##"{"p":{"x_y":{"a_b":1}}}"##);
+    fn patterns_that_change_applicability_decline_the_tool() {
+        // A new match would add required/additionalProperties constraints to an
+        // originally free-form value. A lost match would drop those constraints.
+        for pattern in ["^x_y$", "^x y$"] {
+            let schema = format!(
+                r##"{{"properties":{{"p":{{"properties":{{"x y":{{"type":"object"}}}},"patternProperties":{{"{pattern}":{{"properties":{{"a b":{{}}}},"required":["a b"],"additionalProperties":false}}}}}}}}}}"##
+            );
+            assert!(PropertyKeys::of(schema.as_bytes()).is_none());
+        }
+        let stable = br##"{"properties":{"p":{"properties":{"x y":{}},"patternProperties":{"^(x y|x_y)$":{"properties":{"a b":{}}}}}}}"##;
+        round_trip(stable, r##"{"p":{"x y":{"a b":1}}}"##, r##"{"p":{"x_y":{"a_b":1}}}"##);
     }
 
     #[test]
