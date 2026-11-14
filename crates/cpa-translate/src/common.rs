@@ -874,6 +874,15 @@ pub fn thinking_text(part: &Res<'_>) -> Vec<u8> {
     vec![]
 }
 
+/// Anthropic `usage.output_tokens_details.thinking_tokens`: the reasoning share of
+/// `output_tokens`, which stays the inclusive total (anthropic-sdk-python 5139cf2e,
+/// `types/usage.py`, `types/output_tokens_details.py`). Anthropic types it as an
+/// integer, so a missing, null or non-number value reports nothing rather than 0.
+pub(crate) fn claude_thinking_tokens(usage: &Res<'_>) -> Option<i64> {
+    let thinking = usage.get("output_tokens_details.thinking_tokens");
+    (thinking.kind == Kind::Number).then(|| thinking.int())
+}
+
 // ---------------------------------------------------------------------------------------
 // Claude system text (common/claude_system.go)
 

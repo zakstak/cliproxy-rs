@@ -8,7 +8,7 @@ use crate::{
     common::{self, now_unix},
     stream::GoStream,
 };
-use cpa_common::json::{self as gj, Kind, Res};
+use cpa_common::json::{self as gj, Res};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Default)]
@@ -17,10 +17,8 @@ struct Usage {
     output: i64,
     creation: i64,
     read: i64,
-    /// Anthropic `usage.output_tokens_details.thinking_tokens`: the reasoning share of
-    /// `output_tokens`, which stays the inclusive total (anthropic-sdk-python 5139cf2e,
-    /// `types/usage.py`, `types/output_tokens_details.py`). `None` until a usage
-    /// object reports it, so an unreported count is never written as 0.
+    /// [`common::claude_thinking_tokens`]. `None` until a usage object reports it, so
+    /// an unreported count is never written as 0.
     thinking: Option<i64>,
     present: bool,
 }
@@ -44,11 +42,8 @@ impl Usage {
                 *target = value.int();
             }
         }
-        // Anthropic types the count as an integer; a null or any other non-number
-        // reports nothing, so it is not coerced to 0.
-        let thinking = usage.get("output_tokens_details.thinking_tokens");
-        if thinking.kind == Kind::Number {
-            self.thinking = Some(thinking.int());
+        if let Some(thinking) = common::claude_thinking_tokens(usage) {
+            self.thinking = Some(thinking);
         }
     }
 
