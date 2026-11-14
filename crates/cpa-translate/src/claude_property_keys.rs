@@ -29,11 +29,8 @@
 //! ponytail: `$ref` resolution covers local JSON pointers (`#`, `#/...`) from the root;
 //! anchors, `$id`-relative and remote references are not followed, so keys under them
 //! stay as sent. A `$ref` pointer into a renamed property keeps the client's key (#196).
-//! ponytail: each member costs a lookup in the merged index of the subschemas applying
-//! at its object, plus one check per applying subschema with `patternProperties`,
-//! `additionalProperties` or `unevaluatedProperties` subschemas; many of those at one
-//! position are linear in their count per member. Merging their member rules into the
-//! index is the upgrade.
+//! Schemas past [`MAX_SCHEMA_NODES`] subschemas are sent unchanged (no renames at all),
+//! which bounds the per-member and per-element work of the argument walk.
 //! ponytail: a `patternProperties` pattern the `regex` crate cannot compile (ECMA-262
 //! lookaround, backreferences) is treated as matching every key.
 
@@ -45,6 +42,17 @@ use cpa_common::schema::{SCHEMA_MAP_KEYWORDS, SCHEMA_VALUE_KEYWORDS};
 use regex::bytes::{Regex, RegexBuilder};
 
 const MAX_KEY: usize = 64;
+
+/// The most subschemas (objects and booleans, at any depth) a tool's schema may have for
+/// its keys to be renamed. Every per-member and per-element step of the argument walk
+/// is bounded by the number of subschemas applying there, so this cap keeps that walk
+/// linear in the arguments with a fixed factor. A larger schema is sent as the client
+/// wrote it, and its arguments and returned calls are left alone, as for a schema
+/// Claude accepts: the rename is declined as a whole, never applied in part.
+/// ponytail: 512 nodes covers MCP and OpenAI tool schemas seen so far; a schema past it
+/// with a rejected key gets Claude's 400 again. Merging member rules per set (so a
+/// step's cost is independent of the set's size) is the upgrade that lifts it.
+pub(crate) const MAX_SCHEMA_NODES: usize = 512;
 
 /// Whether Claude accepts `key` as an input_schema property key.
 fn accepted(key: &[u8]) -> bool {
@@ -281,6 +289,9 @@ impl PropertyKeys {
     /// Deterministic for the same schema bytes, so the cached prompt prefix stays stable.
     pub(crate) fn of(schema: &[u8]) -> Option<Self> {
         let (tokens, tree) = walk(schema);
+        if tree.nodes.len() > MAX_SCHEMA_NODES {
+            return None;
+        }
         let mut taken: HashSet<&[u8]> = HashSet::new();
         let mut seen: HashSet<&[u8]> = HashSet::new();
         let mut rejected: Vec<&[u8]> = vec![];
@@ -485,6 +496,14 @@ struct Sets<'k> {
     index: Vec<Option<Index>>,
 }
 
+/// Branch-check verdicts for one instance: by node, and by member subschema and member
+/// value (its position in the arguments). An entry in progress reads as unknown.
+#[derive(Default)]
+struct Memo {
+    checks: HashMap<NodeId, Option<bool>>,
+    members: HashMap<(NodeId, usize), Option<bool>>,
+}
+
 /// What an applicable set says about object members, merged once so that each member
 /// costs a lookup however many subschemas apply.
 #[derive(Default)]
@@ -558,17 +577,21 @@ impl<'k> Sets<'k> {
             return id;
         }
         let mut branched = maybe != NONE;
+        let mut memo = Memo::default();
         let mut seen: HashSet<NodeId> = HashSet::new();
         let mut queue = self.sets[start].clone();
         for m in &self.maybes[maybe] {
             match m {
                 Maybe::Matching(n) => {
-                    if self.check(*n, instance) != Some(false) {
+                    if self.check(*n, instance, &mut memo) != Some(false) {
                         queue.push(*n);
                     }
                 }
                 Maybe::Unless(n, contains) => {
-                    if !contains.iter().any(|&c| self.check(c, instance) == Some(true)) {
+                    if !contains
+                        .iter()
+                        .any(|&c| self.check(c, instance, &mut memo) == Some(true))
+                    {
                         queue.push(*n);
                     }
                 }
@@ -582,14 +605,14 @@ impl<'k> Sets<'k> {
             queue.extend(&node.all_of);
             for &alternative in &node.any_of {
                 branched = true;
-                if self.check(alternative, instance) != Some(false) {
+                if self.check(alternative, instance, &mut memo) != Some(false) {
                     queue.push(alternative);
                 }
             }
             // Without `if`, `then` and `else` are ignored.
             if let [Some(condition), then, otherwise] = node.condition {
                 branched = true;
-                match self.check(condition, instance) {
+                match self.check(condition, instance, &mut memo) {
                     Some(true) => queue.extend([Some(condition), then].into_iter().flatten()),
                     Some(false) => queue.extend(otherwise),
                     None => queue.extend([Some(condition), then, otherwise].into_iter().flatten()),
@@ -642,27 +665,32 @@ impl<'k> Sets<'k> {
 
     /// Whether `instance` matches node `n`: `Some(false)` when the check rules it out,
     /// `Some(true)` when the node and its `allOf` and `$ref` targets hold only checked
-    /// keywords and all pass, `None` when the check cannot tell.
-    fn check(&self, n: NodeId, instance: &Instance<'_>) -> Option<bool> {
-        let mut verdict = Some(true);
-        let mut seen: HashSet<NodeId> = HashSet::new();
-        let mut queue = vec![n];
-        while let Some(n) = queue.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            match self.check_one(n, instance) {
-                Some(false) => return Some(false),
-                Some(true) => {}
-                None => verdict = None,
-            }
-            queue.extend(&self.node(n).all_of);
+    /// keywords and all pass, `None` when the check cannot tell. Each node is checked
+    /// once per instance ([`Memo`]); a reference cycle reads as unknown.
+    fn check(&self, n: NodeId, instance: &Instance<'_>, memo: &mut Memo) -> Option<bool> {
+        if let Some(&verdict) = memo.checks.get(&n) {
+            return verdict;
         }
+        memo.checks.insert(n, None);
+        let mut verdict = self.check_one(n, instance, memo);
+        if verdict != Some(false) {
+            for &target in &self.node(n).all_of {
+                match self.check(target, instance, memo) {
+                    Some(false) => {
+                        verdict = Some(false);
+                        break;
+                    }
+                    None => verdict = None,
+                    Some(true) => {}
+                }
+            }
+        }
+        memo.checks.insert(n, verdict);
         verdict
     }
 
     /// [`Self::check`] for one node's own keywords.
-    fn check_one(&self, n: NodeId, instance: &Instance<'_>) -> Option<bool> {
+    fn check_one(&self, n: NodeId, instance: &Instance<'_>, memo: &mut Memo) -> Option<bool> {
         let check = &self.node(n).check;
         if !scalar_check(check, instance.raw) {
             return Some(false);
@@ -678,7 +706,7 @@ impl<'k> Sets<'k> {
                 let Some(value) = instance.members.get(self.keys.spelling(key, self.direction)) else {
                     continue;
                 };
-                match self.check_member(*child, value) {
+                match self.check_member(*child, value, memo) {
                     Some(false) => return Some(false),
                     Some(true) => {}
                     None => sure = false,
@@ -691,24 +719,34 @@ impl<'k> Sets<'k> {
     /// A member value against its property subschema and that subschema's `allOf` and
     /// `$ref` targets: scalar keywords only, so an object or array value whose schemas
     /// constrain its members is never certain.
-    fn check_member(&self, n: NodeId, value: &[u8]) -> Option<bool> {
-        let structured = matches!(value.first(), Some(b'{' | b'['));
-        let mut verdict = Some(true);
-        let mut seen: HashSet<NodeId> = HashSet::new();
-        let mut queue = vec![n];
-        while let Some(n) = queue.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            let check = &self.node(n).check;
-            if !scalar_check(check, value) {
-                return Some(false);
-            }
-            if !check.complete || (structured && !(check.required.is_empty() && check.members.is_empty())) {
-                verdict = None;
-            }
-            queue.extend(&self.node(n).all_of);
+    fn check_member(&self, n: NodeId, value: &[u8], memo: &mut Memo) -> Option<bool> {
+        let key = (n, value.as_ptr() as usize);
+        if let Some(&verdict) = memo.members.get(&key) {
+            return verdict;
         }
+        memo.members.insert(key, None);
+        let check = &self.node(n).check;
+        let structured = matches!(value.first(), Some(b'{' | b'['));
+        let mut verdict = if !scalar_check(check, value) {
+            Some(false)
+        } else if !check.complete || (structured && !(check.required.is_empty() && check.members.is_empty())) {
+            None
+        } else {
+            Some(true)
+        };
+        if verdict != Some(false) {
+            for &target in &self.node(n).all_of {
+                match self.check_member(target, value, memo) {
+                    Some(false) => {
+                        verdict = Some(false);
+                        break;
+                    }
+                    None => verdict = None,
+                    Some(true) => {}
+                }
+            }
+        }
+        memo.members.insert(key, verdict);
         verdict
     }
 
@@ -1589,17 +1627,38 @@ mod tests {
 
     #[test]
     fn many_in_place_branches_each_declare_their_member() {
-        let branches: Vec<String> = (0..300)
+        let branches: Vec<String> = (0..150)
             .map(|i| format!(r##"{{"properties":{{"k {i}":{{"properties":{{"x y":{{}}}}}}}}}}"##))
             .collect();
         let schema = format!(r##"{{"properties":{{"p":{{"allOf":[{}]}}}}}}"##, branches.join(","));
-        let client: Vec<String> = (0..300).map(|i| format!(r##""k {i}":{{"x y":{i}}}"##)).collect();
-        let claude: Vec<String> = (0..300).map(|i| format!(r##""k_{i}":{{"x_y":{i}}}"##)).collect();
+        let client: Vec<String> = (0..150).map(|i| format!(r##""k {i}":{{"x y":{i}}}"##)).collect();
+        let claude: Vec<String> = (0..150).map(|i| format!(r##""k_{i}":{{"x_y":{i}}}"##)).collect();
         round_trip(
             schema.as_bytes(),
             &format!(r##"{{"p":{{{}}}}}"##, client.join(",")),
             &format!(r##"{{"p":{{{}}}}}"##, claude.join(",")),
         );
+    }
+
+    /// A schema with `n` in-place subschemas beside a rejected key: the walk visits the
+    /// root, `p`, `x y` and each `allOf` member with its `additionalProperties`.
+    fn wide_schema(n: usize) -> String {
+        let branch = r##"{"additionalProperties":{}}"##;
+        format!(
+            r##"{{"properties":{{"p":{{"properties":{{"x y":{{}}}},"allOf":[{}]}}}}}}"##,
+            vec![branch; n].join(",")
+        )
+    }
+
+    #[test]
+    fn schemas_past_the_node_cap_are_left_as_sent() {
+        // root, p, x y: 3 nodes; each branch adds 2.
+        let fits = wide_schema((MAX_SCHEMA_NODES - 3) / 2);
+        let keys = PropertyKeys::of(fits.as_bytes()).unwrap();
+        assert_eq!(keys.to_claude(br##"{"p":{"x y":1}}"##), br##"{"p":{"x_y":1}}"##);
+
+        let wide = wide_schema((MAX_SCHEMA_NODES - 3) / 2 + 1);
+        assert!(PropertyKeys::of(wide.as_bytes()).is_none());
     }
 
     #[test]
