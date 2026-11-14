@@ -114,7 +114,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
     let captures: Value = serde_json::from_str(include_str!("testdata/go_captures.json")).unwrap();
     let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
     let credential = harness_credential();
-    let cfg = Config::parse("").unwrap();
+    let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse("").unwrap());
     for case in captures["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let req = enrich(request(case));
@@ -160,6 +160,10 @@ async fn pipeline_reproduces_go_upstream_captures() {
         for ((k, ours), (_, theirs)) in prepared.headers.iter().zip(&go) {
             if k == "x-client-request-id" {
                 assert!(uuid::Uuid::parse_str(ours).is_ok(), "{name}: request id");
+                continue;
+            }
+            if k == "anthropic-beta" && super::betas::matches_go(ours, theirs, case["upstream_body"].as_str().unwrap())
+            {
                 continue;
             }
             assert_eq!(ours, theirs, "{name}: {k}");
@@ -956,7 +960,9 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             // dates, and whichever ran first used to pin its date for the other.
             std::fs::write(dir.join("auth").join(format!("fixture-{run}.json")), auth).unwrap();
         }
-        let cfg = super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap());
+        let cfg = super::settings::as_recorded_with_2_1_280_profile(
+            super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap()),
+        );
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")
@@ -1107,6 +1113,17 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
             .collect();
         let names = |h: &[(String, String)]| h.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        // First-party API-key requests spell the header as Claude Code 2.1.325 does
+        // (headers::WIRE_CASING); Go records its canonical X-Api-Key.
+        let mut theirs = theirs;
+        if ours.iter().any(|(k, _)| k == "x-api-key") {
+            for (k, _) in &mut theirs {
+                if k == "X-Api-Key" {
+                    *k = "x-api-key".into();
+                }
+            }
+            theirs.sort_by(|a, b| a.0.cmp(&b.0));
+        }
         assert_eq!(names(&ours), names(&theirs), "{name}: header names and casing");
         for ((k, a), (_, b)) in ours.iter().zip(&theirs) {
             if k.eq_ignore_ascii_case("x-client-request-id") && b != "9b6a3f8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b" {
@@ -1123,6 +1140,9 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                     &format!("CLIProxyAPI/{}", env!("CARGO_PKG_VERSION")),
                     "{name}: header {k}"
                 );
+                continue;
+            }
+            if k.eq_ignore_ascii_case("anthropic-beta") && super::betas::matches_go(a, b, &go_body) {
                 continue;
             }
             assert_eq!(a, b, "{name}: header {k}");
@@ -1897,7 +1917,7 @@ async fn compat_replay_sequence_matches_go() {
             .as_str()
             .unwrap()
             .replace("AUTH_DIR", root.to_str().unwrap());
-        let cfg = Config::parse(&text).unwrap();
+        let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse(&text).unwrap());
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")

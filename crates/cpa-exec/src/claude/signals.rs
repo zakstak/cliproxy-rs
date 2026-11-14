@@ -11,7 +11,7 @@ use super::detect::{header, header_values};
 use super::session::{valid_prompt_id, valid_request_id};
 use crate::rawjson;
 
-fn probe(body: &str) -> bool {
+pub(crate) fn probe(body: &str) -> bool {
     let max_tokens = rawjson::get(body, "max_tokens");
     if !max_tokens.exists() || max_tokens.i64() != 1 {
         return false;

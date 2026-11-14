@@ -140,16 +140,40 @@ fn keys(doc: &Value) -> Vec<ClaudeKey> {
 /// they keep proving the opt-in path byte for byte. A recording's own value is kept.
 #[cfg(test)]
 pub(crate) fn as_recorded_before_fallback_switch(mut cfg: Config) -> Config {
+    recorded_default(&mut cfg, &["server-side-fallback"], Value::Bool(true));
+    cfg
+}
+
+/// Go recordings carry the Claude Code 2.1.280 identity, the baseline before 2.1.325.
+/// They replay with that tuple configured as `header-defaults`, as an operator could
+/// configure it, so they keep proving everything but the identity byte for byte; the
+/// 2.1.325 identity has its own capture tests. A recording's own values are kept.
+#[cfg(test)]
+pub(crate) fn as_recorded_with_2_1_280_profile(mut cfg: Config) -> Config {
+    for (key, value) in [
+        ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+        ("package-version", "0.112.1"),
+        ("runtime-version", "v26.3.0"),
+    ] {
+        recorded_default(&mut cfg, &["header-defaults", key], Value::from(value));
+    }
+    cfg
+}
+
+/// Sets `upstream.claude.<path>` to `value` unless the recording set it.
+#[cfg(test)]
+fn recorded_default(cfg: &mut Config, path: &[&str], value: Value) {
     use serde_yaml_ng::Mapping;
     let doc = &mut cfg.document;
     if !doc.is_mapping() {
         *doc = Value::Mapping(Mapping::new());
     }
+    let (leaf, sections) = path.split_last().expect("path");
     let mut node = doc;
-    for key in ["upstream", "claude"] {
+    for key in ["upstream", "claude"].iter().chain(sections) {
         let map = node.as_mapping_mut().expect("config sections are mappings");
         node = map
-            .entry(Value::from(key))
+            .entry(Value::from(*key))
             .or_insert_with(|| Value::Mapping(Mapping::new()));
         if !node.is_mapping() {
             *node = Value::Mapping(Mapping::new());
@@ -157,7 +181,6 @@ pub(crate) fn as_recorded_before_fallback_switch(mut cfg: Config) -> Config {
     }
     node.as_mapping_mut()
         .expect("mapping")
-        .entry(Value::from("server-side-fallback"))
-        .or_insert(Value::Bool(true));
-    cfg
+        .entry(Value::from(*leaf))
+        .or_insert(value);
 }
