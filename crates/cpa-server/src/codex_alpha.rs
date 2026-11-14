@@ -144,6 +144,7 @@ async fn alpha_search(
         session: bound(primary),
         session_parent: bound(parent),
         session_fork: fork,
+        caller: cpa_common::session::caller_scope(&client.api_key),
         exclude,
         ..Selection::default()
     };

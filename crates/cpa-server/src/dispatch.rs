@@ -1052,6 +1052,8 @@ async fn run_routed(
         session: session.id.clone(),
         session_parent: session.parent,
         session_fork: session.fork,
+        session_guardian: session.guardian,
+        caller: session.caller.clone(),
         exclude: pinned_exclusion.clone(),
         ..Selection::default()
     };

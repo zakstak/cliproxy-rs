@@ -1229,6 +1229,12 @@ pub struct Selection {
     pub session_parent: Option<String>,
     /// The session forked from `session_parent` (inherits its binding).
     pub session_fork: bool,
+    /// A Codex Guardian reviewer: inherits its parent's latest eligible binding on any
+    /// model ([`crate::session::Session::guardian`]).
+    pub session_guardian: bool,
+    /// The caller scope that binds this session; a child inherits only bindings of the
+    /// same caller ([`crate::session::Session::caller`]). Empty without a client key.
+    pub caller: String,
     /// A request without an explicit session, for the LCP matcher (Go `pickLCP`). Set
     /// only with session affinity on; it then decides the binding instead of `session`.
     pub lcp: Option<Arc<crate::lcp::Request>>,

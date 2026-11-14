@@ -1181,17 +1181,36 @@ impl Scheduler {
                 None if never => return Err(NoPick::Bound(id)),
                 found => found,
             },
-            None => match keys
-                .fallback
-                .as_ref()
-                .and_then(|fallback| self.affinity.get(fallback, now))
-            {
-                // The session's own conversation alias (not a fork's or subagent's parent).
-                Some(id) if never && !subagent && !fork && find(&id).is_none() => return Err(NoPick::Bound(id)),
-                bound => bound
-                    .filter(|_| !subagent || policy.session_affinity_subagents)
-                    .and_then(|id| find(&id)),
-            },
+            None => {
+                // A fork's or subagent's fallback is its parent, whose binding it inherits
+                // only from the same caller; otherwise it is the session's own alias.
+                let inherits = subagent || fork;
+                // A Guardian reviewer usually runs on another model than its parent, so it
+                // inherits the parent's newest eligible binding on any model (#113).
+                let guardian = (subagent && selection.session_guardian && policy.session_affinity_subagents)
+                    .then(|| {
+                        self.affinity
+                            .latest(&keys.parent, &selection.caller, now, |id| find(id).is_some())
+                    })
+                    .flatten();
+                let bound = match guardian {
+                    Some(id) => Some(id),
+                    None => keys.fallback.as_ref().and_then(|fallback| {
+                        if inherits {
+                            self.affinity.get_for(fallback, &selection.caller, now)
+                        } else {
+                            self.affinity.get(fallback, now)
+                        }
+                    }),
+                };
+                match bound {
+                    // The session's own conversation alias (not a fork's or subagent's parent).
+                    Some(id) if never && !inherits && find(&id).is_none() => return Err(NoPick::Bound(id)),
+                    bound => bound
+                        .filter(|_| !subagent || policy.session_affinity_subagents)
+                        .and_then(|id| find(&id)),
+                }
+            }
         };
         let picked = match reuse {
             Some(c) => c,
@@ -1199,7 +1218,7 @@ impl Scheduler {
                 .pick_unbound(candidates, selection, policy.strategy, ranks)
                 .ok_or(NoPick::Empty)?,
         };
-        self.affinity.bind(&picked.id, &bind_keys, now, ttl);
+        self.affinity.bind(&picked.id, &selection.caller, &bind_keys, now, ttl);
         Ok(picked)
     }
 
@@ -3147,6 +3166,202 @@ mod tests {
             "b",
             "expired"
         );
+    }
+
+    fn affinity_policy(ttl: u64) -> Policy {
+        Policy {
+            strategy: Strategy::FillFirst,
+            session_affinity: true,
+            session_affinity_ttl: Duration::from_secs(ttl),
+            ..Default::default()
+        }
+    }
+
+    /// A Codex session (`codex:<id>`) on `model` for `caller`.
+    fn codex_session(id: &str, model: &str, caller: &str) -> Selection {
+        Selection {
+            session: Some(format!("codex:{id}")),
+            caller: caller.into(),
+            ..selection(model)
+        }
+    }
+
+    /// A Codex Guardian reviewer (or, with `guardian` false, an ordinary subagent) of
+    /// `codex:<parent>` on `model` for `caller`.
+    fn reviewer(parent: &str, model: &str, caller: &str, guardian: bool) -> Selection {
+        Selection {
+            session: Some("codex:reviewer".into()),
+            session_parent: Some(format!("codex:{parent}")),
+            session_guardian: guardian,
+            ..codex_session("reviewer", model, caller)
+        }
+    }
+
+    /// #113: a Guardian reviewer on another model inherits its parent's newest binding of
+    /// the same caller whose credential can serve it; an ordinary subagent, another
+    /// caller, an ineligible or expired parent binding, a reviewer with a binding of its
+    /// own and `session-affinity-subagents: false` do not.
+    #[test]
+    fn guardian_reviewers_inherit_the_parents_newest_eligible_binding() {
+        let (a, b, c) = (
+            cred("a", serde_json::json!({})),
+            cred("b", serde_json::json!({})),
+            cred("c", serde_json::json!({})),
+        );
+        let p = affinity_policy(60);
+        let now = Instant::now();
+        let fresh = |parent_on: &[(&str, &Credential)]| {
+            let mut s = Scheduler::default();
+            for (i, (model, credential)) in parent_on.iter().enumerate() {
+                let at = now + Duration::from_millis(i as u64);
+                s.pick(&tag(&[*credential]), &codex_session("root", model, "me"), &p, at)
+                    .unwrap();
+            }
+            s
+        };
+        let mut s = fresh(&[("big", &b)]);
+        let pick = |s: &mut Scheduler, sel: &Selection, from: &[&Credential]| {
+            s.pick(&tag(from), sel, &p, now).unwrap().id.clone()
+        };
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b]),
+            "b",
+            "inherited"
+        );
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b]),
+            "b",
+            "now its own"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", false), &[&a, &b]),
+            "a",
+            "ordinary subagent"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "intruder", true), &[&a, &b]),
+            "a",
+            "another caller"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &c]),
+            "a",
+            "parent's not eligible"
+        );
+        // The newest parent binding wins; an ineligible newest falls back to the older one.
+        let mut s = fresh(&[("big", &b), ("medium", &c)]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b, &c]),
+            "c",
+            "newest"
+        );
+        let mut s = fresh(&[("big", &b), ("medium", &c)]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b]),
+            "b",
+            "newest eligible"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(
+            s.pick(
+                &tag(&[&a, &b]),
+                &reviewer("root", "small", "me", true),
+                &p,
+                now + secs(61)
+            )
+            .unwrap()
+            .id,
+            "a",
+            "expired"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        s.reconcile(&[std::sync::Arc::new(a.clone())]);
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b]),
+            "a",
+            "removed"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(pick(&mut s, &reviewer("root", "big", "me", true), &[&a]), "a");
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b]),
+            "b",
+            "other model"
+        );
+        let mut s = fresh(&[("big", &b)]);
+        s.pick(&tag(&[&c]), &reviewer("root", "small", "me", true), &p, now)
+            .unwrap();
+        assert_eq!(
+            pick(&mut s, &reviewer("root", "small", "me", true), &[&a, &b, &c]),
+            "c",
+            "own binding first"
+        );
+        let off = Policy {
+            session_affinity_subagents: false,
+            ..p.clone()
+        };
+        let mut s = fresh(&[("big", &b)]);
+        assert_eq!(
+            s.pick(&tag(&[&a, &b]), &reviewer("root", "small", "me", true), &off, now)
+                .unwrap()
+                .id,
+            "a"
+        );
+    }
+
+    /// #113: children inherit a parent binding on the same model only from their own
+    /// caller; naming another caller's parent session gets an ordinary pick. A session's
+    /// own conversation alias is not a parent and keeps working across callers.
+    #[test]
+    fn children_inherit_only_their_own_callers_parent_binding() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let p = affinity_policy(60);
+        let now = Instant::now();
+        for (child, kind) in [
+            (reviewer("root", "big", "me", false), "subagent"),
+            (
+                Selection {
+                    session_fork: true,
+                    ..reviewer("root", "big", "me", false)
+                },
+                "fork",
+            ),
+        ] {
+            let mut s = Scheduler::default();
+            s.pick(&tag(&[&b]), &codex_session("root", "big", "me"), &p, now)
+                .unwrap();
+            let intruder = Selection {
+                session: Some("codex:intruder".into()),
+                caller: "intruder".into(),
+                ..child.clone()
+            };
+            assert_eq!(
+                s.pick(&tag(&[&a, &b]), &intruder, &p, now).unwrap().id,
+                "a",
+                "{kind}: intruder"
+            );
+            assert_eq!(
+                s.pick(&tag(&[&a, &b]), &child, &p, now).unwrap().id,
+                "b",
+                "{kind}: own caller"
+            );
+        }
+        let alias = |caller: &str| Selection {
+            session: Some("sess:1".into()),
+            session_parent: Some("pck:conv".into()),
+            caller: caller.into(),
+            ..selection("big")
+        };
+        let mut s = Scheduler::default();
+        s.pick(&tag(&[&b]), &alias("me"), &p, now).unwrap();
+        let continued = Selection {
+            session: Some("sess:2".into()),
+            ..alias("other")
+        };
+        assert_eq!(s.pick(&tag(&[&a, &b]), &continued, &p, now).unwrap().id, "b", "alias");
     }
 
     #[test]
