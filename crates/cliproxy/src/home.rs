@@ -2781,8 +2781,8 @@ mod tests {
     /// Go `TestHomeExecutionPropagatesRequestMetadata` and
     /// `TestHomeExecutionFailureResultPreservesRequestMetadata` (Go issue #4791): the
     /// usage record of a Home attempt carries the client's requested model, reasoning
-    /// effort, service tier (`auto` when omitted) and generate flag, and a failed attempt
-    /// keeps the requested tier.
+    /// effort and generate flag, on success and on failure. The service tier is the one
+    /// sent upstream (#178, `docs/DIFFERENCES-FROM-GO.md`), not the client's as in Go.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn home_usage_records_carry_the_client_request_metadata() {
         let upstream = ContractUpstream::start(vec![(
@@ -2829,15 +2829,24 @@ mod tests {
                 )
             })
             .collect();
+        // Go records the client's `priority`. Here the record names the tier the
+        // Claude request carried (#178), and the Chat Completions to Claude Messages
+        // translation (Go's too) drops `service_tier`, so every attempt sent none:
+        // `auto`. The upstream bodies are identical while the client bodies differ by
+        // the 26 bytes of `,"service_tier":"priority"`.
         assert_eq!(
             seen,
             [
-                ("client-model", "high", "priority", false, false),
                 ("client-model", "high", "auto", false, false),
-                ("client-model", "high", "priority", false, true),
+                ("client-model", "high", "auto", false, false),
+                ("client-model", "high", "auto", false, true),
             ],
             "{records:?}"
         );
+        let bytes = |key: &str| records.iter().map(|r| r[key].as_u64().unwrap()).collect::<Vec<_>>();
+        let (client, sent) = (bytes("client_request_bytes"), bytes("upstream_request_bytes"));
+        assert_eq!(client[0], client[1] + 26, "{client:?}");
+        assert!(sent.iter().all(|&n| n == sent[0]), "{sent:?}");
         shutdown.cancel();
         task.await.unwrap();
     }
