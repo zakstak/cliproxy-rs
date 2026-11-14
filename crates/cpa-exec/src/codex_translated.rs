@@ -12,11 +12,14 @@
 //! The response is converted back by the same pair's built-in translator, without
 //! namespace restoration or a local token estimate in place of
 //! provider usage. A buffered client receives the aggregate of the upstream's events.
+//! What reaches the client passes the outbound credential guard ([`crate::codex_secret`]),
+//! bound to the values the upstream request carried.
 
 use std::collections::VecDeque;
 
 use super::*;
 use crate::codex_response::{Step, Steps};
+use crate::codex_secret::Guard;
 
 /// The source formats the route converts. Each has a registered built-in pair to Codex.
 const SOURCES: [Format; 2] = [Format::Claude, Format::OpenAI];
@@ -80,7 +83,8 @@ impl CodexExecutor {
     /// One translated request (see the module documentation). The attempt is recorded as
     /// canceled when the client leaves before the response is ready: during the upstream
     /// send, the stream bootstrap or a buffered client's body read ([`crate::cancel`]).
-    /// A stream settles its own outcome ([`client_stream`]).
+    /// A stream settles its own outcome ([`client_stream`]). The answer, translated, is
+    /// guarded against the authentication values the upstream request carried.
     pub(crate) async fn translated(
         &self,
         view: &View<'_>,
@@ -88,14 +92,19 @@ impl CodexExecutor {
         req: ExecRequest,
     ) -> Result<ExecResponse, ExecError> {
         let usage = req.usage.clone();
-        crate::cancel::fail_if_canceled(&usage, self.translated_exchange(view, settings, req)).await
+        let mut secrets = cpa_core::exec::SentCredentials::default();
+        let exchange = self.translated_exchange(view, settings, req, &mut secrets);
+        let answer = crate::cancel::fail_if_canceled(&usage, exchange).await;
+        secrets.guard_response(answer)
     }
 
+    /// `secrets` receives the authentication values the upstream request carries.
     async fn translated_exchange(
         &self,
         view: &View<'_>,
         settings: &Settings,
         req: ExecRequest,
+        secrets: &mut cpa_core::exec::SentCredentials,
     ) -> Result<ExecResponse, ExecError> {
         let model = request::base_model(&req.model).to_owned();
         // One buffer for the upstream send and the response translator: the send shares
@@ -119,7 +128,11 @@ impl CodexExecutor {
             crate::codex_identity::Origin::of(&req),
         );
         let url = format!("{}/responses", view.base_url);
-        let wire = Wire::new(req.capture(), view.credential);
+        // The request log and the usage record keep this exchange scrubbed of them too.
+        *secrets = crate::codex_secret::from_request(&headers, &url);
+        let mut wire = Wire::new(req.capture(), view.credential);
+        wire.bind(secrets);
+        req.usage.sent_credentials(secrets);
         let started = Instant::now();
         let upstream = self
             .open_for(

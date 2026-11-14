@@ -1,5 +1,5 @@
-//! The native Codex routes' outbound credential guard (#25, acceptance criterion 7;
-//! `docs/codex/CONTRACT.md` "Credential isolation").
+//! The Codex routes' outbound credential guard (#25, acceptance criterion 7; the
+//! translated route, #27; `docs/codex/CONTRACT.md` "Credential isolation").
 //!
 //! An upstream can write the authentication value it was sent into what it answers: an
 //! error message that quotes the bearer token, a close reason, a header. Everything a

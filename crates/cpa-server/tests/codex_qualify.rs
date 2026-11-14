@@ -537,3 +537,229 @@ async fn structured_failures_across_profiles() {
         );
     }
 }
+
+/// A proxy on `credentials` that keeps its runtime, so a test can read the scheduler's
+/// view of an account after a failure.
+async fn proxy_with_runtime(
+    script: Script,
+    credentials: impl FnOnce(&str) -> Vec<Credential>,
+) -> (Proxy, Arc<cpa_server::Runtime>) {
+    let upstream = CaptureUpstream::start(script).await;
+    let auth_dir = AuthDir::new();
+    let cfg = Config::parse(&format!(
+        "auth-dir: {}\naccess:\n  api-keys: [{CLIENT_KEY}]\n",
+        auth_dir.0.display()
+    ))
+    .unwrap();
+    let executors = Executors {
+        claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+        codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        meta: Default::default(),
+        xai: Default::default(),
+    };
+    let rt = Arc::new(cpa_server::testing::runtime(
+        cfg,
+        credentials(&upstream.base_url),
+        executors,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let router = cpa_server::router(rt.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (
+        Proxy {
+            addr,
+            upstream,
+            _auth_dir: auth_dir,
+        },
+        rt,
+    )
+}
+
+/// A Sign in with ChatGPT credential with its own ID, on `base_url`.
+fn siwc_credential(id: &str, base_url: &str) -> Credential {
+    let mut credential = credential(Profile::Siwc, base_url, false);
+    credential.id = id.into();
+    credential
+}
+
+async fn post_with_headers(proxy: &Proxy, body: &str) -> (u16, HeaderMap, String) {
+    let response = client_request(wreq::Client::new().post(format!("http://{}/v1/responses", proxy.addr)))
+        .header("content-type", "application/json")
+        .body(body.to_owned())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    (status, headers, response.text().await.unwrap())
+}
+
+const SIWC_REQUEST_ID: &str = "req_siwc_FIXTURE";
+
+/// FP5 (#119): the request shapes OpenAI's SIWC preview limits document, both tool forms,
+/// reach a Sign in with ChatGPT upstream as the client sent them, and the upstream's
+/// stream reaches the client unchanged. So does a body with every field, tool and input
+/// the limits name as unsupported: the proxy strips nothing to force it through.
+#[tokio::test]
+async fn siwc_documented_and_unsupported_requests_pass_unchanged() {
+    for name in [
+        "siwc-request-namespace",
+        "siwc-request-additional-tools",
+        "siwc-request-unsupported",
+    ] {
+        let proxy = proxy(
+            Script {
+                http: vec![Reply::sse(fixture("sse-completed").bytes())],
+                ..Script::default()
+            },
+            "",
+            |url| vec![credential(Profile::Siwc, url, false)],
+        )
+        .await;
+        let body = client_body(name);
+        let (status, answer) = post(&proxy, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{name}: {answer}");
+        assert_eq!(answer, text(&fixture("sse-completed").bytes()), "{name}: the stream");
+        let sent = proxy.upstream.http();
+        assert_eq!(sent.len(), 1, "{name}: one upstream request");
+        assert_eq!(sent[0].uri.path(), "/responses", "{name}");
+        assert_eq!(text(&sent[0].body), body, "{name}: the client's bytes");
+        assert_isolated(name, Profile::Siwc, &sent[0].headers);
+    }
+}
+
+/// FP5 (#119): OpenAI's documented SIWC failures reach the client with their status, body
+/// (`error.code`, `error.param`, or the `detail` admission shape) and `x-request-id`, and
+/// with no `Retry-After` or reset time the upstream did not send. A capability refusal is
+/// not resent on another SIWC account. No failure here refuses the credential's tokens,
+/// so the account's native ChatGPT partition stays as it was.
+#[tokio::test]
+async fn siwc_structured_errors_reach_the_client_unchanged() {
+    for (name, status) in [
+        ("siwc-error-unsupported-capability", 400),
+        ("siwc-error-not-eligible", 403),
+        ("siwc-error-usage-limit", 429),
+        ("siwc-error-usage-unavailable", 503),
+        ("siwc-error-admission-detail", 503),
+    ] {
+        let error = text(&fixture(name).bytes());
+        let mut reply = Reply::json(status, error.clone());
+        reply.headers.push(("x-request-id".into(), SIWC_REQUEST_ID.into()));
+        let (proxy, rt) = proxy_with_runtime(
+            Script {
+                // A second reply, so a resend would be seen rather than answered by the
+                // capture upstream's exhausted-script 500.
+                http: vec![reply.clone(), reply],
+                ..Script::default()
+            },
+            |url| vec![siwc_credential("siwc-a", url), siwc_credential("siwc-b", url)],
+        )
+        .await;
+        let body = client_body("siwc-request-unsupported");
+        let (got, headers, answer) = post_with_headers(&proxy, &body).await;
+        assert_eq!((got, answer.as_str()), (status, error.as_str()), "{name}");
+        assert_eq!(
+            headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some(SIWC_REQUEST_ID),
+            "{name}: the request ID"
+        );
+        assert!(headers.get("retry-after").is_none(), "{name}: no invented retry time");
+        let sent = proxy.upstream.http();
+        for exchange in &sent {
+            assert_eq!(text(&exchange.body), body, "{name}: the client's bytes");
+        }
+        // A capability refusal is a request fault: one attempt, and no account cools. The
+        // others may try the pool's other account once, never the same account again.
+        if status == 400 {
+            assert_eq!(sent.len(), 1, "{name}: the same body is not resent");
+        } else {
+            assert!(sent.len() <= 2, "{name}: at most one attempt per account");
+        }
+        for credential in rt.store().snapshot() {
+            if status == 400 {
+                assert!(!rt.store().blocked(&credential, "gpt-5.5"), "{name}: {}", credential.id);
+            }
+            assert!(!rt.store().tokens_rejected(&credential), "{name}: {}", credential.id);
+            assert_eq!(
+                credential.metadata["access_token"], "at-FAKE",
+                "{name}: the native partition"
+            );
+        }
+    }
+}
+
+/// FP5 (#119): over a WebSocket, SIWC continuation can reference only responses from the
+/// same authenticated connection. A first turn and its continuation go on one upstream
+/// socket of one account, unchanged, even with another SIWC account in the pool.
+#[tokio::test]
+async fn siwc_websocket_continuation_stays_on_its_connection() {
+    let frames: Vec<String> = fixture("siwc-ws-continuation")
+        .frames()
+        .iter()
+        .map(|f| text(f).replacen(r#""model":"gpt-test""#, r#""model":"gpt-5.5""#, 1))
+        .collect();
+    let completed = fixture("sse-completed").frames();
+    let proxy = proxy(
+        Script {
+            ws: vec![completed.clone(), completed],
+            ..Script::default()
+        },
+        "",
+        |url| {
+            let mut a = siwc_credential("siwc-a", url);
+            let mut b = siwc_credential("siwc-b", url);
+            for c in [&mut a, &mut b] {
+                c.attributes.insert("websockets".into(), "true".into());
+            }
+            vec![a, b]
+        },
+    )
+    .await;
+    let mut socket = websocket(&proxy).await;
+    for frame in &frames {
+        socket.send(Message::text(frame.clone())).await.unwrap();
+        let (events, closed) = turn(&mut socket).await;
+        assert_eq!(closed, None, "{events:?}");
+    }
+    let sockets = proxy.upstream.sockets();
+    assert_eq!(sockets.len(), 1, "one upstream socket");
+    let sent: Vec<String> = sockets[0].frames.iter().map(|f| text(f)).collect();
+    assert_eq!(sent, frames, "both frames, unchanged, on that socket");
+    assert_isolated("siwc continuation", Profile::Siwc, &sockets[0].headers);
+}
+
+/// FP5 (#119): a SIWC failure cools the account for SIWC only. When the operator turns
+/// `use_siwc` off, the credential's outer ChatGPT OAuth tokens serve the next request at
+/// once: the cooldown the SIWC tokens earned does not hold back the other token set.
+#[tokio::test]
+async fn a_siwc_failure_leaves_the_outer_partition_usable() {
+    for (name, status) in [
+        ("siwc-error-not-eligible", 403),
+        ("siwc-error-usage-limit", 429),
+        ("siwc-error-usage-unavailable", 503),
+    ] {
+        let (proxy, rt) = proxy_with_runtime(
+            Script {
+                http: vec![
+                    Reply::json(status, fixture(name).bytes()),
+                    Reply::sse(fixture("sse-completed").bytes()),
+                ],
+                ..Script::default()
+            },
+            |url| vec![siwc_credential("account", url)],
+        )
+        .await;
+        let body = client_body("http-request-full");
+        let (got, _) = post(&proxy, "/v1/responses", &body).await;
+        assert_eq!(got, status, "{name}: the SIWC failure");
+        let mut outer = Credential::clone(&rt.store().get("account").unwrap());
+        outer.metadata.insert("use_siwc".into(), false.into());
+        rt.store().upsert(outer);
+        let (got, answer) = post(&proxy, "/v1/responses", &body).await;
+        assert_eq!(got, 200, "{name}: the outer tokens serve: {answer}");
+        let sent = proxy.upstream.http();
+        assert_eq!(sent.len(), 2, "{name}");
+        assert_eq!(sent[1].headers["authorization"], "Bearer at-FAKE", "{name}");
+    }
+}

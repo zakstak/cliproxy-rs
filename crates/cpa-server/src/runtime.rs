@@ -1947,15 +1947,24 @@ impl CredentialStore {
     /// at once, and every other cooldown (a model's 429, a live credential quota) stays.
     /// Called with the change, under the write lock; returns whether anything was
     /// cleared, for the caller to persist.
+    ///
+    /// A Codex credential whose `use_siwc` was turned off sends its outer ChatGPT OAuth
+    /// tokens to the ChatGPT backend from now on, so every cooldown its SIWC tokens
+    /// earned goes too (FP5, #119). OpenAI's SIWC errors say nothing about the outer
+    /// tokens: an eligibility or admission refusal is about SIWC, and a usage limit can
+    /// be app-specific. The reverse switch (a SIWC binding) keeps Go's rule, because an
+    /// outer quota may cover the whole plan.
     fn clear_replaced_unauthorized(&self, before: &[Arc<Credential>], after: &[Arc<Credential>]) -> bool {
-        let replaced: Vec<&str> = after
+        let replaced: Vec<(&str, bool)> = after
             .iter()
-            .filter(|next| {
-                before.iter().find(|c| c.id == next.id).is_some_and(|previous| {
-                    !previous.disabled && !next.disabled && active_tokens_changed(previous, next)
+            .filter_map(|next| {
+                let previous = before.iter().find(|c| c.id == next.id)?;
+                (!previous.disabled && !next.disabled && active_tokens_changed(previous, next)).then(|| {
+                    let siwc_off = cpa_core::registry::dynamic::uses_siwc(previous)
+                        && !cpa_core::registry::dynamic::uses_siwc(next);
+                    (next.id.as_str(), siwc_off)
                 })
             })
-            .map(|c| c.id.as_str())
             .collect();
         if replaced.is_empty() {
             return false;
@@ -1963,8 +1972,12 @@ impl CredentialStore {
         let mut scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let mut cleared = false;
-        for id in replaced {
+        for (id, siwc_off) in replaced {
             cleared |= scheduler.clear_unauthorized(id, now);
+            if siwc_off && scheduler.cooldowns.keys().any(|(cid, _)| cid == id) {
+                scheduler.reset_cooldowns(id);
+                cleared = true;
+            }
         }
         cleared
     }

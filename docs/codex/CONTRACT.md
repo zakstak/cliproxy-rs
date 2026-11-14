@@ -28,6 +28,14 @@ The contract rests on two sources, in this order:
    and the [`POST /responses/compact` reference](https://developers.openai.com/api/reference/resources/responses/methods/compact).
    These pages were read on 2026-11-07. They describe the OpenAI API. They say nothing
    about the ChatGPT Codex backend.
+3. OpenAI's Sign in with ChatGPT documentation, for the `siwc` profile only (FP5,
+   [#119](https://github.com/zakstak/cliproxy-rs/issues/119)): the
+   [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations),
+   [errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
+   and [Codex app-server](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server)
+   pages, read on 2026-11-14. The pages show no revision date, and they call the feature a
+   preview. They describe ChatGPT plan usage on `https://api.openai.com/v1`, not the
+   `chatgpt` or `api-key` profiles.
 
 The following rules decide how to use the sources:
 
@@ -54,7 +62,7 @@ A Codex credential resolves to one of four endpoint profiles.
 | --- | --- | --- | --- |
 | `chatgpt` | `https://chatgpt.com/backend-api/codex` | ChatGPT OAuth access token as `Authorization: Bearer`, plus `chatgpt-account-id` | `model-provider-info/src/lib.rs:472-487` selects this base URL for ChatGPT, agent-identity and personal-access-token auth. `model-provider/src/auth.rs:166-190` adds `chatgpt-account-id`. |
 | `api-key` | `https://api.openai.com/v1` | OpenAI API key as `Authorization: Bearer` | `model-provider-info/src/lib.rs:484` selects this base URL for API-key auth. The OpenAI API documentation applies. |
-| `siwc` | `https://api.openai.com/v1`, unless the credential sets `base_url` | The credential's Sign in with ChatGPT access token (`siwc.access_token`, scope `chatgpt.tokens.use.direct`) as `Authorization: Bearer` | None for Responses. The pinned client mentions SIWC only in realtime code (`codex-api/src/endpoint/realtime_call.rs:146`, `core/src/realtime_conversation.rs:2092`). Every Responses behaviour on this profile is unknown, so the proxy adds nothing: the profile takes the native and translated routes with only the permitted transformations (#28). |
+| `siwc` | `https://api.openai.com/v1`, unless the credential sets `base_url` | The credential's Sign in with ChatGPT access token (`siwc.access_token`, scope `chatgpt.tokens.use.direct`) as `Authorization: Bearer` | None for Responses. The pinned client mentions SIWC only in realtime code (`codex-api/src/endpoint/realtime_call.rs:146`, `core/src/realtime_conversation.rs:2092`). OpenAI's SIWC documentation states what the profile accepts ([SIWC Responses profile](#siwc-responses-profile)). Those are rules for the caller, not edits for a proxy, so the proxy adds nothing: the profile takes the native and translated routes with only the permitted transformations (#28). |
 | `compatible` | An operator-set `base_url` on any other host | Whatever the credential holds | None. Only explicit routing applies. Every behaviour beyond routing is unknown. |
 
 The first-party built-in OpenAI provider sets `supports_websockets: true`
@@ -71,13 +79,13 @@ The key for the matrix:
 
 | Behaviour | `chatgpt` | `api-key` | `siwc` | `compatible` |
 | --- | --- | --- | --- | --- |
-| HTTP `POST /responses`, streaming SSE | FP | FP, Docs | Unknown | Unknown |
-| HTTP `POST /responses` with `stream: false` | Not used, acceptance unknown | Docs | Unknown | Unknown |
+| HTTP `POST /responses`, streaming SSE | FP | FP, Docs | Docs, with `store: false` | Unknown |
+| HTTP `POST /responses` with `stream: false` | Not used, acceptance unknown | Docs | Docs: not accepted, HTTP needs `stream: true` | Unknown |
 | Responses Lite (`x-openai-internal-codex-responses-lite: true`) | FP, when the model catalog sets `use_responses_lite` | Unknown | Unknown | Unknown |
 | Remote compaction v2: `POST /responses` ending in a `compaction_trigger` item | FP | FP | Unknown | Unknown |
 | `POST /responses/compact` | Not used, acceptance unknown | Docs (not used by the pinned client) | Unknown | Unknown |
-| WebSocket `response.create`, first turn | FP | FP, Docs | Unknown | Unknown |
-| WebSocket continuation with `previous_response_id` | FP | FP, Docs | Unknown | Unknown |
+| WebSocket `response.create`, first turn | FP | FP, Docs | Docs (named by the continuation rule) | Unknown |
+| WebSocket continuation with `previous_response_id` | FP | FP, Docs | Docs, same connection only | Unknown |
 | WebSocket prewarm, `generate: false` | FP | FP, Docs | Unknown | Unknown |
 | WebSocket `response.interrupt` | FP | FP, not in Docs | Unknown | Unknown |
 | WebSocket `response.steer` | Not used, acceptance unknown | Docs, GPT-6 family only. Not used by the pinned client. | Unknown | Unknown |
@@ -123,6 +131,74 @@ the first response and forwards each later client frame unchanged, so it changes
 transport, not a payload, and it stays. Go's `response.append` frame has no first-party
 or documented source on any profile, so it is refused (#28,
 [Native WebSocket route](#native-websocket-route)).
+
+### SIWC Responses profile
+
+OpenAI's SIWC pages (source 3 above, read 2026-11-14) replace these `siwc` unknowns. The
+profile accepts:
+
+- HTTP: `store: false` and `stream: true`, with the whole context in an `input` array.
+  `previous_response_id` is not accepted over HTTP. Use `instructions` or developer
+  messages: a `{"type":"message","role":"system"}` item is rejected.
+- WebSocket: a continuation can name only a response from the same authenticated
+  connection, and nothing is stored for later.
+- Fields left out: `background`, `conversation`, `max_output_tokens`, `max_tool_calls`,
+  `metadata`, `moderation`, `multi_agent`, `prompt`, `prompt_cache_retention`,
+  `safety_identifier`, `temperature`, `top_logprobs`, `top_p`, `truncation` and `user`.
+- Tools: function and custom tools inside a `namespace` tool, or in `additional_tools`
+  input items. Web search stays subject to model and account policy. Image generation,
+  file search, Code Interpreter, native computer use, hosted MCP and connectors, and
+  `tool_search` are not accepted, and `programmatic_tool_calling` is not accepted in
+  top-level `tools`.
+- Inputs: text, images and files when the model accepts them. Audio and video input,
+  the Files upload API and transcription are not accepted.
+
+The documented app-server setup uses HTTP only (`supports_websockets = false`). It sets
+`store` and `stream` itself, sends the access token as `Authorization: Bearer`, and treats
+its model list as a catalog, not an entitlement check.
+
+The proxy does not enforce these rules. The native route forwards the client's bytes, and
+the upstream judges them. The proxy never strips a field, tool or input to force a request
+through, and never adds `store` or `stream`
+(`siwc_documented_and_unsupported_requests_pass_unchanged` in
+`crates/cpa-server/tests/codex_qualify.rs`). The translated route's conversion is the same
+on every profile. A converted request can still carry a field or tool this profile refuses,
+and the upstream's error then reaches the client. Whether to refuse those conversions
+before dispatch belongs to #27 and #79.
+
+Failures (`siwc_structured_errors_reach_the_client_unchanged`):
+
+- The client gets the upstream's status, body and `x-request-id` unchanged: `error.code`,
+  `error.param`, and the `{"detail":"..."}` admission shape. The proxy adds no
+  `Retry-After` or reset time the upstream did not send. In particular it never derives
+  one from `subscription_sharing_usage_limit_exceeded`, which the documentation says can
+  be an app-specific limit.
+- A 400 `subscription_sharing_unsupported_capability` is a request fault. It gets one
+  attempt, no other account receives the same body, and no account cools.
+- A 403 `subscription_sharing_user_not_eligible`, a 429 usage limit and a 503 (usage or
+  user unavailable, or admission) keep the status's ordinary handling. The request may try
+  another account in the pool once, never the same account again, and each account that
+  answered cools for its status. Credentials are kept. No failure here refuses a token set,
+  so the credential's outer ChatGPT OAuth tokens stay unchanged. Requests never move from
+  the SIWC tokens to the outer tokens while `use_siwc` is on (#92). When an operator turns
+  `use_siwc` off, the cooldowns the SIWC tokens earned are cleared, and the outer tokens
+  serve the next request (`a_siwc_failure_leaves_the_outer_partition_usable`).
+- A 401, such as `subscription_sharing_invalid_user`, follows the SIWC refresh rules of
+  #92, which this profile does not repeat.
+
+Connection-local continuation holds because one client socket uses one upstream socket on
+one account ([WebSocket state](#websocket-state);
+`siwc_websocket_continuation_stays_on_its_connection`).
+
+The `siwc-*` fixtures in `crates/cpa-exec/tests/fixtures/codex_contract/` are
+`provider-docs` evidence written from these pages, with placeholder text where the pages
+give no value (error messages; no `error.type` is documented).
+
+These remain unknown on `siwc`: WebSocket prewarm, interrupt, steering and connection
+limits (API-key WebSocket limits do not carry over), Responses Lite, compaction v2,
+`POST /responses/compact`, request compression and the 426 fallback. No live check has
+run. First-party Codex does not classify `subscription_sharing_*` or
+`chatpass_v2_*` codes at the pin or at research main `5c3ff1dabf64`.
 
 ### HTTP connection reuse
 
@@ -177,6 +253,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Replace `model` with the upstream model of an operator-configured alias or a caller-selected route, or add it as the first member when the body has none | All profiles | Explicit routing choice. Only the `model` value changes. |
 | Wrap an HTTP Responses body in a `response.create` frame by adding `"type":"response.create"` | A credential with `websockets: true` that serves an HTTP client over a WebSocket | Transport envelope. No other field changes. |
 | Send a WebSocket `response.create` frame as an HTTP Responses body by removing its `type` member, and send `stream: true` when the frame omits `stream` or sets it to `false` | A credential without `websockets` that serves a Responses WebSocket turn ([WebSocket HTTP fallback](#websocket-http-fallback)) | Transport envelope and adaptation. The first-party frame is the HTTP request plus its tag (`codex-api/src/common.rs:315-339`, 400-406). A WebSocket turn always delivers its response as events, so the HTTP request asks for them; the client receives the upstream's events, never an aggregate. No other field changes; a continuation or prewarm is refused instead. |
+| Write an upstream WebSocket text message longer than 1 MiB as one message in frames of at most 1 MiB, each flushed before the next | Codex upstream sockets: native creates, steering frames, interrupts and proxy-formulated frames (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)) | Transport framing, as first-party Codex writes a large turn (`codex-api/src/endpoint/responses_websocket.rs` `send_message`, openai/codex `d15bf1deb77e`, inspected at `5c3ff1dabf64`). The bytes are split where they fall, so a UTF-8 character may span two frames; reassembled, the message is unchanged. Frames are never compressed. No other write comes between a message's frames; a write that stops between them retires the socket. |
 | Hand a WebSocket client each event's `data` payload as one text frame | A WebSocket turn served over HTTP | Transport framing. A WebSocket text frame carries one event; the bytes of each payload are unchanged. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
@@ -204,7 +281,7 @@ response ID, usage and incomplete output items. That error has no retry delay
 success. A replacement 502 would drop the ID, usage and partial output and change that
 classification. A stream that ends without any terminal event is a different case and
 still fails ([Native HTTP route](#native-http-route), [Native WebSocket
-route](#native-websocket-route)). The translated route keeps Go's rule until #27
+route](#native-websocket-route)). The translated route has its own rule, by reason
 ([Translated route](#translated-route)).
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
@@ -662,8 +739,14 @@ held. Only a request that provably never left (the socket's loss was recorded be
 write, or the WebSocket library refused the frame before queueing it) is retried, once,
 on a fresh socket, and an explicit upstream rejection (a wrapped status error, a
 failure event) keeps its failover. A write is provably unsent when it failed or timed
-out before the frame was handed to the WebSocket library; one that failed or timed out
-after the hand-over may have sent part of it. The same rule holds for a turn served over
+out before its first frame was handed to the WebSocket library; one that failed or timed out
+after the hand-over may have sent part of it. A message longer than 1 MiB goes as one
+message in frames of at most 1 MiB (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)):
+the socket stays locked from its first frame to its last, so no other write comes between
+them, and a failure on any later frame is never unsent. A write that stops between frames
+(failed, timed out, or cancelled with its request) records the socket's loss, so the
+socket takes no other message and the next request on the session goes to a fresh socket.
+The write bound and the capture cover the whole message once. The same rule holds for a turn served over
 HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) and for the
 [native HTTP route](#native-http-route): only a request whose connection could not be
 made, or that never left because its deadline had passed, may fail over. After a
@@ -1106,8 +1189,13 @@ reading above, which decides by what a failure means.
   responses included, is scrubbed of its socket's values whichever publishes first. A
   record's status, tokens, account and every other field stay as processed. The request
   body is the client's own bytes and is logged as sent.
-- **What it does not cover.** The translated route (#27) and other providers have no
-  such guard.
+- **The translated route (#27).** The same guard checks what the translated route
+  hands its client, against the values its upstream request carried: an error's body,
+  each translated stream frame and a buffered answer, with the outcomes above
+  (`crates/cpa-exec/src/codex_translated.rs`). Its request log and usage record are
+  scrubbed of them too. Test: `codex_translated.rs`
+  `the_selected_credential_never_reaches_a_translated_client`.
+- **What it does not cover.** Other providers have no such guard.
 
 ## Translated route
 
@@ -1234,11 +1322,28 @@ the translation of the aggregated terminal event. Usage is the provider's. A Cla
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
 provider's counts. Upstream errors keep their classification and reach the client in
-its own error format. Until #27 replaces it, the translator keeps Go's empty-incomplete
-rule: a `response.incomplete` with no output item, no output delta and
-`output_tokens` 0, whose reason is missing or is not `interrupted`, `content_filter` or
-`max_output_tokens`, becomes a request-scoped 502. The native routes no longer apply it
-([Permitted transformations](#permitted-transformations)).
+its own error format.
+
+A `response.incomplete` is never a normal stop. A reason the client API has a stop for
+becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat `length`, and
+`content_filter` is Claude `refusal` and Chat `content_filter`, unless the response
+carries a tool call (`function_call` or `custom_tool_call`, in an output-item event or
+its output). A Claude client reads a call as a `tool_use` stop ahead of either reason,
+and a buffered one gets `{}` for arguments that were cut off, so such a response fails
+as below whatever its reason. Claude Messages and Chat
+Completions have no stop for any other reason: `interrupted`, which the pinned client
+reads as a turn that did not end, and every reason it reads as a terminal
+`ResponseIncomplete`, `unknown` when missing or not a string
+(`codex-api/src/sse/responses.rs:451-506`). Such a response fails with a request-scoped
+502, `upstream response incomplete: <reason>`, whether or not it produced output: a
+streamed client keeps what it received and then gets the error, a buffered client gets
+the error, and the request neither fails over nor cools the credential. Without this, an
+incomplete response would read as `end_turn` or `stop`, and a cut-off call (the
+first-party `sse-incomplete-partial`) as a complete `tool_use`. Go's empty-incomplete
+rule, which judged by missing output instead of by reason, is deleted. The native routes
+deliver every `response.incomplete` as sent ([Permitted
+transformations](#permitted-transformations)). Test: `codex_translated.rs`
+`incomplete_responses_keep_their_meaning`.
 
 ### Token counts and images
 
@@ -1292,7 +1397,7 @@ request silently, and none of them turns a rewrite back on.
 | `upstream.codex.response-steering` | Config | Kept as a transport: the upstream socket stays open after the first response, and each later client frame goes through the request boundary and upstream unchanged. Steers get no payload rules. | OpenAI documents `response.steer` for the GPT-6 family; the pinned client steers with an interrupt and a new create, which the proxy forwards unchanged either way |
 | `response.append` frame | Client | Refused with a 400 that names the frame, on a steering connection as a local error event, otherwise as the turn's error | No first-party or documented source defines it |
 | WebSocket HTTP fallback (a credential without `websockets`) | Credential `websockets` attribute | The client's `response.create` without `type`, with `stream: true`; continuations get the replay close ([WebSocket HTTP fallback](#websocket-http-fallback)) | `codex-api/src/common.rs:315-339`, 400-406 |
-| Sign in with ChatGPT credentials (`use_siwc`) | Auth file | The native and translated routes, with no profile rule. Go's SIWC body rules (`store`, `stream`, dropped `temperature`, `max_output_tokens`, `max_completion_tokens`, `prompt_cache_retention`, `prompt_cache_options` and blank `instructions`, collapsed `configuration_update` items, stripped steer items) are deleted. Token handling and the identity policy stay. | No first-party source covers the profile's Responses behaviour, so the proxy adds nothing; the upstream judges the client's request |
+| Sign in with ChatGPT credentials (`use_siwc`) | Auth file | The native and translated routes, with no profile rule. Go's SIWC body rules (`store`, `stream`, dropped `temperature`, `max_output_tokens`, `max_completion_tokens`, `prompt_cache_retention`, `prompt_cache_options` and blank `instructions`, collapsed `configuration_update` items, stripped steer items) are deleted. Token handling and the identity policy stay. | OpenAI's SIWC documentation lists what the profile accepts ([SIWC Responses profile](#siwc-responses-profile)). Those are rules for the caller, not permitted edits, so the proxy adds nothing and the upstream judges the client's request |
 | `upstream.codex.stream-bootstrap-buffering`, `stream-bootstrap-timeout` | Config | Kept: leading events are held, never changed | Failover before delivery |
 | `upstream.codex.model-level-cooling` | Config | Kept: failure classification only | Scheduler state |
 | `upstream.codex.disable-codex-cloaking`, `codex_disable_cloaking` attribute | Config, credential | Kept with its one remaining effect: a native WebSocket handshake carries the caller's session headers. No value changes identity. | [IDENTITY.md](IDENTITY.md) (#26) |

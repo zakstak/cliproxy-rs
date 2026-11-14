@@ -1,0 +1,2 @@
+{"type":"response.create","model":"gpt-test","store":false,"instructions":"Developer instructions placeholder.","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files."}]}],"tool_choice":"auto","parallel_tool_calls":false}
+{"type":"response.create","model":"gpt-test","store":false,"instructions":"Developer instructions placeholder.","previous_response_id":"resp_fixture_1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Now count them."}]}],"tool_choice":"auto","parallel_tool_calls":false}
