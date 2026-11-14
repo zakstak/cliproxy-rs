@@ -28,8 +28,43 @@ use tokio_util::sync::CancellationToken;
 
 /// Go main's 30-second contexts around the Home bootstrap.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Go `homeSubscriberPreAckRetryBackoff`.
+/// Go `homeSubscriberPreAckRetryBackoff`: the wait before staging a refused config again.
 const PRE_ACK_RETRY: Duration = Duration::from_millis(100);
+
+/// Go `homeSubscriberRetryBackoff` (`ce433b37`, after v8.0.35): the wait before the next
+/// lifetime after one ends with an error, published or not. It belongs to the
+/// subscriber, not a lifetime, so lifetimes that publish and fail at once keep backing
+/// off; only one that stayed published for [`Self::STABLE`] starts over. Go also
+/// reconnects at once on a planned rebalance, which this node never requests.
+#[derive(Default)]
+struct ReconnectBackoff {
+    ceiling: Duration,
+}
+
+impl ReconnectBackoff {
+    const INITIAL: Duration = Duration::from_secs(1);
+    const MAXIMUM: Duration = Duration::from_secs(30);
+    const STABLE: Duration = Duration::from_secs(30);
+
+    /// The next wait after a lifetime that stayed published for `healthy_for` (zero if
+    /// it never published), with `random` in `[0, 1)`: half the doubled ceiling plus up
+    /// to the other half, so even immediate failures leave a quiet period.
+    fn next(&mut self, healthy_for: Duration, random: f64) -> Duration {
+        if healthy_for >= Self::STABLE {
+            self.ceiling = Duration::ZERO;
+        }
+        self.ceiling = match self.ceiling {
+            Duration::ZERO => Self::INITIAL,
+            ceiling => (ceiling * 2).min(Self::MAXIMUM),
+        };
+        self.ceiling / 2 + (self.ceiling / 2).mul_f64(random.clamp(0.0, 1.0))
+    }
+}
+
+/// A uniform value in `[0, 1)` for retry jitter; 0 if the OS has no randomness.
+fn jitter() -> f64 {
+    (getrandom::u64().unwrap_or(0) >> 11) as f64 / (1u64 << 53) as f64
+}
 
 fn set(doc: &mut Yaml, path: &[&str], value: Option<Yaml>) {
     let mut node = doc;
@@ -786,6 +821,7 @@ async fn run_lifetimes(
     let bound = || CredentialConcurrency::default().with_defaults().cancel_bound();
     // Go keeps the publisher settings on the auth manager, across lifetimes.
     let publisher = cpa_home::inflight::PublisherSettings::default();
+    let mut backoff = ReconnectBackoff::default();
     while !shutdown.is_cancelled() {
         let client = match &previous {
             Some(client) => client.new_lifetime(),
@@ -802,7 +838,8 @@ async fn run_lifetimes(
         let lifetime = shutdown.child_token();
         let (configs, mut latest) = tokio::sync::watch::channel::<Option<Vec<u8>>>(None);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // When the lifetime's first config applied and its dispatch was published.
+        let published = Arc::new(std::sync::OnceLock::<tokio::time::Instant>::new());
         let worker = tokio::spawn({
             let (rt, dispatcher, client, registry, app_log) = (
                 rt.clone(),
@@ -846,7 +883,7 @@ async fn run_lifetimes(
                         // of the config (`applyConfigRuntime`).
                         rt.store().replace_config(config_api_keys(&cfg));
                         rt.publish_config(cfg);
-                        if !published.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        if published.set(tokio::time::Instant::now()).is_ok() {
                             // The KV client goes first: an attempt that receives a Home
                             // credential must also see Home KV for its identities and
                             // caches.
@@ -899,6 +936,8 @@ async fn run_lifetimes(
                 },
             )
             .await;
+        // Draining and the retry wait are not part of the published lifetime.
+        let ended = tokio::time::Instant::now();
         lifetime.cancel();
         if let Ok(helpers) = worker.await {
             for helper in helpers {
@@ -938,14 +977,16 @@ async fn run_lifetimes(
                 flusher = ReleaseFlusher::new();
                 registry.set_release_sink(Some(flusher.sink()));
             }
+            let healthy_for = published
+                .get()
+                .map_or(Duration::ZERO, |at| ended.saturating_duration_since(*at));
+            let delay = backoff.next(healthy_for, jitter());
             if let Some(error) = error {
-                tracing::warn!("home config subscription lifetime ended: {error}");
+                tracing::warn!("home config subscription lifetime ended; retrying in {delay:?}: {error}");
             }
-            if !published.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = tokio::time::sleep(PRE_ACK_RETRY) => {}
-                }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
             }
             previous = Some(client);
             continue;
@@ -5856,8 +5897,8 @@ mod tests {
     }
 
     /// Go `TestServiceBacksOffAfterRepeatedPreAckFailures`: a lifetime that fails before
-    /// its ACK is retried no sooner than Go's 100ms backoff (Go asserts at least 75ms),
-    /// and not at all once the service is cancelled.
+    /// its ACK is retried no sooner than half the initial reconnect backoff, and not at
+    /// all once the service is cancelled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pre_ack_failures_back_off_and_stop_on_shutdown() {
         let (attempt_tx, mut attempts) = tokio::sync::mpsc::unbounded_channel();
@@ -5875,8 +5916,8 @@ mod tests {
         let second = attempts.recv().await.unwrap();
         let delay = second - first;
         assert!(
-            delay >= Duration::from_millis(75),
-            "pre-ACK retry delay = {delay:?}, want at least 75ms"
+            delay >= ReconnectBackoff::INITIAL / 2,
+            "pre-ACK retry delay = {delay:?}, want at least 500ms"
         );
         node.shutdown.cancel();
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -5885,5 +5926,115 @@ mod tests {
             "pre-ACK retry continued after cancellation"
         );
         node.stop().await;
+    }
+
+    /// Go `a6b4477b` (after v8.0.35) withholds the AI Studio `/v1/ws` gateway in Home mode
+    /// and forces `ws-auth` on. This fork removed that gateway (#49), so a published Home
+    /// node answers a `/v1/ws` upgrade with 410 like any node, and a Home config that
+    /// turns `ws-auth` on is refused as a removed setting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_home_node_never_opens_the_ai_studio_websocket() {
+        assert!(
+            overlay(b"ws-auth: true\n", None).is_err(),
+            "ws-auth applied in Home mode"
+        );
+        let home = scripted("port: 0\n", vec![]).await;
+        let (base, rt, shutdown, task) = node(&home).await;
+        eventually("dispatch published", || {
+            rt.remote_dispatch().is_some_and(|d| d.available())
+        })
+        .await;
+        let response = wreq::Client::new()
+            .get(format!("{base}/v1/ws"))
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 410);
+        assert!(response.text().await.unwrap().contains("removed_provider"));
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// Go `TestHomeSubscriberRetryBackoffGrowthAndJitter`: each failure doubles the
+    /// ceiling up to 30s, and the wait is half the ceiling plus `random` of the other half.
+    #[test]
+    fn reconnect_backoff_doubles_to_its_maximum_with_equal_jitter() {
+        let ceilings = [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs);
+        for random in [0.0, 0.5, 0.999_999] {
+            let mut backoff = ReconnectBackoff::default();
+            for (attempt, ceiling) in ceilings.into_iter().enumerate() {
+                let delay = backoff.next(Duration::ZERO, random);
+                assert_eq!(
+                    delay,
+                    ceiling / 2 + (ceiling / 2).mul_f64(random),
+                    "attempt {}, random {random}",
+                    attempt + 1
+                );
+                assert!(delay >= ceiling / 2 && delay < ReconnectBackoff::MAXIMUM);
+            }
+        }
+    }
+
+    /// Go `TestHomeSubscriberRetryBackoffResetsOnlyAfterStability`: only a lifetime that
+    /// stayed published for 30s starts the backoff over.
+    #[test]
+    fn reconnect_backoff_starts_over_only_after_a_stable_lifetime() {
+        let mut backoff = ReconnectBackoff::default();
+        backoff.next(Duration::ZERO, 0.0);
+        let short = ReconnectBackoff::STABLE - Duration::from_nanos(1);
+        assert_eq!(
+            backoff.next(short, 0.0),
+            Duration::from_secs(1),
+            "a short lifetime reset it"
+        );
+        assert_eq!(
+            backoff.next(ReconnectBackoff::STABLE, 0.0),
+            ReconnectBackoff::INITIAL / 2,
+            "a stable lifetime did not reset it"
+        );
+    }
+
+    /// Go `ce433b37`: a lifetime that published and then lost its heartbeat is retried
+    /// only after the reconnect backoff, and shutdown cuts that wait short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_published_lifetime_backs_off_before_resubscribing() {
+        const CONFIG: &str = "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-heartbeat-timeout: 200ms\n  cpa-cancel-bound: 100ms\n";
+        let (subscribe_tx, mut subscribes) = tokio::sync::mpsc::unbounded_channel();
+        // Home never pongs, so every lifetime ends 200ms after its ACK.
+        let home = fake_home(move |args| match args[0].go_lower().as_str() {
+            "get" if args[1] == "config" => fake::bulk(CONFIG),
+            "subscribe" => {
+                let _ = subscribe_tx.send(std::time::Instant::now());
+                fake::subscribe_ack()
+            }
+            "ping" => fake::raw("+PONG\r\n"),
+            "lpush" | "rpush" => fake::raw(":1\r\n"),
+            _ => fake::raw("+OK\r\n"),
+        })
+        .await;
+        let node = Bare::start(&home).await;
+        node.published().await;
+
+        let first = subscribes.recv().await.unwrap();
+        let second = subscribes.recv().await.unwrap();
+        // The 200ms heartbeat plus at least half of the initial 1s backoff.
+        let gap = second - first;
+        assert!(
+            gap >= Duration::from_millis(650),
+            "resubscribed {gap:?} after the previous ACK, want at least 650ms"
+        );
+
+        // The second lifetime ends 200ms after its ACK; its backoff is at least 1s.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        node.shutdown.cancel();
+        tokio::time::timeout(Duration::from_millis(300), node.task)
+            .await
+            .expect("shutdown waited out the reconnect backoff")
+            .unwrap();
+        assert!(subscribes.try_recv().is_err(), "resubscribed after shutdown");
     }
 }
