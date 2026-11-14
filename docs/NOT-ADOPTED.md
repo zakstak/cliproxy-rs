@@ -5,9 +5,11 @@ These Go v8.0.67 features were researched under the
 Each section names the Go feature, the current Rust behavior, the reason, and what would
 reopen the decision. Paths refer to this repository.
 
-Two rules decide most of these. The proxy stays transparent to providers: it does not add
-tools, instructions or replayed content to a native request. And a feature needs a
-retained client or deployment that uses it.
+Two rules decide most of these. The proxy stays transparent to providers: beyond the
+rewrites it already carries, such as Claude cloaking
+(`crates/cpa-exec/src/claude/cloak.rs`), it adds no new tools, instructions or replayed
+provider content to requests. And a feature needs a retained client or deployment that
+uses it.
 
 ## Claude web-search result replay (C6, #74)
 
@@ -63,9 +65,9 @@ then, add it only as an explicit opt-in.
 
 Go adds a Muse reminder decision tool to every Muse request that carries tools.
 
-Rust's Meta executor adds no tools. Its only tool edit removes `search_content_types` from
-`web_search` tools, which Meta rejects (`sanitize_web_search_tools` in
-`crates/cpa-exec/src/meta.rs`).
+Rust's Meta executor edits tools the caller sent, for example removing
+`search_content_types` from `web_search` tools, which Meta rejects. It adds no tools and
+has no Muse reminder tool (`crates/cpa-exec/src/meta.rs`).
 
 **Reason:** the proxy would add a tool the caller did not send. That breaks provider
 transparency. Go cites one Muse 1.4.12 capture; no checked official source says the tool
