@@ -69,7 +69,7 @@ try {
     }
     for (const [provider, code] of [["Meta", "META-FAKE"], ["xAI", "XAI-FAKE"]]) {
       await button(provider).click();
-      await main.getByText(code).waitFor();
+      await main.getByText(code, { exact: true }).waitFor();
       if (provider === "Meta") await page.screenshot({ path: `${out}/oauth-meta-device-code.png` });
       await main.getByText("Connected", { exact: true }).waitFor({ timeout: 30_000 });
       pass(`${provider}: device code ${code} shown, polled to completion`);
