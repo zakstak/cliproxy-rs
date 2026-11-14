@@ -15,6 +15,7 @@ const CTX: RequestCtx<'static> = RequestCtx {
     model: "grok-4.7",
     stream: true,
     tool_search: false,
+    system_turns: false,
 };
 
 fn field(out: &[u8], path: &str) -> Option<String> {

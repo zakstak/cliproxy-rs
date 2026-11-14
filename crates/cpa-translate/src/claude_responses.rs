@@ -28,17 +28,23 @@ fn compatible_claude_signature(raw: &[u8]) -> Option<Vec<u8>> {
 
 /// Refuses a request whose user turn is left empty by file or audio parts Claude cannot
 /// receive (f51624aa).
-/// `tool_search` is `upstream.claude.tool-search` as pinned for the request: with it,
+/// `ctx.tool_search` is `upstream.claude.tool-search` as pinned for the request: with it,
 /// Codex client tool_search (`{"type":"tool_search","execution":"client"}`) becomes a
 /// Claude tool and its history a tool_use/tool_result pair (claude_openai-responses_
 /// tool_search.go); without it the translation predates tool_search support.
+///
+/// Instructions and system or developer items become top-level `system` blocks in source
+/// order. With `ctx.system_turns`, a text-only item after the conversation starts goes
+/// out as a `role: system` turn right after the next user message instead (Go 27762819):
+/// clients such as Codex add these on later turns, and joining them to the top-level
+/// system would change the cache prefix ahead of every earlier turn. An item no user
+/// message follows stays top-level.
 pub(crate) fn convert(
-    model: &str,
+    ctx: &crate::RequestCtx<'_>,
     input: &[u8],
-    stream: bool,
     preserve_thinking: bool,
-    tool_search: bool,
 ) -> Result<Vec<u8>, crate::Error> {
+    let (model, stream, tool_search) = (ctx.model, ctx.stream, ctx.tool_search);
     let raw = normalize_codex_agent_messages(input);
     let mut drops = common::UserTurnDrops::default();
     let user_id = common::derive_claude_user_id(&raw);
@@ -64,64 +70,11 @@ pub(crate) fn convert(
     }
 
     let mut system: Vec<Vec<u8>> = vec![];
-    let append_system = |system: &mut Vec<Vec<u8>>, text: &[u8], cache: Option<&Res<'_>>| {
-        if text.is_empty() {
-            return;
-        }
-        let mut block = text_part(text);
-        if let Some(source) = cache.filter(|s| s.exists()) {
-            block = common::attach_cache_control(block, source);
-        }
-        system.push(block);
-    };
     let instructions = root.get("instructions");
     if instructions.kind == Kind::String {
-        append_system(&mut system, &instructions.s, None);
+        push_system_text(&mut system, &instructions.s, None);
     }
     let input_items = root.get("input");
-    if input_items.is_array() {
-        input_items.each(|_, item| {
-            if !is_system_role(&item.get("role")) {
-                return true;
-            }
-            let start = system.len();
-            let content = item.get("content");
-            if content.kind == Kind::String {
-                append_system(&mut system, &content.s, None);
-            } else if content.is_array() {
-                content.each(|_, part| {
-                    match &*part.get("type").bytes() {
-                        b"input_text" | b"output_text" | b"text" => {
-                            append_system(&mut system, &part.get("text").bytes(), Some(&part))
-                        }
-                        _ => {
-                            let kind = trim_space(&part.get("type").bytes()).to_vec();
-                            if !kind.is_empty() {
-                                let mut block = br#"{"type":""}"#.to_vec();
-                                gj::set_str(&mut block, "type", kind);
-                                system.push(block);
-                            }
-                        }
-                    }
-                    true
-                });
-            }
-            if item.get("cache_control").exists()
-                && system.len() > start
-                && let Some(last) = system.last_mut()
-                && !gj::get(last, "cache_control").exists()
-            {
-                *last = common::attach_cache_control(std::mem::take(last), &item);
-            }
-            true
-        });
-    }
-    let mut format = root.get("text.format");
-    if !format.exists() {
-        format = root.get("response_format");
-    }
-    let instruction = common::claude_structured_output_instruction(&format);
-    append_system(&mut system, &instruction, None);
 
     let descriptors = tool_descriptors(&root, tool_search);
     let winners = tool_winners(&descriptors);
@@ -158,10 +111,19 @@ pub(crate) fn convert(
     let mut emitted_results: HashSet<Vec<u8>> = HashSet::new();
     let mut emitted_uses: HashSet<Vec<u8>> = HashSet::new();
     let web_search_history = WebSearchHistory::scan(&items);
+    let mut started = false;
     for (index, item) in items.iter().enumerate() {
         if is_system_role(&item.get("role")) {
+            let blocks = system_item_blocks(item);
+            let in_place = ctx.system_turns
+                && started
+                && matches!(&*item.get("type").bytes(), b"" | b"message")
+                && !blocks.is_empty()
+                && blocks.iter().all(|b| &*gj::get(b, "type").bytes() == b"text");
+            pending.system(blocks, in_place);
             continue;
         }
+        started = true;
         let mut kind = item.get("type").bytes().into_owned();
         if kind.is_empty() && !item.get("role").bytes().is_empty() {
             kind = b"message".to_vec();
@@ -271,7 +233,18 @@ pub(crate) fn convert(
             _ => {}
         }
     }
-    let mut messages = pending.finish();
+    let (mut messages, top_level) = pending.finish();
+    system.extend(top_level);
+    // The structured-output instruction stays the last system block.
+    let mut format = root.get("text.format");
+    if !format.exists() {
+        format = root.get("response_format");
+    }
+    push_system_text(
+        &mut system,
+        &common::claude_structured_output_instruction(&format),
+        None,
+    );
     let had_messages = !messages.is_empty();
     if !preserve_thinking {
         strip_trailing_thinking(&mut messages);
@@ -390,6 +363,53 @@ fn is_system_role(role: &Res<'_>) -> bool {
     matches!(common::norm(role).as_str(), "system" | "developer")
 }
 
+/// A non-empty text block, with `cache`'s `cache_control` when it has one.
+fn push_system_text(system: &mut Vec<Vec<u8>>, text: &[u8], cache: Option<&Res<'_>>) {
+    if text.is_empty() {
+        return;
+    }
+    let mut block = text_part(text);
+    if let Some(source) = cache.filter(|s| s.exists()) {
+        block = common::attach_cache_control(block, source);
+    }
+    system.push(block);
+}
+
+/// One system or developer item's Claude blocks: a text block per non-empty text part,
+/// a typed marker for any other part (the executor refuses it by name), and the item's
+/// `cache_control` on its last block.
+fn system_item_blocks(item: &Res<'_>) -> Vec<Vec<u8>> {
+    let mut blocks = vec![];
+    let content = item.get("content");
+    if content.kind == Kind::String {
+        push_system_text(&mut blocks, &content.s, None);
+    } else if content.is_array() {
+        content.each(|_, part| {
+            match &*part.get("type").bytes() {
+                b"input_text" | b"output_text" | b"text" => {
+                    push_system_text(&mut blocks, &part.get("text").bytes(), Some(&part))
+                }
+                _ => {
+                    let kind = trim_space(&part.get("type").bytes()).to_vec();
+                    if !kind.is_empty() {
+                        let mut block = br#"{"type":""}"#.to_vec();
+                        gj::set_str(&mut block, "type", kind);
+                        blocks.push(block);
+                    }
+                }
+            }
+            true
+        });
+    }
+    if item.get("cache_control").exists()
+        && let Some(last) = blocks.last_mut()
+        && !gj::get(last, "cache_control").exists()
+    {
+        *last = common::attach_cache_control(std::mem::take(last), item);
+    }
+    blocks
+}
+
 fn is_role(message: &[u8], role: &str) -> bool {
     common::norm(&gj::get(message, "role")) == role
 }
@@ -468,6 +488,11 @@ struct Pending {
     role: Vec<u8>,
     parts: Vec<Vec<u8>>,
     tool_uses: Vec<Vec<u8>>,
+    /// The Claude blocks of each system or developer item, in source order. An item
+    /// sent as a `role: system` turn leaves its blocks empty.
+    system: Vec<Vec<Vec<u8>>>,
+    /// Indexes into `system` of the items that go after the next user message.
+    queued: Vec<usize>,
 }
 
 impl Pending {
@@ -486,8 +511,24 @@ impl Pending {
         if !parts.is_empty() {
             let msg = claude_message(&self.role, &parts);
             self.messages.push(msg);
+            if self.role == b"user" {
+                for at in self.queued.drain(..) {
+                    let mut turn = br#"{"role":"system","content":[]}"#.to_vec();
+                    gj::set_raw(&mut turn, "content", gj::join(&std::mem::take(&mut self.system[at])));
+                    self.messages.push(turn);
+                }
+            }
         }
         self.role.clear();
+    }
+
+    /// Claude takes a `role: system` turn only after a user message, so an item kept
+    /// `in_place` waits for the user message being built or the next one.
+    fn system(&mut self, blocks: Vec<Vec<u8>>, in_place: bool) {
+        if in_place {
+            self.queued.push(self.system.len());
+        }
+        self.system.push(blocks);
     }
 
     fn switch_to(&mut self, role: &[u8]) {
@@ -523,9 +564,11 @@ impl Pending {
         self.parts.push(part);
     }
 
-    fn finish(mut self) -> Vec<Vec<u8>> {
+    /// The messages, and the blocks of every system item that is not a turn, which
+    /// belong in the top-level `system`.
+    fn finish(mut self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         self.flush();
-        self.messages
+        (self.messages, self.system.into_iter().flatten().collect())
     }
 }
 

@@ -297,6 +297,7 @@ fn run(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: bo
         model,
         stream: f["stream"].as_bool().unwrap_or(false),
         tool_search,
+        system_turns: false,
     };
     match f["path"].as_str().unwrap() {
         "request" => vec![request_output(translate_request(client, upstream, &ctx, &input))],
@@ -1008,6 +1009,7 @@ fn openai_passthrough_is_byte_oriented() {
     let req = RequestCtx {
         model: "m",
         stream: true,
+        system_turns: false,
         tool_search: false,
     };
     assert_eq!(
@@ -1026,6 +1028,7 @@ fn registration_matches_go() {
     // Unregistered pairs fall back to a model rewrite only.
     let ctx = RequestCtx {
         model: "new",
+        system_turns: false,
         stream: false,
         tool_search: false,
     };
@@ -1051,6 +1054,7 @@ fn deeply_nested_client_bodies_translate_without_overflowing() {
     ]
     .concat();
     let ctx = RequestCtx {
+        system_turns: false,
         model: "gpt-test",
         stream: false,
         tool_search: false,

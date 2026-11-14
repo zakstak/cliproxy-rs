@@ -42,6 +42,7 @@ pub(crate) fn upstream_body(req: &ExecRequest, model: &str) -> Result<String, Ex
         model,
         stream: true,
         tool_search: false,
+        system_turns: false,
     };
     let translated = cpa_translate::codex_request(req.source_format, &ctx, &req.body)
         .ok_or_else(|| {

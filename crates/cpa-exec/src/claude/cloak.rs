@@ -44,7 +44,12 @@ pub(crate) fn canonical_model(model: &str) -> String {
 }
 
 pub(crate) fn legacy_system_reminder(body: &str) -> bool {
-    LEGACY_SYSTEM_REMINDER_MODELS.contains(&canonical_model(rawjson::get(body, "model").str()).as_str())
+    legacy_model(rawjson::get(body, "model").str())
+}
+
+/// Whether `model` rejects a mid-conversation `role: system` turn.
+pub(crate) fn legacy_model(model: &str) -> bool {
+    LEGACY_SYSTEM_REMINDER_MODELS.contains(&canonical_model(model).as_str())
 }
 
 pub(crate) fn is_fable51(model: &str) -> bool {

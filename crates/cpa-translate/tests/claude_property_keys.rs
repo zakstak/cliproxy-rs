@@ -15,6 +15,7 @@ const CTX: RequestCtx<'static> = RequestCtx {
     model: "claude-opus-5-5",
     stream: true,
     tool_search: false,
+    system_turns: false,
 };
 
 fn accepted(key: &str) -> bool {

@@ -31,7 +31,7 @@ pub static PAIR: Registered = registered!(
 );
 
 fn request(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    crate::claude_responses::convert(ctx.model, body, ctx.stream, false, ctx.tool_search)
+    crate::claude_responses::convert(ctx, body, false)
 }
 
 struct Winner {

@@ -121,7 +121,7 @@ pub fn claude_to_openai_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result
 /// ConvertOpenAIResponsesRequestToClaudeWithCompat: like the registered Responses ->
 /// Claude request, but unsigned reasoning history is kept for compatibility endpoints.
 pub fn responses_to_claude_with_compat(ctx: &RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> {
-    claude_responses::convert(ctx.model, body, ctx.stream, true, ctx.tool_search)
+    claude_responses::convert(ctx, body, true)
 }
 
 use bytes::Bytes;
@@ -146,6 +146,11 @@ pub struct RequestCtx<'a> {
     /// `upstream.claude.tool-search` as pinned for this request (Go
     /// `WithClientToolSearch`): Codex client tool_search on the Responses -> Claude pair.
     pub tool_search: bool,
+    /// Responses -> Claude: text-only system and developer items after the conversation
+    /// starts stay in place as `role: system` turns instead of joining the top-level
+    /// `system`, which keeps the prompt-cache prefix of earlier turns. The Claude
+    /// executor sets it only where such a turn reaches Claude as sent.
+    pub system_turns: bool,
 }
 
 /// Request-scoped inputs available to response transforms.

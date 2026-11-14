@@ -25,6 +25,7 @@ fn translate(body: &[u8]) -> Value {
         model: "claude-test",
         stream: true,
         tool_search: false,
+        system_turns: false,
     };
     let out = translate_request(Format::OpenAIResponse, Format::Claude, &ctx, body).unwrap();
     serde_json::from_slice(&out).unwrap()
