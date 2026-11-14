@@ -9,7 +9,9 @@
 //! tests pin that two calls in one answer stay two calls, streamed and buffered, that
 //! the answer ends as a tool call, and that each reasoning part arrives. Grok and Muse
 //! hand Chat and Claude clients the shared `(client, Codex)` pair's output unchanged
-//! (`cpa-exec` `xai.rs`, `meta.rs`), so the pair is what they send.
+//! (`cpa-exec` `xai.rs`, `meta.rs`), so the pair is what they send. #168 tracks two
+//! reasoning defects in the shared Responses -> Claude translator: buffered summary
+//! parts lose their separator, and whitespace-only summaries open thinking blocks.
 use cpa_core::format::Format;
 use cpa_translate::{ResponseCtx, pair};
 use serde_json::{Value, json};
@@ -334,6 +336,9 @@ fn responses_to_claude_keeps_parallel_calls_and_reasoning_parts() {
     assert_eq!(content.len(), 3, "{body}");
     assert_eq!(content[0]["type"], "thinking");
     assert_eq!(content[0]["signature"], "enc");
+    // The buffered thinking text joins the summary parts without the stream's separator
+    // ("onetwo", not "one\n\ntwo"). This translator is shared with the Codex translated
+    // route; #168 tracks the fix with #27, so the text is not pinned here.
     assert_eq!(
         content[1..],
         [
