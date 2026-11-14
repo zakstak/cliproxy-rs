@@ -764,4 +764,11 @@ fn property_names_beside_a_renamed_key_leave_the_tool_as_sent() {
             "propertyNames": {"pattern": "^x y$"}}}}),
         json!({"p": {"x y": 1}}),
     );
+    // Through an `allOf` sibling that constrains the same member.
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"payload": {
+            "properties": {"p": {"properties": {"x y": {}}}},
+            "allOf": [{"properties": {"p": {"propertyNames": {"pattern": "^x y$"}}}}]}}}),
+        json!({"payload": {"p": {"x y": 1}}}),
+    );
 }

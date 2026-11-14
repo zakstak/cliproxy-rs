@@ -24,6 +24,9 @@
 //! A tool is declined as a whole when a `contains` schema names a renamed key at the
 //! element, or a key below a `not` is renamed: the walk renames keys only where a
 //! schema applies, and those decide verdicts in elements and values where they don't.
+//! A tool with any object-valued `propertyNames` is also declined: that constraint
+//! judges the generated name, and lexical positions cannot prove it unrelated to a
+//! renamed key when sibling applicators and references share member/element paths.
 //! Keys of a free-form object (`additionalProperties`, `patternProperties`, no schema)
 //! are data and stay as sent, in both directions, even when they spell a renamed key.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
@@ -646,11 +649,15 @@ impl PropertyKeys {
         // a renamed key decides a verdict elsewhere: below a `not` (read but never
         // applied), in a `contains` at the element (it decides which elements match,
         // for `maxContains`), or beside a `propertyNames` (kept as written, it would
-        // now judge the generated name).
+        // now judge the generated name). Property-name constraints are declined even
+        // at unrelated positions: member/element transitions of in-place siblings and
+        // references can coapply, so lexical position alone cannot prove separation.
+        // ponytail: proving property-name constraints equivalent for every coapplying
+        // instance position would allow unrelated propertyNames to keep renaming.
         // ponytail: following evaluated-only transitions under `not` is the upgrade.
         if tree.renamed_below_not(&to_claude)
             || tree.renamed_by_contains(&to_claude)
-            || tree.renamed_beside_property_names(&to_claude)
+            || tree.nodes.iter().any(|n| !n.property_names.is_empty())
         {
             return None;
         }
@@ -1314,40 +1321,6 @@ impl Tree {
             queue.extend(self.children(n).filter(|&(_, moves)| !moves).map(|(c, _)| c));
         }
         false
-    }
-
-    /// Whether a `propertyNames` schema object shares an instance position with a node
-    /// naming a key in `renamed`. Positions are joined through in-place edges in both
-    /// directions, references included, which can only over-join.
-    fn renamed_beside_property_names(&self, renamed: &HashMap<Vec<u8>, Vec<u8>>) -> bool {
-        if self.nodes.iter().all(|n| n.property_names.is_empty()) {
-            return false;
-        }
-        let mut group: Vec<NodeId> = (0..self.nodes.len()).collect();
-        fn root(group: &mut [NodeId], mut n: NodeId) -> NodeId {
-            while group[n] != n {
-                group[n] = group[group[n]];
-                n = group[n];
-            }
-            n
-        }
-        for n in 0..self.nodes.len() {
-            for (c, moves) in self.children(n).collect::<Vec<_>>() {
-                if !moves {
-                    let (a, b) = (root(&mut group, n), root(&mut group, c));
-                    group[a] = b;
-                }
-            }
-        }
-        let mut constrained: HashSet<NodeId> = HashSet::new();
-        for n in 0..self.nodes.len() {
-            if !self.nodes[n].property_names.is_empty() {
-                constrained.insert(root(&mut group, n));
-            }
-        }
-        (0..self.nodes.len()).any(|n| {
-            self.nodes[n].named.iter().any(|k| renamed.contains_key(k)) && constrained.contains(&root(&mut group, n))
-        })
     }
 
     /// Whether a subschema below a `not`, at another instance position, names a key in
@@ -2081,18 +2054,23 @@ mod tests {
         let referenced = br##"{"$defs":{"names":{"enum":["x y"]}},"properties":{"p":{
             "properties":{"x y":{}},"allOf":[{"propertyNames":{"$ref":"#/$defs/names"}}]}}}"##;
         assert!(PropertyKeys::of(referenced).is_none());
-        // `true`, `false` and a `propertyNames` at another position keep the rename.
+        // In-place parents can constrain the same member through different edges.
+        let siblings = br##"{"properties":{"payload":{"properties":{"p":{"properties":{"x y":{}}}},
+            "allOf":[{"properties":{"p":{"propertyNames":{"pattern":"^x y$"}}}}]}}}"##;
+        assert!(PropertyKeys::of(siblings).is_none());
+        // The same overlap can happen at an array element via items and contains.
+        let elements = br##"{"properties":{"list":{"items":{"properties":{"x y":{}}},
+            "contains":{"propertyNames":{"enum":["x y"]}}}}}"##;
+        assert!(PropertyKeys::of(elements).is_none());
+        // Boolean schemas judge every name alike and keep the rename.
         for names in ["true", "false"] {
             let schema =
                 format!(r##"{{"properties":{{"p":{{"properties":{{"x y":{{}}}},"propertyNames":{names}}}}}}}"##);
             assert!(PropertyKeys::of(schema.as_bytes()).is_some());
         }
         let elsewhere = br##"{"properties":{"p":{"properties":{"x y":{}}},"q":{"propertyNames":{"maxLength":3}}}}"##;
-        round_trip(
-            elsewhere,
-            r##"{"p":{"x y":1},"q":{"abc":2}}"##,
-            r##"{"p":{"x_y":1},"q":{"abc":2}}"##,
-        );
+        // An unrelated object-valued propertyNames is conservatively declined too.
+        assert!(PropertyKeys::of(elsewhere).is_none());
     }
 
     #[test]
