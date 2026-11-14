@@ -66,6 +66,25 @@ const names: Record<string, string> = {
 export const label = (id: string) => names[id] || id;
 export const provider = (a: Data) => String(a.provider || a.type || "unknown").replace("anthropic", "claude");
 export const credName = (a: Data) => String(a.email || a.label || a.account || a.name);
+/** Providers with a sign-in on the Connect page. */
+export const signIns = ["claude", "codex", "xai", "meta"];
+/**
+ * An account that can sign in again in place: a sign-in provider's OAuth file. The server
+ * decides and refuses anything else ("target credential has no sign-in", and others).
+ */
+export const canSignInAgain = (a: Data) => signIns.includes(provider(a)) && !a.runtime_only && a.account_type === "oauth";
+/**
+ * The sign-in start request: a new account of provider `p`, or, with `target`, that existing
+ * account again. A targeted start names no provider: the server takes the target's, and a
+ * server that cannot target asks for one ("provider is required") instead of starting a new
+ * sign-in that would add a second account.
+ */
+export function authUrl(p: string, target?: Data) {
+  const q = new URLSearchParams(target ? { name: target.name, ...(target.auth_index ? { auth_index: target.auth_index } : {}) } : { provider: p });
+  // Go starts a local callback forwarder for these when asked by a web UI.
+  if (["claude", "codex", "xai"].includes(p)) q.set("is_webui", "true");
+  return `/oauth/auth-url?${q}`;
+}
 /** A random client key: "sk-" and 48 hex characters. */
 export const newKey = () => `sk-${Array.from(crypto.getRandomValues(new Uint8Array(24)), (n) => n.toString(16).padStart(2, "0")).join("")}`;
 /** Small flags this browser keeps for the first-run card. Never keys. */

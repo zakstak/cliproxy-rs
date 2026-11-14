@@ -1474,3 +1474,66 @@ payload:
     assert_eq!(gj::get(&first, "input.#").int(), 1, "{text}");
     assert_eq!(gj::get(&first, "type").str(), "response.create", "{text}");
 }
+
+/// #178: a WebSocket turn marks TTFT at the first upstream message with output
+/// (`helpers::responses_token_event`), not at its first message: `response.created` and
+/// an empty delta are frames only.
+#[tokio::test]
+async fn ttft_is_marked_at_the_first_output_message() {
+    let shared: Shared = Arc::default();
+    let app = axum::Router::new().fallback(handler).with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let created = r#"{"type":"response.created","response":{"id":"r1","status":"in_progress","output":[]}}"#;
+    let empty = r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":""}"#;
+    let delta =
+        r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"hi"}"#;
+    let done = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+    let turn = serde_json::json!({
+        "auth": "auth-a",
+        "payload": r#"{"model":"grok-4.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}"#,
+        "acts": [{"send": [created, empty, delta, done]}],
+    });
+    shared.lock().unwrap().turn = Some(turn.clone());
+    let attrs = serde_json::json!({"api_key": "sk-fake", "base_url": "http://UPSTREAM/v1", "websockets": "true"});
+    let credential = credential("auth-a", &attrs, &addr);
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let session = ExecSession {
+        id: "sess-ttft".into(),
+        continuation: false,
+        lease: None,
+    };
+    let (recorder, _capture, usage) = crate::usage_testkit::sinks();
+    let response = executor
+        .execute_in_session(
+            &credential,
+            request(&turn, "sess-ttft", usage),
+            &Config::default(),
+            &session,
+        )
+        .await
+        .unwrap();
+    let ResponseBody::Stream(mut stream) = response.body else {
+        panic!("buffered response");
+    };
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+    }
+    let marks: Vec<&str> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            crate::usage_testkit::Report::RoundTrip => Some("start"),
+            crate::usage_testkit::Report::FirstByte => Some("byte"),
+            crate::usage_testkit::Report::TokenEvent(false) => Some("frame"),
+            crate::usage_testkit::Report::TokenEvent(true) => Some("token"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks, ["start", "frame", "frame", "token", "token"]);
+    executor.close_session("sess-ttft");
+    server.abort();
+}

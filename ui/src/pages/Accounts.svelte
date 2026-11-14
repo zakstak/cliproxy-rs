@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, every, Res } from "../store.svelte";
   import { api, download } from "../api";
-  import { buckets, credName, provider, label, span, accountRow, strategy, readPath, type Data, type Window } from "../core";
+  import { buckets, credName, provider, label, span, accountRow, strategy, readPath, canSignInAgain, type Data, type Window } from "../core";
   import { check, checkAll, canCheck, hasSource, limits, quotaKey, wait } from "../quota";
   import Grille from "../Grille.svelte";
   import Meter from "../Meter.svelte";
@@ -214,6 +214,7 @@
     ["DELETE", "/credentials", "delete"],
     ["POST", "/routing/cooldown/reset", "cooldown reset"],
     ["POST", "/requests/api-call", "quota checks"],
+    ["GET", "/oauth/auth-url", "sign in again"],
   ]}
 />
 
@@ -316,6 +317,11 @@
                             store.call(method, path, body, done, ask).then((ok) => ok && method === "DELETE" && store.go("accounts"))}
                           >{name}</button
                         >{/each}
+                      {#if canSignInAgain(a)}<button
+                          class="key small"
+                          disabled={store.busy || !store.can("GET", "/oauth/auth-url")}
+                          onclick={() => ((store.relogin = a), store.go("connect"))}>Sign in again</button
+                        >{/if}
                       <button
                         class="key small"
                         disabled={store.busy || a.runtime_only || !store.can("GET", "/credentials/download")}

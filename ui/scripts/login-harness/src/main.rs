@@ -20,9 +20,8 @@ async fn main() -> anyhow::Result<()> {
     let executors = Executors {
         claude: ClaudeExecutor::new(DEFAULT_BASE_URL)?,
         codex: cpa_exec::codex::CodexExecutor::new()?,
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
+        meta: Default::default(),
+        xai: Default::default(),
     };
     // The deny-all test runtime: a credential that is not local cannot leave the machine.
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));

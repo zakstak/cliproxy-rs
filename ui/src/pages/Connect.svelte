@@ -1,15 +1,12 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { store, every } from "../store.svelte";
   import { api, ApiError } from "../api";
-  import { label, provider, credName, accountRow, span, type Data } from "../core";
+  import { label, provider, credName, accountRow, span, signIns, authUrl, type Data } from "../core";
   import { check, canCheck, hasSource, limits, quotaKey, wait } from "../quota";
   import Missing from "../Missing.svelte";
   import Bar from "../Bar.svelte";
 
-  const builtIn = ["claude", "codex", "xai", "meta"];
-  // Go starts a local callback forwarder for these when asked by a web UI.
-  const forwarded = ["claude", "codex", "xai"];
-  const providers = builtIn;
   let gone = $state<string[]>([]),
     session = $state<Data | null>(null),
     status = $state(""),
@@ -21,23 +18,35 @@
     now = $state(Date.now()),
     callback = $state("");
   const can = $derived(store.can("GET", "/oauth/auth-url"));
+  // Accounts hands over an account to sign in again. Taking it clears it, so it starts once.
+  $effect(() => {
+    const a = store.relogin;
+    if (!a) return;
+    store.relogin = null;
+    untrack(() => start(provider(a), a));
+  });
 
-  async function start(p: string) {
+  /** Starts a sign-in for a new `p` account, or, with `target`, for that account again. */
+  async function start(p: string, target?: Data) {
     if (session && status === "wait" && !(await cancel())) return;
     store.act(async () => {
-      // The credential names before the sign-in starts, to recognise its credential later.
-      const seen = await names();
-      const r = await api(`/oauth/auth-url?provider=${encodeURIComponent(p)}${forwarded.includes(p) ? "&is_webui=true" : ""}`).catch((e) => {
+      // The credential names before a new sign-in starts, to recognise its credential later.
+      // A targeted one keeps its file name, so only its session status tells how it ended.
+      const seen = target ? null : await names();
+      const r = await api(authUrl(p, target)).catch((e) => {
         // Go knows every built-in provider; a server that lacks one answers provider_not_found.
         if (e instanceof ApiError && e.code === "provider_not_found") {
           gone = [...gone, p];
           throw new Error(`${label(p)} sign-in is not available on this server.`);
         }
+        // A server that cannot target an account ignores `name` and asks for a provider.
+        if (target && e instanceof ApiError && e.message === "provider is required")
+          throw new Error("Signing in to one account again is not available on this server.");
         throw e;
       });
       const url = new URL(r.url, location.href);
       if (!/^https?:$/.test(url.protocol)) throw new Error("The server returned an unsafe sign-in URL.");
-      session = { ...r, url: url.href, provider: p, seen, started: Date.now() };
+      session = { ...r, url: url.href, provider: p, target, seen, started: Date.now() };
       status = "wait";
       problem = found = callback = "";
       acct = got = null;
@@ -90,12 +99,13 @@
       if (r.status !== "ok") return finish(r.status);
       // A queued usage check reads the account from this list, so it must hold the new one.
       await store.creds.load(true);
-      await verify(s, r.acct);
+      const t = s.target;
+      await verify(s, r.acct || (t && store.creds.data?.find((c) => c.name === t.name && c.auth_index === t.auth_index)));
     }, true),
   );
   /** This provider's credentials now, or none when they cannot be read or matched. */
   async function mine(s: Data): Promise<Data[]> {
-    const list = s.seen && builtIn.includes(s.provider) ? await names() : null;
+    const list = s.seen && signIns.includes(s.provider) ? await names() : null;
     return list ? [...list.values()].filter((c) => provider(c) === s.provider) : [];
   }
   /**
@@ -129,7 +139,7 @@
     // Only a token the provider rejects is "refused"; other failed reads say so plainly.
     const refused = [401, 403].includes(got?.code);
     finish(refused ? "refused" : "ok");
-    if (!refused) store.notify(`${label(s.provider)} account connected.`);
+    if (!refused) store.notify(s.target ? `${credName(s.target)} signed in again.` : `${label(s.provider)} account connected.`);
   }
   // Whose page the user approves on.
   const owner = (p: string) => (p === "codex" ? "OpenAI" : label(p));
@@ -145,10 +155,10 @@
   <h2>Sign in with a provider</h2>
   <p class="muted">You approve access on the provider’s own page. The proxy keeps the token and renews it; it never sees your password.</p>
   <div class="providers">
-    {#each providers as p}
+    {#each signIns as p}
       <button
         class="key"
-        aria-pressed={session?.provider === p && status === "wait"}
+        aria-pressed={session?.provider === p && !session.target && status === "wait"}
         disabled={store.busy || !can || gone.includes(p)}
         onclick={() => start(p)}>{label(p)}</button
       >
@@ -158,15 +168,16 @@
 
 {#if session}
   {@const P = label(session.provider)}
+  {@const T = session.target}
   <section class="window flow" aria-live="polite">
     <div class="section-head">
-      <h2>{P}</h2>
+      <h2>{T ? `${P} · ${credName(T)}` : P}</h2>
       {#if status === "wait" && session.expires_in}<span class="legend"
           >{session.started + session.expires_in * 1000 > now ? `Code expires in ${span(session.started + session.expires_in * 1000 - now)}` : "Code expired"}</span
         >{/if}
       <span class="row">
         <span class="lamp {status === 'ok' ? 'ok' : status === 'wait' || status === 'verifying' ? 'warn live' : status === 'error' || status === 'refused' ? 'bad' : 'off'}"></span>
-        {({ wait: "Waiting for approval", verifying: "Checking the account", ok: "Connected", refused: "Provider refused", error: "Failed", unknown: "Result unavailable" } as Record<string, string>)[status] || "Cancelled"}
+        {({ wait: "Waiting for approval", verifying: "Checking the account", ok: T ? "Signed in again" : "Connected", refused: "Provider refused", error: "Failed", unknown: "Result unavailable" } as Record<string, string>)[status] || "Cancelled"}
       </span>
     </div>
     {#if status === "wait"}
@@ -179,6 +190,7 @@
       {:else}
         <p>Approve access on {owner(session.provider)}’s page. This panel updates by itself when you’re done.</p>
       {/if}
+      {#if T}<p class="muted small">Sign in as {credName(T)}. A sign-in to another account is refused and saves nothing.</p>{/if}
       <div class="row">
         <a class="key primary" href={session.url} target="_blank" rel="noopener noreferrer"><svg class="i" aria-hidden="true"><use href="#i-open" /></svg>Open sign-in page</a>
         <button class="key" onclick={() => store.act(() => navigator.clipboard.writeText(session!.url), "Link copied.")}><svg class="i" aria-hidden="true"><use href="#i-copy" /></svg>Copy link</button>
@@ -224,7 +236,7 @@
           {/if}
         </div>
       {/if}
-      {#if found}<p>{found}</p>{:else if !acct}<p>Saved on the server.</p>{/if}
+      {#if found}<p>{found}</p>{:else if T}<p>The account’s own file holds the new sign-in. Its settings are unchanged.</p>{:else if !acct}<p>Saved on the server.</p>{/if}
       {#if status === "refused"}
         <p class="error">{got?.error}</p>
         <p class="muted small">
@@ -236,7 +248,7 @@
             onclick={() => (wait(acct!) ? store.notify(`Read moments ago. Try again in ${span(wait(acct!))}.`) : verify(session!, acct!))}
             ><svg class="i" aria-hidden="true"><use href="#i-refresh" /></svg>Try again</button
           >
-          <button class="key primary" onclick={() => start(session!.provider)}>Sign in again</button>
+          <button class="key primary" onclick={() => start(session!.provider, T)}>Sign in again</button>
           <a class="key quiet" href="#accounts">Open Accounts</a>
         </div>
       {:else}
@@ -244,16 +256,17 @@
         {:else if got?.error}<p class="error">Usage read failed: {got.error}</p>
         {:else if acct && canCheck(acct)}<p class="muted small">Usage not read: read under 2 minutes ago.</p>{/if}
         <div class="row">
-          <button class="key primary" onclick={() => start(session!.provider)}><svg class="i" aria-hidden="true"><use href="#i-plus" /></svg>Connect another {P} account</button>
-          <a class="key" href="#accounts">Open Accounts</a>
+          {#if T}<a class="key primary" href="#accounts">Open Accounts</a>
+          {:else}<button class="key primary" onclick={() => start(session!.provider)}><svg class="i" aria-hidden="true"><use href="#i-plus" /></svg>Connect another {P} account</button>
+            <a class="key" href="#accounts">Open Accounts</a>{/if}
         </div>
       {/if}
     {:else if status === "unknown"}
-      <p>The proxy no longer has this sign-in’s result. Check Accounts to see whether it was added.</p>
-      <div class="row"><a class="key primary" href="#accounts">Open Accounts</a><button class="key" onclick={() => start(session!.provider)}>Start again</button></div>
+      <p>The proxy no longer has this sign-in’s result. {T ? "Check the account on Accounts." : "Check Accounts to see whether it was added."}</p>
+      <div class="row"><a class="key primary" href="#accounts">Open Accounts</a><button class="key" onclick={() => start(session!.provider, T)}>Start again</button></div>
     {:else}
       {#if problem}<p class="error">{problem}</p>{/if}
-      <div class="row"><button class="key" onclick={() => start(session!.provider)}>Start again</button></div>
+      <div class="row"><button class="key" onclick={() => start(session!.provider, T)}>Start again</button></div>
     {/if}
   </section>
 {/if}

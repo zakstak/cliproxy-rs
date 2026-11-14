@@ -450,7 +450,8 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
     let content = rawjson::get(body, &path);
     let date_block = text_block(&date_reminder(date), None);
     if content.kind() == rawjson::Kind::String {
-        let user = text_block(content.str(), if explicit { None } else { EPHEMERAL });
+        let blank = content.str().trim().is_empty();
+        let user = text_block(content.str(), if explicit || blank { None } else { EPHEMERAL });
         return rawjson::set_raw(body, &path, &format!("[{date_block},{user}]"));
     }
     if content.kind() != rawjson::Kind::Array {
@@ -464,7 +465,7 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
             if date_reminder_prefix(&text) {
                 continue;
             }
-            if !explicit && !cached && !context_reminder(&text) {
+            if !explicit && !cached && !context_reminder(&text) && !text.trim().is_empty() {
                 raw.push(with_ephemeral(block.json()));
                 cached = true;
                 continue;
@@ -749,10 +750,30 @@ pub(crate) fn enforce_cache_limit(body: String, mut max: usize) -> String {
 fn cacheable_system(body: &str) -> bool {
     let system = rawjson::get(body, "system");
     match system.kind() {
-        rawjson::Kind::Array => !system.array().is_empty(),
+        rawjson::Kind::Array => last_holder(&system.array(), true).is_some(),
         rawjson::Kind::String => !system.str().trim().is_empty(),
         _ => false,
     }
+}
+
+/// Whether a block can carry a breakpoint: "Empty text blocks cannot be cached" and
+/// thinking blocks cannot be marked (platform docs, Prompt caching). A system block must
+/// be text; a message block may also be a tool use, tool result, image or document.
+fn holds_marker(block: &rawjson::Value, system: bool) -> bool {
+    if block.kind() != rawjson::Kind::Object {
+        return false;
+    }
+    match block.get("type").str() {
+        "text" => !block.get("text").str().trim().is_empty(),
+        "" if system => !block.get("text").str().trim().is_empty(),
+        "" | "thinking" | "redacted_thinking" => false,
+        _ => !system,
+    }
+}
+
+/// The last block of `blocks` that can carry a breakpoint.
+fn last_holder(blocks: &[rawjson::Value], system: bool) -> Option<usize> {
+    blocks.iter().rposition(|b| holds_marker(b, system))
 }
 
 /// `ensureCacheControl`: CPA-owned breakpoints for non-native callers.
@@ -791,10 +812,13 @@ fn inject_system_cache(body: &str) -> String {
     match system.kind() {
         rawjson::Kind::Array => {
             let items = system.array();
-            if items.is_empty() || items.iter().any(|b| valid_cache_control(&b.get("cache_control"))) {
+            if items.iter().any(|b| valid_cache_control(&b.get("cache_control"))) {
                 return body.to_owned();
             }
-            rawjson::set_raw(body, &format!("system.{}.cache_control", items.len() - 1), MARKER)
+            match last_holder(&items, true) {
+                Some(i) => rawjson::set_raw(body, &format!("system.{i}.cache_control"), MARKER),
+                None => body.to_owned(),
+            }
         }
         rawjson::Kind::String if !system.str().trim().is_empty() => {
             rawjson::set_raw(body, "system", &format!("[{}]", text_block(system.str(), EPHEMERAL)))
@@ -806,10 +830,10 @@ fn inject_system_cache(body: &str) -> String {
 fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
     let content = message.get("content");
     if content.kind() == rawjson::Kind::String {
-        return true;
+        return !content.str().trim().is_empty();
     }
     let blocks = content.array();
-    if content.kind() != rawjson::Kind::Array || blocks.is_empty() {
+    if content.kind() != rawjson::Kind::Array || last_holder(&blocks, false).is_none() {
         return false;
     }
     if message.get("role").str() != "assistant" {
@@ -821,44 +845,129 @@ fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
     )
 }
 
-fn inject_messages_cache(body: &str) -> String {
+/// Where a conversation breakpoint goes: `Ok` a block path, `Err` the path of a string
+/// turn to wrap in one text block. The final system turn when it is a non-blank string,
+/// else the last block that can hold a marker in the last eligible user or assistant turn.
+fn messages_target(body: &str) -> Option<Result<String, String>> {
     let messages = rawjson::get(body, "messages");
     if messages.kind() != rawjson::Kind::Array {
-        return body.to_owned();
+        return None;
     }
     let msgs = messages.array();
-    let last_eligible = msgs
+    let idx = msgs
         .iter()
-        .rposition(|m| matches!(m.get("role").str(), "user" | "assistant") && eligible_for_rolling_cache(m));
-    let Some(idx) = last_eligible else {
-        return body.to_owned();
-    };
-    if let Some(final_msg) = msgs.last() {
-        let content = final_msg.get("content");
-        if final_msg.get("role").str() == "system"
-            && content.kind() == rawjson::Kind::String
-            && !content.str().trim().is_empty()
-        {
-            return rawjson::set_raw(
-                body,
-                &format!("messages.{}.content", msgs.len() - 1),
-                &format!("[{}]", text_block(content.str(), EPHEMERAL)),
-            );
-        }
+        .rposition(|m| matches!(m.get("role").str(), "user" | "assistant") && eligible_for_rolling_cache(m))?;
+    if let Some(last) = msgs.last()
+        && last.get("role").str() == "system"
+        && last.get("content").kind() == rawjson::Kind::String
+        && !last.get("content").str().trim().is_empty()
+    {
+        return Some(Err(format!("messages.{}.content", msgs.len() - 1)));
     }
-    let path = format!("messages.{idx}.content");
-    let content = rawjson::get(body, &path);
+    let content = msgs[idx].get("content");
     match content.kind() {
-        rawjson::Kind::Array => {
-            let blocks = content.array();
-            if blocks.iter().any(|b| valid_cache_control(&b.get("cache_control"))) || blocks.is_empty() {
+        rawjson::Kind::String => Some(Err(format!("messages.{idx}.content"))),
+        _ => last_holder(&content.array(), false).map(|i| Ok(format!("messages.{idx}.content.{i}"))),
+    }
+}
+
+/// The string at `path` as one text block carrying `marker`.
+fn wrap_with_marker(body: &str, path: &str, marker: &str) -> String {
+    let text = js_string(rawjson::get(body, path).str());
+    rawjson::set_raw(
+        body,
+        path,
+        &format!(r#"[{{"type":"text","text":{text},"cache_control":{marker}}}]"#),
+    )
+}
+
+fn inject_messages_cache(body: &str) -> String {
+    match messages_target(body) {
+        Some(Err(path)) => wrap_with_marker(body, &path, MARKER),
+        Some(Ok(block)) => {
+            let content = block.rsplit_once('.').map_or("", |(turn, _)| turn);
+            let marked = rawjson::get(body, content)
+                .array()
+                .iter()
+                .any(|b| valid_cache_control(&b.get("cache_control")));
+            if marked {
                 return body.to_owned();
             }
-            rawjson::set_raw(body, &format!("{path}.{}.cache_control", blocks.len() - 1), MARKER)
+            rawjson::set_raw(body, &format!("{block}.cache_control"), MARKER)
         }
-        rawjson::Kind::String => rawjson::set_raw(body, &path, &format!("[{}]", text_block(content.str(), EPHEMERAL))),
-        _ => body.to_owned(),
+        None => body.to_owned(),
     }
+}
+
+/// The last block in the conversation that can hold a breakpoint, in any turn (a
+/// trailing system turn included): `Ok` a block path, `Err` a string turn to wrap.
+fn last_turn_holder(body: &str) -> Option<Result<String, String>> {
+    let messages = rawjson::get(body, "messages");
+    if messages.kind() != rawjson::Kind::Array {
+        return None;
+    }
+    messages.array().iter().enumerate().rev().find_map(|(idx, m)| {
+        let content = m.get("content");
+        match content.kind() {
+            rawjson::Kind::String if !content.str().trim().is_empty() => Some(Err(format!("messages.{idx}.content"))),
+            rawjson::Kind::Array => {
+                last_holder(&content.array(), false).map(|i| Ok(format!("messages.{idx}.content.{i}")))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A top-level `cache_control` (automatic caching) placed on the block it would land on,
+/// the last one that can hold a breakpoint in messages, else system, else tools, and
+/// removed from the top level. Automatic caching takes one of the four slots, and the
+/// last block must not carry a marker with another TTL (platform docs, Prompt caching),
+/// so a request whose breakpoints CPA owns must count and order it with the others. A
+/// marker already on that block stays, unless it is bare and the top-level one is not.
+/// With no such block the field stays and the API skips caching.
+pub(crate) fn materialize_top_level_cache(body: String) -> String {
+    let top = rawjson::get(&body, "cache_control");
+    if !valid_cache_control(&top) {
+        return body;
+    }
+    let top = top.json().to_owned();
+    let bare = |cc: &rawjson::Value| {
+        let mut keys = 0;
+        cc.each(|_, _| {
+            keys += 1;
+            true
+        });
+        valid_cache_control(cc) && keys == 1
+    };
+    let apply = |path: String| {
+        let existing = rawjson::get(&body, &format!("{path}.cache_control"));
+        if !valid_cache_control(&existing) || (bare(&existing) && !bare(&rawjson::parse(&top))) {
+            rawjson::set_raw(&body, &format!("{path}.cache_control"), &top)
+        } else {
+            body.clone()
+        }
+    };
+    let system = rawjson::get(&body, "system");
+    let placed = match last_turn_holder(&body) {
+        Some(Ok(block)) => apply(block),
+        Some(Err(path)) => wrap_with_marker(&body, &path, &top),
+        None => match system.kind() {
+            rawjson::Kind::Array if last_holder(&system.array(), true).is_some() => apply(format!(
+                "system.{}",
+                last_holder(&system.array(), true).unwrap_or_default()
+            )),
+            rawjson::Kind::String if !system.str().trim().is_empty() => wrap_with_marker(&body, "system", &top),
+            _ => match rawjson::get(&body, "tools")
+                .array()
+                .iter()
+                .rposition(|t| !t.get("defer_loading").bool())
+            {
+                Some(i) => apply(format!("tools.{i}")),
+                None => return body,
+            },
+        },
+    };
+    rawjson::delete(&placed, "cache_control")
 }
 
 /// `generateFakeUserIDWithSessionID` for non-CLI-profile cloaking.
@@ -1025,6 +1134,115 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 9, "every capture but the quota probe");
+    }
+
+    /// "Empty text blocks cannot be cached" and thinking blocks cannot carry a marker
+    /// (platform docs, Prompt caching): CPA's breakpoints go on the last block that can
+    /// hold one, and a section with none gets none.
+    #[test]
+    fn cpa_breakpoints_skip_blocks_that_cannot_hold_one() {
+        let marked = |body: &str| -> Vec<String> {
+            super::signals::blocks(body)
+                .into_iter()
+                .filter(|(_, b)| valid_cache_control(&rawjson::get(b, "cache_control")))
+                .map(|(path, _)| path)
+                .collect()
+        };
+        let tools = r#""tools":[{"name":"t","input_schema":{"type":"object"}}]"#;
+        // System: the last non-empty text block; an all-empty system leaves the tools
+        // prefix to the tools marker.
+        let body = format!(
+            r#"{{{tools},"system":[{{"type":"text","text":"rules"}},{{"type":"text","text":"  "}}],"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        assert_eq!(
+            marked(&ensure_cache_control(body)),
+            ["system.0", "messages.0.content.0"]
+        );
+        let body = format!(
+            r#"{{{tools},"system":[{{"type":"text","text":""}}],"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        assert_eq!(marked(&ensure_cache_control(body)), ["tools.0", "messages.0.content.0"]);
+        // Messages: the last block that can hold a marker, skipping empty text.
+        let body =
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"real"},{"type":"text","text":" \n"}]}]}"#;
+        assert_eq!(marked(&ensure_cache_control(body.into())), ["messages.0.content.0"]);
+        // A blank string turn is passed over for the previous eligible turn.
+        let body = r#"{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"   "}]}"#;
+        let out = ensure_cache_control(body.into());
+        assert_eq!(marked(&out), ["messages.1.content.0"]);
+        assert_eq!(rawjson::get(&out, "messages.2.content").json(), r#""   ""#);
+        // A tool-only tail keeps its marker on the tool result.
+        let body =
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"r"}]}]}"#;
+        assert_eq!(marked(&ensure_cache_control(body.into())), ["messages.0.content.0"]);
+        // The date reminder does not mark a blank first user text.
+        let out = inject_current_date(r#"{"messages":[{"role":"user","content":"  "}]}"#, "2026-11-14", false);
+        assert!(marked(&out).is_empty(), "{out}");
+        let out = inject_current_date(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":" "},{"type":"text","text":"q"}]}]}"#,
+            "2026-11-14",
+            false,
+        );
+        assert_eq!(marked(&out), ["messages.0.content.2"], "{out}");
+    }
+
+    #[test]
+    fn top_level_cache_control_lands_on_the_last_cacheable_block() {
+        let top = |cc: &str, rest: &str| materialize_top_level_cache(format!(r#"{{"cache_control":{cc},{rest}}}"#));
+        let ttl = r#"{"type":"ephemeral","ttl":"1h"}"#;
+        // The last block that can hold it, skipping empty text; a string turn is wrapped.
+        let out = top(
+            ttl,
+            r#""messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"text","text":""}]}]"#,
+        );
+        assert_eq!(
+            out,
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"text","text":""}]}]}"#
+        );
+        let out = top(ttl, r#""messages":[{"role":"user","content":"q"}]"#);
+        assert_eq!(
+            out,
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}"#
+        );
+        // A marker already there stays, unless it is bare and the top-level one is not.
+        let out = top(
+            r#"{"type":"ephemeral"}"#,
+            r#""messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]"#,
+        );
+        assert_eq!(rawjson::get(&out, "messages.0.content.0.cache_control.ttl").str(), "1h");
+        let out = top(
+            ttl,
+            r#""messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral"}}]}]"#,
+        );
+        assert_eq!(rawjson::get(&out, "messages.0.content.0.cache_control.ttl").str(), "1h");
+        // A trailing system turn is the last cacheable block.
+        let out = top(
+            ttl,
+            r#""messages":[{"role":"user","content":"q"},{"role":"system","content":[{"type":"text","text":"now"}]}]"#,
+        );
+        assert_eq!(
+            rawjson::get(&out, "messages.1.content.0.cache_control.ttl").str(),
+            "1h",
+            "{out}"
+        );
+        assert!(
+            !rawjson::get(&out, "messages.0.content.0.cache_control").exists(),
+            "{out}"
+        );
+        // Without a cacheable turn: system, then the last tool that is not deferred.
+        let out = top(ttl, r#""system":"rules","messages":[{"role":"user","content":" "}]"#);
+        assert_eq!(rawjson::get(&out, "system.0.cache_control.ttl").str(), "1h");
+        assert!(!rawjson::get(&out, "cache_control").exists());
+        let out = top(
+            ttl,
+            r#""tools":[{"name":"a"},{"name":"b","defer_loading":true}],"messages":[{"role":"user","content":" "}]"#,
+        );
+        assert_eq!(rawjson::get(&out, "tools.0.cache_control.ttl").str(), "1h");
+        // Nothing can hold it: the request is left as sent.
+        let body = r#"{"cache_control":{"type":"ephemeral"},"messages":[{"role":"user","content":" "}]}"#;
+        assert_eq!(materialize_top_level_cache(body.into()), body);
+        let body = r#"{"messages":[{"role":"user","content":"q"}]}"#;
+        assert_eq!(materialize_top_level_cache(body.into()), body);
     }
 
     #[test]

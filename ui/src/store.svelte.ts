@@ -80,6 +80,11 @@ class Store {
   quota = $state<Record<string, { at: number; windows: Window[]; error?: string; code?: number } | { error: string; code?: number }>>({});
   /** Quota checks waiting in line or on their way, by auth index: "Queued" or "Checking…". */
   pending = $state<Record<string, string>>({});
+  /**
+   * The account Accounts asked Connect to sign in again; Connect takes it once. It stays out
+   * of the URL so that a reload or a shared link never starts a sign-in.
+   */
+  relogin = $state<Data | null>(null);
   #probed = new Set<string>();
   #timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -116,6 +121,7 @@ class Store {
     this.#probed.clear();
     this.config.data = this.creds.data = undefined;
     this.quota = {};
+    this.relogin = null;
     this.dirty = false;
   }
   can(method: string, path: string) {

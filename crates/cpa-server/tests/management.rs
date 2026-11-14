@@ -2663,7 +2663,7 @@ async fn api_call_head_does_not_negotiate_gzip() {
     up.abort();
 }
 
-/// Fake provider login endpoints (Claude, Codex, xAI) on one local server; records
+/// Fake provider login endpoints (Claude, Codex, xAI, Meta) on one local server; records
 /// the form or JSON bodies it receives.
 async fn fake_logins() -> (
     String,
@@ -2712,6 +2712,12 @@ async fn fake_logins() -> (
                     "expires_in": 600, "interval": 1}),
                 "/oauth2/token" => json!({"access_token": "fake-xai-at", "refresh_token": "fake-xai-rt",
                     "id_token": xai_id_token, "token_type": "Bearer", "expires_in": 3600}),
+                // Meta: device flow on the auth host, then the key mint.
+                "/oidc/device/authorization/" => json!({"device_code": "mdc", "user_code": "MU-1",
+                    "verification_uri": "https://meta.example.invalid/device", "expires_in": 600, "interval": 1}),
+                "/oidc/device/token/" => json!({"access_token": "fake-meta-dca", "token_type": "Bearer",
+                    "expires_in": 3600}),
+                "/muse-code/key" => json!({"api_key": "fake-meta-key", "user_email": "m@example.invalid"}),
                 _ => json!({}),
             };
             axum::Json(v)
@@ -5574,4 +5580,327 @@ async fn v0_oauth_status_and_session_routes_answer_without_plugins() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("missing state"), "{body}");
     server.abort();
+}
+
+/// A fixture whose auth directory holds `files` (name, JSON) when the runtime loads.
+fn with_auth_files(name: &str, files: &[(&str, Value)]) -> Fixture {
+    let files: Vec<(String, Value)> = files.iter().map(|(n, v)| ((*n).to_owned(), v.clone())).collect();
+    Fixture::from_yaml(name, move |auth, hash| {
+        for (file, content) in &files {
+            std::fs::write(auth.join(file), content.to_string()).unwrap();
+        }
+        format!(
+            "config-version: 8\nserver:\n  host: '127.0.0.1'\n  port: 0\nmanagement:\n  secret-key: '{hash}'\n\
+             oauth:\n  auth-dir: {}\naccess:\n  api-keys: [fake-client]\n\
+             claude-api-key:\n  - api-key: sk-fake-config\n",
+            auth.display()
+        )
+    })
+}
+
+/// The credential files in `f`'s auth directory.
+fn auth_names(f: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(f.dir.join("auth"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn read_json(path: &std::path::Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// Finishes a login started for `provider`: the callback for Claude and Codex; the
+/// device flows of xAI and Meta poll the fake endpoints by themselves.
+async fn finish_login(f: &Fixture, base: &str, provider: &str, state: &str) {
+    match provider {
+        "claude" => {
+            let r: Value = wreq::Client::new()
+                .post(format!("{base}/v8/management/oauth/callback"))
+                .json(&json!({"provider": "claude",
+                    "redirect_url": format!("http://localhost:54545/callback?code=fake-code&state={state}")}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(r, json!({"status": "ok"}));
+        }
+        "codex" => {
+            let delivered = f.rt.deliver_oauth_callback(&cpa_server::runtime::OAuthCallback {
+                provider: "codex",
+                state: state.to_owned(),
+                code: "fake-code".into(),
+                error: String::new(),
+            });
+            assert_eq!(delivered, cpa_server::runtime::OAuthDelivery::Delivered);
+        }
+        _ => {}
+    }
+}
+
+/// The four providers' credential files for the fake logins' accounts (or, with
+/// `other`, for another account), under operator-chosen names, with operator settings
+/// a re-login must keep.
+fn relogin_targets(other: bool) -> Vec<(&'static str, &'static str, Value, &'static str)> {
+    let pick = |mine: &'static str, theirs: &'static str| if other { theirs } else { mine };
+    let settings = |mut v: Value| {
+        let extra = json!({"priority": 7, "label": "Work account", "note": "keep me", "disabled": false});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v
+    };
+    vec![
+        (
+            "claude",
+            "work-claude.json",
+            settings(
+                json!({"type": "claude", "access_token": "sk-ant-oat-old", "refresh_token": "old-r",
+                "email": "a@example.invalid", "account_uuid": pick("acct-1", "acct-2"), "organization_uuid": "org-1",
+                "claude_device_ids": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]}),
+            ),
+            "sk-ant-oat-fake",
+        ),
+        (
+            "codex",
+            "work-codex.json",
+            settings(
+                json!({"type": "codex", "access_token": "old-codex-at", "refresh_token": "old-codex-rt",
+                "email": pick("c@example.invalid", "someone@example.invalid"), "account_id": ""}),
+            ),
+            "fake-codex-at",
+        ),
+        (
+            "xai",
+            "work-xai.json",
+            settings(
+                json!({"type": "xai", "auth_kind": "oauth", "access_token": "old-xai-at",
+                "refresh_token": "old-xai-rt", "email": "x@example.invalid", "sub": pick("xai-user-1", "xai-user-2"),
+                "base_url": "https://xai.example.invalid/v1"}),
+            ),
+            "fake-xai-at",
+        ),
+        (
+            "meta",
+            "work-meta.json",
+            settings(
+                json!({"type": "meta", "auth_kind": "oauth", "access_token": "old-meta-key",
+                "email": pick("m@example.invalid", "other@example.invalid"), "base_url": "https://meta.example.invalid/v1"}),
+            ),
+            "fake-meta-key",
+        ),
+    ]
+}
+
+/// #90: signing an existing account in again (`name` names its file) updates that
+/// file in place for each of the four providers: new tokens, the same file name, and
+/// every operator setting kept; no other file appears. Without `provider`, the target's
+/// provider is used.
+#[tokio::test]
+async fn targeted_relogin_updates_the_accounts_own_file_and_keeps_its_settings() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let targets = relogin_targets(false);
+    let files: Vec<(&str, Value)> = targets.iter().map(|(_, n, v, _)| (*n, v.clone())).collect();
+    let f = with_auth_files("relogin", &files);
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let before = auth_names(&f);
+    for (i, (provider, name, original, token)) in targets.iter().enumerate() {
+        // Every other start names the provider too.
+        let query = if i % 2 == 0 {
+            format!("/oauth/auth-url?name={name}")
+        } else {
+            format!("/oauth/auth-url?provider={provider}&name={name}")
+        };
+        let started = oauth_get(&base, &query).await;
+        assert_eq!(started["status"], "ok", "{provider}: {started}");
+        let state = started["state"].as_str().unwrap().to_owned();
+        finish_login(&f, &base, provider, &state).await;
+        assert_eq!(
+            final_status(&base, &state, 15).await,
+            json!({"status": "ok"}),
+            "{provider}"
+        );
+        let saved = read_json(&f.dir.join("auth").join(name));
+        assert_eq!(saved["access_token"], *token, "{provider}: new tokens");
+        for (key, want) in [
+            ("priority", json!(7)),
+            ("label", json!("Work account")),
+            ("note", json!("keep me")),
+            ("disabled", json!(false)),
+        ] {
+            assert_eq!(saved[key], want, "{provider}: {key} kept");
+        }
+        // The account's endpoint and device identity stay too.
+        for key in ["base_url", "claude_device_ids"] {
+            if original.get(key).is_some() {
+                assert_eq!(saved[key], original[key], "{provider}: {key} kept");
+            }
+        }
+    }
+    assert_eq!(auth_names(&f), before, "no other file appeared");
+    server.abort();
+    fake_server.abort();
+}
+
+/// #90: when the browser signs in to another account than the target stores, nothing
+/// is saved, for each provider, and the session says so without naming either account.
+#[tokio::test]
+async fn targeted_relogin_refuses_another_account() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let targets = relogin_targets(true);
+    let files: Vec<(&str, Value)> = targets.iter().map(|(_, n, v, _)| (*n, v.clone())).collect();
+    let f = with_auth_files("relogin-other", &files);
+    let (base, _state, server) = login_server(&f, &fake).await;
+    for (provider, name, original, _) in &targets {
+        let started = oauth_get(&base, &format!("/oauth/auth-url?provider={provider}&name={name}")).await;
+        let state = started["state"].as_str().unwrap().to_owned();
+        finish_login(&f, &base, provider, &state).await;
+        let status = final_status(&base, &state, 15).await;
+        assert_eq!(status["status"], "error", "{provider}: {status}");
+        let error = status["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Signed in to a different account"),
+            "{provider}: {error}"
+        );
+        assert!(!error.contains("example.invalid"), "{provider}: names no account");
+        assert_eq!(
+            read_json(&f.dir.join("auth").join(name)),
+            *original,
+            "{provider}: unchanged"
+        );
+    }
+    assert_eq!(auth_names(&f).len(), targets.len(), "no file written");
+    server.abort();
+    fake_server.abort();
+}
+
+/// #90: a missing target is 404, a provider other than the target's is 400, a target
+/// without a sign-in (a configured API key) is 400, and a removed provider still gets
+/// its migration error, target or not. A cancelled targeted session saves nothing.
+#[tokio::test]
+async fn targeted_relogin_rejects_bad_targets_and_saves_nothing_when_cancelled() {
+    let (fake, _seen, fake_server) = fake_logins().await;
+    let targets = relogin_targets(false);
+    let f = with_auth_files("relogin-bad", &[(targets[0].1, targets[0].2.clone())]);
+    let (base, _state, server) = login_server(&f, &fake).await;
+    let get = |path: String| {
+        let base = base.clone();
+        async move {
+            let r = wreq::Client::new()
+                .get(format!("{base}/v8/management{path}"))
+                .bearer_auth("fake-management-only")
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.json::<Value>().await.unwrap())
+        }
+    };
+    assert_eq!(
+        get("/oauth/auth-url?provider=claude&name=nope.json".into()).await,
+        (404, json!({"error": "auth file not found"}))
+    );
+    assert_eq!(
+        get("/oauth/auth-url?provider=codex&name=work-claude.json".into()).await,
+        (400, json!({"error": "provider does not match target credential"}))
+    );
+    let config_key =
+        f.rt.store()
+            .snapshot()
+            .iter()
+            .find(|c| c.attributes.get("api_key").map(String::as_str) == Some("sk-fake-config"))
+            .unwrap()
+            .id
+            .clone();
+    let (status, _) = get(format!("/oauth/auth-url?provider=claude&name={config_key}")).await;
+    assert_eq!(status, 400, "a configured API key has no sign-in");
+    for query in ["provider=kimi", "provider=kimi&name=work-claude.json"] {
+        let (status, body) = get(format!("/oauth/auth-url?{query}")).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (410, Some("removed_provider")),
+            "{query}: {body}"
+        );
+    }
+    let started = oauth_get(&base, "/oauth/auth-url?name=work-claude.json").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    let cancelled: Value = wreq::Client::new()
+        .delete(format!("{base}/v8/management/oauth/session?state={state}"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["status"], "ok", "{cancelled}");
+    let r = wreq::Client::new()
+        .post(format!("{base}/v8/management/oauth/callback"))
+        .json(&json!({"provider": "claude",
+            "redirect_url": format!("http://localhost:54545/callback?code=fake-code&state={state}")}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(r.status().as_u16(), 200, "no callback after cancelling");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        read_json(&f.dir.join("auth").join("work-claude.json")),
+        targets[0].2,
+        "unchanged"
+    );
+    server.abort();
+    fake_server.abort();
+}
+
+/// #90: a targeted re-login's own traffic goes through the account's `proxy_url`, as
+/// its requests do. A failing proxy fails the sign-in and leaves the file as it was.
+/// (A loopback proxy that records the tunnel it is asked for and refuses it; nothing
+/// leaves the machine.)
+#[tokio::test]
+async fn targeted_relogin_goes_through_the_accounts_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let record = asked.clone();
+    let proxy_server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut head = vec![0u8; 4096];
+            let n = socket.read(&mut head).await.unwrap_or(0);
+            let line = String::from_utf8_lossy(&head[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            record.lock().unwrap().push(line);
+            let _ = socket
+                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let mut target = relogin_targets(false)[1].2.clone();
+    target["proxy_url"] = json!(proxy_url);
+    let f = with_auth_files("relogin-proxy", &[("work-codex.json", target.clone())]);
+    // The real login endpoints, so the client's own proxy choice decides the route.
+    let (base, _state, server) = serve_with(&f, Default::default()).await;
+    let started = oauth_get(&base, "/oauth/auth-url?name=work-codex.json").await;
+    let state = started["state"].as_str().unwrap().to_owned();
+    finish_login(&f, &base, "codex", &state).await;
+    let status = final_status(&base, &state, 15).await;
+    assert_eq!(status["status"], "error", "{status}");
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|l| l.starts_with("CONNECT auth.openai.com:443")),
+        "the token exchange went through the account's proxy: {asked:?}"
+    );
+    assert_eq!(
+        read_json(&f.dir.join("auth").join("work-codex.json")),
+        target,
+        "unchanged"
+    );
+    server.abort();
+    proxy_server.abort();
 }

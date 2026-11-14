@@ -254,8 +254,8 @@ pub(crate) fn refresh_due(credential: &Credential, lead: Option<chrono::Duration
 pub(crate) enum UsageRule {
     /// Chat Completions streams (`StreamUsageBuffer.ObserveOpenAIStream` on every line).
     OpenAIStream,
-    /// Meta: `response.completed` / `response.incomplete` `data:` events with Codex usage
-    /// (or a tier).
+    /// Meta: `response.completed` / `response.incomplete` / `response.failed` `data:`
+    /// events with Codex usage (or a tier).
     MetaResponses,
 }
 
@@ -326,10 +326,11 @@ struct Held {
     merged: Merged,
 }
 
-/// Usage held back until the response completes (Go's deferred `StreamUsageBuffer.Publish`;
-/// a failure publishes no usage, `PublishFailure` uses an empty detail). Call [`Self::commit`]
-/// exactly when the stream ends without an error. Committed payloads carry no response
-/// model, so they never replace the model observed live.
+/// Usage held back until the response ends (Go's deferred `StreamUsageBuffer.Publish`).
+/// Call [`Self::commit`] when the stream ends without an error, or with an upstream failure
+/// event, whose record keeps the usage reported before it (#178; Go's `PublishFailure`
+/// used an empty detail). Committed payloads carry no response model, so they never
+/// replace the model observed live.
 #[derive(Clone, Default)]
 pub(crate) struct DeferredUsage {
     sink: cpa_core::exec::UsageSink,
@@ -533,7 +534,11 @@ pub(crate) fn defer_usage(
                 UsageRule::MetaResponses => {
                     // TTFT at the first event with output (U1, #99).
                     sink.token_event(responses_token_event(payload));
-                    if matches!(kind.as_slice(), b"response.completed" | b"response.incomplete") {
+                    // A `response.failed` reports the usage of the work before it (#178).
+                    if matches!(
+                        kind.as_slice(),
+                        b"response.completed" | b"response.incomplete" | b"response.failed"
+                    ) {
                         observe_parsed(&mut held.merged, Format::Codex, payload);
                     }
                 }

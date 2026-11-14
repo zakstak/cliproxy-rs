@@ -391,9 +391,11 @@ impl ClaudeExecutor {
         } else {
             translated
         };
-        // reporter.SetTranslatedReasoningEffort on the body sent upstream.
+        // reporter.SetTranslatedReasoningEffort on the body sent upstream, and the
+        // service tier it carries after payload rules (#178).
         if req.usage.enabled() {
             req.usage.request(Format::Claude, prepared.body.as_bytes());
+            req.usage.request_sent(prepared.body.as_bytes());
         }
         if req.usage.wants_claude_cache()
             && let Some(telemetry) = telemetry::collect(&ctx, &req, &prepared)
@@ -1386,10 +1388,18 @@ impl<'a> Ctx<'a> {
         body = normalize_sampling(body, confirmed);
         // `shouldEnsureCacheControl`.
         let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
+        // A top-level 1h breakpoint keeps its duration: CPA's own bare markers come before
+        // it and would void it as 5m ones (1h must precede 5m). Upgraded after the
+        // four-marker limit, which bounds that work.
+        let top = rawjson::get(&body, "cache_control");
+        let top_1h = cpa_owns_cache && cloak::valid_cache_control(&top) && top.get("ttl").str() == "1h";
         if cpa_owns_cache {
-            body = cloak::ensure_cache_control(body);
+            body = cloak::ensure_cache_control(cloak::materialize_top_level_cache(body));
         }
         body = cloak::enforce_cache_limit(body, 4);
+        if top_1h {
+            body = cloak::upgrade_ttl(body, "1h");
+        }
         body = cloak::strip_prompt_cache_options(body);
         let subagent = signals::subagent(&req.headers, &body);
         let subagent_1h = subagent && signals::subagent_requests_1h(&req.headers, &body);

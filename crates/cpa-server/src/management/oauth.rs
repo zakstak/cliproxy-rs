@@ -11,7 +11,7 @@
 use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -413,28 +413,136 @@ fn global_proxy(state: &Management) -> Proxy {
 /// The client for login traffic: the global proxy (else the environment's proxies);
 /// local endpoints in tests.
 pub(super) fn login_client(state: &Management) -> wreq::Client {
+    client_for(state, &global_proxy(state))
+}
+
+/// The client for a login through `proxy`; local endpoints in tests.
+fn client_for(state: &Management, proxy: &Proxy) -> wreq::Client {
     if state.login_base.is_some() {
         return state.clients.get(&Proxy::Direct);
     }
-    state.clients.get(&global_proxy(state))
+    state.clients.get(proxy)
 }
 
-/// Go `StartOAuthV8`.
+/// A targeted re-login (#90, Go `oauthRecoveryTarget`): the existing credential file the
+/// login updates in place, keeping its name and settings, once the signed-in account is
+/// confirmed to be the one the file stores.
+#[derive(Clone)]
+struct Target {
+    path: PathBuf,
+    /// The provider's credential `type`.
+    kind: &'static str,
+}
+
+/// Session errors of a targeted save that wrote nothing. They name no account: anyone
+/// holding the state can read them.
+const TARGET_MISMATCH: &str = "Signed in to a different account than the one being signed in again; nothing was saved. Sign in to that account and try again.";
+const TARGET_UNCONFIRMED: &str = "The credential file stores no account identity to compare with; nothing was saved. Sign in without choosing an account instead.";
+const TARGET_GONE: &str = "The account's credential file is gone or is no longer this provider's; nothing was saved.";
+
+/// Under the disk lock, right before a targeted save: `path` is still a credential of
+/// `kind` and stores the account that signed in. `identity` pairs a credential key with
+/// the signed-in account's value; every pair the file also fills must match (emails
+/// case-insensitively, as Go's `EqualFold`), and at least one must.
+fn confirm_target(path: &Path, kind: &str, identity: &[(&str, &str)]) -> Result<(), String> {
+    let stored = std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Map<String, Value>>(&raw).ok())
+        .ok_or(TARGET_GONE)?;
+    let field = |key: &str| stored.get(key).and_then(Value::as_str).map_or("", str::trim);
+    if !field("type").go_eq_fold(kind) {
+        return Err(TARGET_GONE.into());
+    }
+    let mut confirmed = false;
+    for (key, signed_in) in identity {
+        let (stored, signed_in) = (field(key), signed_in.trim());
+        if stored.is_empty() || signed_in.is_empty() {
+            continue;
+        }
+        let same = if *key == "email" {
+            stored.go_eq_fold(signed_in)
+        } else {
+            stored == signed_in
+        };
+        if !same {
+            return Err(TARGET_MISMATCH.into());
+        }
+        confirmed = true;
+    }
+    if confirmed {
+        Ok(())
+    } else {
+        Err(TARGET_UNCONFIRMED.into())
+    }
+}
+
+/// Go `StartOAuthV8`. `name` (a credential's file name or ID) or `auth_index` chooses an
+/// existing credential to sign in again ([`Target`]); `provider` may then be left out.
 pub(crate) async fn auth_url(State(state): State<Arc<Management>>, RawQuery(raw): RawQuery) -> Response {
     let q = Query::parse(raw);
     let webui = matches!(
         q.first("is_webui").trim().go_lower().as_str(),
         "1" | "true" | "yes" | "on"
     );
-    match q.first("provider").trim().go_lower().as_str() {
+    let mut provider = q.first("provider").trim().go_lower();
+    // Go `ServePluginAuthURL` would try a plugin auth provider's login here. A removed
+    // provider gets its migration error (issue #49).
+    if cpa_core::removed::provider(&provider).is_some() {
+        return removed(&provider, "Login");
+    }
+    let (name, index) = (
+        q.first("name").trim().to_owned(),
+        q.first("auth_index").trim().to_owned(),
+    );
+    let mut target = None;
+    if !name.is_empty() || !index.is_empty() {
+        let found = if name.is_empty() {
+            let all = state.rt.store().snapshot();
+            all.into_iter()
+                .find(|c| cpa_core::config::credentials::auth_index(c) == index)
+        } else {
+            super::auth_files::lookup(&state, &name, &index)
+        };
+        let Some(credential) = found else {
+            return fail(StatusCode::NOT_FOUND, "auth file not found");
+        };
+        let kind = match credential.provider.trim().go_lower().as_str() {
+            "claude" => "claude",
+            "codex" => "codex",
+            "meta" => "meta",
+            "xai" => "xai",
+            _ => return fail(StatusCode::BAD_REQUEST, "target credential has no sign-in"),
+        };
+        let auth_dir = state.rt.config().auth_dir.clone();
+        let path = match super::auth_files::path_of(&credential) {
+            Some(path) if path.parent() == Some(auth_dir.as_path()) => path.to_path_buf(),
+            _ => {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    "target credential is not a file in the auth directory",
+                );
+            }
+        };
+        if cpa_core::registry::dynamic::auth_kind(&credential) != Some("oauth") {
+            return fail(StatusCode::BAD_REQUEST, "target credential has no sign-in");
+        }
+        if provider.is_empty() {
+            provider = kind.to_owned();
+        } else if provider != kind {
+            return fail(StatusCode::BAD_REQUEST, "provider does not match target credential");
+        }
+        // The login's own traffic goes the way the account's requests go.
+        let proxy = Proxy::effective(&credential, &state.rt.config());
+        target = Some((Target { path, kind }, proxy));
+    }
+    let proxy = target.as_ref().map_or_else(|| global_proxy(&state), |(_, p)| p.clone());
+    let target = target.map(|(t, _)| t);
+    match provider.as_str() {
         "" => fail(StatusCode::BAD_REQUEST, "provider is required"),
-        "claude" => start_claude(state, webui).await,
-        "codex" => start_codex(state, webui).await,
-        "meta" => start_meta(state).await,
-        "xai" => start_xai(state).await,
-        // Go `ServePluginAuthURL` would try a plugin auth provider's login here. A
-        // removed provider gets its migration error (issue #49).
-        provider if cpa_core::removed::provider(provider).is_some() => removed(provider, "Login"),
+        "claude" => start_claude(state, webui, target, proxy).await,
+        "codex" => start_codex(state, webui, target, proxy).await,
+        "meta" => start_meta(state, target, proxy).await,
+        "xai" => start_xai(state, target, proxy).await,
         _ => fail(StatusCode::NOT_FOUND, "provider_not_found"),
     }
 }
@@ -495,7 +603,8 @@ async fn save_if_pending<T: Send + 'static>(
         Ok(Ok(None)) => Outcome::Cancelled,
         Ok(Err(e)) => {
             tracing::error!("failed to save {provider} token: {e}");
-            Outcome::Failed(save_error.to_owned())
+            let refused = [TARGET_MISMATCH, TARGET_UNCONFIRMED, TARGET_GONE].contains(&e.as_str());
+            Outcome::Failed(if refused { e } else { save_error.to_owned() })
         }
         Err(e) => {
             resume_panic(e);
@@ -589,7 +698,7 @@ fn started(url: String, sid: String) -> Response {
 }
 
 /// Go `RequestAnthropicToken`.
-async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
+async fn start_claude(state: Arc<Management>, webui: bool, target: Option<Target>, proxy: Proxy) -> Response {
     use cpa_exec::claude_login::ManagedLogin;
     let login = match ManagedLogin::start() {
         Ok(l) => l,
@@ -612,20 +721,30 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
             let exchanged = match &worker.login_base {
                 Some(base) => {
                     let oauth = cpa_exec::oauth::OAuth::with_endpoints(
-                        login_client(&worker),
+                        client_for(&worker, &proxy),
                         &format!("{base}/v1/oauth/token"),
                         &format!("{base}/api/oauth/profile"),
                         &format!("{base}/api/oauth/claude_cli/roles"),
                     );
                     login.exchange_with(&oauth, &code).await
                 }
-                None => login.exchange(&code, &global_proxy(&worker)).await,
+                None => login.exchange(&code, &proxy).await,
             };
             let outcome = match exchanged {
                 Ok(patch) => {
                     let legacy = Arc::new(Mutex::new(None));
                     let slot = legacy.clone();
-                    let write = move |dir: PathBuf, patch| {
+                    let write = move |dir: PathBuf, patch: cpa_core::credential::MetadataPatch| {
+                        if let Some(target) = &target {
+                            let field = |key: &str| patch.set.get(key).and_then(Value::as_str).unwrap_or_default();
+                            let identity = [
+                                ("account_uuid", field("account_uuid")),
+                                ("organization_uuid", field("organization_uuid")),
+                                ("email", field("email")),
+                            ];
+                            confirm_target(&target.path, target.kind, &identity)?;
+                            return ManagedLogin::save_to(&target.path, patch).map_err(|e| exec_text(&e));
+                        }
                         let (path, old) = ManagedLogin::save(&dir, patch).map_err(|e| exec_text(&e))?;
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
                         Ok(path)
@@ -686,8 +805,8 @@ async fn remove_legacy(state: &Arc<Management>, legacy: PathBuf, provider: &str,
 }
 
 /// Go `RequestCodexToken`.
-async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
-    use cpa_exec::codex_oauth::{CodexOAuth, authorize_url, redirect_uri, write_login};
+async fn start_codex(state: Arc<Management>, webui: bool, target: Option<Target>, proxy: Proxy) -> Response {
+    use cpa_exec::codex_oauth::{CodexOAuth, authorize_url, redirect_uri, write_login, write_login_to};
     let Ok((verifier, challenge)) = cpa_exec::oauth::pkce() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate PKCE codes");
     };
@@ -709,7 +828,7 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     let forwarder = forwarder.map(|id| (CODEX_CALLBACK_PORT, id));
     spawn_login(&state, &sid, "codex", forwarder, async move {
         if let Some(code) = wait_for_callback(&worker, &flow, "codex", "Bad Request").await {
-            let client = login_client(&worker);
+            let client = client_for(&worker, &proxy);
             let oauth = match &worker.login_base {
                 Some(base) => CodexOAuth::with_endpoints(
                     client,
@@ -724,7 +843,14 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
                 .await
             {
                 Ok(tokens) => {
-                    let write = |dir: PathBuf, tokens| write_login(&dir, &tokens).map_err(|e| exec_text(&e));
+                    let write = move |dir: PathBuf, tokens: cpa_exec::codex_oauth::Tokens| match &target {
+                        Some(target) => {
+                            let identity = [("account_id", tokens.account_id.as_str()), ("email", &tokens.email)];
+                            confirm_target(&target.path, target.kind, &identity)?;
+                            write_login_to(&target.path, &tokens).map_err(|e| exec_text(&e))
+                        }
+                        None => write_login(&dir, &tokens).map_err(|e| exec_text(&e)),
+                    };
                     save_if_pending(
                         &worker,
                         &flow,
@@ -809,11 +935,11 @@ fn device_started(url: String, sid: String, user_code: &str, expires_in: Option<
 }
 
 /// Go `RequestMetaToken`.
-async fn start_meta(state: Arc<Management>) -> Response {
-    use cpa_exec::meta_auth::{MetaAuth, create_token_storage, save_login};
+async fn start_meta(state: Arc<Management>, target: Option<Target>, proxy: Proxy) -> Response {
+    use cpa_exec::meta_auth::{MetaAuth, create_token_storage, save_login, save_login_to};
     const MAX_POLL_SECONDS: i64 = 15 * 60;
     let sid = format!("meta-{}", unix_nanos());
-    let mut auth = MetaAuth::new(login_client(&state));
+    let mut auth = MetaAuth::new(client_for(&state, &proxy));
     if let Some(base) = &state.login_base {
         auth = auth
             .with_auth_host(base)
@@ -852,7 +978,14 @@ async fn start_meta(state: Arc<Management>) -> Response {
                 Outcome::Failed("Failed to exchange token".into())
             }
             Ok(bundle) => {
-                let write = move |dir: PathBuf, bundle| save_login(&dir, &bundle, now).map(|o| o.path);
+                let write = move |dir: PathBuf, bundle| match &target {
+                    Some(target) => {
+                        let email = create_token_storage(&bundle, now).email;
+                        confirm_target(&target.path, target.kind, &[("email", &email)])?;
+                        save_login_to(&target.path, &bundle, now).map(|o| o.path)
+                    }
+                    None => save_login(&dir, &bundle, now).map(|o| o.path),
+                };
                 save_if_pending(&worker, &sid, "meta", bundle, write, "Failed to save token to file").await
             }
         };
@@ -866,10 +999,10 @@ const XAI_DESTINATION_CONFLICT: &str = "a file in the auth directory at this acc
 const XAI_AUTH_DIR_UNREADABLE: &str = "the auth directory or an existing credential file could not be read";
 
 /// Go `RequestXAIToken`: device flow; the poller saves the credential file.
-async fn start_xai(state: Arc<Management>) -> Response {
-    use cpa_exec::xai_auth::{MAX_POLL_DURATION, SaveError, XaiAuth, login_record, save_login};
+async fn start_xai(state: Arc<Management>, target: Option<Target>, proxy: Proxy) -> Response {
+    use cpa_exec::xai_auth::{MAX_POLL_DURATION, SaveError, XaiAuth, login_record, save_login, save_login_to};
     let sid = format!("xai-{}", unix_nanos());
-    let mut auth = XaiAuth::new(login_client(&state));
+    let mut auth = XaiAuth::new(client_for(&state, &proxy));
     if let Some(base) = &state.login_base {
         auth = auth
             .with_issuer_origin(base)
@@ -918,7 +1051,17 @@ async fn start_xai(state: Arc<Management>) -> Response {
                 // session errors are readable by anyone holding the state.
                 let refusal = Arc::new(Mutex::new(None));
                 let refused = refusal.clone();
-                let write = move |dir: PathBuf, record| {
+                let write = move |dir: PathBuf, record: cpa_exec::xai_auth::LoginRecord| {
+                    if let Some(target) = &target {
+                        let field = |key: &str| match record.metadata.get(key) {
+                            Some(cpa_common::json::GoValue::String(s)) => s.trim().to_owned(),
+                            _ => String::new(),
+                        };
+                        let (sub, email) = (field("sub"), field("email"));
+                        confirm_target(&target.path, target.kind, &[("sub", &sub), ("email", &email)])?;
+                        return save_login_to(&target.path, record, super::auth_files::write_file)
+                            .map_err(|e| e.to_string());
+                    }
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                     let (path, old) = save_login(&dir, record, super::auth_files::write_file).map_err(|e| {
                         let public = match &e {
@@ -1276,6 +1419,53 @@ fn redirect_query(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #90: a targeted save needs the target to still be the provider's credential and
+    /// to store the account that signed in: every identity both sides fill matches
+    /// (emails in any case), and at least one is compared.
+    #[test]
+    fn confirm_target_needs_a_matching_identity() {
+        let dir = std::env::temp_dir().join(format!("confirm-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("work.json");
+        let write = |v: serde_json::Value| std::fs::write(&path, v.to_string()).unwrap();
+        write(serde_json::json!({"type": "claude", "email": "A@Example.invalid", "account_uuid": "acct-1"}));
+        assert_eq!(
+            super::confirm_target(
+                &path,
+                "claude",
+                &[("account_uuid", "acct-1"), ("email", "a@example.invalid")]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            super::confirm_target(&path, "claude", &[("account_uuid", ""), ("email", "a@example.invalid")]),
+            Ok(())
+        );
+        assert_eq!(
+            super::confirm_target(
+                &path,
+                "claude",
+                &[("account_uuid", "acct-2"), ("email", "a@example.invalid")]
+            ),
+            Err(super::TARGET_MISMATCH.into())
+        );
+        assert_eq!(
+            super::confirm_target(&path, "codex", &[("email", "a@example.invalid")]),
+            Err(super::TARGET_GONE.into())
+        );
+        write(serde_json::json!({"type": "claude"}));
+        assert_eq!(
+            super::confirm_target(&path, "claude", &[("email", "a@example.invalid")]),
+            Err(super::TARGET_UNCONFIRMED.into())
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            super::confirm_target(&path, "claude", &[("email", "a@example.invalid")]),
+            Err(super::TARGET_GONE.into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn session_causes_drop_upstream_bodies_and_descriptions() {

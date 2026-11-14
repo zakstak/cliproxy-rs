@@ -33,9 +33,9 @@ async function noProgressToast(when) {
   assert.ok(!/sent|finishing|waiting/i.test(toast), `${when}: stale toast "${toast.trim()}"`);
 }
 
-/** Start a sign-in and return the session state from the provider link. */
+/** Start a sign-in (or, without a provider, wait for one started elsewhere) and return the session state from the provider link. */
 async function begin(provider) {
-  await button(provider).click();
+  if (provider) await button(provider).click();
   await main.getByText("Waiting for approval").waitFor();
   const href = await main.getByRole("link", { name: "Open sign-in page" }).getAttribute("href");
   return { href, state: new URL(href).searchParams.get("state") };
@@ -69,7 +69,7 @@ try {
     }
     for (const [provider, code] of [["Meta", "META-FAKE"], ["xAI", "XAI-FAKE"]]) {
       await button(provider).click();
-      await main.getByText(code).waitFor();
+      await main.getByText(code, { exact: true }).waitFor();
       if (provider === "Meta") await page.screenshot({ path: `${out}/oauth-meta-device-code.png` });
       await main.getByText("Connected", { exact: true }).waitFor({ timeout: 30_000 });
       pass(`${provider}: device code ${code} shown, polled to completion`);
@@ -79,6 +79,34 @@ try {
       await main.getByText(email).first().waitFor({ timeout: 15_000 });
     await page.screenshot({ path: `${out}/oauth-credentials-after.png`, fullPage: true });
     pass("all four new credentials are listed on Accounts");
+
+    // Sign in again from Accounts: the account's own file, no new one; another account is refused.
+    const files = async () => {
+      const r = await fetch(new URL("v8/management/credentials", url), { headers: { Authorization: "Bearer orb-dashboard-test-only" } });
+      return (await r.json()).files.map((f) => f.name).sort();
+    };
+    const again = async (email) => {
+      await page.evaluate(() => (location.hash = "#accounts"));
+      await main.getByRole("button", { name: email }).first().click();
+      await button("Sign in again").click();
+      await main.getByRole("heading", { name: `Claude · ${email}` }).waitFor();
+      const { state } = await begin(null);
+      await paste(`http://localhost:54545/callback?code=fake-code&state=${state}`);
+    };
+    const before = await files();
+    await again("claude-login@example.invalid");
+    await main.getByText("Signed in again", { exact: true }).waitFor({ timeout: 20_000 });
+    await noProgressToast("Claude signed in again");
+    assert.deepEqual(await files(), before);
+    await page.screenshot({ path: `${out}/oauth-claude-signed-in-again.png` });
+    pass("Sign in again on Accounts: targeted session finishes by its status, no new credential file");
+    await again("operator@example.invalid");
+    await main.getByText("Failed", { exact: true }).waitFor({ timeout: 20_000 });
+    const refusal = (await main.locator(".flow .error").textContent()).trim();
+    assert.equal(refusal, "Signed in to a different account than the one being signed in again; nothing was saved. Sign in to that account and try again.");
+    assert.deepEqual(await files(), before);
+    await page.screenshot({ path: `${out}/oauth-claude-wrong-account.png` });
+    pass(`Sign in again as another account shows the server's refusal verbatim: "${refusal}"`);
 
   } else {
     const { state } = await begin("Codex");

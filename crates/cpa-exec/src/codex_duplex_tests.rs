@@ -1625,6 +1625,8 @@ async fn later_creates_get_the_sockets_model_before_they_start() {
 struct Ledger {
     label: String,
     settled: Arc<Mutex<Vec<(String, u16)>>>,
+    /// TTFT marks in order, as the record's label and `start`, `frame` or `token`.
+    marks: Arc<Mutex<Vec<(String, &'static str)>>>,
 }
 
 impl Ledger {
@@ -1632,6 +1634,7 @@ impl Ledger {
         Self {
             label: "attempt".into(),
             settled: Arc::default(),
+            marks: Arc::default(),
         }
     }
 
@@ -1639,7 +1642,12 @@ impl Ledger {
         Some(Arc::new(Self {
             label,
             settled: self.settled.clone(),
+            marks: self.marks.clone(),
         }))
+    }
+
+    fn mark(&self, mark: &'static str) {
+        self.marks.lock().unwrap().push((self.label.clone(), mark));
     }
 
     fn settle(&self, status: u16) {
@@ -1667,6 +1675,12 @@ impl cpa_core::exec::UsageObserver for Ledger {
     }
     fn publish_failure_with_usage(&self, status: u16, _: &str) {
         self.settle(status);
+    }
+    fn round_trip_started(&self) {
+        self.mark("start");
+    }
+    fn token_event(&self, is_token: bool) {
+        self.mark(if is_token { "token" } else { "frame" });
     }
     fn detach(&self) -> Option<Arc<dyn cpa_core::exec::UsageObserver>> {
         self.record("bootstrap".into())
@@ -2585,4 +2599,82 @@ async fn a_create_waiting_for_the_socket_is_refused_after_revocation() {
     );
     drop(stream);
     up.finish().await;
+}
+
+/// #178: each response's record marks TTFT at its first upstream event with output
+/// (`helpers::responses_token_event`). The bootstrap's clock starts at the turn's
+/// create (in `codex_ws`, before the socket write) and moves with the attempt's
+/// accounting; a later create's at its write; an automatic successor's, which no request
+/// started, at its `response.created`. Lifecycle events and empty deltas are frames. A
+/// create upstream rejects before it starts ends its TTFT at the rejection, whether the
+/// rejection reaches the client (400) or is withheld as an account failure (429).
+#[tokio::test]
+async fn each_response_marks_ttft_at_its_first_output_event() {
+    const REJECTED: &str = r#"{"type":"error","status":400,"response_id":"never-started","error":{"type":"invalid_request_error","message":"rejected before it started"}}"#;
+    const LIMITED: &str = r#"{"type":"error","status":429,"response_id":"never-started","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    for (case, rejection) in [REJECTED, LIMITED].into_iter().enumerate() {
+        let delta = |text: &str| {
+            format!(
+                r#"{{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"{text}"}}"#
+            )
+        };
+        let up = Scripted::start(move |mut c: Peer| async move {
+            c.read().await;
+            c.write(&event("response.created", "r1")).await;
+            c.write(&delta("")).await;
+            c.write(&delta("a")).await;
+            c.write(&event("response.completed", "r1")).await;
+            c.read().await;
+            c.write(&event("response.created", "r2")).await;
+            c.write(&delta("b")).await;
+            c.write(&event("response.completed", "r2")).await;
+            c.write(&event("response.created", "r3")).await;
+            c.write(&delta("c")).await;
+            c.write(&event("response.completed", "r3")).await;
+            c.read().await;
+            c.write(rejection).await;
+            c.idle().await;
+        })
+        .await;
+        let client = Client::new(&format!("ttft-marks-{case}"));
+        let ledger = Ledger::attempt();
+        let usage = cpa_core::exec::UsageSink::new(Arc::new(ledger.clone()));
+        let mut stream = client
+            .start_with(&up.url, &tiered("auto"), Format::OpenAIResponse, usage)
+            .await;
+        // The 400 reaches the client as an event; the 429 is withheld and ends the stream.
+        while let Some(Ok(chunk)) = next(&mut stream).await {
+            match (get(&chunk, "type").as_str(), get(&chunk, "response.id").as_str()) {
+                ("response.completed", "r1") => client.send(&tiered("flex")).await,
+                ("response.completed", "r3") => client.send(&tiered("priority")).await,
+                ("error", _) => break,
+                _ => {}
+            }
+        }
+        drop(stream);
+        duplex_gone(&client).await;
+        let marks: Vec<(String, &str)> = ledger.marks.lock().unwrap().clone();
+        let want: Vec<(String, &str)> = [
+            ("attempt", "start"),
+            ("bootstrap", "frame"),
+            ("bootstrap", "frame"),
+            ("bootstrap", "token"),
+            ("bootstrap", "token"),
+            ("flex", "start"),
+            ("flex", "frame"),
+            ("flex", "token"),
+            ("flex", "token"),
+            ("flex+auto", "start"),
+            ("flex+auto", "frame"),
+            ("flex+auto", "token"),
+            ("flex+auto", "token"),
+            ("priority", "start"),
+            ("priority", "token"),
+        ]
+        .into_iter()
+        .map(|(label, mark)| (label.to_owned(), mark))
+        .collect();
+        assert_eq!(marks, want, "{rejection}");
+        up.finish().await;
+    }
 }

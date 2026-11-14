@@ -286,7 +286,7 @@ impl MetaExecutor {
             report_model(&req.usage, Format::Codex, &data);
             let source = std::cell::RefCell::new(Vec::new());
             let mut apply_patch = prepared.apply_patch;
-            let completed = collect_completed(&data, &mut apply_patch, |event| {
+            let completed = collect_completed(&data, &mut apply_patch, &req.usage, |event| {
                 source.borrow_mut().clear();
                 source.borrow_mut().extend_from_slice(event);
                 // A translator error or empty output is Go's apply_patch 502.
@@ -654,10 +654,13 @@ fn lossy(b: &[u8]) -> String {
 
 /// translateMetaCompleted: the first terminal event of a buffered SSE body, with output
 /// items rebuilt from `response.output_item.done`, then a whole-body JSON fallback. Every
-/// event goes through the apply_patch bridge first; a bridge failure is the 502.
+/// event goes through the apply_patch bridge first; a bridge failure is the 502. A
+/// failure event's usage (a `response.failed` reports the work done before it) goes to
+/// `usage` for the failure record (#178).
 fn collect_completed(
     data: &[u8],
     apply_patch: &mut apply_patch_responses::State,
+    usage: &cpa_core::exec::UsageSink,
     translate: impl Fn(&[u8]) -> Result<Vec<u8>, ExecError>,
 ) -> Result<Vec<u8>, ExecError> {
     let bridge_error = || ExecError::local(502, FailureScope::Request, cpa_translate::APPLY_PATCH_UPSTREAM_ERROR);
@@ -667,6 +670,7 @@ fn collect_completed(
             continue;
         };
         if let Some(error) = stream_event_error(event) {
+            usage.response_usage_line(Format::Codex, event);
             return Err(error);
         }
         let (events, error) = apply_patch.transform(event);
@@ -703,7 +707,7 @@ fn collect_completed(
 /// their collected output, and an error event, a bridge failure or a scan error ends the
 /// stream. At EOF the bridge's `finish_stream` runs before a scan error is reported. The
 /// translator emits frames the way the client's Go route writes them; usage is committed
-/// only when the stream ends cleanly.
+/// when the stream ends cleanly or with an upstream failure event.
 ///
 /// Responses clients get EnsureResponsesUsageDetails per line before translation; Go
 /// applies it to each translated chunk, and the Responses translator only adds
@@ -797,6 +801,9 @@ fn stream_events(
             };
             if let Some(error) = stream_event_error(event) {
                 crate::helpers::capture_error(&self.capture, &error);
+                // The usage reported before the failure, a `response.failed`'s own
+                // included, stays in the failure record (#178).
+                self.usage.commit();
                 return self.fail(error);
             }
             let kind = gj::get(event, "type").bytes().into_owned();
