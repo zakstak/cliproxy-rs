@@ -9,9 +9,8 @@
 //! `model`, and `stream: true`, since the response is translated from upstream events
 //! either way.
 //!
-//! The response is converted back by the same pair's built-in translator, without
-//! namespace restoration or a local token estimate in place of
-//! provider usage. A buffered client receives the aggregate of the upstream's events.
+//! The response is converted back by the route's pair ([`cpa_translate::codex_response`]),
+//! without namespace restoration or a local token estimate in place of provider usage. A buffered client receives the aggregate of the upstream's events.
 //! What reaches the client passes the outbound credential guard ([`crate::codex_secret`]),
 //! bound to the values the upstream request carried.
 
@@ -216,7 +215,7 @@ fn response_ctx<'a>(req: &'a ExecRequest, translated: &'a str) -> cpa_translate:
 /// The client's buffered body: the built-in non-stream translation of the aggregate.
 fn client_body(req: &ExecRequest, translated: &str, completed: &str) -> Result<Bytes, ExecError> {
     let ctx = response_ctx(req, translated);
-    let pair = cpa_translate::pair(req.response_format, Format::Codex).ok_or_else(unregistered_response)?;
+    let pair = cpa_translate::codex_response(req.response_format).ok_or_else(unregistered_response)?;
     let out = (pair.non_stream)(&ctx, completed.as_bytes()).map_err(translate_error)?;
     if out.is_empty() {
         return Err(ExecError::local(
@@ -241,7 +240,7 @@ fn client_body(req: &ExecRequest, translated: &str, completed: &str) -> Result<B
 /// consumer, keep the outcome of the step they came from.
 fn client_stream(req: &ExecRequest, translated: &str, held: VecDeque<Step>, rest: Option<Steps>) -> ExecStream {
     let ctx = response_ctx(req, translated);
-    let Some(pair) = cpa_translate::pair(req.response_format, Format::Codex) else {
+    let Some(pair) = cpa_translate::codex_response(req.response_format) else {
         return futures_util::stream::once(async { Err(unregistered_response()) }).boxed();
     };
     let translator = (pair.stream)(&ctx);

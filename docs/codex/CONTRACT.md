@@ -1299,6 +1299,7 @@ The strict mode is the Codex route's alone.
 | A tool declaration becomes `{"type":"function","name","description","parameters","strict"}` from Claude `input_schema`, Chat `function.parameters`, Gemini `parameters` or `parametersJsonSchema`, or an Interactions declaration. The schema is the caller's, as sent: `$schema`, `pattern`, `patternProperties`, literal data and unknown keywords stay. In a Gemini `parameters` schema only, an upper-case `type` name becomes the JSON Schema name, and only at schema positions (the schema itself, `properties` values, `items`, `anyOf` entries). `parametersJsonSchema` is JSON Schema already and is not changed | All | Responses function tools; first-party `tools/src/responses_api.rs:33-45` (`strict: false` when the caller sets none); Gemini `Type` enum against JSON Schema `type` |
 | A tool call and its result keep the caller's call ID, however long, and the tool name | All | Responses `call_id` pairing |
 | A tool name over 64 bytes is shortened, and the response maps the short name back | Claude, Chat, Gemini, Interactions | OpenAI function names allow at most 64 characters |
+| A Chat custom tool in its documented nested form, `{"type":"custom","custom":{"name","description","format"}}`, becomes the Responses custom tool `{"type":"custom","name","description","format"}`; a grammar format `{"type":"grammar","grammar":{"syntax","definition"}}` becomes `{"type":"grammar","syntax","definition"}`. A nested custom `tool_choice` becomes `{"type":"custom","name"}`. The nested name takes part in shortening like any declared name, so the declaration, the `tool_choice`, a history `custom` call and the response's name map agree. The flat Responses form is accepted as before (#170) | Chat | OpenAI Chat Completions custom tools and custom tool calls are nested under `custom`; Responses custom tools and `tool_choice` are flat |
 | Claude `tool_result` content becomes `function_call_output` text or input parts (text, images in any representable source, inline PDFs) | Claude | Responses `function_call_output.output` |
 | Generation controls map to their Responses fields: `max_tokens`, `max_completion_tokens`, `maxOutputTokens` and `max_output_tokens` become `max_output_tokens`; `temperature`, `top_p`/`topP`, Chat `user`, `safety_identifier`, `metadata`, `prompt_cache_key`, `prompt_cache_retention` and `verbosity` map unchanged | All | The Responses fields of the same name and meaning. The ChatGPT backend's acceptance of each is the upstream's to judge |
 | A control at its API default needs nothing: an empty `stop`/`stop_sequences`/`stopSequences`, zero penalties, `n` or `candidateCount` of 1, `logprobs: false`, text-only modalities, `store: false`, Gemini `responseMimeType: text/plain` | All | The default means the same in both APIs |
@@ -1353,9 +1354,13 @@ Content, including content nested in tool results and system prompts:
 - a non-text system block;
 - a tool without an object `input_schema`;
 - a `tool_reference` that names no tool the request declares; Claude `tool_addition` and
-  `tool_removal` blocks, which are unknown blocks here (#170);
+  `tool_removal` blocks, which are unknown blocks here. Anthropic does not document them
+  and no retained client is known to send them, so they stay refused; revisit only if Anthropic
+  documents them and Claude Code sends them (#170);
 - a Chat `refusal` part, an audio part without data, a tool result without its call, a
   duplicated call ID, or a call of an unknown type;
+- a Chat custom tool without a name, nested or flat, and a nested custom tool with members
+  beside `type` and `custom`;
 - Gemini `executableCode` and other parts it cannot convert, a thought with text, a
   system part that is not text, and built-in Gemini tools such as search;
 - an Interactions thought step, a step with no content, or a part with no Responses
@@ -1367,7 +1372,9 @@ equivalent; remove it or send the request to a provider that accepts it`.
 ### Responses
 
 The same pair's built-in response translator converts the upstream's events, without
-namespace restoration. A buffered client receives
+namespace restoration. For a Chat client it reads nested custom declarations as the
+strict conversion does (`cpa_translate::codex_response`), so a custom call returns under
+the client's name; the registered pair that xAI and Meta use is unchanged. A buffered client receives
 the translation of the aggregated terminal event. Usage is the provider's. A Claude
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the

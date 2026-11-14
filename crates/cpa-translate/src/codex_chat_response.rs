@@ -4,8 +4,8 @@
 use crate::{
     Error, ResponseCtx, apply_patch,
     claude_responses::{qualify_namespace_name, tool_descriptors, tool_winners},
-    codex_chat_request::{request_tool_names, short_name_map},
-    common::{go_runes, now_unix, trim_space},
+    codex_chat_request::{flatten_custom_tools, request_tool_names, short_name_map},
+    common::{UserTurnDrops, go_runes, now_unix, trim_space},
     stream::GoStream,
 };
 use cpa_common::json::{self as gj, Kind, Res};
@@ -147,6 +147,28 @@ impl ToolState {
         }
         apply_patch::wrap_input(input)
     }
+}
+
+/// The translated route's stream: the client's nested custom tools read as the strict
+/// request conversion reads them, so their calls return under the client's names.
+pub(crate) fn strict_go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
+    let original = flatten_custom_tools(ctx.original_request, &mut UserTurnDrops::default());
+    go_stream(&ResponseCtx {
+        original_request: &original,
+        ..*ctx
+    })
+}
+
+/// The translated route's buffered answer, read as [`strict_go_stream`] reads the stream.
+pub(crate) fn strict_non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
+    let original = flatten_custom_tools(ctx.original_request, &mut UserTurnDrops::default());
+    non_stream(
+        &ResponseCtx {
+            original_request: &original,
+            ..*ctx
+        },
+        raw,
+    )
 }
 
 pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
