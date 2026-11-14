@@ -753,13 +753,32 @@ fn child_of(info: &mut SessionInfo, prefix: &str, sid: &str, parent_sid: &str, p
     }
 }
 
-fn codex(headers: &HeaderMap, body: &Body<'_>, parent: &str) -> Option<SessionInfo> {
-    let mut sid = first_header(headers, &["Session-Id", "Session_id"]);
-    let mut tid = first_header(headers, &["Thread-Id", "Thread_id"]);
-    let turn = headers
+/// The Codex thread a request's headers name: `Thread-Id`, else the turn metadata's
+/// `thread_id`. Empty for other clients. A Guardian reviewer names its parent by this
+/// thread (`x-codex-parent-thread-id`), whatever session key the parent resolves to.
+pub fn codex_thread(headers: &HeaderMap) -> String {
+    let tid = first_header(headers, &["Thread-Id", "Thread_id"]);
+    if !tid.is_empty() {
+        return tid;
+    }
+    let turn = turn_metadata(headers);
+    if turn.is_empty() || !json::parse(turn.as_bytes()).exists() {
+        return String::new();
+    }
+    normalize_explicit_id(&json::get(turn.as_bytes(), "thread_id").str())
+}
+
+fn turn_metadata(headers: &HeaderMap) -> String {
+    headers
         .get("X-Codex-Turn-Metadata")
         .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn codex(headers: &HeaderMap, body: &Body<'_>, parent: &str) -> Option<SessionInfo> {
+    let mut sid = first_header(headers, &["Session-Id", "Session_id"]);
+    let mut tid = codex_thread(headers);
+    let turn = turn_metadata(headers);
     let turn_exists = !turn.is_empty() && json::parse(turn.as_bytes()).exists();
     let turn_get = |path: &str| {
         if turn_exists {
@@ -770,9 +789,6 @@ fn codex(headers: &HeaderMap, body: &Body<'_>, parent: &str) -> Option<SessionIn
     };
     if sid.is_empty() {
         sid = turn_get("session_id");
-    }
-    if tid.is_empty() {
-        tid = turn_get("thread_id");
     }
     // A thread from the body makes a session the body named, not a header.
     let mut tid_in_body = false;
