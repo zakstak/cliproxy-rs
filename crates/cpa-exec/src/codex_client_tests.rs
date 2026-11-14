@@ -57,6 +57,7 @@ fn replays_go_translation_and_optimization() {
                     model: "test-model",
                     stream: true,
                     tool_search: false,
+                    system_turns: false,
                 };
                 let got = translate_request(from, to, &ctx, input, &client).unwrap();
                 // #80: the Codex-shaped pairs keep the client's output controls.

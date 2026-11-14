@@ -341,6 +341,7 @@ fn claude_request(model: &str, input: Value) -> Value {
         model,
         stream: true,
         tool_search: false,
+        system_turns: false,
     };
     serde_json::from_slice(&translate_request(Format::OpenAIResponse, Format::Claude, &ctx, body.as_bytes()).unwrap())
         .unwrap()

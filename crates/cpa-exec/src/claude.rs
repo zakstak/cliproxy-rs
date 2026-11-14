@@ -359,7 +359,15 @@ impl ClaudeExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let upstream_stream = req.stream || req.response_format != Format::Claude;
         let tool_search = ctx.tool_search();
-        let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, tool_search)?;
+        let system_turns = ctx.system_turns(&req, false);
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            tool_search,
+            system_turns,
+        )?;
         let original_translated = translate::original(
             &req,
             &translated,
@@ -367,6 +375,7 @@ impl ClaudeExecutor {
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            system_turns,
         )?;
         tracing::trace!(target: "cpa_latency", stage = "translated");
         let mut prepared = ctx
@@ -511,7 +520,17 @@ impl ClaudeExecutor {
 
     async fn count_tokens(&self, ctx: Ctx<'_>, mut req: ExecRequest) -> Result<ExecResponse, ExecError> {
         ctx.tool_search_fallback(&mut req);
-        let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search())?;
+        let local = ctx.api_key.trim().is_empty() || !ctx.first_party;
+        // A local count sends nothing upstream, so it keeps the top-level system shape.
+        let system_turns = !local && ctx.system_turns(&req, true);
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            system_turns,
+        )?;
         // sdktranslator.TranslateTokenCount(to=claude, responseFormat, count, raw).
         let render = |raw: &[u8]| {
             let count = rawjson::get(&String::from_utf8_lossy(raw), "input_tokens").i64();
@@ -529,8 +548,9 @@ impl ClaudeExecutor {
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            system_turns,
         )?;
-        if ctx.api_key.trim().is_empty() || !ctx.first_party {
+        if local {
             let mut body = ctx.apply_thinking(&req, String::from_utf8_lossy(&translated).into_owned())?;
             if ctx.rebuild_mid_system() {
                 body = rebuild_mid_system(&body);
@@ -1687,6 +1707,24 @@ impl<'a> Ctx<'a> {
                         .unwrap_or_default(),
                 )
                 .is_some_and(|k| k.rebuild_mid_system_message)
+    }
+
+    /// Whether a Responses request keeps its mid-session system items in place as
+    /// `role: system` turns ([`cpa_translate::RequestCtx::system_turns`], Go 27762819).
+    /// Only the cloaked wire sends the turns as they are: an uncloaked request keeps
+    /// the caller's own shape, strict cloaking drops caller system text,
+    /// `rebuild-mid-system-message` folds the turns into `system`, and a legacy model
+    /// rejects them.
+    fn system_turns(&self, req: &ExecRequest, count: bool) -> bool {
+        if req.source_format != Format::OpenAIResponse
+            || self.rebuild_mid_system()
+            || cloak::legacy_model(&self.base_model)
+        {
+            return false;
+        }
+        let confirmed = detect::detect(&req.headers, &utf8(&req.original_body), count, &self.settings).confirmed;
+        let (cloak, strict, ..) = self.wire_policy(confirmed);
+        cloak && !strict
     }
 
     /// `upstream.claude.tool-search` of this run's config snapshot: Go pins it in the

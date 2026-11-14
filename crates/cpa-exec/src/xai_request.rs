@@ -122,6 +122,7 @@ fn translate(
             model,
             stream,
             tool_search: false,
+            system_turns: false,
         },
         body,
         client,

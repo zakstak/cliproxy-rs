@@ -120,8 +120,15 @@ async fn pipeline_reproduces_go_upstream_captures() {
         let req = enrich(request(case));
         let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
         ctx.today = "2026-10-02".into();
-        let translated =
-            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
         let prepared = if req.operation == Operation::CountTokens {
             let baseline = translate::count_original(
                 &req,
@@ -130,6 +137,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
+                ctx.system_turns(&req, true),
             )
             .unwrap();
             ctx.prepare_count(&req, &translated, &baseline).await.unwrap()
@@ -141,6 +149,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
+                ctx.system_turns(&req, false),
             )
             .unwrap();
             ctx.prepare_messages(&req, &translated, &original, req.stream)
@@ -1069,8 +1078,15 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
         // The stages below run inside generate() and count_tokens(), which drop
         // tool_search first; count_tokens() itself is driven above and in go_unit.
         ctx.tool_search_fallback(&mut req);
-        let translated =
-            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
         let prepared = if count {
             let baseline = translate::count_original(
                 &req,
@@ -1079,6 +1095,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
+                ctx.system_turns(&req, true),
             )
             .unwrap();
             ctx.prepare_count(&req, &translated, &baseline).await
@@ -1091,6 +1108,7 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
+                ctx.system_turns(&req, false),
             )
             .unwrap();
             ctx.prepare_messages(&req, &translated, &original, stream || source != Format::Claude)
@@ -2702,7 +2720,15 @@ async fn claude_code_2_1_325_client_forms_pass_through() {
     };
     let run = async |req: &ExecRequest, cfg: &Config| {
         let ctx = Ctx::new(&executor, &credential, req, cfg);
-        let translated = translate::request(req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(req, false),
+        )
+        .unwrap();
         let original = translate::original(
             req,
             &translated,
@@ -2710,6 +2736,7 @@ async fn claude_code_2_1_325_client_forms_pass_through() {
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            ctx.system_turns(req, false),
         )
         .unwrap();
         ctx.prepare_messages(req, &translated, &original, req.stream)
@@ -2807,8 +2834,15 @@ async fn summary_only_thinking_is_not_synthesized_under_forced_tool_use() {
             let model = rawjson::string(&body, "model");
             (req.model, req.requested_model) = (model.clone(), model);
             let ctx = Ctx::new(&executor, &credential, &req, &cfg);
-            let translated =
-                translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+            let translated = translate::request(
+                &req,
+                ctx.codex,
+                &ctx.base_model,
+                ctx.is_compat,
+                ctx.tool_search(),
+                ctx.system_turns(&req, false),
+            )
+            .unwrap();
             let original = translate::original(
                 &req,
                 &translated,
@@ -2816,6 +2850,7 @@ async fn summary_only_thinking_is_not_synthesized_under_forced_tool_use() {
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
+                ctx.system_turns(&req, false),
             )
             .unwrap();
             let prepared = ctx.prepare_messages(&req, &translated, &original, false).await.unwrap();
@@ -2853,8 +2888,15 @@ async fn claude_clients_keep_their_thinking_with_forced_tools() {
         let mut req = request(&case);
         (req.model, req.requested_model) = (model.into(), model.into());
         let ctx = Ctx::new(&executor, &credential, &req, &cfg);
-        let translated =
-            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
         let original = translate::original(
             &req,
             &translated,
@@ -2862,6 +2904,7 @@ async fn claude_clients_keep_their_thinking_with_forced_tools() {
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            ctx.system_turns(&req, false),
         )
         .unwrap();
         ctx.prepare_messages(&req, &translated, &original, false)
@@ -2915,8 +2958,15 @@ async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
         let mut req = request(&case);
         (req.model, req.requested_model) = (model.into(), model.into());
         let ctx = Ctx::new(&executor, &credential, &req, &cfg);
-        let translated =
-            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
         let original = translate::original(
             &req,
             &translated,
@@ -2924,6 +2974,7 @@ async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            ctx.system_turns(&req, false),
         )
         .unwrap();
         ctx.prepare_messages(&req, &translated, &original, false)
@@ -2962,6 +3013,161 @@ async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
     assert!(!rawjson::get(&effort, "thinking").exists(), "{effort}");
 }
 
+/// One Responses request through the full Messages preparation, on `cfg`: whether it
+/// kept mid-session system items in place, and the body sent.
+async fn prepare_responses(credential: &Credential, cfg: &Config, body: &Value) -> (bool, String) {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let body = body.to_string();
+    let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/responses"});
+    let mut req = request(&case);
+    req.source_format = Format::OpenAIResponse;
+    req.response_format = Format::OpenAIResponse;
+    let model = rawjson::string(&body, "model");
+    (req.model, req.requested_model) = (model.clone(), model);
+    let ctx = Ctx::new(&executor, credential, &req, cfg);
+    let system_turns = ctx.system_turns(&req, false);
+    let translated = translate::request(
+        &req,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        system_turns,
+    )
+    .unwrap();
+    let original = translate::original(
+        &req,
+        &translated,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        system_turns,
+    )
+    .unwrap();
+    let prepared = ctx.prepare_messages(&req, &translated, &original, false).await.unwrap();
+    (system_turns, prepared.body)
+}
+
+/// What the prompt cache keys on, without what moves between turns by design: cache
+/// breakpoints and the billing block. String content is its one text block.
+fn cached_prefix(body: &str) -> (Vec<Value>, Vec<Value>) {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("cache_control");
+                if let Some(Value::String(text)) = map.get("content") {
+                    let text = text.clone();
+                    map.insert("content".into(), serde_json::json!([{"type": "text", "text": text}]));
+                }
+                map.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut body: Value = serde_json::from_str(body).unwrap();
+    strip(&mut body);
+    let system = body["system"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| {
+            !b["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(cloak::BILLING_PREFIX)
+        })
+        .collect();
+    (system, body["messages"].as_array().cloned().unwrap_or_default())
+}
+
+/// #183: a developer item a Responses client adds partway through a cloaked conversation
+/// stays where the client put it, so the next request reads the earlier turns from the
+/// prompt cache instead of writing them again.
+#[tokio::test]
+async fn mid_session_developer_item_keeps_the_cached_prefix() {
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    let first = serde_json::json!({"model": "claude-opus-4-8", "instructions": "base", "input": [
+        {"type": "message", "role": "developer", "content": "leading"},
+        {"type": "message", "role": "user", "content": "one"},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "two"}]},
+        {"type": "message", "role": "user", "content": "three"},
+    ]});
+    let mut second = first.clone();
+    second["input"].as_array_mut().unwrap().extend([
+        serde_json::json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "four"}]}),
+        serde_json::json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "mid"}]}),
+        serde_json::json!({"type": "message", "role": "user", "content": "five"}),
+    ]);
+    let (system1, messages1) = cached_prefix(&prepare_responses(&credential, &cfg, &first).await.1);
+    let (_, sent) = prepare_responses(&credential, &cfg, &second).await;
+    let (system2, messages2) = cached_prefix(&sent);
+    assert_eq!(system1, system2, "{sent}");
+    assert_eq!(messages1[..], messages2[..messages1.len()], "{sent}");
+    // The mid-session item follows the user message after it, the only place Claude
+    // takes a system turn.
+    assert_eq!(
+        messages2[messages1.len()..],
+        [
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "four"}]}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "five"}]}),
+            serde_json::json!({"role": "system", "content": [{"type": "text", "text": "mid"}]}),
+        ],
+        "{sent}"
+    );
+}
+
+/// #183: a mid-session item keeps the top-level path wherever the cloaked wire would not
+/// send its turn as is: strict cloaking drops caller system text, a legacy model refuses
+/// the turn (the preparation would fail), `rebuild-mid-system-message` folds turns into
+/// `system`, and an uncloaked request keeps the caller's shape. A Claude client's
+/// request is never translated.
+#[tokio::test]
+async fn mid_session_items_stay_top_level_unless_the_cloaked_wire_sends_them() {
+    let cfg = Config::parse("").unwrap();
+    for (name, attribute, model, kept) in [
+        ("cloaked", None, "claude-opus-4-8", true),
+        ("strict", Some(("cloak_strict_mode", "true")), "claude-opus-4-8", false),
+        ("legacy", None, "claude-sonnet-4-6", false),
+        (
+            "rebuild",
+            Some(("rebuild_mid_system_message", "true")),
+            "claude-opus-4-8",
+            false,
+        ),
+        ("uncloaked", Some(("cloak_mode", "never")), "claude-opus-4-8", false),
+    ] {
+        let mut credential = harness_credential();
+        if let Some((key, value)) = attribute {
+            credential.attributes.insert(key.into(), value.into());
+        }
+        let body = serde_json::json!({"model": model, "input": [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "two"}]},
+            {"role": "developer", "content": "mid"},
+            {"role": "user", "content": "three"},
+        ]});
+        let (system_turns, sent) = prepare_responses(&credential, &cfg, &body).await;
+        assert_eq!(system_turns, kept, "{name}");
+        let sent: Value = serde_json::from_str(&sent).unwrap();
+        let last = sent["messages"].as_array().unwrap().last().unwrap();
+        if kept {
+            assert_eq!(last["role"], "system", "{name}: {sent}");
+            assert_eq!(last["content"][0]["text"], "mid", "{name}: {sent}");
+        } else {
+            assert_eq!(last["role"], "user", "{name}: {sent}");
+        }
+    }
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let case = serde_json::json!({"request_body": r#"{"model":"claude-opus-4-8","messages":[]}"#, "request_headers": [], "path": "/v1/messages"});
+    let req = request(&case);
+    assert!(!Ctx::new(&executor, &credential, &req, &cfg).system_turns(&req, false));
+}
+
 /// A top-level `cache_control` (automatic caching) takes one of the four breakpoint
 /// slots on the last cacheable block, which must not carry a marker with another TTL,
 /// and 1h breakpoints must precede 5m ones (platform docs, Prompt caching). When CPA
@@ -2980,8 +3186,15 @@ async fn top_level_cache_control_becomes_the_last_breakpoint_when_cpa_owns_them(
         let mut req = request(&case);
         (req.model, req.requested_model) = ("claude-sonnet-4-6".into(), "claude-sonnet-4-6".into());
         let ctx = Ctx::new(&executor, &credential, &req, &cfg);
-        let translated =
-            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
         let original = translate::original(
             &req,
             &translated,
@@ -2989,6 +3202,7 @@ async fn top_level_cache_control_becomes_the_last_breakpoint_when_cpa_owns_them(
             &ctx.base_model,
             ctx.is_compat,
             ctx.tool_search(),
+            ctx.system_turns(&req, false),
         )
         .unwrap();
         let sent = ctx
@@ -3036,7 +3250,15 @@ async fn top_level_one_hour_survives_cpa_markers_on_api_keys() {
     let mut req = request(&case);
     (req.model, req.requested_model) = ("claude-sonnet-4-6".into(), "claude-sonnet-4-6".into());
     let ctx = Ctx::new(&executor, &credential, &req, &cfg);
-    let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+    let translated = translate::request(
+        &req,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        ctx.system_turns(&req, false),
+    )
+    .unwrap();
     let original = translate::original(
         &req,
         &translated,
@@ -3044,6 +3266,7 @@ async fn top_level_one_hour_survives_cpa_markers_on_api_keys() {
         &ctx.base_model,
         ctx.is_compat,
         ctx.tool_search(),
+        ctx.system_turns(&req, false),
     )
     .unwrap();
     let sent = ctx

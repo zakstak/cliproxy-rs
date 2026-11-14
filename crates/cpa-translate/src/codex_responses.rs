@@ -555,6 +555,7 @@ mod tests {
             model: "grok-4.7",
             stream: true,
             tool_search: false,
+            system_turns: false,
         };
         for (fields, want) in [
             (r#""max_output_tokens":17"#, Some("17")),
@@ -598,6 +599,7 @@ mod tests {
         let ctx = crate::RequestCtx {
             model: "grok-4.7",
             stream: true,
+            system_turns: false,
             tool_search: false,
         };
         for (fields, field) in [
