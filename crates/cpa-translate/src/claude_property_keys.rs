@@ -21,12 +21,11 @@
 //! A failed `if`, a ruled-out alternative and `not` are still evaluated at the
 //! position: the keys they name there are renamed (so both sides reach the same
 //! verdict), but none of their subschemas apply below it.
-//! ponytail: an element a `contains` schema rules out keeps the keys only that schema
-//! names, so a discriminator declared only in `contains` is not renamed there (free-form
-//! data in such an element is kept, which review required); counting matches for
-//! `minContains`/`maxContains` would need it renamed. Keys of a free-form object (`additionalProperties`,
-//! `patternProperties`, no schema) are data and stay as sent, in both directions, even
-//! when they spell a renamed key.
+//! A tool is declined as a whole when a `contains` schema names a renamed key at the
+//! element, or a key below a `not` is renamed: the walk renames keys only where a
+//! schema applies, and those decide verdicts in elements and values where they don't.
+//! Keys of a free-form object (`additionalProperties`, `patternProperties`, no schema)
+//! are data and stay as sent, in both directions, even when they spell a renamed key.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
 //! in one and a declared object in another at the same position gets the declared
 //! renames; a fuller validator (for example `jsonschema`) is the upgrade.
@@ -190,6 +189,8 @@ struct Node {
     condition: [Option<NodeId>; 3],
     /// `not`: evaluated here, never applied.
     not: Vec<NodeId>,
+    /// `propertyNames` as a schema object (`true` and `false` judge every name alike).
+    property_names: Vec<NodeId>,
     /// Subschemas that apply when the instance has the key: `dependentSchemas`, the
     /// schema form of `dependencies`.
     dependent: Vec<(Vec<u8>, NodeId)>,
@@ -641,10 +642,16 @@ impl PropertyKeys {
         }) {
             return None;
         }
-        // A key renamed below a `not` (past a member or element) is read there but never
-        // applies, so the walk cannot keep both sides' verdicts; decline the tool.
+        // The walk renames keys only where a schema applies, so decline the tool where
+        // a renamed key decides a verdict elsewhere: below a `not` (read but never
+        // applied), in a `contains` at the element (it decides which elements match,
+        // for `maxContains`), or beside a `propertyNames` (kept as written, it would
+        // now judge the generated name).
         // ponytail: following evaluated-only transitions under `not` is the upgrade.
-        if tree.renamed_below_not(&to_claude) {
+        if tree.renamed_below_not(&to_claude)
+            || tree.renamed_by_contains(&to_claude)
+            || tree.renamed_beside_property_names(&to_claude)
+        {
             return None;
         }
         let mut tree = tree;
@@ -1292,6 +1299,57 @@ impl Tree {
         moving.chain(in_place)
     }
 
+    /// Whether a `contains` schema, or what applies in place beside it, names a key in
+    /// `renamed` at the element.
+    fn renamed_by_contains(&self, renamed: &HashMap<Vec<u8>, Vec<u8>>) -> bool {
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut queue: Vec<NodeId> = self.nodes.iter().flat_map(|n| &n.every).copied().collect();
+        while let Some(n) = queue.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if self.nodes[n].named.iter().any(|k| renamed.contains_key(k)) {
+                return true;
+            }
+            queue.extend(self.children(n).filter(|&(_, moves)| !moves).map(|(c, _)| c));
+        }
+        false
+    }
+
+    /// Whether a `propertyNames` schema object shares an instance position with a node
+    /// naming a key in `renamed`. Positions are joined through in-place edges in both
+    /// directions, references included, which can only over-join.
+    fn renamed_beside_property_names(&self, renamed: &HashMap<Vec<u8>, Vec<u8>>) -> bool {
+        if self.nodes.iter().all(|n| n.property_names.is_empty()) {
+            return false;
+        }
+        let mut group: Vec<NodeId> = (0..self.nodes.len()).collect();
+        fn root(group: &mut [NodeId], mut n: NodeId) -> NodeId {
+            while group[n] != n {
+                group[n] = group[group[n]];
+                n = group[n];
+            }
+            n
+        }
+        for n in 0..self.nodes.len() {
+            for (c, moves) in self.children(n).collect::<Vec<_>>() {
+                if !moves {
+                    let (a, b) = (root(&mut group, n), root(&mut group, c));
+                    group[a] = b;
+                }
+            }
+        }
+        let mut constrained: HashSet<NodeId> = HashSet::new();
+        for n in 0..self.nodes.len() {
+            if !self.nodes[n].property_names.is_empty() {
+                constrained.insert(root(&mut group, n));
+            }
+        }
+        (0..self.nodes.len()).any(|n| {
+            self.nodes[n].named.iter().any(|k| renamed.contains_key(k)) && constrained.contains(&root(&mut group, n))
+        })
+    }
+
     /// Whether a subschema below a `not`, at another instance position, names a key in
     /// `renamed`.
     fn renamed_below_not(&self, renamed: &HashMap<Vec<u8>, Vec<u8>>) -> bool {
@@ -1634,6 +1692,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                 b"contains" => node.every.push(child_id),
                 b"allOf" => node.all_of.push(child_id),
                 b"not" => node.not.push(child_id),
+                b"propertyNames" if boolean.is_none() => node.property_names.push(child_id),
                 b"anyOf" | b"oneOf" => node.any_of.push(child_id),
                 b"if" => node.condition[0] = Some(child_id),
                 b"then" => node.condition[1] = Some(child_id),
@@ -1837,13 +1896,12 @@ mod tests {
             "map":{"additionalProperties":{"properties":{"a b":{}}}},
             "pat":{"patternProperties":{"^p":{"properties":{"a b":{}}}},"additionalProperties":true},
             "tuple":{"prefixItems":[{"properties":{"a b":{}}},true],"items":{"properties":{"c d":{}}}},
-            "old":{"items":[{"properties":{"a b":{}}}],"additionalItems":{"properties":{"c d":{}}}},
-            "has":{"contains":{"properties":{"c d":{}}}}
+            "old":{"items":[{"properties":{"a b":{}}}],"additionalItems":{"properties":{"c d":{}}}}
         }}"##;
         round_trip(
             schema,
-            r##"{"map":{"k":{"a b":1,"c d":0}},"pat":{"p1":{"a b":2},"q":{"a b":3}},"tuple":[{"a b":4},{"a b":5},{"c d":6}],"old":[{"a b":7},{"c d":8}],"has":[{"c d":9}]}"##,
-            r##"{"map":{"k":{"a_b":1,"c d":0}},"pat":{"p1":{"a_b":2},"q":{"a b":3}},"tuple":[{"a_b":4},{"a b":5},{"c_d":6}],"old":[{"a_b":7},{"c_d":8}],"has":[{"c_d":9}]}"##,
+            r##"{"map":{"k":{"a b":1,"c d":0}},"pat":{"p1":{"a b":2},"q":{"a b":3}},"tuple":[{"a b":4},{"a b":5},{"c d":6}],"old":[{"a b":7},{"c d":8}]}"##,
+            r##"{"map":{"k":{"a_b":1,"c d":0}},"pat":{"p1":{"a_b":2},"q":{"a b":3}},"tuple":[{"a_b":4},{"a b":5},{"c_d":6}],"old":[{"a_b":7},{"c_d":8}]}"##,
         );
     }
 
@@ -1987,12 +2045,53 @@ mod tests {
 
     #[test]
     fn contains_applies_only_to_matching_elements() {
+        // A `contains` naming a renamed key at the element declines the tool (see
+        // `contains_naming_a_renamed_key_declines_the_tool`).
         let schema = br##"{"properties":{"items":{"type":"array","contains":{"type":"object",
             "properties":{"kind":{"const":"a"},"x y":{"type":"string"}},"required":["kind","x y"]}}}}"##;
+        assert!(PropertyKeys::of(schema).is_none());
+        // Keys below the element still follow only matching elements.
+        let nested = br##"{"properties":{"items":{"type":"array","contains":{"type":"object",
+            "properties":{"kind":{"const":"a"},"d":{"properties":{"x y":{}}}},"required":["kind"]}}}}"##;
         round_trip(
-            schema,
-            r##"{"items":[{"kind":"a","x y":"declared"},{"kind":"b","x_y":"opaque"},"s"]}"##,
-            r##"{"items":[{"kind":"a","x_y":"declared"},{"kind":"b","x_y":"opaque"},"s"]}"##,
+            nested,
+            r##"{"items":[{"kind":"a","d":{"x y":1}},{"kind":"b","d":{"x_y":"opaque"}},"s"]}"##,
+            r##"{"items":[{"kind":"a","d":{"x_y":1}},{"kind":"b","d":{"x_y":"opaque"}},"s"]}"##,
+        );
+    }
+
+    #[test]
+    fn contains_naming_a_renamed_key_declines_the_tool() {
+        // `[{"kind key":"a"},{"kind key":"b"}]` is valid; renaming only the matching
+        // element would let the other match vacuously and break `maxContains`.
+        let schema = br##"{"properties":{"list":{"type":"array","maxContains":1,
+            "contains":{"properties":{"kind key":{"const":"a"}}}}}}"##;
+        assert!(PropertyKeys::of(schema).is_none());
+        // Through `allOf` beside it as well.
+        let beside = br##"{"properties":{"list":{"contains":{"allOf":[{"required":["kind key"]}],
+            "properties":{"kind key":{}}}}}}"##;
+        assert!(PropertyKeys::of(beside).is_none());
+    }
+
+    #[test]
+    fn property_names_beside_a_renamed_key_decline_the_tool() {
+        let pattern = br##"{"properties":{"p":{"properties":{"x y":{}},"propertyNames":{"pattern":"^x y$"}}}}"##;
+        assert!(PropertyKeys::of(pattern).is_none());
+        // Any constraint, through `allOf` or a reference.
+        let referenced = br##"{"$defs":{"names":{"enum":["x y"]}},"properties":{"p":{
+            "properties":{"x y":{}},"allOf":[{"propertyNames":{"$ref":"#/$defs/names"}}]}}}"##;
+        assert!(PropertyKeys::of(referenced).is_none());
+        // `true`, `false` and a `propertyNames` at another position keep the rename.
+        for names in ["true", "false"] {
+            let schema =
+                format!(r##"{{"properties":{{"p":{{"properties":{{"x y":{{}}}},"propertyNames":{names}}}}}}}"##);
+            assert!(PropertyKeys::of(schema.as_bytes()).is_some());
+        }
+        let elsewhere = br##"{"properties":{"p":{"properties":{"x y":{}}},"q":{"propertyNames":{"maxLength":3}}}}"##;
+        round_trip(
+            elsewhere,
+            r##"{"p":{"x y":1},"q":{"abc":2}}"##,
+            r##"{"p":{"x_y":1},"q":{"abc":2}}"##,
         );
     }
 

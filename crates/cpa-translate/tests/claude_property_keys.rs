@@ -704,3 +704,64 @@ fn patterns_that_change_applicability_leave_the_tool_as_sent() {
     let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
     assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
 }
+
+/// A declined tool: on Chat and Responses, the schema Claude receives, the replayed
+/// arguments and the returned arguments all keep the client's spelling.
+fn assert_left_as_sent(schema: Value, args: Value) {
+    let chat = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": schema}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": args.to_string()}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })
+    .to_string();
+    let responses = json!({
+        "model": "claude-opus-5-5",
+        "tools": [{"type": "function", "name": "f", "parameters": schema}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": args.to_string()},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    })
+    .to_string();
+    for (format, body) in [(Format::OpenAI, &chat), (Format::OpenAIResponse, &responses)] {
+        let out = translate(format, body.as_bytes());
+        let sent = &claude_tool(&out, "f")["input_schema"];
+        assert_eq!(sent["properties"], schema["properties"], "{format:?}");
+        assert_eq!(tool_use_input(&out), &args, "{format:?}");
+    }
+    let answer = claude_answer(args.clone(), "f");
+    let body = non_stream(Format::OpenAI, chat.as_bytes(), &answer);
+    assert_eq!(
+        parse_args(&body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+        args
+    );
+    let body = non_stream(Format::OpenAIResponse, responses.as_bytes(), &answer);
+    assert_eq!(parse_args(&responses_function_call(&body)["arguments"]), args);
+}
+
+/// `[{"kind key":"a"},{"kind key":"b"}]` is valid under `maxContains: 1`; renaming the
+/// key only in the matching element would let the other match too.
+#[test]
+fn contains_naming_a_renamed_key_leaves_the_tool_as_sent() {
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"list": {"type": "array", "maxContains": 1,
+            "contains": {"properties": {"kind key": {"const": "a"}}}}}}),
+        json!({"list": [{"kind key": "a"}, {"kind key": "b"}]}),
+    );
+}
+
+/// `propertyNames` is kept as written, so `x_y` would fail `^x y$`.
+#[test]
+fn property_names_beside_a_renamed_key_leave_the_tool_as_sent() {
+    assert_left_as_sent(
+        json!({"type": "object", "properties": {"p": {"properties": {"x y": {}},
+            "propertyNames": {"pattern": "^x y$"}}}}),
+        json!({"p": {"x y": 1}}),
+    );
+}
