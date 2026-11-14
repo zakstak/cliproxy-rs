@@ -1,0 +1,12 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture_3"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the context."}],"phase":"commentary"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_fixture_3","name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture_3","usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105}}}
+

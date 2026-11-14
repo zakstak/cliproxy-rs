@@ -1327,6 +1327,20 @@ the response ends), not a local estimate, and its final `message_delta` carries 
 provider's counts. Upstream errors keep their classification and reach the client in
 its own error format.
 
+An assistant message's `phase` (#112) is not translated. `commentary` is visible mid-turn
+text that tool calls may follow, and `final_answer` the turn's answer
+(`protocol/src/models.rs:979-995`). Claude Messages and Chat Completions show both as
+ordinary assistant text, and a Claude text block before `tool_use` means the same as
+commentary. A Claude client therefore gets commentary as a text block, in order, and
+never as a thinking block. On replay the client's text carries no phase, so the
+converted assistant message has none, which the first-party client reads as "phase
+unknown". OpenAI recommends resending `phase` on replay; doing so would require inferring
+it from position or hiding it in a marker inside client-visible text or a thinking
+signature, which the client never sent. The route does neither. Go v8.0.67 turns
+commentary into thinking blocks and replays it through an internal signature marker
+(`376015c3`, `531721bf`, `cc4b9949`). Fixture `sse-commentary-then-call`. Test:
+`codex_translated.rs` `commentary_is_visible_text_and_replays_without_a_phase`.
+
 A `response.incomplete` is never a normal stop. A reason the client API has a stop for
 becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat `length`, and
 `content_filter` is Claude `refusal` and Chat `content_filter`, unless the response

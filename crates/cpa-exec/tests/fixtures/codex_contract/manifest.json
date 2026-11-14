@@ -264,6 +264,22 @@
       "notes": "Field values are placeholders."
     },
     {
+      "name": "sse-commentary-then-call",
+      "file": "sse/commentary_then_call.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:822-866 parses_items_and_completed: an assistant message with phase commentary",
+        "codex-rs/protocol/src/models.rs:979-995 MessagePhase: commentary is mid-turn assistant text that tool calls may follow; None is phase unknown",
+        "codex-rs/core/tests/common/responses.rs:1016-1026 ev_function_call"
+      ],
+      "contract": "Commentary is visible assistant text before a tool call: a phase commentary message, then a function_call, then the completion.",
+      "notes": "Combines the first-party commentary item with the first-party function_call event helper; text, call and usage values are placeholders."
+    },
+    {
       "name": "sse-completed-no-usage",
       "file": "sse/completed_no_usage.sse",
       "format": "sse",
