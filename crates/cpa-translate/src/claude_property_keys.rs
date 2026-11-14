@@ -139,6 +139,9 @@ struct Tree {
     nodes: Vec<Node>,
     /// Each node's JSON pointer (client spelling, RFC 6901 escaped).
     pointers: HashMap<Vec<u8>, NodeId>,
+    /// The walk stopped at [`MAX_SCHEMA_NODES`]: the tree is incomplete and the schema
+    /// is declined.
+    overflow: bool,
 }
 
 #[derive(Debug, Default)]
@@ -575,7 +578,7 @@ impl PropertyKeys {
     /// Deterministic for the same schema bytes, so the cached prompt prefix stays stable.
     pub(crate) fn of(schema: &[u8]) -> Option<Self> {
         let (tokens, tree) = walk(schema);
-        if tree.nodes.len() > MAX_SCHEMA_NODES {
+        if tree.overflow {
             return None;
         }
         let mut taken: HashSet<&[u8]> = HashSet::new();
@@ -696,7 +699,12 @@ impl PropertyKeys {
                             (Direction::ToClient, Some(original)) => &original[..],
                             _ => &token.text[..],
                         };
-                        let child = sets.member(set, client);
+                        // Claude's schema keeps its patterns and sees the renamed key.
+                        let wire = match (direction, rename) {
+                            (Direction::ToClaude, Some(name)) => &name[..],
+                            _ => &token.text[..],
+                        };
+                        let child = sets.member(set, client, wire);
                         if let Some(name) = rename {
                             edits.push((token, name));
                         }
@@ -780,7 +788,7 @@ struct Sets<'k> {
     /// alternative, `not`): they name keys there, but nothing below them applies.
     evaluated: Vec<Vec<NodeId>>,
     ids: HashMap<(Vec<NodeId>, Vec<NodeId>), usize>,
-    members: HashMap<(usize, Vec<u8>), usize>,
+    members: HashMap<(usize, Vec<u8>, Vec<u8>), usize>,
     elements: HashMap<(usize, usize), (usize, usize)>,
     /// Lists of nodes that apply to an element only if it matches or fails a check;
     /// index [`NONE`] is the empty list.
@@ -1117,14 +1125,24 @@ impl<'k> Sets<'k> {
         self.index[set].as_ref().is_some_and(|i| i.named.contains(key))
     }
 
-    /// The start set at member `key` (client spelling) of an object at `set`.
-    fn member(&mut self, set: usize, key: &[u8]) -> usize {
+    /// The start set at member `key` (client spelling; `wire` is how Claude's side spells
+    /// it) of an object at `set`. Patterns, which the rename leaves as written, are
+    /// matched against both spellings.
+    fn member(&mut self, set: usize, key: &[u8], wire: &[u8]) -> usize {
         if set == EMPTY {
             return EMPTY;
         }
-        if let Some(&id) = self.members.get(&(set, key.to_vec())) {
+        let memo = (set, key.to_vec(), wire.to_vec());
+        if let Some(&id) = self.members.get(&memo) {
             return id;
         }
+        let matches = |pattern: &Pattern| {
+            let client = pattern.matches(key);
+            if wire == key {
+                return client;
+            }
+            any_of([client, pattern.matches(wire)].into_iter())
+        };
         let Some(index) = self.index[set].as_ref() else {
             return EMPTY;
         };
@@ -1135,7 +1153,7 @@ impl<'k> Sets<'k> {
             // certainly matches. An unknown pattern applies both, as undecided branches do.
             let mut matched = false;
             for (pattern, child) in &node.patterns {
-                match pattern.matches(key) {
+                match matches(pattern) {
                     Some(true) => {
                         matched = true;
                         next.push(*child);
@@ -1153,14 +1171,14 @@ impl<'k> Sets<'k> {
                 evaluated
                     .patterns
                     .iter()
-                    .any(|&m| self.node(m).patterns.iter().any(|(p, _)| p.matches(key) == Some(true)))
+                    .any(|&m| self.node(m).patterns.iter().any(|(p, _)| matches(p) == Some(true)))
             };
             if !evaluated.all && !evaluated.keys.contains(key) && !matched() {
                 next.extend(&self.node(*n).unevaluated);
             }
         }
         let id = self.intern(next);
-        self.members.insert((set, key.to_vec()), id);
+        self.members.insert(memo, id);
         id
     }
 
@@ -1485,6 +1503,13 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                     node.check.complete = false;
                 }
                 continue;
+            }
+            if tree.nodes.len() >= MAX_SCHEMA_NODES {
+                // One node past the cap: stop before building more, so a declined schema
+                // costs at most the cap's worth of nodes and pointers.
+                tree.overflow = true;
+                tree.nodes[id] = node;
+                return (tokens, tree);
             }
             let mut pointer = node.pointer.clone();
             pointer.push(b'/');
@@ -2030,6 +2055,12 @@ mod tests {
 
         let wide = wide_schema((MAX_SCHEMA_NODES - 3) / 2 + 1);
         assert!(PropertyKeys::of(wide.as_bytes()).is_none());
+        // The walk stops at the cap instead of building the whole tree.
+        let huge = wide_schema(10_000);
+        let (_, tree) = walk(huge.as_bytes());
+        assert!(tree.overflow);
+        assert_eq!(tree.nodes.len(), MAX_SCHEMA_NODES);
+        assert!(PropertyKeys::of(huge.as_bytes()).is_none());
     }
 
     #[test]
@@ -2267,6 +2298,14 @@ mod tests {
             r##"{"p":{"kind":"b","tag key":1,"d":{"x_y":2}}}"##,
             r##"{"p":{"kind":"b","tag_key":1,"d":{"x_y":2}}}"##,
         );
+    }
+
+    #[test]
+    fn patterns_match_either_spelling_of_a_renamed_key() {
+        // Claude sees `x_y` and the unchanged pattern `^x_y$`; the client sees `x y`.
+        let schema = br##"{"properties":{"p":{"properties":{"x y":{}},
+            "patternProperties":{"^x_y$":{"properties":{"a b":{}}}}}}}"##;
+        round_trip(schema, r##"{"p":{"x y":{"a b":1}}}"##, r##"{"p":{"x_y":{"a_b":1}}}"##);
     }
 
     #[test]
