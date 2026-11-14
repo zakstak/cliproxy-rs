@@ -1367,7 +1367,14 @@ impl<'a> Ctx<'a> {
         // `shouldEnsureCacheControl`.
         let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
         if cpa_owns_cache {
+            // A top-level 1h breakpoint keeps its duration: CPA's own bare markers come
+            // before it and would void it as 5m ones (1h must precede 5m).
+            let top = rawjson::get(&body, "cache_control");
+            let top_1h = cloak::valid_cache_control(&top) && top.get("ttl").str() == "1h";
             body = cloak::ensure_cache_control(cloak::materialize_top_level_cache(body));
+            if top_1h {
+                body = cloak::upgrade_ttl(body, "1h");
+            }
         }
         body = cloak::enforce_cache_limit(body, 4);
         body = cloak::strip_prompt_cache_options(body);

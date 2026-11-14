@@ -894,6 +894,25 @@ fn inject_messages_cache(body: &str) -> String {
     }
 }
 
+/// The last block in the conversation that can hold a breakpoint, in any turn (a
+/// trailing system turn included): `Ok` a block path, `Err` a string turn to wrap.
+fn last_turn_holder(body: &str) -> Option<Result<String, String>> {
+    let messages = rawjson::get(body, "messages");
+    if messages.kind() != rawjson::Kind::Array {
+        return None;
+    }
+    messages.array().iter().enumerate().rev().find_map(|(idx, m)| {
+        let content = m.get("content");
+        match content.kind() {
+            rawjson::Kind::String if !content.str().trim().is_empty() => Some(Err(format!("messages.{idx}.content"))),
+            rawjson::Kind::Array => {
+                last_holder(&content.array(), false).map(|i| Ok(format!("messages.{idx}.content.{i}")))
+            }
+            _ => None,
+        }
+    })
+}
+
 /// A top-level `cache_control` (automatic caching) placed on the block it would land on,
 /// the last one that can hold a breakpoint in messages, else system, else tools, and
 /// removed from the top level. Automatic caching takes one of the four slots, and the
@@ -924,7 +943,7 @@ pub(crate) fn materialize_top_level_cache(body: String) -> String {
         }
     };
     let system = rawjson::get(&body, "system");
-    let placed = match messages_target(&body) {
+    let placed = match last_turn_holder(&body) {
         Some(Ok(block)) => apply(block),
         Some(Err(path)) => wrap_with_marker(&body, &path, &top),
         None => match system.kind() {
@@ -1191,6 +1210,20 @@ mod tests {
             r#""messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral"}}]}]"#,
         );
         assert_eq!(rawjson::get(&out, "messages.0.content.0.cache_control.ttl").str(), "1h");
+        // A trailing system turn is the last cacheable block.
+        let out = top(
+            ttl,
+            r#""messages":[{"role":"user","content":"q"},{"role":"system","content":[{"type":"text","text":"now"}]}]"#,
+        );
+        assert_eq!(
+            rawjson::get(&out, "messages.1.content.0.cache_control.ttl").str(),
+            "1h",
+            "{out}"
+        );
+        assert!(
+            !rawjson::get(&out, "messages.0.content.0.cache_control").exists(),
+            "{out}"
+        );
         // Without a cacheable turn: system, then the last tool that is not deferred.
         let out = top(ttl, r#""system":"rules","messages":[{"role":"user","content":" "}]"#);
         assert_eq!(rawjson::get(&out, "system.0.cache_control.ttl").str(), "1h");

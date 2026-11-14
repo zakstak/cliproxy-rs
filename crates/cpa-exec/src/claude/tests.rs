@@ -3015,3 +3015,47 @@ async fn top_level_cache_control_becomes_the_last_breakpoint_when_cpa_owns_them(
         );
     }
 }
+
+/// On an API key without the Claude Code profile, a top-level 1h breakpoint still goes
+/// out as 1h, and the markers CPA adds before it join it rather than voiding it.
+#[tokio::test]
+async fn top_level_one_hour_survives_cpa_markers_on_api_keys() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let mut credential = Credential::from_file(
+        Path::new("/fake"),
+        Path::new("/fake/claude-api-key.json"),
+        serde_json::json!({"type": "claude"}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    credential
+        .attributes
+        .insert("api_key".into(), "fake-gateway-key".into());
+    let cfg = Config::parse("").unwrap();
+    let body = r#"{"model":"claude-sonnet-4-6","max_tokens":64,"cache_control":{"type":"ephemeral","ttl":"1h"},"system":"Be brief.","messages":[{"role":"user","content":"one"}]}"#;
+    let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/messages"});
+    let mut req = request(&case);
+    (req.model, req.requested_model) = ("claude-sonnet-4-6".into(), "claude-sonnet-4-6".into());
+    let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+    let translated = translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+    let original = translate::original(
+        &req,
+        &translated,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+    )
+    .unwrap();
+    let sent = ctx
+        .prepare_messages(&req, &translated, &original, false)
+        .await
+        .unwrap()
+        .body;
+    assert!(!rawjson::get(&sent, "cache_control").exists(), "{sent}");
+    let ttls: Vec<String> = signals::blocks(&sent)
+        .into_iter()
+        .filter(|(_, b)| cloak::valid_cache_control(&rawjson::get(b, "cache_control")))
+        .map(|(_, b)| rawjson::string(&b, "cache_control.ttl"))
+        .collect();
+    assert!(!ttls.is_empty() && ttls.iter().all(|t| t == "1h"), "{ttls:?}: {sent}");
+}
