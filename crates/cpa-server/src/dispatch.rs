@@ -1107,7 +1107,8 @@ async fn run_routed(
     loop {
         let mut last: Option<Fault> = None;
         let mut attempted: Vec<String> = Vec::new();
-        // The credential a `never`-rebind session is bound to, once a pick refused it.
+        // The credential a `never`-rebind session is bound to: every pick for a session
+        // binds (or reuses) the credential it returns, and a refused pick names it.
         let mut bound: Option<String> = None;
         let pick_failure = loop {
             if policy.max_retry_credentials > 0 && attempted.len() >= policy.max_retry_credentials {
@@ -1153,6 +1154,9 @@ async fn run_routed(
                     });
                 }
             };
+            if policy.session_affinity_never_rebind && (selection.session.is_some() || selection.lcp.is_some()) {
+                bound = Some(lease.credential.id.clone());
+            }
             selection.exclude.push(lease.credential.id.clone());
             trace.selected(&lease.credential);
             let (mut models, alias) = registry::execution_models(&aliases, &lease.credential, &selection.model);

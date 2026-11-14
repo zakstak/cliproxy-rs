@@ -232,21 +232,30 @@ async fn retry_rounds_retry_only_the_bound_account() {
 
 /// The retry wait follows the bound key alone: with a ready spare, the next round still
 /// waits out the bound key's one-second cooldown and retries it, instead of starting at
-/// once and ending on the refusal.
+/// once and ending on the refusal. Also when `max-retry-credentials: 1` ends the round
+/// right after the bound key's attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_rounds_wait_for_the_bound_account_not_a_spare() {
-    let dir = auth_dir("retry-wait");
-    let a = statuses(&[200]);
-    let (upstream, calls) = mock(a.clone()).await;
-    let routing = "  session-affinity-rebind-on: never\n  retry: {request-retry: 1, max-retry-interval: 5}\n  \
-                   cooldown: {transient-error-cooldown-seconds: 1}\n";
-    let (_rt, url) = start(config(&dir, &upstream, routing)).await;
-    assert_eq!(post(&url, Some(SESSION)).await.status, 200);
-    set(&a, &[500, 200]);
-    let retried = post(&url, Some(SESSION)).await;
-    assert_eq!(retried.status, 200, "{}", retried.body);
-    assert_eq!(*calls.lock().unwrap(), ["sk-fake-a", "sk-fake-a", "sk-fake-a"]);
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, cap) in [("retry-wait", ""), ("retry-wait-capped", ", max-retry-credentials: 1")] {
+        let dir = auth_dir(name);
+        let a = statuses(&[200]);
+        let (upstream, calls) = mock(a.clone()).await;
+        let routing = format!(
+            "  session-affinity-rebind-on: never\n  retry: {{request-retry: 1, max-retry-interval: 5{cap}}}\n  \
+             cooldown: {{transient-error-cooldown-seconds: 1}}\n"
+        );
+        let (_rt, url) = start(config(&dir, &upstream, &routing)).await;
+        assert_eq!(post(&url, Some(SESSION)).await.status, 200);
+        set(&a, &[500, 200]);
+        let retried = post(&url, Some(SESSION)).await;
+        assert_eq!(retried.status, 200, "{name}: {}", retried.body);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["sk-fake-a", "sk-fake-a", "sk-fake-a"],
+            "{name}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A removed bound key refuses the session (without `Retry-After`) until the binding
