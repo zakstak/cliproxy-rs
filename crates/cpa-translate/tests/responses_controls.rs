@@ -3,11 +3,13 @@
 //! a value of either that the Responses body cannot carry. The Codex translated route
 //! (`codex_request`) keeps its own rules. Go v8.0.35 drops the limit and forces
 //! parallel calls (docs/DIFFERENCES-FROM-GO.md); the final outbound bodies are proved in
-//! cpa-server's `responses_controls_e2e`.
+//! cpa-server's `responses_controls_e2e`. A Claude `output_config.effort` without a
+//! `thinking` type has no Responses form on any of the three Claude converters and is
+//! refused.
 
 use cpa_common::json as gj;
 use cpa_core::format::Format;
-use cpa_translate::{RequestCtx, codex_request, translate_request};
+use cpa_translate::{Error, RequestCtx, claude_to_codex_with_compat, codex_request, translate_request};
 
 const CTX: RequestCtx<'static> = RequestCtx {
     model: "grok-4.7",
@@ -173,4 +175,81 @@ fn codex_translated_route_keeps_its_own_rules() {
         "{}",
         String::from_utf8_lossy(&out)
     );
+}
+
+/// The three Claude -> Responses converters: the registered pair (Grok, Muse), its
+/// is-compat variant, and the Codex translated route.
+fn claude_converters(body: &str) -> [(&'static str, Result<Vec<u8>, Error>); 3] {
+    let body = body.as_bytes();
+    [
+        (
+            "registered",
+            translate_request(Format::Claude, Format::Codex, &CTX, body),
+        ),
+        ("compat", claude_to_codex_with_compat(&CTX, body)),
+        ("strict", codex_request(Format::Claude, &CTX, body).unwrap()),
+    ]
+}
+
+/// #80: Go reads `output_config.effort` only under adaptive thinking. Without a thinking
+/// type it is dropped, and the registered pair sends its `medium` default instead. Every
+/// converter refuses it, with a message that names the field and not the client's value.
+#[test]
+fn standalone_claude_effort_is_refused() {
+    for thinking in [
+        "",
+        r#","thinking":null"#,
+        r#","thinking":{}"#,
+        r#","thinking":{"type":null}"#,
+        r#","thinking":{"type":""}"#,
+    ] {
+        for effort in [r#""low""#, r#"" HIGH ""#] {
+            let body = claude(&format!(r#"{thinking},"output_config":{{"effort":{effort}}}"#));
+            for (converter, result) in claude_converters(&body) {
+                let err = result.expect_err(&format!("{converter}: {body}"));
+                assert!(err.0.contains("`output_config.effort`"), "{converter} {body}: {err}");
+                assert!(err.0.contains("without a `thinking` type"), "{converter}: {err}");
+                assert!(!err.0.contains("low") && !err.0.contains("HIGH"), "{converter}: {err}");
+            }
+        }
+    }
+}
+
+/// An absent, `null` or blank effort says nothing, and an effort beside a thinking type
+/// keeps its existing conversion: adaptive thinking takes it, a budget or disabled
+/// thinking ignores it.
+#[test]
+fn claude_effort_controls_keep_their_conversion() {
+    for extra in [
+        "",
+        r#","output_config":{}"#,
+        r#","output_config":{"effort":null}"#,
+        r#","output_config":{"effort":"  "}"#,
+    ] {
+        for (converter, result) in claude_converters(&claude(extra)) {
+            let out = result.unwrap_or_else(|e| panic!("{converter} {extra}: {e}"));
+            let want = (converter != "strict").then(|| r#""medium""#.to_owned());
+            assert_eq!(field(&out, "reasoning.effort"), want, "{converter} {extra}");
+        }
+    }
+    for (converter, result) in claude_converters(&claude(
+        r#","thinking":{"type":"adaptive"},"output_config":{"effort":"low"}"#,
+    )) {
+        let out = result.unwrap();
+        assert_eq!(
+            field(&out, "reasoning.effort").as_deref(),
+            Some(r#""low""#),
+            "{converter}"
+        );
+    }
+    for thinking in [
+        r#""thinking":{"type":"enabled","budget_tokens":2000}"#,
+        r#""thinking":{"type":"disabled"}"#,
+    ] {
+        let with = claude_converters(&claude(&format!(r#",{thinking},"output_config":{{"effort":"max"}}"#)));
+        let without = claude_converters(&claude(&format!(",{thinking}")));
+        for ((converter, with), (_, without)) in with.into_iter().zip(without) {
+            assert_eq!(with.unwrap(), without.unwrap(), "{converter} {thinking}");
+        }
+    }
 }

@@ -841,3 +841,30 @@ async fn failed_tool_results_are_refused() {
         assert_eq!(status, 200, "{content}: an ordinary result: {answer}");
     }
 }
+
+/// #80: a Claude `output_config.effort` without a `thinking` type has no Responses form,
+/// so it is refused before the send, buffered and streamed, instead of being dropped.
+/// Beside adaptive thinking it is the client's reasoning effort.
+#[tokio::test]
+async fn standalone_claude_effort_is_refused_before_the_send() {
+    for stream in [false, true] {
+        let proxy = proxy(vec![completed()], "").await;
+        let mut request = claude_request(stream);
+        request.as_object_mut().unwrap().remove("thinking");
+        request["output_config"] = json!({"effort": "low"});
+        let (status, answer) = post(&proxy.url, "/v1/messages", &request).await;
+        assert_eq!(status, 400, "stream={stream}: {answer}");
+        assert!(
+            answer.contains("`output_config.effort` without a `thinking` type"),
+            "stream={stream}: {answer}"
+        );
+        assert!(proxy.upstream.http().is_empty(), "stream={stream}: nothing was sent");
+    }
+    let proxy = proxy(vec![completed()], "").await;
+    let mut request = claude_request(false);
+    request["thinking"] = json!({"type": "adaptive"});
+    request["output_config"] = json!({"effort": "low"});
+    let (status, answer) = post(&proxy.url, "/v1/messages", &request).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(sent(&proxy)["reasoning"]["effort"], "low");
+}
