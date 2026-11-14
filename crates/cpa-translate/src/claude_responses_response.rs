@@ -183,6 +183,8 @@ struct Usage {
     output: i64,
     creation: i64,
     read: i64,
+    /// [`common::claude_thinking_tokens`], `None` until a usage object reports it.
+    thinking: Option<i64>,
     present: bool,
 }
 
@@ -203,12 +205,25 @@ impl Usage {
                 *slot = v.int();
             }
         }
+        if let Some(thinking) = common::claude_thinking_tokens(usage) {
+            self.thinking = Some(thinking);
+        }
     }
 
     /// (input, output, total, cached).
     fn totals(&self) -> (i64, i64, i64, i64) {
         let input = self.input.wrapping_add(self.creation).wrapping_add(self.read);
         (input, self.output, input.wrapping_add(self.output), self.read)
+    }
+
+    /// Responses `output_tokens_details.reasoning_tokens`: the count Anthropic reported
+    /// (both are the reasoning share of the output total), else Go's estimate of a
+    /// quarter of the thinking text's bytes.
+    // ponytail: the estimate stays for answers without a reported count; it undercounts
+    // summarized thinking. Drop it once Anthropic reports the count on every thinking
+    // answer.
+    fn reasoning(&self, thinking_text_len: usize) -> i64 {
+        self.thinking.unwrap_or((thinking_text_len / 4) as i64)
     }
 }
 
@@ -1447,7 +1462,7 @@ impl State {
             gj::set_raw(&mut completed, "response.output", arr);
         }
         let reasoning_len: usize = self.reasoning_items.iter().map(|r| r.text.len()).sum();
-        let reasoning_tokens = (reasoning_len / 4) as i64;
+        let reasoning_tokens = self.usage.reasoning(reasoning_len);
         if self.usage.present || reasoning_tokens > 0 {
             let (input, output, total, cached) = self.usage.totals();
             gj::set_int(&mut completed, "response.usage.input_tokens", input);
@@ -1962,8 +1977,8 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
         .filter(|i| i.kind == "reasoning")
         .map(|i| i.text.len())
         .sum();
-    let reasoning_tokens = (reasoning_len / 4) as i64;
-    if reasoning_tokens > 0 {
+    let reasoning_tokens = usage.reasoning(reasoning_len);
+    if reasoning_tokens > 0 || usage.thinking.is_some() {
         gj::set_int(
             &mut out,
             "usage.output_tokens_details.reasoning_tokens",

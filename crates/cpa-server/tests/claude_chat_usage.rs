@@ -5,7 +5,8 @@
 //! `usage.output_tokens_details.thinking_tokens` (anthropic-sdk-python 5139cf2e,
 //! `types/usage.py`, `types/output_tokens_details.py`). A Chat Completions client gets
 //! it as `usage.completion_tokens_details.reasoning_tokens`, buffered and streamed,
-//! with an explicit 0 kept and an unreported count left out. Native Messages answers
+//! with an explicit 0 kept and an unreported count left out. A Responses client gets it
+//! as `usage.output_tokens_details.reasoning_tokens`. Native Messages answers
 //! carry the upstream bytes unchanged. The mock writes its streams in small pieces
 //! that split events and lines, so the count also survives the proxy's SSE framing.
 
@@ -208,6 +209,41 @@ async fn chat_reports_claude_thinking_tokens_as_reasoning_tokens() {
             .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert_eq!(text, "answer", "{marker}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Responses usage the mock's counts produce, with `reasoning` as the reasoning count.
+fn responses_usage(reasoning: i64) -> Value {
+    json!({
+        "input_tokens": 10,
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens": 10,
+        "output_tokens_details": {"reasoning_tokens": reasoning},
+        "total_tokens": 20,
+    })
+}
+
+/// A Responses client gets the reported count as `output_tokens_details.reasoning_tokens`,
+/// buffered and streamed. Without one, Go's estimate (a quarter of the 12 bytes of
+/// thinking text) stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_reports_claude_thinking_tokens_as_reasoning_tokens() {
+    let dir = auth_dir("responses");
+    let upstream_url = serve(axum::Router::new().fallback(upstream)).await;
+    let url = proxy(&dir, &upstream_url).await;
+
+    for (marker, reasoning) in [("MODE_SEVEN", 7), ("MODE_ZERO", 0), ("MODE_ABSENT", 3)] {
+        let want = responses_usage(reasoning);
+        let request = |stream: bool| json!({"model": "claude-opus-4-6", "stream": stream, "input": marker});
+
+        let body: Value = serde_json::from_slice(&post(&url, "/v1/responses", request(false)).await).unwrap();
+        assert_eq!(body["usage"], want, "{marker} buffered: {body}");
+
+        let events = data(&post(&url, "/v1/responses", request(true)).await);
+        let completed: Vec<&Value> = events.iter().filter(|e| e["type"] == "response.completed").collect();
+        assert_eq!(completed.len(), 1, "{marker}: {events:?}");
+        assert_eq!(completed[0]["response"]["usage"], want, "{marker} stream");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
