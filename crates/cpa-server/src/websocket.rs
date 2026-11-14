@@ -1238,9 +1238,8 @@ impl Connection {
             request.clone()
         };
         let model = rawjson::get(&request, "model").str().to_owned();
-        let started = self
-            .attempt(&frame, &request, &model, fallback_error.as_ref(), &mut ctx)
-            .await;
+        let attempt = self.attempt(&frame, &request, &model, fallback_error.as_ref(), &mut ctx);
+        let started = pinging(socket, keepalive_interval(&cfg), attempt).await;
         let forwarded = match started {
             Ok(started) => self.forward(socket, started, &cfg, &mut ctx).await,
             // No native attempt served the frame: the fallback's refusal stands, as an
@@ -1877,7 +1876,28 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// `requests.streaming.keepalive-seconds`: WebSocket pings while a turn streams; off by
+/// Runs a turn's bootstrap (`work`, until its first event) and sends the client a ping
+/// every `keepalive` while it waits, so a turn is pinged whenever it is idle, not only
+/// once events flow (#114). A failed ping stops the pings; the reader sees the client
+/// leave and the connection loop cancels the turn.
+async fn pinging<T>(socket: &Sink, keepalive: Option<Duration>, work: impl Future<Output = T>) -> T {
+    tokio::pin!(work);
+    let mut deadline = keepalive.map(|k| tokio::time::Instant::now() + k);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut work => return out,
+            () = sleep_until(deadline) => {
+                deadline = match socket.send(Message::Ping(Bytes::new())).await {
+                    Ok(()) => keepalive.map(|k| tokio::time::Instant::now() + k),
+                    Err(_) => None,
+                };
+            }
+        }
+    }
+}
+
+/// `requests.streaming.keepalive-seconds`: WebSocket pings while a turn is idle; off by
 /// default.
 fn keepalive_interval(cfg: &Config) -> Option<Duration> {
     let seconds = ["requests", "streaming", "keepalive-seconds"]
