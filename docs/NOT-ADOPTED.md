@@ -125,8 +125,8 @@ Go compresses Codex upstream requests with zstd, compresses downstream HTTP resp
 negotiates downstream WebSocket compression, and resends a request uncompressed after a
 400 or 415.
 
-Rust already decodes compressed traffic everywhere it arrives: zstd client request bodies
-(`decode_body` in `crates/cpa-server/src/openai.rs`), compressed upstream responses
+Rust already decodes compressed traffic on these paths: zstd client request bodies on the
+OpenAI-format routes (`decode_body` in `crates/cpa-server/src/openai.rs`), compressed upstream responses
 (`crates/cpa-exec/src/upstream.rs`) and permessage-deflate frames on the upstream Codex
 socket (`crates/cpa-exec/src/codex_ws_deflate.rs`). It sends upstream requests and
 downstream responses uncompressed (`hop_by_hop` in `crates/cpa-server/src/respond.rs`
