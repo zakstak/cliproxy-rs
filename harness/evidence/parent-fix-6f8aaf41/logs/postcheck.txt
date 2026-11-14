@@ -1,8 +1,0 @@
-{"available_bytes_after_lock": {"/home/agent": 8430510080, "/tmp": 8083271680}}
-Real combine CLI: missing Cargo writes unavailable receipt and exits 2
-{
-  "head": "6f8aaf41bde420cf180a3e7a24b7c77aae1ad3cd",
-  "tree": "d1f5f33c035208d3a738c6479d1956c1543f0cd4",
-  "status": "",
-  "index_sha256": "0bfb1fea5f8fe474554cf745d1d935cdc9b490d480ab798467882564a277766a"
-}

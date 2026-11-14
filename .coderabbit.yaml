@@ -20,8 +20,6 @@ reviews:
     - "!crates/**/tests/fixtures/**"
     - "!crates/**/testdata/**"
     - "!**/*_go.json"
-    - "!harness/evidence/**"
-    - "!bench/results/**"
   path_instructions:
     - path: "crates/**/*.rs"
       instructions: |

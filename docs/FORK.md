@@ -8,7 +8,7 @@ layout and how changes move between the fork and upstream.
 
 | Branch | Role |
 | --- | --- |
-| `origin/fork` | Integration branch and GitHub default branch. Open pull requests here. CI runs on every push. |
+| `origin/fork` | Integration branch and GitHub default branch. Open pull requests here. |
 | `origin/master` | A copy of `upstream/master`. Never commit to it directly. It only moves by fast-forward. |
 | `upstream/master` | Upstream's default branch. Upstream has no `main` branch. |
 
@@ -38,7 +38,7 @@ The push is a fast-forward. If Git rejects it as non-fast-forward, someone commi
 
 ## Integrate upstream into `fork`
 
-Bring upstream changes into `fork` by pull request, so that CI runs on the merged result:
+Bring upstream changes into `fork` by pull request. Run the [local checks](../CONTRIBUTING.md#building-and-testing) on the merged result:
 
 ```sh
 git switch -c sync/upstream-$(date +%Y%m%d) origin/fork
@@ -73,15 +73,16 @@ This fork builds from source or with the local Dockerfile. It has no release pub
 
 This fork has no Go/Rust differential harness, benchmark gates, memory soaks, idle or size
 gates, or allocation and wall-clock speed bounds in tests ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
-CI checks formatting, lints, the test suite and the Linux-only build refusal. Upstream
-may still carry such gates. When you integrate upstream changes, drop them and keep the
-functional tests. [AGENTS.md](../AGENTS.md) states the compatibility policy.
+Run formatting, lints and the test suite locally, and preserve the Linux-only build refusal.
+This fork has no GitHub Actions workflows. Upstream may still carry performance gates.
+When you integrate upstream changes, drop them and keep the functional tests.
+[AGENTS.md](../AGENTS.md) states the compatibility policy.
 
 [Features this fork does not adopt](NOT-ADOPTED.md) records the Go features this fork declines
 and the reason for each.
 
 ## Keep fork-specific changes separate
 
-Fork-specific material includes this file, the `fork` entries in `.github/workflows/ci.yml`, and
-any fork-only configuration. Keep it in commits and pull requests of its own, separate from code
-fixes, so that fixes cherry-pick cleanly onto `upstream/master`.
+Fork-specific material includes this file and any fork-only configuration. Keep it in
+commits and pull requests of its own, separate from code fixes, so that fixes cherry-pick
+cleanly onto `upstream/master`.
