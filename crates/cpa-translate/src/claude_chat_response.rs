@@ -8,7 +8,7 @@ use crate::{
     common::{self, now_unix},
     stream::GoStream,
 };
-use cpa_common::json::{self as gj, Res};
+use cpa_common::json::{self as gj, Kind, Res};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Default)]
@@ -17,10 +17,17 @@ struct Usage {
     output: i64,
     creation: i64,
     read: i64,
+    /// Anthropic `usage.output_tokens_details.thinking_tokens`: the reasoning share of
+    /// `output_tokens`, which stays the inclusive total (anthropic-sdk-python 5139cf2e,
+    /// `types/usage.py`, `types/output_tokens_details.py`). `None` until a usage
+    /// object reports it, so an unreported count is never written as 0.
+    thinking: Option<i64>,
     present: bool,
 }
 
 impl Usage {
+    /// Takes every count `usage` reports; counts it leaves out keep their earlier
+    /// value, so `message_delta` adds to what `message_start` reported.
     fn merge(&mut self, usage: &Res<'_>) {
         if !usage.exists() {
             return;
@@ -37,6 +44,12 @@ impl Usage {
                 *target = value.int();
             }
         }
+        // Anthropic types the count as an integer; a null or any other non-number
+        // reports nothing, so it is not coerced to 0.
+        let thinking = usage.get("output_tokens_details.thinking_tokens");
+        if thinking.kind == Kind::Number {
+            self.thinking = Some(thinking.int());
+        }
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -50,6 +63,11 @@ impl Usage {
             ("usage.prompt_tokens_details.cache_write_tokens", self.creation),
         ] {
             gj::set_int(out, path, value);
+        }
+        // OpenAI's `completion_tokens_details.reasoning_tokens` is likewise a part of
+        // `completion_tokens`, so the count moves over as reported.
+        if let Some(thinking) = self.thinking {
+            gj::set_int(out, "usage.completion_tokens_details.reasoning_tokens", thinking);
         }
     }
 }
