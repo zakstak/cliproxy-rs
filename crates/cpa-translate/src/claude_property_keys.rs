@@ -29,6 +29,11 @@
 //! ponytail: `$ref` resolution covers local JSON pointers (`#`, `#/...`) from the root;
 //! anchors, `$id`-relative and remote references are not followed, so keys under them
 //! stay as sent. A `$ref` pointer into a renamed property keeps the client's key (#196).
+//! ponytail: each member costs a lookup in the merged index of the subschemas applying
+//! at its object, plus one check per applying subschema with `patternProperties`,
+//! `additionalProperties` or `unevaluatedProperties` subschemas; many of those at one
+//! position are linear in their count per member. Merging their member rules into the
+//! index is the upgrade.
 //! ponytail: a `patternProperties` pattern the `regex` crate cannot compile (ECMA-262
 //! lookaround, backreferences) is treated as matching every key.
 
@@ -209,6 +214,8 @@ struct Check {
     members: Vec<(Vec<u8>, NodeId)>,
     /// Whether the node has only keywords the check evaluates or annotations.
     complete: bool,
+    /// The `false` schema: nothing matches.
+    never: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -254,6 +261,9 @@ fn type_is(raw: &[u8], name: &[u8]) -> bool {
 /// Whether `type`, `const` and `enum` allow `raw` (a structured value matches no
 /// scalar list).
 fn scalar_check(check: &Check, raw: &[u8]) -> bool {
+    if check.never {
+        return false;
+    }
     if let Some(types) = &check.types
         && !types.iter().any(|t| type_is(raw, t))
     {
@@ -471,6 +481,29 @@ struct Sets<'k> {
     plain: HashMap<usize, usize>,
     /// Per set, the longest `prefix` among its nodes: elements past it share a set.
     prefix: Vec<usize>,
+    /// Per set, built when [`Sets::apply`] first returns it.
+    index: Vec<Option<Index>>,
+}
+
+/// What an applicable set says about object members, merged once so that each member
+/// costs a lookup however many subschemas apply.
+#[derive(Default)]
+struct Index {
+    named: HashSet<Vec<u8>>,
+    properties: HashMap<Vec<u8>, Vec<NodeId>>,
+    /// Nodes with `patternProperties` or `additionalProperties` subschemas: checked per
+    /// member.
+    open: Vec<NodeId>,
+    /// Nodes with `unevaluatedProperties` subschemas, with what is evaluated beside each.
+    unevaluated: Vec<(NodeId, Evaluated)>,
+}
+
+/// The members a node's in-place neighbourhood evaluates.
+#[derive(Default)]
+struct Evaluated {
+    all: bool,
+    keys: HashSet<Vec<u8>>,
+    patterns: Vec<NodeId>,
 }
 
 impl<'k> Sets<'k> {
@@ -485,6 +518,7 @@ impl<'k> Sets<'k> {
             maybes: vec![vec![]],
             plain: HashMap::new(),
             prefix: vec![],
+            index: vec![],
         };
         sets.intern(vec![]);
         sets
@@ -503,6 +537,7 @@ impl<'k> Sets<'k> {
         let id = self.sets.len();
         let prefix = nodes.iter().map(|&n| self.node(n).prefix.len()).max().unwrap_or(0);
         self.prefix.push(prefix);
+        self.index.push(None);
         self.ids.insert(nodes.clone(), id);
         self.sets.push(nodes);
         id
@@ -551,6 +586,7 @@ impl<'k> Sets<'k> {
                     queue.push(alternative);
                 }
             }
+            // Without `if`, `then` and `else` are ignored.
             if let [Some(condition), then, otherwise] = node.condition {
                 branched = true;
                 match self.check(condition, instance) {
@@ -570,7 +606,38 @@ impl<'k> Sets<'k> {
         if !branched {
             self.plain.insert(start, id);
         }
+        self.build_index(id);
         id
+    }
+
+    fn build_index(&mut self, set: usize) {
+        if self.index[set].is_some() {
+            return;
+        }
+        let mut index = Index::default();
+        for &n in &self.sets[set] {
+            let node = self.node(n);
+            index.named.extend(node.named.iter().cloned());
+            for (key, children) in &node.properties {
+                index.properties.entry(key.clone()).or_default().extend(children);
+            }
+            if !node.patterns.is_empty() || !node.additional.is_empty() {
+                index.open.push(n);
+            }
+            if !node.unevaluated.is_empty() {
+                let mut evaluated = Evaluated::default();
+                for m in self.beneath(set, n) {
+                    let other = self.node(m);
+                    evaluated.all |= other.evaluates.members || (m != n && other.evaluates.unevaluated_members);
+                    evaluated.keys.extend(other.properties.keys().cloned());
+                    if !other.patterns.is_empty() {
+                        evaluated.patterns.push(m);
+                    }
+                }
+                index.unevaluated.push((n, evaluated));
+            }
+        }
+        self.index[set] = Some(index);
     }
 
     /// Whether `instance` matches node `n`: `Some(false)` when the check rules it out,
@@ -666,7 +733,7 @@ impl<'k> Sets<'k> {
 
     /// Whether a schema in `set` names property `key` (client spelling).
     fn names(&self, set: usize, key: &[u8]) -> bool {
-        self.sets[set].iter().any(|&n| self.node(n).named.contains(key))
+        self.index[set].as_ref().is_some_and(|i| i.named.contains(key))
     }
 
     /// The start set at member `key` (client spelling) of an object at `set`.
@@ -677,8 +744,11 @@ impl<'k> Sets<'k> {
         if let Some(&id) = self.members.get(&(set, key.to_vec())) {
             return id;
         }
-        let mut next = vec![];
-        for &n in &self.sets[set] {
+        let Some(index) = self.index[set].as_ref() else {
+            return EMPTY;
+        };
+        let mut next = index.properties.get(key).cloned().unwrap_or_default();
+        for &n in &index.open {
             let node = self.node(n);
             let mut matched = false;
             for (pattern, child) in &node.patterns {
@@ -687,22 +757,19 @@ impl<'k> Sets<'k> {
                     next.push(*child);
                 }
             }
-            match node.properties.get(key) {
-                Some(children) => next.extend(children),
-                None if !matched => next.extend(&node.additional),
-                None => {}
+            if !matched && !node.properties.contains_key(key) {
+                next.extend(&node.additional);
             }
-            if !node.unevaluated.is_empty() {
-                let evaluated = self.beneath(set, n).into_iter().any(|m| {
-                    let other = self.node(m);
-                    other.properties.contains_key(key)
-                        || other.evaluates.members
-                        || (m != n && other.evaluates.unevaluated_members)
-                        || other.patterns.iter().any(|(p, _)| p.matches(key))
-                });
-                if !evaluated {
-                    next.extend(&node.unevaluated);
-                }
+        }
+        for (n, evaluated) in &index.unevaluated {
+            let matched = || {
+                evaluated
+                    .patterns
+                    .iter()
+                    .any(|&m| self.node(m).patterns.iter().any(|(p, _)| p.matches(key)))
+            };
+            if !evaluated.all && !evaluated.keys.contains(key) && !matched() {
+                next.extend(&self.node(*n).unevaluated);
             }
         }
         let id = self.intern(next);
@@ -936,7 +1003,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                     true
                 });
             } else if SCHEMA_VALUE_KEYWORDS.contains(&&name[..]) {
-                if object {
+                if object || member == b"true" || member == b"false" {
                     children.push(Child {
                         keyword: name.clone(),
                         segment: None,
@@ -996,13 +1063,20 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
         } in children
         {
             let tuple = segment.is_some() && (keyword == b"items" || keyword == b"prefixItems");
-            if child.first() != Some(&b'{') || depth + 1 >= WALK_DEPTH_LIMIT {
+            // `true` and `false` are schemas too: they evaluate and apply like `{}` and
+            // `{"not":{}}`, so they stay in the tree.
+            let boolean = match child {
+                b"true" => Some(true),
+                b"false" => Some(false),
+                _ => None,
+            };
+            if (child.first() != Some(&b'{') && boolean.is_none()) || depth + 1 >= WALK_DEPTH_LIMIT {
                 if tuple {
                     // Keeps later positions in place; nothing is renamed here.
                     node.prefix.push(None);
                 }
-                if keyword == b"allOf" && child != b"true" {
-                    // `false` or a subschema past the depth limit: not checked.
+                if keyword == b"allOf" {
+                    // Past the depth limit (or not a schema): not checked.
                     node.check.complete = false;
                 }
                 continue;
@@ -1024,6 +1098,11 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
             tree.nodes.push(Node {
                 position,
                 pointer,
+                check: Check {
+                    complete: boolean.is_some(),
+                    never: boolean == Some(false),
+                    ..Check::default()
+                },
                 ..Node::default()
             });
             let key = segment.unwrap_or_default();
@@ -1055,7 +1134,9 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                 // keys, never applied to an argument position.
                 _ => {}
             }
-            stack.push((child, depth + 1, child_id));
+            if boolean.is_none() {
+                stack.push((child, depth + 1, child_id));
+            }
         }
         tree.nodes[id] = node;
     }
@@ -1445,6 +1526,79 @@ mod tests {
             schema,
             r##"{"list":[{"x_y":0},{"kind":"c","x_y":1},{"x y":2}]}"##,
             r##"{"list":[{"x_y":0},{"kind":"c","x_y":1},{"x_y":2}]}"##,
+        );
+    }
+
+    #[test]
+    fn boolean_subschemas_evaluate_and_apply() {
+        // `properties: {data: true}` evaluates `data`, so `unevaluatedProperties` skips it.
+        let evaluated = br##"{"properties":{"p":{"properties":{"data":true},
+            "unevaluatedProperties":{"properties":{"x y":{"type":"string"}}}}}}"##;
+        round_trip(
+            evaluated,
+            r##"{"p":{"data":{"x_y":1},"extra":{"x y":2}}}"##,
+            r##"{"p":{"data":{"x_y":1},"extra":{"x_y":2}}}"##,
+        );
+        // A matching boolean pattern keeps `additionalProperties` off the member.
+        for value in ["true", "false"] {
+            let pattern = format!(
+                r##"{{"properties":{{"p":{{"patternProperties":{{"^data$":{value}}},"additionalProperties":{{"properties":{{"x y":{{}}}}}}}}}}}}"##
+            );
+            round_trip(
+                pattern.as_bytes(),
+                r##"{"p":{"data":{"x_y":1},"other":{"x y":2}}}"##,
+                r##"{"p":{"data":{"x_y":1},"other":{"x_y":2}}}"##,
+            );
+        }
+        // `if: true` takes `then`; `if: false` takes `else`.
+        let conditional = |value: &str| {
+            format!(
+                r##"{{"properties":{{"p":{{"if":{value},"then":{{"properties":{{"x y":{{}}}}}},"else":{{"additionalProperties":true}}}}}}}}"##
+            )
+        };
+        round_trip(
+            conditional("true").as_bytes(),
+            r##"{"p":{"x y":1}}"##,
+            r##"{"p":{"x_y":1}}"##,
+        );
+        round_trip(
+            conditional("false").as_bytes(),
+            r##"{"p":{"x_y":1}}"##,
+            r##"{"p":{"x_y":1}}"##,
+        );
+        // `contains: true` evaluates every element; `contains: false` none.
+        let contains = |value: &str| {
+            format!(
+                r##"{{"properties":{{"l":{{"contains":{value},"unevaluatedItems":{{"properties":{{"x y":{{}}}}}}}}}}}}"##
+            )
+        };
+        round_trip(
+            contains("true").as_bytes(),
+            r##"{"l":[{"x_y":1}]}"##,
+            r##"{"l":[{"x_y":1}]}"##,
+        );
+        round_trip(
+            contains("false").as_bytes(),
+            r##"{"l":[{"x y":1}]}"##,
+            r##"{"l":[{"x_y":1}]}"##,
+        );
+        // A `false` alternative never applies; a `true` one adds nothing.
+        let alternatives = br##"{"properties":{"p":{"anyOf":[false,true,{"properties":{"x y":{}}}]}}}"##;
+        round_trip(alternatives, r##"{"p":{"x y":1}}"##, r##"{"p":{"x_y":1}}"##);
+    }
+
+    #[test]
+    fn many_in_place_branches_each_declare_their_member() {
+        let branches: Vec<String> = (0..300)
+            .map(|i| format!(r##"{{"properties":{{"k {i}":{{"properties":{{"x y":{{}}}}}}}}}}"##))
+            .collect();
+        let schema = format!(r##"{{"properties":{{"p":{{"allOf":[{}]}}}}}}"##, branches.join(","));
+        let client: Vec<String> = (0..300).map(|i| format!(r##""k {i}":{{"x y":{i}}}"##)).collect();
+        let claude: Vec<String> = (0..300).map(|i| format!(r##""k_{i}":{{"x_y":{i}}}"##)).collect();
+        round_trip(
+            schema.as_bytes(),
+            &format!(r##"{{"p":{{{}}}}}"##, client.join(",")),
+            &format!(r##"{{"p":{{{}}}}}"##, claude.join(",")),
         );
     }
 
