@@ -2940,6 +2940,14 @@ async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
     );
     let forced = prepare(suffixed, "", r#"{"type":"any"}"#).await;
     assert!(!rawjson::get(&forced, "thinking").exists(), "{forced}");
+    // The thinking pipeline re-encodes this object; it is still the caller's.
+    let spaced = prepare(
+        "claude-sonnet-4-6",
+        r#""thinking": {"type": "disabled"},"#,
+        r#"{"type":"any"}"#,
+    )
+    .await;
+    assert_eq!(rawjson::string(&spaced, "thinking.type"), "disabled", "{spaced}");
     let effort = prepare(
         "claude-opus-4-6",
         r#""output_config":{"effort":"low"},"#,
