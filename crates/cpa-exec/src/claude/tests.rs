@@ -2898,3 +2898,58 @@ async fn claude_clients_keep_their_thinking_with_forced_tools() {
         }
     }
 }
+
+/// Thinking the proxy writes for a Claude client, from a model suffix, still gives way to
+/// a forced tool choice: manual thinking with forced tool use is refused on every model.
+/// A client that sends no thinking but its own effort keeps the effort.
+#[tokio::test]
+async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    let prepare = async |model: &str, extra: &str, choice: &str| {
+        let body = format!(
+            r#"{{"model":"{model}","max_tokens":4096,{extra}"tools":[{{"name":"lookup","input_schema":{{"type":"object"}}}}],"tool_choice":{choice},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/messages"});
+        let mut req = request(&case);
+        (req.model, req.requested_model) = (model.into(), model.into());
+        let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+        let translated =
+            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+        )
+        .unwrap();
+        ctx.prepare_messages(&req, &translated, &original, false)
+            .await
+            .unwrap()
+            .body
+    };
+    let suffixed = "claude-haiku-4-5-20251001(2048)";
+    let auto = prepare(suffixed, "", r#"{"type":"auto"}"#).await;
+    assert_eq!(
+        rawjson::string(&auto, "thinking.type"),
+        "enabled",
+        "the suffix writes thinking: {auto}"
+    );
+    let forced = prepare(suffixed, "", r#"{"type":"any"}"#).await;
+    assert!(!rawjson::get(&forced, "thinking").exists(), "{forced}");
+    let effort = prepare(
+        "claude-opus-4-6",
+        r#""output_config":{"effort":"low"},"#,
+        r#"{"type":"any"}"#,
+    )
+    .await;
+    assert_eq!(
+        rawjson::get(&effort, "output_config.effort").json(),
+        r#""low""#,
+        "{effort}"
+    );
+    assert!(!rawjson::get(&effort, "thinking").exists(), "{effort}");
+}

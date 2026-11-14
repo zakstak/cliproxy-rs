@@ -1251,6 +1251,10 @@ impl<'a> Ctx<'a> {
         let mut body = translated;
         body = set_string_if_different(body, "model", &self.base_model);
         body = self.apply_thinking(req, body)?;
+        // A Claude client's own thinking, untouched by a model suffix or the summary
+        // pipeline (both absent counts): forced tool use leaves it as sent.
+        let caller_thinking = req.source_format == Format::Claude
+            && rawjson::get(&original, "thinking").json() == rawjson::get(&body, "thinking").json();
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
@@ -1354,7 +1358,7 @@ impl<'a> Ctx<'a> {
             }
         }
         body = self.ensure_max_tokens(body);
-        if req.source_format != Format::Claude {
+        if !caller_thinking {
             body = disable_thinking_if_tool_choice_forced(body);
         }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
@@ -1901,11 +1905,12 @@ fn inject_diagnostics(body: &str, previous_message_id: &str) -> String {
     rawjson::set_raw(body, "diagnostics", &value)
 }
 
-/// `disableThinkingIfToolChoiceForced`, on translated routes only: there the proxy wrote
-/// both the thinking and the forced tool choice, and forced tool use is refused with manual
-/// thinking on every model (platform docs, "Thinking with tool use"); a forced call
-/// returns no thinking block anyway. A Claude client's own combination goes upstream as
-/// sent and the provider decides (docs/DIFFERENCES-FROM-GO.md).
+/// `disableThinkingIfToolChoiceForced`, for thinking the proxy wrote: on translated
+/// routes, or from a model suffix or summary request. Forced tool use is refused with
+/// manual thinking on every model (platform docs, "Thinking with tool use"), and a forced
+/// call returns no thinking block anyway. A Claude client's own thinking (or none) goes
+/// upstream as sent with its effort, and the provider decides
+/// (docs/DIFFERENCES-FROM-GO.md).
 fn disable_thinking_if_tool_choice_forced(body: String) -> String {
     if !matches!(rawjson::get(&body, "tool_choice.type").str(), "any" | "tool") {
         return body;
