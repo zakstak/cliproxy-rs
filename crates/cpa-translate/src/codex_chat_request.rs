@@ -7,6 +7,7 @@ use crate::{
     responses_controls,
 };
 use cpa_common::json::{self as gj, AnyValue, Kind, Res};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 pub static PAIR: Registered = registered!(
@@ -14,6 +15,17 @@ pub static PAIR: Registered = registered!(
     request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
     non_stream: response::non_stream,
     go_stream: response::go_stream,
+    token_count: None,
+);
+
+/// The Codex translated route's pair ([`crate::codex_response`]): the strict request
+/// conversion, and response translators that read the client's nested custom tools as
+/// it does ([`flatten_custom_tools`]).
+pub(crate) static STRICT: Registered = registered!(
+    OpenAI -> Codex,
+    request: codex_strict,
+    non_stream: response::strict_non_stream,
+    go_stream: response::strict_go_stream,
     token_count: None,
 );
 
@@ -140,12 +152,18 @@ struct PendingCall {
 /// route"): no default `instructions` or reasoning effort, the client's
 /// `parallel_tool_calls`, and a refusal for any part Codex cannot express. The
 /// registered pair, which other Responses providers share, keeps Go's conversion.
-pub(crate) fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
+fn codex_strict(ctx: &crate::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::Error> {
     convert(ctx.model, body, ctx.stream, true)
 }
 
 fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8>, crate::Error> {
     let mut drops = UserTurnDrops::default();
+    let flat = if strict {
+        flatten_custom_tools(raw, &mut drops)
+    } else {
+        Cow::Borrowed(raw)
+    };
+    let raw = &flat[..];
     let root = gj::parse(raw);
     let tools = root.get("tools");
     let tool_list = tools.array();
@@ -562,6 +580,74 @@ fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8
         drops.result()
     }
     .map(|()| out)
+}
+
+/// The strict route reads Chat Completions' documented nested custom tool (#170),
+/// `{"type":"custom","custom":{"name","description","format"}}`, as the Responses custom
+/// tool: the definition's members at the top level, and a grammar format's nested
+/// `grammar` members beside its `type`. A nested custom `tool_choice`,
+/// `{"type":"custom","custom":{"name"}}`, becomes `{"type":"custom","name"}`. The rest of
+/// the conversion, and the response's name map, then read one shape; the flat form passes
+/// as before. A custom tool without a name, and a nested one with members beside `type`
+/// and `custom`, are refused into `drops`. Borrowed when there is nothing to flatten;
+/// otherwise `tools` and `tool_choice` are each replaced once, so the work stays linear.
+pub(crate) fn flatten_custom_tools<'a>(raw: &'a [u8], drops: &mut UserTurnDrops) -> Cow<'a, [u8]> {
+    let root = gj::parse(raw);
+    let is_custom = |r: &Res<'_>| r.get("type").bytes().as_ref() == b"custom";
+    let tools = root.get("tools").array();
+    let mut nested = false;
+    for tool in tools.iter().filter(|t| is_custom(t)) {
+        let custom = tool.get("custom");
+        let definition = if custom.is_object() { &custom } else { tool };
+        let name = definition.get("name");
+        if name.kind != Kind::String || name.s.is_empty() {
+            drops.drop_part("custom tool without a name");
+        }
+        if custom.is_object() {
+            nested = true;
+            if tool.map().iter().any(|(key, _)| key != b"type" && key != b"custom") {
+                drops.drop_part("custom tool member beside `custom`");
+            }
+        }
+    }
+    let choice = root.get("tool_choice");
+    let choice_custom = choice.get("custom");
+    let nested_choice = is_custom(&choice) && choice_custom.is_object();
+    if !nested && !nested_choice {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = raw.to_vec();
+    if nested {
+        let flat: Vec<Vec<u8>> = tools
+            .iter()
+            .map(|tool| {
+                let custom = tool.get("custom");
+                if !is_custom(tool) || !custom.is_object() {
+                    return tool.raw.to_vec();
+                }
+                let mut item = custom.raw.to_vec();
+                gj::set_str(&mut item, "type", "custom");
+                let format = custom.get("format");
+                let grammar = format.get("grammar");
+                if format.get("type").bytes().as_ref() == b"grammar" && grammar.is_object() {
+                    let mut flat_format = grammar.raw.to_vec();
+                    gj::set_str(&mut flat_format, "type", "grammar");
+                    gj::set_raw(&mut item, "format", flat_format);
+                }
+                item
+            })
+            .collect();
+        gj::set_raw(&mut out, "tools", gj::join(&flat));
+    }
+    if nested_choice {
+        let mut flat = br#"{"type":"custom"}"#.to_vec();
+        let name = choice_custom.get("name");
+        if name.exists() {
+            gj::set_raw(&mut flat, "name", &name.raw);
+        }
+        gj::set_raw(&mut out, "tool_choice", flat);
+    }
+    Cow::Owned(out)
 }
 
 /// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
