@@ -192,7 +192,7 @@ curl -X POST -H "Authorization: Bearer $MANAGEMENT_KEY" http://127.0.0.1:8317/v8
 
 The answer names each catalog's source, whether it was read, and the providers whose models changed. It is 200 when every catalog was read or skipped, and 502 when one failed. A failed catalog keeps its last valid data. A catalog whose source is `embed` (`--local-model`) or `disabled` (models.json in Home mode) is skipped. Requests sent while a read is running wait for that read instead of starting another.
 
-A refresh reads only these two catalogs. It never asks a provider account which models it serves, so it sends no request with a credential.
+A refresh reads only these two catalogs. It never asks a provider account which models it serves, so no provider credential is sent.
 
 ## worker-threads
 
