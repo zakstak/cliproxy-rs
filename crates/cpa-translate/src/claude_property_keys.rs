@@ -183,6 +183,9 @@ struct Node {
     reference: Option<Vec<u8>>,
     /// The part of this schema an instance can be checked against cheaply.
     check: Check,
+    /// The keys `check` and `dependent` look up, as each side spells them
+    /// ([`Direction::index`]); filled once the names are known.
+    keys: [KeyIndex; 2],
 }
 
 #[derive(Debug, Default)]
@@ -195,6 +198,34 @@ struct Evaluates {
     /// enclosing schema.
     unevaluated_members: bool,
     unevaluated_items: bool,
+}
+
+/// A node's `required`, property and dependent keys, hashed in one side's spelling, so
+/// that a check walks the instance's members and never rehashes schema keys per
+/// instance.
+#[derive(Debug, Default)]
+struct KeyIndex {
+    required: HashSet<Vec<u8>>,
+    members: HashMap<Vec<u8>, Vec<NodeId>>,
+    dependent: HashMap<Vec<u8>, Vec<NodeId>>,
+}
+
+impl KeyIndex {
+    /// Keys as the client spells them, or renamed with `names` for Claude's side.
+    fn new(node: &Node, names: Option<&HashMap<Vec<u8>, Vec<u8>>>) -> KeyIndex {
+        let spell = |key: &Vec<u8>| names.and_then(|n| n.get(key)).unwrap_or(key).clone();
+        let mut index = KeyIndex {
+            required: node.check.required.iter().map(spell).collect(),
+            ..KeyIndex::default()
+        };
+        for (key, child) in &node.check.members {
+            index.members.entry(spell(key)).or_default().push(*child);
+        }
+        for (key, schema) in &node.dependent {
+            index.dependent.entry(spell(key)).or_default().push(*schema);
+        }
+        index
+    }
 }
 
 #[derive(Debug)]
@@ -571,6 +602,10 @@ impl PropertyKeys {
             to_claude.insert(original.to_vec(), name.clone());
             to_client.insert(name, original.to_vec());
         }
+        let mut tree = tree;
+        for node in &mut tree.nodes {
+            node.keys = [KeyIndex::new(node, None), KeyIndex::new(node, Some(&to_claude))];
+        }
         Some(PropertyKeys {
             to_claude,
             to_client,
@@ -691,20 +726,23 @@ impl PropertyKeys {
             Direction::ToClient => self.to_client.get(key).filter(|original| sets.names(set, original)),
         }
     }
-
-    /// The instance's spelling of client key `key`.
-    fn spelling<'s>(&'s self, key: &'s [u8], direction: Direction) -> &'s [u8] {
-        match direction {
-            Direction::ToClaude => key,
-            Direction::ToClient => self.to_claude.get(key).map_or(key, |n| &n[..]),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
 enum Direction {
     ToClaude,
     ToClient,
+}
+
+impl Direction {
+    /// [`Node::keys`] for the instance's side: the client's keys going to Claude,
+    /// Claude's coming back.
+    fn index(self) -> usize {
+        match self {
+            Direction::ToClaude => 0,
+            Direction::ToClient => 1,
+        }
+    }
 }
 
 /// The empty node set: nothing below it is renamed.
@@ -865,10 +903,13 @@ impl<'k> Sets<'k> {
                     None => queue.extend([Some(condition), then, otherwise].into_iter().flatten()),
                 }
             }
-            for (key, schema) in &node.dependent {
+            let dependent = &node.keys[self.direction.index()].dependent;
+            if !dependent.is_empty() {
                 branched = true;
-                if instance.members.contains_key(self.keys.spelling(key, self.direction)) {
-                    queue.push(*schema);
+                for key in instance.members.keys() {
+                    if let Some(schemas) = dependent.get(key) {
+                        queue.extend(schemas);
+                    }
                 }
             }
         }
@@ -945,25 +986,26 @@ impl<'k> Sets<'k> {
             None => sure = false,
             Some(true) => {}
         }
-        if instance.raw.first() == Some(&b'{') {
+        let keys = &self.node(n).keys[self.direction.index()];
+        if instance.raw.first() == Some(&b'{') && !(keys.required.is_empty() && keys.members.is_empty()) {
             // More distinct required keys than members: one is missing.
-            if check.required.len() > instance.members.len() {
+            if keys.required.len() > instance.members.len() {
                 return Some(false);
             }
-            for key in &check.required {
-                if !instance.members.contains_key(self.keys.spelling(key, self.direction)) {
-                    return Some(false);
+            // Walk the instance's members (its own size), never the schema's keys.
+            let mut present = 0;
+            for (key, value) in &instance.members {
+                present += usize::from(keys.required.contains(key));
+                for &child in keys.members.get(key).into_iter().flatten() {
+                    match self.check_member(child, value, memo) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => sure = false,
+                    }
                 }
             }
-            for (key, child) in &check.members {
-                let Some(value) = instance.members.get(self.keys.spelling(key, self.direction)) else {
-                    continue;
-                };
-                match self.check_member(*child, value, memo) {
-                    Some(false) => return Some(false),
-                    Some(true) => {}
-                    None => sure = false,
-                }
+            if present < keys.required.len() {
+                return Some(false);
             }
         }
         sure.then_some(true)
@@ -2118,6 +2160,29 @@ mod tests {
             tuple,
             r##"{"list":[{"x_y":0},{"x y":1}]}"##,
             r##"{"list":[{"x_y":0},{"x_y":1}]}"##,
+        );
+    }
+
+    #[test]
+    fn long_renamed_discriminators_are_read_in_each_spelling() {
+        // A 100-byte discriminator Claude rejects becomes a 64-byte name; the branch
+        // check finds it in either spelling, as `required`, property and dependent key.
+        let long = "k ".repeat(50);
+        let claude = "k_".repeat(32);
+        let schema = format!(
+            r##"{{"properties":{{"rows":{{"items":{{"properties":{{"{long}":{{}}}},
+            "oneOf":[{{"properties":{{"{long}":{{"const":"a"}},"d":{{"properties":{{"x y":{{}}}}}}}},"required":["{long}"]}},
+                     {{"properties":{{"{long}":{{"const":"b"}},"d":{{"additionalProperties":true}}}}}}],
+            "dependentSchemas":{{"{long}":{{"properties":{{"e":{{"properties":{{"z w":{{}}}}}}}}}}}}}}}}}}}}"##
+        );
+        round_trip(
+            schema.as_bytes(),
+            &format!(
+                r##"{{"rows":[{{"{long}":"a","d":{{"x y":1}},"e":{{"z w":2}}}},{{"{long}":"b","d":{{"x_y":3}}}},{{"e":{{"z w":4}}}}]}}"##
+            ),
+            &format!(
+                r##"{{"rows":[{{"{claude}":"a","d":{{"x_y":1}},"e":{{"z_w":2}}}},{{"{claude}":"b","d":{{"x_y":3}}}},{{"e":{{"z w":4}}}}]}}"##
+            ),
         );
     }
 
