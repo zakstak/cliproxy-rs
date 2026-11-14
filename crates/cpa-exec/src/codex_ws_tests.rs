@@ -1918,6 +1918,9 @@ mod duplex;
 #[path = "codex_ws_interrupt_tests.rs"]
 mod interrupt;
 
+#[path = "codex_ws_fragment_tests.rs"]
+mod fragment;
+
 /// `buildCodexResponsesWebsocketURL` answers, recorded from Go v8.0.35 with the inputs of `url.Parse` and
 /// `URL.String()` (tests/reference/go_url).
 #[test]
@@ -3013,7 +3016,8 @@ enum Step {
 #[derive(Default)]
 struct MockSink {
     ready: VecDeque<Step>,
-    start: Option<tokio_tungstenite::tungstenite::Error>,
+    /// Each hand-over's result in turn (accepted once the script is empty).
+    start: VecDeque<Result<(), tokio_tungstenite::tungstenite::Error>>,
     flush: VecDeque<Step>,
     started: usize,
     on_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -3061,7 +3065,7 @@ impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for MockSink {
     ) -> Result<(), Self::Error> {
         let this = self.get_mut();
         this.started += 1;
-        this.start.take().map_or(Ok(()), Err)
+        this.start.pop_front().unwrap_or(Ok(()))
     }
 
     fn poll_flush(
@@ -3091,7 +3095,7 @@ async fn each_write_phase_reports_whether_the_frame_left() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_tungstenite::tungstenite::{Error, Message, error::ProtocolError};
     let io = || Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-    let frame = || Message::text("frame");
+    let frame = || Bytes::from_static(b"frame");
 
     // Readiness fails: nothing handed over, the authority never asked.
     let asked = Arc::new(AtomicUsize::new(0));
@@ -3137,7 +3141,7 @@ async fn each_write_phase_reports_whether_the_frame_left() {
     ] {
         let name = error.to_string();
         let mut sink = MockSink {
-            start: Some(error),
+            start: VecDeque::from([Err(error)]),
             ..MockSink::default()
         };
         let mut queued = false;

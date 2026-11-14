@@ -177,6 +177,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Replace `model` with the upstream model of an operator-configured alias or a caller-selected route, or add it as the first member when the body has none | All profiles | Explicit routing choice. Only the `model` value changes. |
 | Wrap an HTTP Responses body in a `response.create` frame by adding `"type":"response.create"` | A credential with `websockets: true` that serves an HTTP client over a WebSocket | Transport envelope. No other field changes. |
 | Send a WebSocket `response.create` frame as an HTTP Responses body by removing its `type` member, and send `stream: true` when the frame omits `stream` or sets it to `false` | A credential without `websockets` that serves a Responses WebSocket turn ([WebSocket HTTP fallback](#websocket-http-fallback)) | Transport envelope and adaptation. The first-party frame is the HTTP request plus its tag (`codex-api/src/common.rs:315-339`, 400-406). A WebSocket turn always delivers its response as events, so the HTTP request asks for them; the client receives the upstream's events, never an aggregate. No other field changes; a continuation or prewarm is refused instead. |
+| Write an upstream WebSocket text message longer than 1 MiB as one message in frames of at most 1 MiB, each flushed before the next | Codex upstream sockets: native creates, steering frames, interrupts and proxy-formulated frames (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)) | Transport framing, as first-party Codex writes a large turn (`codex-api/src/endpoint/responses_websocket.rs` `send_message`, openai/codex `d15bf1deb77e`, inspected at `5c3ff1dabf64`). The bytes are split where they fall, so a UTF-8 character may span two frames; reassembled, the message is unchanged. Frames are never compressed. No other write comes between a message's frames; a write that stops between them retires the socket. |
 | Hand a WebSocket client each event's `data` payload as one text frame | A WebSocket turn served over HTTP | Transport framing. A WebSocket text frame carries one event; the bytes of each payload are unchanged. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
@@ -662,8 +663,14 @@ held. Only a request that provably never left (the socket's loss was recorded be
 write, or the WebSocket library refused the frame before queueing it) is retried, once,
 on a fresh socket, and an explicit upstream rejection (a wrapped status error, a
 failure event) keeps its failover. A write is provably unsent when it failed or timed
-out before the frame was handed to the WebSocket library; one that failed or timed out
-after the hand-over may have sent part of it. The same rule holds for a turn served over
+out before its first frame was handed to the WebSocket library; one that failed or timed out
+after the hand-over may have sent part of it. A message longer than 1 MiB goes as one
+message in frames of at most 1 MiB (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)):
+the socket stays locked from its first frame to its last, so no other write comes between
+them, and a failure on any later frame is never unsent. A write that stops between frames
+(failed, timed out, or cancelled with its request) records the socket's loss, so the
+socket takes no other message and the next request on the session goes to a fresh socket.
+The write bound and the capture cover the whole message once. The same rule holds for a turn served over
 HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) and for the
 [native HTTP route](#native-http-route): only a request whose connection could not be
 made, or that never left because its deadline had passed, may fail over. After a
