@@ -1354,7 +1354,9 @@ impl<'a> Ctx<'a> {
             }
         }
         body = self.ensure_max_tokens(body);
-        body = disable_thinking_if_tool_choice_forced(body);
+        if req.source_format != Format::Claude {
+            body = disable_thinking_if_tool_choice_forced(body);
+        }
         body = cloak::reconcile_context_management(body, eligible, caller_owned_cm, injected_cm);
         body = normalize_sampling(body, confirmed);
         // `shouldEnsureCacheControl`.
@@ -1899,7 +1901,11 @@ fn inject_diagnostics(body: &str, previous_message_id: &str) -> String {
     rawjson::set_raw(body, "diagnostics", &value)
 }
 
-/// `disableThinkingIfToolChoiceForced`.
+/// `disableThinkingIfToolChoiceForced`, on translated routes only: there the proxy wrote
+/// both the thinking and the forced tool choice, and forced tool use is refused with manual
+/// thinking on every model (platform docs, "Thinking with tool use"); a forced call
+/// returns no thinking block anyway. A Claude client's own combination goes upstream as
+/// sent and the provider decides (docs/DIFFERENCES-FROM-GO.md).
 fn disable_thinking_if_tool_choice_forced(body: String) -> String {
     if !matches!(rawjson::get(&body, "tool_choice.type").str(), "any" | "tool") {
         return body;

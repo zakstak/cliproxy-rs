@@ -477,6 +477,11 @@ const RELOCATES_API_KEY_SYSTEM: &[&str] = &[
     "TestClaudeExecutor_PromptCacheOptionsMode_Explicit_Cloaked_SuppressesAllAutoCacheControl",
 ];
 
+/// Go tests that send a Claude client's own thinking with forced tool use, which Go
+/// deletes and cliproxy-rs forwards (docs/DIFFERENCES-FROM-GO.md): those calls compare
+/// with `tests::without_kept_thinking`; the test's other calls compare as recorded.
+const KEEPS_CALLER_THINKING: &[&str] = &["TestClaudeExecutorPayloadOverrideDisabledThinking"];
+
 /// Go tests whose recorded exchange a replay cannot reproduce, with the reason.
 const NOT_REPLAYABLE: &[(&str, &str)] = &[
     (
@@ -757,7 +762,12 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         {
             *go_betas = ours.clone();
         }
-        sent.push((got, want, text(&rust.body), go_body));
+        let mut rust_body = text(&rust.body);
+        let caller = text(&bytes(&record["request"]["payload"]));
+        if KEEPS_CALLER_THINKING.contains(&test) && crate::rawjson::get(&caller, "thinking").exists() {
+            rust_body = super::tests::without_kept_thinking(&rust_body, &caller);
+        }
+        sent.push((got, want, rust_body, go_body));
     }
     // Identifiers to keep verbatim: the recorded inputs (config, credential, request,
     // upstream replies) and whatever both implementations produced.

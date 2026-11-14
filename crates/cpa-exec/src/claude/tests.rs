@@ -852,6 +852,39 @@ const RELOCATES_API_KEY_SYSTEM: &[&str] = &[
 ];
 
 /// Go v8.0.27's upstream body with the caller system blocks it left top-level (those
+/// Go deletes a Claude client's own `thinking` when it forces tool use; cliproxy-rs
+/// forwards it (docs/DIFFERENCES-FROM-GO.md), and a cloaked request then keeps the
+/// context management the cloak adds for thinking. Rust's body without both, after
+/// checking that the thinking is the caller's, so the rest compares with Go's recording
+/// byte for byte.
+pub(super) fn without_kept_thinking(rust_body: &str, caller_body: &str) -> String {
+    assert!(
+        matches!(
+            rawjson::string(caller_body, "tool_choice.type").as_str(),
+            "any" | "tool"
+        ),
+        "the caller forced no tool: {caller_body}"
+    );
+    let kept = rawjson::get(rust_body, "thinking");
+    assert_eq!(
+        kept.json(),
+        rawjson::get(caller_body, "thinking").json(),
+        "caller thinking"
+    );
+    let mut body = rawjson::delete(rust_body, "thinking");
+    if !rawjson::get(caller_body, "context_management").exists()
+        && rawjson::get(&body, "context_management").json()
+            == r#"{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}"#
+    {
+        body = rawjson::delete(&body, "context_management");
+    }
+    body
+}
+
+/// Scenarios whose Claude client forces tool use with its own thinking, which Go
+/// deletes ([`without_kept_thinking`]).
+const KEEPS_CALLER_THINKING: &[&str] = &["noroles-duplicate-tool-choice"];
+
 /// after the billing, Claude Code identity and Fable blocks) moved into one system
 /// turn each after the leading user run (the first user turn and the user turns and
 /// effort directives that follow it), where cliproxy-rs puts them for API keys too.
@@ -1093,8 +1126,12 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             assert_ne!(relocated, go_body, "{name}: Go kept no caller system text top-level");
             go_body = relocated;
         }
+        let mut rust_body = prepared.body.clone();
+        if KEEPS_CALLER_THINKING.contains(&name) {
+            rust_body = without_kept_thinking(&rust_body, scenario["body"].as_str().unwrap());
+        }
         assert_eq!(
-            random_prompt(&normalize_random(&prepared.body)),
+            random_prompt(&normalize_random(&rust_body)),
             random_prompt(&normalize_random(&go_body)),
             "{name}: upstream body"
         );
@@ -2735,6 +2772,129 @@ async fn claude_code_2_1_325_client_forms_pass_through() {
             assert_ne!(unlisted.body, reference.body, "{name}: cloaked without the setting");
             let ua = unlisted.headers.iter().find(|(k, _)| k == "User-Agent").unwrap();
             assert_eq!(ua.1, profile::BASELINE.user_agent, "{name}");
+        }
+    }
+}
+
+/// A translated request that only asks for reasoning summaries, on a model with manual
+/// thinking only, while the caller forces a tool: the proxy must not turn on the thinking
+/// the summary would need, because forced tool use and manual thinking are refused
+/// together (platform docs, "Thinking with tool use"). The caller's tool choice stays.
+/// The same holds for thinking the translation derives from a reasoning effort: under a
+/// forced tool the translated route sends neither thinking nor effort, as Go does.
+#[tokio::test]
+async fn summary_only_thinking_is_not_synthesized_under_forced_tool_use() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    let tools = r#"[{"type":"function","name":"lookup","parameters":{"type":"object"}}]"#;
+    for (choice, forced) in [
+        (r#""required""#, true),
+        (r#"{"type":"function","name":"lookup"}"#, true),
+        (r#""auto""#, false),
+    ] {
+        let body = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","input":"hi","max_output_tokens":4096,"reasoning":{{"summary":"auto"}},"tools":{tools},"tool_choice":{choice}}}"#
+        );
+        let effort = format!(
+            r#"{{"model":"claude-opus-4-6","input":"hi","max_output_tokens":4096,"reasoning":{{"effort":"high"}},"tools":{tools},"tool_choice":{choice}}}"#
+        );
+        for body in [body, effort] {
+            let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/responses"});
+            let mut req = request(&case);
+            req.source_format = Format::OpenAIResponse;
+            req.response_format = Format::OpenAIResponse;
+            let model = rawjson::string(&body, "model");
+            (req.model, req.requested_model) = (model.clone(), model);
+            let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+            let translated =
+                translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+            let original = translate::original(
+                &req,
+                &translated,
+                ctx.codex,
+                &ctx.base_model,
+                ctx.is_compat,
+                ctx.tool_search(),
+            )
+            .unwrap();
+            let prepared = ctx.prepare_messages(&req, &translated, &original, false).await.unwrap();
+            let sent = &prepared.body;
+            let kind = rawjson::string(sent, "tool_choice.type");
+            assert_eq!(matches!(kind.as_str(), "any" | "tool"), forced, "{choice}: {sent}");
+            let thinking = rawjson::string(sent, "thinking.type");
+            if forced {
+                assert_eq!(thinking, "", "{choice}: {sent}");
+                assert!(!rawjson::get(sent, "output_config.effort").exists(), "{choice}: {sent}");
+            } else {
+                assert!(matches!(thinking.as_str(), "enabled" | "adaptive"), "{choice}: {sent}");
+            }
+        }
+    }
+}
+
+/// A Claude client's own thinking and tool choice reach Claude as sent, whatever their
+/// combination: the provider decides. Adaptive thinking with forced tool use is valid on
+/// most models; manual thinking with it, and forced tool use on Opus 5.5, Sonnet 5.5 and
+/// the Fable/Mythos 5.1 and 5.2 models, are refused upstream (platform docs, "Thinking
+/// with tool use"). `display`, including the beta `updates`, is the caller's too. A forced
+/// choice prepares exactly like `auto` apart from the choice itself.
+#[tokio::test]
+async fn claude_clients_keep_their_thinking_with_forced_tools() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    let tools = r#"[{"name":"lookup","input_schema":{"type":"object"}}]"#;
+    let prepare = async |model: &str, thinking: &str, choice: &str| {
+        let body = format!(
+            r#"{{"model":"{model}","max_tokens":4096,"thinking":{thinking},"output_config":{{"effort":"high"}},"tools":{tools},"tool_choice":{choice},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/messages"});
+        let mut req = request(&case);
+        (req.model, req.requested_model) = (model.into(), model.into());
+        let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+        let translated =
+            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+        )
+        .unwrap();
+        ctx.prepare_messages(&req, &translated, &original, false)
+            .await
+            .unwrap()
+            .body
+    };
+    let field = |b: &str, p: &str| rawjson::get(b, p).json().to_owned();
+    for (model, thinking) in [
+        ("claude-opus-4-6", r#"{"type":"adaptive"}"#),
+        ("claude-opus-4-6", r#"{"type":"adaptive","display":"summarized"}"#),
+        ("claude-opus-5-5", r#"{"type":"adaptive","display":"updates"}"#),
+        ("claude-fable-5-2", r#"{"type":"adaptive","display":"omitted"}"#),
+        ("claude-sonnet-4-6", r#"{"type":"enabled","budget_tokens":2048}"#),
+        ("claude-sonnet-4-6", r#"{"type":"disabled"}"#),
+    ] {
+        let auto = prepare(model, thinking, r#"{"type":"auto"}"#).await;
+        assert_eq!(field(&auto, "thinking"), thinking, "{model}: auto");
+        for choice in [r#"{"type":"any"}"#, r#"{"type":"tool","name":"lookup"}"#] {
+            let sent = prepare(model, thinking, choice).await;
+            // Tool names may be aliased by the OAuth cloak; the choice itself is the caller's.
+            assert_eq!(
+                field(&sent, "tool_choice.type"),
+                field(choice, "type"),
+                "{model} {thinking} {choice}"
+            );
+            for path in ["thinking", "output_config", "context_management"] {
+                assert_eq!(
+                    field(&sent, path),
+                    field(&auto, path),
+                    "{model} {thinking} {choice}: {path}"
+                );
+            }
         }
     }
 }
