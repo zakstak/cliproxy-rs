@@ -2,7 +2,8 @@
 //! bounds (internal/config/credential_in_flight.go), the Codex Live media relay
 //! (internal/config/codex_live.go), and the model catalog sources Go checks while
 //! decoding (internal/registry/catalog_config.go). Messages are Go's, except for the
-//! Codex identity check, which Go does not have (#26, docs/DIFFERENCES-FROM-GO.md).
+//! Codex identity check, which Go does not have (#26, docs/DIFFERENCES-FROM-GO.md), and
+//! the Claude native entrypoint names (#70).
 
 use anyhow::{Result, bail};
 use serde_yaml_ng::Value;
@@ -14,7 +15,30 @@ pub(super) fn go_custom(doc: &Value) -> Result<()> {
     let at = |path: &[&str]| path.iter().try_fold(doc, |node, part| node.get(*part));
     in_flight(at(&["credentials", "in-flight"]))?;
     live_media_relay(at(&["oauth", "providers", "codex", "live-media-relay"]))?;
-    codex_identity(at(&["oauth", "providers", "codex", "header-defaults"]))
+    codex_identity(at(&["oauth", "providers", "codex", "header-defaults"]))?;
+    claude_native_entrypoints(at(&["upstream", "claude", "header-defaults", "native-entrypoints"]))
+}
+
+/// `upstream.claude.header-defaults.native-entrypoints` names Claude Code entrypoints
+/// (the label after `external,` in its User-Agent) whose requests pass through as
+/// Claude Code's own. A malformed entry could never match a User-Agent, so the list is
+/// refused instead of silently ignored: a sequence of names of ASCII letters, digits,
+/// `.`, `_` and `-`.
+fn claude_native_entrypoints(list: Option<&Value>) -> Result<()> {
+    const KEY: &str = "upstream.claude.header-defaults.native-entrypoints";
+    let Some(list) = list.filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let Some(items) = list.as_sequence() else {
+        bail!("{KEY} must be a list of Claude Code entrypoint names");
+    };
+    for (i, item) in items.iter().enumerate() {
+        let name = item.as_str().map(str::trim).unwrap_or_default();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            bail!("{KEY}[{i}] must be a Claude Code entrypoint name: ASCII letters, digits, '.', '_' or '-'");
+        }
+    }
+    Ok(())
 }
 
 /// The Codex `header-defaults.user-agent` (legacy `codex-header-defaults`) set the
@@ -334,6 +358,55 @@ mod tests {
             "upstream: {claude: {header-defaults: {user-agent: claude-cli/2.0}}}\n",
         ] {
             assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");
+        }
+    }
+
+    /// #70: Claude `native-entrypoints` is a list of entrypoint names in every spelling
+    /// of the Claude header defaults; anything else is refused, at load and on a
+    /// Management API write.
+    #[test]
+    fn claude_native_entrypoints_are_names() {
+        for yaml in [
+            "upstream: {claude: {header-defaults: {native-entrypoints: [t3-code, My_App.2]}}}\n",
+            "claude-header-defaults: {native-entrypoints: []}\n",
+            "upstream: {claude: {header-defaults: {native-entrypoints: null}}}\n",
+            // A number decodes into the string field, as in Go's yaml.v3.
+            "upstream: {claude: {header-defaults: {native-entrypoints: [7]}}}\n",
+        ] {
+            assert!(crate::config::Config::parse(yaml).is_ok(), "{yaml}");
+        }
+        for (yaml, want) in [
+            (
+                "upstream: {claude: {header-defaults: {native-entrypoints: t3-code}}}\n",
+                "must be a list",
+            ),
+            (
+                "upstream: {claude: {header-defaults: {native-entrypoints: ['']}}}\n",
+                "native-entrypoints[0]",
+            ),
+            (
+                "upstream: {claude: {header-defaults: {native-entrypoints: [ok, 'a, b']}}}\n",
+                "native-entrypoints[1]",
+            ),
+            (
+                "upstream: {claude: {header-defaults: {native-entrypoints: ['cli)']}}}\n",
+                "native-entrypoints[0]",
+            ),
+            (
+                "claude-header-defaults: {native-entrypoints: ['agent-sdk/1']}\n",
+                "native-entrypoints[0]",
+            ),
+            (
+                "oauth: {providers: {claude: {header-defaults: {native-entrypoints: [' ']}}}}\n",
+                "native-entrypoints[0]",
+            ),
+        ] {
+            let error = crate::config::Config::parse(yaml).expect_err(yaml).to_string();
+            assert!(error.contains(want), "{yaml}: {error}");
+            assert!(
+                crate::config::Config::parse_payload(yaml).is_err(),
+                "{yaml}: Management API writes too"
+            );
         }
     }
 

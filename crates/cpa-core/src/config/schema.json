@@ -512,6 +512,9 @@
                 "stabilize-device-profile": {
                   "optional": "bool"
                 },
+                "native-entrypoints": {
+                  "list": "string"
+                },
                 "anthropic-beta-strip": {
                   "list": "string"
                 },
