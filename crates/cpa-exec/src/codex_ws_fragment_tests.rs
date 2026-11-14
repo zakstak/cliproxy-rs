@@ -342,7 +342,8 @@ async fn a_ping_during_a_fragmented_write_is_answered_without_corrupting_it() {
 }
 
 /// A fragmented write cancelled after its first frame left the upstream inside an
-/// unfinished message: the socket records the loss and takes no other write, which is
+/// unfinished message: the socket records the loss before it releases the sink, so a
+/// write already waiting for the sink, and any later one, writes nothing; each is
 /// therefore provably unsent and may go to a fresh socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_cancelled_between_fragments_retires_the_socket() {
@@ -370,8 +371,27 @@ async fn a_write_cancelled_between_fragments_retires_the_socket() {
         "the upstream stopped reading, so the write is parked"
     );
     assert!(conn.link.lock().unwrap().lost.is_none());
+    let waits = *conn.sink_waits.borrow();
+    let queued = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            conn.send_create(Bytes::from_static(br#"{"type":"response.create"}"#), None)
+                .await
+        })
+    };
+    let mut parked = conn.sink_waits.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), parked.wait_for(|w| *w > waits))
+        .await
+        .expect("the second write waits for the sink")
+        .unwrap();
     write.abort();
     let _ = write.await;
+    let failure = tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("the waiting write finds the loss at once")
+        .unwrap()
+        .expect_err("a write queued behind the cancelled message writes nothing");
+    assert!(failure.unsent);
     assert!(conn.link.lock().unwrap().lost.is_some(), "the socket is retired");
     let failure = conn
         .send_create(Bytes::from_static(br#"{"type":"response.create"}"#), None)

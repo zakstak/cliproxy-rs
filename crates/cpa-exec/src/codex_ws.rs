@@ -419,7 +419,7 @@ impl Upstream {
     }
 
     /// One text message, and whether a failure provably wrote nothing. A socket whose
-    /// loss the reader already recorded is not written at all. The rest is
+    /// loss is recorded once the write holds the sink is not written at all. The rest is
     /// [`write_phases`]: a failure before the first frame was handed to tungstenite, a
     /// timeout included, wrote nothing; tungstenite refuses a closed or closing socket and
     /// a full write buffer before it queues the frame ([`refused_before_queueing`]);
@@ -427,41 +427,46 @@ impl Upstream {
     /// The sink stays locked for the whole message, so no other write's frames come
     /// between its fragments, and the bound covers the whole message. A write that stops
     /// between fragments (failed, timed out or cancelled) leaves the upstream inside an
-    /// unfinished message: [`MidMessage`] records the socket's loss so nothing is written
-    /// on it again.
+    /// unfinished message: [`MidMessage`] records the socket's loss before the sink is
+    /// released, so a write waiting for the sink finds the loss and writes nothing.
     async fn write_certain(&self, payload: Bytes, authority: Option<&Authority>) -> Result<(), WriteFailure> {
-        if let Some(lost) = self.link.lock().expect("link").lost.clone() {
-            return Err(WriteFailure {
-                error: write_error(Some(&lost), "codex websockets executor: write failed"),
-                unsent: true,
-                refusal: None,
-            });
-        }
         let len = payload.len();
         let deadline = self.write.deadline(len);
-        let mut guard = MidMessage {
-            link: &self.link,
-            fragmented: len > FRAGMENT,
-            queued: false,
-        };
+        let queued = std::sync::atomic::AtomicBool::new(false);
         let outcome = tokio::time::timeout(deadline, async {
             #[cfg(test)]
             self.sink_waits.send_modify(|waits| *waits += 1);
             let mut sink = self.sink.lock().await;
-            write_phases(&mut *sink, payload, authority, &mut guard.queued).await
+            if let Some(lost) = self.link.lock().expect("link").lost.clone() {
+                return Err(lost);
+            }
+            // Declared after `sink`, so it is dropped first, also on cancellation.
+            let mut guard = MidMessage {
+                link: &self.link,
+                fragmented: len > FRAGMENT,
+                queued: false,
+                seen: &queued,
+            };
+            let written = write_phases(&mut *sink, payload, authority, &mut guard.queued).await;
+            if matches!(written, Ok(None)) {
+                guard.fragmented = false;
+            }
+            Ok(written)
         })
         .await;
         match outcome {
-            Ok(Ok(None)) => {
-                guard.fragmented = false;
-                Ok(())
-            }
-            Ok(Ok(Some(refusal))) => Err(WriteFailure {
+            Ok(Err(lost)) => Err(WriteFailure {
+                error: write_error(Some(&lost), "codex websockets executor: write failed"),
+                unsent: true,
+                refusal: None,
+            }),
+            Ok(Ok(Ok(None))) => Ok(()),
+            Ok(Ok(Ok(Some(refusal)))) => Err(WriteFailure {
                 error: refusal.error(),
                 unsent: true,
                 refusal: Some(Box::new(refusal)),
             }),
-            Ok(Err((error, unsent))) => Err(WriteFailure {
+            Ok(Ok(Err((error, unsent)))) => Err(WriteFailure {
                 unsent,
                 error: write_error(
                     self.link.lock().expect("link").lost.as_ref(),
@@ -476,7 +481,7 @@ impl Upstream {
                     "codex websockets executor: write timed out",
                 )
                 .with_diagnostic(ws_cause::write_timeout(deadline, len)),
-                unsent: !guard.queued,
+                unsent: !queued.load(std::sync::atomic::Ordering::Relaxed),
                 refusal: None,
             }),
         }
@@ -1072,17 +1077,20 @@ pub(crate) const FRAGMENT: usize = 1 << 20;
 /// Records the socket's loss when a fragmented message stopped after its first frame was
 /// handed over and before it finished: the upstream waits for continuation frames that
 /// never come, and any later message on the socket would be a protocol error. A loss the
-/// reader recorded first is kept.
+/// reader recorded first is kept. Dropped while the write still holds the sink; `seen`
+/// tells [`Upstream::write_certain`] whether anything was handed over.
 struct MidMessage<'a> {
     link: &'a Mutex<Link>,
     /// The message has more than one frame and has not finished.
     fragmented: bool,
     /// Its first frame was handed to tungstenite ([`write_phases`]).
     queued: bool,
+    seen: &'a std::sync::atomic::AtomicBool,
 }
 
 impl Drop for MidMessage<'_> {
     fn drop(&mut self) {
+        self.seen.store(self.queued, std::sync::atomic::Ordering::Relaxed);
         if self.fragmented && self.queued {
             let mut link = self.link.lock().expect("link");
             link.lost
