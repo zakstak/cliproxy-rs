@@ -55,9 +55,22 @@
 //! ponytail: an object that declares a renamed key and also accepts undeclared members
 //! can receive a member that spells the generated name; it then collides with the
 //! renamed key. Declared names avoid each other, but runtime keys are unknown.
-//! ponytail: `$ref` resolution covers local JSON pointers (`#`, `#/...`) from the root;
-//! anchors, `$id`-relative and remote references are not followed, so keys under them
-//! stay as sent. A `$ref` pointer into a renamed property keeps the client's key (#196).
+//! References (#196): each `$id` names a schema resource, resolved (RFC 3986 §5.2)
+//! against the enclosing resource's URI, and a `$ref` resolves against the closest
+//! enclosing resource, by JSON Pointer or static anchor (`$anchor`, `$dynamicAnchor`,
+//! or a fragment-only `$id`), to a schema of this document; nothing is fetched. The
+//! argument walk applies the target in place; an unresolved reference (another
+//! document, or no schema there) leaves the check unknown and the keys under it as
+//! sent. In the schema sent, a JSON Pointer through a renamed key names the new key:
+//! the fragment is percent-decoded and its segments `~0`/`~1`-decoded before matching,
+//! and only renamed segments change, so every other reference keeps its bytes. A
+//! pointer-form `$dynamicRef` is a `$ref` (a pointer never names a `$dynamicAnchor`); a
+//! tool with an anchor-form `$dynamicRef` or a `$recursiveRef` is declined as a whole,
+//! since dynamic scope can pick a target other than the static one. URI resolution is
+//! memoized and charged against a budget linear in the schema's size; a schema past it
+//! is declined as a whole.
+//! ponytail: URIs are compared after resolution and dot-segment removal only (no case or
+//! percent-encoding normalization), and dynamic scope is not modelled.
 //! Schemas past [`MAX_SCHEMA_NODES`] subschemas are sent unchanged (no renames at all),
 //! which bounds the per-member and per-element work of the argument walk.
 //! `patternProperties` patterns are matched with ECMA-262's character classes; a
@@ -118,6 +131,8 @@ struct SchemaTokens<'a> {
     keys: Vec<Token>,
     references: Vec<Token>,
     instances: Vec<(NodeId, &'a [u8])>,
+    /// `$ref` and pointer-form `$dynamicRef` strings, by the node that holds them.
+    pointers: Vec<(NodeId, Token)>,
 }
 
 /// Keywords whose member keys name properties (`dependencies` is the older spelling of
@@ -167,8 +182,22 @@ pub(crate) const ROOT: NodeId = 0;
 #[derive(Debug, Default)]
 struct Tree {
     nodes: Vec<Node>,
-    /// Each node's JSON pointer (client spelling, RFC 6901 escaped).
-    pointers: HashMap<Vec<u8>, NodeId>,
+    /// The walked locations as a trie of decoded JSON Pointer segments: (location,
+    /// segment) -> (location, whether the segment is a property name). Location 0 is
+    /// the root; a keyword with members (`properties`, `$defs`, ...) is a location of
+    /// its own, between a schema and its member subschemas.
+    edges: HashMap<(usize, Vec<u8>), (usize, bool)>,
+    /// The schema at each location, if one is there.
+    at: Vec<Option<NodeId>>,
+    /// Each resource's resolved URI and its node ([`Node::base`]).
+    resources: HashMap<Vec<u8>, NodeId>,
+    /// Each static anchor, by its resource node and name.
+    anchors: HashMap<(NodeId, Vec<u8>), NodeId>,
+    /// A reference may resolve through dynamic scope ([`dynamic_reference`]): the tool
+    /// is declined.
+    dynamic: bool,
+    /// Resolving URIs spent [`UriCache`]'s budget: the tool is declined.
+    uri_budget_spent: bool,
     /// The walk stopped at [`MAX_SCHEMA_NODES`]: the tree is incomplete and the schema
     /// is declined.
     overflow: bool,
@@ -183,8 +212,18 @@ struct Node {
     /// position when it applies in place (`allOf`, `anyOf`, `oneOf`, `if`, `then`,
     /// `else`, `not`, dependent schemas).
     position: NodeId,
-    /// JSON pointer, client spelling, RFC 6901 escaped.
-    pointer: Vec<u8>,
+    /// The node this one is a subschema of (the root is its own).
+    parent: NodeId,
+    /// Its location in [`Tree::edges`].
+    loc: usize,
+    /// The node of the schema resource it belongs to: itself when it has a `$id`.
+    base: NodeId,
+    /// Its `$id` without a fragment: as written during the walk, resolved against its
+    /// parent resource's URI after it.
+    id: Option<Vec<u8>>,
+    /// Its static anchors: `$anchor`, `$dynamicAnchor` (a plain anchor for `$ref`), or
+    /// a fragment-only `$id`'s name.
+    anchors: Vec<Vec<u8>>,
     /// Property keys (client spelling) this schema names: `properties`, `required`,
     /// dependency keywords.
     named: HashSet<Vec<u8>>,
@@ -221,8 +260,8 @@ struct Node {
     /// Subschemas that apply when the instance has the key: `dependentSchemas`, the
     /// schema form of `dependencies`.
     dependent: Vec<(Vec<u8>, NodeId)>,
-    /// The `$ref` value, resolved once the walk is done.
-    reference: Option<Vec<u8>>,
+    /// Its `$ref` and pointer-form `$dynamicRef` values, resolved once the walk is done.
+    references: Vec<Vec<u8>>,
     /// The part of this schema an instance can be checked against cheaply.
     check: Check,
     /// The keys `check` and `dependent` look up, as each side spells them
@@ -622,7 +661,7 @@ impl PropertyKeys {
     /// Deterministic for the same schema bytes, so the cached prompt prefix stays stable.
     pub(crate) fn of(schema: &[u8]) -> Option<Self> {
         let (tokens, tree) = walk(schema);
-        if tree.overflow {
+        if tree.overflow || tree.dynamic || tree.uri_budget_spent {
             return None;
         }
         let mut taken: HashSet<&[u8]> = HashSet::new();
@@ -755,18 +794,20 @@ impl PropertyKeys {
         }
         let tree = &self.tree;
         let anchor = tree.nodes[node].position;
-        let pointer = &tree.nodes[node].pointer;
-        let below = tree.nodes[anchor].pointer.len();
+        // The deepest referenced schema on the lexical chain from `node` up to (not
+        // including) its position: a reference can enter the instance there.
         let mut start = anchor;
-        for (i, _) in pointer.iter().enumerate().filter(|&(i, b)| *b == b'/' && i > below) {
-            if let Some(&m) = tree.pointers.get(&pointer[..i])
-                && tree.referenced.contains(&m)
-            {
+        let mut m = node;
+        while m != anchor {
+            if tree.referenced.contains(&m) {
                 start = m;
+                break;
             }
-        }
-        if node != anchor && tree.referenced.contains(&node) {
-            start = node;
+            let parent = tree.nodes[m].parent;
+            if parent == m {
+                break;
+            }
+            m = parent;
         }
         self.rename_from(start, instance, Direction::ToClaude) == every
     }
@@ -775,7 +816,7 @@ impl PropertyKeys {
     /// and every renamed key in its `const` and `enum` instances, which [`Self::of`]
     /// checked arguments take wherever those apply.
     pub(crate) fn schema(&self, schema: &[u8]) -> Vec<u8> {
-        let (tokens, _) = walk(schema);
+        let (tokens, tree) = walk(schema);
         let mut edits: Vec<Edit> = tokens
             .keys
             .iter()
@@ -800,7 +841,49 @@ impl PropertyKeys {
                 });
             }
         }
+        // Local JSON Pointers through a renamed key, rewritten as JSON strings.
+        let mut uris = UriCache::new(schema);
+        for (n, token) in &tokens.pointers {
+            if let Some(rewritten) = self.pointer(&tree, *n, &token.text, &mut uris) {
+                let mut quoted = Vec::with_capacity(rewritten.len() + 2);
+                gj::marshal_str(&mut quoted, &rewritten, false);
+                edits.push(Edit {
+                    start: token.start,
+                    end: token.end,
+                    with: Replacement::Raw(quoted),
+                });
+            }
+        }
         splice(schema, edits)
+    }
+
+    /// `reference`, held by node `from`, with each segment of its JSON Pointer that names
+    /// a renamed property replaced, or `None` when it needs no change. Segments keep
+    /// their bytes, escapes included, unless renamed; generated names need no escaping
+    /// in either a JSON Pointer or a URI fragment.
+    fn pointer(&self, tree: &Tree, from: NodeId, reference: &[u8], uris: &mut UriCache) -> Option<Vec<u8>> {
+        let (start, fragment) = tree.start(from, reference, uris)?;
+        let fragment = fragment?;
+        let hash = reference.len() - fragment.len() - 1;
+        let mut renames: Vec<(usize, usize, &Vec<u8>)> = vec![];
+        tree.follow(start, fragment, |range, segment, property| {
+            if let Some(name) = self.to_claude.get(segment).filter(|_| property) {
+                renames.push((range.0, range.1, name));
+            }
+        })?;
+        if renames.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(reference.len());
+        out.extend_from_slice(&reference[..=hash]);
+        let mut at = 0;
+        for (start, end, name) in renames {
+            out.extend_from_slice(&fragment[at..start]);
+            out.extend_from_slice(name);
+            at = end;
+        }
+        out.extend_from_slice(&fragment[at..]);
+        Some(out)
     }
 
     /// Tool-call arguments with the client's keys renamed, for history sent to Claude.
@@ -1493,37 +1576,312 @@ impl Tree {
         false
     }
 
-    /// The node a local `$ref` names: `#` or `#/<pointer>`, percent-decoded, then RFC
-    /// 6901. `None` for any other reference, an invalid escape or a pointer to no node.
-    pub(crate) fn resolve(&self, reference: &[u8]) -> Option<NodeId> {
-        let fragment = percent_decode(reference.strip_prefix(b"#")?)?;
-        if fragment.is_empty() {
-            return (!self.nodes.is_empty()).then_some(ROOT);
+    /// The node `reference`, held by node `from`, names in this document: by JSON
+    /// Pointer or static anchor, from the resource its URI names (by default `from`'s
+    /// own). `None` for another document, a dynamic anchor's scope, an invalid escape or
+    /// a fragment that names no schema.
+    #[cfg(test)]
+    pub(crate) fn resolve(&self, from: NodeId, reference: &[u8]) -> Option<NodeId> {
+        self.resolve_with(from, reference, &mut UriCache::default())
+    }
+
+    fn resolve_with(&self, from: NodeId, reference: &[u8], uris: &mut UriCache) -> Option<NodeId> {
+        let (start, fragment) = self.start(from, reference, uris)?;
+        let Some(fragment) = fragment.filter(|f| !f.is_empty()) else {
+            return Some(start);
+        };
+        match self.follow(start, fragment, |_, _, _| {}) {
+            Some(Some(loc)) => self.at[loc],
+            Some(None) => None,
+            // Not a pointer: a static anchor.
+            None => {
+                let name = percent_decode(fragment)?.0;
+                self.anchors.get(&(self.nodes[start].base, name)).copied()
+            }
         }
-        let rest = fragment.strip_prefix(b"/")?;
-        let mut pointer = vec![];
-        for segment in rest.split(|&b| b == b'/') {
-            pointer.push(b'/');
-            push_segment(&mut pointer, &unescape_segment(segment)?);
+    }
+
+    /// The resource node `reference`'s URI part names from node `from`, and the
+    /// fragment after its `#`, if any.
+    fn start<'r>(&self, from: NodeId, reference: &'r [u8], uris: &mut UriCache) -> Option<(NodeId, Option<&'r [u8]>)> {
+        let hash = reference.iter().position(|&b| b == b'#');
+        let uri = &reference[..hash.unwrap_or(reference.len())];
+        let fragment = hash.map(|h| &reference[h + 1..]);
+        let base = self.nodes.get(from)?.base;
+        if uri.is_empty() {
+            return Some((base, fragment));
         }
-        self.pointers.get(&pointer).copied()
+        Some((uris.target(self, base, uri)?, fragment))
+    }
+
+    /// Follows the JSON Pointer `fragment` (percent-encoded, as in a URI) from node
+    /// `start`, calling `segment` with each segment's byte range in `fragment`, its
+    /// decoded text and whether it names a property. `None` when `fragment` is not a
+    /// pointer or has an invalid escape; `Some(None)` when it leaves the walked
+    /// locations, after the segments that were found; else the location it names.
+    fn follow(
+        &self,
+        start: NodeId,
+        fragment: &[u8],
+        mut segment: impl FnMut((usize, usize), &[u8], bool),
+    ) -> Option<Option<usize>> {
+        let (decoded, from) = percent_decode(fragment)?;
+        if decoded.first() != Some(&b'/') {
+            return None;
+        }
+        let mut at = self.nodes[start].loc;
+        let mut begin = 1;
+        let mut found = true;
+        while begin <= decoded.len() {
+            let end = decoded[begin..]
+                .iter()
+                .position(|&b| b == b'/')
+                .map_or(decoded.len(), |n| begin + n);
+            let key = (at, unescape_segment(&decoded[begin..end])?);
+            if found {
+                match self.edges.get(&key) {
+                    Some(&(next, property)) => {
+                        segment((from[begin], from[end]), &key.1, property);
+                        at = next;
+                    }
+                    None => found = false,
+                }
+            }
+            begin = end + 1;
+        }
+        Some(found.then_some(at))
+    }
+
+    /// The location of segment `segment` below location `parent`, added if new.
+    fn loc(&mut self, parent: usize, segment: &[u8], property: bool) -> usize {
+        let next = self.at.len();
+        let (loc, _) = *self.edges.entry((parent, segment.to_vec())).or_insert((next, property));
+        if loc == next {
+            self.at.push(None);
+        }
+        loc
     }
 }
 
-fn percent_decode(text: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len());
+/// URI resolution for [`Tree::start`]: memoized per resource and URI reference, and
+/// charged against a budget linear in the schema's size, since every resolution against
+/// a long base URI costs that base.
+/// ponytail: a structurally shared base URI (prefix hashes) would lift the budget if
+/// real schemas ever reach it.
+struct UriCache {
+    targets: HashMap<(NodeId, Vec<u8>), Option<NodeId>>,
+    /// Bytes of resolution left.
+    budget: usize,
+    spent: bool,
+}
+
+/// Resolution bytes a schema may spend: this many per schema byte, plus [`URI_SLACK`].
+const URI_BUDGET_PER_BYTE: usize = 4;
+const URI_SLACK: usize = 64 * 1024;
+
+impl Default for UriCache {
+    /// Unbounded, for resolving one reference.
+    fn default() -> Self {
+        UriCache {
+            targets: HashMap::new(),
+            budget: usize::MAX,
+            spent: false,
+        }
+    }
+}
+
+impl UriCache {
+    fn new(schema: &[u8]) -> Self {
+        UriCache {
+            budget: schema.len() * URI_BUDGET_PER_BYTE + URI_SLACK,
+            ..UriCache::default()
+        }
+    }
+
+    /// `reference` resolved against `base`, or `None` once the budget is spent.
+    fn resolve(&mut self, base: &[u8], reference: &[u8]) -> Option<Vec<u8>> {
+        match self.budget.checked_sub(base.len() + reference.len()) {
+            Some(left) if !self.spent => self.budget = left,
+            _ => {
+                self.spent = true;
+                return None;
+            }
+        }
+        Some(resolve_uri(base, reference))
+    }
+
+    /// The resource node a URI reference names from resource node `base`.
+    fn target(&mut self, tree: &Tree, base: NodeId, uri: &[u8]) -> Option<NodeId> {
+        if let Some(&target) = self.targets.get(&(base, uri.to_vec())) {
+            return target;
+        }
+        let base_uri = tree.nodes[base].id.as_deref().unwrap_or_default();
+        let target = self
+            .resolve(base_uri, uri)
+            .and_then(|u| tree.resources.get(&u).copied());
+        self.targets.insert((base, uri.to_vec()), target);
+        target
+    }
+}
+
+/// `text` percent-decoded, and where each decoded byte starts in it (one past the end
+/// last), or `None` for an invalid `%` escape.
+fn percent_decode(text: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut from = Vec::with_capacity(text.len() + 1);
     let mut i = 0;
     while i < text.len() {
+        from.push(i);
         if text[i] == b'%' {
-            let hex = std::str::from_utf8(text.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
+            let digit = |at: usize| (*text.get(at)? as char).to_digit(16);
+            decoded.push((digit(i + 1)? * 16 + digit(i + 2)?) as u8);
             i += 3;
         } else {
-            out.push(text[i]);
+            decoded.push(text[i]);
             i += 1;
         }
     }
-    Some(out)
+    from.push(text.len());
+    Some((decoded, from))
+}
+
+/// Whether the `keyword` reference `value` may resolve through dynamic scope. Only a
+/// `$dynamicRef` whose fragment is an anchor can start at a `$dynamicAnchor` and so
+/// depend on the evaluation path (JSON Schema 2020-12 §8.2.3.2); a JSON Pointer fragment
+/// never names one, so a pointer-form `$dynamicRef` resolves exactly like `$ref`. Every
+/// 2019-09 `$recursiveRef` counts.
+fn dynamic_reference(keyword: &[u8], value: &[u8]) -> bool {
+    match keyword {
+        b"$recursiveRef" => true,
+        b"$dynamicRef" => match value.iter().position(|&b| b == b'#') {
+            Some(hash) => {
+                let fragment = &value[hash + 1..];
+                !(fragment.is_empty()
+                    || fragment.starts_with(b"/")
+                    || fragment.len() >= 3 && fragment[..3].eq_ignore_ascii_case(b"%2F"))
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// A URI reference split into its RFC 3986 components, fragment excluded.
+struct UriParts<'a> {
+    scheme: Option<&'a [u8]>,
+    authority: Option<&'a [u8]>,
+    path: &'a [u8],
+    query: Option<&'a [u8]>,
+}
+
+fn uri_parts(uri: &[u8]) -> UriParts<'_> {
+    let uri = &uri[..uri.iter().position(|&b| b == b'#').unwrap_or(uri.len())];
+    let (scheme, rest) = match uri.iter().position(|&b| matches!(b, b':' | b'/' | b'?')) {
+        Some(n)
+            if uri[n] == b':'
+                && uri.first().is_some_and(u8::is_ascii_alphabetic)
+                && uri[..n]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            (Some(&uri[..n]), &uri[n + 1..])
+        }
+        _ => (None, uri),
+    };
+    let (authority, rest) = match rest.strip_prefix(b"//") {
+        Some(after) => {
+            let n = after
+                .iter()
+                .position(|&b| matches!(b, b'/' | b'?'))
+                .unwrap_or(after.len());
+            (Some(&after[..n]), &after[n..])
+        }
+        None => (None, rest),
+    };
+    let (path, query) = match rest.iter().position(|&b| b == b'?') {
+        Some(n) => (&rest[..n], Some(&rest[n + 1..])),
+        None => (rest, None),
+    };
+    UriParts {
+        scheme,
+        authority,
+        path,
+        query,
+    }
+}
+
+/// RFC 3986 §5.2.4: `path` without its `.` and `..` segments.
+fn remove_dot_segments(path: &[u8]) -> Vec<u8> {
+    let mut out: Vec<&[u8]> = vec![];
+    let absolute = path.first() == Some(&b'/');
+    let segments: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let last = segments.len() - 1;
+    for (i, segment) in segments.iter().enumerate().skip(usize::from(absolute)) {
+        match *segment {
+            b"." | b".." => {
+                if *segment == b".." {
+                    out.pop();
+                }
+                // A trailing dot segment leaves a directory path.
+                if i == last {
+                    out.push(b"");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let mut joined = out.join(&b'/');
+    if absolute {
+        joined.insert(0, b'/');
+    }
+    joined
+}
+
+/// RFC 3986 §5.2.2: `reference` resolved against `base`, without a fragment. Nothing is
+/// fetched; a document without a base URI resolves against the empty reference.
+fn resolve_uri(base: &[u8], reference: &[u8]) -> Vec<u8> {
+    let b = uri_parts(base);
+    let r = uri_parts(reference);
+    let (scheme, authority, path, query);
+    if r.scheme.is_some() {
+        (scheme, authority, path, query) = (r.scheme, r.authority, remove_dot_segments(r.path), r.query);
+    } else {
+        scheme = b.scheme;
+        if r.authority.is_some() {
+            (authority, path, query) = (r.authority, remove_dot_segments(r.path), r.query);
+        } else {
+            authority = b.authority;
+            if r.path.is_empty() {
+                path = b.path.to_vec();
+                query = r.query.or(b.query);
+            } else {
+                query = r.query;
+                path = if r.path.first() == Some(&b'/') {
+                    remove_dot_segments(r.path)
+                } else if b.authority.is_some() && b.path.is_empty() {
+                    remove_dot_segments(&[b"/", r.path].concat())
+                } else {
+                    let dir = b.path.iter().rposition(|&b| b == b'/').map_or(0, |n| n + 1);
+                    remove_dot_segments(&[&b.path[..dir], r.path].concat())
+                };
+            }
+        }
+    }
+    let mut out = vec![];
+    if let Some(scheme) = scheme {
+        out.extend_from_slice(scheme);
+        out.push(b':');
+    }
+    if let Some(authority) = authority {
+        out.extend_from_slice(b"//");
+        out.extend_from_slice(authority);
+    }
+    out.extend_from_slice(&path);
+    if let Some(query) = query {
+        out.push(b'?');
+        out.extend_from_slice(query);
+    }
+    out
 }
 
 /// RFC 6901 `~1` to `/` and `~0` to `~`; `None` for any other `~`.
@@ -1542,16 +1900,6 @@ fn unescape_segment(segment: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-fn push_segment(pointer: &mut Vec<u8>, segment: &[u8]) {
-    for &b in segment {
-        match b {
-            b'~' => pointer.extend_from_slice(b"~0"),
-            b'/' => pointer.extend_from_slice(b"~1"),
-            _ => pointer.push(b),
-        }
-    }
 }
 
 /// A subschema the walk found: its keyword, the member key or index after it, and its
@@ -1598,7 +1946,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
         return (tokens, tree);
     }
     tree.nodes.push(Node::default());
-    tree.pointers.insert(vec![], ROOT);
+    tree.at.push(Some(ROOT));
     let mut stack: Vec<(&[u8], usize, NodeId)> = vec![(root, 0, ROOT)];
     while let Some((value, depth, id)) = stack.pop() {
         let mut children: Vec<Child<'_>> = vec![];
@@ -1689,8 +2037,22 @@ fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
                         i += 1;
                     });
                 }
-            } else if name == b"$ref" && member.first() == Some(&b'"') {
-                node.reference = Some(gj::parse(member).s.into_owned());
+            } else if matches!(&name[..], b"$ref" | b"$dynamicRef" | b"$recursiveRef") && member.first() == Some(&b'"')
+            {
+                let text = gj::parse(member).s.into_owned();
+                if dynamic_reference(&name, &text) {
+                    tree.dynamic = true;
+                } else if name != b"$recursiveRef" {
+                    tokens.pointers.push((id, string_token(schema, member, &text)));
+                    node.references.push(text);
+                }
+            } else if matches!(&name[..], b"$id" | b"$anchor" | b"$dynamicAnchor") && member.first() == Some(&b'"') {
+                let text = gj::parse(member).s.into_owned();
+                match (&name[..], text.iter().position(|&b| b == b'#')) {
+                    (b"$id", Some(0)) => node.anchors.push(text[1..].to_vec()),
+                    (b"$id", hash) => node.id = Some(text[..hash.unwrap_or(text.len())].to_vec()),
+                    _ => node.anchors.push(text),
+                }
             } else if name == b"type" {
                 if member.first() == Some(&b'"') {
                     node.check.types = Some(vec![gj::parse(member).s.into_owned()]);
@@ -1779,23 +2141,23 @@ fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
                 tree.nodes[id] = node;
                 return (tokens, tree);
             }
-            let mut pointer = node.pointer.clone();
-            pointer.push(b'/');
-            push_segment(&mut pointer, &keyword);
-            if let Some(segment) = &segment {
-                pointer.push(b'/');
-                push_segment(&mut pointer, segment);
-            }
             let child_id = tree.nodes.len();
+            let mut loc = tree.loc(node.loc, &keyword, false);
+            if let Some(segment) = &segment {
+                let property = matches!(&keyword[..], b"properties" | b"dependentSchemas" | b"dependencies");
+                loc = tree.loc(loc, segment, property);
+            }
+            // The first schema at a location wins, as with duplicate member keys.
+            tree.at[loc].get_or_insert(child_id);
             let position = if moves_position(&keyword) {
                 child_id
             } else {
                 node.position
             };
-            tree.pointers.entry(pointer.clone()).or_insert(child_id);
             tree.nodes.push(Node {
                 position,
-                pointer,
+                parent: id,
+                loc,
                 check: Check {
                     complete: boolean.is_some(),
                     never: boolean == Some(false),
@@ -1841,9 +2203,31 @@ fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
         }
         tree.nodes[id] = node;
     }
+    let mut uris = UriCache::new(schema);
+    // Resources and anchors: a parent comes before its subschemas.
     for n in 0..tree.nodes.len() {
-        if let Some(reference) = tree.nodes[n].reference.take() {
-            match tree.resolve(&reference) {
+        let parent = tree.nodes[n].parent;
+        let mut base = if n == ROOT { ROOT } else { tree.nodes[parent].base };
+        if let Some(id) = tree.nodes[n].id.take() {
+            let parent_uri = if n == ROOT {
+                None
+            } else {
+                tree.nodes[base].id.as_deref()
+            };
+            if let Some(uri) = uris.resolve(parent_uri.unwrap_or_default(), &id) {
+                tree.resources.entry(uri.clone()).or_insert(n);
+                tree.nodes[n].id = Some(uri);
+                base = n;
+            }
+        }
+        tree.nodes[n].base = base;
+        for anchor in std::mem::take(&mut tree.nodes[n].anchors) {
+            tree.anchors.entry((base, anchor)).or_insert(n);
+        }
+    }
+    for n in 0..tree.nodes.len() {
+        for reference in std::mem::take(&mut tree.nodes[n].references) {
+            match tree.resolve_with(n, &reference, &mut uris) {
                 Some(target) => {
                     tree.nodes[n].all_of.push(target);
                     tree.referenced.insert(target);
@@ -1853,6 +2237,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens<'_>, Tree) {
             }
         }
     }
+    tree.uri_budget_spent = uris.spent;
     (tokens, tree)
 }
 
@@ -2615,8 +3000,8 @@ mod tests {
         );
         let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
         let sets = Sets::new(&keys, Direction::ToClaude);
-        let alternative = keys.tree.resolve(b"#/properties/rows/items/anyOf/0").unwrap();
-        let condition = keys.tree.resolve(b"#/properties/rows/items/if").unwrap();
+        let alternative = keys.tree.resolve(ROOT, b"#/properties/rows/items/anyOf/0").unwrap();
+        let condition = keys.tree.resolve(ROOT, b"#/properties/rows/items/if").unwrap();
         let row = |raw: &'static [u8]| Instance {
             raw,
             members: [(b"id".to_vec(), &raw[6..raw.len() - 1])].into_iter().collect(),
@@ -2770,7 +3155,7 @@ mod tests {
     fn an_in_place_node_maps_instances_at_its_parents_position() {
         let schema = br##"{"properties":{"p":{"properties":{"x y":{}},"additionalProperties":false,"allOf":[{"const":{"x y":"ok"}}]}}}"##;
         let keys = PropertyKeys::of(schema).unwrap();
-        let node = keys.tree.resolve(b"#/properties/p/allOf/0").unwrap();
+        let node = keys.tree.resolve(ROOT, b"#/properties/p/allOf/0").unwrap();
         assert_eq!(
             keys.instance_to_claude(node, br##"{"x y":"ok"}"##),
             br##"{"x_y":"ok"}"##
@@ -2780,7 +3165,7 @@ mod tests {
             br##"{"x y":"ok"}"##
         );
         // A node's own position: `p`'s member schema, not the root.
-        let p = keys.tree.resolve(b"#/properties/p").unwrap();
+        let p = keys.tree.resolve(ROOT, b"#/properties/p").unwrap();
         assert_eq!(keys.instance_to_claude(p, br##"{"x y":1}"##), br##"{"x_y":1}"##);
         assert_eq!(keys.instance_to_claude(ROOT, br##"{"x y":1}"##), br##"{"x y":1}"##);
     }
@@ -2883,6 +3268,35 @@ mod tests {
     }
 
     #[test]
+    fn references_by_anchor_and_id_are_instance_entries_too() {
+        // An in-place member reached by anchor or `$id` from free-form `q` is a reference
+        // entry, as by pointer.
+        for target in [r#""$anchor":"c""#, r#""$id":"c.json""#] {
+            let reference = if target.contains("anchor") { "#c" } else { "c.json" };
+            let schema = format!(
+                r##"{{"properties":{{"p":{{"properties":{{"x y":{{}}}},"allOf":[{{{target},"const":{{"x y":1}}}}]}},"q":{{"$ref":"{reference}"}}}}}}"##
+            );
+            assert!(PropertyKeys::of(schema.as_bytes()).is_none(), "{schema}");
+            // Without the reference the member is reached only in place, and renamed.
+            let alone = schema.replace(&format!(r#","q":{{"$ref":"{reference}"}}"#), "");
+            assert!(PropertyKeys::of(alone.as_bytes()).is_some(), "{alone}");
+        }
+        // A definition reached by anchor or `$id` names its enum items' keys wherever it
+        // applies.
+        for (target, reference) in [(r#""$anchor":"o""#, "#o"), (r#""$id":"o.json""#, "o.json")] {
+            let schema = format!(
+                r##"{{"properties":{{"p":{{"$ref":"{reference}"}}}},"$defs":{{"o":{{{target},"properties":{{"c d":{{}}}},"enum":[{{"c d":1}}]}}}}}}"##
+            );
+            let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
+            assert_eq!(
+                String::from_utf8(keys.schema(schema.as_bytes())).unwrap(),
+                schema.replace("c d", "c_d")
+            );
+            round_trip(schema.as_bytes(), r##"{"p":{"c d":1}}"##, r##"{"p":{"c_d":1}}"##);
+        }
+    }
+
+    #[test]
     fn unevaluated_keywords_or_plain_instances_decide_whether_to_rename() {
         // `unevaluated*` can drop names as nodes are added, so the check never passes.
         let unevaluated =
@@ -2897,12 +3311,172 @@ mod tests {
     fn pointers_resolve_escapes_and_refuse_bad_ones() {
         let schema = br##"{"properties":{"a/b~c":{"properties":{"q r":{}}}}}"##;
         let keys = PropertyKeys::of(schema).unwrap();
-        assert!(keys.tree.resolve(b"#/properties/a~1b~0c").is_some());
-        assert!(keys.tree.resolve(b"#/properties/a%7E1b~0c").is_some());
-        assert_eq!(keys.tree.resolve(b"#"), Some(ROOT));
-        assert_eq!(keys.tree.resolve(b"#/properties/a~2b"), None);
-        assert_eq!(keys.tree.resolve(b"#/properties/%zz"), None);
-        assert_eq!(keys.tree.resolve(b"other#/properties"), None);
+        assert!(keys.tree.resolve(ROOT, b"#/properties/a~1b~0c").is_some());
+        assert!(keys.tree.resolve(ROOT, b"#/properties/a%7E1b~0c").is_some());
+        assert_eq!(keys.tree.resolve(ROOT, b"#"), Some(ROOT));
+        assert_eq!(keys.tree.resolve(ROOT, b"#/properties/a~2b"), None);
+        assert_eq!(keys.tree.resolve(ROOT, b"#/properties/%zz"), None);
+        assert_eq!(keys.tree.resolve(ROOT, b"other#/properties"), None);
+    }
+
+    fn renamed(schema: &str) -> String {
+        let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
+        String::from_utf8(keys.schema(schema.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn pointer_escapes_are_decoded_before_matching() {
+        assert_eq!(
+            renamed(
+                r##"{"properties":{"x/y":{},"a~b":{},"a b":{},"c":{"$ref":"#/properties/x~1y"},"d":{"$ref":"#/properties/a~0b"},"e":{"$ref":"#/properties/a%20b"},"f":{"$ref":"#/properties/x%7E1y"},"g":{"$ref":"#/properties/x~1y"}}}"##
+            ),
+            r##"{"properties":{"x_y":{},"a_b":{},"a_b_2":{},"c":{"$ref":"#/properties/x_y"},"d":{"$ref":"#/properties/a_b"},"e":{"$ref":"#/properties/a_b_2"},"f":{"$ref":"#/properties/x_y"},"g":{"$ref":"#/properties/x_y"}}}"##
+        );
+    }
+
+    #[test]
+    fn only_renamed_segments_of_a_pointer_change() {
+        assert_eq!(
+            renamed(
+                r##"{"$defs":{"x/y":{"properties":{"p q":{"properties":{"ok%":{}}}}}},"properties":{"r s":{"properties":{"t u":{}}},"refs":{"items":[{"$ref":"#/$defs/x~1y/properties/p%20q/properties/ok%25"},{"$ref":"#/properties/r%20s/properties/t u"},{"$ref":"#/properties/r s/default/r s"},{"$dynamicRef":"#/dependentSchemas/r s"}]}},"dependentSchemas":{"r s":{}}}"##
+            ),
+            r##"{"$defs":{"x/y":{"properties":{"p_q":{"properties":{"ok_":{}}}}}},"properties":{"r_s":{"properties":{"t_u":{}}},"refs":{"items":[{"$ref":"#/$defs/x~1y/properties/p_q/properties/ok_"},{"$ref":"#/properties/r_s/properties/t_u"},{"$ref":"#/properties/r_s/default/r s"},{"$dynamicRef":"#/dependentSchemas/r_s"}]}},"dependentSchemas":{"r_s":{}}}"##
+        );
+    }
+
+    #[test]
+    fn references_to_unrenamed_or_unknown_locations_keep_their_bytes() {
+        let schema = r##"{"$defs":{"x/y":{}},"properties":{"x/y":{},"a":{"$ref":"#/$defs/x~1y"},"b":{"$ref":"other.json#/properties/x~1y"},"c":{"$ref":"#anchor"},"d":{"$ref":"#/properties/x~2y"},"e":{"$ref":"#/properties/x%zzy"},"e2":{"$ref":"#/properties/x%+1y"},"f":{"$ref":"#"},"g":{"$ref":"#/properties/missing/x~1y"},"i":{"$ref":"#/items/0/properties/x~1y"}}}"##;
+        let want = schema.replacen(r#""x/y":{},"a""#, r#""x_y":{},"a""#, 1);
+        let got = renamed(schema);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn references_resolve_from_the_enclosing_resource() {
+        assert_eq!(
+            renamed(
+                r##"{"$id":"https://example.com/root","properties":{"a b":{},"r":{"$id":"r.json","properties":{"c d":{},"e":{"$ref":"#/properties/c%20d"},"f":{"$ref":"r.json#/properties/c d"},"g":{"$ref":"#/properties/a b"}}},"h":{"$ref":"https://example.com/root#/properties/a b"},"i":{"$ref":"#/properties/r/properties/c d"}}}"##
+            ),
+            r##"{"$id":"https://example.com/root","properties":{"a_b":{},"r":{"$id":"r.json","properties":{"c_d":{},"e":{"$ref":"#/properties/c_d"},"f":{"$ref":"r.json#/properties/c_d"},"g":{"$ref":"#/properties/a b"}}},"h":{"$ref":"https://example.com/root#/properties/a_b"},"i":{"$ref":"#/properties/r/properties/c_d"}}}"##
+        );
+    }
+
+    #[test]
+    fn references_into_embedded_resources_resolve_from_their_base() {
+        // `child.json` resolves against the root's `$id` to the embedded resource.
+        assert_eq!(
+            renamed(
+                r##"{"$id":"https://example.com/root.json","$defs":{"child":{"$id":"child.json","properties":{"x/y":{"type":"string"}}}},"properties":{"copy":{"$ref":"child.json#/properties/x~1y"},"abs":{"$ref":"https://example.com/child.json#/properties/x~1y"},"dots":{"$ref":"./sub/../child.json#/properties/x%7E1y"},"other":{"$ref":"other.json#/properties/x~1y"},"anchor":{"$ref":"child.json#x"}}}"##
+            ),
+            r##"{"$id":"https://example.com/root.json","$defs":{"child":{"$id":"child.json","properties":{"x_y":{"type":"string"}}}},"properties":{"copy":{"$ref":"child.json#/properties/x_y"},"abs":{"$ref":"https://example.com/child.json#/properties/x_y"},"dots":{"$ref":"./sub/../child.json#/properties/x_y"},"other":{"$ref":"other.json#/properties/x~1y"},"anchor":{"$ref":"child.json#x"}}}"##
+        );
+        // Without a root `$id`, relative ids and references resolve alike; a nested
+        // resource's `$id` resolves against its parent resource.
+        assert_eq!(
+            renamed(
+                r##"{"$defs":{"a":{"$id":"dir/a.json","$defs":{"b":{"$id":"b.json","properties":{"p q":{}}}}}},"properties":{"r":{"$ref":"dir/b.json#/properties/p q"},"s":{"$ref":"b.json#/properties/p q"}}}"##
+            ),
+            r##"{"$defs":{"a":{"$id":"dir/a.json","$defs":{"b":{"$id":"b.json","properties":{"p_q":{}}}}}},"properties":{"r":{"$ref":"dir/b.json#/properties/p_q"},"s":{"$ref":"b.json#/properties/p q"}}}"##
+        );
+    }
+
+    #[test]
+    fn schemas_that_may_use_dynamic_scope_keep_their_keys() {
+        for dynamic in [
+            r##"{"$dynamicAnchor":"node","properties":{"a b":{},"kids":{"items":{"$dynamicRef":"#node"}}}}"##,
+            r##"{"properties":{"a b":{},"c":{"$dynamicRef":"other.json#node"}}}"##,
+            r##"{"$recursiveAnchor":true,"properties":{"a b":{},"c":{"$recursiveRef":"#"}}}"##,
+        ] {
+            assert!(PropertyKeys::of(dynamic.as_bytes()).is_none(), "{dynamic}");
+        }
+        // A JSON Pointer never names a `$dynamicAnchor`, so this is a `$ref`.
+        assert_eq!(
+            renamed(
+                r##"{"properties":{"a b":{},"c":{"$dynamicRef":"#/properties/a%20b"},"d":{"$dynamicRef":"#%2Fproperties%2Fa b"}}}"##
+            ),
+            r##"{"properties":{"a_b":{},"c":{"$dynamicRef":"#/properties/a_b"},"d":{"$dynamicRef":"#%2Fproperties%2Fa_b"}}}"##
+        );
+        // Data positions are not schemas.
+        assert!(PropertyKeys::of(br##"{"properties":{"a b":{"default":{"$dynamicRef":"#x"}}}}"##).is_some());
+    }
+
+    #[test]
+    fn uri_references_resolve_per_rfc_3986() {
+        let base = b"http://a/b/c/d;p?q";
+        for (reference, want) in [
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("", "http://a/b/c/d;p?q"),
+            (".", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../..", "http://a/"),
+            ("../../../g", "http://a/g"),
+            ("g;x=1/../y", "http://a/b/c/y"),
+            ("g:h", "g:h"),
+            ("#s", "http://a/b/c/d;p?q"),
+        ] {
+            assert_eq!(
+                String::from_utf8(resolve_uri(base, reference.as_bytes())).unwrap(),
+                want,
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_resolution_past_the_budget_declines_the_tool() {
+        let base = "x".repeat(200_000);
+        // Repeating one reference resolves it once.
+        let refs = r##"{"$ref":"child.json#/properties/x~1y"},"##.repeat(400);
+        let schema = format!(
+            r##"{{"$id":"https://example.com/{base}/root.json","$defs":{{"child":{{"$id":"child.json","properties":{{"x/y":{{}}}}}}}},"items":[{refs}{{}}]}}"##
+        );
+        assert_eq!(renamed(&schema).matches("#/properties/x_y").count(), 400);
+        // Distinct references against a long base would each cost the base.
+        let refs: String = (0..400)
+            .map(|i| format!(r##"{{"$ref":"c{i}.json#/properties/x~1y"}},"##))
+            .collect();
+        let schema = format!(
+            r##"{{"$id":"https://example.com/{base}/root.json","properties":{{"x/y":{{}}}},"items":[{refs}{{}}]}}"##
+        );
+        assert!(PropertyKeys::of(schema.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn references_by_id_and_anchor_map_arguments() {
+        // An embedded resource by URI, and a static anchor, from another node.
+        let schema = br##"{"$id":"https://example.com/root.json",
+            "$defs":{"child":{"$id":"child.json","type":"object","properties":{"x/y":{"type":"string"}}},
+                     "item":{"$anchor":"item","type":"object","properties":{"a b":{"type":"string"}}},
+                     "old":{"$id":"#legacy","properties":{"c d":{}}},
+                     "dyn":{"$dynamicAnchor":"dyn","properties":{"e f":{}}}},
+            "type":"object",
+            "properties":{"copy":{"$ref":"child.json"},"deep":{"$ref":"child.json#/properties/x~1y"},
+                "one":{"$ref":"#item"},"two":{"$ref":"child.json#item"},"three":{"$ref":"#legacy"},
+                "four":{"$ref":"#dyn"}}}"##;
+        // `child.json#item` names no anchor of that resource: unresolved, left as sent. A
+        // `$ref` to a `$dynamicAnchor` is static.
+        round_trip(
+            schema,
+            r##"{"copy":{"x/y":"1"},"one":{"a b":"2"},"two":{"a b":"3"},"three":{"c d":4},"four":{"e f":5}}"##,
+            r##"{"copy":{"x_y":"1"},"one":{"a_b":"2"},"two":{"a b":"3"},"three":{"c_d":4},"four":{"e_f":5}}"##,
+        );
+        let keys = PropertyKeys::of(schema).unwrap();
+        let root = ROOT;
+        let child = keys.tree.resolve(root, b"https://example.com/child.json").unwrap();
+        assert_eq!(keys.tree.resolve(root, b"child.json#"), Some(child));
+        assert_eq!(keys.tree.resolve(root, b"#/$defs/child"), Some(child));
+        assert_eq!(keys.tree.resolve(child, b"#"), Some(child));
+        assert_eq!(
+            keys.tree.resolve(child, b"root.json#item"),
+            keys.tree.resolve(root, b"#item")
+        );
+        assert_eq!(keys.tree.resolve(root, b"other.json#item"), None);
     }
 
     #[test]

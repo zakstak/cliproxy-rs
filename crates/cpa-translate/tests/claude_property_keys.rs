@@ -614,6 +614,170 @@ fn referenced_definitions_still_rename_arguments() {
     assert_eq!(args, json!({"pages": [{"page[size]": 5}]}));
 }
 
+/// A local `$ref` into a renamed property still resolves after the rename (#196).
+/// `~1` is the JSON Pointer escape for `/`.
+#[test]
+fn local_refs_into_renamed_properties_still_resolve() {
+    let parameters = json!({"type": "object", "properties": {
+        "x/y": {"type": "string"},
+        "copy": {"$ref": "#/properties/x~1y"},
+        "defs": {"$ref": "#/$defs/x~1y"}
+    }, "$defs": {"x/y": {"type": "integer"}}});
+    let responses = json!({"model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "t", "parameters": parameters}]})
+    .to_string();
+    let chat = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "t", "parameters": parameters}}]})
+    .to_string();
+    for (client, body) in [(Format::OpenAIResponse, responses), (Format::OpenAI, chat)] {
+        let out = translate(client, body.as_bytes());
+        let schema = &claude_tool(&out, "t")["input_schema"];
+        let copy = schema["properties"]["copy"]["$ref"].as_str().unwrap();
+        assert_eq!(copy, "#/properties/x_y", "{client:?}: {schema}");
+        assert_eq!(schema.pointer(&copy[1..]), Some(&json!({"type": "string"})));
+        // `$defs` names are not property keys, so that reference keeps its bytes.
+        let defs = schema["properties"]["defs"]["$ref"].as_str().unwrap();
+        assert_eq!(defs, "#/$defs/x~1y");
+        assert_eq!(schema.pointer(&defs[1..]), Some(&json!({"type": "integer"})));
+    }
+}
+
+/// A reference into an embedded `$id` resource from another schema node resolves the
+/// resource's URI against the document's base and still resolves after the rename.
+#[test]
+fn refs_into_embedded_resources_still_resolve() {
+    let parameters = json!({"$id": "https://example.com/root.json",
+    "$defs": {"child": {"$id": "child.json", "properties": {"x/y": {"type": "string"}}}},
+    "properties": {
+        "copy": {"$ref": "child.json#/properties/x~1y"},
+        "external": {"$ref": "https://other.example/child.json#/properties/x~1y"},
+        "anchor": {"$ref": "child.json#x"}
+    }});
+    let responses = json!({"model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "t", "parameters": parameters}]})
+    .to_string();
+    let chat = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "t", "parameters": parameters}}]})
+    .to_string();
+    for (client, body) in [(Format::OpenAIResponse, responses), (Format::OpenAI, chat)] {
+        let out = translate(client, body.as_bytes());
+        let schema = &claude_tool(&out, "t")["input_schema"];
+        let props = &schema["properties"];
+        assert_eq!(
+            props["copy"]["$ref"], "child.json#/properties/x_y",
+            "{client:?}: {schema}"
+        );
+        assert_eq!(
+            schema["$defs"]["child"].pointer("/properties/x_y"),
+            Some(&json!({"type": "string"}))
+        );
+        assert_eq!(
+            props["external"]["$ref"],
+            "https://other.example/child.json#/properties/x~1y"
+        );
+        assert_eq!(props["anchor"]["$ref"], "child.json#x");
+    }
+}
+
+/// Chat and Responses requests declaring tool `f` with `parameters` and replaying one
+/// call with `history`.
+fn requests(parameters: &Value, history: &Value) -> [(Format, Vec<u8>); 2] {
+    let chat = json!({"model": "claude-opus-5-5", "stream": true,
+    "tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}],
+    "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+         "function": {"name": "f", "arguments": history.to_string()}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+    ]});
+    let responses = json!({"model": "claude-opus-5-5", "stream": true,
+    "tools": [{"type": "function", "name": "f", "parameters": parameters}],
+    "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": history.to_string()},
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    ]});
+    [
+        (Format::OpenAI, chat.to_string().into_bytes()),
+        (Format::OpenAIResponse, responses.to_string().into_bytes()),
+    ]
+}
+
+/// Replayed `client` arguments reach Claude as `claude`, and a Claude call with `claude`
+/// reaches each client, buffered and streamed, as `client`.
+fn assert_maps(parameters: &Value, client: &Value, claude: &Value) {
+    let events = claude_events(claude, "f");
+    let body = sse(&events).concat();
+    for (format, request) in requests(parameters, client) {
+        assert_eq!(
+            tool_use_input(&translate(format, &request)),
+            claude,
+            "{format:?} history"
+        );
+        let (buffered, streamed) = match format {
+            Format::OpenAI => {
+                let answer = non_stream(format, &request, &body);
+                let (_, args) = chat_call(&stream(format, &request, &events));
+                (
+                    parse_args(&answer["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+                    serde_json::from_str(&args).unwrap(),
+                )
+            }
+            _ => {
+                let answer = non_stream(format, &request, &body);
+                let streamed = stream(format, &request, &events);
+                let done = streamed
+                    .iter()
+                    .find(|e| e["type"] == "response.function_call_arguments.done")
+                    .unwrap();
+                (
+                    parse_args(&responses_function_call(&answer)["arguments"]),
+                    parse_args(&done["arguments"]),
+                )
+            }
+        };
+        assert_eq!(&buffered, client, "{format:?} buffered");
+        assert_eq!(&streamed, client, "{format:?} streamed");
+    }
+}
+
+/// Arguments under a reference to a static anchor, or to an embedded `$id` resource, are
+/// renamed where the target declares them (#196).
+#[test]
+fn references_by_anchor_and_id_rename_arguments() {
+    let anchored = json!({"$defs": {"item": {"$anchor": "item", "type": "object",
+        "properties": {"x y": {"type": "string"}}}},
+        "type": "object", "properties": {"copy": {"$ref": "#item"}}});
+    assert_maps(
+        &anchored,
+        &json!({"copy": {"x y": "a"}}),
+        &json!({"copy": {"x_y": "a"}}),
+    );
+    let embedded = json!({"$id": "https://example.com/root.json",
+        "$defs": {"child": {"$id": "child.json", "type": "object", "properties": {"x/y": {"type": "string"}}}},
+        "type": "object", "properties": {"copy": {"$ref": "child.json"}, "other": {"$ref": "other.json"}}});
+    assert_maps(
+        &embedded,
+        &json!({"copy": {"x/y": "a"}, "other": {"x/y": "b"}}),
+        &json!({"copy": {"x_y": "a"}, "other": {"x/y": "b"}}),
+    );
+}
+
+/// A schema that may resolve a reference through dynamic scope is declined as a whole.
+#[test]
+fn dynamic_scope_schemas_are_left_as_sent() {
+    assert_left_as_sent(
+        json!({"$dynamicAnchor": "node", "type": "object", "properties": {
+            "a b": {"type": "string"}, "kids": {"type": "array", "items": {"$dynamicRef": "#node"}}}}),
+        json!({"a b": "x", "kids": [{"a b": "y"}]}),
+    );
+    assert_left_as_sent(
+        json!({"$recursiveAnchor": true, "type": "object", "properties": {
+            "a b": {"type": "string"}, "kids": {"type": "array", "items": {"$recursiveRef": "#"}}}}),
+        json!({"a b": "x", "kids": [{"a b": "y"}]}),
+    );
+}
+
 /// A schema past the subschema cap (512) is declined as a whole: the schema, replayed
 /// arguments and returned arguments all keep the client's spelling, never a mix.
 #[test]
