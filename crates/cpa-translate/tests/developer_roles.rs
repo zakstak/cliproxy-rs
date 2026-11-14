@@ -18,6 +18,7 @@ const CTX: RequestCtx<'static> = RequestCtx {
     model: "grok-4.7",
     stream: false,
     tool_search: false,
+    system_turns: false,
 };
 
 /// A leading developer message with string content and a later one with a text-part

@@ -21,15 +21,16 @@ pub(crate) fn stream(pair: &Pair, ctx: &ResponseCtx<'_>) -> Box<dyn StreamTransl
 /// orphan-delegation and multi-agent v2 rewrites, Go's `...WithCompat` translators for an
 /// is-compat model, else `sdktranslator.TranslateRequest` (a registered pair with the
 /// summary pipeline, or Go's top-level model rewrite). Streaming translation whenever
-/// the client is not Claude.
+/// the client is not Claude. `system_turns` is [`RequestCtx::system_turns`].
 pub(crate) fn request(
     req: &ExecRequest,
     codex: cpa_common::codex_client::Settings,
     model: &str,
     is_compat: bool,
     tool_search: bool,
+    system_turns: bool,
 ) -> Result<Bytes, ExecError> {
-    translate_body(req, &req.body, codex, model, is_compat, tool_search)
+    translate_body(req, &req.body, codex, model, is_compat, tool_search, system_turns)
 }
 
 /// Go `originalTranslated` from `TranslateRequestPairWithAPIKeyModelCompatibility`: the
@@ -45,6 +46,7 @@ pub(crate) fn original(
     model: &str,
     is_compat: bool,
     tool_search: bool,
+    system_turns: bool,
 ) -> Result<Bytes, ExecError> {
     // Go reuses the translation when both payloads are the same slice; equal bytes
     // translate identically.
@@ -59,7 +61,15 @@ pub(crate) fn original(
         // only the working body sets (such as `max_tokens`) suppresses a default Go would
         // apply. No server path sends distinct bodies that refuse only the baseline today.
         // Return the partial body with translator errors if one does.
-        match translate_body(req, &req.original_body, codex, model, is_compat, tool_search) {
+        match translate_body(
+            req,
+            &req.original_body,
+            codex,
+            model,
+            is_compat,
+            tool_search,
+            system_turns,
+        ) {
             Ok(original) => (&req.original_body, original),
             Err(_) => (&req.body, translated.clone()),
         }
@@ -98,6 +108,7 @@ pub(crate) fn count_original(
     model: &str,
     is_compat: bool,
     tool_search: bool,
+    system_turns: bool,
 ) -> Result<Bytes, ExecError> {
     // Equal bytes translate alike except for generated tool-call IDs (a call without an
     // `id` gets a random one in each translation, claude_chat_request.rs `tool_use`),
@@ -106,7 +117,15 @@ pub(crate) fn count_original(
     if req.original_body.is_empty() || req.original_body == req.body {
         return Ok(translated.clone());
     }
-    translate_body(req, &req.original_body, codex, model, is_compat, tool_search)
+    translate_body(
+        req,
+        &req.original_body,
+        codex,
+        model,
+        is_compat,
+        tool_search,
+        system_turns,
+    )
 }
 
 fn translate_body(
@@ -116,11 +135,13 @@ fn translate_body(
     model: &str,
     is_compat: bool,
     tool_search: bool,
+    system_turns: bool,
 ) -> Result<Bytes, ExecError> {
     let ctx = RequestCtx {
         model,
         stream: req.stream || req.source_format != Format::Claude,
         tool_search,
+        system_turns,
     };
     let client = crate::codex_client::Client {
         headers: &req.headers,
@@ -675,14 +696,14 @@ mod tests {
         );
         req.body = Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#);
         let codex = Default::default();
-        let translated = request(&req, codex, "m", false, false).unwrap();
+        let translated = request(&req, codex, "m", false, false, false).unwrap();
         assert_eq!(
-            original(&req, &translated, codex, "m", false, false).unwrap(),
+            original(&req, &translated, codex, "m", false, false, false).unwrap(),
             translated
         );
         // The working payload's refusal still counts.
         std::mem::swap(&mut req.body, &mut req.original_body);
-        assert!(request(&req, codex, "m", false, false).is_err());
+        assert!(request(&req, codex, "m", false, false, false).is_err());
     }
 
     #[test]
@@ -691,11 +712,11 @@ mod tests {
         request.source_format = Format::Claude;
         request.body = Bytes::from_static(br#"{  "model" : "claude", "messages": [] }"#);
         assert_eq!(
-            super::request(&request, Default::default(), "claude", false, false).unwrap(),
+            super::request(&request, Default::default(), "claude", false, false, false).unwrap(),
             request.body
         );
         assert_eq!(
-            super::request(&request, Default::default(), "claude-base", false, false).unwrap(),
+            super::request(&request, Default::default(), "claude-base", false, false, false).unwrap(),
             br#"{  "model" : "claude-base", "messages": [] }"#.as_slice()
         );
     }

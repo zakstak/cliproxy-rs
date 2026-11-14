@@ -81,6 +81,7 @@ fn fallbacks_match_go() {
                     model: v["model"].as_str().unwrap_or_default(),
                     stream: false,
                     tool_search: false,
+                    system_turns: false,
                 };
                 translate_request(client, upstream, &ctx, &input).unwrap()
             }

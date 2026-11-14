@@ -401,6 +401,7 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
                 model: &base_model,
                 stream,
                 tool_search: false,
+                system_turns: false,
             },
             body,
             &client,

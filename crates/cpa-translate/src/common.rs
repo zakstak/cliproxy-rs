@@ -1148,6 +1148,7 @@ mod tests {
                 model: "m",
                 stream: false,
                 tool_search: false,
+                system_turns: false,
             };
             crate::translate_request(
                 cpa_core::format::Format::Claude,

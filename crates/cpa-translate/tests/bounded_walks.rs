@@ -220,6 +220,7 @@ fn translate_all(depth: usize, code_events: usize) -> Vec<(String, bool, usize, 
                 model: "m",
                 stream,
                 tool_search: false,
+                system_turns: false,
             };
             let out = cpa_translate::translate_request(client, upstream, &ctx, body.as_bytes());
             if let Ok(out) = &out {
@@ -238,6 +239,7 @@ fn translate_all(depth: usize, code_events: usize) -> Vec<(String, bool, usize, 
         let codex_ctx = RequestCtx {
             model: "m",
             stream: true,
+            system_turns: false,
             tool_search: false,
         };
         if let Some(out) = cpa_translate::codex_request(client, &codex_ctx, body.as_bytes()) {
@@ -353,6 +355,7 @@ fn schema_normalization_stops_at_the_walk_limit() {
         );
         let ctx = RequestCtx {
             model: "m",
+            system_turns: false,
             stream: false,
             tool_search: false,
         };

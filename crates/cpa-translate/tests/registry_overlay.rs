@@ -41,6 +41,7 @@ fn thinking(model: &str, effort: &str) -> String {
             model,
             stream: false,
             tool_search: false,
+            system_turns: false,
         },
         body.as_bytes(),
     )
