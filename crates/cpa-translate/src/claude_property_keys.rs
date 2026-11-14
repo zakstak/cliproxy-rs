@@ -90,6 +90,11 @@ struct SchemaTokens {
 /// both); array members list property names.
 const DEPENDENCY_KEYWORDS: [&[u8]; 3] = [b"dependentRequired", b"dependentSchemas", b"dependencies"];
 
+/// JSON Schema's type names.
+const TYPE_NAMES: [&[u8]; 7] = [
+    b"null", b"boolean", b"object", b"array", b"number", b"integer", b"string",
+];
+
 /// Keywords that never stop a subschema from deciding [`Node::check`] for sure: the
 /// ones it evaluates and annotations.
 /// `allOf` and `$ref` count when their targets do ([`Sets::check`]).
@@ -214,9 +219,10 @@ impl Pattern {
 #[derive(Debug, Default)]
 struct Check {
     types: Option<Vec<Vec<u8>>>,
-    /// `const` and `enum`, each a list the instance must be one of. Lists with a
-    /// structured value are left out (and make the check incomplete).
-    values: Vec<Vec<Scalar>>,
+    /// `const` and `enum`, each a set the instance must be in. Lists with a structured
+    /// value are left out (and make the check incomplete).
+    values: Vec<Values>,
+    /// Distinct `required` keys.
     required: Vec<Vec<u8>>,
     /// Property subschemas, checked against the member value.
     members: Vec<(Vec<u8>, NodeId)>,
@@ -232,6 +238,63 @@ enum Scalar {
     Bool(bool),
     Number(Number),
     String(Vec<u8>),
+}
+
+/// A `const` or `enum` list, hashed so that a lookup costs the same however long the
+/// list is.
+#[derive(Debug, Default)]
+struct Values {
+    exact: HashSet<ValueKey>,
+    /// The `f64` bits of numbers `f64` does not hold exactly.
+    inexact: HashSet<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum ValueKey {
+    Null,
+    Bool(bool),
+    String(Vec<u8>),
+    Number(u64),
+}
+
+/// `f64` bits with `-0.0` as `0.0`, so equal numbers share a key.
+fn number_bits(value: f64) -> u64 {
+    if value == 0.0 { 0 } else { value.to_bits() }
+}
+
+impl Values {
+    fn new(list: Vec<Scalar>) -> Values {
+        let mut values = Values::default();
+        for v in list {
+            match v {
+                Scalar::Number(n) if !n.exact => {
+                    values.inexact.insert(number_bits(n.value));
+                }
+                v => {
+                    values.exact.insert(v.key());
+                }
+            }
+        }
+        values
+    }
+
+    /// [`Scalar::same`] against every entry, in one lookup.
+    fn contains(&self, value: &Scalar) -> Option<bool> {
+        match value {
+            Scalar::Number(n) => {
+                let bits = number_bits(n.value);
+                let exact = self.exact.contains(&ValueKey::Number(bits));
+                if exact && n.exact {
+                    Some(true)
+                } else if exact || self.inexact.contains(&bits) {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            v => Some(self.exact.contains(&v.key())),
+        }
+    }
 }
 
 /// A JSON number as `f64`, and whether that holds it exactly.
@@ -252,9 +315,11 @@ impl Number {
             .filter(|b| b.is_ascii_digit())
             .skip_while(|&&b| b == b'0')
             .count();
+        // Zero literals are exact; any other literal only in the normal range, where 15
+        // significant digits round-trip (underflow and subnormals lose them).
         Some(Number {
             value,
-            exact: value.is_finite() && digits <= 15,
+            exact: digits == 0 || (value.is_normal() && digits <= 15),
         })
     }
 }
@@ -270,9 +335,19 @@ impl Scalar {
         }
     }
 
+    fn key(&self) -> ValueKey {
+        match self {
+            Scalar::Null => ValueKey::Null,
+            Scalar::Bool(b) => ValueKey::Bool(*b),
+            Scalar::String(s) => ValueKey::String(s.clone()),
+            Scalar::Number(n) => ValueKey::Number(number_bits(n.value)),
+        }
+    }
+
     /// JSON Schema equality (`1` equals `1.0`); `None` when two numbers round to the
     /// same `f64` but either is not held exactly. Different `f64` values always differ,
     /// since rounding keeps order.
+    #[cfg(test)]
     fn same(&self, other: &Scalar) -> Option<bool> {
         match (self, other) {
             (Scalar::Null, Scalar::Null) => Some(true),
@@ -342,7 +417,7 @@ fn scalar_check(check: &Check, raw: &[u8]) -> Option<bool> {
         let Some(value) = &value else {
             return Some(false);
         };
-        match any_of(list.iter().map(|v| value.same(v))) {
+        match list.contains(value) {
             Some(false) => return Some(false),
             None => verdict = None,
             Some(true) => {}
@@ -766,6 +841,10 @@ impl<'k> Sets<'k> {
             Some(true) => {}
         }
         if instance.raw.first() == Some(&b'{') {
+            // More distinct required keys than members: one is missing.
+            if check.required.len() > instance.members.len() {
+                return Some(false);
+            }
             for key in &check.required {
                 if !instance.members.contains_key(self.keys.spelling(key, self.direction)) {
                     return Some(false);
@@ -1146,7 +1225,7 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                 }
             } else if name == b"const" {
                 match Scalar::parse(member).filter(|_| !object && !array) {
-                    Some(value) => node.check.values.push(vec![value]),
+                    Some(value) => node.check.values.push(Values::new(vec![value])),
                     None => complete = false,
                 }
             } else if name == b"enum" && array {
@@ -1159,13 +1238,27 @@ fn walk(schema: &[u8]) -> (SchemaTokens, Tree) {
                     }
                 });
                 match values {
-                    Some(list) => node.check.values.push(list),
+                    Some(list) => node.check.values.push(Values::new(list)),
                     None => complete = false,
                 }
             }
             true
         });
         node.check.complete = complete;
+        // Distinct entries, in order, so a `required` check costs at most the instance's
+        // own size and a `type` check at most the seven type names; any other name makes
+        // the type unknown.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        node.check.required.retain(|key| seen.insert(key.clone()));
+        if let Some(types) = &mut node.check.types {
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            if types.iter().all(|t| TYPE_NAMES.contains(&&t[..])) {
+                types.retain(|t| seen.insert(t.clone()));
+            } else {
+                node.check.types = None;
+                node.check.complete = false;
+            }
+        }
         node.evaluates.rest |= tuple_items && additional_items;
         for Child {
             keyword,
@@ -1756,6 +1849,89 @@ mod tests {
         assert_eq!(type_is(b"9007199254740993", b"integer"), None);
         assert_eq!(type_is(b"1.5", b"integer"), Some(false));
         assert_eq!(type_is(b"3", b"integer"), Some(true));
+    }
+
+    #[test]
+    fn unknown_type_names_leave_the_check_undecided() {
+        // `"float"` is no JSON Schema type: the `if` cannot be decided, so both sides apply.
+        let schema = br##"{"properties":{"p":{"properties":{"id":{}},
+            "if":{"properties":{"id":{"type":["float","string","string"]}},"required":["id","id"]},
+            "then":{"additionalProperties":true},"else":{"properties":{"x y":{}}}}}}"##;
+        round_trip(schema, r##"{"p":{"id":"s","x y":1}}"##, r##"{"p":{"id":"s","x_y":1}}"##);
+        // Known names, repeated, still decide: a string `id` takes `then`.
+        let known = br##"{"properties":{"p":{"properties":{"id":{}},
+            "if":{"properties":{"id":{"type":["string","string"]}},"required":["id","id"]},
+            "then":{"additionalProperties":true},"else":{"properties":{"x y":{}}}}}}"##;
+        round_trip(known, r##"{"p":{"id":"s","x_y":1}}"##, r##"{"p":{"id":"s","x_y":1}}"##);
+        round_trip(known, r##"{"p":{"id":1,"x y":1}}"##, r##"{"p":{"id":1,"x_y":1}}"##);
+    }
+
+    #[test]
+    fn underflowing_numbers_are_not_exact() {
+        let zero = Scalar::parse(b"0").unwrap();
+        for tiny in [&b"1e-999"[..], b"1e-324", b"2e-324", b"4e-320"] {
+            let n = Scalar::parse(tiny).unwrap();
+            assert_eq!(
+                n.same(&zero),
+                if tiny == b"4e-320" { Some(false) } else { None },
+                "{tiny:?}"
+            );
+            assert_eq!(type_is(tiny, b"integer"), None, "{tiny:?}");
+        }
+        assert_eq!(
+            Scalar::parse(b"1e-324")
+                .unwrap()
+                .same(&Scalar::parse(b"2e-324").unwrap()),
+            None
+        );
+        assert_eq!(Scalar::parse(b"0e-999").unwrap().same(&zero), Some(true));
+        assert_eq!(Scalar::parse(b"-0.0").unwrap().same(&zero), Some(true));
+        assert_eq!(Scalar::parse(b"1e-300").unwrap().same(&zero), Some(false));
+        // In a branch: `id: 1e-999` cannot be told from `const: 0`, so both sides apply.
+        let schema = br##"{"properties":{"p":{"properties":{"id":{}},
+            "if":{"properties":{"id":{"const":0}},"required":["id"]},
+            "then":{"additionalProperties":true},"else":{"properties":{"x y":{}}}}}}"##;
+        round_trip(
+            schema,
+            r##"{"p":{"id":1e-999,"x y":1}}"##,
+            r##"{"p":{"id":1e-999,"x_y":1}}"##,
+        );
+        round_trip(schema, r##"{"p":{"id":0.0,"x_y":1}}"##, r##"{"p":{"id":0.0,"x_y":1}}"##);
+    }
+
+    #[test]
+    fn long_enums_and_required_lists_check_by_lookup() {
+        let ids: Vec<String> = (1..=2000).map(|i| i.to_string()).collect();
+        let keys: Vec<String> = (1..=2000).map(|i| format!(r#""k{i}""#)).collect();
+        let schema = format!(
+            r##"{{"properties":{{"rows":{{"items":{{"properties":{{"id":{{}}}},
+            "if":{{"properties":{{"id":{{"enum":[{}]}}}},"required":["id"]}},
+            "then":{{"properties":{{"x y":{{}}}}}},"else":{{"additionalProperties":true}},
+            "anyOf":[{{"required":[{}]}},true]}}}}}}}}"##,
+            ids.join(","),
+            keys.join(",")
+        );
+        let keys = PropertyKeys::of(schema.as_bytes()).unwrap();
+        let sets = Sets::new(&keys, Direction::ToClaude);
+        let alternative = keys.tree.resolve(b"#/properties/rows/items/anyOf/0").unwrap();
+        let condition = keys.tree.resolve(b"#/properties/rows/items/if").unwrap();
+        let row = |raw: &'static [u8]| Instance {
+            raw,
+            members: [(b"id".to_vec(), &raw[6..raw.len() - 1])].into_iter().collect(),
+        };
+        let inside = row(br#"{"id":2000}"#);
+        let outside = row(br#"{"id":2001}"#);
+        let mut memo = Memo::default();
+        assert_eq!(sets.check(condition, &inside, &mut memo), Some(true));
+        let mut memo = Memo::default();
+        assert_eq!(sets.check(condition, &outside, &mut memo), Some(false));
+        // 2000 required keys against a one-member row: missing without scanning them.
+        assert_eq!(sets.check(alternative, &inside, &mut Memo::default()), Some(false));
+        let client = r##"{"rows":[{"id":2000,"x y":1},{"id":2001,"x y":2}]}"##;
+        assert_eq!(
+            keys.to_claude(client.as_bytes()),
+            br##"{"rows":[{"id":2000,"x_y":1},{"id":2001,"x y":2}]}"##
+        );
     }
 
     #[test]
