@@ -666,6 +666,8 @@ fn handshake_headers(credential: &Credential, token: &str, session_id: &str, req
     if !session_id.is_empty() {
         set("x-grok-conv-id", session_id);
     }
+    // Go v8.0.67 `ensureXAIUserAgent` (#88): before the `header:*` attributes.
+    set("user-agent", &crate::xai::user_agent(&req.headers));
     let session = cpa_common::session::cpa_session_id(req.session.as_deref());
     for (name, value) in cpa_common::headers::custom_headers(&credential.attributes, &req.headers, session.as_deref()) {
         set(&name, &value);
