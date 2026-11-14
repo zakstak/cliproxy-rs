@@ -272,8 +272,11 @@ impl Merged {
     /// `StreamUsageBuffer.Observe(detail, true)`: a detail with tokens (or without a tier)
     /// replaces the buffer, keeping the old tier when it has none; a tier-only detail
     /// updates just the tier.
+    /// Reported zero usage with a tier is usage while nothing was reported before (U1,
+    /// #99).
     fn observe(&mut self, usage: Option<(cpa_core::format::Format, Vec<u8>)>, tier: String, nonzero: bool) {
-        if tier.is_empty() || nonzero {
+        let first_usage = usage.is_some() && self.usage.is_none();
+        if tier.is_empty() || nonzero || first_usage {
             self.usage = usage;
             if !tier.is_empty() {
                 self.tier = tier;
@@ -756,6 +759,19 @@ pub(crate) fn capture_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U1 (#99): a deferred Muse usage buffer keeps reported zero usage when the
+    /// terminal event also names a service tier.
+    #[test]
+    fn deferred_zero_usage_with_a_tier_is_kept() {
+        let mut merged = Merged::default();
+        let zero = br#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#;
+        assert!(observe_parsed(&mut merged, cpa_core::format::Format::Codex, zero));
+        let (_, payload) = merged.payload().unwrap();
+        let payload = String::from_utf8(payload).unwrap();
+        assert!(payload.contains(r#""usage":{"input_tokens":0"#), "{payload}");
+        assert!(payload.contains(r#""service_tier":"default""#), "{payload}");
+    }
 
     /// U1 (#99): which Responses events carry output for TTFT.
     #[test]

@@ -619,9 +619,13 @@ pub struct StreamUsage {
 impl StreamUsage {
     /// Go `StreamUsageBuffer.Observe`: the latest usage wins; a tier-only update keeps
     /// the usage and replaces the tier.
+    ///
+    /// Reported zero usage with a tier is usage, not a tier-only update, while nothing
+    /// was reported before (U1, #99); it never replaces earlier usage.
     fn observe(&mut self, detail: Detail) {
         let tier = detail.response_service_tier.trim().to_owned();
-        if tier.is_empty() || has_tokens(&detail) {
+        let first_usage = detail.breakdown.is_some() && self.detail.breakdown.is_none();
+        if tier.is_empty() || has_tokens(&detail) || first_usage {
             let preserved = std::mem::take(&mut self.detail.response_service_tier);
             self.detail = detail;
             if self.detail.response_service_tier.is_empty() {
@@ -2674,6 +2678,8 @@ pub fn publish_home_unauthorized(
         } else {
             body.to_owned()
         },
+        // No provider usage (U1, #99).
+        usage_observed: Some(false),
         ..Record::default()
     };
     // Go 37fe2608: the record carries the request's client key and access provider.
@@ -2710,6 +2716,27 @@ mod tests {
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/server_go.json");
+
+    /// U1 (#99): reported zero usage is usage, also when the terminal event names a
+    /// service tier; it never replaces usage an earlier event reported.
+    #[test]
+    fn zero_usage_with_a_tier_is_reported_usage() {
+        let zero = r#"data: {"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#;
+        let mut stream = StreamUsage::default();
+        stream.line(Format::Codex, zero.as_bytes());
+        assert!(usage_reported(stream.detail()), "{:?}", stream.detail());
+        assert_eq!(stream.detail().unwrap().response_service_tier, "default");
+
+        let mut chat = StreamUsage::default();
+        for line in [
+            r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+            r#"data: {"service_tier":"flex","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        ] {
+            chat.line(Format::OpenAI, line.as_bytes());
+        }
+        let detail = chat.detail().unwrap();
+        assert_eq!((detail.total, detail.response_service_tier.as_str()), (5, "flex"));
+    }
 
     /// U1 (#99): Claude's documented `usage.service_tier` and `usage.server_tool_use`
     /// counts (platform.claude.com service-tiers, web-search and web-fetch pages, read
@@ -3630,6 +3657,8 @@ mod tests {
             fields.insert("api_key".into(), "fake-client-key".into());
             fields.insert("is_native_key".into(), true.into());
             fields.insert("access_provider".into(), "config-inline".into());
+            // Not in Go's record (U1, #99): a record without provider usage says so.
+            fields.insert("usage_observed".into(), false.into());
             for record in [&mut want, &mut got[0]] {
                 let record = record.as_object_mut().unwrap();
                 assert!(record.remove("timestamp").is_some(), "{name}");
