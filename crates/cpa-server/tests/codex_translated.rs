@@ -935,6 +935,31 @@ fn incomplete(details: &str, text: &str) -> Reply {
     Reply::sse(sse)
 }
 
+/// A `response.created`, a function call cut off after `{"city":`, then a
+/// `response.incomplete` with `reason`. With `done`, the call item is also reported done
+/// before the terminal event, as an upstream may; otherwise only the terminal output
+/// carries it.
+fn incomplete_call(reason: &str, done: bool) -> Reply {
+    let item = r#"{"type":"function_call","id":"fc_1","status":"incomplete","name":"get_weather","call_id":"call_9","arguments":"{\"city\":"}"#;
+    let mut sse = String::from(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    sse.push_str(&format!(
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{}}}\n\n",
+        item.replace(r#""arguments":"{\"city\":""#, r#""arguments":"""#)
+    ));
+    sse.push_str("event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\"}\n\n");
+    if done {
+        sse.push_str(&format!(
+            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{item}}}\n\n"
+        ));
+    }
+    sse.push_str(&format!(
+        "event: response.incomplete\ndata: {{\"type\":\"response.incomplete\",\"response\":{{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{{\"reason\":\"{reason}\"}},\"output\":[{item}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n"
+    ));
+    Reply::sse(sse)
+}
+
 /// The stop a Claude and a Chat client read from `answer`: Claude `stop_reason`, Chat
 /// `finish_reason`, streamed or buffered.
 fn client_stop(answer: &str) -> Option<String> {
@@ -965,7 +990,8 @@ fn client_stop(answer: &str) -> Option<String> {
 /// the response fails with an upstream error that names the reason: the first-party
 /// `sse-incomplete-partial` (an `invalid_recipient` stop inside a call), an unknown or
 /// missing reason, and `interrupted`, which the first-party client reads as a turn that
-/// did not end (`codex-api/src/sse/responses.rs:451-506`).
+/// did not end (`codex-api/src/sse/responses.rs:451-506`). An incomplete response that
+/// carries a tool call fails whatever its reason.
 #[tokio::test]
 async fn incomplete_responses_keep_their_meaning() {
     let partial = Reply::sse(fixture("sse-incomplete-partial").bytes());
@@ -995,6 +1021,12 @@ async fn incomplete_responses_keep_their_meaning() {
             (incomplete(r#"{"reason":"unknown"}"#, ""), "unknown"),
             (incomplete("null", "Partial"), "unknown"),
             (incomplete(r#"{"reason":"interrupted"}"#, "Partial"), "interrupted"),
+            // A Claude client would read a tool call in an incomplete response as a
+            // `tool_use` stop, and a buffered one would get `{}` for the cut-off
+            // arguments, so a call fails whatever the reason.
+            (incomplete_call("max_output_tokens", true), "max_output_tokens"),
+            (incomplete_call("max_output_tokens", false), "max_output_tokens"),
+            (incomplete_call("content_filter", true), "content_filter"),
         ];
         for (reply, reason) in failing {
             for (path, body) in [
@@ -1012,9 +1044,9 @@ async fn incomplete_responses_keep_their_meaning() {
                     answer.contains(&format!("upstream response incomplete: {reason}")),
                     "{path} stream={stream}: the error names the reason: {answer}"
                 );
-                assert!(!answer.contains("tool_use\""), "no call from a cut-off item: {answer}");
                 if !stream {
                     assert_eq!(status, 502, "{path} {reason}: {answer}");
+                    assert!(!answer.contains("tool_use\""), "no call from a cut-off item: {answer}");
                 }
                 assert_eq!(proxy.upstream.http().len(), 1, "never retried: {path} {reason}");
             }

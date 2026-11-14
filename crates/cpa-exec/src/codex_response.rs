@@ -588,9 +588,14 @@ pub(crate) fn bootstrap_overload(body: &str) -> ExecError {
 /// a request-scoped 502 that names the reason, whatever output came before, instead of
 /// reaching the client as a normal stop or a complete call.
 ///
+/// A response that `called` a tool (an earlier event carried a call item) or whose
+/// output carries one fails whatever its reason: a Claude client reads a call as a
+/// `tool_use` stop, ahead of `max_tokens` or `refusal`, and a buffered one gets `{}` for
+/// arguments that were cut off.
+///
 /// Only the translated route ([`Processor`]) applies it. Native HTTP and WebSocket routes
 /// deliver every `response.incomplete` as sent (#25).
-pub(crate) fn untranslatable_incomplete(payload: &str) -> Option<ExecError> {
+pub(crate) fn untranslatable_incomplete(payload: &str, called: bool) -> Option<ExecError> {
     if rawjson::get(payload, "type").str() != "response.incomplete" {
         return None;
     }
@@ -599,10 +604,28 @@ pub(crate) fn untranslatable_incomplete(payload: &str) -> Option<ExecError> {
         Kind::String if !reason.str().is_empty() => reason.str(),
         _ => "unknown",
     };
-    if matches!(reason, "max_output_tokens" | "content_filter") {
+    let calls = || {
+        let output = rawjson::get(payload, "response.output");
+        output.kind() == Kind::Array && output.items().iter().any(|item| is_call(item.get("type").str()))
+    };
+    if matches!(reason, "max_output_tokens" | "content_filter") && !called && !calls() {
         return None;
     }
     Some(request_scoped(502, &format!("upstream response incomplete: {reason}")))
+}
+
+/// Whether an output item of `kind` is a call of a client tool, which the translated
+/// route's clients read as a tool call.
+fn is_call(kind: &str) -> bool {
+    matches!(kind, "function_call" | "custom_tool_call")
+}
+
+/// Whether `payload` is an output-item event that carries a call ([`is_call`]).
+fn carries_call(payload: &str) -> bool {
+    matches!(
+        rawjson::get(payload, "type").str(),
+        "response.output_item.added" | "response.output_item.done"
+    ) && is_call(rawjson::get(payload, "item.type").str())
 }
 
 /// `isCodexBootstrapBufferableEvent`: frames that show the client nothing yet.
@@ -782,6 +805,8 @@ pub(crate) struct Processor {
     items: OutputItems,
     preserve_native: bool,
     model_level_cooling: bool,
+    /// Whether an output-item event carried a call ([`untranslatable_incomplete`]).
+    called: bool,
     /// The last completed payload (response.completed/incomplete), for buffered callers.
     pub completed: Option<String>,
     /// Usage records see every upstream payload in Codex format (`observeCodexTokenEvent`).
@@ -798,6 +823,7 @@ impl Processor {
             items: OutputItems::default(),
             preserve_native,
             model_level_cooling,
+            called: false,
             completed: None,
             usage: Default::default(),
             wire: Default::default(),
@@ -891,7 +917,8 @@ impl Processor {
                             before: framed(&lines),
                         };
                     }
-                    if let Some(error) = untranslatable_incomplete(payload) {
+                    self.called |= carries_call(payload);
+                    if let Some(error) = untranslatable_incomplete(payload, self.called) {
                         return Step::Fail {
                             error,
                             body: None,
@@ -968,10 +995,11 @@ impl Processor {
                 if let Some((error, _)) = received_failure(data, self.model_level_cooling) {
                     return Err(error);
                 }
+                self.called |= carries_call(payload);
                 match rawjson::get(payload, "type").str() {
                     "response.output_item.done" => self.items.collect(payload),
                     "response.completed" | "response.incomplete" => {
-                        if let Some(error) = untranslatable_incomplete(payload) {
+                        if let Some(error) = untranslatable_incomplete(payload, self.called) {
                             return Err(error);
                         }
                         return Ok(Some(self.items.patch(payload.to_owned())));
@@ -1191,13 +1219,25 @@ mod incomplete_tests {
         )
     }
 
-    /// A reason with a client stop translates; every other reason fails and is named,
-    /// `unknown` when missing, null, empty or not a string.
+    /// A reason with a client stop translates unless a call was made; every other reason
+    /// fails and is named, `unknown` when missing, null, empty or not a string.
     #[test]
     fn only_reasons_with_a_client_stop_translate() {
         for reason in ["content_filter", "max_output_tokens"] {
             let payload = incomplete(&format!(r#""incomplete_details":{{"reason":"{reason}"}},"#));
-            assert!(untranslatable_incomplete(&payload).is_none(), "{reason}");
+            assert!(untranslatable_incomplete(&payload, false).is_none(), "{reason}");
+            assert!(
+                untranslatable_incomplete(&payload, true).is_some(),
+                "{reason} after a call"
+            );
+            let call = payload.replace(
+                r#""output":[]"#,
+                r#""output":[{"type":"function_call","status":"incomplete","arguments":"{"}]"#,
+            );
+            assert!(
+                untranslatable_incomplete(&call, false).is_some(),
+                "{reason} with a call"
+            );
         }
         for (details, named) in [
             ("", "unknown"),
@@ -1211,7 +1251,7 @@ mod incomplete_tests {
                 "invalid_recipient",
             ),
         ] {
-            let error = untranslatable_incomplete(&incomplete(details)).expect(details);
+            let error = untranslatable_incomplete(&incomplete(details), false).expect(details);
             assert_eq!(error.status, 502, "{details}");
             assert_eq!(error.scope, cpa_core::exec::FailureScope::Request, "{details}");
             assert!(
@@ -1221,7 +1261,7 @@ mod incomplete_tests {
             );
         }
         let completed = r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#;
-        assert!(untranslatable_incomplete(completed).is_none());
+        assert!(untranslatable_incomplete(completed, true).is_none());
     }
 }
 

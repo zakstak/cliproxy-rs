@@ -1243,7 +1243,11 @@ its own error format.
 
 A `response.incomplete` is never a normal stop. A reason the client API has a stop for
 becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat `length`, and
-`content_filter` is Claude `refusal` and Chat `content_filter`. Claude Messages and Chat
+`content_filter` is Claude `refusal` and Chat `content_filter`, unless the response
+carries a tool call (`function_call` or `custom_tool_call`, in an output-item event or
+its output). A Claude client reads a call as a `tool_use` stop ahead of either reason,
+and a buffered one gets `{}` for arguments that were cut off, so such a response fails
+as below whatever its reason. Claude Messages and Chat
 Completions have no stop for any other reason: `interrupted`, which the pinned client
 reads as a turn that did not end, and every reason it reads as a terminal
 `ResponseIncomplete`, `unknown` when missing or not a string
