@@ -275,27 +275,44 @@ fn apply_custom(h: &mut GoHeaders, credential: &Credential, req: &ExecRequest) {
     }
 }
 
+/// The Grok CLI's User-Agent (`xaiDefaultUserAgent`).
+fn workspace_user_agent() -> String {
+    format!("xai-grok-workspace/{CLIENT_VERSION}")
+}
+
+/// The User-Agent of an xAI request outside the Grok CLI chat proxy: the API, a custom
+/// base URL and the Responses WebSocket (#88, Go v8.0.67 `ensureXAIUserAgent`,
+/// 5026f365). It is the caller's first `User-Agent` value, trimmed, or the Grok CLI's
+/// when that value is absent or blank. No other caller header is copied. A
+/// `header:User-Agent` attribute, applied after this, still replaces it.
+pub(crate) fn user_agent(client: &HeaderMap) -> String {
+    match client.get(http::header::USER_AGENT).map(|v| trim_space(v.as_bytes())) {
+        // Lossy like a `$Header` reference (`custom_headers`): request headers are text.
+        Some(caller) if !caller.is_empty() => String::from_utf8_lossy(caller).into_owned(),
+        _ => workspace_user_agent(),
+    }
+}
+
 /// `applyXAIHeaders`.
 fn plain_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
     let mut h = default_headers(token, stream, session);
+    h.set("User-Agent", user_agent(&req.headers));
     apply_custom(&mut h, c, req);
     h
 }
 
-/// `applyXAIChatHeaders`: the Grok CLI identity when an OAuth credential talks to the
-/// chat proxy.
+/// `applyXAIChatHeaders`: the fixed Grok CLI identity when an OAuth credential talks to
+/// the chat proxy; any other base URL gets [`plain_headers`].
 fn chat_headers(c: &Credential, token: &str, stream: bool, session: &str, req: &ExecRequest) -> GoHeaders {
-    if using_api(c) {
+    if using_api(c) || !is_cli_chat_proxy(&chat_base_url(c)) {
         return plain_headers(c, token, stream, session, req);
     }
     let mut h = default_headers(token, stream, session);
-    if is_cli_chat_proxy(&chat_base_url(c)) {
-        h.set("X-XAI-Token-Auth", "xai-grok-cli");
-        h.set("x-grok-client-version", CLIENT_VERSION);
-        h.set("User-Agent", format!("xai-grok-workspace/{CLIENT_VERSION}"));
-        h.set("x-grok-client-identifier", "grok-shell");
-        h.set("x-authenticateresponse", "authenticate-response");
-    }
+    h.set("X-XAI-Token-Auth", "xai-grok-cli");
+    h.set("x-grok-client-version", CLIENT_VERSION);
+    h.set("User-Agent", workspace_user_agent());
+    h.set("x-grok-client-identifier", "grok-shell");
+    h.set("x-authenticateresponse", "authenticate-response");
     apply_custom(&mut h, c, req);
     h
 }

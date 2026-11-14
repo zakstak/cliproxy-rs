@@ -307,9 +307,11 @@ class PredicateTests(unittest.TestCase):
             from differential import comparable, differences
             return judge.judge(case, go, rust, differences(comparable(go), comparable(rust)), pins["divergences"],
                                "selective", pins, FakeRun({}), ROOT)["verdict"]
-        self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.1")), "pass")
-        self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.2")), "fail")
-        self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.1", [["X-Extra", "1"]])), "fail")
+        self.assertEqual(run(grok("127.0.0.3:8080", "xai-grok-workspace/1.0.44")), "pass")
+        self.assertEqual(run(grok("127.0.0.3:8080", "xai-grok-workspace/1.0.45")), "fail")
+        # The v8.0.35 default no longer explains the delta (#88).
+        self.assertEqual(run(grok("127.0.0.3:8080", "Go-http-client/1.1")), "fail")
+        self.assertEqual(run(grok("127.0.0.3:8080", "xai-grok-workspace/1.0.44", [["X-Extra", "1"]])), "fail")
 
     def test_created_timestamps_may_only_differ_within_their_skew(self):
         pins = pins_with(["openai-created-timestamps"])

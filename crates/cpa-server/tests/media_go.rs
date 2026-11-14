@@ -309,6 +309,32 @@ fn without_compat_models(body: &str) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// The client User-Agent the Go driver sends unless a scenario sets its own.
+const DRIVER_USER_AGENT: &str = "media-golden/1";
+
+/// #88 (docs/DIFFERENCES-FROM-GO.md, "xAI User-Agent"): an xAI API request carries the
+/// client's User-Agent, as Go v8.0.67 does (5026f365), where Go recorded net/http's
+/// default. The video download the server fetches itself (`/files/...`) has no client
+/// and keeps Go's default. Every other byte of each request still compares.
+fn with_user_agent_difference(s: &Scenario) -> Vec<String> {
+    let client = s.headers.get("User-Agent").map_or(DRIVER_USER_AGENT, String::as_str);
+    s.requests
+        .iter()
+        .map(|go| {
+            let target = go.split(' ').nth(1).unwrap_or_default();
+            if target.starts_with("/v1/") {
+                go.replacen(
+                    "\r\nUser-Agent: Go-http-client/1.1\r\n",
+                    &format!("\r\nUser-Agent: {client}\r\n"),
+                    1,
+                )
+            } else {
+                go.clone()
+            }
+        })
+        .collect()
+}
+
 /// Replays `fixture` on a fresh runtime; `expected` is the response a scenario must give.
 async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> String) -> Vec<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -368,7 +394,7 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
             headers.insert(name, value.parse().unwrap());
         };
         set("Authorization", "Bearer client-key-1");
-        set("User-Agent", "media-golden/1");
+        set("User-Agent", DRIVER_USER_AGENT);
         if !s.content_type.is_empty() {
             set("Content-Type", &s.content_type);
         }
@@ -445,10 +471,10 @@ async fn replay(tag: &str, fixture: &Fixture, expected: impl Fn(&Scenario) -> St
         {
             diffs.push(diff);
         }
-        if requests != s.requests {
+        let want_requests = with_user_agent_difference(s);
+        if requests != want_requests {
             diffs.push(format!(
-                "upstream requests:\n  go   {:?}\n  rust {requests:?}",
-                s.requests
+                "upstream requests:\n  go   {want_requests:?}\n  rust {requests:?}",
             ));
         }
         if !diffs.is_empty() {
