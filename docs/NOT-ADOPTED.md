@@ -46,21 +46,6 @@ save that one cache miss.
 **Reconsider when:** restarts during long cloaked sessions are frequent enough that the
 cache misses show up in usage data.
 
-## Claude tool schemas with rejected property names (C9, #77)
-
-When Anthropic rejects a tool's property name (for example `not[labels]`), Go replaces the
-tool's schema with an open object and embeds the original schema in the tool description.
-It does the same for `tool_addition` blocks.
-
-Rust sends the caller's schema unchanged, so the caller gets Anthropic's error.
-
-**Reason:** the rewrite silently turns a strict schema into an open one, so the model can
-send arguments the caller's schema forbids. No retained client is known to send such
-names; the only evidence is a Go issue report (upstream #7389).
-
-**Reconsider when:** a retained client sends a rejected property name in normal use. Even
-then, add it only as an explicit opt-in.
-
 ## Muse reminder tool (M3, #83)
 
 Go adds a Muse reminder decision tool to every Muse request that carries tools.
