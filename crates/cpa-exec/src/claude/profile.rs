@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use http::HeaderMap;
 use sha2::{Digest, Sha256};
 
-use super::detect::{NATIVE_ENTRYPOINTS, header, native_user_agent, raw_header, user_agent_details};
+use super::detect::{
+    header, native_entrypoint, native_user_agent, raw_header, split_request_fields, user_agent_details,
+};
 use super::settings::Settings;
 
 /// Claude Code 2.1.325 / @anthropic-ai/sdk 0.128.0 on Node v26.12.1, from the loopback
@@ -326,7 +328,9 @@ pub(crate) fn runtime_version_ok(s: &str) -> bool {
 
 /// `extractClaudeDeviceProfile`: a native-looking caller's own software tuple.
 fn candidate(headers: &HeaderMap, settings: &Settings) -> Option<Profile> {
-    let user_agent = header(headers, "user-agent").trim().to_owned();
+    // A stored profile is shared by the credential's later requests: keep this request's
+    // own fields out of it (`resolve_required` adds the current request's back).
+    let user_agent = split_request_fields(header(headers, "user-agent")).0;
     version(&user_agent)?;
     if !native_user_agent(&user_agent) {
         return None;
@@ -368,7 +372,7 @@ fn cache() -> &'static Mutex<HashMap<[u8; 32], Entry>> {
 }
 
 /// Go `claudeDeviceProfileScopedKey`.
-fn scope_string(credential_id: &str, api_key: &str, profile: &Profile) -> String {
+fn scope_string(credential_id: &str, api_key: &str, profile: &Profile, settings: &Settings) -> String {
     let mut key = if !credential_id.trim().is_empty() {
         format!("auth:{}", credential_id.trim())
     } else if !api_key.trim().is_empty() {
@@ -380,7 +384,7 @@ fn scope_string(credential_id: &str, api_key: &str, profile: &Profile) -> String
     let (entrypoint, _) = user_agent_details(&profile.user_agent);
     if !entrypoint.is_empty() && entrypoint != "cli" {
         key.push_str("|subclient:");
-        key.push_str(if NATIVE_ENTRYPOINTS.contains(&entrypoint.as_str()) {
+        key.push_str(if native_entrypoint(&entrypoint, settings) {
             &entrypoint
         } else {
             "other"
@@ -389,8 +393,8 @@ fn scope_string(credential_id: &str, api_key: &str, profile: &Profile) -> String
     key
 }
 
-fn scope_key(credential_id: &str, api_key: &str, profile: &Profile) -> [u8; 32] {
-    Sha256::digest(scope_string(credential_id, api_key, profile).as_bytes()).into()
+fn scope_key(credential_id: &str, api_key: &str, profile: &Profile, settings: &Settings) -> [u8; 32] {
+    Sha256::digest(scope_string(credential_id, api_key, profile, settings).as_bytes()).into()
 }
 
 /// Go `normalizeClaudeDeviceProfile`: the configured platform, and the baseline
@@ -434,11 +438,17 @@ pub(crate) async fn resolve_required(
     headers: &HeaderMap,
     settings: &Settings,
 ) -> Result<Profile, String> {
-    match cpa_home::kv::current_client() {
-        Ok(None) => Ok(resolve(credential_id, api_key, headers, settings)),
-        Ok(Some(client)) => resolve_home(&client, credential_id, api_key, headers, settings).await,
-        Err(error) => Err(error.to_string()),
+    let mut profile = match cpa_home::kv::current_client() {
+        Ok(None) => resolve(credential_id, api_key, headers, settings),
+        Ok(Some(client)) => resolve_home(&client, credential_id, api_key, headers, settings).await?,
+        Err(error) => return Err(error.to_string()),
+    };
+    // This request's own User-Agent fields go out with it (stored profiles hold none).
+    let fields = split_request_fields(header(headers, "user-agent")).1;
+    if !fields.is_empty() && native_user_agent(&profile.user_agent) {
+        profile.user_agent = format!("{}{fields})", profile.user_agent.trim_end_matches(')'));
     }
+    Ok(profile)
 }
 
 /// Go `claudeDeviceProfileKVValue`.
@@ -510,6 +520,7 @@ pub(crate) async fn resolve_home(
         credential_id,
         api_key,
         candidate.as_ref().unwrap_or(&Profile::default()),
+        settings,
     );
     let value_key = format!("cpa:claude:device-profile:{}", cpa_home::kv::hash_key_part(&scope));
     let expire = |key: String| async move { client.kv_expire(&key, PROFILE_TTL).await.map_err(|e| e.to_string()) };
@@ -561,6 +572,7 @@ pub(crate) fn resolve(credential_id: &str, api_key: &str, headers: &HeaderMap, s
         credential_id,
         api_key,
         candidate.as_ref().unwrap_or(&Profile::default()),
+        settings,
     );
     let mut cache = cache().lock().expect("device profile cache");
     cache.retain(|_, e| e.expires > now);
@@ -768,6 +780,29 @@ mod tests {
         let mut bare = HeaderMap::new();
         bare.insert("user-agent", newer_patch.parse().unwrap());
         assert!(accepted_user_agent(&bare, newer_patch, &s));
+    }
+
+    /// A stabilized profile stores no request's client-app or workload field; each
+    /// request goes out with its own.
+    #[tokio::test]
+    async fn stabilized_profiles_keep_request_fields_out() {
+        let mut s = Settings::default();
+        s.header_defaults.stabilize_device_profile = true;
+        let headers = |ua: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("user-agent", ua.parse().unwrap());
+            h.insert("x-stainless-package-version", "0.128.0".parse().unwrap());
+            h.insert("x-stainless-runtime-version", "v26.12.1".parse().unwrap());
+            h
+        };
+        let with_app = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12, client-app/app-a)";
+        let first = resolve_required("fields.json", "", &headers(with_app), &s)
+            .await
+            .unwrap();
+        assert_eq!(first.user_agent, with_app);
+        let plain = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12)";
+        let second = resolve_required("fields.json", "", &headers(plain), &s).await.unwrap();
+        assert_eq!(second.user_agent, plain);
     }
 
     #[test]

@@ -1422,3 +1422,125 @@ async fn reasoning_summaries_read_the_same_streamed_and_buffered() {
         assert_eq!(reasoning, 3, "stream={stream}: the earlier one and both signed items");
     }
 }
+
+/// A Chat Completions request with a documented nested custom tool, `{"type":"custom",
+/// "custom":{"name","description","format"}}`, its grammar format nested as
+/// `{"type":"grammar","grammar":{...}}`, a forced `tool_choice` of the same nested shape
+/// and an earlier nested custom call with its result (#170). `name` is over 64 bytes.
+fn nested_custom_request(name: &str, stream: bool) -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "stream": stream,
+        "tools": [{"type": "custom", "custom": {
+            "name": name,
+            "description": "Runs a Python snippet.",
+            "format": {"type": "grammar", "grammar": {"syntax": "lark", "definition": "start: /.+/"}}
+        }}],
+        "tool_choice": {"type": "custom", "custom": {"name": name}},
+        "messages": [
+            {"role": "user", "content": "Print 1."},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": name, "input": "print(1)"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "1"},
+            {"role": "user", "content": "Now print 2."}
+        ]
+    })
+}
+
+/// Chat nested custom tools on the translated route (#170; `docs/codex/CONTRACT.md`
+/// "Translated route"). The declaration reaches Codex as the Responses custom tool
+/// `{"type":"custom","name","description","format"}` with a flat grammar format; the
+/// nested name is shortened once and used by the declaration, the `tool_choice` and the
+/// history call alike. The model's custom call returns under the client's name, streamed
+/// and buffered.
+#[tokio::test]
+async fn nested_custom_tools_round_trip_under_the_client_name() {
+    let long = format!("mcp__gateway__{}", "very_long_custom_tool_segment_".repeat(3));
+    let short = format!("mcp__{}", &"very_long_custom_tool_segment_".repeat(3)[..59]);
+    let item = |input: &str| {
+        format!(
+            r#"{{"type":"custom_tool_call","id":"ctc_1","status":"completed","name":"{short}","call_id":"call_9","input":"{input}"}}"#
+        )
+    };
+    let reply = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n\
+event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{added}}}\n\n\
+event: response.custom_tool_call_input.delta\ndata: {{\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"output_index\":0,\"delta\":\"print(2)\"}}\n\n\
+event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{done}}}\n\n\
+event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{done}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n",
+        added = item(""),
+        done = item("print(2)"),
+    );
+    for stream in [true, false] {
+        let proxy = proxy(vec![Reply::sse(reply.clone())], "").await;
+        let (status, answer) = post(
+            &proxy.url,
+            "/v1/chat/completions",
+            &nested_custom_request(&long, stream),
+        )
+        .await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        let body = sent(&proxy);
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "custom",
+                "name": short,
+                "description": "Runs a Python snippet.",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+            }]),
+            "the Responses custom tool: {body}"
+        );
+        assert_eq!(body["tool_choice"], json!({"type": "custom", "name": short}), "{body}");
+        let calls = items(&body, "custom_tool_call");
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["call_id"], "call_1", "{body}");
+        assert_eq!(calls[0]["name"], short.as_str(), "{body}");
+        assert_eq!(calls[0]["input"], "print(1)", "{body}");
+        let outputs = items(&body, "custom_tool_call_output");
+        assert_eq!(outputs.len(), 1, "{body}");
+        assert_eq!(outputs[0]["call_id"], "call_1", "{body}");
+        assert_eq!(outputs[0]["output"], "1", "{body}");
+
+        assert!(
+            answer.contains(&format!("\"name\":\"{long}\"")),
+            "stream={stream}: the client's name: {answer}"
+        );
+        assert!(
+            !answer.contains(&format!("\"name\":\"{short}\"")),
+            "stream={stream}: {answer}"
+        );
+        assert!(answer.contains("print(2)"), "stream={stream}: {answer}");
+        assert_eq!(
+            client_stop(&answer).as_deref(),
+            Some("tool_calls"),
+            "stream={stream}: {answer}"
+        );
+    }
+}
+
+/// A custom tool declaration without a name, nested or flat, names no tool the model can
+/// call, and a member beside a nested `custom` has no place in the Responses tool: both
+/// are refused before the send (#170).
+#[tokio::test]
+async fn unexpressible_custom_tools_are_refused_before_the_send() {
+    let mut nested = chat_request(false);
+    nested["tools"] = json!([{"type": "custom", "custom": {"description": "No name."}}]);
+    let mut flat = chat_request(false);
+    flat["tools"] = json!([{"type": "custom", "description": "No name."}]);
+    let mut beside = chat_request(false);
+    beside["tools"] = json!([{"type": "custom", "name": "other", "custom": {"name": "run"}}]);
+    for (body, named) in [
+        (nested, "custom tool without a name"),
+        (flat, "custom tool without a name"),
+        (beside, "custom tool member beside `custom`"),
+    ] {
+        let proxy = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/chat/completions", &body).await;
+        assert_eq!(status, 400, "{body}: {answer}");
+        assert!(answer.contains("unsupported conversion"), "{answer}");
+        assert!(answer.contains(named), "{named}: {answer}");
+        assert!(proxy.upstream.http().is_empty(), "nothing sent: {answer}");
+    }
+}

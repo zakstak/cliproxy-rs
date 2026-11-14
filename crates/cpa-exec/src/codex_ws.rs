@@ -263,6 +263,10 @@ pub(crate) struct Upstream {
     /// executor before the socket is published. Later requests on this socket repeat
     /// it ([`Upstream::later_metadata`]); no other socket's value can reach them.
     upgrade_model: std::sync::OnceLock<UpgradeModel>,
+    /// The largest message this socket's own upgrade said the upstream reads
+    /// ([`peer_message_limit`]), set once by the Codex executor before the socket is
+    /// published. A longer message is refused before it is written ([`Self::write_certain`]).
+    peer_limit: std::sync::OnceLock<usize>,
     /// The authentication values this socket's handshake carried: the outbound
     /// credential guard of everything read from it ([`crate::codex_secret`]). A reused
     /// socket keeps its own handshake's values; a fresh dial gets the request's.
@@ -312,6 +316,7 @@ impl Upstream {
             reader: Mutex::default(),
             lease: Mutex::default(),
             upgrade_model: std::sync::OnceLock::new(),
+            peer_limit: std::sync::OnceLock::new(),
             #[cfg(test)]
             sink_waits: tokio::sync::watch::Sender::new(0),
         })
@@ -418,8 +423,11 @@ impl Upstream {
         self.write_certain(payload, authority).await
     }
 
-    /// One text message, and whether a failure provably wrote nothing. A socket whose
-    /// loss is recorded once the write holds the sink is not written at all. The rest is
+    /// One text message, and whether a failure provably wrote nothing. A message longer
+    /// than the upstream's advertised limit is refused before anything else (FP4 #118):
+    /// unsent, request-scoped, and the 413 `message_too_big` a WebSocket client receives as
+    /// close 1009. A socket whose loss is recorded once the write holds the sink is not
+    /// written at all. The rest is
     /// [`write_phases`]: a failure before the first frame was handed to tungstenite, a
     /// timeout included, wrote nothing; tungstenite refuses a closed or closing socket and
     /// a full write buffer before it queues the frame ([`refused_before_queueing`]);
@@ -431,6 +439,13 @@ impl Upstream {
     /// released, so a write waiting for the sink finds the loss and writes nothing.
     async fn write_certain(&self, payload: Bytes, authority: Option<&Authority>) -> Result<(), WriteFailure> {
         let len = payload.len();
+        if let Some(&limit) = self.peer_limit.get().filter(|limit| len > **limit) {
+            return Err(WriteFailure {
+                error: over_peer_limit(limit),
+                unsent: true,
+                refusal: None,
+            });
+        }
         let deadline = self.write.deadline(len);
         let queued = std::sync::atomic::AtomicBool::new(false);
         let outcome = tokio::time::timeout(deadline, async {
@@ -1225,6 +1240,38 @@ fn closed_too_big(reason: &str) -> ExecError {
         serde_json::json!({
             "error": {"message": message, "type": "invalid_request_error", "code": "message_too_big"},
             "close_reason": reason,
+        })
+        .to_string(),
+    )
+}
+
+/// `x-codex-websocket-max-message-bytes` on an upstream upgrade, read as first-party Codex
+/// reads it (`codex-api/src/endpoint/responses_websocket.rs`, openai/codex `ed7ca22bb60a`,
+/// inspected at `5c3ff1dabf64`): the first value as a decimal `usize` (`str::parse`, so
+/// `+5` is 5 and ` 5` is nothing). Absent or unreadable is no limit; `0` is a limit of
+/// zero bytes.
+pub(crate) fn peer_message_limit(handshake: &HeaderMap) -> Option<usize> {
+    handshake
+        .get("x-codex-websocket-max-message-bytes")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+/// A message longer than the upstream's advertised limit, refused before it was written:
+/// the request-scoped 413 of an upstream 1009 close, which a WebSocket client receives as
+/// close 1009 before any event of the turn. First-party Codex reads that close as
+/// `WebsocketMessageTooLarge` and sends the request over HTTP itself; the proxy sends it
+/// nowhere else.
+fn over_peer_limit(limit: usize) -> ExecError {
+    ExecError::local(
+        413,
+        FailureScope::Request,
+        serde_json::json!({
+            "error": {
+                "message": format!("request exceeds the upstream websocket message limit of {limit} bytes"),
+                "type": "invalid_request_error",
+                "code": "message_too_big",
+            },
         })
         .to_string(),
     )
@@ -2245,6 +2292,9 @@ impl CodexExecutor {
         let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets, socket_id);
         if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
             let _ = conn.upgrade_model.set(upgrade);
+        }
+        if let Some(limit) = peer_message_limit(&handshake) {
+            let _ = conn.peer_limit.set(limit);
         }
         // Publish before the reader runs, so a reader that fails at once still finds its
         // socket current and invalidates it; holding the handle slot keeps a concurrent

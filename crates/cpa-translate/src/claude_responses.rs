@@ -5,6 +5,7 @@
 
 use crate::{
     claude_chat_request::{apply_effort, text_part},
+    claude_property_keys::PropertyKeys,
     common::{self, trim_space},
     thinking,
 };
@@ -128,6 +129,11 @@ pub(crate) fn convert(
     // Native tool search declares discovered tools as deferred and replays search
     // results as tool_reference blocks, which keeps the cached prefix.
     let native = client_search_wins(&descriptors);
+    let property_keys: HashMap<&[u8], PropertyKeys> = descriptors
+        .iter()
+        .filter(|d| winners.get(&d.name) == Some(&d.order))
+        .filter_map(|d| Some((&d.name[..], function_property_keys(d)?)))
+        .collect();
     let mut pending = Pending::default();
     let mut items: Vec<Res<'_>> = vec![];
     if input_items.exists() {
@@ -209,7 +215,10 @@ pub(crate) fn convert(
                     if !args.is_empty() && gj::valid(&args) {
                         let parsed = gj::parse(&args);
                         if parsed.is_object() {
-                            gj::set_raw(&mut tool_use, "input", &parsed.raw);
+                            match property_keys.get(&name[..]) {
+                                Some(keys) => gj::set_raw(&mut tool_use, "input", keys.to_claude(&parsed.raw)),
+                                None => gj::set_raw(&mut tool_use, "input", &parsed.raw),
+                            };
                         }
                     }
                 }
@@ -1414,6 +1423,20 @@ fn tool_parameters<'a>(tool: &Res<'a>) -> Option<Res<'a>> {
     .find(Res::exists)
 }
 
+/// The Claude input schema of a function declaration, before property-key renames.
+fn function_schema(tool: &Res<'_>) -> Vec<u8> {
+    let params = tool_parameters(tool);
+    common::normalize_claude_tool_input_schema(Some(params.as_ref().map_or(&b""[..], |p| &p.raw)))
+}
+
+/// The property-key renames a function declaration needs on Claude (#77).
+pub(crate) fn function_property_keys(d: &Descriptor<'_>) -> Option<PropertyKeys> {
+    if d.kind != b"function" || d.client_search {
+        return None;
+    }
+    PropertyKeys::of(&function_schema(&d.tool))
+}
+
 fn descriptor_to_claude(d: &Descriptor<'_>, claude_name: &[u8]) -> Option<Vec<u8>> {
     let mut name = claude_name.to_vec();
     if name.is_empty() && !d.direct {
@@ -1436,8 +1459,10 @@ fn descriptor_to_claude(d: &Descriptor<'_>, claude_name: &[u8]) -> Option<Vec<u8
             if !description.is_empty() {
                 gj::set_str(&mut t, "description", description);
             }
-            let params = tool_parameters(&d.tool);
-            let schema = common::normalize_claude_tool_input_schema(Some(params.as_ref().map_or(&b""[..], |p| &p.raw)));
+            let mut schema = function_schema(&d.tool);
+            if let Some(keys) = PropertyKeys::of(&schema) {
+                schema = keys.schema(&schema);
+            }
             gj::set_raw(&mut t, "input_schema", schema);
             t = common::attach_cache_control(t, &d.tool);
             if !gj::get(&t, "cache_control").exists() {

@@ -17,6 +17,9 @@ pub(crate) struct HeaderDefaults {
     pub timeout: String,
     pub timezone: String,
     pub stabilize_device_profile: bool,
+    /// `native-entrypoints`: entrypoints, lowercase, treated as native Claude Code
+    /// beside the built-in ones (validated in `cpa_core::config::validate`).
+    pub native_entrypoints: Vec<String>,
 }
 
 /// One `claude-api-key` entry after group inheritance (Go `config.ClaudeKey`).
@@ -80,6 +83,15 @@ impl Settings {
             timeout: field("timeout"),
             timezone: field("timezone"),
             stabilize_device_profile: flag(h.and_then(|h| h.get("stabilize-device-profile"))),
+            // ASCII names: config validation refuses anything else.
+            native_entrypoints: h
+                .and_then(|h| h.get("native-entrypoints"))
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|e| e.trim().to_ascii_lowercase())
+                .collect(),
         };
         s.disable_cloak_mode = flag(claude.and_then(|c| c.get("disable-claude-cloak-mode")));
         s.model_level_cooling = flag(claude.and_then(|c| c.get("model-level-cooling")));
