@@ -634,6 +634,17 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
         br#"{"model":"","instructions":"","input":[]}"#.to_vec()
     };
     let root = gj::parse(raw);
+    // `output_config.effort` becomes `reasoning.effort` only beside adaptive thinking
+    // (below). Without a thinking type Go drops it; the registered, compat and strict
+    // conversions refuse it instead (#80). A blank or non-string value is read as absent,
+    // as under adaptive thinking.
+    let effort = root.get("output_config.effort");
+    if root.get("thinking.type").bytes().is_empty() && effort.kind == Kind::String && !trim_space(&effort.s).is_empty()
+    {
+        return Err(Error(
+            "unsupported conversion: `output_config.effort` without a `thinking` type cannot be translated to a Responses request; remove it or send the request to a provider that accepts it".into(),
+        ));
+    }
     let names = original_to_short(raw);
     gj::set_str(&mut out, "model", model);
     // The registered pair (Grok, Muse) keeps the client's output limit and refuses a

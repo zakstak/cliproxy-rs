@@ -317,3 +317,39 @@ async fn unreadable_controls_are_refused_before_anything_is_sent() {
     assert!(xai_calls.lock().unwrap().is_empty(), "nothing reached Grok");
     assert!(meta_calls.lock().unwrap().is_empty(), "nothing reached Muse");
 }
+
+/// #80: a Claude Messages `output_config.effort` without a `thinking` type has no
+/// Responses form, so it is refused before anything is sent instead of being dropped.
+/// Beside adaptive thinking it still becomes `reasoning.effort`.
+#[tokio::test]
+async fn standalone_claude_effort_is_refused_before_anything_is_sent() {
+    let auth_dir = AuthDir::new();
+    let (proxy, xai_calls, meta_calls) = proxy(&auth_dir).await;
+    for (provider, model, _) in PROVIDERS {
+        for stream in [false, true] {
+            let case = format!("{provider} stream={stream}");
+            let mut body = Client::Messages.body(model, stream, false);
+            body["output_config"] = json!({"effort": "low"});
+            let (status, text) = post(format!("{proxy}/v1/messages"), &body).await;
+            assert_eq!(status, 400, "{case}: {text}");
+            assert!(
+                text.contains("`output_config.effort` without a `thinking` type"),
+                "{case}: {text}"
+            );
+        }
+    }
+    assert!(xai_calls.lock().unwrap().is_empty(), "nothing reached Grok");
+    assert!(meta_calls.lock().unwrap().is_empty(), "nothing reached Muse");
+    for (provider, model, _) in PROVIDERS {
+        let calls = if provider == "xai" { &xai_calls } else { &meta_calls };
+        let mut body = Client::Messages.body(model, false, false);
+        body["thinking"] = json!({"type": "adaptive"});
+        body["output_config"] = json!({"effort": "low"});
+        let (status, text) = post(format!("{proxy}/v1/messages"), &body).await;
+        assert_eq!(status, 200, "{provider}: {text}");
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{provider}");
+        let sent: Value = serde_json::from_str(&seen[0].2).unwrap();
+        assert_eq!(sent["reasoning"]["effort"], "low", "{provider}: {sent}");
+    }
+}
