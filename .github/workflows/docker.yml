@@ -49,5 +49,3 @@ jobs:
         run: docker build -t cliproxy-rs:ci .
       - name: Smoke test
         run: docker run --rm cliproxy-rs:ci --version
-      - name: Size gate
-        run: bench/gate.sh image cliproxy-rs:ci

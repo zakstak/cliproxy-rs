@@ -102,7 +102,7 @@ impl<'a> ClaudeView<'a> {
 
 /// The first-party Anthropic transport.
 enum Native {
-    /// Production or harness: native and OAuth profiles per effective proxy.
+    /// Production or TLS tests: native and OAuth profiles per effective proxy.
     Transport(Arc<Transport>),
     /// Unit tests against plain HTTP mocks.
     Fixed(wreq::Client),
@@ -131,7 +131,7 @@ impl ClaudeExecutor {
         ))
     }
 
-    /// The production profile with test trust roots and dial overrides (harness).
+    /// The production profile with test trust roots and dial overrides (TLS tests).
     /// OAuth refresh uses the same transport, so it cannot escape the hooks.
     pub fn with_hooks(hooks: Hooks, base_url: impl Into<String>) -> Self {
         Self::with_transport(Arc::new(Transport::new(hooks.clone())), hooks, base_url)
@@ -1219,10 +1219,9 @@ impl<'a> Ctx<'a> {
     }
 
     // ponytail: every rewrite that changes the body still returns a new copy of it, so a
-    // cloaked 1.9 MB request allocates 32 buffers of 256 KiB or more and peaks at 5.1x its
-    // body (alloc.cloak.* in bench/budgets.txt). Recording the edits from one walk and
-    // splicing them into one output, as signals.rs does for cache_control, is the way to
-    // the 3x target.
+    // cloaked request holds several copies of its body at once. Recording the edits from
+    // one walk and splicing them into one output, as signals.rs does for cache_control,
+    // would remove those copies.
     async fn prepare_messages(
         &self,
         req: &ExecRequest,

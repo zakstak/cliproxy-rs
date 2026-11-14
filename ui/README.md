@@ -16,10 +16,10 @@ npm ci
 npm run dev      # Vite on :5173, proxies /v8 to 127.0.0.1:8317 (override with CPA_BACKEND=...)
 npm run check    # svelte-check, 0 errors and 0 warnings expected
 npm test         # unit tests for src/core.ts
-npm run build    # dist/, dist-panel/, then the size budget
+npm run build    # dist/ and dist-panel/
 ```
 
-`npm run build` runs `vite build`, then `scripts/panel.mjs` (inlines JS, CSS, font and favicon into `dist-panel/management.html`, writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md), then `scripts/size.mjs`, which fails the build if gzip JavaScript exceeds 53,900 B or CSS exceeds 6,853 B. The ceilings began as the sizes of the dashboard this one replaced (42,642 B and 6,853 B); JavaScript was raised for the beginner onboarding, for the Claude usage parser and plan limits, for 0.4.2's Accounts page, Connect result and sign-in recovery, and for the non-destructive live usage feed.
+`npm run build` runs `vite build`, then `scripts/panel.mjs` (copies `dist/index.html` to `dist/management.html`, the path the Rust server serves; inlines JS, CSS, font and favicon into `dist-panel/management.html`; writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md). The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
 
 Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checked in and embedded at compile time.
 

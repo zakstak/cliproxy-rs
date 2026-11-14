@@ -47,7 +47,8 @@ impl Drop for Pins {
     }
 }
 
-/// The harness credential (harness/fixtures.py): fake, local-only.
+/// The fake, local-only credential of the retired Go differential harness, whose captures
+/// `testdata/go_captures.json` holds.
 fn harness_credential() -> Credential {
     let metadata = serde_json::json!({
         "type": "claude", "access_token": "sk-ant-oat01-FAKE-LOCAL-ONLY",
@@ -1335,7 +1336,7 @@ async fn cloaked_conversation_prefix_holds_for_warm_changed_and_idle_turns() {
     // The selected content the cache is keyed on, in Anthropic's order (tools, system,
     // messages), up to and including message `upto`. The billing block (system.0)
     // carries a per-request signature, as in native Claude Code; that Anthropic leaves
-    // it out of the key is an upstream assumption, which bench/claude-cache-live.sh
+    // it out of the key is an upstream assumption, which tools/claude-cache/live.sh
     // confirms with real cache reads. The rolling breakpoint on the last message moves
     // on with each turn, so markers after the first two messages are left out here and
     // checked by path below.

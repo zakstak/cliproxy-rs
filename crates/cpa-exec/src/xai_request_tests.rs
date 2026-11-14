@@ -315,11 +315,12 @@ fn long_histories_of_repeated_namespaces_deduplicate() {
 }
 
 /// A namespace that grows across history (each item re-declares it with one more
-/// child) folds into one dispatcher listing every child, sent once, whose calls
-/// restore for the first and the last child.
+/// child) folds into one dispatcher listing every child exactly once, sent once, whose
+/// calls restore for the first and the last child. Go emits a full copy of the merged
+/// dispatcher at every occurrence (issue #86 review).
 #[test]
 fn a_namespace_growing_across_history_folds_once() {
-    let n = 260;
+    let n = 500;
     let mut grown = body(vec![], vec![]);
     let input = grown["input"].as_array_mut().unwrap();
     input.clear();
@@ -331,7 +332,9 @@ fn a_namespace_growing_across_history_folds_once() {
     assert!(fold);
     assert_eq!(names(&out), ["app"], "{out}");
     let catalog = out["tools"][0]["description"].as_str().unwrap();
-    assert!(catalog.contains("- tool_0") && catalog.contains(&format!("- tool_{}", n - 1)));
+    let listed: Vec<&str> = catalog.lines().filter(|line| line.starts_with("- tool_")).collect();
+    let want: Vec<String> = (0..n).map(|i| format!("- tool_{i}")).collect();
+    assert_eq!(listed, want, "every child once, in history order");
     for child in ["tool_0".to_owned(), format!("tool_{}", n - 1)] {
         let restored = restore(&refs, call("app", &format!(r#"{{"name":"{child}","arguments":{{}}}}"#)));
         assert_eq!(

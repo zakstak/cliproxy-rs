@@ -1,8 +1,7 @@
-//! Selective harness contracts (issue #67, H1) for the retained providers without a Go
-//! wire collector: Grok (`xai`) and Muse (`meta`) through the real router, each client
-//! format over HTTP and, where the route streams, SSE; and the refusal of removed
-//! providers (#49) and native plugins (#47). `harness/manifest.json` lists every test here
-//! by name, and `harness/acceptance.py` fails when one is missing, skipped or unknown.
+//! Functional contracts (first written for issue #67, H1) for the retained providers
+//! Grok (`xai`) and Muse (`meta`) through the real router, each client format over HTTP
+//! and, where the route streams, SSE; and the refusal of removed providers (#49) and
+//! native plugins (#47).
 //!
 //! The upstream is `cpa_server::testing::codex_capture::CaptureUpstream`, the capture
 //! server the Codex contract tests use: loopback only, recording each request as

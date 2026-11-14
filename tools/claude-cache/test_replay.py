@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).with_name("claude-cache-replay.py")
+SCRIPT = Path(__file__).with_name("replay.py")
 API = runpy.run_path(str(SCRIPT))
 
 

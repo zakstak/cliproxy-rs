@@ -99,7 +99,7 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let model = request::base_model(&req.model).to_owned();
         // One buffer for the upstream send and the response translator: the send shares
-        // it instead of copying the converted body (#29, docs/BENCHMARKS.md).
+        // it instead of copying the converted body (#29).
         let sent = Bytes::from(upstream_body(&req, &model)?);
         // The conversion produced a `String`, so the bytes are UTF-8.
         let body = std::str::from_utf8(&sent)

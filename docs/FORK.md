@@ -69,6 +69,14 @@ Upstream pull requests contain only generic fixes, never fork-specific files.
 
 This fork builds from source or with the local Dockerfile. It has no release publishing workflow, release installer or distribution packages, and all workspace crates have publishing disabled. Preserve these choices when integrating upstream changes. Version tags follow the `-zak.N` convention in [AGENTS.md](../AGENTS.md); tags do not trigger publication.
 
+## Functional checks only
+
+This fork has no Go/Rust differential harness, benchmark gates, memory soaks, idle or size
+gates, or allocation and wall-clock speed bounds in tests ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
+CI checks formatting, lints, the test suite and the Linux-only build refusal. Upstream
+may still carry such gates. When you integrate upstream changes, drop them and keep the
+functional tests. [AGENTS.md](../AGENTS.md) states the compatibility policy.
+
 ## Keep fork-specific changes separate
 
 Fork-specific material includes this file, the `fork` entries in `.github/workflows/ci.yml`, and

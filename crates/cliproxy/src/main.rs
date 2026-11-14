@@ -610,8 +610,7 @@ fn main() -> anyhow::Result<()> {
 /// the next requests, so it runs once the process goes quiet (under 50 ms of CPU in five
 /// seconds), and at least once a minute while busy. It trims once after startup, then
 /// parks until a response or a WebSocket turn ends: with no requests, no timer and no wakeup. The trim
-/// itself runs on the blocking pool, off the two request threads. See
-/// docs/BENCHMARKS.md (Claude soak).
+/// itself runs on the blocking pool, off the two request threads.
 ///
 /// Cost per request: the response body is boxed once more, and its drop does one
 /// atomic load (plus a wakeup when the task is parked).
