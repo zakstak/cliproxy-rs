@@ -61,9 +61,16 @@ strings and tuple JSON framing, not raw section lengths or token counts. Claude
 cache telemetry hashes use a private random process-local HMAC key and rotate
 on restart, including identities derived from configured API keys.
 
-The queue and RESP channel gain additional zero-token observations marked
-`usage_observed: false` on `Ending::Done` (completion or client drop) only when
-all these conditions hold:
+A record whose provider reported no token usage carries `usage_observed: false`
+([#99](https://github.com/zakstak/cliproxy-rs/issues/99)): a response that ended
+without `usage`, an attempt that reported only a service tier, or a failure before
+any usage arrived. Its zero tokens mean unknown usage, not zero usage. A record with
+reported usage, zeros included, has no such field, as in Go, so absence of the marker
+means the provider reported usage. Go writes zeros in both cases.
+
+With Claude cache telemetry on, the queue and RESP channel also gain zero-token
+observations marked `usage_observed: false` on `Ending::Done` (completion or client
+drop) where Go emits no record, only when all these conditions hold:
 
 - The attempt was not discarded and has not already been published.
 - The executor has not published an outcome.
@@ -72,13 +79,27 @@ all these conditions hold:
   collection to be enabled.
 - The usage queue accepts records (management and usage statistics are enabled).
 
-Go emits no record on this no-usage path. The additional records' zeros mean
-unknown usage, and `failed: false` does not establish success. Failed attempts do
-not receive this marker.
-A native non-streaming Claude JSON response without usage still publishes an
-ordinary record through its executor-supplied outcome, without this marker.
-Absence of the marker therefore does not prove that usage was observed.
-Ordinary records keep Go's accounting.
+`failed: false` on such an observation does not establish success.
+
+Usage accounting changes from [#99](https://github.com/zakstak/cliproxy-rs/issues/99):
+
+- A failure record keeps the usage the provider reported before the failure, such as
+  that of a terminal event a streaming client received before the stream broke. The
+  native Codex routes also read it from the `response.failed` event itself. Go v8.0.35
+  keeps it only for Claude streams and records zero tokens for every other failure. A
+  failure the proxy records as the client leaving (status 499) still records no tokens.
+- `ttft_ms` of a streamed native Codex HTTP response (a WebSocket turn served over
+  HTTP included) and of a Muse stream runs to the first upstream event that carries
+  output: a non-empty text, reasoning, refusal, tool-argument or media delta, a
+  completed part or item with content, or a terminal event. `response.created`,
+  announced items, encrypted-only reasoning and empty deltas do not count. Go v8.0.35
+  measures the native Codex route to the response head and Muse to its first packet.
+  A buffered native Codex answer runs to its first body byte. Other routes keep their
+  marks.
+- A Claude record carries the service tier Anthropic assigned (`usage.service_tier`)
+  as `response_service_tier`, and a `server_tool_use` object with the
+  `web_search_requests` and `web_fetch_requests` counts Anthropic reported, each only
+  when the provider sent it. Go v8.0.35 records neither for Claude.
 
 ## Deliberate differences
 

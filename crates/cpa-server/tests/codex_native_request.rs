@@ -1719,7 +1719,9 @@ async fn chunked_upstream(first: String, ending: Ending) -> String {
 /// 9/9/18 in one whole chunk, then a body cut off without its terminating chunk, is no
 /// successful answer and no successful record. The failure keeps the buffered route's
 /// request-scoped 408 for a stream without a terminal event, and its record carries no
-/// tokens (the server's failure records never do). Controls: the same event with a clean
+/// tokens: the buffered reader never accounted the event. A streaming client received
+/// the event, so its failure record keeps the usage the provider reported (U1, #99).
+/// Controls: the same event with a clean
 /// end is the answer, with its usage; a later completion decides; a cut-off body after
 /// `response.created` alone fails the same way; a cut-off after a real completion keeps
 /// that completion. The streaming route already fails on the read failure.
@@ -1793,7 +1795,7 @@ async fn buffered_answers_end_on_a_processing_error_only_at_a_clean_end() {
             200,
             None,
             true,
-            0,
+            18,
         ),
     ];
     for Case {
@@ -2890,4 +2892,141 @@ async fn a_typed_first_party_code_on_a_503_moves_to_another_account() {
         .collect();
     assert_eq!(tokens, [format!("Bearer {SELECTED}"), format!("Bearer {SECOND}")]);
     assert!(cooldowns(&proxy) > 0, "the failing account is cooled");
+}
+
+/// U1 (#99): a stream that fails after the provider reported usage keeps that usage in
+/// its failure record, streamed and buffered. `response.failed` carries the response's
+/// `usage` (OpenAI's Responses streaming reference); an `error` event carries none, and
+/// its failure records no tokens.
+#[tokio::test]
+async fn a_failed_stream_keeps_the_usage_it_reported() {
+    let created = r#"{"type":"response.created","response":{"id":"resp_f","status":"in_progress","output":[]}}"#;
+    let failed = r#"{"type":"response.failed","response":{"id":"resp_f","status":"failed","output":[],"error":{"code":"server_error","message":"boom"},"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":4},"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":16}}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (stream, body) in [(true, &full), (false, &buffered)] {
+        let proxy = native(
+            false,
+            Script {
+                http: vec![Reply::sse(format!("data: {created}\n\ndata: {failed}\n\n"))],
+                ..Script::default()
+            },
+            "",
+        )
+        .await;
+        proxy.rt.usage_queue().configure(
+            true,
+            &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+        );
+        let headers: [(&str, &str); 0] = [];
+        let _ = post(&proxy.url, "/v1/responses", &headers, body.clone()).await;
+        let records = usage_records(&proxy, 1).await;
+        assert_eq!(records.len(), 1, "stream {stream}: {records:?}");
+        let record = &records[0];
+        assert_eq!(record["failed"], true, "stream {stream}: {record}");
+        let tokens = &record["tokens"];
+        assert_eq!(
+            [
+                &tokens["input_tokens"],
+                &tokens["cached_tokens"],
+                &tokens["output_tokens"],
+                &tokens["reasoning_tokens"],
+                &tokens["total_tokens"]
+            ],
+            [11, 4, 5, 2, 16],
+            "stream {stream}: {record}"
+        );
+    }
+}
+
+/// U1 (#99): missing usage stays distinct from zero usage. A completed response that
+/// reports zero tokens is a record with zeros; one that reports no usage is a record with
+/// zeros marked `usage_observed: false`, streamed and buffered. Records with usage keep
+/// their shape, so existing collectors decode both.
+#[tokio::test]
+async fn missing_usage_is_not_recorded_as_zero() {
+    let zero = r#"{"type":"response.completed","response":{"id":"resp_z","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#;
+    let missing = r#"{"type":"response.completed","response":{"id":"resp_m","status":"completed","output":[]}}"#;
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (stream, body) in [(true, &full), (false, &buffered)] {
+        let unobserved = serde_json::Value::Bool(false);
+        for (name, end, want) in [("zero", zero, None), ("missing", missing, Some(&unobserved))] {
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(format!("data: {end}\n\n"))],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let headers: [(&str, &str); 0] = [];
+            let (status, _, _) = post(&proxy.url, "/v1/responses", &headers, body.clone()).await;
+            assert_eq!(status, 200, "{name} stream {stream}");
+            let records = usage_records(&proxy, 1).await;
+            assert_eq!(records.len(), 1, "{name} stream {stream}: {records:?}");
+            let record = &records[0];
+            assert_eq!(record["failed"], false, "{record}");
+            assert_eq!(record["tokens"]["total_tokens"], 0, "{record}");
+            assert_eq!(record.get("usage_observed"), want, "{name} stream {stream}: {record}");
+        }
+    }
+}
+
+/// U1 (#99): an event whose JSON spans several `data:` lines (joined with newlines, as SSE
+/// defines) is accounted, and a repeated terminal event is accounted once, the first one
+/// winning, streamed and buffered.
+#[tokio::test]
+async fn multiline_and_repeated_terminal_events_are_accounted_once() {
+    let multiline = concat!(
+        "data: {\"type\":\"response.completed\",\n",
+        "data: \"response\":{\"id\":\"resp_ml\",\"status\":\"completed\",\"output\":[],\n",
+        "data: \"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+    );
+    let first = r#"{"type":"response.completed","response":{"id":"resp_r","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}"#;
+    let again = r#"{"type":"response.completed","response":{"id":"resp_r","status":"completed","output":[],"usage":{"input_tokens":40,"output_tokens":10,"total_tokens":50}}}"#;
+    let repeated = format!("data: {first}\n\ndata: {again}\n\n");
+    let full = routed("http-request-full");
+    let buffered = full.replacen(r#""stream":true"#, r#""stream":false"#, 1);
+    for (stream, body) in [(true, &full), (false, &buffered)] {
+        for (name, sse, want) in [
+            ("multiline", multiline.to_owned(), [3, 2, 5]),
+            ("repeated", repeated.clone(), [4, 1, 5]),
+        ] {
+            let proxy = native(
+                false,
+                Script {
+                    http: vec![Reply::sse(sse)],
+                    ..Script::default()
+                },
+                "",
+            )
+            .await;
+            proxy.rt.usage_queue().configure(
+                true,
+                &Config::parse("observability: {usage: {usage-statistics-enabled: true}}\n").unwrap(),
+            );
+            let headers: [(&str, &str); 0] = [];
+            let (status, _, _) = post(&proxy.url, "/v1/responses", &headers, body.clone()).await;
+            assert_eq!(status, 200, "{name} stream {stream}");
+            let records = usage_records(&proxy, 1).await;
+            assert_eq!(records.len(), 1, "{name} stream {stream}: {records:?}");
+            let tokens = &records[0]["tokens"];
+            assert_eq!(
+                [
+                    &tokens["input_tokens"],
+                    &tokens["output_tokens"],
+                    &tokens["total_tokens"]
+                ],
+                want,
+                "{name} stream {stream}: {}",
+                records[0]
+            );
+        }
+    }
 }

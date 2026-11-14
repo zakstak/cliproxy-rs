@@ -48,8 +48,12 @@ fn failure() -> ExecError {
 }
 
 /// What the stream records for `error` if the consumer leaves before taking it.
+/// An upstream failure's record, which keeps the usage reported before it (U1, #99).
 fn recorded(error: &ExecError) -> (u16, String) {
-    (error.status, String::from_utf8_lossy(&error.body).into_owned())
+    (
+        error.status,
+        format!("with usage: {}", String::from_utf8_lossy(&error.body)),
+    )
 }
 
 /// `rest` as the upstream after the held steps: these steps, then an upstream that stays

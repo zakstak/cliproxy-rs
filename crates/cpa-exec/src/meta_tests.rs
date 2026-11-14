@@ -2013,3 +2013,21 @@ async fn payload_rules_decide_prompt_cache_retention_after_the_client() {
         }
     }
 }
+
+/// U1 (#99): a Muse stream marks TTFT at the first event with output (here the completed
+/// message item), after the first packet and `response.created` were only frames.
+#[tokio::test]
+async fn stream_ttft_is_marked_at_the_first_output_event() {
+    let r = run("responses-stream").await;
+    let marks: Vec<bool> = r
+        .usage
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::device_fixture::UsageEvent::Token(token) => Some(token),
+            _ => None,
+        })
+        .collect();
+    // The first packet, then response.created, the message item and response.completed.
+    assert_eq!(marks, [false, false, true, true]);
+}

@@ -528,6 +528,8 @@ pub(crate) fn defer_usage(
                     }
                 }
                 UsageRule::MetaResponses => {
+                    // TTFT at the first event with output (U1, #99).
+                    sink.token_event(responses_token_event(payload));
                     if matches!(kind.as_slice(), b"response.completed" | b"response.incomplete") {
                         observe_parsed(&mut held.merged, Format::Codex, payload);
                     }
@@ -577,6 +579,65 @@ pub(crate) fn track_first_byte(
         }
     })
     .boxed()
+}
+
+/// Whether a Responses stream event carries output: a non-empty text, reasoning, refusal,
+/// tool-argument or media delta, a completed part or item with content, or a terminal event
+/// (so TTFT is never missed on a fast, failed or truncated turn). Lifecycle, metadata and
+/// search-state events are not output. TTFT is marked at the first such event (U1, #99),
+/// following the OpenAI Responses streaming events; Go v8.0.67
+/// `helps.IsResponsesTokenEvent` is the lead.
+pub(crate) fn responses_token_event(payload: &[u8]) -> bool {
+    use cpa_common::json::{self as gj, Kind};
+    let text = |path: &str| !gj::get(payload, path).str().is_empty();
+    match gj::get(payload, "type").str().as_ref() {
+        "response.reasoning_summary_text.delta"
+        | "response.reasoning.delta"
+        | "response.reasoning_text.delta"
+        | "response.output_text.delta"
+        | "response.text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta"
+        | "response.code_interpreter_call_code.delta"
+        | "response.mcp_call_arguments.delta"
+        | "response.shell_call_command.delta"
+        | "response.refusal.delta"
+        | "response.audio.transcript.delta" => text("delta"),
+        "response.audio.delta" => text("delta") || text("data"),
+        "response.image_generation_call.partial_image" => text("partial_image_b64"),
+        "response.shell_call_command.added" | "response.shell_call_command.done" => text("command"),
+        "response.reasoning_summary_text.done" | "response.reasoning_text.done" | "response.output_text.done" => {
+            text("text")
+        }
+        "response.refusal.done" => text("refusal"),
+        "response.function_call_arguments.done" | "response.mcp_call_arguments.done" => text("arguments"),
+        "response.custom_tool_call_input.done" => text("input"),
+        "response.code_interpreter_call_code.done" => text("code"),
+        "response.reasoning_summary_part.done" => text("part.text"),
+        "response.content_part.done" => text("part.text") || text("part.refusal"),
+        "response.output_item.done" => {
+            let item = gj::get(payload, "item");
+            match item.get("type").str().as_ref() {
+                "function_call" => !item.get("arguments").str().is_empty(),
+                "custom_tool_call" => !item.get("input").str().is_empty(),
+                // Encrypted-only reasoning is not output; a text part is.
+                "reasoning" => ["summary", "content"].iter().any(|field| {
+                    item.get(*field).array().iter().any(|part| {
+                        let text = part.get("text");
+                        text.kind == Kind::String && !text.str().is_empty()
+                    })
+                }),
+                "message" => item
+                    .get("content")
+                    .array()
+                    .iter()
+                    .any(|part| !part.get("text").str().is_empty() || !part.get("refusal").str().is_empty()),
+                _ => false,
+            }
+        }
+        "response.completed" | "response.done" | "response.incomplete" | "response.failed" | "error" => true,
+        _ => false,
+    }
 }
 
 /// Go `http.Response.Header` for an HTTP/1.1 upstream response (net/http
@@ -695,6 +756,70 @@ pub(crate) fn capture_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U1 (#99): which Responses events carry output for TTFT.
+    #[test]
+    fn responses_token_events() {
+        let cases = [
+            (r#"{"type":"response.output_text.delta","delta":"hi"}"#, true),
+            (r#"{"type":"response.output_text.delta","delta":""}"#, false),
+            (
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"plan"}"#,
+                true,
+            ),
+            (r#"{"type":"response.function_call_arguments.delta","delta":"{"}"#, true),
+            (r#"{"type":"response.audio.delta","data":"AAAA"}"#, true),
+            (
+                r#"{"type":"response.image_generation_call.partial_image","partial_image_b64":"AAAA"}"#,
+                true,
+            ),
+            (
+                r#"{"type":"response.content_part.done","part":{"type":"refusal","refusal":"no"}}"#,
+                true,
+            ),
+            (
+                r#"{"type":"response.content_part.done","part":{"type":"output_text","text":""}}"#,
+                false,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"text":"hi"}]}}"#,
+                true,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","arguments":""}}"#,
+                false,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"text":""},{"text":"plan"}]}}"#,
+                true,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"encrypted_content":"OPAQUE"}}"#,
+                false,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"text":null}],"content":[{"text":123}]}}"#,
+                false,
+            ),
+            (
+                r#"{"type":"response.output_item.added","item":{"type":"reasoning","summary":[{"text":"plan"}]}}"#,
+                false,
+            ),
+            (
+                r#"{"type":"response.output_item.done","item":{"type":"web_search_call","status":"completed"}}"#,
+                false,
+            ),
+            (r#"{"type":"response.created","response":{"id":"r"}}"#, false),
+            (r#"{"type":"response.in_progress","response":{"id":"r"}}"#, false),
+            (r#"{"type":"response.completed","response":{"id":"r"}}"#, true),
+            (r#"{"type":"response.failed","response":{"id":"r"}}"#, true),
+            (r#"{"type":"error","error":{"message":"x"}}"#, true),
+            ("not json", false),
+        ];
+        for (payload, want) in cases {
+            assert_eq!(responses_token_event(payload.as_bytes()), want, "{payload}");
+        }
+    }
 
     #[test]
     fn response_headers_take_go_response_header_shape() {

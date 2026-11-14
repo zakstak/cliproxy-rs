@@ -34,6 +34,8 @@ pub(crate) enum Report {
     RoundTrip,
     /// `first_byte` (Go `MarkFirstResponseByte`).
     FirstByte,
+    /// `token_event`: an upstream frame, and whether it carried output.
+    TokenEvent(bool),
 }
 
 #[derive(Default)]
@@ -81,6 +83,9 @@ impl cpa_core::exec::UsageObserver for Recorder {
     }
     fn first_byte(&self) {
         self.0.lock().unwrap().push(Report::FirstByte);
+    }
+    fn token_event(&self, is_token: bool) {
+        self.0.lock().unwrap().push(Report::TokenEvent(is_token));
     }
 }
 
