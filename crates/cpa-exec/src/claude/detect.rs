@@ -12,7 +12,7 @@
 
 use http::HeaderMap;
 
-use super::profile::{self, Profile};
+use super::profile;
 use super::settings::Settings;
 use crate::rawjson;
 
@@ -178,7 +178,7 @@ pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, set
         && x_app
         && ua
         && metadata_user_id
-        && helper_profile(headers, payload, settings);
+        && helper_profile(headers, payload);
     Detection {
         confirmed: (standard || helper) && native,
         helper_profile: helper,
@@ -250,14 +250,14 @@ fn joined_betas(headers: &HeaderMap) -> String {
         .join(",")
 }
 
-fn helper_profile(headers: &HeaderMap, payload: &str, settings: &Settings) -> bool {
+fn helper_profile(headers: &HeaderMap, payload: &str) -> bool {
     let Some(shape) = measured_beta_shape(&joined_betas(headers)) else {
         return false;
     };
-    body_shape(payload) == Some(shape) && helper_headers(headers, settings) && helper_session(headers, payload)
+    body_shape(payload) == Some(shape) && helper_headers(headers) && helper_session(headers, payload)
 }
 
-fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
+fn helper_headers(headers: &HeaderMap) -> bool {
     let expected = [
         ("accept", "application/json"),
         ("content-type", "application/json"),
@@ -282,21 +282,11 @@ fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
     {
         return false;
     }
-    let baseline = Profile::default_for(settings);
-    let user_agent = raw_header(headers, "user-agent");
-    let candidate = (
-        profile::version(user_agent),
-        raw_header(headers, "x-stainless-package-version"),
-        raw_header(headers, "x-stainless-runtime-version"),
-    );
-    let exact = candidate.0.is_some()
-        && candidate.0 == profile::version(&baseline.user_agent)
-        && candidate.1 == baseline.package_version
-        && candidate.2 == baseline.runtime_version;
-    // Another release's helper is confirmed with its own versions, as its main requests
-    // are (docs/DIFFERENCES-FROM-GO.md); the measured beta and body shapes still guard.
-    let own = profile::own_release(user_agent, settings) && profile::stainless_versions_ok(headers);
-    if !exact && !own {
+    // Any forwarded release's helper is confirmed with its own well-formed versions, as
+    // its main requests are, with or without a stabilized profile; the measured beta and
+    // body shapes still guard. Go confirms only the exact baseline tuple
+    // (docs/DIFFERENCES-FROM-GO.md), which would cloak every other release's helpers.
+    if !profile::stainless_versions_ok(headers) {
         return false;
     }
     if !raw_header(headers, "x-stainless-async").is_empty()
@@ -553,8 +543,10 @@ mod tests {
         // A release between the floor and the baseline follows the same rule.
         assert!(confirmed("claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0"));
         assert!(!confirmed("claude-cli/2.1.280 (external, cli)", "", "v26.3.0"));
-        // The baseline release still needs the exact baseline tuple (Go).
-        assert!(!confirmed("claude-cli/2.1.325 (external, cli)", "0.120.4", "v27.0.1"));
+        // So does the baseline release on another SDK or runtime (Go needs the exact
+        // baseline tuple).
+        assert!(confirmed("claude-cli/2.1.325 (external, cli)", "0.120.4", "v27.0.1"));
+        assert!(!confirmed("claude-cli/2.1.325 (external, cli)", "0.120", "v27.0.1"));
         // A changed shape falls back to cloaking.
         let (h, body) = helper("claude-cli/2.2.3 (external, cli)", "0.120.4", "v27.0.1");
         let body = body.replace(r#""max_tokens":80"#, r#""max_tokens":81"#);
@@ -610,9 +602,10 @@ mod tests {
         assert!(!detect(&h, &body, false, &s).confirmed);
     }
 
-    /// With a stabilized profile nothing newer is forwarded, so Go's rules apply: a
-    /// 2.1.290 request is Claude Code without Stainless headers, and its helper is
-    /// confirmed only with the exact baseline tuple.
+    /// With a stabilized profile Go's line rule applies to main requests: a 2.1.290
+    /// request is Claude Code without Stainless headers. Helpers of a forwarded release,
+    /// such as the measured 2.1.280 title helper, stay confirmed with their own versions,
+    /// so the stabilized profile does not cloak them.
     #[test]
     fn stabilized_profiles_keep_go_detection() {
         let mut s = Settings::default();
@@ -629,6 +622,10 @@ mod tests {
         assert!(detect(&h, &body, false, &s).confirmed);
         assert!(detect(&h, &body, true, &s).confirmed, "count_tokens");
         let (h, body) = helper("claude-cli/2.1.290 (external, cli)", "0.120.4", "v27.0.1");
+        assert!(detect(&h, &body, false, &s).confirmed);
+        let (h, body) = helper("claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0");
+        assert!(detect(&h, &body, false, &s).confirmed);
+        let (h, body) = helper("claude-cli/2.1.280 (external, cli)", "", "v26.3.0");
         assert!(!detect(&h, &body, false, &s).confirmed);
     }
 }

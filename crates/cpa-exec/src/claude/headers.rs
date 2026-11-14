@@ -496,10 +496,10 @@ fn legacy_device_headers(h: &mut GoHeader, p: &Plan<'_>) {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .trim();
-        // A native release other than the baseline keeps its own SDK and runtime versions,
+        // A forwarded native release keeps its own well-formed SDK and runtime versions,
         // so they match its User-Agent (docs/DIFFERENCES-FROM-GO.md); otherwise Go's
-        // baseline values.
-        let own = profile::own_release(ua, p.settings);
+        // baseline values. This path runs only without a stabilized profile.
+        let own = profile::plausible_user_agent(ua, p.settings);
         ensure_valid("X-Stainless-Runtime-Version", &d.runtime_version, &|v| {
             v == d.runtime_version || (own && profile::runtime_version_ok(v))
         });
@@ -697,6 +697,59 @@ mod tests {
         }
     }
 
+    /// Native Claude Code 2.1.325 with default settings: detection confirms the captured
+    /// request, and its own identity headers and Anthropic-Beta list go upstream as sent,
+    /// with the credential's key in place of the caller's.
+    #[test]
+    fn native_claude_code_2_1_325_keeps_its_headers() {
+        let doc = include_str!("testdata/claude_code_2_1_325.json");
+        let settings = Settings::default();
+        let attributes = Default::default();
+        let capture = rawjson::get(doc, "captures.0");
+        let captured: Vec<(String, String)> = capture
+            .get("headers")
+            .array()
+            .iter()
+            .map(|h| (h.get("0").str().to_owned(), h.get("1").str().to_owned()))
+            .collect();
+        let incoming: HeaderMap = captured
+            .iter()
+            .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+            .collect();
+        let body = capture.get("body");
+        let detection = super::super::detect::detect(&incoming, body.json(), false, &settings);
+        assert!(detection.confirmed && !detection.helper_profile);
+        let h = build(&Plan {
+            api_key: "sk-ant-api03-credential",
+            bearer: false,
+            first_party: true,
+            count_tokens: false,
+            stream: true,
+            extra_betas: &[],
+            body: body.json(),
+            incoming: &incoming,
+            confirmed: true,
+            helper: false,
+            cli_fingerprint: true,
+            use_oauth_betas: false,
+            session_id: "00000000-0000-4000-8000-000000000325",
+            settings: &settings,
+            attributes: &attributes,
+            cpa_session: "",
+            device_profile: None,
+            cached_session_id: "",
+        });
+        let (pairs, _) = wire(h, true, false);
+        let ours = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        for (k, v) in &captured {
+            match k.as_str() {
+                "Connection" | "Host" | "Content-Length" => {}
+                "x-api-key" => assert_eq!(ours(k), Some("sk-ant-api03-credential")),
+                _ => assert_eq!(ours(k), Some(v.as_str()), "{k}"),
+            }
+        }
+    }
+
     #[test]
     fn harness_unconfirmed_oauth_messages_headers_match_go_capture() {
         let settings = Settings::default();
@@ -835,13 +888,14 @@ mod version_tests {
                 "v27.0.1".into()
             )
         );
-        // The baseline release itself keeps Go's baseline SDK and runtime versions.
+        // So does the baseline release itself, for example on another Node (Go pins the
+        // baseline values).
         assert_eq!(
             sent("claude-cli/2.1.325 (external, cli)"),
             (
                 "claude-cli/2.1.325 (external, cli)".into(),
-                "0.128.0".into(),
-                "v26.12.1".into()
+                "0.120.4".into(),
+                "v27.0.1".into()
             )
         );
         // Another major, or a release below the floor, gets the whole baseline identity.

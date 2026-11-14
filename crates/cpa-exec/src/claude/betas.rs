@@ -120,10 +120,11 @@ fn haiku55(m: &str) -> bool {
     let m = canonical_model(m);
     m == "claude-haiku-5-5" || m.starts_with("claude-haiku-5-5-") || m.starts_with("claude-haiku-5-5[")
 }
-/// Models Claude Code's cli entrypoint sends `thinking.display: updates` for when
-/// thinking is active (the 2.1.325 capture adds Fable 5.2 and Haiku 5.5).
+/// Models a cloaked request gets `thinking.display: updates` for. The 2.1.325 capture
+/// shows Claude Code's cli entrypoint sending it for Fable 5.2 and Haiku 5.5 as well;
+/// injecting display into more cloaked bodies is left to #78.
 pub(crate) fn progress_display(m: &str) -> bool {
-    is_opus55(m) || is_fable51(m) || fable52(m) || sonnet5(m) || sonnet55(m) || haiku55(m)
+    is_opus55(m) || is_fable51(m) || sonnet5(m) || sonnet55(m)
 }
 /// Models Claude Code 2.1.325 sends per-turn-control-2026-07-01 for on every request.
 fn per_turn_control_model(m: &str) -> bool {
@@ -538,7 +539,7 @@ mod tests {
         }
     }
 
-    /// Fable 5.2 gates. Per-turn control and progress display follow the 2.1.325 capture;
+    /// Fable 5.2 gates. Per-turn control follows the 2.1.325 capture;
     /// per-turn timing follows a caller's `output_config.timing` body on the models whose
     /// timing beta was already assembled, now with Fable 5.2 (Go `6db7d4b8`; the capture
     /// sends no timing body).
@@ -550,7 +551,6 @@ mod tests {
         };
         for model in ["claude-fable-5-2", "claude-fable-5-2[1m]", "anthropic/claude-fable-5-2"] {
             assert!(per_turn_control_model(model), "{model}");
-            assert!(progress_display(model), "{model}");
             assert!(timing(model), "{model}");
         }
         // Sonnet 5.5 and Haiku 5.5 send per-turn control (capture); timing stays unassembled.
@@ -558,10 +558,8 @@ mod tests {
             assert!(per_turn_control_model(model), "{model}");
             assert!(!timing(model), "{model}");
         }
-        assert!(progress_display("claude-haiku-5-5"));
         for model in ["claude-fable-5", "claude-fable-5-20", "claude-haiku-4-5-20251001"] {
             assert!(!per_turn_control_model(model), "{model}");
-            assert!(!progress_display(model), "{model}");
         }
     }
 
