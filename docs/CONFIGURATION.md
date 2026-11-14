@@ -192,6 +192,8 @@ curl -X POST -H "Authorization: Bearer $MANAGEMENT_KEY" http://127.0.0.1:8317/v8
 
 The answer names each catalog's source, whether it was read, and the providers whose models changed. It is 200 when every catalog was read or skipped, and 502 when one failed. A failed catalog keeps its last valid data. A catalog whose source is `embed` (`--local-model`) or `disabled` (models.json in Home mode) is skipped. Requests sent while a read is running wait for that read instead of starting another.
 
+A refresh reads only these two catalogs. It never asks a provider account which models it serves, so it sends no request with a credential.
+
 ## worker-threads
 
 `worker-threads: 4` at the top level sets how many threads serve requests. Without it, cliproxy-rs uses the smaller of the CPU count and two, which is plenty for one person: a coding-agent request with a 300 KB prompt costs about 20 to 30 ms of CPU (a small chat request about 1 ms), and most of a request's time is spent waiting on the provider. Each extra thread can keep its own pool of freed memory, so more threads mean a larger resident size. The `TOKIO_WORKER_THREADS` environment variable overrides it.
