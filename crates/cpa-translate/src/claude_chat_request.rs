@@ -3,6 +3,7 @@
 
 use crate::{
     Error, Registered, RequestCtx, claude_chat_response,
+    claude_property_keys::PropertyKeys,
     common::{self, trim_space},
     thinking,
 };
@@ -132,6 +133,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Re
         }
     }
     gj::set_bool(&mut out, "stream", stream);
+    let property_keys = property_keys(&root);
 
     let mut system: Vec<Vec<u8>> = vec![];
     let mut message_blocks: Vec<Vec<u8>> = vec![];
@@ -203,7 +205,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Re
                     if calls.is_array() && role == b"assistant" {
                         calls.each(|_, call| {
                             if call.get("type").str() == "function" {
-                                blocks.push(tool_use(&call));
+                                blocks.push(tool_use(&call, &property_keys));
                             }
                             true
                         });
@@ -250,7 +252,7 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Re
     }
     gj::set_items(&mut out, "messages", &message_blocks);
 
-    tools(&mut out, &root);
+    tools(&mut out, &root, &property_keys);
     if root.get("parallel_tool_calls").kind == Kind::False {
         if gj::get(&out, "tool_choice").exists() {
             if gj::get(&out, "tool_choice.type").str() != "none" {
@@ -267,7 +269,36 @@ fn convert(model: &str, raw: &[u8], stream: bool, preserve_thinking: bool) -> Re
     Ok(thinking::apply_translated_summary_to_claude(out, raw, "openai", model))
 }
 
-fn tool_use(call: &Res<'_>) -> Vec<u8> {
+/// The Claude input schema of a Chat function declaration, before property-key renames.
+fn function_schema(function: &Res<'_>) -> Vec<u8> {
+    let parameters = [function.get("parameters"), function.get("parametersJsonSchema")]
+        .into_iter()
+        .find(Res::exists);
+    common::normalize_claude_tool_input_schema(parameters.as_ref().map(|p| &*p.raw))
+}
+
+/// The property-key renames each declared function needs on Claude, by its Claude name
+/// (#77). The first declaration of a name decides, as Claude sees it first.
+pub(crate) fn property_keys(root: &Res<'_>) -> HashMap<Vec<u8>, PropertyKeys> {
+    let mut seen = HashSet::new();
+    let mut out = HashMap::new();
+    root.get("tools").each(|_, tool| {
+        if tool.get("type").str() != "function" {
+            return true;
+        }
+        let function = tool.get("function");
+        let name = common::sanitize_claude_function_name(&function.get("name").bytes());
+        if seen.insert(name.clone())
+            && let Some(keys) = PropertyKeys::of(&function_schema(&function))
+        {
+            out.insert(name, keys);
+        }
+        true
+    });
+    out
+}
+
+fn tool_use(call: &Res<'_>, property_keys: &HashMap<Vec<u8>, PropertyKeys>) -> Vec<u8> {
     let mut id = call.get("id").bytes().into_owned();
     if id.is_empty() {
         id = common::generate_claude_tool_call_id();
@@ -276,11 +307,8 @@ fn tool_use(call: &Res<'_>) -> Vec<u8> {
     let function = call.get("function");
     let mut part = br#"{"type":"tool_use","id":"","name":"","input":{}}"#.to_vec();
     gj::set_str(&mut part, "id", &id);
-    gj::set_str(
-        &mut part,
-        "name",
-        common::sanitize_claude_function_name(&function.get("name").bytes()),
-    );
+    let name = common::sanitize_claude_function_name(&function.get("name").bytes());
+    gj::set_str(&mut part, "name", &name);
     let args = function.get("arguments").bytes();
     let parsed = gj::parse(&args);
     let input: &[u8] = if !args.is_empty() && gj::valid(&args) && parsed.is_object() {
@@ -288,11 +316,14 @@ fn tool_use(call: &Res<'_>) -> Vec<u8> {
     } else {
         b"{}"
     };
-    gj::set_raw(&mut part, "input", input);
+    match property_keys.get(&name) {
+        Some(keys) => gj::set_raw(&mut part, "input", keys.to_claude(input)),
+        None => gj::set_raw(&mut part, "input", input),
+    };
     part
 }
 
-fn tools(out: &mut Vec<u8>, root: &Res<'_>) {
+fn tools(out: &mut Vec<u8>, root: &Res<'_>, property_keys: &HashMap<Vec<u8>, PropertyKeys>) {
     let mut allowed_names: HashSet<Vec<u8>> = HashSet::new();
     let mut allowed = false;
     let mut mode = "auto".to_owned();
@@ -337,10 +368,10 @@ fn tools(out: &mut Vec<u8>, root: &Res<'_>) {
             let mut t = br#"{"name":"","description":""}"#.to_vec();
             gj::set_str(&mut t, "name", &sanitized);
             gj::set_str(&mut t, "description", function.get("description").bytes());
-            let parameters = [function.get("parameters"), function.get("parametersJsonSchema")]
-                .into_iter()
-                .find(Res::exists);
-            let schema = common::normalize_claude_tool_input_schema(parameters.as_ref().map(|p| &*p.raw));
+            let mut schema = function_schema(&function);
+            if let Some(keys) = property_keys.get(&sanitized) {
+                schema = keys.schema(&schema);
+            }
             gj::set_raw(&mut t, "input_schema", schema);
             t = common::attach_cache_control(t, &tool);
             if !gj::get(&t, "cache_control").exists() {

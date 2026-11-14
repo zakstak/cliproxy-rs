@@ -10,9 +10,10 @@ use crate::apply_patch::CallState;
 use crate::{
     Error, Registered, RequestCtx, ResponseCtx,
     claude_fallback::FallbackChain,
+    claude_property_keys::PropertyKeys,
     claude_responses::{
-        REDACTED_THINKING_PREFIX, TOOL_SEARCH_ID_PREFIX, ToolNames, split_qualified_call, tool_descriptors,
-        tool_winners, web_search_call_id,
+        REDACTED_THINKING_PREFIX, TOOL_SEARCH_ID_PREFIX, ToolNames, function_property_keys, split_qualified_call,
+        tool_descriptors, tool_winners, web_search_call_id,
     },
     common::{self, now_unix, sse_event, trim_space},
     stream::GoStream,
@@ -41,6 +42,8 @@ struct Winner {
     /// The declaration's local name and namespace (an apply_patch call's identity).
     local_name: Vec<u8>,
     namespace: Vec<u8>,
+    /// The function's property keys renamed on Claude, restored in its calls (#77).
+    property_keys: Option<PropertyKeys>,
 }
 
 struct Tools {
@@ -67,6 +70,7 @@ impl Tools {
                     apply_patch,
                     local_name,
                     namespace: d.namespace.clone(),
+                    property_keys: function_property_keys(d),
                 };
                 (name, winner)
             })
@@ -95,6 +99,19 @@ impl Tools {
     /// isApplyPatch: the original request's winning declaration decides.
     fn is_apply_patch(&self, name: &[u8]) -> bool {
         self.winner(name).is_some_and(|w| w.apply_patch)
+    }
+
+    /// Whether calls of this tool carry renamed property keys.
+    fn renames_keys(&self, name: &[u8]) -> bool {
+        self.winner(name).is_some_and(|w| w.property_keys.is_some())
+    }
+
+    /// A call's arguments with the client's property keys restored.
+    fn restore_keys(&self, name: &[u8], arguments: Vec<u8>) -> Vec<u8> {
+        match self.winner(name).and_then(|w| w.property_keys.as_ref()) {
+            Some(keys) => keys.to_client(&arguments),
+            None => arguments,
+        }
     }
 
     /// Two names for one block that resolve to different tools.
@@ -715,8 +732,14 @@ impl State {
         Ok(vec![event("response.output_item.added", &item)])
     }
 
-    fn emit_pending_args(&mut self, idx: i64) -> Vec<Vec<u8>> {
+    /// The arguments received since the last delta. A call with renamed property keys
+    /// is held until its block ends (`finishing`): a key split across fragments cannot be
+    /// restored, so its client-keyed arguments go out as one delta.
+    fn emit_pending_args(&mut self, idx: i64, finishing: bool) -> Vec<Vec<u8>> {
         if !self.func_item_added.contains(&idx) || self.tool_error || self.tools.is_tool_search(&self.name(idx)) {
+            return vec![];
+        }
+        if !finishing && self.tools.renames_keys(&self.name(idx)) {
             return vec![];
         }
         let sent = self.func_args_sent.get(&idx).copied().unwrap_or(0);
@@ -754,7 +777,13 @@ impl State {
             return Ok(vec![]);
         }
         let mut out = self.emit_func_item(idx, true)?;
-        out.extend(self.emit_pending_args(idx));
+        let name = self.name(idx);
+        if self.tools.renames_keys(&name)
+            && let Some(args) = self.func_args.remove(&idx)
+        {
+            self.func_args.insert(idx, self.tools.restore_keys(&name, args));
+        }
+        out.extend(self.emit_pending_args(idx, true));
         if self.tool_error {
             return Ok(out);
         }
@@ -1077,7 +1106,7 @@ impl State {
                         }
                         if pj.exists() {
                             self.func_args.entry(idx).or_default().extend_from_slice(&pj.bytes());
-                            out.extend(self.emit_pending_args(idx));
+                            out.extend(self.emit_pending_args(idx, false));
                         }
                     }
                     b"thinking_delta" => {
@@ -1252,7 +1281,7 @@ impl State {
                     return Ok(());
                 }
                 out.extend(self.emit_func_item(idx, false)?);
-                out.extend(self.emit_pending_args(idx));
+                out.extend(self.emit_pending_args(idx, false));
             }
             b"server_tool_use" => {
                 if cb.get("name").str() == "web_search" {
@@ -1942,7 +1971,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
                 tools.identity(item, request, &it.name, "")
             }
             _ => {
-                let mut args = it.args.clone();
+                let mut args = tools.restore_keys(&it.name, it.args.clone());
                 if args.is_empty() && item_status == "completed" {
                     args = b"{}".to_vec();
                 }

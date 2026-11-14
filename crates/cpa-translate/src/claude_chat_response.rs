@@ -5,6 +5,7 @@
 use crate::{
     Error, ResponseCtx,
     claude_fallback::FallbackChain,
+    claude_property_keys::PropertyKeys,
     common::{self, now_unix},
     stream::GoStream,
 };
@@ -97,8 +98,21 @@ pub(crate) fn data_payload(line: &[u8]) -> Option<&[u8]> {
 pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     Box::new(State {
         model: ctx.model.as_bytes().to_vec(),
+        property_keys: crate::claude_chat_request::property_keys(&gj::parse(ctx.original_request)),
         ..State::default()
     })
+}
+
+impl Tool {
+    /// Claude's buffered arguments, `{}` when it sent none, with the client's property
+    /// keys restored (#77).
+    fn finish(&mut self, property_keys: &HashMap<Vec<u8>, PropertyKeys>) {
+        if self.arguments.is_empty() {
+            self.arguments = b"{}".to_vec();
+        } else if let Some(keys) = property_keys.get(&self.name) {
+            self.arguments = keys.to_client(&self.arguments);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -112,6 +126,8 @@ struct State {
     usage: Usage,
     tools: HashMap<i64, Tool>,
     next_tool: i64,
+    /// The declared functions' renamed property keys, by Claude name.
+    property_keys: HashMap<Vec<u8>, PropertyKeys>,
     trailing_sent: bool,
 }
 
@@ -211,9 +227,7 @@ impl State {
             }
             "content_block_stop" => {
                 let mut tool = self.tools.remove(&index)?;
-                if tool.arguments.is_empty() {
-                    tool.arguments = b"{}".to_vec();
-                }
+                tool.finish(&self.property_keys);
                 gj::set_int(&mut out, "choices.0.delta.tool_calls.0.index", tool.index);
                 gj::set_str(&mut out, "choices.0.delta.tool_calls.0.id", &tool.id);
                 gj::set_str(&mut out, "choices.0.delta.tool_calls.0.type", "function");
@@ -293,6 +307,7 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
     let mut reasoning: Option<Vec<u8>> = None;
     let mut usage = Usage::default();
     let mut tools: BTreeMap<i64, Tool> = BTreeMap::new();
+    let property_keys = crate::claude_chat_request::property_keys(&gj::parse(ctx.original_request));
     let mut fallbacks = FallbackChain::default();
     for line in body.split(|&c| c == b'\n') {
         let Some(payload) = data_payload(line) else {
@@ -359,10 +374,8 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, body: &[u8]) -> Result<Vec<u8>, Error> 
                 }
             }
             "content_block_stop" => {
-                if let Some(tool) = tools.get_mut(&index)
-                    && tool.arguments.is_empty()
-                {
-                    tool.arguments = b"{}".to_vec();
+                if let Some(tool) = tools.get_mut(&index) {
+                    tool.finish(&property_keys);
                 }
             }
             "message_delta" => {
