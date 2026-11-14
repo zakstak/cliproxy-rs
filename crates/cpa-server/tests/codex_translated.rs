@@ -913,3 +913,156 @@ async fn standalone_claude_effort_is_refused_before_the_send() {
     assert_eq!(status, 200, "{answer}");
     assert_eq!(sent(&proxy)["reasoning"]["effort"], "low");
 }
+
+/// A `response.created`, a text delta when `text` is not empty, then a
+/// `response.incomplete` with `details` as its `incomplete_details`.
+fn incomplete(details: &str, text: &str) -> Reply {
+    let mut sse = String::from(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut output = String::from("[]");
+    if !text.is_empty() {
+        sse.push_str(&format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"{text}\"}}\n\n"
+        ));
+        output = format!(
+            r#"[{{"type":"message","id":"msg_1","status":"incomplete","role":"assistant","content":[{{"type":"output_text","text":"{text}"}}]}}]"#
+        );
+    }
+    sse.push_str(&format!(
+        "event: response.incomplete\ndata: {{\"type\":\"response.incomplete\",\"response\":{{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{details},\"output\":{output},\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n"
+    ));
+    Reply::sse(sse)
+}
+
+/// The stop a Claude and a Chat client read from `answer`: Claude `stop_reason`, Chat
+/// `finish_reason`, streamed or buffered.
+fn client_stop(answer: &str) -> Option<String> {
+    let values: Vec<Value> = match serde_json::from_str::<Value>(answer) {
+        Ok(value) => vec![value],
+        Err(_) => answer
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect(),
+    };
+    values.iter().find_map(|v| {
+        [
+            &v["stop_reason"],
+            &v["delta"]["stop_reason"],
+            &v["choices"][0]["finish_reason"],
+        ]
+        .into_iter()
+        .find_map(|s| s.as_str().map(str::to_owned))
+    })
+}
+
+/// A `response.incomplete` is never a normal stop on the translated route
+/// (`docs/codex/CONTRACT.md` "Translated route", Responses). A reason the client API
+/// has a stop for becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat
+/// `length`, `content_filter` is Claude `refusal` and Chat `content_filter`. Any other
+/// reason, with or without output, has none in Claude Messages or Chat Completions, so
+/// the response fails with an upstream error that names the reason: the first-party
+/// `sse-incomplete-partial` (an `invalid_recipient` stop inside a call), an unknown or
+/// missing reason, and `interrupted`, which the first-party client reads as a turn that
+/// did not end (`codex-api/src/sse/responses.rs:451-506`).
+#[tokio::test]
+async fn incomplete_responses_keep_their_meaning() {
+    let partial = Reply::sse(fixture("sse-incomplete-partial").bytes());
+    let mapped = [
+        (r#"{"reason":"max_output_tokens"}"#, "max_tokens", "length"),
+        (r#"{"reason":"content_filter"}"#, "refusal", "content_filter"),
+    ];
+    for stream in [true, false] {
+        for (details, claude, chat) in mapped {
+            for (path, body, stop) in [
+                ("/v1/messages", claude_request(stream), claude),
+                ("/v1/chat/completions", chat_request(stream), chat),
+            ] {
+                let proxy = proxy(vec![incomplete(details, "Partial")], "").await;
+                let (status, answer) = post(&proxy.url, path, &body).await;
+                assert_eq!(status, 200, "{path} stream={stream} {details}: {answer}");
+                assert_eq!(
+                    client_stop(&answer).as_deref(),
+                    Some(stop),
+                    "{path} stream={stream}: {answer}"
+                );
+                assert!(answer.contains("Partial"), "the partial output stays: {answer}");
+            }
+        }
+        let failing = [
+            (partial.clone(), "invalid_recipient"),
+            (incomplete(r#"{"reason":"unknown"}"#, ""), "unknown"),
+            (incomplete("null", "Partial"), "unknown"),
+            (incomplete(r#"{"reason":"interrupted"}"#, "Partial"), "interrupted"),
+        ];
+        for (reply, reason) in failing {
+            for (path, body) in [
+                ("/v1/messages", claude_request(stream)),
+                ("/v1/chat/completions", chat_request(stream)),
+            ] {
+                let proxy = proxy(vec![reply.clone()], "").await;
+                let (status, answer) = post(&proxy.url, path, &body).await;
+                assert_eq!(
+                    client_stop(&answer),
+                    None,
+                    "{path} stream={stream} {reason}: no normal stop: {answer}"
+                );
+                assert!(
+                    answer.contains(&format!("upstream response incomplete: {reason}")),
+                    "{path} stream={stream}: the error names the reason: {answer}"
+                );
+                assert!(!answer.contains("tool_use\""), "no call from a cut-off item: {answer}");
+                if !stream {
+                    assert_eq!(status, 502, "{path} {reason}: {answer}");
+                }
+                assert_eq!(proxy.upstream.http().len(), 1, "never retried: {path} {reason}");
+            }
+        }
+    }
+}
+
+/// The outbound credential guard covers the translated route
+/// (`docs/codex/CONTRACT.md` "Credential isolation"): an upstream that writes the
+/// credential it was sent into its answer never hands it to the client. An error keeps
+/// its status and loses its body, a streamed client event that carries it is withheld
+/// while the rest of the stream arrives, and a buffered answer that carries it fails.
+#[tokio::test]
+async fn the_selected_credential_never_reaches_a_translated_client() {
+    let echo = |status| {
+        Reply::json(
+            status,
+            r#"{"error":{"type":"invalid_request_error","message":"bad token at-FAKE"}}"#,
+        )
+    };
+    let leaking = || {
+        Reply::sse(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"at-FAKE\"}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Helloat-FAKE\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n",
+        )
+    };
+    for stream in [true, false] {
+        for (path, body) in [
+            ("/v1/messages", claude_request(stream)),
+            ("/v1/chat/completions", chat_request(stream)),
+        ] {
+            let rejecting = proxy(vec![echo(400)], "").await;
+            let (status, answer) = post(&rejecting.url, path, &body).await;
+            assert_eq!(status, 400, "{path} stream={stream}: the classified status: {answer}");
+            assert!(!answer.contains("at-FAKE"), "{path} stream={stream}: {answer}");
+
+            let answering = proxy(vec![leaking()], "").await;
+            let (status, answer) = post(&answering.url, path, &body).await;
+            assert!(!answer.contains("at-FAKE"), "{path} stream={stream}: {answer}");
+            if stream {
+                assert_eq!(status, 200, "{answer}");
+                assert!(answer.contains("Hello"), "the rest of the stream arrives: {answer}");
+                assert!(client_stop(&answer).is_some(), "the stream completes: {answer}");
+            } else {
+                assert_eq!(status, 502, "{path}: {answer}");
+            }
+        }
+    }
+}

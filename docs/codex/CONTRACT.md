@@ -204,7 +204,7 @@ response ID, usage and incomplete output items. That error has no retry delay
 success. A replacement 502 would drop the ID, usage and partial output and change that
 classification. A stream that ends without any terminal event is a different case and
 still fails ([Native HTTP route](#native-http-route), [Native WebSocket
-route](#native-websocket-route)). The translated route keeps Go's rule until #27
+route](#native-websocket-route)). The translated route has its own rule, by reason
 ([Translated route](#translated-route)).
 
 [#26](https://github.com/zakstak/cliproxy-rs/issues/26) defines the header policy.
@@ -1106,8 +1106,13 @@ reading above, which decides by what a failure means.
   responses included, is scrubbed of its socket's values whichever publishes first. A
   record's status, tokens, account and every other field stay as processed. The request
   body is the client's own bytes and is logged as sent.
-- **What it does not cover.** The translated route (#27) and other providers have no
-  such guard.
+- **The translated route (#27).** The same guard checks what the translated route
+  hands its client, against the values its upstream request carried: an error's body,
+  each translated stream frame and a buffered answer, with the outcomes above
+  (`crates/cpa-exec/src/codex_translated.rs`). Its request log and usage record are
+  scrubbed of them too. Test: `codex_translated.rs`
+  `the_selected_credential_never_reaches_a_translated_client`.
+- **What it does not cover.** Other providers have no such guard.
 
 ## Translated route
 
@@ -1234,11 +1239,24 @@ the translation of the aggregated terminal event. Usage is the provider's. A Cla
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
 provider's counts. Upstream errors keep their classification and reach the client in
-its own error format. Until #27 replaces it, the translator keeps Go's empty-incomplete
-rule: a `response.incomplete` with no output item, no output delta and
-`output_tokens` 0, whose reason is missing or is not `interrupted`, `content_filter` or
-`max_output_tokens`, becomes a request-scoped 502. The native routes no longer apply it
-([Permitted transformations](#permitted-transformations)).
+its own error format.
+
+A `response.incomplete` is never a normal stop. A reason the client API has a stop for
+becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat `length`, and
+`content_filter` is Claude `refusal` and Chat `content_filter`. Claude Messages and Chat
+Completions have no stop for any other reason: `interrupted`, which the pinned client
+reads as a turn that did not end, and every reason it reads as a terminal
+`ResponseIncomplete`, `unknown` when missing or not a string
+(`codex-api/src/sse/responses.rs:451-506`). Such a response fails with a request-scoped
+502, `upstream response incomplete: <reason>`, whether or not it produced output: a
+streamed client keeps what it received and then gets the error, a buffered client gets
+the error, and the request neither fails over nor cools the credential. Without this, an
+incomplete response would read as `end_turn` or `stop`, and a cut-off call (the
+first-party `sse-incomplete-partial`) as a complete `tool_use`. Go's empty-incomplete
+rule, which judged by missing output instead of by reason, is deleted. The native routes
+deliver every `response.incomplete` as sent ([Permitted
+transformations](#permitted-transformations)). Test: `codex_translated.rs`
+`incomplete_responses_keep_their_meaning`.
 
 ### Token counts and images
 

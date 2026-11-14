@@ -15,8 +15,6 @@ use crate::codex_json::{set_raw, set_str};
 
 pub(crate) const INCOMPLETE_MESSAGE: &str =
     "stream error: stream disconnected before completion: stream closed before response.completed";
-pub(crate) const EMPTY_INCOMPLETE_MESSAGE: &str =
-    "stream error: upstream terminated with incomplete empty response (0 tokens)";
 /// `codexBootstrapMaxBufferedFrames` / `codexBootstrapMaxBufferedBytes`.
 pub(crate) const BOOTSTRAP_MAX_FRAMES: usize = 48;
 pub(crate) const BOOTSTRAP_MAX_BYTES: usize = 1 << 20;
@@ -579,41 +577,32 @@ pub(crate) fn bootstrap_overload(body: &str) -> ExecError {
     status_error(503, body.as_bytes(), HeaderMap::new(), false)
 }
 
-/// `HasMeaningfulCodexOutputDelta`.
-pub(crate) fn meaningful_delta(payload: &str) -> bool {
-    matches!(
-        rawjson::get(payload, "type").str(),
-        "response.output_text.delta"
-            | "response.reasoning_text.delta"
-            | "response.reasoning_summary_text.delta"
-            | "response.function_call_arguments.delta"
-    ) && !rawjson::get(payload, "delta").str().trim().is_empty()
-}
-
-/// `IsCodexTerminalEmptyIncomplete`: `response.incomplete` with literally zero output,
-/// an upstream silent abort. Unlike Go, an incomplete response that names why it stopped
-/// (`interrupted`, `content_filter`, `max_output_tokens`) is that response, not an
-/// abort: a cancellation before the first token produces exactly this shape, and current
-/// Codex reads those reasons itself (docs/DIFFERENCES-FROM-GO.md).
+/// The failure for a `response.incomplete` that the translated route's clients cannot
+/// read as a stop (`docs/codex/CONTRACT.md` "Translated route", Responses). Claude
+/// Messages and Chat Completions each have a stop for `max_output_tokens` (`max_tokens`,
+/// `length`) and `content_filter` (`refusal`, `content_filter`), which the response
+/// translators set. Neither has one for any other reason: `interrupted`, which the
+/// pinned client reads as a turn that did not end, or a reason it reads as a terminal
+/// `ResponseIncomplete`, `unknown` when missing or not a string
+/// (`codex-api/src/sse/responses.rs:451-506` at 44ccf394573c). Such a response fails with
+/// a request-scoped 502 that names the reason, whatever output came before, instead of
+/// reaching the client as a normal stop or a complete call.
 ///
-/// Only the translated route ([`Processor`]) still applies it (#27). Native HTTP and
-/// WebSocket routes deliver every `response.incomplete` as sent (#25).
-pub(crate) fn empty_incomplete(payload: &str, items: usize, saw_delta: bool) -> bool {
-    if rawjson::get(payload, "type").str() != "response.incomplete" || saw_delta || items > 0 {
-        return false;
+/// Only the translated route ([`Processor`]) applies it. Native HTTP and WebSocket routes
+/// deliver every `response.incomplete` as sent (#25).
+pub(crate) fn untranslatable_incomplete(payload: &str) -> Option<ExecError> {
+    if rawjson::get(payload, "type").str() != "response.incomplete" {
+        return None;
     }
-    if matches!(
-        rawjson::get(payload, "response.incomplete_details.reason").str(),
-        "interrupted" | "content_filter" | "max_output_tokens"
-    ) {
-        return false;
+    let reason = rawjson::get(payload, "response.incomplete_details.reason");
+    let reason = match reason.kind() {
+        Kind::String if !reason.str().is_empty() => reason.str(),
+        _ => "unknown",
+    };
+    if matches!(reason, "max_output_tokens" | "content_filter") {
+        return None;
     }
-    let output = rawjson::get(payload, "response.output");
-    if output.kind() == Kind::Array && !output.items().is_empty() {
-        return false;
-    }
-    let tokens = rawjson::get(payload, "response.usage.output_tokens");
-    tokens.kind() == Kind::Number && tokens.json().trim() == "0"
+    Some(request_scoped(502, &format!("upstream response incomplete: {reason}")))
 }
 
 /// `isCodexBootstrapBufferableEvent`: frames that show the client nothing yet.
@@ -791,7 +780,6 @@ pub(crate) enum Step {
 /// Per-response SSE processing shared by streaming and buffered paths.
 pub(crate) struct Processor {
     items: OutputItems,
-    saw_delta: bool,
     preserve_native: bool,
     model_level_cooling: bool,
     /// The last completed payload (response.completed/incomplete), for buffered callers.
@@ -808,7 +796,6 @@ impl Processor {
     pub fn new(preserve_native: bool, model_level_cooling: bool) -> Self {
         Self {
             items: OutputItems::default(),
-            saw_delta: false,
             preserve_native,
             model_level_cooling,
             completed: None,
@@ -904,12 +891,9 @@ impl Processor {
                             before: framed(&lines),
                         };
                     }
-                    if meaningful_delta(payload) {
-                        self.saw_delta = true;
-                    }
-                    if empty_incomplete(payload, self.items.len(), self.saw_delta) {
+                    if let Some(error) = untranslatable_incomplete(payload) {
                         return Step::Fail {
-                            error: request_scoped(502, EMPTY_INCOMPLETE_MESSAGE),
+                            error,
                             body: None,
                             before: framed(&lines),
                         };
@@ -980,9 +964,6 @@ impl Processor {
                     self.usage
                         .response_line(cpa_core::format::Format::Codex, payload.as_bytes());
                 }
-                if meaningful_delta(payload) {
-                    self.saw_delta = true;
-                }
                 // As received: the first-party gate admits JSON whitespace only.
                 if let Some((error, _)) = received_failure(data, self.model_level_cooling) {
                     return Err(error);
@@ -990,8 +971,8 @@ impl Processor {
                 match rawjson::get(payload, "type").str() {
                     "response.output_item.done" => self.items.collect(payload),
                     "response.completed" | "response.incomplete" => {
-                        if empty_incomplete(payload, self.items.len(), self.saw_delta) {
-                            return Err(request_scoped(502, EMPTY_INCOMPLETE_MESSAGE));
+                        if let Some(error) = untranslatable_incomplete(payload) {
+                            return Err(error);
                         }
                         return Ok(Some(self.items.patch(payload.to_owned())));
                     }
@@ -1201,8 +1182,8 @@ pub(crate) async fn bootstrap(
 }
 
 #[cfg(test)]
-mod empty_incomplete_tests {
-    use super::empty_incomplete;
+mod incomplete_tests {
+    use super::untranslatable_incomplete;
 
     fn incomplete(details: &str) -> String {
         format!(
@@ -1210,20 +1191,37 @@ mod empty_incomplete_tests {
         )
     }
 
-    /// An explained stop is a response; an unexplained zero-output one stays an abort.
+    /// A reason with a client stop translates; every other reason fails and is named,
+    /// `unknown` when missing, null, empty or not a string.
     #[test]
-    fn named_reasons_are_not_silent_aborts() {
-        for reason in ["interrupted", "content_filter", "max_output_tokens"] {
+    fn only_reasons_with_a_client_stop_translate() {
+        for reason in ["content_filter", "max_output_tokens"] {
             let payload = incomplete(&format!(r#""incomplete_details":{{"reason":"{reason}"}},"#));
-            assert!(!empty_incomplete(&payload, 0, false), "{reason}");
+            assert!(untranslatable_incomplete(&payload).is_none(), "{reason}");
         }
-        for details in [
-            "",
-            r#""incomplete_details":null,"#,
-            r#""incomplete_details":{"reason":"unknown"},"#,
+        for (details, named) in [
+            ("", "unknown"),
+            (r#""incomplete_details":null,"#, "unknown"),
+            (r#""incomplete_details":{"reason":null},"#, "unknown"),
+            (r#""incomplete_details":{"reason":""},"#, "unknown"),
+            (r#""incomplete_details":{"reason":7},"#, "unknown"),
+            (r#""incomplete_details":{"reason":"interrupted"},"#, "interrupted"),
+            (
+                r#""incomplete_details":{"reason":"invalid_recipient"},"#,
+                "invalid_recipient",
+            ),
         ] {
-            assert!(empty_incomplete(&incomplete(details), 0, false), "{details}");
+            let error = untranslatable_incomplete(&incomplete(details)).expect(details);
+            assert_eq!(error.status, 502, "{details}");
+            assert_eq!(error.scope, cpa_core::exec::FailureScope::Request, "{details}");
+            assert!(
+                error.body.as_ref() == format!("upstream response incomplete: {named}").as_bytes(),
+                "{details}: {}",
+                String::from_utf8_lossy(&error.body)
+            );
         }
+        let completed = r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#;
+        assert!(untranslatable_incomplete(completed).is_none());
     }
 }
 
