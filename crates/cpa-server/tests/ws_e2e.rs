@@ -906,6 +906,21 @@ async fn upstream_1009_reaches_the_client_as_1009() {
     run("ws_upstream_message_too_big").await;
 }
 
+/// FP4 #118: an upstream close 1009 before any event reaches the client as close 1009 with
+/// no text before it (handshake metadata goes out only with the turn's first event), the
+/// one reading first-party Codex takes as `WebsocketMessageTooLarge` and answers by
+/// switching to HTTP itself. The proxy writes the request once and sends it nowhere
+/// else.
+#[tokio::test]
+async fn upstream_1009_before_any_event_reaches_the_client_before_any_text() {
+    run_with("ws_upstream_message_too_big", |scenario| {
+        let step = &mut scenario["steps"][0];
+        step["upstream"][0]["events"] = serde_json::json!([]);
+        step["frames"] = serde_json::json!([{ "close": 1009, "reason": "too big" }]);
+    })
+    .await;
+}
+
 /// gorilla's close text reaches the client verbatim; only a mapped 413 is trimmed.
 #[tokio::test]
 async fn upstream_1009_reason_reaches_the_client_verbatim() {

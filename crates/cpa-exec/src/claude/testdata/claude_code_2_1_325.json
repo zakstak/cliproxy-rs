@@ -1,0 +1,2321 @@
+{
+ "source": "Claude Code 2.1.325 (`claude --version`), captured 2026-11-14 by pointing ANTHROPIC_BASE_URL at a loopback mock inside a network-denied namespace (`unshare -rn`), with a fresh temporary HOME and CLAUDE_CONFIG_DIR. `cli` entries ran the interactive UI in a pty (`claude --model M 'say ok'`), `sdk-cli` entries ran `claude -p 'say ok' --model M`.",
+ "auth": "api-key: ANTHROPIC_API_KEY=fake-key. oauth: CLAUDE_CODE_OAUTH_TOKEN=<fake token>; no account, profile or feature-flag endpoint was reachable, so these are not real-account captures.",
+ "limits": "Feature flags, remote settings and account data were unreachable. Betas and billing fields gated by them (for example prompt-caching-scope-2026-01-05, mid-conversation-system-clear-at-2026-08-21, thinking-binding-controls-2026-08-01, the billing cch, cc_prompt_id and cc_turn_origin fields) are absent here; their absence is not evidence that a real session omits them. The host was Linux x64, so X-Stainless-OS and X-Stainless-Arch describe it, not the profile.",
+ "sanitized": "Credentials are redacted, session and device IDs replaced, Content-Length dropped, and long text, tool descriptions, schemas and the safeguards classifier context replaced. Key order, roles, block types, cache_control markers, the billing block, the first user turn's attribution reminder and other reminders (which the billing fingerprint skips; redacted reminders keep their tags) and the prompt it samples are kept verbatim.",
+ "captures": [
+  {
+   "name": "cli api-key claude-fable-5-2",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-2",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "cli api-key claude-fable-5-1",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-1",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "high"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "cli api-key claude-opus-5-5",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-opus-5-5",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "cli api-key claude-sonnet-5-5",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-sonnet-5-5",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "cli api-key claude-haiku-5-5",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "interleaved-thinking-2025-05-14,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-haiku-5-5",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "cli oauth quota probe claude-fable-5-2",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Authorization",
+     "Bearer <redacted>"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-2",
+    "max_tokens": 1,
+    "messages": [
+     {
+      "role": "user",
+      "content": "quota"
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    }
+   }
+  },
+  {
+   "name": "cli oauth claude-fable-5-2",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Authorization",
+     "Bearer <redacted>"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-2",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral",
+         "ttl": "1h"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": {
+       "type": "ephemeral",
+       "ttl": "1h"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral",
+       "ttl": "1h"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "AskUserQuestion",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "updates"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "safeguards": [
+     {
+      "type": "dangerous_tool_use",
+      "classifier_context": "<redacted>"
+     }
+    ],
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "sdk-cli api-key claude-fable-5-2",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, sdk-cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-2",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=sdk-cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "omitted"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "sdk-cli oauth claude-fable-5-2",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Authorization",
+     "Bearer <redacted>"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, sdk-cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-fable-5-2",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):\n- End git commit messages with:\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\n- End pull request descriptions with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n</system-reminder>\n"
+       },
+       {
+        "type": "text",
+        "text": "say ok"
+       }
+      ]
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "<redacted>",
+        "cache_control": {
+         "type": "ephemeral",
+         "ttl": "1h"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=sdk-cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+      "cache_control": {
+       "type": "ephemeral",
+       "ttl": "1h"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral",
+       "ttl": "1h"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 128000,
+    "thinking": {
+     "type": "adaptive",
+     "display": "omitted"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "output_config": {
+     "effort": "medium"
+    },
+    "stream": true
+   }
+  },
+  {
+   "name": "sdk-cli api-key claude-haiku-4-5-20251001",
+   "path": "/v1/messages?beta=true",
+   "headers": [
+    [
+     "Accept",
+     "application/json"
+    ],
+    [
+     "Content-Type",
+     "application/json"
+    ],
+    [
+     "User-Agent",
+     "claude-cli/2.1.325 (external, sdk-cli)"
+    ],
+    [
+     "X-Claude-Code-Session-Id",
+     "00000000-0000-4000-8000-000000000325"
+    ],
+    [
+     "X-Stainless-Arch",
+     "x64"
+    ],
+    [
+     "X-Stainless-Lang",
+     "js"
+    ],
+    [
+     "X-Stainless-OS",
+     "Linux"
+    ],
+    [
+     "X-Stainless-Package-Version",
+     "0.128.0"
+    ],
+    [
+     "X-Stainless-Retry-Count",
+     "0"
+    ],
+    [
+     "X-Stainless-Runtime",
+     "node"
+    ],
+    [
+     "X-Stainless-Runtime-Version",
+     "v26.12.1"
+    ],
+    [
+     "X-Stainless-Timeout",
+     "600"
+    ],
+    [
+     "anthropic-beta",
+     "interleaved-thinking-2025-05-14,context-management-2025-06-27,claude-code-20250219,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20"
+    ],
+    [
+     "anthropic-dangerous-direct-browser-access",
+     "true"
+    ],
+    [
+     "anthropic-version",
+     "2023-06-01"
+    ],
+    [
+     "x-api-key",
+     "<redacted>"
+    ],
+    [
+     "x-app",
+     "cli"
+    ],
+    [
+     "Connection",
+     "keep-alive"
+    ],
+    [
+     "Host",
+     "127.0.0.1:18765"
+    ],
+    [
+     "Accept-Encoding",
+     "gzip, deflate, br, zstd"
+    ],
+    [
+     "Content-Length",
+     "<original>"
+    ]
+   ],
+   "body": {
+    "model": "claude-haiku-4-5-20251001",
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "<system-reminder>\n<redacted>\n</system-reminder>"
+       },
+       {
+        "type": "text",
+        "text": "say ok",
+        "cache_control": {
+         "type": "ephemeral"
+        }
+       }
+      ]
+     }
+    ],
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.325.f16; cc_entrypoint=sdk-cli;"
+     },
+     {
+      "type": "text",
+      "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     },
+     {
+      "type": "text",
+      "text": "<redacted>",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Agent",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Bash",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Edit",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ListAgents",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Read",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ReportFindings",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ScheduleWakeup",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Skill",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "ToolSearch",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "Workflow",
+      "input_schema": {
+       "type": "object"
+      }
+     },
+     {
+      "name": "DeferredToolPlaceholder",
+      "input_schema": {
+       "type": "object"
+      },
+      "defer_loading": true
+     },
+     {
+      "name": "Write",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ],
+    "metadata": {
+     "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000325\"}"
+    },
+    "max_tokens": 32000,
+    "thinking": {
+     "budget_tokens": 31999,
+     "type": "enabled",
+     "display": "omitted"
+    },
+    "context_management": {
+     "edits": [
+      {
+       "type": "clear_thinking_20251015",
+       "keep": "all"
+      }
+     ]
+    },
+    "stream": true
+   }
+  }
+ ]
+}

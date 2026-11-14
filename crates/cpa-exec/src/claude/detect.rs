@@ -4,19 +4,38 @@
 //! User-Agent, the claude-code beta and a valid metadata.user_id; count_tokens omits
 //! the last) from a verified entrypoint, or as one of the exactly measured Haiku helper
 //! shapes. Without `stabilize-device-profile` the User-Agent may be any release at or
-//! above the measured one within its major version, and a newer one also needs
-//! well-formed Stainless version headers. With it, Go's rule applies: the same
-//! major.minor, patch at or above the measured one, and no Stainless requirement.
+//! above the floor (`profile::NATIVE_FLOOR`) within its major version, and one other
+//! than the baseline also needs well-formed Stainless version headers. With it, Go's
+//! rule applies: the same major.minor, patch at or above the floor's, and no Stainless
+//! requirement.
 //! Copying the User-Agent alone is not enough.
 
 use http::HeaderMap;
 
-use super::profile::{self, Profile};
+use super::profile;
 use super::settings::Settings;
 use crate::rawjson;
 
-/// Entrypoints whose wire behaviour was captured and reviewed for passthrough.
-pub(crate) const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "claude-vscode"];
+/// Entrypoints whose wire behaviour was captured and reviewed for passthrough. The
+/// Agent SDK entrypoints send what sdk-cli sends (testdata/claude_code_2_1_325_clients.json).
+const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "sdk-ts", "sdk-py", "claude-vscode"];
+
+/// A built-in native entrypoint, or one configured in `header-defaults.native-entrypoints`
+/// for a host that drives Claude Code under its own name (T3 Code: `t3-code`).
+pub(crate) fn native_entrypoint(entrypoint: &str, settings: &Settings) -> bool {
+    NATIVE_ENTRYPOINTS.contains(&entrypoint)
+        || settings
+            .header_defaults
+            .native_entrypoints
+            .iter()
+            .any(|e| e == entrypoint)
+}
+
+/// The fields Claude Code 2.1.325 writes after the entrypoint, in this order, each at
+/// most once: `agent-sdk/` (an Agent SDK host's version), `client-app/`
+/// (`CLAUDE_AGENT_SDK_CLIENT_APP`) and `workload/`. The last two describe one request,
+/// not the installation.
+const UA_FIELDS: [&str; 3] = ["agent-sdk/", "client-app/", "workload/"];
 pub(crate) const HELPER_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,7 +111,8 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .then(|| &s[prefix.len()..])
 }
 
-/// `(?i)^claude-cli/N.N.N\s+\(external,\s*[^,)]+(?:,\s*agent-sdk/N.N.N)?\)$`
+/// `claude-cli/N.N.N (external, ENTRYPOINT[, agent-sdk/N.N.N][, client-app/APP][, workload/NAME])`,
+/// with the prefix and field names matched case-insensitively.
 pub(crate) fn native_user_agent(user_agent: &str) -> bool {
     let Some(rest) = strip_prefix_ci(user_agent, "claude-cli/") else {
         return false;
@@ -113,18 +133,55 @@ pub(crate) fn native_user_agent(user_agent: &str) -> bool {
     let Some(inner) = rest.strip_suffix(')') else {
         return false;
     };
-    let inner = inner.trim_start();
-    let (entry, sdk) = match inner.find([',', ')']) {
-        Some(i) if inner.as_bytes()[i] == b',' => (&inner[..i], Some(inner[i + 1..].trim_start())),
-        Some(_) => return false,
-        None => (inner, None),
-    };
-    if entry.is_empty() {
+    if inner.contains(['(', ')']) {
         return false;
     }
-    match sdk {
-        None => true,
-        Some(sdk) => strip_prefix_ci(sdk, "agent-sdk/").is_some_and(semver),
+    let mut fields = inner.split(',');
+    if fields.next().is_none_or(|entry| entry.trim_start().is_empty()) {
+        return false;
+    }
+    let mut next = 0;
+    for field in fields {
+        let field = field.trim_start();
+        let Some((kind, value)) = UA_FIELDS
+            .iter()
+            .enumerate()
+            .skip(next)
+            .find_map(|(i, name)| strip_prefix_ci(field, name).map(|v| (i, v)))
+        else {
+            return false;
+        };
+        if if kind == 0 {
+            !semver(value)
+        } else {
+            value.trim().is_empty()
+        } {
+            return false;
+        }
+        next = kind + 1;
+    }
+    true
+}
+
+/// A native User-Agent without its per-request fields (`client-app/`, `workload/`), and
+/// those fields as written (`, client-app/APP, workload/NAME`), so that a stored device
+/// profile never carries one request's fields into another's.
+pub(crate) fn split_request_fields(user_agent: &str) -> (String, &str) {
+    let user_agent = user_agent.trim();
+    if !native_user_agent(user_agent) {
+        return (user_agent.to_owned(), "");
+    }
+    let comment = user_agent.find('(').unwrap_or_default();
+    let start = user_agent[comment..]
+        .match_indices(',')
+        .map(|(i, _)| comment + i)
+        .find(|&i| {
+            let field = user_agent[i + 1..].trim_start();
+            UA_FIELDS[1..].iter().any(|name| strip_prefix_ci(field, name).is_some())
+        });
+    match start {
+        Some(i) => (format!("{})", &user_agent[..i]), &user_agent[i..user_agent.len() - 1]),
+        None => (user_agent.to_owned(), ""),
     }
 }
 
@@ -160,14 +217,16 @@ pub(crate) fn valid_user_id(user_id: &str) -> bool {
 pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, settings: &Settings) -> Detection {
     let user_agent = raw_header(headers, "user-agent");
     let (entrypoint, _) = user_agent_details(user_agent);
-    let x_app = raw_header(headers, "x-app") == "cli";
-    // A newer release counts only with its own well-formed SDK and runtime versions:
+    // Background sessions send cli-bg (testdata/claude_code_2_1_325_clients.json).
+    let x_app = matches!(raw_header(headers, "x-app"), "cli" | "cli-bg");
+    // A release other than the baseline counts only with its own well-formed SDK and
+    // runtime versions:
     // otherwise its forwarded User-Agent would go upstream with baseline versions.
     let ua = profile::accepted_user_agent(headers, user_agent, settings);
     let betas = has_claude_code_beta(headers);
     let user_id = rawjson::get(payload, "metadata.user_id");
     let metadata_user_id = user_id.kind() == rawjson::Kind::String && valid_user_id(user_id.str());
-    let native = NATIVE_ENTRYPOINTS.contains(&entrypoint.as_str());
+    let native = native_entrypoint(&entrypoint, settings);
     let standard = x_app && ua && betas && (count_tokens || metadata_user_id);
     let helper = native
         && !count_tokens
@@ -176,7 +235,7 @@ pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, set
         && x_app
         && ua
         && metadata_user_id
-        && helper_profile(headers, payload, settings);
+        && helper_profile(headers, payload);
     Detection {
         confirmed: (standard || helper) && native,
         helper_profile: helper,
@@ -248,14 +307,14 @@ fn joined_betas(headers: &HeaderMap) -> String {
         .join(",")
 }
 
-fn helper_profile(headers: &HeaderMap, payload: &str, settings: &Settings) -> bool {
+fn helper_profile(headers: &HeaderMap, payload: &str) -> bool {
     let Some(shape) = measured_beta_shape(&joined_betas(headers)) else {
         return false;
     };
-    body_shape(payload) == Some(shape) && helper_headers(headers, settings) && helper_session(headers, payload)
+    body_shape(payload) == Some(shape) && helper_headers(headers) && helper_session(headers, payload)
 }
 
-fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
+fn helper_headers(headers: &HeaderMap) -> bool {
     let expected = [
         ("accept", "application/json"),
         ("content-type", "application/json"),
@@ -280,21 +339,11 @@ fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
     {
         return false;
     }
-    let baseline = Profile::default_for(settings);
-    let user_agent = raw_header(headers, "user-agent");
-    let candidate = (
-        profile::version(user_agent),
-        raw_header(headers, "x-stainless-package-version"),
-        raw_header(headers, "x-stainless-runtime-version"),
-    );
-    let exact = candidate.0.is_some()
-        && candidate.0 == profile::version(&baseline.user_agent)
-        && candidate.1 == baseline.package_version
-        && candidate.2 == baseline.runtime_version;
-    // A newer release's helper is confirmed with its own versions, as its main requests
-    // are (docs/DIFFERENCES-FROM-GO.md); the measured beta and body shapes still guard.
-    let newer = profile::newer_than_baseline(user_agent, settings) && profile::stainless_versions_ok(headers);
-    if !exact && !newer {
+    // Any forwarded release's helper is confirmed with its own well-formed versions, as
+    // its main requests are, with or without a stabilized profile; the measured beta and
+    // body shapes still guard. Go confirms only the exact baseline tuple
+    // (docs/DIFFERENCES-FROM-GO.md), which would cloak every other release's helpers.
+    if !profile::stainless_versions_ok(headers) {
         return false;
     }
     if !raw_header(headers, "x-stainless-async").is_empty()
@@ -490,6 +539,89 @@ mod tests {
         serde_json::to_string(&identity).unwrap()
     }
 
+    /// Claude Code 2.1.325's client forms (testdata/claude_code_2_1_325_clients.json):
+    /// the Agent SDK entrypoints, the client-app User-Agent field, background sessions'
+    /// `x-app: cli-bg`, and T3 Code's `t3-code` entrypoint, native only when configured.
+    #[test]
+    fn claude_code_2_1_325_client_forms() {
+        let doc = include_str!("testdata/claude_code_2_1_325_clients.json");
+        let mut t3 = Settings::default();
+        t3.header_defaults.native_entrypoints = vec!["t3-code".into()];
+        for capture in rawjson::get(doc, "captures").array() {
+            let name = capture.get("name").str().to_owned();
+            let h: HeaderMap = capture
+                .get("headers")
+                .array()
+                .iter()
+                .map(|h| (h.get("0").str().parse().unwrap(), h.get("1").str().parse().unwrap()))
+                .collect();
+            let body = capture.get("body");
+            let default = detect(&h, body.json(), false, &Settings::default()).confirmed;
+            let configured = detect(&h, body.json(), false, &t3).confirmed;
+            if name.starts_with("t3-code") {
+                assert!(!default && configured, "{name}");
+            } else {
+                assert!(default && configured, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_fields_split_from_the_identity() {
+        let ua = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12, client-app/my-app/1.0, workload/cron)";
+        assert_eq!(
+            split_request_fields(ua),
+            (
+                "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12)".to_owned(),
+                ", client-app/my-app/1.0, workload/cron"
+            )
+        );
+        let plain = "claude-cli/2.1.325 (external, cli)";
+        assert_eq!(split_request_fields(plain), (plain.to_owned(), ""));
+        let foreign = "my-app (external, cli, client-app/x)";
+        assert_eq!(split_request_fields(foreign), (foreign.to_owned(), ""));
+    }
+
+    /// Malformed or unknown client identities stay cloaked.
+    #[test]
+    fn client_identity_rejections() {
+        let s = Settings::default();
+        let body = format!(
+            r#"{{"model":"claude-sonnet-4-6","metadata":{{"user_id":{}}},"messages":[]}}"#,
+            user_id()
+        );
+        let confirmed = |ua: &str, x_app: &str| {
+            let h = headers(&[
+                ("user-agent", ua),
+                ("x-app", x_app),
+                ("anthropic-beta", "claude-code-20250219"),
+                ("x-stainless-package-version", "0.128.0"),
+                ("x-stainless-runtime-version", "v26.12.1"),
+            ]);
+            detect(&h, &body, false, &s).confirmed
+        };
+        let ok = "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.12, client-app/my-app/1.0, workload/cron)";
+        assert!(confirmed(ok, "cli"));
+        assert!(confirmed(ok, "cli-bg"));
+        for x_app in ["", "CLI", "cli-fg", "cli,cli-bg"] {
+            assert!(!confirmed(ok, x_app), "{x_app:?}");
+        }
+        for ua in [
+            "claude-cli/2.1.325 (external, claude-desktop)",
+            "claude-cli/2.1.325 (external, t3-code, agent-sdk/0.3.321)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a, agent-sdk/0.3.12)",
+            "claude-cli/2.1.325 (external, sdk-ts, workload/a, client-app/b)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a, client-app/b)",
+            "claude-cli/2.1.325 (external, sdk-ts, other/1)",
+            "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3)",
+            "claude-cli/2.1.325 (external, sdk-ts, client-app/a(b))",
+            "claude-cli/2.1.325 (external, sdk-ts,)",
+        ] {
+            assert!(!confirmed(ua, "cli"), "{ua}");
+        }
+    }
+
     /// A Haiku session-title helper in the measured Title280 shape.
     fn helper(user_agent: &str, package: &str, runtime: &str) -> (HeaderMap, String) {
         let betas = helper_betas(
@@ -542,22 +674,28 @@ mod tests {
             d.confirmed && d.helper_profile
         };
         assert!(
-            confirmed("claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0"),
+            confirmed("claude-cli/2.1.325 (external, cli)", "0.128.0", "v26.12.1"),
             "baseline"
         );
         assert!(confirmed("claude-cli/2.2.3 (external, cli)", "0.120.4", "v27.0.1"));
         assert!(!confirmed("claude-cli/2.2.3 (external, cli)", "", "v27.0.1"));
         assert!(!confirmed("claude-cli/2.2.3 (external, cli)", "0.120", "v27.0.1"));
-        // The baseline release still needs the exact baseline tuple (Go).
-        assert!(!confirmed("claude-cli/2.1.280 (external, cli)", "0.120.4", "v27.0.1"));
+        // A release between the floor and the baseline follows the same rule.
+        assert!(confirmed("claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0"));
+        assert!(!confirmed("claude-cli/2.1.280 (external, cli)", "", "v26.3.0"));
+        // So does the baseline release on another SDK or runtime (Go needs the exact
+        // baseline tuple).
+        assert!(confirmed("claude-cli/2.1.325 (external, cli)", "0.120.4", "v27.0.1"));
+        assert!(!confirmed("claude-cli/2.1.325 (external, cli)", "0.120", "v27.0.1"));
         // A changed shape falls back to cloaking.
         let (h, body) = helper("claude-cli/2.2.3 (external, cli)", "0.120.4", "v27.0.1");
         let body = body.replace(r#""max_tokens":80"#, r#""max_tokens":81"#);
         assert!(!detect(&h, &body, false, &s).confirmed);
     }
 
-    /// A standard request from a newer release is confirmed only with both Stainless
-    /// version headers well formed; the baseline release does not need them.
+    /// A standard request from a release other than the baseline is confirmed only with
+    /// both Stainless version headers well formed; the baseline release does not need
+    /// them.
     #[test]
     fn newer_release_needs_valid_stainless_versions() {
         let s = Settings::default();
@@ -587,7 +725,10 @@ mod tests {
                 ("x-stainless-runtime-version", "27.0.1")
             ]
         ));
-        assert!(confirmed("claude-cli/2.1.280 (external, cli)", &[]));
+        assert!(confirmed("claude-cli/2.1.325 (external, cli)", &[]));
+        // The floor release is not the baseline, so it needs them too.
+        assert!(!confirmed("claude-cli/2.1.280 (external, cli)", &[]));
+        assert!(confirmed("claude-cli/2.1.280 (external, cli)", &valid));
         // Forwarding reads each header's first value: an empty first value with a valid
         // second one would send the baseline SDK version under the 2.2.3 User-Agent.
         let mut h = headers(&[
@@ -601,9 +742,10 @@ mod tests {
         assert!(!detect(&h, &body, false, &s).confirmed);
     }
 
-    /// With a stabilized profile nothing newer is forwarded, so Go's rules apply: a
-    /// 2.1.290 request is Claude Code without Stainless headers, and its helper is
-    /// confirmed only with the exact baseline tuple.
+    /// With a stabilized profile Go's line rule applies to main requests: a 2.1.290
+    /// request is Claude Code without Stainless headers. Helpers of a forwarded release,
+    /// such as the measured 2.1.280 title helper, stay confirmed with their own versions,
+    /// so the stabilized profile does not cloak them.
     #[test]
     fn stabilized_profiles_keep_go_detection() {
         let mut s = Settings::default();
@@ -620,6 +762,10 @@ mod tests {
         assert!(detect(&h, &body, false, &s).confirmed);
         assert!(detect(&h, &body, true, &s).confirmed, "count_tokens");
         let (h, body) = helper("claude-cli/2.1.290 (external, cli)", "0.120.4", "v27.0.1");
+        assert!(detect(&h, &body, false, &s).confirmed);
+        let (h, body) = helper("claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0");
+        assert!(detect(&h, &body, false, &s).confirmed);
+        let (h, body) = helper("claude-cli/2.1.280 (external, cli)", "", "v26.3.0");
         assert!(!detect(&h, &body, false, &s).confirmed);
     }
 }

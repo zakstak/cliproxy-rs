@@ -1098,3 +1098,449 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         }
     }
 }
+
+/// A Claude Code request that uses client-side tool search: an eager `ToolSearch` tool,
+/// deferred tools, and a history in which `ToolSearch` returned `tool_reference` blocks
+/// (Anthropic tool search with a custom search tool), then referenced one tool again.
+fn deferred_request(long: &str) -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "max_tokens": 1024,
+        "stream": false,
+        "tools": [
+            {"name": "ToolSearch", "description": "Find deferred tools.",
+             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+            {"name": "WebFetch", "description": "Fetch a URL.", "defer_loading": true,
+             "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}}},
+            {"name": long, "description": "A gateway MCP tool.", "defer_loading": true,
+             "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+            {"name": "NeverLoaded", "defer_loading": true, "input_schema": {"type": "object"}}
+        ],
+        "messages": [
+            {"role": "user", "content": "Fetch example.com"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_s1", "name": "ToolSearch", "input": {"query": "fetch"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s1", "content": [
+                    {"type": "tool_reference", "tool_name": "WebFetch"},
+                    {"type": "tool_reference", "tool_name": long},
+                    {"type": "tool_reference", "tool_name": "WebFetch"}
+                ]},
+                {"type": "text", "text": "Go on."}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_s2", "name": "ToolSearch", "input": {"query": "fetch again"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s2", "content": [
+                    {"type": "text", "text": "Found:"},
+                    {"type": "tool_reference", "tool_name": "WebFetch"},
+                    {"type": "tool_reference", "tool_name": "ToolSearch"}
+                ]}
+            ]}
+        ]
+    })
+}
+
+/// Deferred Claude tools are expressed with the Responses `additional_tools` input item,
+/// "a list of additional tools made available at this item" (`docs/codex/CONTRACT.md`
+/// "Translated route"). A deferred tool is not in top-level `tools`, as Anthropic keeps
+/// it out of the model's context; at the `tool_result` that references it, its
+/// definition follows the call output in an `additional_tools` developer item, once,
+/// before the rest of the turn. A reference to an eager or already loaded tool adds
+/// nothing, and a never-referenced tool is never sent. The model's call of a loaded tool
+/// returns under its Claude name, a shortened long name included.
+#[tokio::test]
+async fn deferred_tools_load_where_tool_search_references_them() {
+    let long = format!("mcp__gateway__{}", "very_long_tool_name_segment_".repeat(3));
+    let short = format!("mcp__{}", &"very_long_tool_name_segment_".repeat(3)[..59]);
+    let call = format!(
+        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"id\":\"fc_1\",\"status\":\"completed\",\"name\":\"{short}\",\"call_id\":\"call_9\",\"arguments\":\"{{}}\"}}}}\n\n\
+event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{{\"type\":\"function_call\",\"id\":\"fc_1\",\"status\":\"completed\",\"name\":\"{short}\",\"call_id\":\"call_9\",\"arguments\":\"{{}}\"}}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n"
+    );
+    let proxy = proxy(vec![Reply::sse(call)], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &deferred_request(&long)).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_nothing_added(&body, &["ToolSearch"]);
+
+    let input = body["input"].as_array().unwrap();
+    let kinds: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "message",
+            "function_call",
+            "function_call_output",
+            "additional_tools",
+            "message",
+            "function_call",
+            "function_call_output"
+        ],
+        "{body}"
+    );
+    assert_eq!(input[2]["output"], "", "only references: nothing else to say: {body}");
+    let added = &input[3];
+    assert_eq!(added["role"], "developer", "{added}");
+    // The item and the call output before it have the contract fixture's members.
+    let contract: Value = serde_json::from_slice(&fixture("http-request-tools-at-item").bytes()).unwrap();
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(added), keys(&contract["input"][3]), "{added}");
+    assert_eq!(keys(&input[2]), keys(&contract["input"][2]), "{body}");
+    let names: Vec<&str> = added["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["WebFetch", short.as_str()],
+        "each once, in reference order: {added}"
+    );
+    assert_eq!(
+        added["tools"][0],
+        json!({"type": "function", "name": "WebFetch", "description": "Fetch a URL.", "strict": false,
+               "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}}),
+        "the definition as a top-level tool would be, without defer_loading: {added}"
+    );
+    assert_eq!(
+        input[6]["output"],
+        json!([{"type": "input_text", "text": "Found:"}]),
+        "the later reference adds nothing: {body}"
+    );
+    assert!(!body.to_string().contains("NeverLoaded"), "{body}");
+    assert!(!body.to_string().contains("tool_reference"), "{body}");
+
+    let message: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(message["content"][0]["type"], "tool_use", "{message}");
+    assert_eq!(message["content"][0]["name"], long, "the Claude name: {message}");
+}
+
+/// What tool search cannot express is still refused before the send: a reference to a
+/// tool the request does not declare, and Claude's mid-conversation `tool_addition` and
+/// `tool_removal` blocks.
+#[tokio::test]
+async fn unexpressible_tool_loading_is_refused_before_the_send() {
+    let mut unknown = deferred_request("mcp__x");
+    unknown["messages"][2]["content"][0]["content"][1]["tool_name"] = json!("Missing");
+    let mut addition = deferred_request("mcp__x");
+    addition["messages"][2]["content"][1] =
+        json!({"type": "tool_addition", "tool": {"type": "tool_reference", "name": "WebFetch"}});
+    let mut removal = deferred_request("mcp__x");
+    removal["messages"][2]["content"][1] =
+        json!({"type": "tool_removal", "tool": {"type": "tool_reference", "name": "WebFetch"}});
+    for (body, named) in [
+        (unknown, "tool_reference to a tool the request does not declare"),
+        (addition, "tool_addition"),
+        (removal, "tool_removal"),
+    ] {
+        let proxy = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &body).await;
+        assert_eq!(status, 400, "{named}: {answer}");
+        assert!(answer.contains(named), "{named}: {answer}");
+        assert!(proxy.upstream.http().is_empty(), "{named}: nothing sent");
+    }
+}
+
+/// Codex `phase: commentary` through a Claude client (#112; `docs/codex/CONTRACT.md`
+/// "Translated route"). Commentary is visible mid-turn assistant text that tool calls may
+/// follow (first-party `MessagePhase`), which is what a Claude text block before
+/// `tool_use` is. So it reaches the client as an ordinary text block, in order, streamed
+/// and buffered: no thinking block, no signature marker, no `phase` member. On replay
+/// the Claude text carries no phase, and the converted assistant message has none, which
+/// first-party Codex reads as "phase unknown". Nothing is inferred or injected.
+#[tokio::test]
+async fn commentary_is_visible_text_and_replays_without_a_phase() {
+    for stream in [true, false] {
+        let proxy = proxy(vec![Reply::sse(fixture("sse-commentary-then-call").bytes())], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &claude_request(stream)).await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        for absent in ["thinking", "phase", "commentary", "signature"] {
+            assert!(!answer.contains(absent), "stream={stream}: no {absent}: {answer}");
+        }
+        let blocks: Vec<(String, String)> = if stream {
+            answer
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .filter(|e| e["type"] == "content_block_start")
+                .map(|e| {
+                    let block = &e["content_block"];
+                    (
+                        block["type"].as_str().unwrap().to_owned(),
+                        block["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect()
+        } else {
+            let message: Value = serde_json::from_str(&answer).unwrap();
+            message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["type"].as_str().unwrap().to_owned(),
+                        b["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            blocks,
+            [
+                ("text".to_owned(), String::new()),
+                ("tool_use".to_owned(), "get_weather".to_owned())
+            ],
+            "stream={stream}: {answer}"
+        );
+        assert!(answer.contains("Checking the context."), "stream={stream}: {answer}");
+        assert_eq!(
+            client_stop(&answer).as_deref(),
+            Some("tool_use"),
+            "stream={stream}: {answer}"
+        );
+    }
+
+    let mut replay = claude_request(false);
+    replay["messages"][1]["content"] = json!([
+        {"type": "text", "text": "Checking the context."},
+        {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}
+    ]);
+    let proxy = proxy(vec![completed()], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &replay).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    let said: Vec<&Value> = items(&body, "message")
+        .into_iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(said.len(), 1, "{body}");
+    assert_eq!(said[0]["content"][0]["text"], "Checking the context.", "{body}");
+    assert!(said[0].get("phase").is_none(), "no inferred phase: {body}");
+}
+
+/// A Responses answer with a two-part summary signed `signature`, a whitespace-only
+/// summary signed the same, and an unsigned whitespace-only summary, then text. Its
+/// `response.completed` lists no output, so a buffered client gets the aggregate of the
+/// done items.
+fn reasoning_answer(signature: &str) -> Reply {
+    let events = [
+        json!({"type":"response.created","response":{"id":"resp_r","model":"gpt-5.5"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_a","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"one"}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":1,"delta":"two"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_a","encrypted_content":signature,"summary":[{"type":"summary_text","text":"one"},{"type":"summary_text","text":"two"}]}}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_b","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":1,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":1,"summary_index":0,"delta":" \n"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_b","encrypted_content":signature,"summary":[{"type":"summary_text","text":" \n"}]}}),
+        json!({"type":"response.output_item.added","output_index":2,"item":{"type":"reasoning","id":"rs_c","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":2,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":2,"summary_index":0,"delta":"\n"}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":2,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+        json!({"type":"response.output_item.done","output_index":2,"item":{"type":"reasoning","id":"rs_c","summary":[{"type":"summary_text","text":"\n"},{"type":"summary_text","text":""}]}}),
+        json!({"type":"response.output_item.added","output_index":3,"item":{"type":"message","id":"msg","role":"assistant","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":3,"content_index":0,"part":{"type":"output_text","text":""}}),
+        json!({"type":"response.output_text.delta","output_index":3,"content_index":0,"delta":"hi"}),
+        json!({"type":"response.content_part.done","output_index":3,"content_index":0,"part":{"type":"output_text","text":"hi"}}),
+        json!({"type":"response.output_item.done","output_index":3,"item":{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}),
+        json!({"type":"response.completed","response":{"id":"resp_r","status":"completed","model":"gpt-5.5","output":[],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}),
+    ];
+    let sse: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    Reply::sse(sse)
+}
+
+/// The content blocks of a Claude answer: a buffered message's `content`, or a stream's
+/// blocks with their deltas folded in.
+fn claude_blocks(answer: &str) -> Vec<Value> {
+    if let Ok(message) = serde_json::from_str::<Value>(answer) {
+        return message["content"].as_array().cloned().unwrap_or_default();
+    }
+    let mut blocks: Vec<Value> = vec![];
+    for e in answer
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+    {
+        match e["type"].as_str() {
+            Some("content_block_start") => blocks.push(e["content_block"].clone()),
+            Some("content_block_delta") => {
+                let block = &mut blocks[e["index"].as_u64().unwrap() as usize];
+                let delta = &e["delta"];
+                let (field, value) = match delta["type"].as_str().unwrap() {
+                    "thinking_delta" => ("thinking", &delta["thinking"]),
+                    "text_delta" => ("text", &delta["text"]),
+                    "signature_delta" => ("signature", &delta["signature"]),
+                    other => panic!("unexpected delta {other}"),
+                };
+                let joined = block[field].as_str().unwrap_or_default().to_owned() + value.as_str().unwrap();
+                block[field] = json!(joined);
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// #168: a Claude client reads the same thinking blocks streamed and buffered. A
+/// reasoning item's summary parts join with a blank line, and a whitespace-only summary
+/// is no thinking text: unsigned it opens no block, signed it keeps the signature-only
+/// block that carries the encrypted reasoning. Replayed as the next turn, that answer
+/// converts: an unsigned blank thinking block would be refused, because Codex cannot
+/// carry reasoning text without its encrypted content.
+#[tokio::test]
+async fn reasoning_summaries_read_the_same_streamed_and_buffered() {
+    let signature = codex_signature();
+    let want = vec![
+        json!({"type":"thinking","thinking":"one\n\ntwo","signature":signature}),
+        json!({"type":"thinking","thinking":"","signature":signature}),
+        json!({"type":"text","text":"hi"}),
+    ];
+    for stream in [true, false] {
+        let first = proxy(vec![reasoning_answer(&signature)], "").await;
+        let (status, answer) = post(&first.url, "/v1/messages", &claude_request(stream)).await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        let blocks = claude_blocks(&answer);
+        assert_eq!(blocks, want, "stream={stream}: {answer}");
+
+        let mut replay = claude_request(false);
+        let messages = replay["messages"].as_array_mut().unwrap();
+        messages.push(json!({"role": "assistant", "content": blocks}));
+        messages.push(json!({"role": "user", "content": "Thanks."}));
+        let next = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&next.url, "/v1/messages", &replay).await;
+        assert_eq!(status, 200, "stream={stream}: the answer replays: {answer}");
+        let reasoning = items(&sent(&next), "reasoning").len();
+        assert_eq!(reasoning, 3, "stream={stream}: the earlier one and both signed items");
+    }
+}
+
+/// A Chat Completions request with a documented nested custom tool, `{"type":"custom",
+/// "custom":{"name","description","format"}}`, its grammar format nested as
+/// `{"type":"grammar","grammar":{...}}`, a forced `tool_choice` of the same nested shape
+/// and an earlier nested custom call with its result (#170). `name` is over 64 bytes.
+fn nested_custom_request(name: &str, stream: bool) -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "stream": stream,
+        "tools": [{"type": "custom", "custom": {
+            "name": name,
+            "description": "Runs a Python snippet.",
+            "format": {"type": "grammar", "grammar": {"syntax": "lark", "definition": "start: /.+/"}}
+        }}],
+        "tool_choice": {"type": "custom", "custom": {"name": name}},
+        "messages": [
+            {"role": "user", "content": "Print 1."},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": name, "input": "print(1)"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "1"},
+            {"role": "user", "content": "Now print 2."}
+        ]
+    })
+}
+
+/// Chat nested custom tools on the translated route (#170; `docs/codex/CONTRACT.md`
+/// "Translated route"). The declaration reaches Codex as the Responses custom tool
+/// `{"type":"custom","name","description","format"}` with a flat grammar format; the
+/// nested name is shortened once and used by the declaration, the `tool_choice` and the
+/// history call alike. The model's custom call returns under the client's name, streamed
+/// and buffered.
+#[tokio::test]
+async fn nested_custom_tools_round_trip_under_the_client_name() {
+    let long = format!("mcp__gateway__{}", "very_long_custom_tool_segment_".repeat(3));
+    let short = format!("mcp__{}", &"very_long_custom_tool_segment_".repeat(3)[..59]);
+    let item = |input: &str| {
+        format!(
+            r#"{{"type":"custom_tool_call","id":"ctc_1","status":"completed","name":"{short}","call_id":"call_9","input":"{input}"}}"#
+        )
+    };
+    let reply = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n\
+event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{added}}}\n\n\
+event: response.custom_tool_call_input.delta\ndata: {{\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"output_index\":0,\"delta\":\"print(2)\"}}\n\n\
+event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{done}}}\n\n\
+event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{done}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n",
+        added = item(""),
+        done = item("print(2)"),
+    );
+    for stream in [true, false] {
+        let proxy = proxy(vec![Reply::sse(reply.clone())], "").await;
+        let (status, answer) = post(
+            &proxy.url,
+            "/v1/chat/completions",
+            &nested_custom_request(&long, stream),
+        )
+        .await;
+        assert_eq!(status, 200, "stream={stream}: {answer}");
+        let body = sent(&proxy);
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "custom",
+                "name": short,
+                "description": "Runs a Python snippet.",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+            }]),
+            "the Responses custom tool: {body}"
+        );
+        assert_eq!(body["tool_choice"], json!({"type": "custom", "name": short}), "{body}");
+        let calls = items(&body, "custom_tool_call");
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["call_id"], "call_1", "{body}");
+        assert_eq!(calls[0]["name"], short.as_str(), "{body}");
+        assert_eq!(calls[0]["input"], "print(1)", "{body}");
+        let outputs = items(&body, "custom_tool_call_output");
+        assert_eq!(outputs.len(), 1, "{body}");
+        assert_eq!(outputs[0]["call_id"], "call_1", "{body}");
+        assert_eq!(outputs[0]["output"], "1", "{body}");
+
+        assert!(
+            answer.contains(&format!("\"name\":\"{long}\"")),
+            "stream={stream}: the client's name: {answer}"
+        );
+        assert!(
+            !answer.contains(&format!("\"name\":\"{short}\"")),
+            "stream={stream}: {answer}"
+        );
+        assert!(answer.contains("print(2)"), "stream={stream}: {answer}");
+        assert_eq!(
+            client_stop(&answer).as_deref(),
+            Some("tool_calls"),
+            "stream={stream}: {answer}"
+        );
+    }
+}
+
+/// A custom tool declaration without a name, nested or flat, names no tool the model can
+/// call, and a member beside a nested `custom` has no place in the Responses tool: both
+/// are refused before the send (#170).
+#[tokio::test]
+async fn unexpressible_custom_tools_are_refused_before_the_send() {
+    let mut nested = chat_request(false);
+    nested["tools"] = json!([{"type": "custom", "custom": {"description": "No name."}}]);
+    let mut flat = chat_request(false);
+    flat["tools"] = json!([{"type": "custom", "description": "No name."}]);
+    let mut beside = chat_request(false);
+    beside["tools"] = json!([{"type": "custom", "name": "other", "custom": {"name": "run"}}]);
+    for (body, named) in [
+        (nested, "custom tool without a name"),
+        (flat, "custom tool without a name"),
+        (beside, "custom tool member beside `custom`"),
+    ] {
+        let proxy = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/chat/completions", &body).await;
+        assert_eq!(status, 400, "{body}: {answer}");
+        assert!(answer.contains("unsupported conversion"), "{answer}");
+        assert!(answer.contains(named), "{named}: {answer}");
+        assert!(proxy.upstream.http().is_empty(), "nothing sent: {answer}");
+    }
+}

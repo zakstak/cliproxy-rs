@@ -118,6 +118,8 @@ pub(crate) const MESSAGES_ORDER: &[&str] = &[
     "anthropic-beta",
     "anthropic-dangerous-direct-browser-access",
     "anthropic-version",
+    // API-key credentials: where Claude Code 2.1.325 sends it (testdata/claude_code_2_1_325.json).
+    "x-api-key",
     "x-app",
     "x-client-request-id",
     "Connection",
@@ -131,6 +133,7 @@ const WIRE_CASING: &[(&str, &str)] = &[
     ("X-Stainless-Os", "X-Stainless-OS"),
     ("Anthropic-Beta", "anthropic-beta"),
     ("Anthropic-Version", "anthropic-version"),
+    ("X-Api-Key", "x-api-key"),
     ("X-App", "x-app"),
     ("X-Client-Request-Id", "x-client-request-id"),
     (
@@ -493,14 +496,15 @@ fn legacy_device_headers(h: &mut GoHeader, p: &Plan<'_>) {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .trim();
-        // A newer native release keeps its own SDK and runtime versions, so they match
-        // its User-Agent (docs/DIFFERENCES-FROM-GO.md); otherwise Go's baseline values.
-        let newer = profile::newer_than_baseline(ua, p.settings);
+        // A forwarded native release keeps its own well-formed SDK and runtime versions,
+        // so they match its User-Agent (docs/DIFFERENCES-FROM-GO.md); otherwise Go's
+        // baseline values. This path runs only without a stabilized profile.
+        let own = profile::plausible_user_agent(ua, p.settings);
         ensure_valid("X-Stainless-Runtime-Version", &d.runtime_version, &|v| {
-            v == d.runtime_version || (newer && profile::runtime_version_ok(v))
+            v == d.runtime_version || (own && profile::runtime_version_ok(v))
         });
         ensure_valid("X-Stainless-Package-Version", &d.package_version, &|v| {
-            v == d.package_version || (newer && profile::package_version_ok(v))
+            v == d.package_version || (own && profile::package_version_ok(v))
         });
         ensure_valid("X-Stainless-Os", &profile::host_os(), &|_| true);
         ensure_valid("X-Stainless-Arch", &profile::host_arch(), &|_| true);
@@ -623,6 +627,129 @@ mod tests {
         assert!(!needs_cached_session(true, true, "explicit-session"));
     }
 
+    /// A cloaked request carries Claude Code 2.1.325's header order and identity values,
+    /// in API-key and OAuth modes (testdata/claude_code_2_1_325.json). The capture went
+    /// to a loopback base URL and has no x-client-request-id, and its X-Stainless-OS and
+    /// -Arch describe the capture host, so those are not compared; Anthropic-Beta is
+    /// pinned by the betas capture test.
+    #[test]
+    fn cloaked_headers_follow_claude_code_2_1_325_capture() {
+        let doc = include_str!("testdata/claude_code_2_1_325.json");
+        let settings = Settings::default();
+        let attributes = Default::default();
+        let incoming = HeaderMap::new();
+        for index in [0, 6] {
+            let capture = rawjson::get(doc, &format!("captures.{index}"));
+            let name = capture.get("name").str().to_owned();
+            let captured: Vec<(String, String)> = capture
+                .get("headers")
+                .array()
+                .iter()
+                .map(|h| (h.get("0").str().to_owned(), h.get("1").str().to_owned()))
+                .collect();
+            let bearer = captured.iter().any(|(k, _)| k == "Authorization");
+            let body = capture.get("body");
+            let h = build(&Plan {
+                api_key: "fake-credential",
+                bearer,
+                first_party: true,
+                count_tokens: false,
+                stream: true,
+                extra_betas: &[],
+                body: body.json(),
+                incoming: &incoming,
+                confirmed: false,
+                helper: false,
+                cli_fingerprint: true,
+                use_oauth_betas: bearer,
+                session_id: "00000000-0000-4000-8000-000000000325",
+                settings: &settings,
+                attributes: &attributes,
+                cpa_session: "",
+                device_profile: None,
+                cached_session_id: "",
+            });
+            let (pairs, order) = wire(h, true, false);
+            let order: Vec<&str> = order
+                .iter()
+                .map(String::as_str)
+                .filter(|n| *n != "x-client-request-id")
+                .collect();
+            let want: Vec<&str> = captured.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(order, want, "{name}: wire order and casing");
+            for (k, v) in &captured {
+                if matches!(
+                    k.as_str(),
+                    "Authorization"
+                        | "x-api-key"
+                        | "X-Stainless-OS"
+                        | "X-Stainless-Arch"
+                        | "anthropic-beta"
+                        | "Connection"
+                        | "Host"
+                        | "Content-Length"
+                ) {
+                    continue;
+                }
+                let ours = pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+                assert_eq!(ours, Some(v.as_str()), "{name}: {k}");
+            }
+        }
+    }
+
+    /// Native Claude Code 2.1.325 with default settings: detection confirms the captured
+    /// request, and its own identity headers and Anthropic-Beta list go upstream as sent,
+    /// with the credential's key in place of the caller's.
+    #[test]
+    fn native_claude_code_2_1_325_keeps_its_headers() {
+        let doc = include_str!("testdata/claude_code_2_1_325.json");
+        let settings = Settings::default();
+        let attributes = Default::default();
+        let capture = rawjson::get(doc, "captures.0");
+        let captured: Vec<(String, String)> = capture
+            .get("headers")
+            .array()
+            .iter()
+            .map(|h| (h.get("0").str().to_owned(), h.get("1").str().to_owned()))
+            .collect();
+        let incoming: HeaderMap = captured
+            .iter()
+            .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+            .collect();
+        let body = capture.get("body");
+        let detection = super::super::detect::detect(&incoming, body.json(), false, &settings);
+        assert!(detection.confirmed && !detection.helper_profile);
+        let h = build(&Plan {
+            api_key: "sk-ant-api03-credential",
+            bearer: false,
+            first_party: true,
+            count_tokens: false,
+            stream: true,
+            extra_betas: &[],
+            body: body.json(),
+            incoming: &incoming,
+            confirmed: true,
+            helper: false,
+            cli_fingerprint: true,
+            use_oauth_betas: false,
+            session_id: "00000000-0000-4000-8000-000000000325",
+            settings: &settings,
+            attributes: &attributes,
+            cpa_session: "",
+            device_profile: None,
+            cached_session_id: "",
+        });
+        let (pairs, _) = wire(h, true, false);
+        let ours = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        for (k, v) in &captured {
+            match k.as_str() {
+                "Connection" | "Host" | "Content-Length" => {}
+                "x-api-key" => assert_eq!(ours(k), Some("sk-ant-api03-credential")),
+                _ => assert_eq!(ours(k), Some(v.as_str()), "{k}"),
+            }
+        }
+    }
+
     #[test]
     fn harness_unconfirmed_oauth_messages_headers_match_go_capture() {
         let settings = Settings::default();
@@ -687,7 +814,8 @@ mod tests {
         assert_eq!(order[19], "Host");
         assert_eq!(order[21], "Content-Length");
         let get = |n: &str| pairs.iter().find(|(k, _)| k == n).unwrap().1.clone();
-        assert_eq!(get("User-Agent"), "claude-cli/2.1.280 (external, cli)");
+        // Go recorded the 2.1.280 baseline; the cloaked identity is now 2.1.325.
+        assert_eq!(get("User-Agent"), "claude-cli/2.1.325 (external, cli)");
         assert_eq!(get("X-Stainless-OS"), "MacOS");
         assert_eq!(get("Accept-Encoding"), "gzip, deflate, br, zstd");
     }
@@ -750,23 +878,34 @@ mod version_tests {
                 "v27.0.1".into()
             )
         );
-        // The baseline release itself keeps Go's baseline SDK and runtime versions.
+        // So does a release between the floor and the baseline: it is not cloaked as
+        // the newer baseline.
         assert_eq!(
             sent("claude-cli/2.1.280 (external, cli)"),
             (
                 "claude-cli/2.1.280 (external, cli)".into(),
-                "0.112.1".into(),
-                "v26.3.0".into()
+                "0.120.4".into(),
+                "v27.0.1".into()
             )
         );
-        // Another major, or an older release, gets the whole baseline identity.
+        // So does the baseline release itself, for example on another Node (Go pins the
+        // baseline values).
+        assert_eq!(
+            sent("claude-cli/2.1.325 (external, cli)"),
+            (
+                "claude-cli/2.1.325 (external, cli)".into(),
+                "0.120.4".into(),
+                "v27.0.1".into()
+            )
+        );
+        // Another major, or a release below the floor, gets the whole baseline identity.
         for refused in ["claude-cli/3.0.0 (external, cli)", "claude-cli/2.1.220 (external, cli)"] {
             assert_eq!(
                 sent(refused),
                 (
-                    "claude-cli/2.1.280 (external, cli)".into(),
-                    "0.112.1".into(),
-                    "v26.3.0".into()
+                    "claude-cli/2.1.325 (external, cli)".into(),
+                    "0.128.0".into(),
+                    "v26.12.1".into()
                 ),
                 "{refused}"
             );

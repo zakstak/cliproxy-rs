@@ -253,6 +253,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Replace `model` with the upstream model of an operator-configured alias or a caller-selected route, or add it as the first member when the body has none | All profiles | Explicit routing choice. Only the `model` value changes. |
 | Wrap an HTTP Responses body in a `response.create` frame by adding `"type":"response.create"` | A credential with `websockets: true` that serves an HTTP client over a WebSocket | Transport envelope. No other field changes. |
 | Send a WebSocket `response.create` frame as an HTTP Responses body by removing its `type` member, and send `stream: true` when the frame omits `stream` or sets it to `false` | A credential without `websockets` that serves a Responses WebSocket turn ([WebSocket HTTP fallback](#websocket-http-fallback)) | Transport envelope and adaptation. The first-party frame is the HTTP request plus its tag (`codex-api/src/common.rs:315-339`, 400-406). A WebSocket turn always delivers its response as events, so the HTTP request asks for them; the client receives the upstream's events, never an aggregate. No other field changes; a continuation or prewarm is refused instead. |
+| Write an upstream WebSocket text message longer than 1 MiB as one message in frames of at most 1 MiB, each flushed before the next | Codex upstream sockets: native creates, steering frames, interrupts and proxy-formulated frames (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)) | Transport framing, as first-party Codex writes a large turn (`codex-api/src/endpoint/responses_websocket.rs` `send_message`, openai/codex `d15bf1deb77e`, inspected at `5c3ff1dabf64`). The bytes are split where they fall, so a UTF-8 character may span two frames; reassembled, the message is unchanged. Frames are never compressed. No other write comes between a message's frames; a write that stops between them retires the socket. |
 | Hand a WebSocket client each event's `data` payload as one text frame | A WebSocket turn served over HTTP | Transport framing. A WebSocket text frame carries one event; the bytes of each payload are unchanged. |
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
@@ -261,7 +262,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. The comment is written only at an event boundary, never inside a line or event the upstream left unfinished (#105). |
-| Send a WebSocket ping control frame to the client while a turn is idle | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
+| Send a WebSocket ping control frame to the client while a turn is idle, including while it waits for its first upstream event (#114) | Responses WebSockets with `requests.streaming.keepalive-seconds` | Transport framing. A ping is not a request: nothing reaches the upstream. |
 | Deliver `x-codex-turn-state` and `openai-model` from the upstream handshake as `{"type":"response.metadata","headers":{...}}` before the first event of the turn that opened the socket. Before the first event of each later request on that socket, deliver the socket's `openai-model` alone in the same event shape | Native WebSocket turns (#3, #24) | Transport adaptation. The proxy's own 101 precedes credential selection, and the pinned client reads both headers from this event (`sse/responses.rs:193-222`). A directly connected client re-emits its upgrade model on every request (`responses_websocket.rs:302-303`); turn state stays with the turn that opened the socket. For each request, `openai-model` is left out when the routed model differs from the client's, ignoring ASCII case only, or, as an additional proxy policy, when the socket was opened for another upstream model. Backend applicability after a model switch is unknown. No other header travels. [Handshake metadata](#handshake-metadata) has the rules. |
 | Add the line endings that close a final event the upstream left open | Native streams | Transport framing. Without them an SSE client drops that event at the end of the stream. The event's bytes are unchanged. |
 
@@ -738,8 +739,14 @@ held. Only a request that provably never left (the socket's loss was recorded be
 write, or the WebSocket library refused the frame before queueing it) is retried, once,
 on a fresh socket, and an explicit upstream rejection (a wrapped status error, a
 failure event) keeps its failover. A write is provably unsent when it failed or timed
-out before the frame was handed to the WebSocket library; one that failed or timed out
-after the hand-over may have sent part of it. The same rule holds for a turn served over
+out before its first frame was handed to the WebSocket library; one that failed or timed out
+after the hand-over may have sent part of it. A message longer than 1 MiB goes as one
+message in frames of at most 1 MiB (FP3 [#117](https://github.com/zakstak/cliproxy-rs/issues/117)):
+the socket stays locked from its first frame to its last, so no other write comes between
+them, and a failure on any later frame is never unsent. A write that stops between frames
+(failed, timed out, or cancelled with its request) records the socket's loss, so the
+socket takes no other message and the next request on the session goes to a fresh socket.
+The write bound and the capture cover the whole message once. The same rule holds for a turn served over
 HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) and for the
 [native HTTP route](#native-http-route): only a request whose connection could not be
 made, or that never left because its deadline had passed, may fail over. After a
@@ -1043,6 +1050,53 @@ show which model served each generation. `x-reasoning-included` has no event con
 the pinned client, so copying it into JSON could not deliver it, and the proxy never
 infers it from body content. Reasoning-included metadata stays undelivered.
 
+### Message size limits
+
+FP4 [#118](https://github.com/zakstak/cliproxy-rs/issues/118). First-party Codex at research
+main `5c3ff1dabf64` reads `x-codex-websocket-max-message-bytes` from the 101 of its socket
+and sends a request longer than that limit over HTTP, without writing it
+(`codex-api/src/endpoint/responses_websocket.rs`, `ed7ca22bb60a`). It reads a close 1009
+that arrives before any text frame of the request as `WebsocketMessageTooLarge`, switches
+the session to HTTP and sends the request there in full; a 1009 after any text is an
+ordinary stream error (`core/src/responses_retry.rs`, `bc3ccba6e1cb`). The proxy's rules:
+
+- **Local advertisement.** The proxy's 101 on the Responses WebSocket carries
+  `x-codex-websocket-max-message-bytes: 67108864`, its own receive limit for one client
+  message (`MAX_REQUEST_BYTES`; the client socket negotiates no compression, so this is
+  the length the client measures). That 101 precedes credential selection, so it never
+  states an upstream's limit, and the header is never copied into `response.metadata`: the
+  client reads it only from the 101. A client message above the limit still ends the
+  connection as before; a client that honours the header never sends one.
+- **Upstream limit.** Each Codex upstream socket reads the same header from its own 101
+  with the first-party parser: the first value as a decimal `usize` (`str::parse`). A
+  missing or unreadable value is no limit; `0` is a limit of zero. A message on that socket
+  longer than the limit (a create, a steering frame, an interrupt; equal passes) is
+  refused before any byte is written, as a request-scoped 413 `message_too_big`: no
+  failover, no cooldown, no retry on another socket. For a turn's create, the client's
+  connection then closes with 1009 before any text of that turn, since handshake metadata
+  goes out only with the turn's first event; first-party Codex retries the request over
+  HTTP itself, and the proxy carries that HTTP request like any other
+  ([Native HTTP route](#native-http-route)). A refused steering frame ends its stream
+  with that error after the response's text, and a refused interrupt is answered with a
+  400 `error` event as any rejected interrupt is; neither is the no-text signal. A limit
+  above the proxy's own never refuses anything.
+- **Upstream close 1009.** An upstream close with 1009 is the same request-scoped 413
+  and reaches the client as close 1009 ([Socket and account ownership](#socket-and-account-ownership)).
+  Before any event of the turn, the client sees no text before it; after an event, it
+  sees the close after that event. The proxy never sends the request again on any path:
+  once a message was written, an early close does not prove the upstream did not run it,
+  and only the client decides to retry. The proxy closes with 1009 only after the
+  upstream's own 1009 or its advertised limit; both are size rejections.
+
+Not covered: an isolated run of the first-party client against the proxy. The tests pin
+the parser's cases (absent, unreadable, zero, below, at and above the limit, above the
+proxy's own) and the client-visible sequence (close 1009 with no text, nothing written
+upstream, the client's HTTP request forwarded unchanged as the one dispatch) with
+loopback mocks. Building the first-party client for that harness takes its whole
+workspace and pinned git dependencies, and its decision rests on two inputs these tests
+already fix: the 101 header and a close 1009 before any text. No live upstream has been
+seen to send the header.
+
 ### WebSocket HTTP fallback
 
 A Codex credential without `websockets` has no upstream socket, so a turn on it goes
@@ -1245,6 +1299,7 @@ The strict mode is the Codex route's alone.
 | A tool declaration becomes `{"type":"function","name","description","parameters","strict"}` from Claude `input_schema`, Chat `function.parameters`, Gemini `parameters` or `parametersJsonSchema`, or an Interactions declaration. The schema is the caller's, as sent: `$schema`, `pattern`, `patternProperties`, literal data and unknown keywords stay. In a Gemini `parameters` schema only, an upper-case `type` name becomes the JSON Schema name, and only at schema positions (the schema itself, `properties` values, `items`, `anyOf` entries). `parametersJsonSchema` is JSON Schema already and is not changed | All | Responses function tools; first-party `tools/src/responses_api.rs:33-45` (`strict: false` when the caller sets none); Gemini `Type` enum against JSON Schema `type` |
 | A tool call and its result keep the caller's call ID, however long, and the tool name | All | Responses `call_id` pairing |
 | A tool name over 64 bytes is shortened, and the response maps the short name back | Claude, Chat, Gemini, Interactions | OpenAI function names allow at most 64 characters |
+| A Chat custom tool in its documented nested form, `{"type":"custom","custom":{"name","description","format"}}`, becomes the Responses custom tool `{"type":"custom","name","description","format"}`; a grammar format `{"type":"grammar","grammar":{"syntax","definition"}}` becomes `{"type":"grammar","syntax","definition"}`. A nested custom `tool_choice` becomes `{"type":"custom","name"}`. The nested name takes part in shortening like any declared name, so the declaration, the `tool_choice`, a history `custom` call and the response's name map agree. The flat Responses form is accepted as before (#170) | Chat | OpenAI Chat Completions custom tools and custom tool calls are nested under `custom`; Responses custom tools and `tool_choice` are flat |
 | Claude `tool_result` content becomes `function_call_output` text or input parts (text, images in any representable source, inline PDFs) | Claude | Responses `function_call_output.output` |
 | Generation controls map to their Responses fields: `max_tokens`, `max_completion_tokens`, `maxOutputTokens` and `max_output_tokens` become `max_output_tokens`; `temperature`, `top_p`/`topP`, Chat `user`, `safety_identifier`, `metadata`, `prompt_cache_key`, `prompt_cache_retention` and `verbosity` map unchanged | All | The Responses fields of the same name and meaning. The ChatGPT backend's acceptance of each is the upstream's to judge |
 | A control at its API default needs nothing: an empty `stop`/`stop_sequences`/`stopSequences`, zero penalties, `n` or `candidateCount` of 1, `logprobs: false`, text-only modalities, `store: false`, Gemini `responseMimeType: text/plain` | All | The default means the same in both APIs |
@@ -1261,6 +1316,7 @@ The strict mode is the Codex route's alone.
 | The Claude Code billing line in system text (`x-anthropic-billing-header:`) is not sent | Claude | Anthropic billing metadata, not an instruction to the model |
 | Claude tool `cache_control` is not sent | Claude | An Anthropic-only caching hint; Responses caches automatically |
 | Claude system-role messages inside `messages` move after the pending tool results | Claude | Responses requires a call's output to follow the call |
+| Claude tool search (#79): a deferred tool (`defer_loading: true`) is not in top-level `tools`. A `tool_result` whose `tool_reference` blocks name it loads it: its definition, converted as a top-level tool would be and without `defer_loading`, follows the turn's tool results in one `{"type":"additional_tools","role":"developer","tools":[...]}` item, the first time it is referenced. The call output keeps the result's other blocks, or is `""` when it held references only. A reference to an eager tool or to one already loaded adds nothing, and a deferred tool that is never referenced is never sent. Top-level `tools` therefore stay the same as tools load | Claude | Anthropic keeps a deferred tool out of the model's context until a `tool_reference` expands it at that point. The Responses `AdditionalTools` input item is "a list of additional tools made available at this item" (API reference); the first-party client places such items after earlier context (`core/src/context/world_state/top_level_tools.rs:212-218`). Fixture `http-request-tools-at-item` |
 
 #### Refusals
 
@@ -1296,9 +1352,15 @@ Content, including content nested in tool results and system prompts:
 - a `tool_result` with `is_error: true`: Responses `function_call_output` has no failure
   status, so the result is refused rather than sent as an ordinary result;
 - a non-text system block;
-- a tool without an object `input_schema`, or a deferred tool (`defer_loading: true`);
+- a tool without an object `input_schema`;
+- a `tool_reference` that names no tool the request declares; Claude `tool_addition` and
+  `tool_removal` blocks, which are unknown blocks here. Anthropic does not document them
+  and no retained client is known to send them, so they stay refused; revisit only if Anthropic
+  documents them and Claude Code sends them (#170);
 - a Chat `refusal` part, an audio part without data, a tool result without its call, a
   duplicated call ID, or a call of an unknown type;
+- a Chat custom tool without a name, nested or flat, and a nested custom tool with members
+  beside `type` and `custom`;
 - Gemini `executableCode` and other parts it cannot convert, a thought with text, a
   system part that is not text, and built-in Gemini tools such as search;
 - an Interactions thought step, a step with no content, or a part with no Responses
@@ -1310,12 +1372,37 @@ equivalent; remove it or send the request to a provider that accepts it`.
 ### Responses
 
 The same pair's built-in response translator converts the upstream's events, without
-namespace restoration. A buffered client receives
+namespace restoration. For a Chat client it reads nested custom declarations as the
+strict conversion does (`cpa_translate::codex_response`), so a custom call returns under
+the client's name; the registered pair that xAI and Meta use is unchanged. A buffered client receives
 the translation of the aggregated terminal event. Usage is the provider's. A Claude
 client's `message_start` carries what the translator knows (zero input tokens before
 the response ends), not a local estimate, and its final `message_delta` carries the
 provider's counts. Upstream errors keep their classification and reach the client in
 its own error format.
+
+A reasoning item reaches a Claude client as one thinking block, streamed and buffered
+alike: its summary parts joined with a blank line, and its `encrypted_content` as the
+signature. A summary part that is empty or only whitespace is not thinking text, so it
+adds no separator, and an item with no other text opens no block. A signed item still
+gets a signature-only block, which the client sends back as the opaque `reasoning`
+item; an unsigned blank block would be refused on that replay, because Codex cannot
+carry reasoning text without its encrypted content (#168). Test: `codex_translated.rs`
+`reasoning_summaries_read_the_same_streamed_and_buffered`.
+
+An assistant message's `phase` (#112) is not translated. `commentary` is visible mid-turn
+text that tool calls may follow, and `final_answer` the turn's answer
+(`protocol/src/models.rs:979-995`). Claude Messages and Chat Completions show both as
+ordinary assistant text, and a Claude text block before `tool_use` means the same as
+commentary. A Claude client therefore gets commentary as a text block, in order, and
+never as a thinking block. On replay the client's text carries no phase, so the
+converted assistant message has none, which the first-party client reads as "phase
+unknown". OpenAI recommends resending `phase` on replay; doing so would require inferring
+it from position or hiding it in a marker inside client-visible text or a thinking
+signature, which the client never sent. The route does neither. Go v8.0.67 turns
+commentary into thinking blocks and replays it through an internal signature marker
+(`376015c3`, `531721bf`, `cc4b9949`). Fixture `sse-commentary-then-call`. Test:
+`codex_translated.rs` `commentary_is_visible_text_and_replays_without_a_phase`.
 
 A `response.incomplete` is never a normal stop. A reason the client API has a stop for
 becomes that stop: `max_output_tokens` is Claude `max_tokens` and Chat `length`, and
@@ -1367,6 +1454,11 @@ and neither synthesizes a prompt-cache key. Both read the client's JSON through 
 - #33 owns the image model IDs.
 
 ### Remaining limits
+
+- Mid-input `additional_tools` beside top-level `tools` is documented as an input item,
+  and the SIWC preview documents it as a way to supply tools. The first-party client
+  sends it only for Responses Lite models, which have no top-level `tools`. Whether a
+  standard model on the ChatGPT backend honours it is a live gate, not a local result.
 
 - A Gemini `thoughtSignature` is not sent: it is Gemini's state for its own model, and
   no other model reads it.

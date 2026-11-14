@@ -114,7 +114,7 @@ async fn pipeline_reproduces_go_upstream_captures() {
     let captures: Value = serde_json::from_str(include_str!("testdata/go_captures.json")).unwrap();
     let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
     let credential = harness_credential();
-    let cfg = Config::parse("").unwrap();
+    let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse("").unwrap());
     for case in captures["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let req = enrich(request(case));
@@ -160,6 +160,10 @@ async fn pipeline_reproduces_go_upstream_captures() {
         for ((k, ours), (_, theirs)) in prepared.headers.iter().zip(&go) {
             if k == "x-client-request-id" {
                 assert!(uuid::Uuid::parse_str(ours).is_ok(), "{name}: request id");
+                continue;
+            }
+            if k == "anthropic-beta" && super::betas::matches_go(ours, theirs, case["upstream_body"].as_str().unwrap())
+            {
                 continue;
             }
             assert_eq!(ours, theirs, "{name}: {k}");
@@ -956,7 +960,9 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             // dates, and whichever ran first used to pin its date for the other.
             std::fs::write(dir.join("auth").join(format!("fixture-{run}.json")), auth).unwrap();
         }
-        let cfg = super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap());
+        let cfg = super::settings::as_recorded_with_2_1_280_profile(
+            super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap()),
+        );
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")
@@ -1107,6 +1113,17 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
             .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
             .collect();
         let names = |h: &[(String, String)]| h.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        // First-party API-key requests spell the header as Claude Code 2.1.325 does
+        // (headers::WIRE_CASING); Go records its canonical X-Api-Key.
+        let mut theirs = theirs;
+        if ours.iter().any(|(k, _)| k == "x-api-key") {
+            for (k, _) in &mut theirs {
+                if k == "X-Api-Key" {
+                    *k = "x-api-key".into();
+                }
+            }
+            theirs.sort_by(|a, b| a.0.cmp(&b.0));
+        }
         assert_eq!(names(&ours), names(&theirs), "{name}: header names and casing");
         for ((k, a), (_, b)) in ours.iter().zip(&theirs) {
             if k.eq_ignore_ascii_case("x-client-request-id") && b != "9b6a3f8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b" {
@@ -1123,6 +1140,9 @@ async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool
                     &format!("CLIProxyAPI/{}", env!("CARGO_PKG_VERSION")),
                     "{name}: header {k}"
                 );
+                continue;
+            }
+            if k.eq_ignore_ascii_case("anthropic-beta") && super::betas::matches_go(a, b, &go_body) {
                 continue;
             }
             assert_eq!(a, b, "{name}: header {k}");
@@ -1897,7 +1917,7 @@ async fn compat_replay_sequence_matches_go() {
             .as_str()
             .unwrap()
             .replace("AUTH_DIR", root.to_str().unwrap());
-        let cfg = Config::parse(&text).unwrap();
+        let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse(&text).unwrap());
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")
@@ -2620,4 +2640,101 @@ async fn server_side_fallback_is_opt_in_and_keeps_callers_fallbacks() {
     .await;
     let (upstream, _) = sent.lock().unwrap().pop().unwrap();
     assert!(!rawjson::get(&upstream, "fallbacks").exists(), "{upstream}");
+}
+
+/// Claude Code 2.1.325's client forms (testdata/claude_code_2_1_325_clients.json) are
+/// prepared exactly like the same request from native `cli` Claude Code (on an OAuth
+/// account that binds the user ID and signs billing, as for any native caller), and
+/// keep the caller's own identity headers, including the client-app field and
+/// X-Client-App. T3 Code's entrypoint does so once configured in `native-entrypoints`;
+/// unlisted, it is cloaked under the baseline identity.
+#[tokio::test]
+async fn claude_code_2_1_325_client_forms_pass_through() {
+    let doc = include_str!("testdata/claude_code_2_1_325_clients.json");
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let configured =
+        Config::parse("upstream:\n  claude:\n    header-defaults:\n      native-entrypoints: [T3-Code]\n").unwrap();
+    let default = Config::parse("").unwrap();
+    let prepare = |headers: &Value, body: &str| {
+        let case = serde_json::json!({"request_body": body, "request_headers": headers, "path": "/v1/messages"});
+        let mut req = request(&case);
+        let model = rawjson::string(body, "model");
+        (req.model, req.requested_model) = (model.clone(), model);
+        req
+    };
+    let run = async |req: &ExecRequest, cfg: &Config| {
+        let ctx = Ctx::new(&executor, &credential, req, cfg);
+        let translated = translate::request(req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let original = translate::original(
+            req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+        )
+        .unwrap();
+        ctx.prepare_messages(req, &translated, &original, req.stream)
+            .await
+            .unwrap()
+    };
+    for capture in rawjson::get(doc, "captures").array() {
+        let name = capture.get("name").str().to_owned();
+        let headers: Value = serde_json::from_str(capture.get("headers").json()).unwrap();
+        let body = capture.get("body").json().to_owned();
+        // The same request from interactive native Claude Code.
+        let native: Value = headers
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| h[0] != "X-Client-App")
+            .map(|h| match h[0].as_str().unwrap() {
+                "User-Agent" => serde_json::json!(["User-Agent", "claude-cli/2.1.325 (external, cli)"]),
+                "x-app" => serde_json::json!(["x-app", "cli"]),
+                _ => h.clone(),
+            })
+            .collect();
+        let req = prepare(&headers, &body);
+        let cfg = if name.starts_with("t3-code") {
+            &configured
+        } else {
+            &default
+        };
+        let prepared = run(&req, cfg).await;
+        let reference = run(&prepare(&native, &body), &default).await;
+        assert_eq!(prepared.body, reference.body, "{name}: body");
+        let sent = |n: &str| {
+            prepared
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.as_str())
+        };
+        for n in [
+            "User-Agent",
+            "x-app",
+            "X-Client-App",
+            "X-Stainless-Package-Version",
+            "X-Stainless-Runtime-Version",
+            "X-Stainless-OS",
+            "X-Stainless-Arch",
+        ] {
+            let caller = req.headers.get(n).map(|v| v.to_str().unwrap());
+            assert_eq!(sent(n), caller, "{name}: {n}");
+        }
+        // The OAuth account's betas join the caller's, as for native cli.
+        let beta = |h: &[(String, String)]| h.iter().find(|(k, _)| k == "anthropic-beta").map(|(_, v)| v.clone());
+        assert_eq!(
+            beta(&prepared.headers),
+            beta(&reference.headers),
+            "{name}: anthropic-beta"
+        );
+        if name.starts_with("t3-code") {
+            let unlisted = run(&req, &default).await;
+            assert_ne!(unlisted.body, reference.body, "{name}: cloaked without the setting");
+            let ua = unlisted.headers.iter().find(|(k, _)| k == "User-Agent").unwrap();
+            assert_eq!(ua.1, profile::BASELINE.user_agent, "{name}");
+        }
+    }
 }

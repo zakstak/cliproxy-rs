@@ -263,6 +263,10 @@ pub(crate) struct Upstream {
     /// executor before the socket is published. Later requests on this socket repeat
     /// it ([`Upstream::later_metadata`]); no other socket's value can reach them.
     upgrade_model: std::sync::OnceLock<UpgradeModel>,
+    /// The largest message this socket's own upgrade said the upstream reads
+    /// ([`peer_message_limit`]), set once by the Codex executor before the socket is
+    /// published. A longer message is refused before it is written ([`Self::write_certain`]).
+    peer_limit: std::sync::OnceLock<usize>,
     /// The authentication values this socket's handshake carried: the outbound
     /// credential guard of everything read from it ([`crate::codex_secret`]). A reused
     /// socket keeps its own handshake's values; a fresh dial gets the request's.
@@ -312,6 +316,7 @@ impl Upstream {
             reader: Mutex::default(),
             lease: Mutex::default(),
             upgrade_model: std::sync::OnceLock::new(),
+            peer_limit: std::sync::OnceLock::new(),
             #[cfg(test)]
             sink_waits: tokio::sync::watch::Sender::new(0),
         })
@@ -392,11 +397,12 @@ impl Upstream {
     /// `writeCodexWebsocketMessage` + `mapCodexWebsocketWriteError`: a write after the
     /// upstream closed with 1009 reports the request-scoped 413 instead. A write that
     /// outlasts [`WriteLimit`] fails like any other write: the caller invalidates the
-    /// socket, so a partly written frame is never followed by another. Cost: one timer
+    /// socket, so a partly written message is never followed by another. Cost: one timer
     /// entry while a write is in flight.
     pub(crate) async fn send(&self, frame: String) -> Result<(), ExecError> {
-        let len = frame.len();
-        self.write_message(Message::text(frame), len).await
+        self.write_certain(Bytes::from(frame), None)
+            .await
+            .map_err(WriteFailure::into_error)
     }
 
     /// [`Self::send`] for a downstream client's frame (N1 #111 W2): `authority` admits the
@@ -406,70 +412,76 @@ impl Upstream {
         frame: String,
         authority: Option<&Authority>,
     ) -> Result<(), WriteFailure> {
-        let len = frame.len();
-        self.write_certain(Message::text(frame), len, authority).await
+        self.write_certain(Bytes::from(frame), authority).await
     }
 
-    /// One text frame holding a client's own bytes unchanged, UTF-8 or not, as gorilla
+    /// One text message holding a client's own bytes unchanged, UTF-8 or not, as gorilla
     /// writes a `TextMessage`, for a request whose replay must be decided: the failure says
-    /// whether the frame provably never left ([`WriteFailure::unsent`]), and whether
+    /// whether the message provably never left ([`WriteFailure::unsent`]), and whether
     /// `authority` refused it ([`WriteFailure::refusal`]).
     pub(crate) async fn send_create(&self, payload: Bytes, authority: Option<&Authority>) -> Result<(), WriteFailure> {
-        use tokio_tungstenite::tungstenite::protocol::frame::{
-            Frame,
-            coding::{Data, OpCode},
-        };
+        self.write_certain(payload, authority).await
+    }
+
+    /// One text message, and whether a failure provably wrote nothing. A message longer
+    /// than the upstream's advertised limit is refused before anything else (FP4 #118):
+    /// unsent, request-scoped, and the 413 `message_too_big` a WebSocket client receives as
+    /// close 1009. A socket whose loss is recorded once the write holds the sink is not
+    /// written at all. The rest is
+    /// [`write_phases`]: a failure before the first frame was handed to tungstenite, a
+    /// timeout included, wrote nothing; tungstenite refuses a closed or closing socket and
+    /// a full write buffer before it queues the frame ([`refused_before_queueing`]);
+    /// every later failure, and a timeout during a flush, may follow a partial write.
+    /// The sink stays locked for the whole message, so no other write's frames come
+    /// between its fragments, and the bound covers the whole message. A write that stops
+    /// between fragments (failed, timed out or cancelled) leaves the upstream inside an
+    /// unfinished message: [`MidMessage`] records the socket's loss before the sink is
+    /// released, so a write waiting for the sink finds the loss and writes nothing.
+    async fn write_certain(&self, payload: Bytes, authority: Option<&Authority>) -> Result<(), WriteFailure> {
         let len = payload.len();
-        self.write_certain(
-            Message::Frame(Frame::message(payload, OpCode::Data(Data::Text), true)),
-            len,
-            authority,
-        )
-        .await
-    }
-
-    async fn write_message(&self, message: Message, len: usize) -> Result<(), ExecError> {
-        self.write_certain(message, len, None)
-            .await
-            .map_err(WriteFailure::into_error)
-    }
-
-    /// One write, and whether a failure provably wrote nothing. A socket whose loss the
-    /// reader already recorded is not written at all. The rest is [`write_phases`]: a
-    /// failure before the frame was handed to tungstenite, a timeout included, wrote
-    /// nothing; tungstenite refuses a closed or closing socket and a full write buffer
-    /// before it queues the frame ([`refused_before_queueing`]); every later failure, and
-    /// a timeout during the flush, may follow a partial write.
-    async fn write_certain(
-        &self,
-        message: Message,
-        len: usize,
-        authority: Option<&Authority>,
-    ) -> Result<(), WriteFailure> {
-        if let Some(lost) = self.link.lock().expect("link").lost.clone() {
+        if let Some(&limit) = self.peer_limit.get().filter(|limit| len > **limit) {
             return Err(WriteFailure {
-                error: write_error(Some(&lost), "codex websockets executor: write failed"),
+                error: over_peer_limit(limit),
                 unsent: true,
                 refusal: None,
             });
         }
         let deadline = self.write.deadline(len);
-        let mut queued = false;
+        let queued = std::sync::atomic::AtomicBool::new(false);
         let outcome = tokio::time::timeout(deadline, async {
             #[cfg(test)]
             self.sink_waits.send_modify(|waits| *waits += 1);
             let mut sink = self.sink.lock().await;
-            write_phases(&mut *sink, message, authority, &mut queued).await
+            if let Some(lost) = self.link.lock().expect("link").lost.clone() {
+                return Err(lost);
+            }
+            // Declared after `sink`, so it is dropped first, also on cancellation.
+            let mut guard = MidMessage {
+                link: &self.link,
+                fragmented: len > FRAGMENT,
+                queued: false,
+                seen: &queued,
+            };
+            let written = write_phases(&mut *sink, payload, authority, &mut guard.queued).await;
+            if matches!(written, Ok(None)) {
+                guard.fragmented = false;
+            }
+            Ok(written)
         })
         .await;
         match outcome {
-            Ok(Ok(None)) => Ok(()),
-            Ok(Ok(Some(refusal))) => Err(WriteFailure {
+            Ok(Err(lost)) => Err(WriteFailure {
+                error: write_error(Some(&lost), "codex websockets executor: write failed"),
+                unsent: true,
+                refusal: None,
+            }),
+            Ok(Ok(Ok(None))) => Ok(()),
+            Ok(Ok(Ok(Some(refusal)))) => Err(WriteFailure {
                 error: refusal.error(),
                 unsent: true,
                 refusal: Some(Box::new(refusal)),
             }),
-            Ok(Err((error, unsent))) => Err(WriteFailure {
+            Ok(Ok(Err((error, unsent)))) => Err(WriteFailure {
                 unsent,
                 error: write_error(
                     self.link.lock().expect("link").lost.as_ref(),
@@ -484,7 +496,7 @@ impl Upstream {
                     "codex websockets executor: write timed out",
                 )
                 .with_diagnostic(ws_cause::write_timeout(deadline, len)),
-                unsent: !queued,
+                unsent: !queued.load(std::sync::atomic::Ordering::Relaxed),
                 refusal: None,
             }),
         }
@@ -1070,24 +1082,60 @@ impl WriteFailure {
     }
 }
 
-/// The phases of one upstream write, in order (N1 #111 W1, W2): wait until `sink` can
-/// take the frame (`poll_ready`, which also flushes earlier frames), let `authority`
-/// admit it, hand it over (`start_send`), and flush it (`poll_flush`). The client
-/// authority is therefore decided after every wait that comes before the frame is
-/// committed: a key revoked while the write waited for the socket, for its lock or for an
-/// earlier frame's flush stops it; a revocation after the frame was handed over cannot
-/// recall it. `queued` turns true just before the hand-over, so a timeout before it
-/// proves nothing was written. An error is returned with whether nothing of this frame
-/// was written.
+/// Largest data frame written upstream. A longer text message goes as one message in
+/// frames of at most this size, each flushed before the next is handed over, as
+/// first-party Codex writes it (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
+/// `send_message`, openai/codex d15bf1d). The bytes are split as they are, so a UTF-8
+/// character may span two frames; the upstream reassembles the message unchanged.
+pub(crate) const FRAGMENT: usize = 1 << 20;
+
+/// Records the socket's loss when a fragmented message stopped after its first frame was
+/// handed over and before it finished: the upstream waits for continuation frames that
+/// never come, and any later message on the socket would be a protocol error. A loss the
+/// reader recorded first is kept. Dropped while the write still holds the sink; `seen`
+/// tells [`Upstream::write_certain`] whether anything was handed over.
+struct MidMessage<'a> {
+    link: &'a Mutex<Link>,
+    /// The message has more than one frame and has not finished.
+    fragmented: bool,
+    /// Its first frame was handed to tungstenite ([`write_phases`]).
+    queued: bool,
+    seen: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for MidMessage<'_> {
+    fn drop(&mut self) {
+        self.seen.store(self.queued, std::sync::atomic::Ordering::Relaxed);
+        if self.fragmented && self.queued {
+            let mut link = self.link.lock().expect("link");
+            link.lost
+                .get_or_insert_with(|| transport("codex websockets executor: write stopped inside a message"));
+        }
+    }
+}
+
+/// The phases of one upstream text message, in order (N1 #111 W1, W2): wait until `sink`
+/// can take a frame (`poll_ready`, which also flushes earlier frames), let `authority`
+/// admit the message, then for each frame of at most [`FRAGMENT`] bytes hand it over
+/// (`start_send`) and flush it (`poll_flush`). The client authority is therefore decided
+/// after every wait that comes before the message is committed: a key revoked while the
+/// write waited for the socket, for its lock or for an earlier message's flush stops it; a
+/// revocation after the first frame was handed over cannot recall the message. `queued`
+/// turns true just before the first hand-over, so a timeout before it proves nothing was
+/// written. An error is returned with whether nothing of this message was written.
 pub(crate) async fn write_phases<S>(
     sink: &mut S,
-    message: Message,
+    mut payload: Bytes,
     authority: Option<&Authority>,
     queued: &mut bool,
 ) -> Result<Option<Refusal>, (tokio_tungstenite::tungstenite::Error, bool)>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
+    use tokio_tungstenite::tungstenite::protocol::frame::{
+        Frame,
+        coding::{Data, OpCode},
+    };
     std::future::poll_fn(|cx| sink.poll_ready_unpin(cx))
         .await
         .map_err(|error| (error, true))?;
@@ -1095,14 +1143,29 @@ where
         return Ok(Some(refusal));
     }
     *queued = true;
-    sink.start_send_unpin(message).map_err(|error| {
-        let unsent = refused_before_queueing(&error);
-        (error, unsent)
-    })?;
-    std::future::poll_fn(|cx| sink.poll_flush_unpin(cx))
-        .await
-        .map_err(|error| (error, false))?;
-    Ok(None)
+    let mut first = true;
+    loop {
+        let fragment = payload.split_to(payload.len().min(FRAGMENT));
+        let last = payload.is_empty();
+        if !first {
+            std::future::poll_fn(|cx| sink.poll_ready_unpin(cx))
+                .await
+                .map_err(|error| (error, false))?;
+        }
+        let opcode = OpCode::Data(if first { Data::Text } else { Data::Continue });
+        sink.start_send_unpin(Message::Frame(Frame::message(fragment, opcode, last)))
+            .map_err(|error| {
+                let unsent = first && refused_before_queueing(&error);
+                (error, unsent)
+            })?;
+        std::future::poll_fn(|cx| sink.poll_flush_unpin(cx))
+            .await
+            .map_err(|error| (error, false))?;
+        if last {
+            return Ok(None);
+        }
+        first = false;
+    }
 }
 
 /// tungstenite errors returned before the frame is queued for the stream.
@@ -1177,6 +1240,38 @@ fn closed_too_big(reason: &str) -> ExecError {
         serde_json::json!({
             "error": {"message": message, "type": "invalid_request_error", "code": "message_too_big"},
             "close_reason": reason,
+        })
+        .to_string(),
+    )
+}
+
+/// `x-codex-websocket-max-message-bytes` on an upstream upgrade, read as first-party Codex
+/// reads it (`codex-api/src/endpoint/responses_websocket.rs`, openai/codex `ed7ca22bb60a`,
+/// inspected at `5c3ff1dabf64`): the first value as a decimal `usize` (`str::parse`, so
+/// `+5` is 5 and ` 5` is nothing). Absent or unreadable is no limit; `0` is a limit of
+/// zero bytes.
+pub(crate) fn peer_message_limit(handshake: &HeaderMap) -> Option<usize> {
+    handshake
+        .get("x-codex-websocket-max-message-bytes")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+/// A message longer than the upstream's advertised limit, refused before it was written:
+/// the request-scoped 413 of an upstream 1009 close, which a WebSocket client receives as
+/// close 1009 before any event of the turn. First-party Codex reads that close as
+/// `WebsocketMessageTooLarge` and sends the request over HTTP itself; the proxy sends it
+/// nowhere else.
+fn over_peer_limit(limit: usize) -> ExecError {
+    ExecError::local(
+        413,
+        FailureScope::Request,
+        serde_json::json!({
+            "error": {
+                "message": format!("request exceeds the upstream websocket message limit of {limit} bytes"),
+                "type": "invalid_request_error",
+                "code": "message_too_big",
+            },
         })
         .to_string(),
     )
@@ -2197,6 +2292,9 @@ impl CodexExecutor {
         let conn = Upstream::new(target.clone(), sink, self.ws.write, secrets, socket_id);
         if let Some(upgrade) = UpgradeModel::from_handshake(model, &handshake) {
             let _ = conn.upgrade_model.set(upgrade);
+        }
+        if let Some(limit) = peer_message_limit(&handshake) {
+            let _ = conn.peer_limit.set(limit);
         }
         // Publish before the reader runs, so a reader that fails at once still finds its
         // socket current and invalidates it; holding the handle slot keeps a concurrent

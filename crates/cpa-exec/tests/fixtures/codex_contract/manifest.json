@@ -47,6 +47,24 @@
       "notes": "The tool declaration contents are illustrative. Responses Lite is a model-catalog flag; API-key support is unknown."
     },
     {
+      "name": "http-request-tools-at-item",
+      "file": "http/request_tools_at_item.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key", "siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/api/reference/resources/responses/methods/create/ AdditionalTools input item: role developer, tools \"A list of additional tools made available at this item\"",
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations function/custom tools may be supplied through additional_tools input items",
+        "codex-rs/protocol/src/models.rs:1070-1078 ResponseItem::AdditionalTools { id, role, tools }",
+        "codex-rs/core/src/context/world_state/top_level_tools.rs:212-218 incremental tool additions as an additional_tools developer item",
+        "codex-rs/core/src/session/world_state_item_tests.rs:56,76-82,110 additional_tools items placed after earlier context"
+      ],
+      "contract": "Tools made available partway through the input: top-level tools stay as they were, and an additional_tools developer item after a function_call_output adds definitions from that item on. The translated route expresses Claude tool search this way.",
+      "notes": "The first-party client emits mid-input additional_tools only for Responses Lite models, which send no top-level tools. Whether a standard model honours the item beside top-level tools on the ChatGPT backend is a live gate; the API reference lists it as an input item and the SIWC preview documents it."
+    },
+    {
       "name": "http-request-compaction",
       "file": "http/request_compaction.json",
       "format": "json",
@@ -244,6 +262,22 @@
       ],
       "contract": "A completed stream with encrypted reasoning, output_text with empty annotations, message phase, end_turn and full usage including cache-write details.",
       "notes": "Field values are placeholders."
+    },
+    {
+      "name": "sse-commentary-then-call",
+      "file": "sse/commentary_then_call.sse",
+      "format": "sse",
+      "transport": "http",
+      "direction": "to-client",
+      "endpoints": ["chatgpt", "api-key"],
+      "evidence": "first-party-test",
+      "sources": [
+        "codex-rs/codex-api/src/sse/responses.rs:822-866 parses_items_and_completed: an assistant message with phase commentary",
+        "codex-rs/protocol/src/models.rs:979-995 MessagePhase: commentary is mid-turn assistant text that tool calls may follow; None is phase unknown",
+        "codex-rs/core/tests/common/responses.rs:1016-1026 ev_function_call"
+      ],
+      "contract": "Commentary is visible assistant text before a tool call: a phase commentary message, then a function_call, then the completion.",
+      "notes": "Combines the first-party commentary item with the first-party function_call event helper; text, call and usage values are placeholders."
     },
     {
       "name": "sse-completed-no-usage",

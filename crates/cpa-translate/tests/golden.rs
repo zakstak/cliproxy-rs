@@ -195,8 +195,8 @@ const PENDING: &[(&str, &str, &str)] = &[
 ];
 
 /// Fixtures recorded at an older reference whose behaviour this fork deliberately
-/// takes from the selective Go v8.0.67 target (8bba7a77), each listed in
-/// docs/DIFFERENCES-FROM-GO.md. Like PENDING, every fixture an entry matches must
+/// takes from the selective Go v8.0.67 target (8bba7a77) or changes itself (#168), each
+/// listed in docs/DIFFERENCES-FROM-GO.md. Like PENDING, every fixture an entry matches must
 /// still fail, so an entry cannot hide a regression elsewhere. The fixtures keep their
 /// recorded provenance; Rust unit tests assert the new behaviour.
 const SELECTIVE: &[(&str, &str, &str)] = &[
@@ -249,6 +249,16 @@ const SELECTIVE: &[(&str, &str, &str)] = &[
         "openai-response->claude",
         "TestTextSearchTextOrderPreservedInStreamingAndReplay:literal#5",
         "#72: a continuation's search result keeps its ID (aadb34f9)",
+    ),
+    (
+        "claude->codex",
+        "codex-events/non-stream/0",
+        "#168: buffered summary parts join with a blank line, as streamed",
+    ),
+    (
+        "claude->codex",
+        "codex-claude/non-stream/0",
+        "#168: buffered summary parts join with a blank line, as streamed",
     ),
 ];
 
@@ -422,6 +432,10 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
     let refused_80 = actual.first().is_some_and(|o| o == b"#80-REFUSED");
     early.extend(differences);
     early.extend(developer_role_difference(client, upstream, f, bytes, &mut actual));
+    if reasoning_flush_moved(client, upstream, f, bytes, &actual, &expected) {
+        actual = expected.clone();
+    }
+    early.extend(property_key_difference(client, upstream, f, &mut actual, &expected));
     if refused_80 {
         actual = expected.clone();
     }
@@ -567,6 +581,30 @@ fn controls_difference(
     errors
 }
 
+/// #168 (docs/DIFFERENCES-FROM-GO.md, "Reasoning summaries for Claude clients"): the
+/// Responses -> Claude stream opens a thinking block with a summary part's first text
+/// that is not whitespace, not at `response.reasoning_summary_part.added`, so the block
+/// start and the part separator are written with a later input line. For a stream
+/// fixture with summary parts on that pair, Go's bytes in Go's order are accepted.
+fn reasoning_flush_moved(
+    client: Format,
+    upstream: Format,
+    f: &Value,
+    bytes: bool,
+    actual: &[Vec<u8>],
+    expected: &[Vec<u8>],
+) -> bool {
+    (client, upstream) == (Format::Claude, Format::Codex)
+        && f["path"] == "stream"
+        && f["lines"].as_array().unwrap().iter().any(|line| {
+            let line = field(line, bytes);
+            line.windows(PART_ADDED.len()).any(|w| w == PART_ADDED)
+        })
+        && actual.concat() == expected.concat()
+}
+
+const PART_ADDED: &[u8] = b"response.reasoning_summary_part.added";
+
 /// #80 (docs/DIFFERENCES-FROM-GO.md, "Developer messages in Responses-shaped Chat
 /// Completions requests"): the Responses -> Chat converter keeps a `developer` message's
 /// role, which Go v8.0.35, which recorded these fixtures, rewrites to `user`.
@@ -617,6 +655,135 @@ fn developer_role_difference(
             "#80: {} developer messages sent, {want} in the input",
             developer.len()
         )]
+    }
+}
+
+/// #77 (docs/DIFFERENCES-FROM-GO.md, "Claude tool property keys on translated routes"):
+/// the Chat and Responses -> Claude converters rename each tool property key Claude
+/// rejects, which Go v8.0.35, which recorded these fixtures, sends unchanged.
+///
+/// For a request fixture on those pairs this checks each tool schema against Go's: a key
+/// Claude accepts is kept, a rejected one is replaced by one accepted name everywhere it
+/// is declared and in `required`, and nothing else changes. It then puts Go's schema
+/// bytes back, so every other byte is still compared with Go's. Returns the mismatches.
+fn property_key_difference(
+    client: Format,
+    upstream: Format,
+    f: &Value,
+    actual: &mut [Vec<u8>],
+    expected: &[Vec<u8>],
+) -> Vec<String> {
+    if upstream != Format::Claude
+        || !matches!(client, Format::OpenAI | Format::OpenAIResponse)
+        || f["path"] != "request"
+    {
+        return vec![];
+    }
+    let (Some(out), Some(want)) = (actual.first_mut(), expected.first()) else {
+        return vec![];
+    };
+    let (Ok(got), Ok(go)) = (
+        serde_json::from_slice::<Value>(out),
+        serde_json::from_slice::<Value>(want),
+    ) else {
+        return vec![];
+    };
+    let mut errors = vec![];
+    for (i, go_tool) in go["tools"].as_array().into_iter().flatten().enumerate() {
+        let (go_schema, rust_schema) = (&go_tool["input_schema"], &got["tools"][i]["input_schema"]);
+        let mut names = HashMap::new();
+        rejected_key_names(go_schema, rust_schema, &mut names, &mut errors);
+        if names.is_empty() {
+            continue;
+        }
+        let mut renamed = go_schema.clone();
+        rename_property_keys(&mut renamed, &names);
+        if renamed != *rust_schema {
+            errors.push(format!(
+                "#77: tools.{i} schema differs beyond renamed keys: {rust_schema}"
+            ));
+        }
+        let path = format!("tools.{i}.input_schema");
+        gj::set_raw(out, &path, gj::get(want, &path).raw);
+    }
+    errors
+}
+
+fn claude_accepts_key(key: &str) -> bool {
+    (1..=64).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Walks Go's and Rust's schema together, recording the accepted name each rejected
+/// property key became.
+fn rejected_key_names(go: &Value, rust: &Value, names: &mut HashMap<String, String>, errors: &mut Vec<String>) {
+    match (go, rust) {
+        (Value::Object(go), Value::Object(rust)) => {
+            for ((key, go_value), (rust_key, rust_value)) in go.iter().zip(rust) {
+                if key == "properties"
+                    && let (Value::Object(go_props), Value::Object(rust_props)) = (go_value, rust_value)
+                {
+                    for ((go_key, go_prop), (rust_key, rust_prop)) in go_props.iter().zip(rust_props) {
+                        if claude_accepts_key(go_key) {
+                            if go_key != rust_key {
+                                errors.push(format!("#77: accepted key {go_key:?} became {rust_key:?}"));
+                            }
+                        } else if !claude_accepts_key(rust_key)
+                            || names
+                                .insert(go_key.clone(), rust_key.clone())
+                                .is_some_and(|n| n != *rust_key)
+                        {
+                            errors.push(format!("#77: rejected key {go_key:?} became {rust_key:?}"));
+                        }
+                        rejected_key_names(go_prop, rust_prop, names, errors);
+                    }
+                } else if key == rust_key {
+                    rejected_key_names(go_value, rust_value, names, errors);
+                }
+            }
+        }
+        (Value::Array(go), Value::Array(rust)) => {
+            for (go, rust) in go.iter().zip(rust) {
+                rejected_key_names(go, rust, names, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_property_keys(value: &mut Value, names: &HashMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut child) in entries {
+                match (key.as_str(), &mut child) {
+                    ("properties", Value::Object(props)) => {
+                        let props = std::mem::take(props);
+                        let renamed = props
+                            .into_iter()
+                            .map(|(k, mut v)| {
+                                rename_property_keys(&mut v, names);
+                                (names.get(&k).cloned().unwrap_or(k), v)
+                            })
+                            .collect();
+                        child = Value::Object(renamed);
+                    }
+                    ("required", Value::Array(items)) => {
+                        for item in items.iter_mut() {
+                            if let Some(name) = item.as_str().and_then(|s| names.get(s)) {
+                                *item = Value::String(name.clone());
+                            }
+                        }
+                    }
+                    _ => rename_property_keys(&mut child, names),
+                }
+                map.insert(key, child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| rename_property_keys(v, names)),
+        _ => {}
     }
 }
 

@@ -15,6 +15,8 @@ use crate::stream::GoStream;
 use crate::{Error, ResponseCtx};
 
 /// Joins the summary parts of one Codex reasoning item inside one thinking block.
+/// Whitespace-only parts are not thinking text: they add no separator and, alone, open no
+/// block (#168).
 const SUMMARY_PART_SEPARATOR: &[u8] = b"\n\n";
 
 #[derive(Default)]
@@ -40,7 +42,12 @@ struct State {
     text_open: bool,
     thinking_open: bool,
     thinking_signature: Vec<u8>,
+    /// The current reasoning item streamed thinking text.
     thinking_summary_seen: bool,
+    /// The current summary part streamed text that is not only whitespace.
+    thinking_part_shown: bool,
+    /// The current part's whitespace, held until the part shows text.
+    thinking_held: Vec<u8>,
     web_search_uses: HashSet<Vec<u8>>,
     web_search_results: HashSet<Vec<u8>>,
     last_web_search_id: Vec<u8>,
@@ -210,6 +217,37 @@ impl State {
         event(out, "content_block_stop", &payload);
         self.block_index += 1;
         self.thinking_open = false;
+    }
+
+    /// One delta of the current summary part. A part's leading whitespace waits for its
+    /// first other text; a part that never shows any adds nothing.
+    fn summary_text(&mut self, text: &[u8], out: &mut Vec<u8>) {
+        if !self.thinking_part_shown {
+            self.thinking_held.extend_from_slice(text);
+            if trim_space(text).is_empty() {
+                return;
+            }
+        }
+        self.stop_text(out);
+        if self.thinking_part_shown || !self.thinking_open {
+            self.start_thinking(out);
+        } else {
+            self.thinking_delta(SUMMARY_PART_SEPARATOR, out);
+        }
+        if self.thinking_part_shown {
+            self.thinking_delta(text, out);
+        } else {
+            let held = std::mem::take(&mut self.thinking_held);
+            self.thinking_delta(&held, out);
+        }
+        self.thinking_part_shown = true;
+        self.thinking_summary_seen = true;
+    }
+
+    /// A new summary part (or reasoning item) begins.
+    fn next_summary_part(&mut self) {
+        self.thinking_part_shown = false;
+        self.thinking_held.clear();
     }
 
     fn finalize_signature_only_thinking(&mut self, out: &mut Vec<u8>) {
@@ -549,22 +587,12 @@ impl State {
                 gj::set_str(&mut payload, "message.id", root.get("response.id").bytes());
                 event(&mut out, "message_start", &payload);
             }
-            b"response.reasoning_summary_part.added" => {
-                self.stop_text(&mut out);
-                // Codex splits one reasoning item into summary parts; only its
-                // output_item.done carries the final signature, so one block stays open.
-                if self.thinking_open {
-                    self.thinking_delta(SUMMARY_PART_SEPARATOR, &mut out);
-                } else {
-                    self.start_thinking(&mut out);
-                }
-                self.thinking_summary_seen = true;
-            }
+            // Codex splits one reasoning item into summary parts; only its
+            // output_item.done carries the final signature, so the parts share one block,
+            // which the first part with text opens.
+            b"response.reasoning_summary_part.added" => self.next_summary_part(),
             b"response.reasoning_summary_text.delta" | b"response.reasoning_text.delta" => {
-                self.stop_text(&mut out);
-                self.start_thinking(&mut out);
-                self.thinking_delta(&root.get("delta").bytes(), &mut out);
-                self.thinking_summary_seen = true;
+                self.summary_text(&root.get("delta").bytes(), &mut out);
             }
             b"response.content_part.added" => {
                 self.finalize_thinking(&mut out);
@@ -621,6 +649,7 @@ impl State {
                         // its open block into this one.
                         self.finalize_thinking(&mut out);
                         self.thinking_summary_seen = false;
+                        self.next_summary_part();
                         // Fallback only: output_item.done carries the final signature.
                         self.thinking_signature = item.get("encrypted_content").bytes().into_owned();
                     }
@@ -688,6 +717,7 @@ impl State {
                         }
                         self.thinking_signature.clear();
                         self.thinking_summary_seen = false;
+                        self.next_summary_part();
                     }
                     b"web_search_call" => self.web_search_result(&root, &item, &mut out),
                     _ => {}
@@ -1001,21 +1031,36 @@ fn web_search_blocks(blocks: &mut Vec<Vec<u8>>, item: &Res<'_>, seen: &mut HashS
     seen.insert(id);
 }
 
-/// extractCodexReasoningItemText: the summary text, else the content text.
+/// The thinking text of a reasoning item, as the stream renders it: its summary parts
+/// joined by [`SUMMARY_PART_SEPARATOR`], else its content text; empty when only
+/// whitespace.
 fn reasoning_item_text(item: &Res<'_>) -> Vec<u8> {
     let summary = item.get("summary");
-    let thinking = if summary.exists() {
-        joined_text(&summary)
-    } else {
-        vec![]
-    };
-    if !thinking.is_empty() {
-        return thinking;
+    let mut thinking = vec![];
+    if summary.is_array() {
+        summary.each(|_, part| {
+            let text = text_of(&part);
+            if !trim_space(&text).is_empty() {
+                if !thinking.is_empty() {
+                    thinking.extend_from_slice(SUMMARY_PART_SEPARATOR);
+                }
+                thinking.extend_from_slice(&text);
+            }
+            true
+        });
+    } else if summary.exists() {
+        thinking = summary.bytes().into_owned();
     }
-    let content = item.get("content");
-    if content.exists() {
-        joined_text(&content)
-    } else {
-        vec![]
+    if trim_space(&thinking).is_empty() {
+        let content = item.get("content");
+        thinking = if content.exists() {
+            joined_text(&content)
+        } else {
+            vec![]
+        };
     }
+    if trim_space(&thinking).is_empty() {
+        thinking.clear();
+    }
+    thinking
 }

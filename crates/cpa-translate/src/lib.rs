@@ -56,6 +56,7 @@ pub mod apply_patch_responses;
 mod claude_chat_request;
 mod claude_chat_response;
 mod claude_fallback;
+mod claude_property_keys;
 mod claude_responses;
 mod claude_responses_response;
 mod codex_chat_request;
@@ -284,7 +285,7 @@ pub fn translate_request(
 pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Option<Result<Vec<u8>, Error>> {
     let convert: RequestFn = match client {
         Format::Claude => codex_claude::codex_strict,
-        Format::OpenAI => codex_chat_request::codex_strict,
+        Format::OpenAI => codex_chat_request::STRICT.pair.request,
         _ => return None,
     };
     let upstream = Format::Codex;
@@ -294,6 +295,17 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
         Ok(out)
     });
     Some(converted.map(|out| thinking::apply_summary_for_model(out, upstream.as_str(), ctx.model, summary)))
+}
+
+/// The Codex translated route's response translators for a `client` answered from Codex:
+/// the pair whose request conversion [`codex_request`] uses. For a Chat Completions client
+/// they read nested custom tools as that conversion does; the registered pair, which the
+/// xAI and Meta executors share, keeps its reading.
+pub fn codex_response(client: Format) -> Option<&'static Pair> {
+    match client {
+        Format::OpenAI => Some(&codex_chat_request::STRICT.pair),
+        _ => pair(client, Format::Codex),
+    }
 }
 
 /// The registered branch of Go `TranslateRequestEnvelope`.

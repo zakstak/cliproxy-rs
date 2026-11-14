@@ -70,6 +70,8 @@ mod payload_barrier;
 pub mod proxy;
 mod quota;
 pub(crate) use cpa_common::rawjson;
+#[cfg(test)]
+mod reasoning_testkit;
 mod replay;
 #[cfg(feature = "test-support")]
 pub mod test_support;

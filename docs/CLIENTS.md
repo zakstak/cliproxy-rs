@@ -27,10 +27,19 @@ For a persistent personal setup, put this in `~/.claude/settings.json`:
 
 ### Claude Code versions
 
-With a Claude account, cliproxy-rs forwards Claude Code's own identity (its `User-Agent` and SDK and Node versions) when Claude Code is 2.1.280 or newer within major version 2. A release newer than 2.1.280 must send both its `X-Stainless-Package-Version` and `X-Stainless-Runtime-Version` headers, as Claude Code does; its session-title and quota-probe requests are forwarded the same way. With `stabilize-device-profile: true`, 2.1.x releases from 2.1.280 still count as Claude Code, so they are not cloaked, but they go upstream with the stabilized 2.1.280 identity; 2.2 and later are cloaked, and the Stainless requirement does not apply. Other clients, and older Claude Code, are sent upstream as Claude Code 2.1.280. When a `claude-cli` client is not forwarded, the log says so at most once per account and version, naming the account by its auth index (the one the dashboard and the Management API show), and says when missing Stainless headers are the reason:
+With a Claude account, cliproxy-rs forwards Claude Code's own identity (its `User-Agent` and SDK and Node versions) when Claude Code is 2.1.280 or newer within major version 2. Every such release except 2.1.325 must send both its `X-Stainless-Package-Version` and `X-Stainless-Runtime-Version` headers, as Claude Code does; its session-title and quota-probe requests are forwarded the same way. With `stabilize-device-profile: true`, 2.1.x releases from 2.1.280 still count as Claude Code, so they are not cloaked, but they go upstream with the stabilized 2.1.325 identity; 2.2 and later are cloaked, and the Stainless requirement does not apply. Other clients, and Claude Code older than 2.1.280, are sent upstream as Claude Code 2.1.325 (SDK 0.128.0, Node v26.12.1), the newest release measured, so that they can use models that older releases cannot. Claude Code counts with any of its built-in entrypoints (`cli`, `sdk-cli`, `sdk-ts`, `sdk-py`, `claude-vscode`), from background sessions (`x-app: cli-bg`), and with the `agent-sdk/`, `client-app/` and `workload/` fields it appends to its `User-Agent`. An application that runs Claude Code under its own entrypoint name is cloaked until you list that name. T3 Code, for example, uses `t3-code`:
+
+```yaml
+upstream:
+  claude:
+    header-defaults:
+      native-entrypoints: [t3-code]
+```
+
+When a `claude-cli` client is not forwarded, the log says so at most once per account and version, naming the account by its auth index (the one the dashboard and the Management API show), and says when missing Stainless headers are the reason:
 
 ```text
-claude: Claude Code 2.1.220 on credential 1f3a9c0b7d2e4a68 is not passed through; requests use the claude-cli/2.1.280 (external, cli) identity. ...
+claude: Claude Code 2.1.220 on credential 1f3a9c0b7d2e4a68 is not passed through; requests use the claude-cli/2.1.325 (external, cli) identity. ...
 ```
 
 Anthropic refuses Claude Code releases that are too old for a model. The error reaches your client as a 400:
