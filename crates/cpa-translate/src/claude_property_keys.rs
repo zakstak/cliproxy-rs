@@ -20,7 +20,11 @@
 //! that nothing applying beside them evaluates.
 //! A failed `if`, a ruled-out alternative and `not` are still evaluated at the
 //! position: the keys they name there are renamed (so both sides reach the same
-//! verdict), but none of their subschemas apply below it. Keys of a free-form object (`additionalProperties`,
+//! verdict), but none of their subschemas apply below it.
+//! ponytail: an element a `contains` schema rules out keeps the keys only that schema
+//! names, so a discriminator declared only in `contains` is not renamed there (free-form
+//! data in such an element is kept, which review required); counting matches for
+//! `minContains`/`maxContains` would need it renamed. Keys of a free-form object (`additionalProperties`,
 //! `patternProperties`, no schema) are data and stay as sent, in both directions, even
 //! when they spell a renamed key.
 //! ponytail: branches the bounded check cannot tell apart all apply, so a free-form map
@@ -278,6 +282,16 @@ fn ecma_pattern(source: &str) -> Option<String> {
         match (c, in_class) {
             ('\\', _) => {
                 let escaped = chars.next()?;
+                // A class escape next to a `-` would turn that literal hyphen into a
+                // range once expanded (`[\w-a]`), so such a class is unknown.
+                if in_class && matches!(escaped, 'd' | 'w' | 's') {
+                    let after_hyphen = out.ends_with('-') && !out.ends_with("[-") && !out.ends_with("[^-");
+                    let rest = chars.as_str();
+                    let before_hyphen = rest.starts_with('-') && !rest.starts_with("-]");
+                    if after_hyphen || before_hyphen {
+                        return None;
+                    }
+                }
                 let replacement = match (escaped, in_class) {
                     ('d', false) => "[0-9]".to_owned(),
                     ('D', false) => "[^0-9]".to_owned(),
@@ -625,6 +639,12 @@ impl PropertyKeys {
                 !matches!((pattern.matches(client), pattern.matches(wire)), (Some(a), Some(b)) if a == b)
             })
         }) {
+            return None;
+        }
+        // A key renamed below a `not` (past a member or element) is read there but never
+        // applies, so the walk cannot keep both sides' verdicts; decline the tool.
+        // ponytail: following evaluated-only transitions under `not` is the upgrade.
+        if tree.renamed_below_not(&to_claude) {
             return None;
         }
         let mut tree = tree;
@@ -1246,6 +1266,49 @@ impl<'k> Sets<'k> {
 }
 
 impl Tree {
+    /// Each subschema of `n`, and whether it describes a different instance position.
+    fn children(&self, n: NodeId) -> impl Iterator<Item = (NodeId, bool)> + '_ {
+        let node = &self.nodes[n];
+        let moving = node
+            .properties
+            .values()
+            .flatten()
+            .chain(node.patterns.iter().map(|(_, c)| c))
+            .chain(&node.additional)
+            .chain(&node.unevaluated)
+            .chain(node.prefix.iter().flatten())
+            .chain(&node.rest)
+            .chain(&node.unevaluated_items)
+            .chain(&node.every)
+            .map(|&c| (c, true));
+        let in_place = node
+            .all_of
+            .iter()
+            .chain(&node.any_of)
+            .chain(node.condition.iter().flatten())
+            .chain(node.dependent.iter().map(|(_, d)| d))
+            .chain(&node.not)
+            .map(|&c| (c, false));
+        moving.chain(in_place)
+    }
+
+    /// Whether a subschema below a `not`, at another instance position, names a key in
+    /// `renamed`.
+    fn renamed_below_not(&self, renamed: &HashMap<Vec<u8>, Vec<u8>>) -> bool {
+        let mut seen: HashSet<(NodeId, bool)> = HashSet::new();
+        let mut queue: Vec<(NodeId, bool)> = self.nodes.iter().flat_map(|n| &n.not).map(|&c| (c, false)).collect();
+        while let Some((n, moved)) = queue.pop() {
+            if !seen.insert((n, moved)) {
+                continue;
+            }
+            if moved && self.nodes[n].named.iter().any(|k| renamed.contains_key(k)) {
+                return true;
+            }
+            queue.extend(self.children(n).map(|(c, moves)| (c, moved || moves)));
+        }
+        false
+    }
+
     /// The node a local `$ref` names: `#` or `#/<pointer>`, percent-decoded, then RFC
     /// 6901. `None` for any other reference, an invalid escape or a pointer to no node.
     pub(crate) fn resolve(&self, reference: &[u8]) -> Option<NodeId> {
@@ -2144,6 +2207,10 @@ mod tests {
         // Unknown: no faithful translation, a rejected construct, a non-BMP key.
         assert_eq!(pattern(r"^[\D]$").matches(b"x"), None);
         assert_eq!(pattern(r"^[]a]$").matches(b"a"), None);
+        assert_eq!(pattern(r"^[\w-a]$").matches(b"-"), None);
+        assert_eq!(pattern(r"^[a-\d]$").matches(b"-"), None);
+        assert_eq!(pattern(r"^[-\d]$").matches(b"-"), Some(true));
+        assert_eq!(pattern(r"^[\d-]$").matches(b"-"), Some(true));
         assert_eq!(pattern(r"^[^]a]$").matches(b"a"), None);
         assert_eq!(pattern(r"^(?=a)").matches(b"a"), None);
         assert_eq!(pattern(r"^.$").matches("😀".as_bytes()), None);
@@ -2326,6 +2393,20 @@ mod tests {
         }
         let stable = br##"{"properties":{"p":{"properties":{"x y":{}},"patternProperties":{"^(x y|x_y)$":{"properties":{"a b":{}}}}}}}"##;
         round_trip(stable, r##"{"p":{"x y":{"a b":1}}}"##, r##"{"p":{"x_y":{"a_b":1}}}"##);
+    }
+
+    #[test]
+    fn renamed_keys_below_not_decline_the_tool() {
+        let nested = br##"{"properties":{"p":{"properties":{"data":{}},
+            "not":{"properties":{"data":{"properties":{"x y":{"const":"a"}}}}}}}}"##;
+        assert!(PropertyKeys::of(nested).is_none());
+        // Through a reference too.
+        let referenced = br##"{"$defs":{"d":{"properties":{"x y":{}}}},"properties":{"p":{
+            "not":{"properties":{"data":{"$ref":"#/$defs/d"}}}}}}"##;
+        assert!(PropertyKeys::of(referenced).is_none());
+        // At the `not` itself the key is renamed in place.
+        let level = br##"{"properties":{"p":{"not":{"properties":{"x y":{}},"required":["x y"]}}}}"##;
+        round_trip(level, r##"{"p":{"x y":1}}"##, r##"{"p":{"x_y":1}}"##);
     }
 
     #[test]
