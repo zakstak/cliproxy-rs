@@ -120,6 +120,14 @@ Usage accounting changes from [#178](https://github.com/zakstak/cliproxy-rs/issu
   and payload rules, or `auto` when the request carried none. Go v8.0.35 records the
   client's tier. Grok's translation drops a client's tier, so a Grok record names one
   only when a payload rule sets it. Other routes and providers keep the client's tier.
+- A record carries xAI's reported cost and server-side tool counts when the terminal
+  event's `usage` holds them: `cost_in_usd_ticks` (10^10 ticks per US dollar) and a
+  `server_side_tool_usage_details` object with the documented counters xAI sent
+  (`code_interpreter_calls`, `document_search_calls`, `file_search_calls`,
+  `image_generation_calls`, `mcp_calls`, `web_search_calls`, `x_search_calls`,
+  `x_posts_fetched`, `x_users_fetched`). Source: the docs.x.ai API reference, Responses
+  `usage`, read 2026-11-14. A missing or `null` value stays absent, and a reported zero
+  stays zero. The proxy computes no cost of its own. Go v8.0.35 records neither.
 
 ## Deliberate differences
 
