@@ -152,7 +152,8 @@ fn data(body: &[u8]) -> Vec<Value> {
 fn schema() -> Value {
     json!({"type": "object", "properties": {
         "not[labels]": {"type": "string", "description": "Exclude labels"},
-        "state": {"type": "string"}
+        "state": {"type": "string"},
+        "also": {"$ref": "#/properties/not%5Blabels%5D"}
     }, "required": ["not[labels]"]})
 }
 
@@ -201,6 +202,8 @@ async fn translated_routes_rename_and_restore_rejected_property_keys() {
             "{sent}"
         );
         assert_eq!(sent["required"], json!(["not_labels_"]));
+        // The local `$ref` follows the rename (#196).
+        assert_eq!(sent["properties"]["also"]["$ref"], "#/properties/not_labels_");
         assert_eq!(history, json!({"not_labels_": "wip"}));
         let output = if stream {
             let events = data(&body);
@@ -222,6 +225,8 @@ async fn translated_routes_rename_and_restore_rejected_property_keys() {
             "messages": [{"role": "user", "content": "hi"}]});
         let (status, body) = post(&url, "/v1/chat/completions", &chat).await;
         assert_eq!(status, 200, "stream={stream}: {}", String::from_utf8_lossy(&body));
+        let (sent, _) = last_sent(&up);
+        assert_eq!(sent["properties"]["also"]["$ref"], "#/properties/not_labels_", "{sent}");
         let arguments = if stream {
             data(&body)
                 .iter()
