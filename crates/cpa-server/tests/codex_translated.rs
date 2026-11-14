@@ -1098,3 +1098,148 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         }
     }
 }
+
+/// A Claude Code request that uses client-side tool search: an eager `ToolSearch` tool,
+/// deferred tools, and a history in which `ToolSearch` returned `tool_reference` blocks
+/// (Anthropic tool search with a custom search tool), then referenced one tool again.
+fn deferred_request(long: &str) -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "max_tokens": 1024,
+        "stream": false,
+        "tools": [
+            {"name": "ToolSearch", "description": "Find deferred tools.",
+             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+            {"name": "WebFetch", "description": "Fetch a URL.", "defer_loading": true,
+             "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}}},
+            {"name": long, "description": "A gateway MCP tool.", "defer_loading": true,
+             "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+            {"name": "NeverLoaded", "defer_loading": true, "input_schema": {"type": "object"}}
+        ],
+        "messages": [
+            {"role": "user", "content": "Fetch example.com"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_s1", "name": "ToolSearch", "input": {"query": "fetch"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s1", "content": [
+                    {"type": "tool_reference", "tool_name": "WebFetch"},
+                    {"type": "tool_reference", "tool_name": long},
+                    {"type": "tool_reference", "tool_name": "WebFetch"}
+                ]},
+                {"type": "text", "text": "Go on."}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_s2", "name": "ToolSearch", "input": {"query": "fetch again"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s2", "content": [
+                    {"type": "text", "text": "Found:"},
+                    {"type": "tool_reference", "tool_name": "WebFetch"},
+                    {"type": "tool_reference", "tool_name": "ToolSearch"}
+                ]}
+            ]}
+        ]
+    })
+}
+
+/// Deferred Claude tools are expressed with the Responses `additional_tools` input item,
+/// "a list of additional tools made available at this item" (`docs/codex/CONTRACT.md`
+/// "Translated route"). A deferred tool is not in top-level `tools`, as Anthropic keeps
+/// it out of the model's context; at the `tool_result` that references it, its
+/// definition follows the call output in an `additional_tools` developer item, once,
+/// before the rest of the turn. A reference to an eager or already loaded tool adds
+/// nothing, and a never-referenced tool is never sent. The model's call of a loaded tool
+/// returns under its Claude name, a shortened long name included.
+#[tokio::test]
+async fn deferred_tools_load_where_tool_search_references_them() {
+    let long = format!("mcp__gateway__{}", "very_long_tool_name_segment_".repeat(3));
+    let short = format!("mcp__{}", &"very_long_tool_name_segment_".repeat(3)[..59]);
+    let call = format!(
+        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"id\":\"fc_1\",\"status\":\"completed\",\"name\":\"{short}\",\"call_id\":\"call_9\",\"arguments\":\"{{}}\"}}}}\n\n\
+event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{{\"type\":\"function_call\",\"id\":\"fc_1\",\"status\":\"completed\",\"name\":\"{short}\",\"call_id\":\"call_9\",\"arguments\":\"{{}}\"}}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}}}}\n\n"
+    );
+    let proxy = proxy(vec![Reply::sse(call)], "").await;
+    let (status, answer) = post(&proxy.url, "/v1/messages", &deferred_request(&long)).await;
+    assert_eq!(status, 200, "{answer}");
+    let body = sent(&proxy);
+    assert_nothing_added(&body, &["ToolSearch"]);
+
+    let input = body["input"].as_array().unwrap();
+    let kinds: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "message",
+            "function_call",
+            "function_call_output",
+            "additional_tools",
+            "message",
+            "function_call",
+            "function_call_output"
+        ],
+        "{body}"
+    );
+    assert_eq!(input[2]["output"], "", "only references: nothing else to say: {body}");
+    let added = &input[3];
+    assert_eq!(added["role"], "developer", "{added}");
+    // The item and the call output before it have the contract fixture's members.
+    let contract: Value = serde_json::from_slice(&fixture("http-request-tools-at-item").bytes()).unwrap();
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(added), keys(&contract["input"][3]), "{added}");
+    assert_eq!(keys(&input[2]), keys(&contract["input"][2]), "{body}");
+    let names: Vec<&str> = added["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["WebFetch", short.as_str()],
+        "each once, in reference order: {added}"
+    );
+    assert_eq!(
+        added["tools"][0],
+        json!({"type": "function", "name": "WebFetch", "description": "Fetch a URL.", "strict": false,
+               "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}}),
+        "the definition as a top-level tool would be, without defer_loading: {added}"
+    );
+    assert_eq!(
+        input[6]["output"],
+        json!([{"type": "input_text", "text": "Found:"}]),
+        "the later reference adds nothing: {body}"
+    );
+    assert!(!body.to_string().contains("NeverLoaded"), "{body}");
+    assert!(!body.to_string().contains("tool_reference"), "{body}");
+
+    let message: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(message["content"][0]["type"], "tool_use", "{message}");
+    assert_eq!(message["content"][0]["name"], long, "the Claude name: {message}");
+}
+
+/// What tool search cannot express is still refused before the send: a reference to a
+/// tool the request does not declare, and Claude's mid-conversation `tool_addition` and
+/// `tool_removal` blocks.
+#[tokio::test]
+async fn unexpressible_tool_loading_is_refused_before_the_send() {
+    let mut unknown = deferred_request("mcp__x");
+    unknown["messages"][2]["content"][0]["content"][1]["tool_name"] = json!("Missing");
+    let mut addition = deferred_request("mcp__x");
+    addition["messages"][2]["content"][1] =
+        json!({"type": "tool_addition", "tool": {"type": "tool_reference", "name": "WebFetch"}});
+    let mut removal = deferred_request("mcp__x");
+    removal["messages"][2]["content"][1] =
+        json!({"type": "tool_removal", "tool": {"type": "tool_reference", "name": "WebFetch"}});
+    for (body, named) in [
+        (unknown, "tool_reference to a tool the request does not declare"),
+        (addition, "tool_addition"),
+        (removal, "tool_removal"),
+    ] {
+        let proxy = proxy(vec![completed()], "").await;
+        let (status, answer) = post(&proxy.url, "/v1/messages", &body).await;
+        assert_eq!(status, 400, "{named}: {answer}");
+        assert!(answer.contains(named), "{named}: {answer}");
+        assert!(proxy.upstream.http().is_empty(), "{named}: nothing sent");
+    }
+}

@@ -47,6 +47,24 @@
       "notes": "The tool declaration contents are illustrative. Responses Lite is a model-catalog flag; API-key support is unknown."
     },
     {
+      "name": "http-request-tools-at-item",
+      "file": "http/request_tools_at_item.json",
+      "format": "json",
+      "transport": "http",
+      "direction": "to-upstream",
+      "endpoints": ["chatgpt", "api-key", "siwc"],
+      "evidence": "provider-docs",
+      "sources": [
+        "https://developers.openai.com/api/reference/resources/responses/methods/create/ AdditionalTools input item: role developer, tools \"A list of additional tools made available at this item\"",
+        "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations function/custom tools may be supplied through additional_tools input items",
+        "codex-rs/protocol/src/models.rs:1070-1078 ResponseItem::AdditionalTools { id, role, tools }",
+        "codex-rs/core/src/context/world_state/top_level_tools.rs:212-218 incremental tool additions as an additional_tools developer item",
+        "codex-rs/core/src/session/world_state_item_tests.rs:56,76-82,110 additional_tools items placed after earlier context"
+      ],
+      "contract": "Tools made available partway through the input: top-level tools stay as they were, and an additional_tools developer item after a function_call_output adds definitions from that item on. The translated route expresses Claude tool search this way.",
+      "notes": "The first-party client emits mid-input additional_tools only for Responses Lite models, which send no top-level tools. Whether a standard model honours the item beside top-level tools on the ChatGPT backend is a live gate; the API reference lists it as an input item and the SIWC preview documents it."
+    },
+    {
       "name": "http-request-compaction",
       "file": "http/request_compaction.json",
       "format": "json",

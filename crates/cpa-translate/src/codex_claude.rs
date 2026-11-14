@@ -383,6 +383,50 @@ struct Messages<'m> {
     pending_tool_uses: Vec<Vec<u8>>,
     pending_reminders: Vec<Vec<u8>>,
     drops: UserTurnDrops,
+    /// Strict: the declared tools a `tool_reference` can name ([`ToolSearch`]).
+    search: ToolSearch,
+}
+
+/// Claude tool search on the Codex translated route (`docs/codex/CONTRACT.md`
+/// "Translated route"). A deferred tool (`defer_loading: true`) stays out of the model's
+/// context until a `tool_result` references it with a `tool_reference` block. Responses
+/// expresses the same with an `additional_tools` input item, "a list of additional tools
+/// made available at this item": the referenced definitions follow the call output, each
+/// the first time it is referenced.
+#[derive(Default)]
+struct ToolSearch {
+    /// Deferred tools by Claude name: the Responses definition each loads.
+    deferred: HashMap<Vec<u8>, Vec<u8>>,
+    /// Eager tools by Claude name: referencing one adds nothing.
+    eager: HashSet<Vec<u8>>,
+    /// Deferred tools already made available.
+    loaded: HashSet<Vec<u8>>,
+}
+
+impl ToolSearch {
+    /// The `additional_tools` item for `references`, the tool names one `tool_result`
+    /// referenced, or `None` when none of them loads a tool. A name no declared tool
+    /// has is refused.
+    fn load(&mut self, references: &[Vec<u8>], drops: &mut UserTurnDrops) -> Option<Vec<u8>> {
+        let mut tools = vec![];
+        for name in references {
+            match self.deferred.get(name) {
+                Some(definition) => {
+                    if self.loaded.insert(name.clone()) {
+                        tools.push(definition.clone());
+                    }
+                }
+                None if self.eager.contains(name) => {}
+                None => drops.drop_part("tool_reference to a tool the request does not declare"),
+            }
+        }
+        if tools.is_empty() {
+            return None;
+        }
+        let mut item = br#"{"type":"additional_tools","role":"developer","tools":[]}"#.to_vec();
+        gj::set_raw(&mut item, "tools", gj::join(&tools));
+        Some(item)
+    }
 }
 
 impl Messages<'_> {
@@ -510,9 +554,15 @@ impl Messages<'_> {
                     }
                     b"tool_result" => {
                         flush(&mut self.items, &mut current);
-                        let item = tool_result(part, self.strict.then_some(&mut self.drops));
-                        self.items.push(item);
+                        let mut references = vec![];
+                        let strict = self.strict.then_some((&mut self.drops, &mut references));
+                        self.items.push(tool_result(part, strict));
                         sendable += 1;
+                        // The loaded definitions follow this turn's tool results, as a
+                        // system reminder does.
+                        if let Some(item) = self.search.load(&references, &mut self.drops) {
+                            self.pending_reminders.push(item);
+                        }
                     }
                     // Strict: a block Codex cannot express is refused, not dropped.
                     other if self.strict => self.drops.drop_part(&String::from_utf8_lossy(other)),
@@ -558,9 +608,15 @@ impl Messages<'_> {
 }
 
 /// A `tool_result` block as a `function_call_output` item. `strict` (the Codex
-/// translated route's drops) keeps the call ID and every nested block: an image in any
-/// representable source, a PDF document, text; anything else is refused.
-fn tool_result(part: &Res<'_>, mut strict: Option<&mut UserTurnDrops>) -> Vec<u8> {
+/// translated route's drops, and the tool names its `tool_reference` blocks name) keeps
+/// the call ID and every nested block: an image in any representable source, a PDF
+/// document, text; a `tool_reference` loads its tool ([`ToolSearch`]) and is no output
+/// part; anything else is refused. A result of references only has empty output.
+fn tool_result(part: &Res<'_>, strict: Option<(&mut UserTurnDrops, &mut Vec<Vec<u8>>)>) -> Vec<u8> {
+    let (mut strict, mut references) = match strict {
+        Some((drops, references)) => (Some(drops), Some(references)),
+        None => (None, None),
+    };
     let mut output = br#"{"type":"function_call_output"}"#.to_vec();
     if let Some(drops) = strict.as_deref_mut()
         && part.get("is_error").kind == Kind::True
@@ -599,6 +655,11 @@ fn tool_result(part: &Res<'_>, mut strict: Option<&mut UserTurnDrops>) -> Vec<u8
                     }
                     None => drops.drop_part("document in a tool_result"),
                 },
+                (b"tool_reference", Some(_)) => {
+                    if let Some(references) = references.as_deref_mut() {
+                        references.push(block.get("tool_name").bytes().into_owned());
+                    }
+                }
                 (b"text", _) => {
                     let mut text = br#"{"type":"input_text","text":""}"#.to_vec();
                     gj::set_str(&mut text, "text", block.get("text").bytes());
@@ -611,12 +672,65 @@ fn tool_result(part: &Res<'_>, mut strict: Option<&mut UserTurnDrops>) -> Vec<u8
             }
         }
     }
-    if items.is_empty() {
+    if items.is_empty() && references.is_some_and(|r| !r.is_empty()) {
+        gj::set_str(&mut output, "output", "");
+    } else if items.is_empty() {
         gj::set_str(&mut output, "output", content.bytes());
     } else {
         gj::set_raw(&mut output, "output", gj::join(&items));
     }
     output
+}
+
+/// A Claude tool declaration as a Responses function tool: the type, the (short) name,
+/// the parameters, and `strict`. Strict refuses a tool without an object `input_schema`.
+fn function_tool(
+    tool: &Res<'_>,
+    names: &HashMap<Vec<u8>, Vec<u8>>,
+    strict: bool,
+    drops: &mut UserTurnDrops,
+) -> Vec<u8> {
+    let mut item = tool.raw.to_vec();
+    let kind = tool.get("type");
+    if kind.kind != Kind::String || kind.s.as_ref() != b"function" {
+        gj::set_str(&mut item, "type", "function");
+    }
+    let name = tool.get("name");
+    if name.exists() {
+        let original = name.bytes().into_owned();
+        let short = mapped_name(names, &original);
+        if name.kind != Kind::String || short != original {
+            gj::set_str(&mut item, "name", &short);
+        }
+    }
+    // Strict: the client's schema as sent. Go normalizes it (drops `$schema`,
+    // `$id` and unsupported `pattern`s, adds `type` and `properties`), with no
+    // destination source requiring that.
+    let schema = tool.get("input_schema");
+    if !strict {
+        gj::set_raw(&mut item, "parameters", normalize_tool_parameters(&schema.raw));
+    } else if schema.is_object() {
+        gj::set_raw(&mut item, "parameters", &schema.raw);
+    } else {
+        drops.drop_part("tool without an object input_schema");
+    }
+    let cleanup: &[&str] = if strict {
+        &["input_schema", "cache_control", "defer_loading"]
+    } else {
+        &["input_schema", "parameters.$schema", "cache_control", "defer_loading"]
+    };
+    for path in cleanup {
+        if gj::get(&item, path).exists() {
+            gj::delete(&mut item, path);
+        }
+    }
+    // Strict: the client's `strict`, else `false` as the pinned client sends. Go
+    // forces `false`.
+    let current = gj::get(&item, "strict").kind;
+    if (strict && !matches!(current, Kind::True | Kind::False)) || (!strict && current != Kind::False) {
+        gj::set_bool(&mut item, "strict", false);
+    }
+    item
 }
 
 fn eq_fold(value: &[u8], token: &str) -> bool {
@@ -665,7 +779,25 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
         pending_tool_uses: vec![],
         pending_reminders: vec![],
         drops: UserTurnDrops::default(),
+        search: ToolSearch::default(),
     };
+    let tools = root.get("tools");
+    if strict && tools.is_array() {
+        // Before the messages, which load deferred tools where they reference them. A
+        // tool the conversion refuses is refused, in order, by the tools loop below.
+        for tool in tools.array() {
+            if is_web_search_tool(&tool.get("type").bytes()) {
+                continue;
+            }
+            let name = tool.get("name").bytes().into_owned();
+            if tool.get("defer_loading").kind == Kind::True {
+                let item = function_tool(&tool, &names, strict, &mut UserTurnDrops::default());
+                state.search.deferred.insert(name, item);
+            } else {
+                state.search.eager.insert(name);
+            }
+        }
+    }
 
     let system = root.get("system");
     if system.exists() {
@@ -705,7 +837,6 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
         state.flush_reminders();
     }
 
-    let tools = root.get("tools");
     let mut has_web_search = false;
     let mut tool_items: Vec<Vec<u8>> = vec![];
     if tools.is_array() {
@@ -727,51 +858,11 @@ fn convert(model: &str, raw: &[u8], preserve: bool, strict: bool) -> Result<Vec<
                 tool_items.push(web_search_tool(&tool));
                 continue;
             }
-            let mut item = tool.raw.to_vec();
-            let kind = tool.get("type");
-            if kind.kind != Kind::String || kind.s.as_ref() != b"function" {
-                gj::set_str(&mut item, "type", "function");
+            let item = function_tool(&tool, &names, strict, &mut state.drops);
+            // Strict: a deferred tool loads where a `tool_result` references it.
+            if !(strict && tool.get("defer_loading").kind == Kind::True) {
+                tool_items.push(item);
             }
-            let name = tool.get("name");
-            if name.exists() {
-                let original = name.bytes().into_owned();
-                let short = mapped_name(&names, &original);
-                if name.kind != Kind::String || short != original {
-                    gj::set_str(&mut item, "name", &short);
-                }
-            }
-            // Strict: the client's schema as sent. Go normalizes it (drops `$schema`,
-            // `$id` and unsupported `pattern`s, adds `type` and `properties`), with no
-            // destination source requiring that.
-            let schema = tool.get("input_schema");
-            if !strict {
-                gj::set_raw(&mut item, "parameters", normalize_tool_parameters(&schema.raw));
-            } else if schema.is_object() {
-                gj::set_raw(&mut item, "parameters", &schema.raw);
-            } else {
-                state.drops.drop_part("tool without an object input_schema");
-            }
-            let cleanup: &[&str] = if strict {
-                &["input_schema", "cache_control", "defer_loading"]
-            } else {
-                &["input_schema", "parameters.$schema", "cache_control", "defer_loading"]
-            };
-            if strict && tool.get("defer_loading").kind == Kind::True {
-                // Deferred tool loading (tool search) has no Responses form.
-                state.drops.drop_part("deferred tool (defer_loading)");
-            }
-            for path in cleanup {
-                if gj::get(&item, path).exists() {
-                    gj::delete(&mut item, path);
-                }
-            }
-            // Strict: the client's `strict`, else `false` as the pinned client sends. Go
-            // forces `false`.
-            let current = gj::get(&item, "strict").kind;
-            if (strict && !matches!(current, Kind::True | Kind::False)) || (!strict && current != Kind::False) {
-                gj::set_bool(&mut item, "strict", false);
-            }
-            tool_items.push(item);
         }
     }
 
