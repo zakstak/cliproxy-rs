@@ -1367,7 +1367,7 @@ impl<'a> Ctx<'a> {
         // `shouldEnsureCacheControl`.
         let cpa_owns_cache = !explicit && !confirmed && (cloaked || cloak::count_cache_controls(&body) == 0);
         if cpa_owns_cache {
-            body = cloak::ensure_cache_control(body);
+            body = cloak::ensure_cache_control(cloak::materialize_top_level_cache(body));
         }
         body = cloak::enforce_cache_limit(body, 4);
         body = cloak::strip_prompt_cache_options(body);

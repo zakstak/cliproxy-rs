@@ -2961,3 +2961,57 @@ async fn proxy_written_thinking_gives_way_to_forced_tools_on_claude_clients() {
     );
     assert!(!rawjson::get(&effort, "thinking").exists(), "{effort}");
 }
+
+/// A top-level `cache_control` (automatic caching) takes one of the four breakpoint
+/// slots on the last cacheable block, which must not carry a marker with another TTL,
+/// and 1h breakpoints must precede 5m ones (platform docs, Prompt caching). When CPA
+/// owns a request's breakpoints it places that one itself, so the limit and the TTL
+/// order cover it.
+#[tokio::test]
+async fn top_level_cache_control_becomes_the_last_breakpoint_when_cpa_owns_them() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    for top in [r#"{"type":"ephemeral"}"#, r#"{"type":"ephemeral","ttl":"1h"}"#] {
+        let body = format!(
+            r#"{{"model":"claude-sonnet-4-6","max_tokens":64,"cache_control":{top},"system":"Be brief.","tools":[{{"name":"t","input_schema":{{"type":"object"}}}}],"messages":[{{"role":"user","content":"one"}},{{"role":"assistant","content":"two"}},{{"role":"user","content":"three"}}]}}"#
+        );
+        let case = serde_json::json!({"request_body": body, "request_headers": [], "path": "/v1/messages"});
+        let mut req = request(&case);
+        (req.model, req.requested_model) = ("claude-sonnet-4-6".into(), "claude-sonnet-4-6".into());
+        let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+        let translated =
+            translate::request(&req, ctx.codex, &ctx.base_model, ctx.is_compat, ctx.tool_search()).unwrap();
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+        )
+        .unwrap();
+        let sent = ctx
+            .prepare_messages(&req, &translated, &original, false)
+            .await
+            .unwrap()
+            .body;
+        assert!(!rawjson::get(&sent, "cache_control").exists(), "{top}: {sent}");
+        let marks: Vec<(String, String)> = signals::blocks(&sent)
+            .into_iter()
+            .filter(|(_, b)| cloak::valid_cache_control(&rawjson::get(b, "cache_control")))
+            .map(|(path, b)| (path, rawjson::string(&b, "cache_control.ttl")))
+            .collect();
+        assert!(marks.len() <= 4, "{top}: {marks:?}");
+        let last = marks.iter().rfind(|(p, _)| p.starts_with("messages.")).unwrap();
+        assert!(
+            last.0.starts_with("messages.2."),
+            "{top}: the last cacheable block: {marks:?}"
+        );
+        let order: Vec<&str> = marks.iter().map(|(_, ttl)| ttl.as_str()).collect();
+        assert!(
+            !order.windows(2).any(|w| w[0] != "1h" && w[1] == "1h"),
+            "{top}: 1h after 5m: {marks:?}"
+        );
+    }
+}
