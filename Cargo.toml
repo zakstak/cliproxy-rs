@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.1-zak.2"
+version = "0.4.1-zak.3"
 publish = false
 edition = "2024"
 license = "MIT"
@@ -14,13 +14,13 @@ categories = ["network-programming", "web-programming"]
 
 [workspace.dependencies]
 # Keep internal dependency versions aligned with workspace.package.version.
-cpa-common = { path = "crates/cpa-common", version = "0.4.1-zak.2" }
-cpa-core = { path = "crates/cpa-core", version = "0.4.1-zak.2" }
-cpa-exec = { path = "crates/cpa-exec", version = "0.4.1-zak.2" }
-cpa-home = { path = "crates/cpa-home", version = "0.4.1-zak.2" }
-cpa-server = { path = "crates/cpa-server", version = "0.4.1-zak.2" }
-cpa-store = { path = "crates/cpa-store", version = "0.4.1-zak.2" }
-cpa-translate = { path = "crates/cpa-translate", version = "0.4.1-zak.2" }
+cpa-common = { path = "crates/cpa-common", version = "0.4.1-zak.3" }
+cpa-core = { path = "crates/cpa-core", version = "0.4.1-zak.3" }
+cpa-exec = { path = "crates/cpa-exec", version = "0.4.1-zak.3" }
+cpa-home = { path = "crates/cpa-home", version = "0.4.1-zak.3" }
+cpa-server = { path = "crates/cpa-server", version = "0.4.1-zak.3" }
+cpa-store = { path = "crates/cpa-store", version = "0.4.1-zak.3" }
+cpa-translate = { path = "crates/cpa-translate", version = "0.4.1-zak.3" }
 
 anyhow = "1"
 axum = "0.8.9"
