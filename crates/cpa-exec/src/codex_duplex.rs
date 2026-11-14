@@ -630,6 +630,19 @@ impl Duplex {
         }
     }
 
+    /// The oldest pending create, which `payload` rejects before it started: the failure
+    /// is its only upstream frame, so its TTFT ends there (#178). `account` cannot route
+    /// the frame to it, because no response of it is open.
+    fn mark_rejection(&self, payload: &str) {
+        if let Some(accounting) = self.pending.front().and_then(|pending| pending.accounting.as_ref())
+            && accounting.usage.enabled()
+        {
+            accounting
+                .usage
+                .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
+        }
+    }
+
     /// What an upstream message settles, apart from its delivery: a terminal event its
     /// response's record, a failure the record of the request it belongs to, and a
     /// withheld failure every record. `reading` is the message's classification. The
@@ -642,6 +655,9 @@ impl Duplex {
             // rate-limit error, say): neither may reach the client as an event, so the
             // stream ends on it, as on any account failure. Its classified status stays.
             if error.withheld() {
+                if !self.first_response && matches!(self.failure_owner(payload), Owner::Rejected) {
+                    self.mark_rejection(payload);
+                }
                 self.fail_records(error);
                 return Settlement::Account(error.clone());
             }
@@ -649,16 +665,10 @@ impl Duplex {
                 match self.failure_owner(payload) {
                     Owner::Ambiguous => return Settlement::Ambiguous,
                     Owner::Rejected => {
+                        self.mark_rejection(payload);
                         if let Some(rejected) = self.pending.pop_front()
                             && let Some(accounting) = rejected.accounting
                         {
-                            // The rejection is the create's only upstream frame: its TTFT
-                            // ends there (#178), which `account` cannot route to it.
-                            if accounting.usage.enabled() {
-                                accounting
-                                    .usage
-                                    .token_event(crate::helpers::responses_token_event(payload.as_bytes()));
-                            }
                             accounting.fail(error);
                         }
                     }
