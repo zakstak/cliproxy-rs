@@ -223,7 +223,8 @@ const ECMA_SPACE: &str =
 
 /// An ECMA-262 pattern rewritten for the `regex` crate: `\d`, `\w`, `\s` and their
 /// negations, `\b`, `\B` and `.` get ECMA's character sets instead of Unicode's.
-/// Other syntax passes through, and what the crate rejects (lookaround,
+/// Only shared syntax and explicitly translated escapes pass through. Unsupported
+/// syntax and what the crate rejects (lookaround,
 /// backreferences, `\c`, `[^]`) leaves the pattern unknown. `None` for a negated
 /// class escape inside a character class, which has no class-body equivalent.
 /// ponytail: case-insensitive and other flags do not occur in JSON Schema patterns;
@@ -250,7 +251,28 @@ fn ecma_pattern(source: &str) -> Option<String> {
                     ('s', true) => ECMA_SPACE.to_owned(),
                     ('b', true) => r"\x08".to_owned(),
                     ('D' | 'W' | 'S', true) => return None,
-                    (other, _) => format!("\\{other}"),
+                    ('n' | 'r' | 't', _) => format!("\\{escaped}"),
+                    ('f', _) => r"\x0C".to_owned(),
+                    ('v', _) => r"\x0B".to_owned(),
+                    ('x' | 'u', _) => {
+                        let width = if escaped == 'x' { 2 } else { 4 };
+                        let mut hex = String::with_capacity(width);
+                        for _ in 0..width {
+                            let digit = chars.next()?;
+                            if !digit.is_ascii_hexdigit() {
+                                return None;
+                            }
+                            hex.push(digit);
+                        }
+                        format!("\\x{{{hex}}}")
+                    }
+                    (
+                        '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '/' | '\\' | '|' | '-',
+                        _,
+                    ) => format!("\\{escaped}"),
+                    // Identity escapes and Rust-specific escapes can have different
+                    // meanings. Only the explicitly translated subset is certain.
+                    _ => return None,
                 };
                 out.push_str(&replacement);
             }
@@ -265,6 +287,26 @@ fn ecma_pattern(source: &str) -> Option<String> {
                     chars = stripped.chars();
                 }
             }
+            ('[', true) => return None,
+            // Group modifiers other than non-capturing and named groups are Rust-only
+            // (`(?i)`, `(?P<n>)`) or rejected (lookaround); `{,n}` is a literal in ECMA.
+            ('(', false)
+                if chars.as_str().starts_with('?')
+                    && !chars.as_str().starts_with("?:")
+                    && !(chars.as_str().starts_with("?<")
+                        && !chars.as_str().starts_with("?<=")
+                        && !chars.as_str().starts_with("?<!")) =>
+            {
+                return None;
+            }
+            ('{', false) if chars.as_str().starts_with(',') => return None,
+            ('&' | '~', true) => {
+                // Rust treats `&&` and `~~` as set operators; ECMA treats them as
+                // class members. Escape each character to preserve its literal meaning.
+                out.push('\\');
+                out.push(c);
+            }
+            ('-', true) if chars.as_str().starts_with('-') => return None,
             (']', true) => {
                 in_class = false;
                 out.push(']');
@@ -1918,6 +1960,25 @@ mod tests {
         assert_eq!(type_is(b"9007199254740993", b"integer"), None);
         assert_eq!(type_is(b"1.5", b"integer"), Some(false));
         assert_eq!(type_is(b"3", b"integer"), Some(true));
+    }
+
+    #[test]
+    fn pattern_syntax_never_inherits_rust_only_meanings() {
+        let pattern = |p: &str| Pattern {
+            source: p.as_bytes().to_vec(),
+            compiled: OnceLock::new(),
+        };
+        assert_eq!(pattern(r"^[a&&b]$").matches(b"&"), Some(true));
+        assert_eq!(pattern(r"^[a~~b]$").matches(b"~"), Some(true));
+        assert_eq!(pattern(r"^\a$").matches(b"a"), None);
+        assert_eq!(pattern(r"^\a$").matches(b"\x07"), None);
+        assert_eq!(pattern(r"^[a[b]c]$").matches(b"ac]"), None);
+        assert_eq!(pattern(r"^a$").matches(b"a\n"), Some(false));
+        assert_eq!(pattern(r"^\x61\u0062$").matches(b"ab"), Some(true));
+        assert_eq!(pattern(r"(?i)^a$").matches(b"A"), None);
+        assert_eq!(pattern(r"^(?P<n>a)$").matches(b"a"), None);
+        assert_eq!(pattern(r"^a{,2}$").matches(b"a"), None);
+        assert_eq!(pattern(r"^(?:a|b)(?<n>c)$").matches(b"bc"), Some(true));
     }
 
     #[test]
