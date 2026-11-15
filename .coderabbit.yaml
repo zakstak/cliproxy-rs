@@ -14,7 +14,6 @@ reviews:
     - "!Cargo.lock"
     - "!ui/package-lock.json"
     - "!ui/dist/**"
-    - "!ui/dist-panel/**"
     - "!crates/cpa-core/src/config/schema.json"
     - "!crates/**/tests/fixtures/**"
     - "!crates/**/testdata/**"

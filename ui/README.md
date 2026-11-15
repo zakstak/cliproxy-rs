@@ -1,9 +1,6 @@
 # cliproxy-rs dashboard
 
-The management dashboard for cliproxy-rs, written in Svelte 5 with plain CSS. It talks to the v8 Management API defined by Go CLIProxyAPI, and it has two outputs built from one source tree:
-
-- `dist/` is embedded by the Rust binary (`crates/cpa-server/build.rs`) and served at `/management.html`.
-- `dist-panel/management.html` is one self-contained file for existing Go CLIProxyAPI servers. See [PANEL.md](PANEL.md).
+The management dashboard for cliproxy-rs, written in Svelte 5 with plain CSS. It talks to the v8 Management API. The Rust binary embeds `dist/` through `crates/cpa-server/build.rs` and serves the dashboard at `/management.html`.
 
 The visual system is in [DESIGN.md](DESIGN.md). Every read shows loading, empty, error, not available, or data. Keep management keys in memory, preserve keyboard access and visible focus, and respect reduced motion in both themes.
 
@@ -16,10 +13,10 @@ npm ci
 npm run dev      # Vite on :5173, proxies /v8 to 127.0.0.1:8317 (override with CPA_BACKEND=...)
 npm run check    # svelte-check, 0 errors and 0 warnings expected
 npm test         # unit tests for src/core.ts
-npm run build    # dist/ and dist-panel/
+npm run build    # dist/ for the Rust binary
 ```
 
-`npm run build` runs `vite build`, then `scripts/panel.mjs` (copies `dist/index.html` to `dist/management.html`, the path the Rust server serves; inlines JS, CSS, font and favicon into `dist-panel/management.html`; writes its SHA-256 to `dist-panel/management.html.sha256` and into PANEL.md). The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
+`npm run build` runs `vite build`, then `scripts/build.mjs` to copy `dist/index.html` to `dist/management.html`, the path the Rust server serves. JavaScript, CSS, fonts, and icons stay as separate files in `dist/`. The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
 
 Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checked in and embedded at compile time.
 
@@ -66,10 +63,9 @@ Config list writes reread the target first and refuse to write if it changed sin
 
 ## Verification scripts
 
-Both scripts are for disposable servers with fake credentials only: they edit configuration and credential files. Fixture requirements: management key `orb-dashboard-test-only`, a disabled fake Claude credential with email `operator@example.invalid`, routing strategy `round-robin`, and an empty `requests.payload.default`.
+Run these scripts against disposable servers with fake credentials only: they edit configuration and credential files. Fixture requirements: management key `orb-dashboard-test-only`, a disabled fake Claude credential with email `operator@example.invalid`, routing strategy `round-robin`, and an empty `requests.payload.default`.
 
-- `node scripts/browser-check-rust.mjs [url] [capture-dir]` drives the dashboard with agent-browser against the Rust binary (or Go): nine screens in both themes, unsupported actions disabled on Rust, a payload rule written and removed, a YAML diff discarded, 390 px layout, and no key in storage.
-- `CHROME_PATH=... node scripts/panel-check-go.mjs [url] [capture-dir]` drives the single-file panel with Playwright against Go: all 12 screens in both themes, credential edits, a Codex OAuth start and cancel, config list writes, the section editor, request logs, the live usage view, phone layouts, and asserts that no request leaves the serving origin, Go is never probed, there are no console errors, and the key is not stored. `playwright-core` is a dev dependency for this script only; it downloads no browser.
+- `node scripts/browser-check-rust.mjs [url] [capture-dir]` drives the dashboard with agent-browser against the Rust binary: screens in both themes, unsupported actions disabled, a payload rule written and removed, a YAML diff discarded, 390 px layout, and no key in storage.
 - `node scripts/fake-logins.mjs [port]` serves fake provider login endpoints (Claude, Codex, Meta and xAI token, profile, device-code and key-mint routes) and a Claude usage endpoint that echoes its `Authorization` header. Fake tokens and `@example.invalid` emails only.
 - `scripts/login-harness/` is a test build of cliproxy-rs whose only change is `Options.login_base`, which points every provider login endpoint at the fake. It is never shipped. Build it with `cp ../../../Cargo.lock . && CARGO_TARGET_DIR=../../../target cargo build` inside that directory.
 - `CHROME_PATH=... node scripts/oauth-check.mjs <url> --mode fake` drives Claude and Codex sign-in through a pasted callback URL and Meta and xAI through the device code against the harness, and checks each new credential appears. It then signs the new Claude account in again from Accounts (no new file appears) and tries the same for the fixture account, which the server refuses because the fake signs in as another account; the panel must show that refusal word for word. `--mode dead` runs against the shipped binary with a dead `requests.proxy-url` and checks that a pasted callback ends in an honest failure.
