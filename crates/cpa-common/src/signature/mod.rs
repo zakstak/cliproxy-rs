@@ -2,8 +2,12 @@
 //! a signed reasoning block, and the request sanitizers built on that decision.
 //!
 //! Every validator is a structural check on the signature bytes; nothing here verifies
-//! cryptography. Detection order and envelope rules follow Go exactly because a wrong
-//! claim either drops valid history or replays a foreign signature upstream (400).
+//! cryptography. Detection order and envelope rules are a replay-safety policy: a wrong
+//! claim either drops valid history or replays a foreign signature upstream, which the
+//! provider refuses with a 400. The rules came from CLIProxyAPI and stay because they
+//! classify the envelopes the supported providers issue; tests pin each decision, and a
+//! change to one must keep valid history from a supported provider replayable. Error
+//! text is a diagnostic for logs, not a contract.
 
 use crate::gostr::{GoStr, lower_bytes, trim_space};
 mod claude;
@@ -23,18 +27,19 @@ pub use gpt::*;
 pub use grok::*;
 pub use kimi::*;
 
-/// Go `base64.RawURLEncoding.DecodeString`; `Err` is Go's error text
-/// (`illegal base64 data at input byte N`).
+/// Unpadded URL-safe base64 (RFC 4648 section 5). CR and LF are skipped. `Err` names
+/// the first bad input byte (`illegal base64 data at input byte N`).
 pub fn raw_url_base64_decode(src: &[u8]) -> Result<Vec<u8>, String> {
     wire::RAW_URL.decode(src)
 }
 
-/// Go `base64.StdEncoding.DecodeString`; `Err` is Go's error text.
+/// Padded standard base64 (RFC 4648 section 4). CR and LF are skipped. `Err` names the
+/// first bad input byte.
 pub fn std_base64_decode(src: &[u8]) -> Result<Vec<u8>, String> {
     wire::STD.decode(src)
 }
 
-/// A validation failure. The text matches Go's error string.
+/// A validation failure. The text is a diagnostic, not a stable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
@@ -167,13 +172,13 @@ pub fn provider_from_model_name(model: &str) -> Provider {
 /// GPT Fernet `g`).
 const SELF_DESCRIBING_FIRST_CHARS: &[u8] = b"CEQRg";
 
-/// The alphanumeric base64 core plus `extra`, as Go's `base64AlphabetSet`.
+/// The alphanumeric base64 core plus `extra`.
 pub(crate) fn in_base64_alphabet(b: u8, extra: &[u8]) -> bool {
     b.is_ascii_alphanumeric() || extra.contains(&b)
 }
 
-/// First byte outside the alphabet with the rune Go's `utf8.DecodeRuneInString`
-/// reports there (U+FFFD for an invalid sequence).
+/// First byte outside the alphabet, with the character that starts there (U+FFFD for an
+/// invalid UTF-8 sequence), for the diagnostic.
 pub(crate) fn first_invalid_char(sig: &[u8], extra: &[u8]) -> Option<(usize, u32)> {
     let index = sig.iter().position(|b| !in_base64_alphabet(*b, extra))?;
     let rune = crate::json::decode_rune(&sig[index..]).0.map_or(0xfffd, |c| c as u32);
@@ -435,7 +440,7 @@ fn provider_matches_target(target: Provider, detected: Provider) -> bool {
     }
 }
 
-/// Valid signatures are base64 (plus Go's skipped CR/LF), so they are always ASCII.
+/// Valid signatures are base64 (plus skipped CR and LF), so they are always ASCII.
 pub(crate) fn ascii(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }

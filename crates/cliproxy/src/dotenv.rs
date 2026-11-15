@@ -235,7 +235,10 @@ pub fn load_from_working_dir() {
 mod tests {
     use super::*;
 
-    /// Inputs and results recorded from godotenv.Unmarshal (main_fixture_test.go).
+    /// The `.env` syntax operators use next to `config.yaml`: quoting, comments, `export`,
+    /// `:` separators and expansion of earlier keys. Inputs come from godotenv's fixtures
+    /// (main_fixture_test.go), the library CLIProxyAPI loads `.env` files with, so an
+    /// existing file keeps its values.
     #[test]
     fn dotenv_supports_quoting_comments_prior_key_expansion_and_atomic_refusal() {
         let cases: &[(&str, &[(&str, &str)])] = &[

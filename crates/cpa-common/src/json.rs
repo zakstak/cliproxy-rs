@@ -1,15 +1,29 @@
-//! Go-compatible JSON reading and editing.
+//! Byte-oriented JSON reading and editing for request and response bodies.
 //!
-//! Byte-oriented ports of tidwall/gjson v1.18.0 (reading) and tidwall/sjson v1.2.5
-//! (editing), with Go's encoding/json string and float encoding. CLIProxyAPI builds every
-//! translated body with these two libraries, so matching their quirks is what makes the
-//! output match byte for byte: number coercions (`"12.75"` is 0 as an int), conditional
-//! HTML escaping of set strings, raw copies of malformed bytes, and appends that scan
-//! backward for the last `}`.
+//! The reader and editor started as ports of tidwall/gjson v1.18.0 and tidwall/sjson
+//! v1.2.5, which CLIProxyAPI uses for the same work; the names of many helpers still
+//! cite the Go function they came from. Their behaviour is kept for what the proxy
+//! needs, not for parity with Go:
 //!
-//! Strings are bytes, like Go strings. [`Res::str`] decodes lossily for comparisons;
-//! anything copied into output goes through [`Res::bytes`] or the raw slice so invalid
-//! UTF-8 keeps Go's treatment (raw when copied raw, `\ufffd` when marshaled).
+//! - An edit changes only the bytes of the selected value, or the member or element it
+//!   adds or deletes. Every other span of the document, including number spelling,
+//!   escapes and white space, is copied unchanged, so a passthrough body keeps its bytes
+//!   and an edited one keeps a stable prefix.
+//! - Reading never changes the document, and a read of malformed input returns what it
+//!   can instead of failing, so observers of upstream bytes do not alter what they
+//!   forward.
+//! - Output for a given input is deterministic. Claude request signing and prompt
+//!   caching depend on that, so a change to how an edit writes bytes is a change to
+//!   cache semantics (see AGENTS.md).
+//! - Number coercions (`"12.75"` reads as 0 through [`Res::int`]), HTML escaping of set
+//!   strings, raw copies of malformed bytes and appends that scan backward for the last
+//!   `}` are current behaviour, and the output of existing callers depends on them. They
+//!   are not requirements for new callers: where a typed reading fits, decode with serde
+//!   or [`GoValue`].
+//!
+//! Strings are bytes. [`Res::str`] decodes lossily for comparisons; anything copied into
+//! output goes through [`Res::bytes`] or the raw slice, so invalid UTF-8 stays raw when
+//! copied raw and becomes `\ufffd` when marshaled.
 //!
 //! ponytail: paths cover keys, `\` escapes, `*`/`?` wildcards, indexes, `#`, `#.key` and
 //! `|` pipes and `@this`. gjson queries (`#(...)`), other modifiers (`@reverse`), multipaths
@@ -1712,9 +1726,9 @@ pub fn parse(json: &[u8]) -> Res<'_> {
     Res::default()
 }
 
-/// gjson.Valid.
-/// encoding/json `Valid`: gjson's grammar check plus encoding/json's nesting limit of
-/// 10000 arrays and objects.
+/// [`valid`] plus a nesting limit of 10000 arrays and objects. The limit bounds the depth
+/// that later readers and decoders of an accepted document must handle; encoding/json
+/// uses the same number, so documents accepted by CLIProxyAPI stay accepted.
 pub fn std_valid(data: &[u8]) -> bool {
     if !valid(data) {
         return false;
@@ -3631,7 +3645,7 @@ mod tests {
         String::from_utf8(b).unwrap()
     }
 
-    // Cases carried over from cpa-exec's kimi_json, each checked against sjson.
+    // Inputs first written for cpa-exec's retired kimi_json helper (issue #49).
     #[test]
     fn targeted_setters_create_paths_replace_values_and_keep_unrelated_spans() {
         let input = br#"{ "keep":{"raw":1.2300e+04}, "items":[{"a":1},{"b":2}]}"#;

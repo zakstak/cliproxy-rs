@@ -1925,7 +1925,7 @@ async fn split_sse_events_spend_the_bootstrap_budget() {
     let error = through_sse(&within, true, true).await.expect_err("fails over");
     assert_eq!(error.status, 503, "{error:?}");
     // Each delivered line spends the budget before the next is read, and a handshake may
-    // fill it exactly (outcomes recorded from Go v8.0.35): 47 comments and the overload's
+    // fill it exactly (`BOOTSTRAP_MAX_FRAMES`): 47 comments and the overload's
     // `event:` line are 48 held lines; one comment of raw plus translated bytes equal to
     // 1 MiB is held, so the overload after it fails over.
     let overload_data = SPLIT_OVERLOAD.strip_prefix("event: error\n").unwrap();

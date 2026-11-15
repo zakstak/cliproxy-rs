@@ -1,6 +1,10 @@
-//! A tiny writer for Go `json.Marshal` output of flat structs: fields in declaration
-//! order, HTML-escaped strings, sorted map keys. Home receives these as RESP keys and
-//! payloads; byte parity keeps sizes (in-flight part limits) identical to Go.
+//! A small writer for the flat JSON objects Home receives as RESP keys and payloads:
+//! fields in the order written, `,omitempty` options left out, and map keys sorted.
+//! Home parses them as JSON, so escaping and member order are not wire requirements.
+//! The output for given fields is deterministic, and the in-flight packer measures
+//! these exact bytes against Home's part, revision and count limits
+//! (`inflight::pack`), so a part it sends is the size it checked. Strings are
+//! HTML-escaped, as Go's `json.Marshal` writes them.
 
 use std::collections::BTreeMap;
 
@@ -78,7 +82,7 @@ impl Object {
     }
 }
 
-/// A Go-encoded JSON string.
+/// A JSON string, HTML-escaped.
 pub(crate) fn string_into(out: &mut Vec<u8>, value: &[u8]) {
     cpa_common::json::marshal_str(out, value, true);
 }

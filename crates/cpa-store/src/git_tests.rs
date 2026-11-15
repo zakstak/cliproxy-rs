@@ -1,5 +1,9 @@
-//! Go internal/store/gitstore_test.go cases (M4-0361) against local bare remotes. Each
-//! test names the Go test it mirrors; the expected values are Go's assertions.
+//! Git store behaviour against local bare remotes: branch selection, sync around local
+//! changes, conflict safety and push ordering. Operators share one remote between
+//! nodes, so each expectation is what keeps another node's credentials and config
+//! intact: a sync never overwrites a remote-only change, a conflict fails closed, and a
+//! stale push is rejected. Many cases started from Go's
+//! internal/store/gitstore_test.go (M4-0361); comments name the Go test as provenance.
 //!
 //! Not ported: the go-git handle cases (`TestRecoverRepositoryCloseFailures*`,
 //! `TestInspectRecoveryBaselineFailureClosesRepositoryHandle`, rename-failure

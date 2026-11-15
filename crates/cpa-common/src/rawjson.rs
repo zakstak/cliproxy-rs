@@ -1,23 +1,28 @@
-//! The Go-compatible JSON reader and editor behind `&str` signatures: tidwall/gjson
-//! v1.18.0, tidwall/sjson v1.2.5 and Go encoding/json through [`crate::json`].
+//! The [`crate::json`] reader and editor behind `&str` signatures.
 //!
-//! Claude request rewriting must reproduce Go's bytes exactly: CCH signs the final
-//! body, and prompt caching keys on it. The Codex observers (failure classification,
-//! quota headers, WebSocket bookkeeping, the Images adapter and Alpha Search) and the
-//! shared Responses WebSocket handler read through it too. Reading never changes the
-//! document: callers forward the bytes they inspected.
+//! Claude request rewriting edits through it. CCH signs the final body and prompt
+//! caching keys on its prefix, so for a given request the rewritten bytes must stay
+//! the same from one release to the next: a change to what an edit writes is a cache
+//! semantics change and needs the live cache-read and cache-write check in AGENTS.md.
+//! Matching CLIProxyAPI's bytes is not the requirement; keeping the current, signed and
+//! cached bytes stable is. The Codex observers (failure classification, quota headers,
+//! WebSocket bookkeeping, the Images adapter and Alpha Search) and the shared Responses
+//! WebSocket handler read through it too. Reading never changes the document: callers
+//! forward the bytes they inspected.
 //!
-//! Lookups follow Go's gjson: a path that is missing under the first of duplicate keys
-//! moves on to a later member, a lookup into text that does not start with JSON finds
-//! the first `{` or `[`, numbers format as Go's `Result.String()` does, and `Bool()`,
-//! `Int()` and `Float()` coerce Go's way. [`Value::array`] is Go's `Array()`;
+//! Lookup rules that callers depend on: a path that is missing under the first of
+//! duplicate keys moves on to a later member, a lookup into text that does not start
+//! with JSON finds the first `{` or `[`, [`Value::str`] renders an integer with its
+//! literal digits and another number as its shortest decimal without an exponent, and
+//! `bool()`, `int()` and `float()` coerce as [`crate::json::Res`] does.
+//! [`Value::array`] treats a non-array as a one-element list and null as empty;
 //! [`Value::items`] is the elements of an array and nothing otherwise.
 
 use std::borrow::Cow;
 
 use crate::json::{self, Res};
-/// JSON kinds exposed by the Go-compatible reader. This adapter does not use the
-/// third-party gjson crate.
+/// JSON kinds exposed by the reader. This adapter does not use the third-party gjson
+/// crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Null,
@@ -133,7 +138,7 @@ impl<'a> Value<'a> {
     pub fn array(&self) -> Vec<Value<'a>> {
         let src = self.src();
         if self.kind() != Kind::Array {
-            // Go: nothing for null, else the value itself.
+            // Nothing for null, else the value itself.
             return self.res.array().into_iter().map(|v| Value::new(src, v)).collect();
         }
         let mut n = 0;
@@ -200,7 +205,8 @@ pub fn offset(json: &str, value: &Value<'_>) -> Option<usize> {
     (!raw.is_empty() && start + raw.len() <= json.len() && &json[start..start + raw.len()] == raw).then_some(start)
 }
 
-/// Go's `encoding/json` string marshalling (HTML-escaping, U+2028/9 escaped).
+/// A JSON string with `<`, `>`, `&`, U+2028 and U+2029 escaped, as the existing Claude
+/// rewrites write set strings.
 pub fn go_string(s: &str) -> String {
     marshal(s, true)
 }
@@ -257,6 +263,10 @@ mod tests {
         assert_eq!(get(body, "type").str(), "response.completed");
         assert_eq!(get(body, "n").json(), "9007199254740993");
         assert_eq!(get(body, "fraction").json(), "1.2300e+04");
+        // Text rendering: integer digits as written, other numbers in plain decimal.
+        assert_eq!(get(body, "n").str(), "9007199254740993");
+        assert_eq!(get(body, "fraction").str(), "12300");
+        assert_eq!(get(r#"{"f":1.5e-7}"#, "f").str(), "0.00000015");
         assert_eq!(get(body, "name").str(), "u1");
         assert_eq!(get(body, "name").json(), r#""u\u0031""#);
         assert_eq!(get(body, "items.1.id").str(), "two");

@@ -1,8 +1,11 @@
-//! Go's `bytes.TrimSpace` for the Meta executor. The Codex request helpers
-//! that used to be adapted here are `cpa_common::codex_client` and `crate::codex_tokens`.
+//! White-space trimming over bytes for the Meta and xAI executors. The Codex request
+//! helpers that used to be adapted here are `cpa_common::codex_client` and
+//! `crate::codex_tokens`.
 
-/// Go `bytes.TrimSpace`: leading and trailing runes with `unicode.IsSpace` (the same set as
-/// Rust's `char::is_whitespace`); an invalid UTF-8 sequence is not space and stops trimming.
+/// Trims leading and trailing Unicode white space (`char::is_whitespace`, the
+/// White_Space property) from bytes that may not be UTF-8. An invalid UTF-8 sequence is
+/// not white space and stops trimming, so the bytes kept are never altered. Go's
+/// `bytes.TrimSpace` trims the same set.
 pub(crate) fn go_trim_space(b: &[u8]) -> &[u8] {
     fn rune(b: &[u8]) -> Option<char> {
         std::str::from_utf8(b).ok()?.chars().next()
@@ -39,9 +42,11 @@ pub(crate) fn go_trim_space(b: &[u8]) -> &[u8] {
 mod tests {
     use super::go_trim_space;
 
+    /// ASCII and non-ASCII White_Space characters are trimmed. Control characters outside
+    /// White_Space (U+001C), U+200B and U+180E are kept, and an invalid or truncated
+    /// UTF-8 sequence at an edge stops trimming.
     #[test]
-    fn trim_space_matches_bytes_trim_space() {
-        // Expected values printed by Go 1.26 bytes.TrimSpace for the same inputs.
+    fn trim_space_trims_unicode_white_space_and_stops_at_invalid_utf8() {
         let cases: [(&[u8], &[u8]); 10] = [
             (b" \t\x0b\x0cx\r\n", b"x"),
             ("\u{a0}\u{85}x\u{2028}".as_bytes(), b"x"),

@@ -1,11 +1,10 @@
-//! Adapts Go-shaped stream translators to the [`StreamTranslator`] contract.
+//! Adapts line-based stream translators to the [`StreamTranslator`] contract.
 //!
-//! Go executors read upstream bodies line by line and call the translator per line (or,
-//! for OpenAI-compatible upstreams, per SSE frame). Translators return chunks, which the
-//! client's route handler then frames. Here every framed upstream event is turned back
-//! into the lines the Go executor would have passed, each goes through the Go-shaped
-//! [`GoStream`], and each chunk is framed the way that client's Go handler writes it, so
-//! the bytes returned are the bytes the client receives.
+//! The translators were ported from CLIProxyAPI, where executors read upstream bodies
+//! line by line and call the translator per line. Here every framed upstream event is
+//! split back into those lines, each goes through the line-based [`GoStream`], and each
+//! chunk is framed as a complete event of the client's streaming protocol, so the bytes
+//! returned are the bytes the client receives.
 
 use crate::{Error, StreamTranslator};
 use bytes::Bytes;
@@ -40,14 +39,15 @@ pub(crate) fn scan_lines(event: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
 }
 
-/// How the client's Go handler writes one translator chunk. Go's stream layer drops
-/// empty chunks before any handler sees them (handlers_stream.go).
+/// One translator chunk as client bytes: a Chat Completions chunk becomes a
+/// `data: <chunk>` event, and other clients' chunks are already complete events. An
+/// empty chunk writes nothing.
 pub fn frame(client: Format, chunk: &[u8]) -> Option<Vec<u8>> {
     if chunk.is_empty() {
         return None;
     }
     match client {
-        // openai_handlers.go: `data: %s\n\n`.
+        // Chat Completions streaming: `data: <json>` and a blank line.
         Format::OpenAI => {
             let mut out = Vec::with_capacity(chunk.len() + 8);
             out.extend_from_slice(b"data: ");

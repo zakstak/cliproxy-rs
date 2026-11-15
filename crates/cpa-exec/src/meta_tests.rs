@@ -64,8 +64,8 @@ fn replace_origin(value: &Value, origin: &str, url: &str) -> Value {
     }
 }
 
-/// The credential Go executed with: metadata and attributes exactly as recorded, the
-/// capture server's URL swapped for the Rust mock's.
+/// The fixture's credential: metadata and attributes as the fixture records them, with
+/// the capture server's URL swapped for the local mock's.
 fn meta_credential(fx: &Value, origin: &str, url: &str) -> Credential {
     let metadata = replace_origin(&fx["credential"], origin, url)
         .as_object()

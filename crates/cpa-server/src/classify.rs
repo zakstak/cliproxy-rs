@@ -842,10 +842,10 @@ mod tests {
     }
 
     /// FP2 controls: a failure without a sourced reading, which every other provider's
-    /// executor reports (Claude, xAI, Meta), keeps Go's rules exactly. The same bodies the
-    /// Codex executor reads otherwise stay where Go put them: a 403 rejection code is a
-    /// credential retry round with a cooldown, a context-labelled 5xx is a request fault,
-    /// and Go's own vectors are unchanged.
+    /// executor reports (Claude, xAI, Meta), uses the local fallback policy. Bodies the
+    /// Codex executor reads as terminal rejections stay ordinary failures there: a 403
+    /// rejection code is a credential retry round with a cooldown, and a context-labelled
+    /// 5xx is a request fault.
     #[test]
     // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
     fn unsourced_failures_use_the_local_fallback_policy() {
@@ -867,11 +867,11 @@ mod tests {
                 r#"{"error":{"code":"context_length_exceeded"}}"#,
                 r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded"}}"#,
             ] {
-                assert!(is_request_fault(status, body), "{status} {body}: Go's code rule");
+                assert!(is_request_fault(status, body), "{status} {body}: context code rule");
                 assert!(is_request_invalid(&upstream(status, body)), "{status} {body}");
             }
         }
-        // Go's own vectors, unchanged.
+        // A context or content-policy code on a 400 is a request fault; a bare 503 is not.
         assert!(is_request_fault(
             400,
             r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#

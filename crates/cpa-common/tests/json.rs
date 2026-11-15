@@ -114,8 +114,10 @@ fn number_preserving_decode_keeps_precision_and_rejects_invalid_documents() {
     }
 }
 
+/// A validated document nests at most 10000 arrays and objects; brackets inside strings
+/// do not count.
 #[test]
-fn std_valid_applies_encoding_json_nesting_limit() {
+fn std_valid_refuses_documents_nested_deeper_than_10000() {
     let nested = |n: usize| [vec![b'['; n], vec![b']'; n]].concat();
     assert!(cpa_common::json::std_valid(&nested(10_000)));
     assert!(!cpa_common::json::std_valid(&nested(10_001)));
@@ -123,7 +125,7 @@ fn std_valid_applies_encoding_json_nesting_limit() {
     assert!(!cpa_common::json::std_valid(b"{"));
 }
 
-/// Issue #146: gjson and sjson descend once per path component. A path of more than
+/// Issue #146: reads and edits descend once per path component. A path of more than
 /// `WALK_DEPTH_LIMIT` components is not found and cannot be edited, instead of
 /// overflowing a 2 MiB worker stack; one at the limit still works.
 #[test]

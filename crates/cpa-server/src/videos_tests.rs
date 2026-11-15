@@ -1,5 +1,5 @@
-//! Videos handler tests. The routes are checked against the Go server in
-//! tests/media_go.rs; these cover what the goldens cannot reach in one process run.
+//! Videos handler tests for what one route request cannot reach. Route behaviour is
+//! covered in tests/media_contracts.rs.
 
 use super::*;
 
