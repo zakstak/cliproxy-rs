@@ -1,138 +1,50 @@
 import type { Data } from "./core";
+import type { Format } from "./server";
+import { ApiError, ManagementSession, type Hooks } from "./api-session";
+export { ApiError } from "./api-session";
 
-// The management key lives only in this module's memory. It is never written to storage.
-// Requests go only to the server that served this page: the API sits next to it
-// (/management.html -> /v8/management, also under a reverse-proxy path prefix).
+// /management.html and reverse-proxy prefixes resolve to the same API neighbour.
 export const base = new URL(".", location.href).href.replace(/\/$/, "");
-let key = "";
-let revision = 0;
-let hooks: {
-  unauthorized(): void;
-  missing(method: string, path: string): void;
-  meta(h: Headers | null): void;
-} = { unauthorized() {}, missing() {}, meta() {} };
-
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-    public code: string,
-    public method: string,
-    public path: string,
-  ) {
-    super(message);
-  }
-  /** The server does not implement this route or method (Rust 501/405, Go's empty 404). */
-  get missing() {
-    return this.status === 501 || this.status === 405 || (this.status === 404 && !this.code);
-  }
-}
-
-export function connect(secret: string, h: typeof hooks) {
-  key = secret;
-  hooks = h;
-  revision++;
-}
-export function disconnect() {
-  key = "";
-  revision++;
-}
-export const endpoint = () => `${base}/v8/management`;
+const session = new ManagementSession(base);
+export const connect = (secret: string, hooks: Hooks) => session.connect(secret, hooks);
+export const disconnect = () => session.disconnect();
+export const endpoint = () => session.endpoint;
+export const transport = session.transport;
 export const route = (path: string) => path.split("?")[0];
 
-async function send(path: string, method: string, body?: unknown) {
-  if (!key) throw new Error("Sign in with your management key.");
-  const at = revision;
-  const headers: Record<string, string> = { Authorization: `Bearer ${key}` };
-  const yaml = path === "/config.yaml";
-  if (body !== undefined && !(body instanceof FormData))
-    headers["Content-Type"] = yaml ? "application/yaml" : "application/json";
-  let response: Response;
-  try {
-    response = await fetch(endpoint() + path, {
-      method,
-      headers,
-      body: body === undefined || body instanceof FormData || yaml ? (body as BodyInit) : JSON.stringify(body),
-      signal: AbortSignal.timeout(path.includes("/refresh") ? 300_000 : 30_000),
-      cache: "no-store",
-      redirect: "error",
-    });
-  } catch (e) {
-    if (at === revision) hooks.meta(null);
-    throw new Error(
-      at !== revision
-        ? "Connection changed. Try again."
-        : e instanceof Error && e.name === "TimeoutError"
-          ? "The server did not answer in time."
-          : "Cannot reach the server. Check that cliproxy is still running.",
-    );
-  }
-  if (at !== revision) throw new Error("Connection changed. Try again.");
-  hooks.meta(response.headers);
-  return response;
+export function api(path: string, method?: string, body?: unknown, format?: "json"): Promise<Data>;
+export function api(path: string, method: string, body: unknown, format: "text"): Promise<string>;
+export function api(path: string, method: string, body: unknown, format: "blob"): Promise<Blob>;
+export async function api(path: string, method = "GET", body?: unknown, format: Format = "json"): Promise<unknown> {
+  return (await transport(path, { method, body, format })).body;
 }
-
-export async function api(
-  path: string,
-  method = "GET",
-  body?: unknown,
-  format: "json" | "text" | "blob" = "json",
-): Promise<any> {
-  const at = revision;
-  const response = await send(path, method, body);
-  const ok = response.ok;
-  const value = !ok
-    ? await response.json().catch(() => ({}))
-    : format === "blob"
-      ? await response.blob()
-      : format === "text"
-        ? await response.text()
-        : response.status === 204
-          ? {}
-          : await response.json();
-  // A body that finishes after sign-out or a reconnect belongs to the old session.
-  if (at !== revision) throw new Error("Connection changed. Try again.");
-  if (ok) return value;
-  if (response.status === 401) hooks.unauthorized();
-  const error = new ApiError(
-    String(value.message || value.error || `HTTP ${response.status}`),
-    response.status,
-    String(value.code || value.error || ""),
-    method,
-    route(path),
-  );
-  if (error.missing) {
-    error.message = `Not available on this server (${method} ${route(path)} → ${response.status}).`;
-    hooks.missing(method, route(path));
-  }
-  throw error;
-}
-/** True when the server lacks the route; other errors are real failures. */
 export const missing = (e: unknown) => e instanceof ApiError && e.missing;
-export const text = (e: unknown) => (e instanceof Error ? e.message : String(e));
+export const text = (e: unknown) => e instanceof Error ? e.message : String(e);
 
-/** Asks this proxy for its model list with a client key, as a tool would. No upstream call. */
+/** This proxy's public model list, authenticated with a client key, never a management key.
+ * Redirects are refused so client credentials cannot follow a redirect to another host. */
 export async function clientModels(clientKey: string): Promise<string[]> {
-  const r = await fetch(`${base}/v1/models`, { headers: { Authorization: `Bearer ${clientKey}` }, cache: "no-store" });
+  const r = await fetch(`${base}/v1/models`, { headers: { Authorization: `Bearer ${clientKey}` }, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(30_000) });
   if (r.status === 401) throw new Error("The proxy rejected this key. Check that it is listed under Client keys.");
-  if (!r.ok) throw new Error(`The proxy answered HTTP ${r.status}. Check Logs for the reason.`);
-  return ((await r.json()).data || []).map((m: Data) => String(m.id));
+  if (!r.ok) throw new Error(`The proxy answered HTTP ${r.status}. Check Activity for the reason.`);
+  const body: unknown = await r.json();
+  if (!body || typeof body !== "object" || !("data" in body) || !Array.isArray(body.data)) throw new Error("The server returned an unexpected model list.");
+  return body.data.flatMap((m: unknown) => m && typeof m === "object" && "id" in m && typeof m.id === "string" ? [m.id] : []);
 }
-
-export async function configValue(path: string, fallback: unknown) {
-  try {
-    return await api(path);
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404 && e.code === "not_found") return fallback;
-    throw e;
-  }
-}
-
 export function download(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob),
-    a = document.createElement("a");
+  const url = URL.createObjectURL(blob), a = document.createElement("a");
   a.href = url;
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** Actionable sign-in errors, including a disabled management API. */
+export function signInHelp(e: unknown): string {
+  if (!(e instanceof ApiError)) return text(e);
+  if (e.status === 404 || /key not set/.test(e.message)) return "The management API is off on this server. Set management.secret-key in config.yaml (or start it with MANAGEMENT_PASSWORD), then restart it.";
+  if (/remote management disabled/.test(e.message)) return "This server accepts the dashboard only from its own machine. Open it there, or set management.allow-remote: true in config.yaml with a strong key.";
+  if (/banned/i.test(e.message)) return `${e.message}. Too many wrong keys came from this address.`;
+  if (e.status === 401) return "That key is not right. Use the plain text you set as management.secret-key: the server replaces it in config.yaml with a hash on first start.";
+  return e.message;
 }

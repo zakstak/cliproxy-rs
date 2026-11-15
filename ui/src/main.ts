@@ -1,5 +1,6 @@
 import { mount } from "svelte";
+import "./app.css";
 import App from "./App.svelte";
-import "./style.css";
-
-mount(App, { target: document.getElementById("app")! });
+const target = document.getElementById("app");
+if (!target) throw new Error("index.html has no #app element.");
+mount(App, { target });

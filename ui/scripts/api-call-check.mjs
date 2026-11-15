@@ -1,7 +1,7 @@
 // POST /requests/api-call as the Accounts screen sends it, against fake endpoints only.
 // For each server: pick the fake credential claude-research.json, ask for Claude usage from
 // scripts/fake-logins.mjs (port 9102) with "Authorization: Bearer $TOKEN$", and check that
-// the server substituted the credential's token, returned Go's {status_code, header, body}
+// the server substituted the credential's token, returned the Management API's {status_code, header, body}
 // shape, and that the dashboard's quota parser reads the windows. Servers are compared.
 // Usage: node scripts/api-call-check.mjs <server-base> [<server-base> ...]
 import assert from "node:assert/strict";
