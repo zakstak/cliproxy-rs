@@ -30,7 +30,7 @@ pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Scopes a token refresh asks for: the scopes saved logins were granted with, unchanged
 /// (Go ea0b4712). Claude Code 2.1.322's default refresh scopes (`czt()`) add `user:plugins`,
 /// which a refresh may not add to an existing grant (RFC 6749 section 6); see
-/// docs/parity-audit/claude-code-2.1.322-oauth.md.
+/// crates/cpa-exec/tests/reference/claude/oauth.md.
 pub const REFRESH_SCOPE: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 /// Scopes an authorization asks for: the Console scope `org:create_api_key` ahead of the

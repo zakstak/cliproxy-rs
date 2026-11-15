@@ -252,7 +252,7 @@ mod tests {
     use super::*;
 
     /// The reader semantics the executors and the Responses WebSocket handler rely on
-    /// since the third-party gjson crate was removed (docs/GJSON-MIGRATION.md).
+    /// since the third-party gjson crate was removed.
     #[test]
     fn reads_follow_go_gjson() {
         // The first of duplicate keys wins; a path missing under it moves on to a later

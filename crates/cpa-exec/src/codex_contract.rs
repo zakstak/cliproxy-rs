@@ -19,9 +19,8 @@ use serde::Deserialize;
 /// names a [`Fixture::revision`]. It is the contract authority (`docs/codex/CONTRACT.md`).
 pub const FIRST_PARTY_COMMIT: &str = "44ccf394573cabb95e1f751a59f9d76f6f79faf1";
 
-/// The researched `openai/codex` main commit of the FP1 source refresh (#115,
-/// `docs/codex/FP1-SOURCE-REFRESH.md`). A fixture that cites it is source-refresh
-/// evidence. It does not move the contract pin.
+/// The researched `openai/codex` main commit listed in the fixture manifest.
+/// A fixture that cites it is source-refresh evidence. It does not move the contract pin.
 pub const RESEARCHED_MAIN_COMMIT: &str = "5c3ff1dabf644169f4bd74b215719f381e4fdb3f";
 
 /// What a fixture's content rests on.

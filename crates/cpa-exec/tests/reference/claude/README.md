@@ -7,8 +7,8 @@ holds Go's own executor tests at `6fecc6e`, recorded by `unit/record.py`.
 
 ## Translator commits in the recorded trees
 
-The translators to Claude follow v8.0.35 (`docs/parity-audit/upstream-v8.0.35.md`), and
-Go's executor recordings carry the translated bodies. Each recorded tree is therefore
+The translators in these recordings follow Go v8.0.35, and Go's executor recordings
+carry the translated bodies. Each recorded tree is therefore
 its reference commit with the translator commits that change those bodies
 cherry-picked on top, in a scratch clone (the reference checkout is not modified):
 
@@ -97,9 +97,9 @@ time zone and is recorded per scenario; the replay pins its clock to it.
 
 ## v8.0.27 goldens
 
-The Claude prompt-cache and prompt-shaping fixes this executor follows from v8.0.27
-(see `docs/parity-audit/upstream-v8.0.35.md`) have their own goldens, recorded from a
-v8.0.27 checkout (`bf93416`, with `0d18d3b3` as above) the same way; everything else
+The Claude prompt-cache and prompt-shaping fixes from Go v8.0.27 have their own
+goldens, recorded from a v8.0.27 checkout (`bf93416`, with `0d18d3b3` as above) the
+same way; everything else
 stays on `6fecc6e`.
 
 - `../../../src/claude/testdata/go_executor_v8.0.27.json`: this generator on

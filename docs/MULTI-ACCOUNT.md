@@ -1,17 +1,12 @@
 # Several accounts
 
-This guide covers routing across your own accounts and API keys, for use on your own machines. Do not pool other people's subscriptions. Read [Accounts and provider terms](../README.md#accounts-and-provider-terms). It assumes the proxy is already running ([GETTING-STARTED.md](GETTING-STARTED.md)).
+This guide covers routing across your own accounts and API keys, for use on your own machines. Do not pool other people's subscriptions. Read [Accounts and provider terms](../README.md#accounts-and-provider-terms). It assumes the proxy is already running ([INSTALL.md](INSTALL.md)).
 
 ## Add the accounts
 
 Sign in to each account once, from the dashboard (Connect account) or the command line (`--claude-login`, `--codex-login`). Every sign-in becomes one file in `auth-dir`, and every file is one account in the rotation.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="img/credentials-dark.png">
-  <img src="img/credentials-light.png" alt="The Credentials page: three Claude and two Codex accounts with their state and recent requests" width="880">
-</picture>
-
-The provider's sign-in page uses whatever account your browser is logged into. To add a second Claude account, log out of claude.ai first, or open the sign-in link in a private window or another browser profile; `--no-browser` prints the link instead of opening it. The dashboard's Credentials page lists every account with its state, and lets you disable one without deleting it.
+The provider's sign-in page uses whatever account your browser is logged into. To add a second Claude account, log out of claude.ai first, or open the sign-in link in a private window or another browser profile; `--no-browser` prints the link instead of opening it. The dashboard's Accounts page lists every account with its state, and lets you disable one without deleting it.
 
 ### Sign one account in again
 
@@ -22,7 +17,7 @@ curl -H "Authorization: Bearer $MANAGEMENT_KEY" \
   "http://127.0.0.1:8317/v8/management/oauth/auth-url?name=work-claude.json"
 ```
 
-`name` takes the file name or credential ID shown on the Credentials page, or use `auth_index`. The v0 routes (`anthropic-auth-url`, `codex-auth-url`, `xai-auth-url`, `meta-auth-url`) take the same parameters. `provider` is optional and, when given, must be the account's provider. The answer is the usual sign-in link and `state`; finish the sign-in as for a new account. This works for Claude, Codex, xAI and Muse (`meta`) accounts.
+`name` takes the file name or credential ID shown on the Accounts page, or use `auth_index`. The v0 routes (`anthropic-auth-url`, `codex-auth-url`, `xai-auth-url`, `meta-auth-url`) take the same parameters. `provider` is optional and, when given, must be the account's provider. The answer is the usual sign-in link and `state`; finish the sign-in as for a new account. This works for Claude, Codex, xAI and Muse (`meta`) accounts.
 
 The signed-in account must be the one the file stores (the same account ID, organization or email, where the file records them). The proxy then updates that file in place: it keeps the file name and every setting in it (priority, weight, label, `proxy_url`, `disabled`, a custom `base_url`, a Claude account's device identity and the rest), and replaces the tokens and what the sign-in reports about the account. If the browser signed in to another account, or the file records no account identity to compare with, nothing is saved and the sign-in reports why without naming either account. The sign-in's own requests to the provider go through the account's `proxy_url` (else `requests.proxy-url`), the way its other requests do.
 
@@ -61,7 +56,7 @@ CLIProxyAPI has no `soonest-reset`: it reads that value, and an unset strategy, 
 
 You can change the strategy on the dashboard's Configuration page, or in `config.yaml`.
 
-Each account can also have a `priority` (default 0). The proxy only uses the accounts with the highest priority among those that are ready, and falls back to lower ones when all of those are cooling down or disabled. Set Priority and Weight per account on the dashboard's Credentials page, or as top-level `"priority"` and `"weight"` fields in the account's file.
+Each account can also have a `priority` (default 0). The proxy only uses the accounts with the highest priority among those that are ready, and falls back to lower ones when all of those are cooling down or disabled. Set Priority and Weight per account on the dashboard's Accounts page, or as top-level `"priority"` and `"weight"` fields in the account's file.
 
 ## Session affinity
 
@@ -107,23 +102,18 @@ When a provider answers 429 (too many requests, or a used-up limit), the proxy r
 - A rejected token (401 or 403) rests the account for 30 minutes, and the dashboard marks it "Sign in again" when the sign-in has expired or was revoked.
 - A successful request on the account clears its cooldown for that model.
 
-`routing.retry.request-retry` (default 0) adds rounds over the accounts when every attempt in a round failed, and `routing.retry.max-retry-interval` (seconds, default 0) lets the proxy wait for an account to come out of cooldown instead of failing at once. The Reset cooldown button on the Credentials and Quotas pages clears the proxy's own record only; it does not give back any provider limit.
+`routing.retry.request-retry` (default 0) adds rounds over the accounts when every attempt in a round failed, and `routing.retry.max-retry-interval` (seconds, default 0) lets the proxy wait for an account to come out of cooldown instead of failing at once. The Reset cooldown button on the Accounts page clears the proxy's own record only; it does not give back any provider limit.
 
 The optional [fail over only on 429 preset](CONFIGURATION.md#optional-preset-fail-over-only-on-429) keeps 429 failover for OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses. Credential-preparation failures and an enabled `requests.streaming.bootstrap-retries` can still cause another attempt.
 
 ## Read the quota view
 
-The Quotas page asks each account's provider for its usage when you press Check quota (or Check limits on the Overview). For a Claude account it shows the rows Claude Code's own `/usage` shows:
+The Accounts page asks each account's provider for its usage when you press Check quota (or Check limits on the Overview). For a Claude account it shows the rows Claude Code's own `/usage` shows:
 
 - Current session: the 5-hour window.
 - Current week (all models): the weekly limit.
 - Current week (Fable only), (Opus only) and so on: a separate weekly cap for one model, when the plan has one.
 - Extra usage: paid usage beyond the plan, in dollars, when it is turned on.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="img/quotas-dark.png">
-  <img src="img/quotas-light.png" alt="The Quotas page: Claude session and weekly limits including a Fable-only weekly cap, and Codex 5-hour and weekly limits" width="880">
-</picture>
 
 Each row shows how much is used and when it resets. Codex accounts show their 5-hour and weekly windows. Between checks, the proxy also reads the limit headers that Codex sends with every reply, so the Overview can show Codex limits without a check.
 
@@ -137,7 +127,7 @@ These settings go in the account's file in `auth-dir` (the server reloads it whe
 }
 ```
 
-`proxy_url` sends that account's requests through its own proxy (`http://`, `https://`, `socks5://` or `socks5h://`); `"direct"` skips every proxy. Without it, the account uses `requests.proxy-url` from `config.yaml`. When neither is set, most providers follow the `HTTPS_PROXY` environment variables, while Claude accounts connect directly. For an API key in `config.yaml`, the same setting is `proxy-url` on the key's entry.
+`proxy_url` sends that account's requests through its own proxy (`http://`, `https://`, `socks5://` or `socks5h://`); `"direct"` skips every proxy. Without it, the account uses `requests.proxy-url` from `config.yaml`. When neither is set, Claude accounts and the Codex chatgpt.com transport connect directly; standard transports for other endpoints can inherit environment proxies. For an API key in `config.yaml`, the same setting is `proxy-url` on the key's entry.
 
 Claude request shaping follows CLIProxyAPI's rules. Its default `auto` mode can rewrite system prompts for non-native clients. To turn it off, set `"cloak_mode": "never"` in the account's file, or `oauth.providers.claude.disable-claude-cloak-mode: true` in `config.yaml`. The rewrite does not make using a Claude subscription in another tool permitted; use an API key or a supported cloud provider there.
 
@@ -190,7 +180,7 @@ routing:
     max-retry-interval: 30
 ```
 
-Sign in five times (three Claude accounts, two Codex accounts), then set these fields on the Credentials page, or add them to the files in `~/.cliproxy-rs/auth`:
+Sign in five times (three Claude accounts, two Codex accounts), then set these fields on the Accounts page, or add them to the files in `~/.cliproxy-rs/auth`:
 
 | Account file | Fields | Why |
 |---|---|---|

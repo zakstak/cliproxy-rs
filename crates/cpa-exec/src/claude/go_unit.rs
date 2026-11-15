@@ -1,7 +1,7 @@
 //! Go's own Claude unit tests, replayed. tests/reference/claude/unit/record.py runs the
 //! Go test files of CLIProxyAPI 6fecc6e with recording wrappers around the functions
 //! they test; every recorded call (inputs and Go's outputs) is replayed here through
-//! the Rust port. One test per Go file, named after its PARITY.md item; a failure lists
+//! the Rust port. One test per Go file, named after its original audit item; a failure lists
 //! every diverging call with the Go test that made it. The Claude prompt-cache and
 //! prompt-shaping fixes this executor follows from v8.0.27 are replayed from Go's tests
 //! at v8.0.27 the same way (`v8_0_27_*`).

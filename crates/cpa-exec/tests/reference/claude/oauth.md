@@ -1,10 +1,8 @@
-# Claude Code 2.1.322 OAuth authorization and refresh
+# Claude OAuth source evidence
 
-Evidence for [#76](https://github.com/zakstak/cliproxy-rs/issues/76) (C8): the OAuth `state`,
-the authorization scopes and the refresh scopes that the first-party Claude Code client uses.
-It moves neither the frozen Go v8.0.35 reference nor the
-[selective v8.0.67 ledger](selective-v8.0.67.md). It reads the client itself, which the
-provider-first rule in `AGENTS.md` puts ahead of Go.
+Source evidence for the authorization scopes, refresh scopes, and OAuth state in
+`crates/cpa-exec/src/oauth.rs`. The provider-first compatibility policy in
+[AGENTS.md](../../../../../AGENTS.md) applies.
 
 ## Provenance
 

@@ -14,9 +14,9 @@
 //! over HTTP, the routed `model` for an alias. Every upstream request also carries only
 //! the credential's own token: no client key or client cookie crosses the proxy.
 //!
-//! The per-feature tests stay with the PRs that own them; docs/codex/QUALIFICATION.md
-//! maps each acceptance item to its tests. Loopback upstreams, fake tokens and a private
-//! `auth-dir` only.
+//! Per-feature tests cover the native HTTP, WebSocket, translated and identity rules
+//! in docs/codex/CONTRACT.md. Loopback upstreams, fake tokens and a private `auth-dir`
+//! only.
 
 use std::path::Path;
 use std::sync::Arc;

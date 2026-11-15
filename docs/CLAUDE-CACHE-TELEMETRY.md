@@ -123,8 +123,7 @@ Work is linear in body size, with a bounded lookback ring. Tokenization and the
 tokenizer's resident allocation are absent. The observation copy and hashing are
 skipped unless both usage collection and the separate telemetry opt-in are enabled.
 Collection still parses and hashes the final payload synchronously before sending;
-large bodies can delay async workers. Use the mock load check below before enabling
-collection on a constrained host.
+large bodies can delay async workers.
 
 Restarts rotate every fingerprint and identity. Do not interpret a hash change
 across a restart as a prompt change or cold-cache proof. Restart boundaries cannot
@@ -227,8 +226,8 @@ happen.
 ## Deployment boundary
 
 Mock-upstream tests verify both response modes, privacy of the additions, final
-TTLs, and byte-identical traffic with telemetry on and off. CI also runs the
-network-free replay fixtures. A week of new production telemetry is still needed
+TTLs, and byte-identical traffic with telemetry on and off. Run the network-free
+replay fixtures locally with `python3 tools/claude-cache/test_replay.py`. A week of production telemetry is needed
 before choosing a TTL or evaluating a maintenance policy. Publishing a release
 or replacing Core's running proxy requires Vayun's explicit approval. No live
 Claude login is exercised by these tests.

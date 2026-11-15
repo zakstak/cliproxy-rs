@@ -1,14 +1,14 @@
 # Moving from CLIProxyAPI (Go) to cliproxy-rs
 
-cliproxy-rs follows CLIProxyAPI at commit `6fecc6e` (v8.0.10). It reads the same files, so switching is a matter of stopping one binary and starting the other on the same config. This page lists what carries over, what does not, and how to switch back.
+cliproxy-rs reads CLIProxyAPI configuration and credential files for Claude, Codex, xAI, and Meta. The last Go reference snapshot is v8.0.35 (`ae3ee3be303f`); provider sources and the [Codex contract](codex/CONTRACT.md) decide provider behaviour. This page covers switching servers, settings to remove, and switching back.
 
 ## What carries over
 
-- `config.yaml`. The v8 layout and the older flat layout (top-level `port`, `auth-dir`, an `api-keys` list, `remote-management`) are both read. Every v8 setting is accepted except `plugins` and the settings of the removed providers, including settings for features cliproxy-rs does not have yet (listed below); those are kept in the file but have no effect. A config with a `plugins` section fails to load: see [Native plugins](#native-plugins). A config that configures a removed provider fails to load with migration guidance: see [Removed providers](DIFFERENCES-FROM-GO.md#removed-providers).
+- `config.yaml`. The v8 layout and the older flat layout (top-level `port`, `auth-dir`, an `api-keys` list, `remote-management`) are both read. Remove [native plugin settings](#native-plugins), [removed provider settings](DIFFERENCES-FROM-GO.md#removed-providers), and the [refused Codex settings](#additions) before switching.
 - Credential files in `oauth.auth-dir` (default `~/.cli-proxy-api`). Claude, Codex, Meta and xAI files are used as they are. Files of the providers this fork removed (Antigravity, Kimi, Devin, Gemini, Vertex, AI Studio) stay on disk unchanged but are not loaded; each scan logs a warning naming the file ([Removed providers](DIFFERENCES-FROM-GO.md#removed-providers)).
 - The hashed management key. Go and cliproxy-rs both hash a plaintext `management.secret-key` with bcrypt on start and write the hash back, and each accepts the other's hash.
 - Client keys in `access.api-keys`, provider keys under `api-keys` for Claude, Codex, xAI and Meta, model aliases and exclusions, payload rules, proxies, routing strategy, retries and cooldowns. A config that sets a removed provider's keys or settings (`openai-compatibility`, `gemini-api-key`, `vertex-api-key`, `antigravity`, `ws-auth: true`, ...) does not load until they are removed; the error names each one.
-- The client routes (`/v1/...`, `/v1beta/...`, `/backend-api/codex/...`) and the Responses WebSocket, so clients need no changes.
+- The retained OpenAI and Anthropic client routes (`/v1/...`, `/backend-api/codex/...`) and the Responses WebSocket. Gemini routes under `/v1beta/...` return `410 Gone`.
 - The v8 Management API at `/v8/management`, apart from the gaps below, and the dashboard at `/management.html`.
 
 When a setting is changed through the dashboard or the Management API, cliproxy-rs edits only that key and keeps the rest of the text and its comments. As in Go, that first write also converts a flat legacy config to the v8 layout and moves keys that are not v8 settings into comments instead of deleting them. The dashboard's raw editor saves the text you submit.
@@ -19,7 +19,7 @@ The way back works too. In our tests against fake sign-in servers, Go 6fecc6e li
 
 1. Stop the Go server.
 2. Back up `config.yaml` and the credential directory. They hold OAuth refresh tokens, so keep the backup private.
-3. Check your command line against the flag list below. A few Go modes are not available yet, and cliproxy-rs exits with an error instead of starting without them. Remove any `plugins` section from `config.yaml` ([Native plugins](#native-plugins)).
+3. Check your command line against the flag list below. Removed provider modes exit with a migration error. Remove any `plugins` section from `config.yaml` ([Native plugins](#native-plugins)) and the refused settings listed above.
 4. Start cliproxy-rs with the same config: `cliproxy --config /path/to/config.yaml`.
 5. Open `/management.html` and check that your credentials are listed and healthy, then send a test request with one of your client keys.
 
@@ -33,13 +33,13 @@ cliproxy-rs accepts every CLIProxyAPI flag, in Go's single-dash spelling (`-conf
 
 `-tui` and `-tui -standalone` open the terminal UI as in Go, with the differences listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
-## Not available yet
+## Dashboard and profiling
 
-These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs does not act on them yet, or only in part:
+These features differ from Go:
 
 | Go setting or feature | In cliproxy-rs |
 | --- | --- |
-| `pprof` | No profiling endpoint. |
+| `pprof` | Optional debug listener. CPU profiling needs the `cpa-server/pprof` build feature; Go runtime profiles return `501`. See [Configuration](CONFIGURATION.md#observability). |
 | `management.panel-github-repository`, `management.disable-auto-update-panel`, `MANAGEMENT_STATIC_PATH` | The dashboard is built into the binary and never downloaded or read from disk. `management.disable-control-panel` is honoured. |
 | Config reload log summaries | The config is reloaded, but the changes are not summarised in the log. |
 
@@ -49,12 +49,12 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 
 The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs and model definitions behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Meta and xAI. Sign-in for Antigravity, Kimi and Devin, the Vertex import (`oauth/import?provider=vertex`, `/v0/management/vertex/import`) and the v0 `gemini-api-key`, `interactions-api-key`, `vertex-api-key` and `openai-compatibility` lists answer 410 with top-level `code: "removed_provider"` and migration guidance in `error`.
 
-Not available on cliproxy-rs:
+Operator-visible differences:
 
-- `server/latest-version` answers `502` with "no release repository is configured" because cliproxy-rs doesn't check for its own releases yet. Go asks GitHub for the latest CLIProxyAPI release.
+- `server/latest-version` checks the upstream Rust project's latest release on request and caches successful results for 12 hours. It does not identify a fork release or install anything. `CLIPROXY_NO_UPDATE_CHECK=1` disables it with `503 update_check_disabled`.
 - The plugin, plugin store and plugin quota routes answer `410` ([Native plugins](#native-plugins)).
 
-The bundled dashboard checks which server it is talking to and marks these features as not available instead of failing.
+The bundled dashboard checks which server it is talking to and disables unavailable actions.
 
 ## Differences from Go
 
@@ -98,4 +98,4 @@ Stop cliproxy-rs and start Go on the same config and credential directory. Crede
 
 ## Details
 
-[PARITY.md](PARITY.md) sums up what works and links the item-by-item audit of every route, setting, flag and Go test suite.
+[DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md) records operator-visible differences. The [Codex contract](codex/CONTRACT.md) defines supported transformations and endpoint-specific limits.
