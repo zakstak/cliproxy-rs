@@ -1,0 +1,16 @@
+[package]
+name = "ledger-sandbox"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ledger-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

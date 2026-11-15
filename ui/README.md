@@ -2,6 +2,8 @@
 
 Ledger is the primary dashboard. Svelte 5 renders the interface, Effect handles typed API operations, and Tailwind 4 generates layout utilities at build time. The Rust binary embeds the checked-in `dist/` directory and serves `/management.html`. The former dashboard and the separate prototype are removed.
 
+An isolated [Leptos prototype](leptos/README.md) implements Activity and configuration editing with a fixture-only Rust server. Run it separately to evaluate a Rust frontend. It does not replace Ledger or connect to a running proxy.
+
 ## Development
 
 Requires Node 22.12 or newer.
