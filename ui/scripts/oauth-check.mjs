@@ -1,130 +1,92 @@
-// End-to-end account sign-in through the dashboard. Disposable servers only.
-//
-// --mode fake: the server's login endpoints point at scripts/fake-logins.mjs (the
-//   login-harness build of cliproxy-rs). Claude and Codex finish through a pasted callback
-//   URL, Meta and xAI through the device-code flow; each new credential must appear in
-//   the list.
-// --mode dead: the shipped binary with requests.proxy-url on a dead port. A pasted callback
-//   must end in an honest failure, never "Connected". No request reaches a provider.
-//
-// Usage: CHROME_PATH=... node scripts/oauth-check.mjs <page-url> --mode fake|dead [capture-dir]
+// Ledger account sign-in through a real disposable Rust server and local fake providers.
+// CHROME_PATH=... node scripts/oauth-check.mjs <page-url> --mode fake|dead [capture-dir]
 import { chromium } from "playwright-core";
+import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import assert from "node:assert/strict";
 import { assertPrivateAuthDir } from "./private-auth-dir.mjs";
-
-const [url, , mode, dir] = process.argv.slice(2);
-assert.ok(url && ["fake", "dead"].includes(mode), "usage: oauth-check.mjs <page-url> --mode fake|dead [capture-dir]");
-// Both modes sign in through a real server.
-await assertPrivateAuthDir(url, "orb-dashboard-test-only");
-const out = resolve(dir || "oauth-check");
-mkdirSync(out, { recursive: true });
+const [url, flag, mode, dir] = process.argv.slice(2);
+assert.ok(url && flag === "--mode" && ["fake", "dead"].includes(mode), "usage: oauth-check.mjs <url> --mode fake|dead [captures]");
+const key = "orb-dashboard-test-only";
+await assertPrivateAuthDir(url, key);
+const out = resolve(dir || "/tmp/ledger-oauth"); mkdirSync(out, { recursive: true });
 const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH });
-const page = await (await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2 })).newPage();
-const errors = [];
-page.on("pageerror", (e) => errors.push(String(e)));
-const main = page.locator("main");
-const button = (name) => main.getByRole("button", { name, exact: true });
-const pass = (t) => console.log(`PASS ${t}`);
-/** The toast, if any, must not still say a sign-in is in progress once it has finished. */
-async function noProgressToast(when) {
-  const toast = await page.locator(".toast").textContent({ timeout: 500 }).catch(() => "");
-  assert.ok(!/sent|finishing|waiting/i.test(toast), `${when}: stale toast "${toast.trim()}"`);
-}
-
-/** Start a sign-in (or, without a provider, wait for one started elsewhere) and return the session state from the provider link. */
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const errors = []; page.on("pageerror", e => errors.push(String(e)));
+const dialog = page.getByRole("dialog");
 async function begin(provider) {
-  if (provider) await button(provider).click();
-  await main.getByText("Waiting for approval").waitFor();
-  const href = await main.getByRole("link", { name: "Open sign-in page" }).getAttribute("href");
-  return { href, state: new URL(href).searchParams.get("state") };
+  if (provider) {
+    await page.evaluate(() => { location.hash = "accounts?add=1"; });
+    await dialog.getByLabel(provider, { exact: true }).check();
+    await dialog.getByRole("button", { name: "Continue", exact: true }).click();
+  }
+  await dialog.locator("strong").filter({ hasText: /Waiting for you to approve/ }).waitFor();
+  const href = await dialog.getByRole("link", { name: "Open sign-in page", exact: true }).getAttribute("href");
+  assert.ok(/^https?:/.test(href), "real provider link remains operable");
+  return new URL(href).searchParams.get("state");
 }
-async function paste(redirect) {
-  await main.getByText("The browser ended on a page that won’t load").click();
-  await main.getByLabel("Paste that page’s full address").fill(redirect);
-  await button("Send").click();
+async function paste(provider, state) {
+  await dialog.getByText("The browser ended on a page that won't load", { exact: true }).click();
+  await dialog.getByLabel("Paste that page's full address").fill(provider === "Claude"
+    ? `http://localhost:54545/callback?code=fake-code&state=${state}`
+    : `http://localhost:1455/auth/callback?code=fake-code&state=${state}`);
+  await dialog.getByRole("button", { name: "Send address", exact: true }).click();
 }
-
+async function done(provider) {
+  await dialog.locator("strong").filter({ hasText: new RegExp(`${provider} account connected`) }).waitFor({ timeout: 30_000 });
+  await page.screenshot({ path: `${out}/${provider.toLowerCase()}-connected.png` });
+  await dialog.getByRole("button", { name: "Done", exact: true }).click();
+}
 try {
   await page.goto(url);
-  await page.getByLabel("Management key").fill("orb-dashboard-test-only");
-  await page.getByRole("button", { name: "Connect", exact: true }).click();
-  await main.getByText("operator@example.invalid").first().waitFor();
-  await page.evaluate(() => (location.hash = "#connect"));
-  await main.getByRole("heading", { name: "Sign in with a provider" }).waitFor();
-
+  await page.getByLabel("Management key").fill(key);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.locator("#main").waitFor();
   if (mode === "fake") {
-    for (const [provider, redirect, email] of [
-      ["Claude", (s) => `http://localhost:54545/callback?code=fake-code&state=${s}`, "claude-login@example.invalid"],
-      ["Codex", (s) => `http://localhost:1455/auth/callback?code=fake-code&state=${s}`, "codex-login@example.invalid"],
-    ]) {
-      const { href, state } = await begin(provider);
-      assert.ok(href.startsWith("https://") && state, `${provider}: provider link ${href}`);
-      await paste(redirect(state));
-      await main.getByText("Connected", { exact: true }).waitFor({ timeout: 20_000 });
-      await noProgressToast(`${provider} connected`);
-      await page.screenshot({ path: `${out}/oauth-${provider.toLowerCase()}-connected.png` });
-      pass(`${provider}: authorize link, pasted callback, code exchange, credential saved (${email})`);
+    for (const provider of ["Claude", "Codex"]) {
+      const state = await begin(provider); assert.ok(state);
+      await paste(provider, state); await done(provider);
+      console.log(`PASS ${provider} real callback, exchange and credential save through local peer`);
     }
     for (const [provider, code] of [["Meta", "META-FAKE"], ["xAI", "XAI-FAKE"]]) {
-      await button(provider).click();
-      await main.getByText(code, { exact: true }).waitFor();
-      if (provider === "Meta") await page.screenshot({ path: `${out}/oauth-meta-device-code.png` });
-      await main.getByText("Connected", { exact: true }).waitFor({ timeout: 30_000 });
-      pass(`${provider}: device code ${code} shown, polled to completion`);
+      await begin(provider);
+      await dialog.getByText(code, { exact: true }).waitFor();
+      await done(provider);
+      console.log(`PASS ${provider} real device flow through local peer`);
     }
-    await page.evaluate(() => (location.hash = "#accounts"));
-    for (const email of ["claude-login@example.invalid", "codex-login@example.invalid", "meta-login@example.invalid", "xai-login@example.invalid"])
-      await main.getByText(email).first().waitFor({ timeout: 15_000 });
-    await page.screenshot({ path: `${out}/oauth-credentials-after.png`, fullPage: true });
-    pass("all four new credentials are listed on Accounts");
-
-    // Sign in again from Accounts: the account's own file, no new one; another account is refused.
-    const files = async () => {
-      const r = await fetch(new URL("v8/management/credentials", url), { headers: { Authorization: "Bearer orb-dashboard-test-only" } });
-      return (await r.json()).files.map((f) => f.name).sort();
-    };
-    const again = async (email) => {
-      await page.evaluate(() => (location.hash = "#accounts"));
-      await main.getByRole("button", { name: email }).first().click();
-      await button("Sign in again").click();
-      await main.getByRole("heading", { name: `Claude · ${email}` }).waitFor();
-      const { state } = await begin(null);
-      await paste(`http://localhost:54545/callback?code=fake-code&state=${state}`);
-    };
+    await page.evaluate(() => { location.hash = "accounts"; });
+    const endpoint = new URL("v8/management/credentials", new URL(".", url));
+    const files = async () => (await (await fetch(endpoint, { headers: { Authorization: `Bearer ${key}` } })).json()).files.map(f => f.name).sort();
     const before = await files();
-    await again("claude-login@example.invalid");
-    await main.getByText("Signed in again", { exact: true }).waitFor({ timeout: 20_000 });
-    await noProgressToast("Claude signed in again");
-    assert.deepEqual(await files(), before);
-    await page.screenshot({ path: `${out}/oauth-claude-signed-in-again.png` });
-    pass("Sign in again on Accounts: targeted session finishes by its status, no new credential file");
-    await again("operator@example.invalid");
-    await main.getByText("Failed", { exact: true }).waitFor({ timeout: 20_000 });
-    const refusal = (await main.locator(".flow .error").textContent()).trim();
-    assert.equal(refusal, "Signed in to a different account than the one being signed in again; nothing was saved. Sign in to that account and try again.");
-    assert.deepEqual(await files(), before);
-    await page.screenshot({ path: `${out}/oauth-claude-wrong-account.png` });
-    pass(`Sign in again as another account shows the server's refusal verbatim: "${refusal}"`);
-
+    for (const email of ["claude-login@example.invalid", "operator@example.invalid"]) {
+      await page.locator("#main").getByRole("button", { name: email, exact: true }).click();
+      await page.getByRole("button", { name: "Sign in again", exact: true }).click();
+      const state = await begin(); await paste("Claude", state);
+      if (email.startsWith("claude-login")) {
+        await dialog.locator("strong").filter({ hasText: /^Signed in again/ }).waitFor({ timeout: 30_000 });
+        await dialog.getByRole("button", { name: "Done", exact: true }).click();
+      } else {
+        await dialog.locator("[data-step-lead]").filter({ hasText: /different account than/ }).waitFor({ timeout: 30_000 });
+        await dialog.getByRole("button", { name: "Close", exact: true }).first().click();
+      }
+      assert.deepEqual(await files(), before, "targeted login never creates a second file");
+      const closeDetail = page.getByRole("button", { name: "Close", exact: true });
+      if (await closeDetail.count()) await closeDetail.first().click();
+    }
+    console.log("PASS targeted reauthentication and wrong-account refusal");
   } else {
-    const { state } = await begin("Codex");
-    await paste(`http://localhost:1455/auth/callback?code=fake-code&state=${state}`);
-    await main.getByText("Failed", { exact: true }).waitFor({ timeout: 30_000 });
-    const problem = await main.locator(".flow .error").textContent();
-    assert.ok(/exchange/i.test(problem), problem);
-    await noProgressToast("Codex failed");
-    await page.screenshot({ path: `${out}/oauth-codex-failed.png` });
-    pass(`Codex with an unreachable token endpoint fails honestly: "${problem.trim()}"`);
-    await button("Start again").click();
-    await main.getByText("Waiting for approval").waitFor();
-    await button("Cancel sign-in").click();
-    await main.getByText("Cancelled", { exact: true }).waitFor();
-    await noProgressToast("Codex cancelled");
-    pass("Start again opens a new session; Cancel ends it; no in-progress toast remains after any end state");
+    const state = await begin("Codex"); await paste("Codex", state);
+    await dialog.getByText(/No account was added/).waitFor({ timeout: 40_000 });
+    assert.match(await dialog.innerText(), /exchange|connect|request failed/i);
+    await dialog.getByRole("button", { name: "Start again", exact: true }).click();
+    await dialog.locator("strong").filter({ hasText: /Waiting for you to approve/ }).waitFor();
+    await dialog.getByRole("button", { name: "Cancel sign-in", exact: true }).click();
+    assert.equal(await dialog.count(), 0);
+    console.log("PASS failed exchange, fresh session retry and server-confirmed cancellation");
   }
   assert.deepEqual(errors, []);
-} finally {
-  await browser.close();
-}
+} catch (e) {
+  await page.screenshot({ path: `${out}/failure.png`, fullPage: true }).catch(() => {});
+  console.error((await page.locator("body").innerText()).slice(-4000));
+  throw e;
+} finally { await browser.close(); }

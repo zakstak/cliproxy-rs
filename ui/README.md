@@ -1,83 +1,70 @@
 # cliproxy-rs dashboard
 
-The management dashboard for cliproxy-rs, written in Svelte 5 with plain CSS. It talks to the v8 Management API. The Rust binary embeds `dist/` through `crates/cpa-server/build.rs` and serves the dashboard at `/management.html`.
+Ledger is the primary dashboard. Svelte 5 renders the interface, Effect handles typed API operations, and Tailwind 4 generates layout utilities at build time. The Rust binary embeds the checked-in `dist/` directory and serves `/management.html`. The former dashboard and the separate prototype are removed.
 
-The visual system is in [DESIGN.md](DESIGN.md). Every read shows loading, empty, error, not available, or data. Keep management keys in memory, preserve keyboard access and visible focus, and respect reduced motion in both themes.
-
-## Commands
+## Development
 
 Requires Node 22.12 or newer.
 
 ```sh
 npm ci
-npm run dev      # Vite on :5173, proxies /v8 to 127.0.0.1:8317 (override with CPA_BACKEND=...)
-npm run check    # svelte-check, 0 errors and 0 warnings expected
-npm test         # unit tests for src/core.ts
-npm run build    # dist/ for the Rust binary
+CPA_BACKEND=http://127.0.0.1:8347 npm run dev
+npm run check
+npm test
+npm run build
 ```
 
-`npm run build` runs `vite build`, then `scripts/build.mjs` to copy `dist/index.html` to `dist/management.html`, the path the Rust server serves. JavaScript, CSS, fonts, and icons stay as separate files in `dist/`. The bundle has no size budget ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)).
+Vite binds to loopback on port 5173. It proxies `/v8`, `/v1` and `/healthz` to `CPA_BACKEND` (default `http://127.0.0.1:8317`). Point it at a disposable server when experimenting: the dashboard edits that server's configuration and credentials.
 
-Rebuild the UI before compiling Rust when UI sources change; `ui/dist` is checked in and embedded at compile time.
+`npm run build` builds Ledger and copies `dist/index.html` to `dist/management.html`. Rebuild the UI before compiling Rust; `crates/cpa-server/build.rs` embeds those assets. Fonts and icons are local. Effect is the only additional runtime dependency; Tailwind and Vite are build tools.
 
-## Structure
+## Safe sandbox verification
 
-| Path | Role |
+Use a test binary, a private auth directory and a loopback-only network namespace. Never use `~/.cli-proxy-api` or real provider credentials for tests. `sandbox-check.mjs` creates a fresh directory under the system temp directory and starts a server with disabled fake OAuth credentials and a fake provider API key. It also starts a local mock upstream for a request that must appear in Activity.
+
+After building the UI and the Rust binary, run from `ui/`:
+
+```sh
+CHROME_PATH=/absolute/path/to/chrome scripts/isolated.sh \
+  'node scripts/sandbox-check.mjs /absolute/path/to/cliproxy /tmp/ledger-captures'
+```
+
+`isolated.sh` denies external networking and leaves loopback available to the server and browser. The harness stops its server after the check. It keeps the disposable config and captures for inspection. It does not install, deploy or replace a running proxy.
+
+For a disposable server you already started:
+
+```sh
+CHROME_PATH=/absolute/path/to/chrome node scripts/browser-check-rust.mjs \
+  http://127.0.0.1:8347/management.html /tmp/ledger-captures
+```
+
+The browser script verifies the private auth directory before writing anything. Its fixture uses management key `orb-dashboard-test-only`, a disabled account named `operator@example.invalid`, a client key, and `routing.retry.request-retry: 3`. It checks all screens in both themes at desktop, tablet and phone widths, real config writes with `If-Match`, YAML parsing, conflict protection, drafts, client-key model checks and keyboard detail focus.
+
+Add `--oauth` to the sandbox command and pass the `login-harness` binary to run the local sign-in checks instead. Build it with `cargo build --manifest-path scripts/login-harness/Cargo.toml` from `ui/`.
+
+`oauth-check.mjs` exercises sign-in against the local provider endpoints in `fake-logins.mjs`, using the non-shipped `login-harness/` Rust binary. Its runtime denies nonlocal provider traffic. These tests prove local protocol flows; they do not prove real provider approval, screen-reader output or physical touch.
+
+## Source layout
+
+| Path | Responsibility |
 | --- | --- |
-| `src/api.ts` | Fetch wrapper. Holds the management key in memory and reports unimplemented routes (Go-style empty 404, 501, 405). |
-| `src/store.svelte.ts` | Shared state: session, server kind from version headers, config, credentials, capabilities, toasts, writes with stale checks. |
-| `src/core.ts` | Pure helpers: credential state, traffic buckets, usage records, quota windows, diffs. Tested in `src/core.test.ts`. |
-| `src/Load.svelte` | Loading, error, not-available and data states for one read. |
-| `src/Missing.svelte` | One line naming actions this server does not implement. |
-| `src/Grille.svelte` | The 20-bucket traffic grille. |
-| `src/Editor.svelte` | JSON or YAML editor with a reviewed diff and a reread before writing. |
-| `src/pages/*.svelte` | One component per screen. |
+| `src/api-session.ts`, `src/api.ts` | Same-server authentication, response formats, ETags, cancellation, session lifetime and client-key model checks |
+| `src/server.ts` | Effect operations, typed failures and immutable reviewed config writes |
+| `src/app.svelte.ts`, `src/latest.ts` | Session, navigation, retained data, polling and current-read coordination |
+| `src/screens/` | Activity, Usage, Accounts, Tools and Settings |
+| `src/parts/` | Details, charts, setup, account sign-in and the configuration editor |
+| `src/draft.ts`, `src/diff.ts` | Draft history, multi-hunk review and conflict reconciliation |
+| `src/core.ts`, `src/records.ts`, `src/observe.ts`, `src/batch.ts` | Data parsing, account state, watched-time metrics and partial batch results |
+| `src/app.css` | Theme tokens and shared components; Tailwind uses these tokens for layout utilities |
 
-## Honest states
+## API and state
 
-Every read renders loading, empty, error, not available, or data. The server kind comes from response headers: cliproxy-rs sends `X-CPA-VERSION: cliproxy-rs-<version>`; Go sends its version with `X-CPA-COMMIT` and `X-CPA-BUILD-DATE`. Go implements the whole v8 API, so it is never probed.
+The management key stays in memory. Reloading or signing out drops it. API calls resolve beside the page, including under a reverse-proxy prefix, and refuse redirects. Sign-out aborts outstanding management calls and rejects late responses from the old session. A rejected key returns to sign-in. Theme choice is kept in browser storage; drafts and watched requests stay in the tab's memory.
 
-Other servers are probed once per session for the write actions a screen offers. A route that does not exist answers with gin's empty 404 (or 501/405), and the UI cannot tell that apart from a real route without asking, because `OPTIONS` returns 204 everywhere. Each probe is therefore a request Go rejects with 400 during input validation, before any side effect: an empty JSON body to `POST /credentials`, `POST /credentials/refresh`, `PATCH /credentials/fields`, `DELETE /credentials`, `POST /routing/cooldown/reset`, `POST /requests/api-call` and `POST /oauth/import`; `GET /oauth/auth-url` without a provider. Each was checked against Go 6fecc6e to return 400 with the auth directory and config unchanged. The live usage feed is a cliproxy-rs route, probed with `GET /observability/usage/live?count=0`, which cliproxy-rs rejects with 400 before reading the feed. Actions whose probe meets an empty 404 render disabled and are named in one line; reads the server lacks show "Not available on this server" with the route and status code. `DELETE /observability/logs` cannot be probed safely, so Clear is disabled when the log read is unavailable and otherwise marks itself off after a first empty 404.
+Activity starts watching `/observability/usage/live` after sign-in. It reads by cursor without consuming the collector queue, keeps the last hour or 2,000 records, and labels observation gaps. Rates use time actually watched. Config keys are joined by their server-assigned `auth_index` with `/observability/usage/api-keys`; the credential-file endpoint omits them. Their runtime health is labelled unknown. There is no group-disable toggle because the server does not implement it. Accounts refresh every ten seconds while visible; live activity and server logs refresh every three seconds without overlapping reads. Usage shows the server's twenty ten-minute request buckets, with unknown counts distinguished from zero.
 
-Traffic comes from `recent_requests` in `GET /credentials` and `GET /observability/usage/api-keys` (twenty 10-minute buckets, reported by the server). The live usage view pages through `GET /observability/usage/live` by cursor. That feed copies usage records without removing them, so collectors that read the usage queue and other dashboard tabs still get every record. The view starts on a button, shows only requests that arrive after it starts, and keeps events in the tab only: the last hour, at most 2,000. If the tab falls behind, or is hidden for longer than a minute while no other viewer reads, the server reports a gap and the view says that some requests were missed. Go CLIProxyAPI has no such feed and is never probed, so the dashboard treats the route as missing there: the button is disabled and the page names the live request view as not available.
+Limit checks call `/requests/api-call` only after an explicit user action or account sign-in, one account at a time and at most once per account every two minutes. Failed reads retain the last good limits. Adding an account uses `/oauth/auth-url`, `/oauth/status`, `/oauth/callback` and `/oauth/session`; provider approval happens on the provider's page. No simulated approval or fixture controls ship in the dashboard.
 
-## Endpoints
+Config writes capture the target, original value and proposed value when reviewed. They reread and compare, then send the server's ETag in `If-Match`. The Rust server checks that version while saving and rejects stale writes with HTTP 412. Only a race involving an unrelated change is rechecked automatically; target changes require reconciliation. An unanswered write is reported as uncertain, and retry checks whether it already landed. Drafts survive navigation, repeated conflicts keep earlier versions, and sign-out or page unload warns about unsaved work.
 
-All paths are under `/v8/management`. Every screen also uses `GET /config` and `GET /credentials`.
-
-| Screen | Endpoints |
-| --- | --- |
-| Overview | `GET /credentials` every 10 s while visible |
-| Accounts | `GET /credentials` every 10 s while visible, `POST /credentials` (upload), `DELETE /credentials`, `GET /credentials/download`, `GET /credentials/models`, `PATCH /credentials/status`, `PATCH /credentials/fields`, `POST /credentials/refresh`, `POST /routing/cooldown/reset`; quota checks by button only, one at a time and at most once per account every 2 minutes: `POST /requests/api-call` (Claude, Codex usage). Batch actions send one request per account, except one `DELETE /credentials` for all. Sign in again opens Connect for that account. |
-| Connect | `GET /oauth/auth-url` (for Sign in again on Accounts: `name` and `auth_index` without `provider`; a targeted sign-in ends by its session status, since it adds no credential), `GET /oauth/status` every 2 s while waiting, `POST /oauth/callback`, `DELETE /oauth/session` |
-| Providers | `GET /observability/usage/api-keys`; `PUT /config/api-keys/<family>` |
-| Client keys | `PUT /config/access/api-keys` |
-| Models | `GET /routing/model-definitions/<channel>`; `PUT /config/oauth/model-alias/<channel>`, `PUT /config/oauth/excluded-models/<channel>` |
-| Payload rules | `PUT /config/requests/payload/<kind>` |
-| Usage | `GET /observability/usage/api-keys`; while the live view is on, `GET /observability/usage/live?after=<cursor>` every 3 s while visible |
-| Logs | `GET /observability/logs` (cursor, every 3 s), `DELETE /observability/logs`, `GET /observability/logs/errors`, `GET /observability/logs/errors/<name>`, `GET /observability/logs/requests/<id>` |
-| Configuration | `GET, PUT /config/<section>`, `GET, PUT /config.yaml` |
-| System | `GET /server/latest-version` on request |
-
-Config list writes reread the target first and refuse to write if it changed since it was shown. The API has no revision precondition, so this narrows the race window rather than closing it.
-
-## Verification scripts
-
-Run these scripts against disposable servers with fake credentials only: they edit configuration and credential files. Fixture requirements: management key `orb-dashboard-test-only`, a disabled fake Claude credential with email `operator@example.invalid`, routing strategy `round-robin`, and an empty `requests.payload.default`.
-
-- `node scripts/browser-check-rust.mjs [url] [capture-dir]` drives the dashboard with agent-browser against the Rust binary: screens in both themes, unsupported actions disabled, a payload rule written and removed, a YAML diff discarded, 390 px layout, and no key in storage.
-- `node scripts/fake-logins.mjs [port]` serves fake provider login endpoints (Claude, Codex, Meta and xAI token, profile, device-code and key-mint routes) and a Claude usage endpoint that echoes its `Authorization` header. Fake tokens and `@example.invalid` emails only.
-- `scripts/login-harness/` is a test build of cliproxy-rs whose only change is `Options.login_base`, which points every provider login endpoint at the fake. It is never shipped. Build it with `cp ../../../Cargo.lock . && CARGO_TARGET_DIR=../../../target cargo build` inside that directory.
-- `CHROME_PATH=... node scripts/oauth-check.mjs <url> --mode fake` drives Claude and Codex sign-in through a pasted callback URL and Meta and xAI through the device code against the harness, and checks each new credential appears. It then signs the new Claude account in again from Accounts (no new file appears) and tries the same for the fixture account, which the server refuses because the fake signs in as another account; the panel must show that refusal word for word. `--mode dead` runs against the shipped binary with a dead `requests.proxy-url` and checks that a pasted callback ends in an honest failure.
-- `node scripts/api-call-check.mjs <base> [<base> ...]` sends the Accounts screen's `POST /requests/api-call` to the fake usage endpoint through each server, checks `$TOKEN$` substitution and that the quota parser reads the windows, and compares the response shape between servers.
-- `CHROME_PATH=... node scripts/quota-check.mjs [dashboard-url] [capture-dir]` drives Overview and Accounts with fake management responses (Playwright, like `oauth-check.mjs`): failed checks retain live or passive limits and their timestamps, Claude 403 advice explains setup-token permissions, a successful retry clears errors, a second check within 2 minutes sends nothing, the drawer's Check quota re-enables by itself after its 2 minutes, and a partial batch delete keeps the failed account selected and names it. It makes no provider calls.
-- The checks that sign in or send through a test server (`oauth-check.mjs` fake and dead modes, `first-run-check.mjs`, `api-call-check.mjs`) refuse to start unless the server reports an auth-dir whose real path, symlinks resolved, is strictly inside the system temp dir's real path (`scripts/private-auth-dir.mjs`; a path that doesn't resolve is refused too, and `npm test` covers it with disposable symlinks). The key is `oauth.auth-dir` (or the legacy root `auth-dir`). Anything else, such as `management.auth-dir`, falls back to `~/.cli-proxy-api`, where real logins live. Use a disposable container or user account with private home and credential directories, and block external network access while allowing loopback.
-- `scripts/verify-backend.mjs` is the API-level verifier for the Go release backend, unchanged from the previous dashboard.
-
-## Security
-
-The management key lives in `src/api.ts` module memory and is cleared on sign-out; reloading signs out. Only the theme is stored. Downloaded credential files and configuration previews contain secrets; treat them accordingly. Do not use the dashboard over plain HTTP across a network.
-
-## Fonts
-
-Host Grotesk (SIL Open Font License, `public/fonts/OFL.txt`), subset to Latin and weights 400–650 with fontTools.
+The primary routes are `#logs`, `#logs/server`, `#usage`, `#accounts`, `#tools` and `#settings`. Settings has `keys`, `models`, `payload`, `config` and `system` sections. Former dashboard bookmarks redirect to the corresponding Ledger screen.
